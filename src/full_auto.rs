@@ -313,6 +313,17 @@ pub struct SubTools {
     /// see us; this one is so the PILOT can read the panel — full auto brought
     /// a Baron to life and left the cockpit dark (2026-08-01).
     pub flood: crate::tools::lights::SetFloodLights,
+    /// Whether the ramp items include the panel lighting (the profile's
+    /// `ramp_panel_lights`).
+    pub panel_lights: bool,
+    /// The crew's preflight between the battery and the ramp items
+    /// ([`crate::preflight`]), and the Boeing start whose APU steps it
+    /// brings the APU up with.
+    pub preflight: Option<crate::aircraft::PreflightProfile>,
+    pub preflight_apu: Option<crate::aircraft::BoeingStartProfile>,
+    /// The start tool answers only once the start is over
+    /// (`StartKind::start_is_inline`): its reply is the verdict.
+    pub start_inline: bool,
     pub taxi: crate::tools::taxi::AutoTaxi,
     pub line_up: crate::tools::taxi::LineUp,
     pub circuit: crate::tools::circuit::Circuit,
@@ -494,8 +505,13 @@ async fn ramp_items(
     }
     // Panel lighting with them. The bus is live and the pilot is about to
     // be asked to read instruments. The tool's Ok is not a readback: the
-    // switch is read back here.
-    {
+    // switch is read back here. Left out where the airframe declares no
+    // path to it (`ramp_panel_lights: false`): the Zibo's rheostats are its
+    // own, the stock write is undone, and "did not come on" was said about
+    // a switch we never had (EGHL 2026-10-06).
+    if !tools.panel_lights {
+        event("lights_panel", json!({ "skipped": "undeclared" }));
+    } else {
         use crate::tools::Tool;
         let sent = tools
             .flood
@@ -623,6 +639,41 @@ fn circuit_takeoff_failed(stood_down: Option<&str>, aborted: bool) -> bool {
             stood_down,
             Some(crate::circuit::TAKEOFF_NOT_COMPLETED | crate::circuit::TERRAIN_REFUSED)
         )
+}
+
+/// How long an inline start's engines are given to read RUNNING once the
+/// start has answered: its stable call reads N2, the running flag can lag a
+/// moment behind it.
+const START_SETTLE_SECS: f64 = 10.0;
+
+/// The hand-back owed when an inline start has answered and the engines are
+/// not running: its reply as the line (it says why, and ends "Your
+/// aircraft."), or a plain one when the tool failed outright. `None` when
+/// the engines run. Pure.
+fn inline_start_hand_back(running: bool, reply: Option<&str>) -> Option<(String, &'static str)> {
+    if running {
+        return None;
+    }
+    let line = match reply.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) if r.contains("Your aircraft") => r.to_string(),
+        Some(r) => format!("{r} The engines aren't running. Your aircraft."),
+        None => "The start didn't run. Your aircraft.".to_string(),
+    };
+    Some((line, "start_stopped"))
+}
+
+/// The preflight's closing line: only the switches that did not take, by
+/// name. A clean preflight has said its milestones already. Pure.
+fn preflight_line(not_taken: &[String]) -> Option<String> {
+    match not_taken {
+        [] => None,
+        [one] => Some(format!("Preflight done, but the {one} didn't take.")),
+        many => Some(format!(
+            "Preflight done, but {} switches didn't take: {}.",
+            many.len(),
+            many.join(", ")
+        )),
+    }
 }
 
 /// The give-up's line and reason, relabelled as the pilot's cancel when the
@@ -2077,6 +2128,35 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             bail_if_abort!();
         }
 
+        // The crew's preflight on the airframe's own switches, where it
+        // declares one: the APU and its generators, then the overhead in
+        // the checklist's order, before the ramp items, so the lamps they
+        // read back are powered (the Zibo's are AC: "Nav lights did not
+        // come on" on the battery alone, EGHL 2026-10-06).
+        if let Some(pf) = &tools.preflight {
+            let apu = tools
+                .preflight_apu
+                .clone()
+                .map(crate::tools::jet_start::BoeingStart::new);
+            let mut say = |s: &str| announce(&voice, Priority::Advisory, s);
+            let mut panel = |_: &str| {};
+            match crate::preflight::run(&xp, pf, apu.as_ref(), &mut say, &mut panel).await {
+                Ok(not_taken) => {
+                    event("preflight", json!({ "not_taken": not_taken }));
+                    if let Some(line) = preflight_line(&not_taken) {
+                        announce(&voice, Priority::Advisory, &line);
+                    }
+                }
+                Err(line) => {
+                    event("preflight", json!({ "failed": line }));
+                    give_up(&xp, tools.taxi.park_brake_valve_set, &voice, &line, "preflight_power")
+                        .await;
+                    return;
+                }
+            }
+            bail_if_abort!();
+        }
+
         // Beacon BEFORE the propeller moves — that is what it is for, and it
         // is the one light with an actual safety job on a ramp. Nav lights with
         // it, since they belong on whenever the master is.
@@ -2111,7 +2191,23 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 ])
             },
         );
-        if let Ok(reply) = tools.start_engine.execute(&json!({}), &ctx).await {
+        let reply = tools.start_engine.execute(&json!({}), &ctx).await;
+        // An inline start has answered with its verdict. Engines not running
+        // once it has is a start that stopped and said "Your aircraft." in
+        // its reply, and the mission ends there: it used to say so and then
+        // wait out the five-minute class deadline holding the aircraft as
+        // `Automation("full auto")` (EGHL 2026-10-06, the Zibo's duct
+        // pressure refusal).
+        if tools.start_inline {
+            bail_if_abort!();
+            let running = wait_until(START_SETTLE_SECS, 500, || engine_running(&xp)).await;
+            if let Some((line, reason)) = inline_start_hand_back(running, reply.as_deref().ok()) {
+                event("start_stopped", json!({ "reply": reply.as_ref().ok() }));
+                give_up(&xp, tools.taxi.park_brake_valve_set, &voice, &line, reason).await;
+                return;
+            }
+        }
+        if let Ok(reply) = reply {
             announce(&voice, Priority::Advisory, &reply);
         }
         // The starter cranks before it catches — for seconds on a piston, for
@@ -2246,6 +2342,32 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         );
     }
     bail_if_abort!();
+
+    // The IRS the preflight set aligning, waited on before anything moves:
+    // the platform is the attitude the autopilot flies on, so no mission
+    // taxis out on one still aligning. Begun at the preflight, it has had
+    // the whole start to run; the wait is bounded and said.
+    if let Some(align) = tools.preflight.as_ref().and_then(|p| p.align.as_ref()) {
+        waiting("the I.R.S. to align");
+        let mut say = |s: &str| announce(&voice, Priority::Advisory, s);
+        let verdict =
+            crate::preflight::wait_aligned(&xp, align, &|| ABORT.load(SeqCst), &mut say).await;
+        event("irs_align", json!({ "verdict": format!("{verdict:?}") }));
+        bail_if_abort!();
+        let hand_back = match verdict {
+            crate::preflight::AlignVerdict::TimedOut { remaining_s } => {
+                Some(crate::preflight::align_timeout_line(remaining_s))
+            }
+            crate::preflight::AlignVerdict::Off => Some(
+                "The I.R.S. is off, so there's no attitude to fly on. Your aircraft.".to_string(),
+            ),
+            _ => None,
+        };
+        if let Some(line) = hand_back {
+            give_up(&xp, tools.taxi.park_brake_valve_set, &voice, &line, "irs_not_aligned").await;
+            return;
+        }
+    }
 
     // --- Stage 2: altimeter ---------------------------------------------------
     // NO brake release here, deliberately. The brakes used to come off at this

@@ -1073,6 +1073,19 @@ pub struct AircraftProfile {
     /// [`crate::tools::signs`]). `None` with `cabin_crew` is the stock switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_belt_signs: Option<SeatBeltSigns>,
+    /// The crew's preflight on the airframe's own switches, run by full
+    /// auto between the battery and the ramp items ([`PreflightProfile`]).
+    /// `None`: full auto goes from the battery straight to the ramp, as
+    /// every airframe did before 2026-10-07.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<PreflightProfile>,
+    /// Whether full auto's ramp items include the panel lighting through the
+    /// flood tool. `false` where the panel's rheostats are the add-on's own
+    /// and no switch for them is declared: the stock flood write is undone
+    /// there, and "Panel lights did not come on" was said about a switch we
+    /// never had (the Zibo, EGHL 2026-10-06). Defaults to true.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub ramp_panel_lights: bool,
     /// The circuit selects its pattern altitude on the altitude dial and lets
     /// the autopilot's capture hold the level legs, instead of flying altitude
     /// through the VS dial (`circuit::ap_holds_level`). Per airframe because
@@ -1719,6 +1732,93 @@ pub struct StartStep {
     /// Every step is still blackboxed and shown on the panel transcript.
     #[serde(default)]
     pub say: Option<String>,
+    /// A KNOB more than one detent from `want` (the 737's IRS selectors,
+    /// OFF / ALIGN / NAV / ATT; its AC meter and autobrake knobs): stepped
+    /// one press at a time, each read back, up to this many presses. `None`
+    /// is the single press every step had before 2026-10-07.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_presses: Option<u32>,
+    /// Run the step only while a reading is above a value (the 737's centre
+    /// tank pumps, on only with more than 453 kg in the tank). A failed read
+    /// skips the step: no measurement is no reason to switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_above: Option<StepCondition>,
+}
+
+/// A reading a [`StartStep`] waits on: `dataref` (which may be `name[i]`)
+/// above `value`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepCondition {
+    pub dataref: String,
+    pub value: f64,
+}
+
+/// The crew's preflight, from the battery to ready for the start, on the
+/// airframe's own switches (the Zibo's: its `clist.txt` PRELIMINARY
+/// FLIGHTDECK and PREFLIGHT PREPARATION sections). Run by full auto once the
+/// bus is live and before the ramp items, so the lights it reads back are
+/// powered (the Zibo's lamps are AC: on the battery alone every exterior
+/// lamp reads 0 whatever its switch says, probed 2026-10-07).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreflightProfile {
+    /// Bring the APU and its generators and bleed up FIRST, through the
+    /// start's own APU steps (`boeing_start` `apu_steps` and
+    /// `apu_power_steps`): the clist's "APU STARTED" and "APU GENERATORS
+    /// ON" open the preliminary flight deck procedure.
+    #[serde(default)]
+    pub apu_first: bool,
+    /// The switches, in the checklist's order: read before fire, read back,
+    /// at a crew's pace (`jet_start::run_steps`).
+    #[serde(default)]
+    pub steps: Vec<StartStep>,
+    /// The inertial reference alignment the steps begin ([`AlignWait`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<AlignWait>,
+}
+
+/// An alignment begun by the preflight and waited on before the taxi: the
+/// IRS gives the attitude the autopilot flies on, so no mission rolls on an
+/// unaligned platform. Every name is the airframe's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlignWait {
+    /// Each system's mode; aligned when every one reads `want`.
+    pub modes: Vec<String>,
+    #[serde(default = "two")]
+    pub want: f64,
+    /// Seconds of alignment left, for the spoken wait; optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<String>,
+    /// How long the taxi waits on it before handing back.
+    #[serde(default = "align_timeout_default")]
+    pub timeout_secs: f64,
+    /// The present position entered for the alignment, as a crew types it
+    /// into POS INIT ([`PositionEntry`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_entry: Option<PositionEntry>,
+}
+
+/// Where the alignment takes its present position: a `data` dataref the
+/// position is written to as `N5111.1W00102.5`, then a command that hands it
+/// to the IRS (the Zibo's `FMS/irs_pos_fmc_set` and `fmc_to_irs_pos`, read
+/// from B738.LATLON.lua; without it a first alignment ends flashing ALIGN,
+/// waiting for the entry, and never reaches NAV).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionEntry {
+    pub dataref: String,
+    pub command: String,
+}
+
+fn two() -> f64 {
+    2.0
+}
+fn align_timeout_default() -> f64 {
+    900.0
+}
+fn yes() -> bool {
+    true
+}
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 /// The airliner start: bleed air up, ENG MODE to IGN/START, each master
@@ -4898,6 +4998,8 @@ fn cessna_172sp() -> AircraftProfile {
         takeoff_config: None,
         takeoff_power: None,
         seat_belt_signs: None,
+        preflight: None,
+        ramp_panel_lights: true,
         ap_altitude_capture: false,
         ils: true,
         parking_brake: true,
@@ -5260,6 +5362,8 @@ fn cirrus_sr22() -> AircraftProfile {
         takeoff_config: None,
         takeoff_power: None,
         seat_belt_signs: None,
+        preflight: None,
+        ramp_panel_lights: true,
         ap_altitude_capture: false,
         ils: true,
         parking_brake: true,

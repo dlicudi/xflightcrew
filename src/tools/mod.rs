@@ -463,6 +463,8 @@ impl Registry {
                     lights: profile.lights.clone(),
                     flood_dataref: profile.flood_lights_dataref.clone(),
                     flood_toggle: profile.flood_lights_toggle.clone(),
+                    ramp_panel_lights: profile.ramp_panel_lights,
+                    preflight: profile.preflight.clone(),
                     // "Can we start it at all": the generic piston group OR a
                     // custom cycle-switch piston sequence (the DC-3, whose
                     // mixture is xlua-overridden so it declares no `engine`).

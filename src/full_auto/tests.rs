@@ -2132,3 +2132,89 @@ fn a_withdraw_empties_the_crew_queue() {
     assert_eq!(gone.len(), 2, "{gone:?}");
     assert!(!crate::crew_radio::crew_radio_pending());
 }
+
+/// EGHL 2026-10-06: the Zibo's Boeing start refused on 0 psi of duct
+/// pressure and said "Your aircraft.", and full auto then held the
+/// aircraft for the five-minute class deadline. An inline start's reply is
+/// its verdict: engines not running once it has answered ends the mission
+/// with the start's own words, said once.
+#[test]
+fn an_inline_start_that_stopped_ends_the_mission_with_its_own_words() {
+    use super::inline_start_hand_back;
+    let duct = "Duct pressure 0 P.S.I., not enough to start number two. Check the A.P.U. and its bleed. Your aircraft.";
+    assert_eq!(
+        inline_start_hand_back(false, Some(duct)),
+        Some((duct.to_string(), "start_stopped"))
+    );
+    assert_eq!(
+        inline_start_hand_back(true, Some("Both engines running. After-start flow complete.")),
+        None
+    );
+    // A reply that does not hand back is still a hand-back without engines.
+    assert_eq!(
+        inline_start_hand_back(false, Some("Number two, fuel in.")).map(|(l, _)| l),
+        Some("Number two, fuel in. The engines aren't running. Your aircraft.".to_string())
+    );
+    assert_eq!(
+        inline_start_hand_back(false, None).map(|(l, _)| l),
+        Some("The start didn't run. Your aircraft.".to_string())
+    );
+    // Only the airliner class answers inline; the others fire and return.
+    use crate::tools::full_auto::StartKind;
+    assert!(StartKind::Airliner.start_is_inline());
+    for k in [
+        StartKind::Piston,
+        StartKind::Turboprop,
+        StartKind::Jet,
+        StartKind::Scripted,
+        StartKind::None,
+    ] {
+        assert!(!k.start_is_inline(), "{k:?}");
+    }
+}
+
+#[test]
+fn the_preflight_names_only_what_did_not_take() {
+    use super::preflight_line;
+    assert_eq!(preflight_line(&[]), None);
+    assert_eq!(
+        preflight_line(&["yaw dumper".into()]).as_deref(),
+        Some("Preflight done, but the yaw dumper didn't take.")
+    );
+    assert_eq!(
+        preflight_line(&["yaw dumper".into(), "trim air".into()]).as_deref(),
+        Some("Preflight done, but 2 switches didn't take: yaw dumper, trim air.")
+    );
+}
+
+/// The preflight is the Zibo's alone: every other airframe goes from the
+/// battery to the ramp exactly as before, its panel lights included.
+#[test]
+fn only_the_zibo_declares_a_preflight_and_leaves_out_the_panel_lights() {
+    let mut seen = 0;
+    for entry in std::fs::read_dir("profiles").expect("profiles dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let id = path.file_stem().and_then(|s| s.to_str()).expect("id").to_string();
+        let text = std::fs::read_to_string(&path).expect("read");
+        let p: crate::aircraft::AircraftProfile =
+            serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("{id}: {e}"));
+        seen += 1;
+        if id == "zibo_738" {
+            let pf = p.preflight.as_ref().expect("zibo preflight");
+            assert!(pf.apu_first);
+            assert!(p.boeing_start.as_ref().is_some_and(|b| !b.apu_steps.is_empty()));
+            let align = pf.align.as_ref().expect("irs alignment");
+            assert!(align.position_entry.is_some());
+            // The IRS goes first: the alignment is the long pole.
+            assert!(pf.steps[0].command.contains("irs_L"), "{:?}", pf.steps[0]);
+            assert!(!p.ramp_panel_lights);
+        } else {
+            assert!(p.preflight.is_none(), "{id}");
+            assert!(p.ramp_panel_lights, "{id}");
+        }
+    }
+    assert!(seen > 5);
+}

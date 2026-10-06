@@ -75,6 +75,7 @@ mod plugin_status;
 mod pollers;
 mod prefs;
 mod plan_audit;
+mod preflight;
 mod procedure;
 mod pushback;
 mod radiofx;
