@@ -76,6 +76,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("efb::feed::PREFLIGHT", 'F'),
     ("efb::feed::RADIO_PENDING", 'S'),
     ("efb::feed::TICK", 'S'),
+    ("efb::mod::SERVING", 'S'),
     ("flight::PILOT_TAKEOVER", 'F'),
     ("flight::PUBLISHED", 'S'),
     ("flight_state::FLIGHTS_BEGUN", 'S'),

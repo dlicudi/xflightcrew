@@ -664,6 +664,10 @@ fn draw_health(f: &mut Frame, app: &App, area: Rect) {
     systems.push(kv("mic", app.boot.mic.clone()));
     systems.push(kv("listen", app.boot.listen.clone()));
     systems.push(kv("brain", "deterministic, no model".to_string()));
+    systems.push(kv(
+        "EFB",
+        crate::efb::serving_url().unwrap_or_else(|| "off (XCOPILOT_EFB=true or Settings)".into()),
+    ));
     f.render_widget(
         Paragraph::new(systems).block(Block::default().borders(Borders::ALL).title(" systems ")),
         left,

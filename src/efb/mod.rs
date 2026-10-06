@@ -697,6 +697,7 @@ async fn supervise(server: Arc<Server>, print_url: bool) {
             println!("\n  EFB: {url}\n");
         }
         announced = true;
+        *SERVING.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
         tracing::info!(%url, "EFB serving");
         crate::blackbox::record(
             "efb",
@@ -719,8 +720,18 @@ async fn supervise(server: Arc<Server>, print_url: bool) {
         {
             tracing::warn!("EFB server ended: {e}");
         }
+        *SERVING.lock().unwrap_or_else(|e| e.into_inner()) = None;
         crate::blackbox::record("efb", serde_json::json!({ "event": "stop", "port": port }));
     }
+}
+
+/// The link the server is answering on, while it is: the terminal shows it
+/// (the dashboard owns the screen, so the boot print is plain mode only).
+static SERVING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The EFB link now, `None` while it is off or not yet listening.
+pub fn serving_url() -> Option<String> {
+    SERVING.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[cfg(test)]
