@@ -1059,6 +1059,53 @@ pub(crate) fn matches_keyword(w: &str) -> bool {
             .any(|k| levenshtein(w, k) <= 1)
 }
 
+/// A bare "cancel" or "abort" as the whole utterance ("cancel", "cancel
+/// cancel", "abort", "cancel everything"): it names no automation, so it
+/// takes the CANCEL button's own context phrase (`auto_status::cancel_phrase`).
+/// Typed "cancel" under full auto was a deterministic miss, said nothing, and
+/// the mission went on into the push (LXGB 737, 2026-10-06). "Stop" keeps its
+/// own routing (brakes on the ground, the push); "cancel that" is undo's.
+pub(crate) fn bare_cancel(command: &str) -> bool {
+    let words: Vec<String> = command
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    let (cancel, rest): (Vec<&String>, Vec<&String>) = words
+        .iter()
+        .partition(|w| matches!(w.as_str(), "cancel" | "abort"));
+    !cancel.is_empty()
+        && words.len() <= 3
+        && rest
+            .iter()
+            .all(|w| matches!(w.as_str(), "everything" | "all" | "please"))
+}
+
+#[cfg(test)]
+mod bare_cancel_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_cancel_takes_the_buttons_phrase() {
+        for t in ["cancel", "Cancel.", "cancel cancel", "abort", "cancel everything", "cancel please"] {
+            assert!(bare_cancel(t), "{t}");
+        }
+        for t in [
+            "cancel full auto",
+            "cancel that",
+            "cancel the reminder",
+            "abort takeoff",
+            "stop",
+            "",
+        ] {
+            assert!(!bare_cancel(t), "{t}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod unregistered_tool_tests {
     use super::*;

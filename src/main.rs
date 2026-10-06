@@ -1912,6 +1912,15 @@ async fn run_session(
             }
         }
 
+        // A bare "cancel" names no automation: it means what the panel's
+        // CANCEL button means, chosen from what is running.
+        if router::bare_cancel(&command) {
+            if let Some(phrase) = auto_status::cancel_phrase() {
+                reporter.log(ui::LogKind::Info, format!("bare cancel → \"{phrase}\""));
+                command = phrase.to_string();
+            }
+        }
+
         // Domain gate, follow-up, and bare-value rewrite apply to SPOKEN input
         // only — phonetic nonsense and STT follow-ups are voice problems. A typed
         // command is taken as-is. Questions are let through too (the LLM decides
