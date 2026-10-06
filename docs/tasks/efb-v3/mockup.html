@@ -1,0 +1,546 @@
+<title>XVL Flight Bag</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=B612:wght@400;700&family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #07090C;
+  --surface: #0F141B;
+  --raised: #151C25;
+  --line: #222B36;
+  --text: #E6EDF3;
+  --soft: #B7C2CF;
+  --muted: #8B98A8;
+  --cyan: #7FD3F7;
+  --magenta: #EB6EEB;
+  --green: #7EE2A4;
+  --green-bg: #102418;
+  --amber: #FFC266;
+  --amber-bg: #2A1A08;
+  --red: #FF8A80;
+  --red-bg: #2A0E0C;
+  --sel: #10283A;
+  --violet: #B9A6FF;
+  --mono: 'B612 Mono', ui-monospace, Menlo, monospace;
+  --sans: 'B612', system-ui, -apple-system, sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #E9EDF1; --surface: #FFFFFF; --raised: #F3F6F9; --line: #CDD5DE;
+    --text: #0E141B; --soft: #2C3846; --muted: #5A6878;
+    --cyan: #0B6E99; --magenta: #A8279C; --green: #1D7A45; --green-bg: #E3F4EA;
+    --amber: #9A5B00; --amber-bg: #FDF0DC; --red: #B3261E; --red-bg: #FBE4E2; --sel: #DCEEF8; --violet: #5B3FC4;
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #E9EDF1; --surface: #FFFFFF; --raised: #F3F6F9; --line: #CDD5DE;
+  --text: #0E141B; --soft: #2C3846; --muted: #5A6878;
+  --cyan: #0B6E99; --magenta: #A8279C; --green: #1D7A45; --green-bg: #E3F4EA;
+  --amber: #9A5B00; --amber-bg: #FDF0DC; --red: #B3261E; --red-bg: #FBE4E2; --sel: #DCEEF8; --violet: #5B3FC4;
+}
+:root[data-theme="dark"] { color-scheme: dark; }
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: var(--sans); font-size: 15px; line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; color: inherit; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.lbl { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+
+.app { display: grid; grid-template-columns: 88px 1fr; min-height: 100%; }
+.rail {
+  background: var(--surface); border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 4px; padding-block: 12px; padding-inline: 8px;
+}
+.tab {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  background: none; border: 0; border-radius: 10px; padding: 10px 4px; cursor: pointer;
+  color: var(--muted); font-size: 12px;
+}
+.tab svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.8; }
+.tab[aria-selected="true"] { background: var(--sel); color: var(--cyan); }
+.tab:focus-visible, .seg button:focus-visible, .act:focus-visible, .gear:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.rail .gear { margin-top: auto; }
+.gear { background: none; border: 0; color: var(--muted); padding: 10px; border-radius: 10px; cursor: pointer; display: grid; place-items: center; }
+.gear svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.8; }
+
+.main { display: flex; flex-direction: column; min-width: 0; }
+.strip {
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+  padding-block: 10px; padding-inline: 20px;
+  background: var(--surface); border-bottom: 1px solid var(--line);
+}
+.strip .cs { font-weight: 700; font-size: 16px; }
+.strip .route { color: var(--soft); }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); font-size: 13px; }
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pill.green { color: var(--green); background: var(--green-bg); border-color: transparent; }
+.pill.amber { color: var(--amber); background: var(--amber-bg); border-color: transparent; }
+.strip .com { margin-left: auto; display: flex; gap: 8px; align-items: baseline; }
+.strip .com .num { color: var(--cyan); font-size: 16px; }
+
+.content { padding-block: 16px 120px; padding-inline: 20px; display: flex; flex-direction: column; gap: 16px; max-width: 1100px; width: 100%; }
+
+.mock { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; color: var(--muted); font-size: 12px; }
+.seg { display: inline-flex; flex-wrap: wrap; border: 1px dashed var(--line); border-radius: 10px; padding: 3px; gap: 3px; }
+.seg button { border: 0; background: none; padding: 6px 12px; border-radius: 7px; cursor: pointer; color: var(--soft); font-size: 13px; }
+.seg button[aria-pressed="true"] { background: var(--raised); color: var(--text); box-shadow: inset 0 0 0 1px var(--line); }
+
+.banner {
+  display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  background: var(--red-bg); color: var(--red); border-radius: 12px; padding: 12px 16px; font-weight: 700;
+}
+.banner button { background: none; border: 1px solid currentColor; color: inherit; border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+
+.now {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+  padding: 18px 20px; display: grid; gap: 14px;
+}
+.now .head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.now h1 { margin: 0; font-size: clamp(22px, 3.2vw, 30px); line-height: 1.15; text-wrap: balance; font-weight: 700; }
+.now h1 .fix { color: var(--magenta); }
+.now .sub { color: var(--soft); max-width: 62ch; }
+.now .who { font-size: 13px; color: var(--muted); }
+
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; display: grid; gap: 2px; min-width: 0; }
+.tile .v { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: clamp(22px, 3vw, 30px); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .v small { font-size: .5em; font-weight: 400; color: var(--muted); margin-left: 4px; }
+.tile .note { font-size: 12px; color: var(--muted); }
+.tile.mag .v { color: var(--magenta); }
+.tile.ok .v { color: var(--green); }
+.tile.warn .v { color: var(--amber); }
+
+.cols { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; align-items: start; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; display: grid; gap: 10px; min-width: 0; }
+.card h2 { margin: 0; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+.rows { display: grid; gap: 8px; }
+.row { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+.row:last-child { border-bottom: 0; padding-bottom: 0; }
+.row .k { color: var(--soft); }
+.row .val { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+.row .val.mag { color: var(--magenta); }
+.row .val.cy { color: var(--cyan); }
+.row .val.ok { color: var(--green); }
+.row .val.warn { color: var(--amber); }
+
+.legs { display: grid; gap: 0; }
+.leg { display: grid; grid-template-columns: 70px 1fr auto; gap: 10px; align-items: baseline; padding-block: 7px; border-bottom: 1px solid var(--line); font-size: 14px; }
+.leg:last-child { border-bottom: 0; }
+.leg .id { font-family: var(--mono); font-weight: 700; }
+.leg .meta { color: var(--muted); font-size: 12px; }
+.leg .eta { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--soft); }
+.leg.active .id, .leg.active .eta { color: var(--magenta); }
+.leg.done { opacity: .45; }
+
+.check { display: grid; gap: 6px; }
+.item { display: flex; justify-content: space-between; gap: 10px; font-size: 14px; }
+.item .st { font-family: var(--mono); font-size: 12px; }
+.item .st.done { color: var(--green); }
+.item .st.held { color: var(--cyan); }
+.item .st.wait { color: var(--amber); }
+
+.bar {
+  height: 10px; border-radius: 5px; background: var(--raised); border: 1px solid var(--line); position: relative; overflow: hidden;
+}
+.bar i { position: absolute; inset: 0 auto 0 0; background: var(--green); border-radius: 5px; }
+.bar b { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); }
+
+.actions {
+  position: fixed; left: 88px; right: 0; bottom: 0; z-index: 6;
+  display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end;
+  padding-block: 12px calc(12px + env(safe-area-inset-bottom, 0px)); padding-inline: 20px;
+  background: linear-gradient(to top, var(--bg) 70%, transparent);
+}
+.act { border-radius: 12px; padding: 12px 18px; cursor: pointer; font-weight: 700; border: 1px solid var(--line); background: var(--surface); }
+.act.say { color: var(--cyan); }
+.act.ptt { background: var(--sel); color: var(--cyan); border-color: var(--cyan); min-width: 150px; }
+.act.mine { color: var(--red); border-color: var(--red); background: var(--red-bg); }
+
+.log { display: grid; gap: 0; }
+.ln { display: grid; grid-template-columns: 52px minmax(0, 168px) minmax(0, 1fr); gap: 4px 12px; align-items: baseline; padding-block: 8px; border-bottom: 1px solid var(--line); font-size: 14px; }
+.ln:last-child { border-bottom: 0; }
+.ln .t { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; }
+.ln .ft { font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: .03em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ln .ft .to { color: var(--muted); font-weight: 400; }
+.ln .tx { color: var(--text); min-width: 0; }
+.ln .tag { display: inline-block; margin-left: 8px; font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--line); color: var(--muted); vertical-align: 1px; }
+.ln .tag.owed { color: var(--amber); border-color: var(--amber); }
+.ln .tag.ch { color: var(--soft); }
+.ln.you .ft { color: var(--text); }
+.ln.copilot .ft { color: var(--cyan); }
+.ln.cabin .ft { color: var(--violet); }
+.ln.atc .ft { color: var(--green); }
+.ln.us .ft { color: var(--text); }
+.ln.other { opacity: .5; }
+.freq { display: flex; gap: 10px; align-items: baseline; padding-block: 10px 6px; border-bottom: 1px solid var(--line); color: var(--soft); font-size: 13px; }
+.freq .num { color: var(--cyan); font-size: 15px; }
+.freq:first-child { padding-top: 0; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); }
+.legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; background: currentColor; }
+.legend .l-you { color: var(--text); } .legend .l-cp { color: var(--cyan); } .legend .l-cab { color: var(--violet); } .legend .l-atc { color: var(--green); }
+.radio-now { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 640px) {
+  .ln { grid-template-columns: 44px minmax(0, 1fr); }
+  .ln .tx { grid-column: 1 / -1; }
+  .radio-now { grid-template-columns: minmax(0, 1fr); }
+}
+
+.other { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; color: var(--soft); max-width: 62ch; display: grid; gap: 8px; }
+.other h1 { margin: 0; font-size: 22px; color: var(--text); }
+
+@media (max-width: 900px) {
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cols { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .rail {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 7; flex-direction: row; justify-content: space-around;
+    border-right: 0; border-top: 1px solid var(--line);
+    padding-block: 6px calc(6px + env(safe-area-inset-bottom, 0px)); padding-inline: 8px;
+  }
+  .rail .gear { margin-top: 0; }
+  .tab { padding: 6px 4px; flex: 1; }
+  .actions { left: 0; bottom: calc(64px + env(safe-area-inset-bottom, 0px)); padding-inline: 16px; justify-content: stretch; }
+  .act { flex: 1; padding: 12px 10px; }
+  .act.say { display: none; }
+  .content { padding-inline: 16px; padding-block: 12px 190px; }
+  .strip { padding-inline: 16px; }
+  .strip .com { margin-left: 0; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .phase { animation: rise .18s ease-out; }
+  @keyframes rise { from { opacity: .4; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+}
+</style>
+
+<div class="app">
+  <nav class="rail" role="tablist" aria-label="Pages">
+    <button class="tab" role="tab" aria-selected="true" data-tab="flight" id="t-flight">
+      <svg viewBox="0 0 24 24"><path d="M2 13l8-2 4-8h2l-2 8 6 1v2l-6 1 2 7h-2l-4-7-8-1z"/></svg>Flight</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="map" id="t-map">
+      <svg viewBox="0 0 24 24"><path d="M3 6l6-2 6 2 6-2v14l-6 2-6-2-6 2z"/><path d="M9 4v14M15 6v14"/></svg>Map</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="plan" id="t-plan">
+      <svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M9 11h7M9 15h7M9 7h3"/></svg>Plan</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="radio" id="t-radio">
+      <svg viewBox="0 0 24 24"><path d="M4 9h16v11H4z"/><path d="M8 4l10 5"/><circle cx="9" cy="14.5" r="2.5"/><path d="M15 13h3M15 16h3"/></svg>Radio</button>
+    <button class="gear" aria-label="Settings" id="t-settings">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></button>
+  </nav>
+
+  <div class="main">
+    <header class="strip">
+      <span class="cs">WAT519</span>
+      <span class="route">B738 &middot; LXGB &rarr; EGKK</span>
+      <span class="pill" id="phase-pill"><span class="dot"></span><span id="phase-name">Parked</span></span>
+      <span class="pill green" id="who-pill"><span class="dot"></span><span id="who">Full auto</span></span>
+      <span class="com"><span class="lbl">COM1</span><span class="num" id="com">131.200</span><span id="com-who" class="lbl">Gibraltar Twr</span></span>
+    </header>
+
+    <main class="content">
+      <div class="mock" id="mock-ctl">
+        <span>Mockup: show the Flight tab in</span>
+        <div class="seg" role="group" aria-label="Phase">
+          <button aria-pressed="true" data-phase="parked">Parked</button>
+          <button aria-pressed="false" data-phase="taxi">Taxi</button>
+          <button aria-pressed="false" data-phase="cruise">Climb &amp; cruise</button>
+          <button aria-pressed="false" data-phase="approach">Descent &amp; approach</button>
+        </div>
+      </div>
+
+      <!-- PARKED -->
+      <section class="phase" data-for="parked">
+        <div class="now">
+          <div class="head">
+            <span class="lbl">Now &middot; on stand 1</span>
+            <span class="who">Engines starting, about a minute left</span>
+          </div>
+          <h1>IFR clearance to Gatwick held, runway 27, squawk <span class="num">4553</span></h1>
+          <div class="sub">Runway heading, climb 5,000 ft. Read back and accepted at 13:12. Next: request taxi once both engines are running.</div>
+        </div>
+        <div class="tiles" style="margin-top:16px">
+          <div class="tile ok"><span class="lbl">Engine 2</span><span class="v num">63.7<small>% N2</small></span><span class="note">Stable</span></div>
+          <div class="tile"><span class="lbl">Engine 1</span><span class="v num">31.4<small>% N2</small></span><span class="note">Fuel in, rising</span></div>
+          <div class="tile"><span class="lbl">Block fuel</span><span class="v num">20,860<small>lb</small></span><span class="note">Plan 20,880</span></div>
+          <div class="tile"><span class="lbl">Takeoff weight</span><span class="v num">147,720<small>lb</small></span><span class="note">Limit 159,140</span></div>
+        </div>
+        <div class="cols" style="margin-top:16px">
+          <div class="card">
+            <h2>Before start checklist</h2>
+            <div class="check">
+              <div class="item"><span>Flight deck door</span><span class="st done">CLOSED</span></div>
+              <div class="item"><span>Fuel</span><span class="st done">20,860 LB</span></div>
+              <div class="item"><span>Passenger signs</span><span class="st done">SET</span></div>
+              <div class="item"><span>Windows</span><span class="st done">LOCKED</span></div>
+              <div class="item"><span>MCP</span><span class="st held">V2 150, HDG 270, ALT 5000</span></div>
+              <div class="item"><span>Takeoff speeds</span><span class="st wait">WAITING</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Runway 27</h2>
+            <div class="rows">
+              <div class="row"><span class="k">Available</span><span class="val">1,763 m</span></div>
+              <div class="row"><span class="k">Needed</span><span class="val ok">1,421 m, fits</span></div>
+              <div class="row"><span class="k">Wind</span><span class="val cy">090 / 11 kt</span></div>
+              <div class="row"><span class="k">QNH</span><span class="val">1018</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAXI -->
+      <section class="phase" data-for="taxi" hidden>
+        <div class="now">
+          <div class="head"><span class="lbl">Now &middot; taxiing, 14 kt</span><span class="who">Cleared to holding point Echo, runway 27</span></div>
+          <h1>Next: left onto <span class="fix">Echo</span> in <span class="num">180 m</span></h1>
+          <div class="sub">Route Bravo, Echo. Hold short of runway 27 at Echo. Report ready for departure.</div>
+        </div>
+        <div class="tiles" style="margin-top:16px">
+          <div class="tile mag"><span class="lbl">Next turn</span><span class="v num">L&nbsp;E</span><span class="note">180 m</span></div>
+          <div class="tile"><span class="lbl">To the hold</span><span class="v num">420<small>m</small></span><span class="note">About 1 min</span></div>
+          <div class="tile"><span class="lbl">Groundspeed</span><span class="v num">14<small>kt</small></span><span class="note">Held at 18</span></div>
+          <div class="tile ok"><span class="lbl">Departure runway</span><span class="v num">27</span><span class="note">1,763 m, wind 090/11</span></div>
+        </div>
+        <div class="cols" style="margin-top:16px">
+          <div class="card">
+            <h2>Taxi route</h2>
+            <div class="legs">
+              <div class="leg done"><span class="id">STAND 1</span><span class="meta">Pushback complete</span><span class="eta">done</span></div>
+              <div class="leg done"><span class="id">B</span><span class="meta">Bravo, 260 m</span><span class="eta">done</span></div>
+              <div class="leg active"><span class="id">E</span><span class="meta">Echo, left turn</span><span class="eta">180 m</span></div>
+              <div class="leg"><span class="id">HOLD E</span><span class="meta">Hold short runway 27</span><span class="eta">420 m</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Before takeoff</h2>
+            <div class="rows">
+              <div class="row"><span class="k">Flaps</span><span class="val ok">5</span></div>
+              <div class="row"><span class="k">Trim</span><span class="val ok">Set</span></div>
+              <div class="row"><span class="k">Autobrake</span><span class="val ok">RTO</span></div>
+              <div class="row"><span class="k">Transponder</span><span class="val cy">4553 TA/RA</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CRUISE -->
+      <section class="phase" data-for="cruise" hidden>
+        <div class="now">
+          <div class="head"><span class="lbl">Now &middot; cruise FL360, M.78</span><span class="who">LNAV following the route, altitude hold</span></div>
+          <h1>Next <span class="fix">REVTU</span> in <span class="num">74 nm</span>, at <span class="num">16:02</span></h1>
+          <div class="sub">Then UP88 to VASUX for the VASU1G arrival. Top of descent near ODREP, 31 minutes from now.</div>
+        </div>
+        <div class="tiles" style="margin-top:16px">
+          <div class="tile mag"><span class="lbl">REVTU</span><span class="v num">74<small>nm</small></span><span class="note">ETA 16:02</span></div>
+          <div class="tile"><span class="lbl">Top of descent</span><span class="v num">31<small>min</small></span><span class="note">248 nm, near ODREP</span></div>
+          <div class="tile"><span class="lbl">EGKK</span><span class="v num">16:58</span><span class="note">412 nm to go</span></div>
+          <div class="tile ok"><span class="lbl">Fuel at EGKK</span><span class="v num">7,940<small>lb</small></span><span class="note">Plan 7,610, reserve 5,120</span></div>
+        </div>
+        <div class="cols" style="margin-top:16px">
+          <div class="card">
+            <h2>Route ahead</h2>
+            <div class="legs">
+              <div class="leg done"><span class="id">ARTIV</span><span class="meta">DCT</span><span class="eta">15:46</span></div>
+              <div class="leg active"><span class="id">REVTU</span><span class="meta">DCT &middot; 74 nm</span><span class="eta">16:02</span></div>
+              <div class="leg"><span class="id">ODREP</span><span class="meta">UP88 &middot; top of descent</span><span class="eta">16:07</span></div>
+              <div class="leg"><span class="id">VASUX</span><span class="meta">UP88 &middot; arrival begins</span><span class="eta">16:12</span></div>
+              <div class="leg"><span class="id">TELTU</span><span class="meta">VASU1G &middot; at 13,000, 250 kt</span><span class="eta">16:17</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Flight</h2>
+            <div class="rows">
+              <div class="row"><span class="k">Speed</span><span class="val">262 kt IAS &middot; 458 GS</span></div>
+              <div class="row"><span class="k">Wind aloft</span><span class="val cy">250 / 38 kt</span></div>
+              <div class="row"><span class="k">Lateral</span><span class="val ok">LNAV, on track</span></div>
+              <div class="row"><span class="k">EGKK weather</span><span class="val">080/12 9999 BKN035</span></div>
+              <div class="row"><span class="k">Arrival runway</span><span class="val mag">08R, ILS</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- APPROACH -->
+      <section class="phase" data-for="approach" hidden>
+        <div class="banner" role="alert"><span>Warning: sink rate on the glideslope, check the approach</span><button type="button" id="ack">Acknowledge</button></div>
+        <div class="now">
+          <div class="head"><span class="lbl">Now &middot; on the VASU1G arrival, 6,100 ft</span><span class="who">Cleared ILS 08R, contact tower at 8 nm</span></div>
+          <h1>ILS <span class="fix">08R</span> &middot; <span class="num">110.90</span> IGG, DA <span class="num">400 ft</span></h1>
+          <div class="sub">Final approach course 078. Glideslope intercept at 3,000 ft. Vref 142 kt, flaps 30, autobrake 2.</div>
+        </div>
+        <div class="tiles" style="margin-top:16px">
+          <div class="tile mag"><span class="lbl">Runway</span><span class="v num">08R</span><span class="note">LDA 2,766 m</span></div>
+          <div class="tile"><span class="lbl">Wind</span><span class="v num">080/12</span><span class="note">Headwind 12, cross 2</span></div>
+          <div class="tile"><span class="lbl">Minimums</span><span class="v num">400<small>ft DA</small></span><span class="note">QNH 1013</span></div>
+          <div class="tile ok"><span class="lbl">Landing distance</span><span class="v num">1,650<small>m</small></span><span class="note">Of 2,766 available</span></div>
+        </div>
+        <div class="cols" style="margin-top:16px">
+          <div class="card">
+            <h2>Stopping margin</h2>
+            <div class="bar" role="img" aria-label="1,650 m needed of 2,766 m"><i style="width:59.7%"></i><b style="left:59.7%"></b></div>
+            <div class="rows">
+              <div class="row"><span class="k">Needed, flaps 30, autobrake 2</span><span class="val">1,650 m</span></div>
+              <div class="row"><span class="k">Margin</span><span class="val ok">1,116 m</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Landing checklist</h2>
+            <div class="check">
+              <div class="item"><span>Engine start switches</span><span class="st done">CONT</span></div>
+              <div class="item"><span>Speedbrake</span><span class="st done">ARMED</span></div>
+              <div class="item"><span>Landing gear</span><span class="st wait">AT 2,000 FT</span></div>
+              <div class="item"><span>Flaps</span><span class="st wait">30, GREEN LIGHT</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" id="intercom">
+        <h2>Intercom</h2>
+        <div class="log" id="intercom-log"></div>
+      </section>
+
+      <!-- OTHER TABS -->
+      <section class="other" data-tabpage="map" hidden>
+        <h1>Map</h1>
+        <p>On the ground and near the field, today's airport diagram with the taxi route. In the air, the route: legs in magenta, our position, the active fix and the top of descent. Not part of this mockup.</p>
+      </section>
+      <section class="other" data-tabpage="plan" hidden>
+        <h1>Plan</h1>
+        <p>Route, departure and arrival, fuel and the load sheet, weather for origin, destination and alternate, and the plan check. One scrolling page. Not part of this mockup.</p>
+      </section>
+      <section data-tabpage="radio" hidden style="display:grid;gap:16px">
+        <div class="radio-now">
+          <div class="tile"><span class="lbl">COM1 &middot; Gibraltar Tower</span><span class="v num" style="color:var(--cyan)">131.200</span><span class="note">Squawk 4553, mode C</span></div>
+          <div class="tile ok"><span class="lbl">Clearance</span><span class="v num">EGKK</span><span class="note">Rwy 27, hdg, 5,000 ft. Accepted</span></div>
+          <div class="tile warn"><span class="lbl">Readback</span><span class="v num">Owed</span><span class="note">Taxi to holding point Echo</span></div>
+        </div>
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center">
+            <h2>Frequency log</h2>
+            <div class="seg" role="group" aria-label="Show">
+              <button aria-pressed="true" data-log="radio" id="f-radio">Radio</button>
+              <button aria-pressed="false" data-log="all" id="f-all">All</button>
+            </div>
+          </div>
+          <div class="legend"><span class="l-you">You / our callsign</span><span class="l-cp">Copilot</span><span class="l-cab">Cabin</span><span class="l-atc">ATC</span><span style="color:var(--muted)">Dimmed: other traffic</span></div>
+          <div class="log" id="radio-log"></div>
+        </div>
+      </section>
+    </main>
+
+    <div class="actions" id="actions">
+      <button class="act say" type="button" id="act-1">Request taxi</button>
+      <button class="act ptt" type="button" id="ptt">Hold to talk</button>
+      <button class="act mine" type="button" id="mine">My controls</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var P = {
+    parked:   { name: 'Parked',   who: 'Full auto', com: '131.200', comWho: 'Gibraltar Twr', act: 'Request taxi' },
+    taxi:     { name: 'Taxi',     who: 'Full auto', com: '131.200', comWho: 'Gibraltar Twr', act: 'Ready for departure' },
+    cruise:   { name: 'Cruise',   who: 'Full auto', com: '132.800', comWho: 'Brest Ctl',     act: 'When is top of descent?' },
+    approach: { name: 'Approach', who: 'Full auto', com: '126.825', comWho: 'London Ctl',    act: 'Go around' }
+  };
+  // [time, class, from, to, text, tags]
+  var IC = {
+    parked: [
+      ['13:10', 'copilot', 'COPILOT', 'YOU', 'Plan LXGB to EGKK, 2 hours 20. Details on the EFB.'],
+      ['13:10', 'you', 'YOU', 'COPILOT', 'Fly my flight plan.'],
+      ['13:11', 'copilot', 'COPILOT', 'YOU', "Battery's on."],
+      ['13:11', 'cabin', 'CABIN', 'FLIGHT DECK', 'Boarding complete, 152 on board.'],
+      ['13:12', 'copilot', 'COPILOT', 'YOU', 'Starting engine two.']
+    ],
+    taxi: [
+      ['13:16', 'copilot', 'COPILOT', 'YOU', 'Pushback complete, tug clear.'],
+      ['13:17', 'you', 'YOU', 'CABIN', 'Cabin crew, prepare for departure.'],
+      ['13:17', 'cabin', 'CABIN', 'FLIGHT DECK', 'Cabin secure.'],
+      ['13:18', 'copilot', 'COPILOT', 'YOU', 'My taxi. Echo via Bravo, 18 knots.']
+    ],
+    cruise: [
+      ['15:44', 'copilot', 'COPILOT', 'YOU', 'LNAV engaged, following the route.'],
+      ['15:52', 'cabin', 'CABIN', 'FLIGHT DECK', 'Coffee for the flight deck?'],
+      ['15:52', 'you', 'YOU', 'CABIN', 'Yes please, two.'],
+      ['15:58', 'copilot', 'COPILOT', 'YOU', 'Next, REVTU.']
+    ],
+    approach: [
+      ['16:20', 'copilot', 'COPILOT', 'YOU', 'Approach briefed: ILS 08R, minimums 400.'],
+      ['16:24', 'copilot', 'COPILOT', 'CABIN', 'Cabin crew, seats for landing.'],
+      ['16:25', 'cabin', 'CABIN', 'FLIGHT DECK', 'Cabin secure for landing.'],
+      ['16:27', 'copilot', 'COPILOT', 'YOU', 'Localiser alive. Glideslope alive.']
+    ]
+  };
+  var RADIO = [
+    ['freq', '131.200', 'Gibraltar Tower'],
+    ['13:12', 'us', 'WAT519', 'TOWER', 'Request IFR clearance to Echo Golf Kilo Kilo.', ['by copilot']],
+    ['13:12', 'atc', 'TOWER', 'WAT519', 'Cleared to London Gatwick, runway 27, runway heading, climb 5,000 feet, squawk 4553.'],
+    ['13:13', 'us', 'WAT519', 'TOWER', 'Cleared to London Gatwick, runway 27, runway heading, 5,000 feet, squawk 4553.', ['readback', 'by copilot']],
+    ['13:14', 'atc', 'TOWER', 'EZY8791', 'Runway 09, cleared to land, wind 090 at 11.', [], true],
+    ['13:14', 'other', 'EZY8791', 'TOWER', 'Cleared to land runway 09, Easy 8791.', [], true],
+    ['13:16', 'us', 'WAT519', 'TOWER', 'Request taxi, runway 27.', ['by copilot']],
+    ['13:16', 'atc', 'TOWER', 'WAT519', 'Taxi to holding point Echo, runway 27, via Bravo, Echo. QNH 1018.', ['readback owed']]
+  ];
+  var logMode = 'radio';
+  function line(r, chan) {
+    var tags = (r[5] || []).map(function (t) { return '<span class="tag' + (t.indexOf('owed') >= 0 ? ' owed' : '') + '">' + t + '</span>'; }).join('');
+    if (chan) tags = '<span class="tag ch">' + chan + '</span>' + tags;
+    var cls = 'ln ' + r[1] + (r[6] ? ' other' : '');
+    return '<div class="' + cls + '"><span class="t">' + r[0] + '</span><span class="ft">' + r[2] + ' <span class="to">&rarr; ' + r[3] + '</span></span><span class="tx">' + r[4] + tags + '</span></div>';
+  }
+  function renderLogs() {
+    document.getElementById('intercom-log').innerHTML = IC[phase].map(function (r) { return line(r); }).join('');
+    var out = [];
+    if (logMode === 'all') {
+      var all = [];
+      RADIO.forEach(function (r) { if (r[0] !== 'freq') all.push([r, 'RADIO']); });
+      IC.parked.concat(IC.taxi).forEach(function (r) { all.push([r, 'INTERCOM']); });
+      all.sort(function (a, b) { return a[0][0] < b[0][0] ? -1 : a[0][0] > b[0][0] ? 1 : 0; });
+      out = all.map(function (x) { return line(x[0], x[1]); });
+    } else {
+      out = RADIO.map(function (r) {
+        return r[0] === 'freq' ? '<div class="freq"><span class="num">' + r[1] + '</span><span>' + r[2] + '</span></div>' : line(r);
+      });
+    }
+    document.getElementById('radio-log').innerHTML = out.join('');
+    ['f-radio', 'f-all'].forEach(function (id) { var b = document.getElementById(id); b.setAttribute('aria-pressed', String(b.dataset.log === logMode)); });
+  }
+  ['f-radio', 'f-all'].forEach(function (id) {
+    document.getElementById(id).addEventListener('click', function () { logMode = this.dataset.log; renderLogs(); });
+  });
+  var phase = 'parked', tab = 'flight';
+  var segs = document.querySelectorAll('.seg button');
+  var tabs = document.querySelectorAll('.tab');
+  function render() {
+    var p = P[phase];
+    document.getElementById('phase-name').textContent = p.name;
+    document.getElementById('who').textContent = p.who;
+    document.getElementById('com').textContent = p.com;
+    document.getElementById('com-who').textContent = p.comWho;
+    document.getElementById('act-1').textContent = p.act;
+    segs.forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.phase === phase)); });
+    tabs.forEach(function (t) { t.setAttribute('aria-selected', String(t.dataset.tab === tab)); });
+    document.querySelectorAll('.phase').forEach(function (s) { s.hidden = tab !== 'flight' || s.dataset.for !== phase; });
+    document.querySelectorAll('[data-tabpage]').forEach(function (s) { s.hidden = s.dataset.tabpage !== tab; });
+    document.getElementById('mock-ctl').hidden = tab !== 'flight';
+    document.getElementById('intercom').hidden = tab !== 'flight';
+    renderLogs();
+  }
+  segs.forEach(function (b) { b.addEventListener('click', function () { phase = b.dataset.phase; render(); }); });
+  tabs.forEach(function (t) { t.addEventListener('click', function () { tab = t.dataset.tab; render(); }); });
+  var ack = document.getElementById('ack');
+  if (ack) ack.addEventListener('click', function () { ack.parentElement.hidden = true; });
+  render();
+})();
+</script>
