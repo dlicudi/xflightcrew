@@ -967,7 +967,7 @@ impl FireState {
                 "callout",
                 serde_json::json!({ "id": id, "sev": format!("{sev:?}"), "msg": &msg }),
             );
-            voice.alert(sev.into(), msg);
+            voice.hazard(sev, msg);
             self.last_spoken = Some(now);
             self.spoke_this_episode = true;
             return true;
@@ -4393,7 +4393,7 @@ pub async fn run(
                         // said again it landed on the next "you have control"
                         // (LEMG 13 1790690743, 2026-09-29, #54).
                         if !pilot_released_recently() {
-                        voice.alert(Priority::Caution, "Flight automation has stopped. I'm monitoring only; you have control. Check the autopilot.".to_string());
+                            voice.hazard(Severity::Caution, "Flight automation has stopped. I'm monitoring only; you have control. Check the autopilot.");
                         }
                     }
                 } else if snap.on_ground {
@@ -4593,7 +4593,7 @@ pub async fn run(
                     serde_json::json!({"event":"connection_lost"}),
                 );
                 if crate::mode::copilot_enabled() {
-                    voice.alert(Priority::Warning, "Connection to X-Plane lost. Flight automation is stopped. You'll have control when the sim returns.".to_string());
+                    voice.hazard(Severity::Warning, "Connection to X-Plane lost. Flight automation is stopped. You'll have control when the sim returns.".to_string());
                 }
             }
         } else {

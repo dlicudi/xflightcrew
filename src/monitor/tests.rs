@@ -2423,3 +2423,77 @@ fn tod_ahead_is_said_once_through_a_flicker() {
     assert!(c.eval_at(&s, t0).is_some());
     assert!(c.eval_at(&dip, t0 + TOD_AHEAD_HOLD + Duration::from_secs(1)).is_none());
 }
+
+/// The EFB's banner and chip are hazards, never every line spoken at
+/// Warning (2026-10-06: autoland's "I'll land at EGKK runway 26L" was a red
+/// banner). The arm line is spoken through `alert` at Warning so the radio
+/// cannot cut it, and stays out; a monitor check's Warning goes in.
+mod efb_severity {
+    use crate::voice::{Priority, Voice};
+
+    #[test]
+    fn only_a_hazard_reaches_the_efb_banner() {
+        let _m = crate::mode::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _f = crate::efb::feed::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::mode::set(crate::mode::Mode::Both);
+        let voice = Voice::new(crate::config::Config::default());
+        voice.set_hold(true);
+        let arm = "I'll land at EGKK runway 26L, 8 miles. I have the approach.";
+        let intercept = "Intercepting the final approach.";
+        voice.alert(Priority::Warning, arm);
+        voice.alert(Priority::Caution, intercept);
+        let mut fire = super::super::FireState::new();
+        let spoke = fire.active(
+            "sink_rate",
+            "Sink rate! 2400 feet a minute at 400 feet. Pull up.".into(),
+            super::super::Severity::Warning,
+            std::time::Duration::ZERO,
+            &voice,
+            None,
+            std::time::Instant::now(),
+            false,
+        );
+        assert!(spoke);
+        let alerts = crate::efb::feed::alerts();
+        let level = |text: &str| {
+            alerts
+                .iter()
+                .rev()
+                .find(|a| a.text.starts_with(text))
+                .map(|a| a.level)
+        };
+        assert_eq!(
+            level("I'll land at EGKK"),
+            Some("advisory"),
+            "an announcement"
+        );
+        assert_eq!(level("Intercepting the final"), Some("advisory"));
+        assert_eq!(level("Sink rate!"), Some("warning"), "the monitor's hazard");
+        // And the page: the banner has the hazard only.
+        let f = crate::efb::state::Facts {
+            now_t: alerts.last().map(|a| a.t).unwrap_or(0.0),
+            alerts,
+            ..Default::default()
+        };
+        let s = crate::efb::state::build(&f);
+        assert!(s
+            .alerts
+            .warnings
+            .iter()
+            .any(|a| a.text.starts_with("Sink rate!")));
+        assert!(!s
+            .alerts
+            .warnings
+            .iter()
+            .any(|a| a.text.starts_with("I'll land")));
+        assert!(!s
+            .alerts
+            .cautions
+            .iter()
+            .any(|a| a.text.starts_with("Intercepting")));
+    }
+}

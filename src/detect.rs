@@ -670,7 +670,7 @@ pub(crate) fn spawn_aircraft_detector(
                                     let already_said = health::plugin_missing().is_some_and(|m| !m.is_empty());
                                     if let Some(line) = health::plugin_summary(&plugin_missing) {
                                         if !already_said {
-                                            det_voice.alert(voice::Priority::Caution, line);
+                                            det_voice.hazard(crate::monitor::Severity::Caution, line);
                                         }
                                     }
                                     // Fixed by a rebuild and reload: the

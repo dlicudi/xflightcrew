@@ -4639,14 +4639,20 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         ApproachPhase::Flare if cfg.flare_power.is_some() => "Over the threshold, flaring, easing the power back.",
                         ApproachPhase::Flare => "Over the threshold, flaring, power to idle.",
                     };
-                    // A go-around the stabilised gate ordered says why.
-                    let line = match runtime.stable_said.take() {
+                    // A go-around the stabilised gate ordered says why, and
+                    // is a hazard (the EFB's caution); the rest announce.
+                    let (line, unstable) = match runtime.stable_said.take() {
                         Some(why) if ga && line.starts_with("Going around") => {
-                            format!("Not stabilised, {why}. Going around.")
+                            (format!("Not stabilised, {why}. Going around."), true)
                         }
-                        _ => line.to_string(),
+                        _ => (line.to_string(), false),
                     };
-                    if !line.is_empty() {
+                    if unstable {
+                        tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
+                        if let Some(v) = &voice {
+                            v.hazard(crate::monitor::Severity::Caution, line);
+                        }
+                    } else if !line.is_empty() {
                         announce(line, Priority::Caution);
                     }
                 }

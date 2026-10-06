@@ -373,6 +373,10 @@ pub(crate) struct Facts {
     /// The one landing rule, the book figure (`aircraft::planned_landing_needed_ft`),
     /// metres; `None` when the profile recites none.
     pub(crate) landing_need_m: Option<f64>,
+    /// The plan's fields where the field directory puts them (or the plan's
+    /// own waypoint): ("origin" | "destination" | "alternate", ICAO, lat,
+    /// lon). The route map labels them always.
+    pub(crate) fields: Vec<(&'static str, String, f64, f64)>,
 }
 
 /// What a setting accepts, as the registry declares it (`settings::Kind`).
@@ -1804,6 +1808,11 @@ pub(crate) mod tests {
             lateral: None,
             takeoff_need_m: None,
             landing_need_m: None,
+            fields: vec![
+                ("origin", "LEMG".into(), 36.675, -4.499),
+                ("destination", "EGKK".into(), 51.148, -0.190),
+                ("alternate", "EGLL".into(), 51.471, -0.461),
+            ],
         }
     }
 
@@ -2081,15 +2090,42 @@ pub(crate) mod tests {
         f.tick.as_mut().unwrap().on_ground = true;
         f.takeoff_need_m = Some(1_421.0);
         write("parked", &f);
+        write("approach", &approach());
+        // The same approach with the Map tab's auto choice on the route (the
+        // basemap's terminal view): 12 nm out at 3,500 ft.
+        let mut f = approach();
+        let t = f.tick.as_mut().unwrap();
+        t.lon = -0.50;
+        t.alt_ft = 3_500.0;
+        t.agl_ft = 3_300.0;
+        write("approach_route", &f);
+    }
+
+    /// The pilot's screenshot, 2026-10-06: the 737 8 nm out of EGKK at
+    /// 2,040 ft, on the approach, only the destination left to fly.
+    pub(crate) fn approach() -> Facts {
         let mut f = cruise();
         f.flight.as_mut().unwrap().phase = Phase::Approach;
+        f.flight.as_mut().unwrap().alt_ft = 2_040.0;
         f.landing_need_m = Some(1_650.0);
         f.readback_owed = Some("Cleared ILS 26L".into());
+        f.active_fix = Some(("EGKK".into(), Some(8.0)));
+        f.tod = None;
+        let t = f.tick.as_mut().unwrap();
+        t.lat = 51.12;
+        t.lon = -0.40;
+        t.alt_ft = 2_040.0;
+        t.agl_ft = 1_840.0;
+        t.ias_kts = 160.0;
+        t.gs_kts = 150.0;
+        t.track_deg = Some(78.0);
+        t.heading_deg = 78.0;
+        f.com1_khz = Some(124_230);
         f.airport.diagram = Some(crate::efb::airport::DiagramRef {
             icao: "EGKK".into(),
             name: "Gatwick".into(),
             version: "v".into(),
-            lat0: 51.15,
+            lat0: 51.148,
             lon0: -0.19,
             runways: vec![crate::efb::airport::RunwayEnd {
                 ident: "26L".into(),
@@ -2097,7 +2133,7 @@ pub(crate) mod tests {
                 heading_true: 257.8,
             }],
         });
-        write("approach", &f);
+        f
     }
 
     #[test]

@@ -682,7 +682,15 @@
     if (!root || !W || !H || !root.offsetParent) return;
     var o = ownNow(t);
     var moving = o && o.moving;
-    if (follow && o) {
+    var fb = fieldBounds();
+    if (follow && o && st && st.own && !st.own.on_ground && fb) {
+      // Airborne on the approach: the field and the aircraft together,
+      // north up (following at taxi scale would leave the field off screen).
+      var x0 = Math.min(fb[0], o.x), x1 = Math.max(fb[2], o.x), y0 = Math.min(fb[1], o.y), y1 = Math.max(fb[3], o.y);
+      view.cx = (x0 + x1) / 2; view.cy = (y0 + y1) / 2;
+      view.s = Math.max(0.0005, Math.min(W * 0.85 / Math.max(1, x1 - x0), (H - 140) * 0.85 / Math.max(1, y1 - y0)));
+      view.rot = 0;
+    } else if (follow && o) {
       // Track up: the glided heading, which is the ground track once flying.
       view.cx = o.x; view.cy = o.y;
       view.rot = trackUp ? o.h * Math.PI / 180 : 0;

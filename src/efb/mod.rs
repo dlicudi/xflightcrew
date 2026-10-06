@@ -20,6 +20,7 @@
 //! anything run on its runtime, and nothing here holds a lock across an await.
 
 pub(crate) mod airport;
+pub(crate) mod basemap;
 pub(crate) mod feed;
 pub(crate) mod flight_tab;
 pub(crate) mod ptt;
@@ -415,7 +416,32 @@ fn gather(server: &Server) -> state::Facts {
         crate::aircraft::planned_landing_needed_ft(r.landing_distance_ft, r.takeoff_distance_ft)
             .map(|ft| ft * 0.3048)
     });
+    // The plan's fields where the directory puts them (an index the app
+    // already loaded from apt.dat), else the plan's own waypoint.
+    let fields = plan
+        .as_ref()
+        .map(|p| {
+            [
+                ("origin", &p.origin),
+                ("destination", &p.destination),
+                ("alternate", &p.alternate),
+            ]
+            .into_iter()
+            .filter(|(_, i)| !i.trim().is_empty())
+            .filter_map(|(role, icao)| {
+                let at = crate::station::field_position(icao).or_else(|| {
+                    p.waypoints
+                        .iter()
+                        .find(|w| w.0.eq_ignore_ascii_case(icao))
+                        .map(|w| (w.1, w.2))
+                })?;
+                Some((role, icao.trim().to_ascii_uppercase(), at.0, at.1))
+            })
+            .collect()
+        })
+        .unwrap_or_default();
     state::Facts {
+        fields,
         now_t: now_unix(),
         flight: crate::flight::published(),
         owner: crate::flight_state::crew_has_aircraft().map(|o| o.name()),
@@ -719,6 +745,69 @@ async fn airport_route(
     r
 }
 
+#[derive(serde::Deserialize, Default)]
+struct BasemapQuery {
+    t: Option<String>,
+    /// "lat0,lon0,lat1,lon1"
+    bbox: Option<String>,
+    /// The view's width in CSS pixels.
+    px: Option<f64>,
+}
+
+/// The route map's water and fields for a view (`basemap`): X-Plane's own
+/// installed map data, read off this thread. 404 when the data is not
+/// installed or the view is too wide: the page then draws the route alone.
+async fn basemap_route(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<BasemapQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorised(&live_token(), &headers, q.t.as_deref()) {
+        return refuse(peer, "/basemap");
+    }
+    let bbox: Vec<f64> = q
+        .bbox
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let Ok(bbox) = <[f64; 4]>::try_from(bbox) else {
+        return (StatusCode::BAD_REQUEST, "bbox=lat0,lon0,lat1,lon1").into_response();
+    };
+    let px = q.px.unwrap_or(1000.0);
+    let started = Instant::now();
+    let built =
+        tokio::task::spawn_blocking(move || basemap::answer(&basemap::water_dir(), bbox, px))
+            .await
+            .ok()
+            .flatten();
+    let Some(a) = built else {
+        return (StatusCode::NOT_FOUND, "no map data for that view").into_response();
+    };
+    tracing::debug!(
+        bytes = a.json.len(),
+        rings = a.rings,
+        ms = started.elapsed().as_millis() as u64,
+        "EFB basemap"
+    );
+    let etag = format!("\"{}\"", a.etag);
+    let fresh = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
+    let mut r = if fresh {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        ([(header::CONTENT_TYPE, "application/json")], a.json.clone()).into_response()
+    };
+    if let Ok(v) = HeaderValue::from_str(&etag) {
+        r.headers_mut().insert(header::ETAG, v);
+    }
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    r
+}
+
 /// The Airport page's script: code, no data, so like the icon it needs no
 /// token (a `<script src>` carries no header, and a home-screen app's first
 /// load must not depend on the cookie having landed).
@@ -961,6 +1050,7 @@ pub(crate) fn router(server: Arc<Server>) -> Router {
         .route("/setting", post(setting))
         .route("/ptt", post(ptt_route))
         .route("/airport", get(airport_route))
+        .route("/basemap", get(basemap_route))
         .route("/diagram.js", get(diagram_js))
         .route("/manifest.webmanifest", get(manifest_route))
         .route("/icon.svg", get(icon))

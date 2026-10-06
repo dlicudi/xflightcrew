@@ -379,6 +379,84 @@ pub(crate) fn active_tower_khz() -> Option<i64> {
 pub(super) type ActivePanel = (String, f64, Vec<(String, i64)>);
 pub(super) static ACTIVE_PANEL: Mutex<Option<ActivePanel>> = Mutex::new(None);
 
+/// A field's position by its code, from the field directory (any land
+/// field) or the region index: the crew's EFB map draws the plan's origin,
+/// destination and alternate by it. `None` until the index has loaded.
+pub fn field_position(icao: &str) -> Option<(f64, f64)> {
+    let code = icao.trim();
+    if code.is_empty() {
+        return None;
+    }
+    if let Some(p) = FIELD_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(i, _, _)| i.eq_ignore_ascii_case(code))
+        .map(|(_, _, p)| *p)
+    {
+        return Some(p);
+    }
+    REGION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|a| a.icao.eq_ignore_ascii_case(code))
+        .map(|a| (a.lat, a.lon))
+}
+
+/// A field on a map: code, position, staffed tower.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldDot {
+    pub icao: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub towered: bool,
+}
+
+/// The fields inside a lat/lon box, for the crew's EFB map: the towered
+/// ones (the region index) and, with `all`, every land field in the
+/// directory, at most `limit`, towered first. Empty until the index loads.
+pub fn fields_in_box(
+    lat0: f64,
+    lon0: f64,
+    lat1: f64,
+    lon1: f64,
+    all: bool,
+    limit: usize,
+) -> Vec<FieldDot> {
+    let inside = |la: f64, lo: f64| la >= lat0 && la <= lat1 && lo >= lon0 && lo <= lon1;
+    let mut out: Vec<FieldDot> = REGION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|a| inside(a.lat, a.lon))
+        .take(limit)
+        .map(|a| FieldDot {
+            icao: a.icao.clone(),
+            lat: a.lat,
+            lon: a.lon,
+            towered: true,
+        })
+        .collect();
+    if all && out.len() < limit {
+        let dir = FIELD_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        for (icao, _, (la, lo)) in dir.iter() {
+            if out.len() >= limit {
+                break;
+            }
+            if inside(*la, *lo) && !out.iter().any(|f| f.icao == *icao) {
+                out.push(FieldDot {
+                    icao: icao.clone(),
+                    lat: *la,
+                    lon: *lo,
+                    towered: false,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// A ground station's nominal antenna height. VHF range is line of sight, so
 /// even on the ramp the mast buys a few miles.
 pub(super) const ANTENNA_FT: f64 = 50.0;
