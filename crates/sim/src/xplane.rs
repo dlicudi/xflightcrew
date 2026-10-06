@@ -512,6 +512,12 @@ pub trait XPlane: Send + Sync {
     async fn get_bytes(&self, name: &str) -> Result<Vec<u8>> {
         Err(anyhow!("no byte read for {name}"))
     }
+    /// Write a `data`-typed dataref's raw bytes (the Web API takes them
+    /// base64). Defaulted like [`XPlane::get_bytes`].
+    async fn set_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let _ = bytes;
+        Err(anyhow!("no byte write for {name}"))
+    }
 }
 
 /// True when what the sim shows is not the aircraft flying NOW: paused, or
@@ -1335,6 +1341,9 @@ impl XPlane for XPlaneClient {
     async fn get_bytes(&self, name: &str) -> Result<Vec<u8>> {
         XPlaneClient::get_bytes(self, name).await
     }
+    async fn set_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        XPlaneClient::set_data(self, name, bytes).await
+    }
 }
 
 /// Recording fake for tests: reads come from a preset table, writes and commands
@@ -1531,6 +1540,11 @@ impl FakeXPlane {
         self.writes.lock().unwrap().iter().any(|(n, _)| n == name)
     }
 
+    /// Every command run, in order.
+    pub fn commands(&self) -> Vec<String> {
+        self.commands.lock().unwrap().clone()
+    }
+
     /// Whether `command` was ever run.
     pub fn ran(&self, command: &str) -> bool {
         self.commands.lock().unwrap().iter().any(|c| c == command)
@@ -1667,6 +1681,14 @@ impl XPlane for FakeXPlane {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow!("FakeXPlane: no byte read preset for {name}"))
+    }
+    /// A byte write lands in the byte reads, so a readback sees it.
+    async fn set_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.byte_reads
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), bytes.to_vec());
+        Ok(())
     }
 }
 

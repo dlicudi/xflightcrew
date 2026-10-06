@@ -849,6 +849,50 @@ pub(crate) async fn run_steps(
     let mut not_taken = Vec::new();
     for step in steps {
         let short = step_short_name(step);
+        // A step that applies only above a reading: below it, or unread,
+        // the switch is left where it is.
+        if let Some(cond) = &step.when_above {
+            let v = read_position(xp, &cond.dataref).await;
+            if !v.is_some_and(|v| v > cond.value) {
+                crate::blackbox::record(
+                    "airliner_start",
+                    serde_json::json!({"event": "step", "command": step.command, "position": step.position,
+                                       "skipped": {"dataref": cond.dataref, "read": v, "above": cond.value}}),
+                );
+                continue;
+            }
+        }
+        // A knob more than one detent away: stepped and read back press by
+        // press ([`step_knob`]).
+        if let (Some(max), Some(pos)) = (step.max_presses, step.position.as_deref()) {
+            let (outcome, before, after) = step_knob(xp, step, pos, max).await;
+            crate::blackbox::record(
+                "airliner_start",
+                serde_json::json!({"event": "step", "command": step.command, "position": step.position,
+                                   "before": before, "after": after, "outcome": format!("{outcome:?}")}),
+            );
+            match outcome {
+                StepOutcome::NotTaken => {
+                    panel(&format!("{short}: did not take"));
+                    not_taken.push(short);
+                }
+                StepOutcome::AlreadySet => {
+                    panel(&format!("{short}: already set"));
+                    if let Some(line) = &step.say {
+                        say(line);
+                    }
+                    continue;
+                }
+                _ => {
+                    panel(&short);
+                    if let Some(line) = &step.say {
+                        say(line);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(FLOW_STEP_MS)).await;
+            continue;
+        }
         // Read before fire. These are toggles, and a toggle fired at a
         // switch already on turns it OFF, which on the APU battery is a
         // start that never begins, with no error anywhere.
@@ -923,6 +967,60 @@ pub(crate) async fn run_steps(
         tokio::time::sleep(Duration::from_millis(FLOW_STEP_MS)).await;
     }
     not_taken
+}
+
+/// Step a knob to `step.want` one detent at a time: read, press toward the
+/// wanted position (`command` from below, `down_command` from above), wait
+/// for the reading to MOVE, again, up to `max` presses. A press that moves
+/// nothing ends it as not taken: a knob at its stop, or a command that is
+/// not this knob's, never presses on blindly. Returns the outcome and the
+/// first and last readings.
+async fn step_knob(
+    xp: &dyn crate::xplane::XPlane,
+    step: &crate::aircraft::StartStep,
+    pos: &str,
+    max: u32,
+) -> (StepOutcome, Option<f64>, Option<f64>) {
+    let at = |v: Option<f64>| v.is_some_and(|v| (v - step.want).abs() < 0.5);
+    let before = read_position(xp, pos).await;
+    if at(before) {
+        return (StepOutcome::AlreadySet, before, before);
+    }
+    let mut now = before;
+    for _ in 0..max {
+        let cmd = match (now, step.down_command.as_deref()) {
+            (Some(v), Some(down)) if v > step.want => down,
+            _ => step.command.as_str(),
+        };
+        match step.held_secs {
+            Some(secs) => {
+                let _ = xp.run_command_for(cmd, secs).await;
+            }
+            None => {
+                let _ = xp.run_command(cmd).await;
+            }
+        }
+        let was = now;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(CONFIRM_SECS);
+        loop {
+            tokio::time::sleep(Duration::from_millis(CONFIRM_POLL_MS)).await;
+            now = read_position(xp, pos).await;
+            if at(now) {
+                return (StepOutcome::Confirmed, before, now);
+            }
+            let moved = match (was, now) {
+                (Some(a), Some(b)) => (a - b).abs() >= 0.5,
+                _ => false,
+            };
+            if moved {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return (StepOutcome::NotTaken, before, now);
+            }
+        }
+    }
+    (StepOutcome::NotTaken, before, now)
 }
 
 fn spoken_engine(idx: usize) -> &'static str {
@@ -1288,7 +1386,7 @@ impl BoeingStart {
     /// wait for the ducts. A failed N1 read is no measurement: the cold
     /// steps are skipped and the duct check that follows judges the air.
     /// `Err` is the line to hand back with.
-    async fn apu_up(
+    pub(crate) async fn apu_up(
         &self,
         xp: &dyn crate::xplane::XPlane,
         say: &mut (dyn FnMut(&str) + Send),
@@ -1569,6 +1667,8 @@ mod boeing_start_tests {
             held_secs: None,
             down_command: None,
             say: None,
+            max_presses: None,
+            when_above: None,
         }];
         p.apu_power_steps = vec![crate::aircraft::StartStep {
             command: "apu_bleed".into(),
@@ -1577,6 +1677,8 @@ mod boeing_start_tests {
             held_secs: None,
             down_command: None,
             say: None,
+            max_presses: None,
+            when_above: None,
         }];
         for (n1, started) in [(0.0, true), (100.0, false)] {
             let xp = cockpit();
@@ -1789,6 +1891,8 @@ mod airliner_start_tests {
             held_secs: None,
             down_command: None,
             say: say.map(str::to_string),
+            max_presses: None,
+            when_above: None,
         }
     }
 
@@ -2012,6 +2116,8 @@ mod airliner_start_tests {
             held_secs: Some(1.0),
             down_command: None,
             say: None,
+            max_presses: None,
+            when_above: None,
         };
         assert_eq!(step_short_name(&k), "APU start");
         assert_eq!(

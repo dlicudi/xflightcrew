@@ -363,6 +363,10 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
 - LXGB's authored route joins at the nearest leg (`join_waypoint`) and is terrain-probed on its legs.
 - Full auto: engine start per class (`StartKind`); power-up INLINE (racing bring-ups shut a
   cross-tie); waits on `driving()`, not `ACTIVE`; ends with `taxi_in_after_landing`.
+  **A declared preflight runs between the battery and the ramp** (`src/preflight.rs`,
+  `preflight:`; the Zibo's clist order, APU first so AC lamps read back), its IRS alignment
+  waited on before the taxi; **an inline start's reply is its verdict** (`inline_start_hand_back`):
+  engines not running once it answers ends the mission.
 - **Airborne, "fly the flight plan" and "land the aircraft" are ONE planner, from ANY state**
   (`src/recovery_plan.rs`, `choose_join`): refused only for the physically impossible, with the
   number (`impossible`); the nearest runway only when asked, an engine out, or no plan.

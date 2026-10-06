@@ -82,6 +82,15 @@ pub fn start_kind(
 }
 
 impl StartKind {
+    /// Whether the start tool runs the WHOLE start before it answers (the
+    /// airliner and Boeing starts), so its reply is the verdict: engines
+    /// not running once it has answered is a start that stopped, and its
+    /// reply already says why. Every other start fires and returns, and is
+    /// judged on the engine against the class deadline.
+    pub fn start_is_inline(self) -> bool {
+        self == StartKind::Airliner
+    }
+
     /// How long full auto waits for the engine to be RUNNING after it fires the
     /// start — a per-class figure, because the three starts are not the same
     /// order of duration. A piston catches in seconds. The jet sequence is a
@@ -407,6 +416,11 @@ pub struct FullAuto {
     /// flood tool: an override wired here and not there is a tool that behaves
     /// one way for the pilot and another for the automation.
     pub flood_toggle: Option<crate::aircraft::ToggleSwitch>,
+    /// The profile's `ramp_panel_lights`: false leaves the panel lighting
+    /// out of the ramp items on an airframe with no declared path to it.
+    pub ramp_panel_lights: bool,
+    /// The crew's preflight on the airframe's own switches (`preflight:`).
+    pub preflight: Option<crate::aircraft::PreflightProfile>,
     // circuit / climb-out
     pub cfg: ApConfig,
     pub vr_kts: f64,
@@ -615,8 +629,14 @@ impl FullAuto {
                 self.flood_dataref.clone(),
                 self.flood_toggle.clone(),
             ),
+            panel_lights: self.ramp_panel_lights,
+            preflight: self.preflight.clone(),
+            // The preflight's APU comes up through the Boeing start's own
+            // APU steps: one sequence for the APU, wherever it is asked for.
+            preflight_apu: self.boeing_start.clone(),
             no_start_sequence: kind == StartKind::None,
             start_scripted: kind == StartKind::Scripted,
+            start_inline: kind.start_is_inline(),
             // One start per airframe CLASS: a turboprop cranks with the PT6
             // sequence, a jet with the APU/bleed-air sequence, a piston with
             // the one-shot start. All run behind full auto's own bus-power

@@ -252,14 +252,24 @@ boeing_start:
     - { command: sim/lights/beacon_lights_on, position: sim/cockpit2/switches/beacon_on, want: 1 }
     - { command: laminar/B738/toggle_switch/l_pack_dn, down_command: laminar/B738/toggle_switch/l_pack_up, position: laminar/B738/air/l_pack_pos, want: 0 }
     - { command: laminar/B738/toggle_switch/r_pack_dn, down_command: laminar/B738/toggle_switch/r_pack_up, position: laminar/B738/air/r_pack_pos, want: 0, say: "Packs off." }
-  # After both are stable (BEFORE TAXI): generators on, packs AUTO, APU
-  # bleed off. The APU itself is left running for the pilot.
+  # After both are stable (BEFORE TAXI): generators on, packs AUTO (right,
+  # then left), the isolation valve back to AUTO from the preflight's OPEN,
+  # APU bleed off, probe heat on (the Skymatix Zibomod checklist C-0030's
+  # after-start order; its isolation CLOSE between the two engines is not
+  # flown, this start has no step between engines). The APU itself is left
+  # running for the pilot. Isolation valve probed 2026-10-07: 0 CLOSE,
+  # 1 AUTO, 2 OPEN; `iso_valve_dn` steps UP (at 2 it does nothing),
+  # `iso_valve_up` steps down. Probe heat `capt_probes_pos` / `fo_probes_pos`
+  # are toggles under the same name as their position (0 to 1 probed).
   post_start_steps:
     - { command: laminar/B738/toggle_switch/gen1_dn, held_secs: 1.0, position: "sim/cockpit/electrical/generator_on[0]", want: 1 }
     - { command: laminar/B738/toggle_switch/gen2_dn, held_secs: 1.0, position: "sim/cockpit/electrical/generator_on[1]", want: 1, say: "Generators on." }
-    - { command: laminar/B738/toggle_switch/l_pack_dn, down_command: laminar/B738/toggle_switch/l_pack_up, position: laminar/B738/air/l_pack_pos, want: 1 }
-    - { command: laminar/B738/toggle_switch/r_pack_dn, down_command: laminar/B738/toggle_switch/r_pack_up, position: laminar/B738/air/r_pack_pos, want: 1, say: "Packs auto." }
+    - { command: laminar/B738/toggle_switch/r_pack_dn, down_command: laminar/B738/toggle_switch/r_pack_up, position: laminar/B738/air/r_pack_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/l_pack_dn, down_command: laminar/B738/toggle_switch/l_pack_up, position: laminar/B738/air/l_pack_pos, want: 1, say: "Packs auto." }
+    - { command: laminar/B738/toggle_switch/iso_valve_dn, down_command: laminar/B738/toggle_switch/iso_valve_up, position: laminar/B738/air/isolation_valve_pos, want: 1, max_presses: 2 }
     - { command: laminar/B738/toggle_switch/bleed_air_apu, position: laminar/B738/toggle_switch/bleed_air_apu_pos, want: 0, say: "A.P.U. bleed off." }
+    - { command: laminar/B738/toggle_switch/capt_probes_pos, position: laminar/B738/toggle_switch/capt_probes_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/fo_probes_pos, position: laminar/B738/toggle_switch/fo_probes_pos, want: 1, say: "Probe heat on." }
 
 # Cutoff: the start levers, moved by their OWN commands (`mixture1_cutoff`,
 # `mixture2_cutoff`, B738_Commands.txt calc.lua block), the same ones the
@@ -340,6 +350,88 @@ electrical:
     off_commands: [laminar/B738/toggle_switch/gen1_up, laminar/B738/toggle_switch/gen2_up]
     readback:     ["sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]"]
 
+# ---- PREFLIGHT (full auto, 2026-10-07) -------------------------------------
+# The crew's preflight from a live battery to ready for the start
+# (`preflight:`, `src/preflight.rs`), run by full auto between "Battery's on"
+# and the ramp items. The order is the aircraft's own checklist's (clist.txt
+# v9.0 PRELIMINARY FLIGHTDECK (1/3) to (3/3), PREFLIGHT PREPARATION (1/7) to
+# (7/7)), cross-checked against the Skymatix Zibomod checklist C-0030. Every
+# step is read before it is fired and read back; a switch already set is
+# passed over. Directions probed by hand 2026-10-07 at EGHL, parked, brake
+# set, battery only, each switch restored:
+#   - IRS L `irs_L_right` steps `toggle_switch/irs_left` UP (0 OFF, 1 ALIGN,
+#     2 NAV, 3 ATT), `irs_L_left` down; the alignment's truth is
+#     `irs/irs_mode` (2 = NAV, B738.LATLON.lua). The R knob's commands are
+#     taken to mirror the L's (not pressed: the sim closed mid-probe).
+#   - A first alignment ends flashing ALIGN until a present position is
+#     entered (B738.LATLON.lua): written to `FMS/irs_pos_fmc_set` as
+#     `N5111.1W00102.5` and handed over by `push_button/fmc_to_irs_pos`
+#     (probed: `irs/irs_pos_set` took it, mode stayed 1 aligning, 473 s left
+#     at real alignment time).
+#   - Electric hydraulic pumps, fuel pumps, window heats, trim air, the FD
+#     switches: toggles, 0 to 1 probed. Engine hydraulic pumps read 1 cold.
+#   - AC meter knob `ac_power_up` steps up (0 to 1), `_dn` down; 3 is APU GEN.
+#   - Autobrake `autobrake_dn` steps DOWN (1 OFF to 0 RTO), `_up` up.
+#   - Yaw damper `yaw_dumper` did NOT hold on the battery alone (it needs
+#     hydraulic B and AC): it comes after the pumps here, named if it fails.
+#   - Every exterior LAMP dataref (nav, logo, landing, taxi) reads 0 on the
+#     battery whatever its switch: the lamps are AC. Hence the APU first.
+# Already right cold and so read and passed over: isolation valve OPEN (2),
+# recirc fans AUTO, CAB/UTIL and IFE on, engine bleeds on, start switches
+# AUTO, crossfeed closed. Left out (owed): pressurisation mode (AUTO cold,
+# direction unprobed), emergency exit lights (under a guard), transponder
+# STBY and bank angle (already set cold), the MCP (the autoflight block's).
+preflight:
+  apu_first: true
+  steps:
+    # IRS to NAV first: the alignment takes minutes (433 to 473 s at EGHL).
+    - { command: laminar/B738/toggle_switch/irs_L_right, down_command: laminar/B738/toggle_switch/irs_L_left, position: laminar/B738/toggle_switch/irs_left, want: 2, max_presses: 3 }
+    - { command: laminar/B738/toggle_switch/irs_R_right, down_command: laminar/B738/toggle_switch/irs_R_left, position: laminar/B738/toggle_switch/irs_right, want: 2, max_presses: 3, say: "I.R.S. aligning." }
+    - { command: laminar/B738/knob/ac_power_up, down_command: laminar/B738/knob/ac_power_dn, position: laminar/B738/knob/ac_power, want: 3, max_presses: 6 }
+    - { command: laminar/B738/toggle_switch/hydro_pumps1, position: laminar/B738/toggle_switch/hydro_pumps1_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/hydro_pumps2, position: laminar/B738/toggle_switch/hydro_pumps2_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/electric_hydro_pumps1, position: laminar/B738/toggle_switch/electric_hydro_pumps1_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/electric_hydro_pumps2, position: laminar/B738/toggle_switch/electric_hydro_pumps2_pos, want: 1, say: "Hydraulics on." }
+    - { command: laminar/B738/autopilot/cab_util_toggle, position: laminar/B738/toggle_switch/cab_util_pos, want: 1 }
+    - { command: laminar/B738/autopilot/ife_pass_seat_toggle, position: laminar/B738/toggle_switch/ife_pass_seat_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/yaw_dumper, position: laminar/B738/toggle_switch/yaw_dumper_pos, want: 1, say: "Yaw damper on." }
+    - { command: laminar/B738/toggle_switch/fuel_pump_lft1, position: laminar/B738/fuel/fuel_tank_pos_lft1, want: 1 }
+    - { command: laminar/B738/toggle_switch/fuel_pump_lft2, position: laminar/B738/fuel/fuel_tank_pos_lft2, want: 1 }
+    - { command: laminar/B738/toggle_switch/fuel_pump_rgt1, position: laminar/B738/fuel/fuel_tank_pos_rgt1, want: 1 }
+    - { command: laminar/B738/toggle_switch/fuel_pump_rgt2, position: laminar/B738/fuel/fuel_tank_pos_rgt2, want: 1, say: "Fuel pumps on." }
+    # Centre pumps only above 453 kg in the centre tank (`m_fuel[1]`, read
+    # 0 with both wings at 3,698 kg).
+    - { command: laminar/B738/toggle_switch/fuel_pump_ctr1, position: laminar/B738/fuel/fuel_tank_pos_ctr1, want: 1, when_above: { dataref: "sim/flightmodel/weight/m_fuel[1]", value: 453 } }
+    - { command: laminar/B738/toggle_switch/fuel_pump_ctr2, position: laminar/B738/fuel/fuel_tank_pos_ctr2, want: 1, when_above: { dataref: "sim/flightmodel/weight/m_fuel[1]", value: 453 }, say: "Centre pumps on." }
+    - { command: laminar/B738/toggle_switch/window_heat_l_side, position: laminar/B738/ice/window_heat_l_side_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/window_heat_l_fwd, position: laminar/B738/ice/window_heat_l_fwd_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/window_heat_r_fwd, position: laminar/B738/ice/window_heat_r_fwd_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/window_heat_r_side, position: laminar/B738/ice/window_heat_r_side_pos, want: 1, say: "Window heat on." }
+    - { command: laminar/B738/toggle_switch/trim_air, position: laminar/B738/air/trim_air_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/l_recirc_fan, position: laminar/B738/air/l_recirc_fan_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/r_recirc_fan, position: laminar/B738/air/r_recirc_fan_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/iso_valve_dn, down_command: laminar/B738/toggle_switch/iso_valve_up, position: laminar/B738/air/isolation_valve_pos, want: 2, max_presses: 2 }
+    - { command: laminar/B738/toggle_switch/bleed_air_1, position: laminar/B738/toggle_switch/bleed_air_1_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/bleed_air_2, position: laminar/B738/toggle_switch/bleed_air_2_pos, want: 1 }
+    - { command: laminar/B738/autopilot/flight_director_toggle, position: laminar/B738/autopilot/flight_director_pos, want: 1 }
+    - { command: laminar/B738/autopilot/flight_director_fo_toggle, position: laminar/B738/autopilot/flight_director_fo_pos, want: 1, say: "Flight directors on." }
+    - { command: laminar/B738/knob/autobrake_up, down_command: laminar/B738/knob/autobrake_dn, position: laminar/B738/autobrake/autobrake_pos, want: 0, max_presses: 6, say: "Autobrake R.T.O." }
+  align:
+    modes: [laminar/B738/irs/irs_mode, laminar/B738/irs/irs2_mode]
+    want: 2
+    remaining: laminar/B738/irs/alignment_left_remain
+    # Real alignment time is 5 to 17 minutes by latitude (B738_irs_time);
+    # begun at the preflight it has the whole start behind it.
+    timeout_secs: 900
+    position_entry:
+      dataref: laminar/B738/FMS/irs_pos_fmc_set
+      command: laminar/B738/push_button/fmc_to_irs_pos
+# The panel's rheostats are the Zibo's own: the stock flood write
+# (`panel_brightness_ratio`) did not stand (probed 2026-10-07) and there is
+# no command for them, so full auto's ramp leaves the panel lighting out.
+ramp_panel_lights: false
+# ---- end PREFLIGHT ----------------------------------------------------------
+
 # Exterior lights on the Zibo's own commands where it has them, read back on
 # the stock switch datarefs it drives (the pilot's cockpitdecks pages read
 # the same stock names as the lamps' truth).
@@ -351,13 +443,24 @@ electrical:
 # - beacon: the stock commands (not named in zibomod; the pilot's deck
 #   fires the stock toggle).
 # - taxi: the Zibo's taxi switch (`taxi_light_brightness_on/off`).
-# VERIFY each readback follows its switch.
+# Probed 2026-10-07 on the battery alone: every LAMP dataref (nav, landing,
+# taxi, generic_lights_switch) reads 0 whatever the switch, the lamps being
+# AC. So landing, taxi, logo and wing read back on their SWITCH positions
+# (landing_lights_on set `land_lights_left_pos` and `_right_pos` 0 to 1;
+# taxi_light_brightness_on 0 to 2; logo and wing `toggle_switch/logo_light`,
+# `wing_light` 0 to 1, each off command back to 0). Nav and strobe share
+# one three-position switch (`position_light_pos` 1 STROBE & STEADY,
+# 0 OFF, -1 STEADY), which no on/off reading can tell apart, so they stay
+# on their lamps: full auto reaches them only after the preflight's APU
+# power (`preflight:` above).
 lights:
   - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: laminar/B738/toggle_switch/position_light_steady, command_off: laminar/B738/toggle_switch/position_light_off }
   - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
   - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: laminar/B738/toggle_switch/position_light_strobe, command_off: laminar/B738/toggle_switch/position_light_steady }
-  - { key: landing, spoken: landing lights,    dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
-  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: laminar/B738/toggle_switch/taxi_light_brightness_on, command_off: laminar/B738/toggle_switch/taxi_light_brightness_off }
+  - { key: landing, spoken: landing lights,    dataref: laminar/B738/switch/land_lights_left_pos,   command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: taxi light,        dataref: laminar/B738/toggle_switch/taxi_light_brightness_pos, command_on: laminar/B738/toggle_switch/taxi_light_brightness_on, command_off: laminar/B738/toggle_switch/taxi_light_brightness_off }
+  - { key: logo,    spoken: logo light,        dataref: laminar/B738/toggle_switch/logo_light,      command_on: laminar/B738/switch/logo_light_on, command_off: laminar/B738/switch/logo_light_off }
+  - { key: wing,    spoken: wing lights,       dataref: laminar/B738/toggle_switch/wing_light,      command_on: laminar/B738/switch/wing_light_on, command_off: laminar/B738/switch/wing_light_off }
 
 # The seat belt switch is the Zibo's: a read-only position stepped by its
 # up/down commands (zibomod: "Seat Belt Switch Up" / "Down"). 0 OFF parked.
