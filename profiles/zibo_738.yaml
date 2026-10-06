@@ -201,7 +201,9 @@ boeing_start:
   # bleed are the pilot's (or the preflight flow's): this start refuses,
   # with the number, rather than turn a starter with no air.
   duct_pressure: [laminar/B738/indicators/duct_press_L, laminar/B738/indicators/duct_press_R]
-  min_duct_psi: 25.0
+  # The Zibo's APU bleed settles at 21 psi (39 only as it opens, probed
+  # 2026-10-06); its clist asks only for pressure above 0.
+  min_duct_psi: 15.0
   starter_grd: 0.0
   starter_released: 1.0
   lever_idle: 1.0
@@ -328,14 +330,14 @@ lights:
 
 # The seat belt switch is the Zibo's: a read-only position stepped by its
 # up/down commands (zibomod: "Seat Belt Switch Up" / "Down"). 0 OFF parked.
-# VERIFY: which way `up` steps, and that 2 is ON (the stock encoding is 0
-# off, 1 auto, 2 on; the stock switch reads 0 with this one).
+# Probed 2026-10-06: `seatbelt_sign_dn` steps the position UP (0 to 1), so
+# it is our up_command; 2 is ON (the clist's FASTEN BELTS item).
 seat_belt_signs:
   position: laminar/B738/toggle_switch/seatbelt_sign_pos
   on: 2
   off: 0
-  up_command: laminar/B738/toggle_switch/seatbelt_sign_up
-  down_command: laminar/B738/toggle_switch/seatbelt_sign_dn
+  up_command: laminar/B738/toggle_switch/seatbelt_sign_dn
+  down_command: laminar/B738/toggle_switch/seatbelt_sign_up
 
 # The transponder mode knob is the Zibo's: `laminar/B738/knob/transponder_pos`
 # is read-only (probed), so it is STEPPED by `transponder_mode_up/dn`. Parked
