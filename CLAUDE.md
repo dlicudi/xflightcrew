@@ -366,6 +366,8 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
 - **Cruise is a SPEED** (`procedure::scheduled_cruise_kts`); **a planned step is flown at its fix**
   (`apply_step_climbs`). **The next fix is `procedure::active_leg()` first**: the GPS sits on the
   plan's first entry. **The arrival is briefed at the arm** (`full_auto::brief_arrival`).
+  **A route-only arrival crosses its gateway on the field's 3 degree path**
+  (`procedure::arrival_gateway_alt_ft`): never the last fix's cruise-side altitude.
 - **Full auto flies the checklist items it owns; lists only cross-check** (mixture:
   `engine::arm_mixture_manager`, `mixture_rich_for_landing`).
 - **Exterior lights follow the practice** (`src/tools/lights.rs` `Exterior`): taxi light to taxi,
@@ -385,7 +387,8 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   `IFR_FLIGHT`); airborne it goes to a radar position (`radar_position`).
 - **The inbound call** goes to the destination's OWN tower (`inbound_due`) or on its challenge;
   `call_inbound` tunes COM1 and arms that station (`station::arm_station_for_freq`). A crossing
-  field's challenge is `zone_challenge`, never "inbound".
+  field's challenge is `zone_challenge`, never "inbound". **"Final" is reported ESTABLISHED on it**
+  (`autoland::final_report_due`, `established_on_final`), never as autoland takes the arrival.
 - **Top of descent**: only `procedure::planned_tod` is announced; **while a follower flies, the
   plan's ring is silence** (`Snapshot::follower_flying`); only in cruise (`monitor::tod_in_cruise`).
   **A level the plan handed down is not argued with** (`STEP_CLIMB_MIN_CRUISE_MIN`).
@@ -444,7 +447,11 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
 - **A reposition is a PATTERN, never a point** (`src/reversal.rs`), only when a re-intercept is not
   flyable (`straight_in_losable`); **the stabilised gate is about TIME** (`unstabilised_at_gate`);
   **its side and platform are the circuit's rule over its corridor** (`reversal::plan`); a refusal
-  climbs and hands over level (`TerrainHold`).
+  climbs and hands over level (`TerrainHold`). **No-go airspace is the circuit's rule too**
+  (`side_airspace`; a side no pattern keeps clear of is flown for the ground and SAID,
+  `reversal_airspace`), and **the downwind is never EXTENDED into it**: the height is lost in a
+  hold short of it (`AirspaceLimit`, `limit_step`, `reversal_hold`), else it turns in high
+  (`extension_capped`).
 - **An approach never takes away the flap the wing flies on** (`flap_kept_flying`); flaps never
   cycle on a placard; **a climb is flown on thrust** (`climb_power_floor`); a give-up hands the
   SPEED to the governor (`hand_back_speed_kts`).

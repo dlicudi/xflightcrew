@@ -2735,17 +2735,52 @@ pub fn enroute_legs(
 /// route that already reaches the arrival area is left byte-for-byte alone.
 pub const ARRIVAL_GATEWAY_NM: f64 = 12.0;
 
-pub fn extend_to_arrival_gateway(
-    legs: &mut Vec<ProcLeg>,
-    destination: &crate::simbrief::Waypoint,
-) -> bool {
+/// Whether [`extend_to_arrival_gateway`] would add a gateway: the route's
+/// last fix lies beyond the arrival area. A caller that must read the
+/// field's elevation for the gateway asks this first (the apt.dat scan
+/// takes a moment). Pure.
+pub fn needs_arrival_gateway(legs: &[ProcLeg], destination: &crate::simbrief::Waypoint) -> bool {
     let Some(last) = legs.last().and_then(|l| l.fix.as_ref()) else {
         return false;
     };
     let dist_nm = crate::nav::haversine_nm(last.lat, last.lon, destination.lat, destination.lon);
-    if !dist_nm.is_finite() || dist_nm <= ARRIVAL_GATEWAY_NM + 3.0 {
+    dist_nm.is_finite() && dist_nm > ARRIVAL_GATEWAY_NM + 3.0
+}
+
+/// The altitude the arrival gateway is crossed at, ft: the route's last
+/// altitude, never above the 3 degree path from the field at the gateway's
+/// distance. A route that ends remote from its field has no STAR reaching
+/// the arrival area, so autoland takes it from the gateway on a straight-in
+/// or a reposition pattern, and both want the aircraft near the field at
+/// about the pattern's height: on the path is the most a straight-in can
+/// use, and a pattern's downwind loses the rest at its own descent.
+/// LEGR-LXGB, 2026-10-06 (sortie 1791275171-full_auto, 737): the gateway
+/// copied the plan's 12,700 ft, autoland took the arrival 12 nm east of
+/// the field at 13,300 ft, and the reposition began 10,100 ft above its
+/// platform and extended its downwind over Spain to lose it. `None` for the
+/// field's elevation keeps the route's altitude. Pure.
+pub fn arrival_gateway_alt_ft(last_alt_ft: Option<f64>, field_elev_ft: Option<f64>) -> Option<f64> {
+    let on_path = field_elev_ft
+        .filter(|e| e.is_finite())
+        .map(|e| e + ARRIVAL_GATEWAY_NM * crate::autoland::GLIDEPATH_FT_PER_NM);
+    match (last_alt_ft, on_path) {
+        (Some(a), Some(p)) => Some(a.min((p / 100.0).round() * 100.0)),
+        (a, None) => a,
+        (None, p) => p.map(|p| (p / 100.0).round() * 100.0),
+    }
+}
+
+pub fn extend_to_arrival_gateway(
+    legs: &mut Vec<ProcLeg>,
+    destination: &crate::simbrief::Waypoint,
+    field_elev_ft: Option<f64>,
+) -> bool {
+    if !needs_arrival_gateway(legs, destination) {
         return false;
     }
+    let Some(last) = legs.last().and_then(|l| l.fix.as_ref()) else {
+        return false;
+    };
     let bearing = crate::nav::bearing_deg(destination.lat, destination.lon, last.lat, last.lon);
     let (lat, lon) = crate::nav::project_latlon(
         destination.lat,
@@ -2753,7 +2788,7 @@ pub fn extend_to_arrival_gateway(
         bearing,
         ARRIVAL_GATEWAY_NM,
     );
-    let alt = legs.last().and_then(|l| l.alt1_ft);
+    let alt = arrival_gateway_alt_ft(legs.last().and_then(|l| l.alt1_ft), field_elev_ft);
     legs.push(ProcLeg {
         seq: legs.len() as u32,
         transition: String::new(),

@@ -3875,6 +3875,26 @@ async fn fly_route(
         if let Some(khz) = inbound_owed.take() {
             call_inbound(xp, ctx, voice, callsign, khz, false, built.rwy_id.as_deref()).await;
         }
+        // "Final" is reported established on it, never when autoland takes
+        // the arrival: a reposition round the field is not a final, and the
+        // tower clears what it is told (`autoland::final_report_due`).
+        let waited = Instant::now();
+        while !ABORT.load(SeqCst)
+            && crate::autoland::ACTIVE.load(Relaxed)
+            && !crate::autoland::established_on_final()
+        {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let waited_s = waited.elapsed().as_secs_f64();
+        if waited_s >= 1.0 {
+            event(
+                "final_call_waited",
+                json!({ "waited_s": waited_s.round(),
+                        "established": crate::autoland::established_on_final() }),
+            );
+        }
+    }
+    if crate::autoland::established_on_final() && !ABORT.load(SeqCst) {
         let call = match &landing_rwy {
             Some(rwy) => format!("final runway {}", crate::circuit::spell_runway(&rwy.id)),
             None => "final".to_string(),

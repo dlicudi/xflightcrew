@@ -952,7 +952,23 @@ impl FullAuto {
         );
         let dest_wp = rp::destination_of(&fp.waypoints, &fp.destination).cloned();
         if let Some(dest) = dest_wp.as_ref() {
-            crate::procedure::extend_to_arrival_gateway(&mut legs, dest);
+            // The gateway is crossed on the field's 3 degree path, so its
+            // elevation is read, only when there is a gateway to add.
+            let elev = if crate::procedure::needs_arrival_gateway(&legs, dest) {
+                let (apt, icao) = (ctx.config.apt_data_path.clone(), fp.destination.clone());
+                tokio::task::spawn_blocking(move || {
+                    crate::nav::find_airport(&apt, &icao)
+                        .ok()
+                        .flatten()
+                        .map(|a| a.elev_ft)
+                })
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            crate::procedure::extend_to_arrival_gateway(&mut legs, dest, elev);
         }
         // The OFP's planned steps, flown where it planned them (#101).
         record_step_climbs(&mut legs, &fp.schedule);
@@ -1568,7 +1584,11 @@ impl FullAuto {
                 .last()
                 .filter(|w| w.ident.eq_ignore_ascii_case(&fp.destination))
             {
-                crate::procedure::extend_to_arrival_gateway(&mut legs, dest);
+                crate::procedure::extend_to_arrival_gateway(
+                    &mut legs,
+                    dest,
+                    dest_apt.as_ref().map(|a| a.elev_ft),
+                );
             }
         }
         let arrival_line = match (star_line, arrival_line) {

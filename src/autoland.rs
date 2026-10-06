@@ -91,6 +91,41 @@ pub fn landing_configured() -> bool {
     LANDING_CONFIGURED.load(Ordering::SeqCst)
 }
 
+/// The approach flying now is ESTABLISHED on its final: the crew's "final"
+/// report is due ([`final_report_due`]). Written every tick by the run,
+/// cleared when an approach starts and ends.
+static ON_FINAL: AtomicBool = AtomicBool::new(false);
+
+/// Is the approach flying now established on its final? Full auto's "final"
+/// call waits for it (`full_auto` `final_call`).
+pub fn established_on_final() -> bool {
+    ON_FINAL.load(Ordering::SeqCst)
+}
+
+/// A crew reports final once ESTABLISHED on it: the guidance flying its
+/// Final (inside the final's range, laterally stabilised), no reposition
+/// pattern in hand, not going around, and the track lined up with the
+/// runway. LEGR-LXGB, 2026-10-06 (sortie 1791275171-full_auto): "final
+/// runway zero nine" went out the moment autoland took the arrival, 12 nm
+/// EAST of the field at 13,300 ft and about to fly a reposition round the
+/// Rock, and the tower cleared it to land on it. Pure.
+pub fn final_report_due(
+    phase_final: bool,
+    pattern_flying: bool,
+    going_around: bool,
+    track_deg: f64,
+    course_deg: f64,
+) -> bool {
+    phase_final
+        && !pattern_flying
+        && !going_around
+        && crate::angles::abs_diff_deg(track_deg, course_deg) <= FINAL_REPORT_TRACK_DEG
+}
+
+/// Lined up for the report: the track within this of the runway course
+/// (the final's own 35 degree cut is an intercept, not a final).
+const FINAL_REPORT_TRACK_DEG: f64 = 30.0;
+
 /// One-line emergency status for the panel's live strip ("AUTOLAND LELC 23R
 /// 12.4nm FINAL"); empty when nothing is flying. Written by the autoland and
 /// recover watchers, composed into the strip by the monitor each tick.
@@ -1322,7 +1357,10 @@ fn spawn_autoland(launch: AutolandLaunch) {
     // Taken on the caller's thread: a stand-down landing before the thread
     // runs cancels THIS run. The run's end clears the panel line and the
     // landing configuration, only while it still owns the slot.
-    let lease = RUN.take_over().with_cleanup(&LANDING_CONFIGURED, || set_panel(""));
+    let lease = RUN.take_over().with_cleanup(&LANDING_CONFIGURED, || {
+        set_panel("");
+        ON_FINAL.store(false, Ordering::SeqCst);
+    });
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1343,6 +1381,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 return;
             }
             LANDING_CONFIGURED.store(false, Ordering::SeqCst);
+            ON_FINAL.store(false, Ordering::SeqCst);
             let announce = |line: String, sev: Priority| {
                 tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
                 if let Some(v) = &voice { v.alert(sev, line); }
@@ -1600,6 +1639,11 @@ fn spawn_autoland(launch: AutolandLaunch) {
             // how this loop gets round to a final it is on the wrong side of.
             let mut reversal: Option<crate::reversal::Reversal> = None;
             let mut reversals_flown: u32 = 0;
+            // Where this pattern's downwind stops for no-go airspace while
+            // high, and the hold short of it (`reversal::limit_step`).
+            let mut reversal_limit: Option<crate::reversal::AirspaceLimit> = None;
+            let mut hold_back = false;
+            let mut limit_said = false;
             // A published missed approach asked for once: one that cannot be
             // flown falls through to our own pattern, never to "Your aircraft"
             // with nobody there (LEMG 13 SR22 circuit 2026-09-29).
@@ -2740,6 +2784,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                 }
                                 reversal_began = true;
                                 pattern_gs_kts = gs_kts;
+                                reversal_limit = plan.limit.clone();
+                                hold_back = false;
+                                limit_said = false;
                                 if matches!(
                                     plan.why,
                                     "switched_side_for_terrain" | "raised_for_terrain"
@@ -2750,17 +2797,22 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                             "why": plan.why, "platform_ft": plan.platform_ft}),
                                     );
                                 }
+                                if let Some(name) = plan.airspace.as_deref() {
+                                    crate::blackbox::record(
+                                        "autoland",
+                                        serde_json::json!({"event": "reversal_airspace",
+                                            "why": plan.why, "airspace": name,
+                                            "platform_ft": plan.platform_ft}),
+                                    );
+                                }
                                 announce(
-                                    format!(
-                                        "Repositioning for runway {}: {} downwind at {:.0} feet{}.",
-                                        crate::circuit::spell_runway(&rwy.id),
-                                        if plan.side < 0.0 { "left-hand" } else { "right-hand" },
-                                        (plan.platform_ft / 100.0).round() * 100.0,
-                                        match plan.why {
-                                            "raised_for_terrain" => ", raised for the high ground",
-                                            "switched_side_for_terrain" => ", the other side is high ground",
-                                            _ => "",
-                                        }
+                                    crate::reversal::reposition_line(
+                                        &crate::circuit::spell_runway(&rwy.id),
+                                        plan.side,
+                                        plan.platform_ft,
+                                        plan.why,
+                                        plan.platform_ft > default_platform + 50.0,
+                                        plan.airspace.as_deref(),
                                     ),
                                     Priority::Advisory,
                                 );
@@ -2809,7 +2861,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     let join = join_point_nm(rev.platform_ft, rwy.elev_ft);
                     // Height first: a downwind begun far above the platform
                     // extends until the rest of the pattern can lose it.
-                    let high = rev.leg == crate::reversal::Leg::Outbound
+                    let too_high = rev.leg == crate::reversal::Leg::Outbound
                         && crate::reversal::too_high_to_turn(
                             alt,
                             rev.platform_ft,
@@ -2818,20 +2870,57 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             gs_kts,
                             crate::procedure::descent_fpm(),
                         );
+                    // ...but never INTO no-go airspace: short of it the height
+                    // is lost in a hold, else the downwind turns in high.
+                    let was_back = hold_back;
+                    let lim = crate::reversal::limit_step(
+                        too_high,
+                        along_nm,
+                        reversal_limit.as_ref(),
+                        &mut hold_back,
+                    );
+                    let high = lim.high;
                     if high && !rev.high {
                         let above = ((alt - rev.platform_ft) / 100.0).round() * 100.0;
                         crate::blackbox::record(
                             "autoland",
                             serde_json::json!({"event": "downwind_extended", "above_ft": above,
-                                               "along_nm": along_nm, "alt": alt}),
+                                "along_nm": along_nm, "alt": alt,
+                                "limit_nm": reversal_limit.as_ref().map(|l| l.extend_to_nm),
+                                "airspace": reversal_limit.as_ref().map(|l| &l.name),
+                                "hold": reversal_limit.as_ref().map(|l| l.hold)}),
                         );
                         announce(
-                            format!("We're {above:.0} feet above the pattern. Extending the downwind to lose it."),
+                            crate::reversal::extend_line(above, reversal_limit.as_ref()),
                             Priority::Advisory,
                         );
                     }
+                    if lim.back && !was_back {
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "reversal_hold", "along_nm": along_nm,
+                                "alt": alt, "above_ft": alt - rev.platform_ft,
+                                "limit_nm": reversal_limit.as_ref().map(|l| l.extend_to_nm)}),
+                        );
+                    }
+                    if lim.capped && !limit_said {
+                        limit_said = true;
+                        let above = ((alt - rev.platform_ft) / 100.0).round() * 100.0;
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "extension_capped", "along_nm": along_nm,
+                                "alt": alt, "above_ft": above,
+                                "airspace": reversal_limit.as_ref().map(|l| &l.name)}),
+                        );
+                        if let Some(l) = reversal_limit.as_ref() {
+                            announce(
+                                crate::reversal::capped_line(above, &l.name),
+                                Priority::Advisory,
+                            );
+                        }
+                    }
                     rev.high = high;
-                    match crate::reversal::step(
+                    let stepped = crate::reversal::step(
                         rev,
                         &rwy,
                         lat,
@@ -2842,7 +2931,16 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         gs_kts,
                         join,
                         raw.phase == ApproachPhase::Final,
-                    ) {
+                    );
+                    // The hold's way back toward the field, outside the downwind.
+                    let stepped = if lim.back {
+                        Some(crate::reversal::hold_heading(
+                            &rwy, rev.side, lat, lon, along_nm, gs_kts,
+                        ))
+                    } else {
+                        stepped
+                    };
+                    match stepped {
                         Some(h) => pattern = Some((h, rev.leg, rev.platform_ft)),
                         None => {
                             reversal = None;
@@ -3766,6 +3864,16 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // The ILS: its needles against our path, and the coupled
                 // approach where the airframe allows it.
                 let on_final = g.phase == ApproachPhase::Final && pattern.is_none() && !ga;
+                ON_FINAL.store(
+                    final_report_due(
+                        g.phase == ApproachPhase::Final,
+                        pattern.is_some() || reversal.is_some() || hold.is_some(),
+                        ga,
+                        track_true,
+                        rwy.course_deg,
+                    ),
+                    Ordering::SeqCst,
+                );
                 let needles = ils.as_ref().map(|_| {
                     // From the tick's one read.
                     let (h, v, lv, gv) = (st.get(F::Hdef), st.get(F::Vdef), st.get(F::LocValid), st.get(F::GsValid));
@@ -8468,6 +8576,9 @@ mod lemg_737_flare_tests;
 
 #[cfg(test)]
 mod ap_engage_tests;
+
+#[cfg(test)]
+mod final_report_tests;
 
 /// LEMG 13 and 31 as apt.dat has them, a 737's heading response and the
 /// autoland loop's lateral composition, for the replays of the 2026-09-28

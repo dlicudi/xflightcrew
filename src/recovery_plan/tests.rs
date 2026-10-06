@@ -38,7 +38,7 @@ fn lemg_plan() -> Vec<Waypoint> {
 
 fn lemg_legs(w: &[Waypoint]) -> Vec<ProcLeg> {
     let mut legs = crate::procedure::enroute_legs(w, "LFRG", "LEMG", 35_000.0);
-    crate::procedure::extend_to_arrival_gateway(&mut legs, w.last().unwrap());
+    crate::procedure::extend_to_arrival_gateway(&mut legs, w.last().unwrap(), Some(53.0));
     legs
 }
 

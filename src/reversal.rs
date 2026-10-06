@@ -696,6 +696,249 @@ pub async fn hold_altitude_ahead_ft(
     )
 }
 
+// ---------------------------------------------------------------------------
+// No-go airspace: the pattern's legs are judged against the P/R/Q volumes the
+// sim ships (`airspace.txt`, the circuit's own `SideFacts.airspace`), and the
+// downwind is never EXTENDED into one: height is lost in a hold short of it.
+//
+// LEGR-LXGB 09, 2026-10-06 (sortie 1791275171-full_auto, 737): the
+// reposition began 12 nm east of the field 10,100 ft above its platform,
+// went round Europa Point at 7,700 ft, and flew its downwind west along
+// 36.07 N to 5.61 W, 12 nm past the threshold over Spanish land between
+// Algeciras and Tarifa, then a base north over land and a 12 nm final over
+// Los Barrios: R-164 ALGECIRAS (GND to 30,000 ft) under most of it.
+// ---------------------------------------------------------------------------
+
+/// The hold's straight legs, nm: back toward the field on a line two radii
+/// outside the downwind, then the downwind again. With two half turns a lap
+/// is about five minutes for a jet, 7,000 ft at the pattern's descent.
+pub const HOLD_LEG_NM: f64 = 3.0;
+/// The hold's turn begins this far short of the first downwind sample in a
+/// volume, nm, on top of the turn's own radius (a 180 away overshoots by it).
+const AIRSPACE_MARGIN_NM: f64 = 0.5;
+
+/// Where an extended downwind must stop for no-go airspace, and whether it
+/// may lose its height in a hold there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirspaceLimit {
+    /// The downwind is never flown past this, nm along, while high: a radius
+    /// and a margin short of the first sample inside a volume.
+    pub extend_to_nm: f64,
+    /// The first sample inside it, nm along.
+    pub conflict_nm: f64,
+    /// The volume, spoken ("restricted area R 164").
+    pub name: String,
+    /// The hold short of it is clear of every volume and of the ground (the
+    /// pattern's 1,000 ft): lose the height there. Else the downwind turns in
+    /// at the limit, high, and the stabilised gate has the last word.
+    pub hold: bool,
+}
+
+/// The first volume a pattern side's LEVEL legs (the drawn downwind and base,
+/// the line points of [`side_frame`]) enter at `platform_ft`, spoken. The
+/// inbound is the runway's own final, flown wherever the runway is. Pure.
+pub fn side_airspace(
+    rwy: &Runway,
+    pts: &[ProbePt],
+    platform_ft: f64,
+    spaces: &[crate::airspace::Airspace],
+) -> Option<String> {
+    let lls: Vec<(f64, f64)> = pts
+        .iter()
+        .filter(|p| p.line && p.leg != Leg::Inbound)
+        .map(|p| pattern_point(rwy, p.along_nm, p.lateral_nm))
+        .collect();
+    crate::airspace::first_conflict(spaces, &lls, platform_ft).map(|a| a.spoken_name())
+}
+
+/// The first sample of the downwind line (`side`, `offset_nm` out) from
+/// `from_nm` to [`MAX_OUTBOUND_NM`] inside a volume at `platform_ft` or at
+/// `alt_ft` (the height it will be flown down from): `(along, name)`, or
+/// `None` when the whole extension is clear. Pure.
+pub fn downwind_conflict(
+    rwy: &Runway,
+    side: f64,
+    offset_nm: f64,
+    from_nm: f64,
+    platform_ft: f64,
+    alt_ft: f64,
+    spaces: &[crate::airspace::Airspace],
+) -> Option<(f64, String)> {
+    let from = from_nm.min(MAX_OUTBOUND_NM);
+    let x = side * offset_nm;
+    crate::circuit::densify(&[(from, x), (MAX_OUTBOUND_NM, x)], LINE_STEP_NM)
+        .into_iter()
+        .find_map(|(a, x)| {
+            let (lat, lon) = pattern_point(rwy, a, x);
+            spaces
+                .iter()
+                .find(|s| s.blocks(lat, lon, platform_ft) || s.blocks(lat, lon, alt_ft))
+                .map(|s| (a, s.spoken_name()))
+        })
+}
+
+/// The hold short of `extend_to_nm`: the racetrack's outer leg, two radii
+/// outside the downwind, from [`HOLD_LEG_NM`] and a radius back to a radius
+/// past the turn, and the two half turns across. Level points, for the
+/// ground probe and the airspace check. Pure.
+pub fn hold_frame(side: f64, offset_nm: f64, r_nm: f64, extend_to_nm: f64) -> Vec<ProbePt> {
+    let outer = side * (offset_nm + 2.0 * r_nm);
+    let inner = side * offset_nm;
+    let (near, far) = (extend_to_nm - HOLD_LEG_NM - r_nm, extend_to_nm + r_nm);
+    crate::circuit::densify(
+        &[(near, inner), (near, outer), (far, outer), (far, inner)],
+        LINE_STEP_NM,
+    )
+    .into_iter()
+    .map(|(along_nm, lateral_nm)| ProbePt {
+        along_nm,
+        lateral_nm,
+        leg: Leg::Outbound,
+        line: false,
+        level: true,
+    })
+    .collect()
+}
+
+/// The limit a downwind conflict at `conflict_nm` sets, nm along: a radius
+/// and the margin short of it, never behind where the downwind begins. Pure.
+pub fn extend_to_nm(conflict_nm: f64, r_nm: f64, from_nm: f64) -> f64 {
+    (conflict_nm - r_nm - AIRSPACE_MARGIN_NM).max(from_nm)
+}
+
+/// One tick of the downwind's height rule under an [`AirspaceLimit`]:
+/// `high` is [`too_high_to_turn`]; `back` the hold's outer leg in hand,
+/// carried tick to tick. Returns what the pattern flies: `high` as the
+/// pattern sees it (an extension stopped at the limit turns in), and whether
+/// this tick is the hold's way back toward the field. No limit: today's
+/// rule, the downwind extends to [`MAX_OUTBOUND_NM`]. Pure.
+pub fn limit_step(
+    high: bool,
+    along_nm: f64,
+    limit: Option<&AirspaceLimit>,
+    back: &mut bool,
+) -> LimitStep {
+    let Some(l) = limit.filter(|_| high) else {
+        *back = false;
+        return LimitStep {
+            high,
+            back: false,
+            capped: false,
+        };
+    };
+    if !l.hold {
+        let capped = along_nm >= l.extend_to_nm;
+        *back = false;
+        return LimitStep {
+            high: !capped,
+            back: false,
+            capped,
+        };
+    }
+    if *back {
+        if along_nm <= l.extend_to_nm - HOLD_LEG_NM {
+            *back = false;
+        }
+    } else if along_nm >= l.extend_to_nm {
+        *back = true;
+    }
+    LimitStep {
+        high: true,
+        back: *back,
+        capped: false,
+    }
+}
+
+/// What [`limit_step`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitStep {
+    /// The pattern is still too high to turn in.
+    pub high: bool,
+    /// Flying the hold's outer leg back toward the field.
+    pub back: bool,
+    /// An extension stopped at the airspace with no hold: turning in high.
+    pub capped: bool,
+}
+
+/// The TRUE heading of the hold's outer leg: back toward the field on the
+/// line two radii outside the downwind, pursued like the downwind itself
+/// (never steeper across it than 45 degrees). From the downwind the turn
+/// onto it is the short way, AWAY from the runway; from it back onto the
+/// downwind ([`step`]'s outbound pursuit), toward it. Pure.
+pub fn hold_heading(
+    rwy: &Runway,
+    side: f64,
+    lat: f64,
+    lon: f64,
+    along_nm: f64,
+    gs_kts: f64,
+) -> f64 {
+    let r = sizing_radius_nm(gs_kts);
+    let outer = side * (OFFSET_RADII * r + 2.0 * r);
+    let (plat, plon) = pattern_point(rwy, along_nm - 2.0 * r, outer);
+    let brg = bearing_deg(lat, lon, plat, plon);
+    let off = crate::angles::signed_diff_deg(brg, rwy.course_deg).clamp(-45.0, 45.0);
+    (rwy.course_deg + off).rem_euclid(360.0)
+}
+
+/// What the crew says as a pattern begins: the runway, the side, the
+/// platform, and why it is where it is (raised for the ground, the other
+/// side, or a volume no side was clear of). Pure.
+pub fn reposition_line(
+    runway_spoken: &str,
+    side: f64,
+    platform_ft: f64,
+    why: &str,
+    raised: bool,
+    airspace: Option<&str>,
+) -> String {
+    let because = match (why, airspace) {
+        ("switched_side_for_terrain", _) => ", the other side is high ground".to_string(),
+        ("switched_side_for_airspace", _) => ", the other side is restricted airspace".to_string(),
+        (_, Some(name)) if raised => {
+            format!(", raised for the high ground. No side is clear of {name}")
+        }
+        (_, Some(name)) => format!(". No side is clear of {name}"),
+        ("raised_for_terrain", None) => ", raised for the high ground".to_string(),
+        _ => String::new(),
+    };
+    format!(
+        "Repositioning for runway {runway_spoken}: {} downwind at {:.0} feet{because}.",
+        if side < 0.0 {
+            "left-hand"
+        } else {
+            "right-hand"
+        },
+        (platform_ft / 100.0).round() * 100.0,
+    )
+}
+
+/// What the crew says as the downwind begins to lose height it has too much
+/// of: extended, or held short of a volume. Pure.
+pub fn extend_line(above_ft: f64, limit: Option<&AirspaceLimit>) -> String {
+    match limit {
+        Some(l) if l.hold => format!(
+            "We're {above_ft:.0} feet above the pattern. Holding clear of {} to lose it.",
+            l.name
+        ),
+        _ => format!(
+            "We're {above_ft:.0} feet above the pattern. Extending the downwind to lose it."
+        ),
+    }
+}
+
+/// ...and when there is no legal room to lose it before the volume. Pure.
+pub fn capped_line(above_ft: f64, name: &str) -> String {
+    format!("No room to lose the height clear of {name}. Turning in {above_ft:.0} feet high.")
+}
+
+/// The no-go volumes near the threshold, or `None` when the file cannot be
+/// read (no data: the old behaviour, said in the record). Blocking.
+pub fn load_spaces_near(path: &str, lat: f64, lon: f64) -> Option<Vec<crate::airspace::Airspace>> {
+    std::fs::File::open(path).ok()?;
+    Some(crate::airspace::load_near(path, lat, lon, 0.5))
+}
+
 /// A pattern planned over the probed ground, for the loop to fly.
 #[derive(Debug, Clone)]
 pub struct PatternPlan {
@@ -706,6 +949,12 @@ pub struct PatternPlan {
     pub refused: Option<String>,
     /// ...and the altitude the refusal climbs to and holds.
     pub hold_ft: Option<f64>,
+    /// The flown side's level legs enter this no-go volume (spoken): no side
+    /// was clear of it (`airspace_unavoidable`), flown for the ground's sake
+    /// and said.
+    pub airspace: Option<String>,
+    /// Where the downwind must stop for airspace while high.
+    pub limit: Option<AirspaceLimit>,
     /// The facts for the `reversal` record.
     pub record: serde_json::Value,
 }
@@ -754,6 +1003,17 @@ pub async fn plan(
     let mut built_for = default_platform_ft;
     let mut rounds = 0u32;
     let mut first_lines: Option<(Option<f64>, Option<f64>)> = None;
+    // The no-go volumes near the field (off the loop's thread: the file is
+    // tens of MB). Unreadable: no airspace rule, the old behaviour, recorded.
+    let spaces: Option<Vec<crate::airspace::Airspace>> = {
+        let path = crate::settings::live().airspace_path.clone();
+        let (lat, lon) = (rwy.thr_lat, rwy.thr_lon);
+        tokio::task::spawn_blocking(move || load_spaces_near(&path, lat, lon))
+            .await
+            .ok()
+            .flatten()
+    };
+    let airspace_word = if spaces.is_some() { "read" } else { "unread" };
     let no_data = |rounds: u32| {
         let side = pick_side(xtk_now, None, None);
         PatternPlan {
@@ -762,7 +1022,10 @@ pub async fn plan(
             why: "no_terrain_data",
             refused: None,
             hold_ft: None,
-            record: serde_json::json!({"terrain": "none", "rounds": rounds}),
+            airspace: None,
+            limit: None,
+            record: serde_json::json!({"terrain": "none", "rounds": rounds,
+                                       "airspace": airspace_word}),
         }
     };
     loop {
@@ -784,7 +1047,11 @@ pub async fn plan(
             let ground: Vec<f64> = g.iter().chain(ig.iter()).copied().collect();
             side_facts(&all, &ground)
         };
-        let (l, r) = (facts(&lp, &lg), facts(&rp, &rg));
+        let (mut l, mut r) = (facts(&lp, &lg), facts(&rp, &rg));
+        if let Some(sp) = spaces.as_deref() {
+            l.airspace = side_airspace(&rwy, &lp, built_for, sp);
+            r.airspace = side_airspace(&rwy, &rp, built_for, sp);
+        }
         let lines = *first_lines.get_or_insert((l.line_max_ft, r.line_max_ft));
         let default_side = pick_side(xtk_now, lines.0, lines.1);
         let j = judge(default_side, &l, &r, rwy.elev_ft, default_platform_ft);
@@ -821,7 +1088,59 @@ pub async fn plan(
             }
             None => None,
         };
+        // The downwind's limit for no-go airspace on the side flown, and the
+        // hold short of it, probed: clear of every volume and 1,000 ft over
+        // its ground at the platform it descends to.
+        let flown_airspace = if j.side < 0.0 {
+            l.airspace.clone()
+        } else {
+            r.airspace.clone()
+        };
+        let limit = match (&refused, spaces.as_deref()) {
+            (None, Some(sp)) => {
+                let rr = sizing_radius_nm(gs_kts);
+                let offset = OFFSET_RADII * rr;
+                match downwind_conflict(&rwy, j.side, offset, along_now, platform_ft, alt_ft, sp) {
+                    Some((conflict_nm, name)) => {
+                        let to = extend_to_nm(conflict_nm, rr, along_now);
+                        let pts = hold_frame(j.side, offset, rr, to);
+                        let lls: Vec<(f64, f64)> = pts
+                            .iter()
+                            .map(|p| pattern_point(&rwy, p.along_nm, p.lateral_nm))
+                            .collect();
+                        let clear_air = sp.iter().all(|s| {
+                            !lls.iter().any(|&(la, lo)| {
+                                s.blocks(la, lo, platform_ft) || s.blocks(la, lo, alt_ft)
+                            })
+                        });
+                        let ground = if clear_air {
+                            ground_under(&xp, &rwy, &pts).await
+                        } else {
+                            None
+                        };
+                        let hold = clear_air
+                            && ground.as_ref().is_some_and(|g| {
+                                g.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+                                    + crate::circuit::PATTERN_TERRAIN_CLEAR_FT
+                                    <= platform_ft + 0.5
+                            });
+                        Some(AirspaceLimit {
+                            extend_to_nm: to,
+                            conflict_nm,
+                            name,
+                            hold,
+                        })
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
         let record = serde_json::json!({
+            "airspace": airspace_word,
+            "left_airspace": l.airspace, "right_airspace": r.airspace,
+            "limit": limit.as_ref().map(|l| serde_json::json!({"extend_to_nm": l.extend_to_nm,
+                "conflict_nm": l.conflict_nm, "name": l.name, "hold": l.hold})),
             "terrain": "probed", "rounds": rounds, "side_pick": j.why,
             "left_line_ft": l.line_max_ft, "right_line_ft": r.line_max_ft,
             "left_corridor_max_ft": l.terrain_max_ft, "right_corridor_max_ft": r.terrain_max_ft,
@@ -836,6 +1155,8 @@ pub async fn plan(
             why: j.why,
             refused,
             hold_ft,
+            airspace: flown_airspace,
+            limit,
             record,
         };
     }
@@ -2143,5 +2464,303 @@ mod tests {
             w.verdict(t).is_some()
         });
         assert!(waited.is_some_and(|t| t > PLAN_WAIT_S && t < PLAN_WAIT_S + 2.0), "{waited:?}");
+    }
+
+    // --- No-go airspace (LEGR-LXGB 09, 2026-10-06) ---------------------------
+
+    /// LXGB 09 from apt.dat: the 09 threshold and the 27 threshold.
+    fn lxgb_09() -> Runway {
+        let (lat, lon) = (36.1508156, -5.3596312);
+        Runway {
+            icao: "LXGB".into(),
+            id: "09".into(),
+            thr_lat: lat,
+            thr_lon: lon,
+            course_deg: bearing_deg(lat, lon, 36.1506, -5.3336),
+            length_m: 1680.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 15.0,
+        }
+    }
+
+    /// R-164 ALGECIRAS (CADIZ), GND to 30,000 ft, from the pilot's
+    /// `Custom Data/airspaces/airspace.txt`: its vertices, the arcs round
+    /// Algeciras and Tarifa thinned to their ends.
+    fn r164() -> crate::airspace::Airspace {
+        crate::airspace::Airspace {
+            class: 'R',
+            name: "R-164        (ALGECIRAS (CADIZ))".into(),
+            floor_ft: 0.0,
+            ceiling_ft: 30_000.0,
+            poly: vec![
+                (36.4433, -5.2719),
+                (36.4164, -5.1544),
+                (36.3742, -5.1183),
+                (36.1814, -5.2694),
+                (36.1725, -5.2722),
+                (36.1489, -5.2764),
+                (36.1536, -5.3375),
+                (36.1528, -5.3389),
+                (36.1550, -5.3453),
+                (36.1547, -5.3519),
+                (36.1558, -5.3506),
+                (36.1558, -5.4019),
+                (36.0944, -5.3842),
+                (36.0792, -5.3842),
+                (36.0406, -5.4092),
+                (36.0286, -5.4256),
+                (36.0203, -5.4458),
+                (36.0167, -5.4650),
+                (36.0175, -5.4747),
+                (35.9833, -5.5608),
+                (35.9667, -5.6089),
+                (35.9994, -5.6517),
+                (36.0225, -5.6719),
+                (36.0239, -5.6900),
+                (36.0558, -5.6647),
+                (36.2056, -5.6583),
+            ],
+        }
+    }
+
+    /// The pattern the sortie flew (12 nm east of the field, 13,283 ft, a
+    /// 3,210 ft platform, 212 kt) met R-164 on BOTH sides: the right-hand
+    /// downwind south of the Rock enters it over the bay, 1.5 to 2 nm past
+    /// the threshold, and the left one over La Linea. The downwind may be
+    /// extended only to a radius and a half mile short of it, and the hold
+    /// there (over the Strait south of Europa Point) is clear of it.
+    #[test]
+    fn lxgb_09_downwind_stops_short_of_r164_and_holds_over_the_strait() {
+        let rwy = lxgb_09();
+        let sp = vec![r164()];
+        let (gs, platform, alt, along_now) = (212.0, 3_210.0, 13_283.0, -11.98);
+        // Both sides' level legs are in it: no side is clear.
+        let l = side_frame(-1.0, platform, rwy.elev_ft, gs, along_now);
+        let r = side_frame(1.0, platform, rwy.elev_ft, gs, along_now);
+        let r164_name = Some("restricted area R 164");
+        assert_eq!(side_airspace(&rwy, &l, platform, &sp).as_deref(), r164_name);
+        assert_eq!(side_airspace(&rwy, &r, platform, &sp).as_deref(), r164_name);
+        // The flown base 12 nm out (5.61 W) is deep inside it.
+        let (blat, blon) = pattern_point(&rwy, 12.0, 4.9);
+        assert!(sp[0].contains(blat, blon));
+        // The right-hand downwind meets it over the bay.
+        let rr = sizing_radius_nm(gs);
+        let offset = OFFSET_RADII * rr;
+        let (conflict, name) = downwind_conflict(&rwy, 1.0, offset, along_now, platform, alt, &sp)
+            .expect("R-164 ahead");
+        assert_eq!(name, "restricted area R 164");
+        assert!((1.0..2.5).contains(&conflict), "{conflict}");
+        let to = extend_to_nm(conflict, rr, along_now);
+        assert!(to < conflict - rr, "{to}");
+        // The racetrack short of it is clear of it, at both heights.
+        for p in hold_frame(1.0, offset, rr, to) {
+            let (la, lo) = pattern_point(&rwy, p.along_nm, p.lateral_nm);
+            assert!(
+                !sp[0].blocks(la, lo, platform) && !sp[0].blocks(la, lo, alt),
+                "{p:?}"
+            );
+        }
+        // No volume: no limit, today's rule.
+        assert!(downwind_conflict(&rwy, 1.0, offset, along_now, platform, alt, &[]).is_none());
+    }
+
+    /// The rule per tick: not high, nothing; high with a hold, out to the
+    /// limit, back along the outer leg for HOLD_LEG_NM, out again; high
+    /// without one, the downwind turns in at the limit.
+    #[test]
+    fn a_high_downwind_holds_at_the_airspace_limit_and_never_extends_past_it() {
+        let held = AirspaceLimit {
+            extend_to_nm: -0.6,
+            conflict_nm: 1.6,
+            name: "restricted area R 164".into(),
+            hold: true,
+        };
+        let mut back = false;
+        // Not high: the limit is nothing.
+        let s = limit_step(false, 0.0, Some(&held), &mut back);
+        let quiet = LimitStep {
+            high: false,
+            back: false,
+            capped: false,
+        };
+        assert_eq!(s, quiet);
+        // High, short of the limit: the downwind is flown.
+        let s = limit_step(true, -3.0, Some(&held), &mut back);
+        assert_eq!(
+            s,
+            LimitStep {
+                high: true,
+                ..quiet
+            }
+        );
+        // At it: the hold's way back.
+        let s = limit_step(true, -0.6, Some(&held), &mut back);
+        assert!(s.high && s.back);
+        // Still back until HOLD_LEG_NM short of it.
+        assert!(limit_step(true, -2.0, Some(&held), &mut back).back);
+        assert!(!limit_step(true, -0.6 - HOLD_LEG_NM, Some(&held), &mut back).back);
+        // Out again on the downwind, and back once more at the limit.
+        let s = limit_step(true, -1.0, Some(&held), &mut back);
+        assert!(!s.back);
+        let _ = limit_step(true, -0.5, Some(&held), &mut back);
+        assert!(back);
+        // Height lost: the pattern goes on, the hold forgotten.
+        let s = limit_step(false, -0.8, Some(&held), &mut back);
+        assert_eq!(s, quiet);
+        // No legal hold: turned in at the limit, high.
+        let capped = AirspaceLimit {
+            hold: false,
+            ..held.clone()
+        };
+        assert!(limit_step(true, -1.0, Some(&capped), &mut back).high);
+        let s = limit_step(true, -0.6, Some(&capped), &mut back);
+        assert_eq!(
+            s,
+            LimitStep {
+                capped: true,
+                ..quiet
+            }
+        );
+        // No limit at all: today's extension.
+        let s = limit_step(true, 20.0, None, &mut back);
+        assert_eq!(
+            s,
+            LimitStep {
+                high: true,
+                ..quiet
+            }
+        );
+    }
+
+    /// Flown: the LXGB 09 sortie's start, 12 nm east at 13,283 ft over a
+    /// 3,210 ft platform, but with the limit. The pattern loses the height
+    /// round Europa Point and in the hold over the Strait, and is never in
+    /// R-164 while it is high; then it goes on to its base.
+    #[test]
+    fn the_lxgb_09_pattern_loses_its_height_clear_of_r164() {
+        let rwy = lxgb_09();
+        let sp = vec![r164()];
+        let gs = 212.0;
+        let platform = 3_210.0;
+        let rr = sizing_radius_nm(gs);
+        let offset = OFFSET_RADII * rr;
+        let along0 = -11.98;
+        let (conflict, name) =
+            downwind_conflict(&rwy, 1.0, offset, along0, platform, 13_283.0, &sp).unwrap();
+        let limit = AirspaceLimit {
+            extend_to_nm: extend_to_nm(conflict, rr, along0),
+            conflict_nm: conflict,
+            name,
+            hold: true,
+        };
+        let recip = (rwy.course_deg + 180.0) % 360.0;
+        let (lat, lon) = pattern_point(&rwy, along0, 0.35);
+        let mut p = Plant {
+            lat,
+            lon,
+            hdg: 281.0,
+            bank: 0.0,
+            gs_kts: gs,
+            max_bank: 25.0,
+        };
+        let mut rev = Reversal {
+            side: 1.0,
+            leg: Leg::Outbound,
+            platform_ft: platform,
+            high: false,
+        };
+        let join = crate::autoland::join_point_nm(platform, rwy.elev_ft);
+        let (mut alt, mut back, mut holds, mut was_back) = (13_283.0, false, 0, false);
+        let dt = 1.0;
+        let mut base_at = None;
+        for _ in 0..6000 {
+            let along = along_track_nm(p.lat, p.lon, &rwy);
+            let xtk = cross_track_nm(p.lat, p.lon, &rwy);
+            let too_high = rev.leg == Leg::Outbound
+                && too_high_to_turn(alt, platform, along, join, gs, 2_000.0);
+            let lim = limit_step(too_high, along, Some(&limit), &mut back);
+            rev.high = lim.high;
+            if lim.high {
+                assert!(
+                    !sp[0].blocks(p.lat, p.lon, alt),
+                    "high in R-164 at {along:.2} nm, {alt:.0} ft"
+                );
+            }
+            if lim.back && !was_back {
+                holds += 1;
+            }
+            was_back = lim.back;
+            let h = step(
+                &mut rev, &rwy, p.lat, p.lon, along, xtk, p.hdg, gs, join, false,
+            );
+            let bug = if lim.back {
+                hold_heading(&rwy, rev.side, p.lat, p.lon, along, gs)
+            } else {
+                h.unwrap_or(recip)
+            };
+            p.fly(bug, dt);
+            let vs = platform_vs_fpm(platform, alt, false, 1_500.0, 2_000.0);
+            alt += vs * dt / 60.0;
+            if rev.leg != Leg::Outbound {
+                base_at = Some((along, alt));
+                break;
+            }
+        }
+        let (along_base, alt_base) = base_at.expect("the pattern reached its base");
+        assert!(holds >= 1, "the height was lost in a hold");
+        assert!(
+            (alt_base - platform).abs() < 300.0,
+            "at the platform by the base: {alt_base:.0}"
+        );
+        assert!(
+            along_base > conflict,
+            "the pattern goes on to its base: {along_base:.1}"
+        );
+    }
+
+    #[test]
+    fn the_reposition_names_the_airspace_it_cannot_avoid() {
+        let line = reposition_line(
+            "zero nine",
+            1.0,
+            3_210.0,
+            "airspace_unavoidable",
+            true,
+            Some("restricted area R 164"),
+        );
+        assert_eq!(
+            line,
+            "Repositioning for runway zero nine: right-hand downwind at 3200 feet, raised for the \
+             high ground. No side is clear of restricted area R 164."
+        );
+        assert_eq!(
+            reposition_line(
+                "two seven",
+                -1.0,
+                1_605.0,
+                "default_side_clear",
+                false,
+                None
+            ),
+            "Repositioning for runway two seven: left-hand downwind at 1600 feet."
+        );
+        let held = AirspaceLimit {
+            extend_to_nm: -0.6,
+            conflict_nm: 1.6,
+            name: "restricted area R 164".into(),
+            hold: true,
+        };
+        assert_eq!(
+            extend_line(2_000.0, Some(&held)),
+            "We're 2000 feet above the pattern. Holding clear of restricted area R 164 to lose it."
+        );
+        assert_eq!(
+            extend_line(2_000.0, None),
+            "We're 2000 feet above the pattern. Extending the downwind to lose it."
+        );
+        for l in [line, capped_line(900.0, "restricted area R 164")] {
+            assert!(!l.contains('\u{2014}') && !l.contains('\u{2013}'), "{l}");
+        }
     }
 }

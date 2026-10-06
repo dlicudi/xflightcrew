@@ -13999,3 +13999,64 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   Ctrl-C; the row's `Fast` says "N s at xA" (#168).
 - A law that misbehaves in the air while its test passes: suspect the plant. A first-order lag
   cannot ring; fly second-order plants through the real transport delay.
+
+## 2026-10-06: the Gibraltar 09 arrival, its height, its airspace and its "final" (LEGR-LXGB 737)
+
+Sortie 1791275171-full_auto, 737-800. The METAR's 090/11 picked runway 09;
+no STAR serves 09 from the north, so the follower flew the route to the
+arrival gateway (`procedure::extend_to_arrival_gateway`, #214), which copied
+the last fix's altitude: "Top of descent ... down to 12,700 feet". Autoland
+took the arrival 12 nm EAST of the field at 13,300 ft ("I'll land at LXGB
+runway 09, 13 miles"). At t=1791276587 the reversal began
+(`why: join_point_behind`, `above_path_ft` 9,410): the probed corridor
+raised its platform twice (1,605 to 2,685 to 3,210 ft, `rounds` 3, the base
+moving west over the hills behind Algeciras with every raise), and the
+downwind was "extended" (`downwind_extended`, `above_ft` 10,100). Flown:
+round Europa Point at about 7,700 ft, then a downwind west along 36.07 N to
+5.61 W, a base north over land at 5.63 W, a 12 nm final at 3,000 ft. 389 of
+the 661 `state` records from the reversal to the wheels lie inside R-164
+ALGECIRAS (CADIZ), GND to 30,000 ft, in the pilot's
+`Custom Data/airspaces/airspace.txt` (the 61-point polygon, which reaches
+west to Tarifa; the `Resources` copy is a shorter one that stops at a
+diagonal through the bay). And "final runway zero nine" went out at
+t=1791276600, as the pattern began, 12 nm east of the field; the tower
+cleared the landing on it.
+
+Real practice for 09 (UK MIL AIP AD 2 LXGB): round the south of the Rock,
+north into the bay, a right-hand circuit with a LATE turn onto final, never
+into Spanish prohibited airspace.
+
+Fixed, offline:
+
+- **A route-only arrival crosses its gateway on the field's 3 degree path**
+  (`procedure::arrival_gateway_alt_ft`: the route's altitude, never above
+  field + 12 nm x 318 ft; LXGB 3,800 ft). The plan's own ceilings ahead
+  (`profile_ceiling_ft`) start the descent before PIMOS. The field's
+  elevation is read from apt.dat by both arms (`needs_arrival_gateway`
+  first on the resume); unread, the old altitude.
+- **No-go airspace is the reversal's, by the circuit's rule**
+  (`reversal::side_airspace` into `SideFacts.airspace`): a clean side wins,
+  a side clear of airspace beats one in it, and when no side is clear
+  (`airspace_unavoidable`: LXGB 09's right downwind meets R-164 over the bay
+  1.5 to 2 nm past the threshold, the left one over La Linea) the pattern is
+  flown for the ground and SAID ("No side is clear of restricted area R
+  164", blackbox `reversal_airspace`).
+- **The downwind is never EXTENDED into it** (`downwind_conflict`,
+  `extend_to_nm`, `AirspaceLimit`): too high to turn, it flies on only to a
+  radius and half a mile short of the first volume; there it holds
+  (`limit_step`, `hold_heading`: a racetrack two radii outside the downwind,
+  turning away, `HOLD_LEG_NM` back), the hold probed clear of every volume
+  and 1,000 ft over its ground; with no legal hold it turns in high
+  (`extension_capped`). An unreadable airspace file is today's rule,
+  recorded `airspace: unread`.
+- **"Final" is reported established on it** (`autoland::final_report_due`:
+  Final, no pattern, not going around, tracking within 30 degrees of the
+  course; `established_on_final`): full auto waits for it
+  (`final_call_waited`).
+
+Not done: the real 09 visual. By the custom polygon the only airspace-free
+final is the late turn inside 1.9 nm, east of 5 24 W, which autoland's
+pattern law (join point no closer than the FAP, 5 nm) cannot fly, so a 737's
+09 pattern still bases over R-164 when the ground raises its platform. With
+the gateway on the path it arrives 600 to 2,200 ft over its platform and
+no longer extends or holds; check the blackbox before calling it fixed.
