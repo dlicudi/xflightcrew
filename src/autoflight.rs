@@ -146,6 +146,10 @@ pub enum Button {
     /// All autothrottle modes off, armed kept.
     AutothrottleOff,
     AutothrottleArm,
+    /// LNAV on the FMS: the profile's `lnav_command` (the 737's
+    /// `lnav_press`), else the stock GPSS. A toggle: pressed only through
+    /// [`LnavEngage`], never on a read that says it is in.
+    Lnav,
 }
 
 /// A dial: written only through [`set_dial`] / [`stage_dial`].
@@ -460,6 +464,7 @@ pub fn button_bits(b: Button) -> u32 {
         Button::Gpss => Modes::FMS_ARMED | Modes::FMS | Modes::LOC_ARMED | Modes::LOC,
         Button::WingLeveler => Modes::WING_LEVELER,
         Button::AutothrottleOn => Modes::AUTOTHROTTLE,
+        Button::Lnav => Modes::LNAV,
         _ => 0,
     }
 }
@@ -489,6 +494,10 @@ impl Modes {
     pub const TOGA_VERTICAL: u32 = 65536;
     pub const VNAV_ARMED: u32 = 131072;
     pub const VNAV: u32 = 262144;
+    /// LNAV / GPSS engaged: the 737's `lnav_press` brings it in and it
+    /// REPLACES HDG SEL (probed 2026-10-06: 540672 = LNAV + ALT HOLD, the
+    /// heading bit cleared).
+    pub const LNAV: u32 = 524288;
 
     /// From a read (a float on the wire).
     pub fn from_read(v: f64) -> Option<Self> {
@@ -521,13 +530,16 @@ impl Modes {
     pub fn gs(self) -> bool {
         self.has(Self::GS)
     }
+    pub fn lnav(self) -> bool {
+        self.has(Self::LNAV)
+    }
     /// The approach mode is in: either half armed or captured.
     pub fn approach_any(self) -> bool {
         self.has(Self::LOC_ARMED | Self::LOC | Self::GS_ARMED | Self::GS)
     }
     /// The words for the tape.
     pub fn words(self) -> Vec<&'static str> {
-        const ALL: [(u32, &str); 17] = [
+        const ALL: [(u32, &str); 18] = [
             (Modes::AUTOTHROTTLE, "at"),
             (Modes::HEADING, "hdg"),
             (Modes::WING_LEVELER, "wlv"),
@@ -545,6 +557,7 @@ impl Modes {
             (Modes::ALT_HOLD, "alt_hold"),
             (Modes::TOGA_LATERAL, "toga_lat"),
             (Modes::TOGA_VERTICAL, "toga_vert"),
+            (Modes::LNAV, "lnav"),
         ];
         ALL.iter()
             .filter(|(b, _)| self.has(*b))
@@ -603,6 +616,10 @@ pub struct Panel {
     pub window: WindowRule,
     /// The profile's `ils_coupled`: autoland flies the airframe's APP.
     pub coupled_ils: bool,
+    /// The panel's LNAV button and lamp (`lnav_command`, `lnav_status`):
+    /// declared on both, the enroute follower flies the FMS's LNAV (#227).
+    pub lnav: Option<String>,
+    pub lnav_status: Option<String>,
 }
 
 impl Default for Panel {
@@ -616,6 +633,8 @@ impl Default for Panel {
             autothrottle_off: cmd::AT_OFF.into(),
             window: WindowRule::ParkAbove,
             coupled_ils: false,
+            lnav: None,
+            lnav_status: None,
         }
     }
 }
@@ -645,7 +664,20 @@ impl Panel {
                 WindowRule::ParkAbove
             },
             coupled_ils: p.ils_coupled,
+            // Both or neither: a button without its lamp cannot be read
+            // before it is pressed, and it is a toggle.
+            lnav: a
+                .filter(|a| a.lnav_status.is_some())
+                .and_then(|a| a.lnav_command.clone()),
+            lnav_status: a
+                .filter(|a| a.lnav_command.is_some())
+                .and_then(|a| a.lnav_status.clone()),
         }
+    }
+
+    /// This airframe's LNAV is declared: the follower may hand it the lateral.
+    pub fn lnav_declared(&self) -> bool {
+        self.lnav.is_some() && self.lnav_status.is_some()
     }
 
     /// The command a button is on this panel.
@@ -671,6 +703,7 @@ impl Panel {
             Button::AutothrottleOn => cmd::AT_ON,
             Button::AutothrottleOff => &self.autothrottle_off,
             Button::AutothrottleArm => cmd::AT_ARM,
+            Button::Lnav => self.lnav.as_deref().unwrap_or(cmd::GPSS),
         }
     }
 }
@@ -1056,6 +1089,137 @@ pub async fn arm_approach(xp: &dyn XPlane, site: &str) -> Option<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// LNAV on the FMS (#227).
+// ---------------------------------------------------------------------------
+
+/// Seconds a press of the LNAV toggle is given before the modes are judged
+/// again: the 737's lamps are xlua outputs a frame or more behind the stock
+/// modes, and a second press of a toggle that DID take turns it back off.
+pub const LNAV_SETTLE_S: f64 = 1.5;
+/// Presses before an LNAV that will not come in is given up (each one only
+/// after a settled read said it was still out).
+pub const LNAV_PRESSES: u32 = 2;
+
+/// LNAV engaged, from the lamp and the bitfield: either reading in is in
+/// (the lamp lags the stock mode, the bitfield is the truth), both read out
+/// is out, nothing read is no measurement. Pure.
+pub fn lnav_engaged(status: Option<f64>, modes: Option<Modes>) -> Option<bool> {
+    let lamp = status.filter(|v| v.is_finite()).map(|v| v >= 0.5);
+    let bit = modes.map(Modes::lnav);
+    match (lamp, bit) {
+        (None, None) => None,
+        (a, b) => Some(a == Some(true) || b == Some(true)),
+    }
+}
+
+/// One step of bringing LNAV in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LnavStep {
+    /// It reads in.
+    Engaged,
+    /// Out and settled: press the button now.
+    Press,
+    /// A press is settling; judge again later.
+    Wait,
+    /// Pressed [`LNAV_PRESSES`] times, settled, still out.
+    Failed,
+    /// Nothing read: no measurement, nothing pressed.
+    Unread,
+}
+
+/// Bringing LNAV in through its toggle: read before every press, a press
+/// only on a settled read that says out, never a blind repeat. Pure.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LnavEngage {
+    pressed_at: Option<f64>,
+    presses: u32,
+}
+
+impl LnavEngage {
+    pub fn step(&mut self, now_s: f64, engaged: Option<bool>) -> LnavStep {
+        match engaged {
+            None => LnavStep::Unread,
+            Some(true) => LnavStep::Engaged,
+            Some(false) => {
+                if self.settling(now_s) {
+                    LnavStep::Wait
+                } else if self.presses >= LNAV_PRESSES {
+                    LnavStep::Failed
+                } else {
+                    self.pressed_at = Some(now_s);
+                    self.presses += 1;
+                    LnavStep::Press
+                }
+            }
+        }
+    }
+
+    /// A press is inside its settle: a read saying out is not yet a verdict.
+    pub fn settling(&self, now_s: f64) -> bool {
+        self.pressed_at.is_some_and(|p| now_s - p < LNAV_SETTLE_S)
+    }
+
+    pub fn presses(&self) -> u32 {
+        self.presses
+    }
+}
+
+/// LNAV engaged on the live airframe: the declared lamp and the bitfield,
+/// read together ([`lnav_engaged`]). `None` when the airframe declares no
+/// LNAV or nothing read.
+pub async fn read_lnav(xp: &dyn XPlane) -> Option<bool> {
+    let p = panel();
+    let status_name = p.lnav_status.clone()?;
+    let (status, state) = tokio::join!(xp.get_float(&status_name), xp.get_float(names::AP_STATE));
+    lnav_engaged(status.ok(), state.ok().and_then(Modes::from_read))
+}
+
+/// Press the LNAV button, on the tape. Called only on [`LnavEngage`]'s
+/// `Press` (a toggle: never on a read that says it is in).
+pub async fn press_lnav(xp: &dyn XPlane, site: &str) -> bool {
+    press_logged(xp, Button::Lnav, site).await
+}
+
+/// Take LNAV out for the heading bug: the bug to `hdg_mag` first (no lurch),
+/// then HDG SEL, which REPLACES LNAV on the 737. Pressed when LNAV reads in
+/// or HDG reads out, never on a failed read of both; read back after a
+/// settle. `Some(true)` HDG in and LNAV out, `Some(false)` not, `None`
+/// unread. Taped `autoflight` `lnav_out`.
+pub async fn lnav_out(xp: &dyn XPlane, hdg_mag: f64, site: &str) -> Option<bool> {
+    let hdg = hdg_mag.rem_euclid(360.0);
+    let bug_ok = set_dial(xp, Dial::HeadingBug, hdg).await.is_ok();
+    let (hdg_r, state_r) = tokio::join!(
+        xp.get_float(names::HDG_STATUS),
+        xp.get_float(names::AP_STATE)
+    );
+    let hdg_on = hdg_r.ok().map(|v| v > 0.5);
+    let lnav_on = state_r.ok().and_then(Modes::from_read).map(Modes::lnav);
+    let press = lnav_on == Some(true) || hdg_on == Some(false);
+    if press {
+        press_logged(xp, Button::Heading, site).await;
+        tokio::time::sleep(Duration::from_millis(SETTLE_MS)).await;
+    }
+    let (hdg_r, state_r) = tokio::join!(
+        xp.get_float(names::HDG_STATUS),
+        xp.get_float(names::AP_STATE)
+    );
+    let after_hdg = hdg_r.ok().map(|v| v > 0.5);
+    let after_lnav = state_r.ok().and_then(Modes::from_read).map(Modes::lnav);
+    let taken = match (after_hdg, after_lnav) {
+        (Some(h), Some(l)) => Some(h && !l),
+        (Some(h), None) => Some(h),
+        (None, Some(l)) => Some(!l),
+        (None, None) => None,
+    };
+    crate::blackbox::record(
+        "autoflight",
+        json!({"event": "lnav_out", "site": site, "hdg": hdg, "bug_ok": bug_ok,
+               "lnav_was": lnav_on, "hdg_was": hdg_on, "pressed": press, "taken": taken}),
+    );
+    taken
+}
+
+// ---------------------------------------------------------------------------
 // Primitives: engage, hold level, hold heading.
 // ---------------------------------------------------------------------------
 
@@ -1315,7 +1479,7 @@ mod tests {
             "full_auto.rs",
             "tools/setup_enroute.rs",
         ];
-        const MODES: [&str; 7] = [
+        const MODES: [&str; 8] = [
             "Button::Heading)",
             "Button::Heading,",
             "Button::VerticalSpeed",
@@ -1323,6 +1487,7 @@ mod tests {
             "Button::LevelChange",
             "Button::Approach",
             "Button::Gpss",
+            "Button::Lnav",
         ];
         const CALLS: [&str; 3] = [
             "autoflight::press(",
@@ -1411,6 +1576,22 @@ mod tests {
         ] {
             assert!(names.iter().any(|x| x == n), "{n} not probed");
         }
+        // Its LNAV (#227): declared, both halves, probed.
+        assert!(panel.lnav_declared());
+        assert_eq!(
+            panel.command(Button::Lnav),
+            "laminar/B738/autopilot/lnav_press"
+        );
+        assert_eq!(
+            panel.lnav_status.as_deref(),
+            Some("laminar/B738/autopilot/lnav_status")
+        );
+        for n in [
+            panel.lnav.as_ref().unwrap(),
+            panel.lnav_status.as_ref().unwrap(),
+        ] {
+            assert!(names.iter().any(|x| x == n), "{n} not probed");
+        }
         assert!(
             !names.iter().any(|x| x.contains("cmd_b")),
             "CMD B is never named"
@@ -1492,10 +1673,14 @@ mod tests {
             Button::AutothrottleOn,
             Button::AutothrottleOff,
             Button::AutothrottleArm,
+            Button::Lnav,
         ] {
             names.push(Panel::default().command(b).to_string());
             names.push(panel.command(b).to_string());
         }
+        names.extend(panel.lnav_status.clone());
+        names.push(crate::datarefs::GPS_XTK.to_string());
+        names.push(crate::datarefs::GPS_NAV_ID.to_string());
         let missing: Vec<&String> = names
             .iter()
             .filter(|n| {
@@ -1871,5 +2056,56 @@ mod tests {
         assert!(hold_heading(&fake, 365.0, "test").await);
         assert_eq!(fake.last_write(Dial::HeadingBug.read_name()), Some(5.0));
         assert!(!fake.ran(cmd::HEADING), "HDG already in: never toggled");
+    }
+
+    /// #227, the 737 at FL360: 540672 is LNAV (524288) and ALT HOLD, HDG
+    /// gone. The lamp lags the stock mode; either one in is in; nothing read
+    /// is no measurement.
+    #[test]
+    fn lnav_reads_from_the_lamp_and_the_bitfield() {
+        let m = Modes::from_read(540672.0).unwrap();
+        assert!(m.lnav() && !m.heading());
+        assert!(m.words().contains(&"lnav") && m.words().contains(&"alt_hold"));
+        assert_eq!(lnav_engaged(Some(1.0), Some(m)), Some(true));
+        assert_eq!(lnav_engaged(Some(0.0), Some(m)), Some(true), "lamp lag");
+        assert_eq!(lnav_engaged(None, Some(Modes(16384 | 2))), Some(false));
+        assert_eq!(lnav_engaged(Some(0.0), None), Some(false));
+        assert_eq!(lnav_engaged(None, None), None);
+        assert_eq!(button_bits(Button::Lnav), Modes::LNAV);
+    }
+
+    /// The toggle is pressed only on a settled read that says out, at most
+    /// twice; a read inside the settle waits, an unread presses nothing,
+    /// and in is never pressed.
+    #[test]
+    fn lnav_engage_presses_only_on_a_settled_out() {
+        let mut e = LnavEngage::default();
+        assert_eq!(e.step(0.0, None), LnavStep::Unread);
+        assert_eq!(e.step(0.0, Some(false)), LnavStep::Press);
+        assert_eq!(e.step(0.5, Some(false)), LnavStep::Wait);
+        assert_eq!(e.step(1.4, Some(false)), LnavStep::Wait);
+        assert_eq!(e.step(1.6, Some(false)), LnavStep::Press);
+        assert_eq!(e.presses(), 2);
+        assert_eq!(e.step(2.0, Some(false)), LnavStep::Wait);
+        assert_eq!(e.step(3.2, Some(false)), LnavStep::Failed);
+        let mut e = LnavEngage::default();
+        assert_eq!(e.step(0.0, Some(true)), LnavStep::Engaged);
+        assert_eq!(e.presses(), 0, "already in: never toggled");
+    }
+
+    /// Taking LNAV out: the bug first, then HDG SEL (which replaces LNAV on
+    /// the 737), read back.
+    #[tokio::test]
+    async fn lnav_out_sets_the_bug_then_presses_heading() {
+        let fake = FakeXPlane::with_reads(&[(names::HDG_STATUS, 0.0), (names::AP_STATE, 540672.0)]);
+        fake.set_on_command(cmd::HEADING, names::HDG_STATUS, 2.0);
+        fake.set_on_command(cmd::HEADING, names::AP_STATE, 16386.0);
+        assert_eq!(lnav_out(&fake, 371.0, "test").await, Some(true));
+        assert_eq!(fake.last_write(Dial::HeadingBug.read_name()), Some(11.0));
+        assert_eq!(fake.ran_count(cmd::HEADING), 1);
+        // HDG already in, no LNAV: nothing pressed.
+        let fake = FakeXPlane::with_reads(&[(names::HDG_STATUS, 2.0), (names::AP_STATE, 16386.0)]);
+        assert_eq!(lnav_out(&fake, 90.0, "test").await, Some(true));
+        assert!(!fake.ran(cmd::HEADING));
     }
 }

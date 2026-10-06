@@ -202,6 +202,9 @@ pub const STALL_WARNING_RATIO: &str = "sim/cockpit2/annunciators/stall_warning_r
 pub const PUSHBACK_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
 /// The GPS's active waypoint ident.
 pub const GPS_NAV_ID: &str = "sim/cockpit2/radios/indicators/gps_nav_id";
+/// The GPS cross-track error from the FMS's active leg, nm, signed: what
+/// LNAV captures to 0.0 (#227).
+pub const GPS_XTK: &str = "sim/cockpit2/radios/indicators/gps_xtk";
 pub const SUN_PITCH_DEG: &str = "sim/graphics/scenery/sun_pitch_degrees";
 /// The pilot's yoke, -1..1: hands on the controls.
 pub const YOKE_PITCH_RATIO: &str = "sim/joystick/yoke_pitch_ratio";

@@ -218,6 +218,16 @@ pub struct AutoflightProfile {
     /// remain armed").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autothrottle_off_command: Option<String>,
+    /// The panel's own LNAV button (a toggle) and its lamp, 1 engaged: the
+    /// enroute follower hands its lateral to the FMS on an airframe that
+    /// declares them, its heading bug the watched fallback (#227). The 737's
+    /// `lnav_press` fires the stock GPSS (only with CMD in); `autopilot_state`
+    /// carries it as bit 524288 (`autoflight::Modes::LNAV`). Both or neither;
+    /// `None` keeps the follower on its heading bug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lnav_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lnav_status: Option<String>,
     /// This MCP flies a V/S only TOWARD its altitude window (Boeing logic):
     /// autoland parks the window at the field (`autoflight::WindowRule::
     /// AtField`), toward every descent of the approach. Off: parked above
