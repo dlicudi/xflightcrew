@@ -19,6 +19,7 @@
 //! thread and runtime: the command loop blocks on the mic and would starve
 //! anything run on its runtime, and nothing here holds a lock across an await.
 
+pub(crate) mod airport;
 pub(crate) mod feed;
 pub(crate) mod state;
 
@@ -37,6 +38,9 @@ use crate::voice::Voice;
 
 /// The page, one self-contained file (vanilla JS, no build step).
 const PAGE: &str = include_str!("page.html");
+
+/// The Airport page's drawing code (vanilla JS, no library, no tiles).
+const DIAGRAM_JS: &str = include_str!("diagram.js");
 
 /// The cookie that carries the token after the first `?t=` load.
 const COOKIE: &str = "xvl_efb";
@@ -384,6 +388,36 @@ fn gather(server: &Server) -> state::Facts {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone(),
+        airport: airport_facts(),
+    }
+}
+
+/// The Airport page's facts: the station's field, the taxi route the party
+/// line holds, the guide's card, the runways. The diagram itself is filled
+/// in by [`current`] once the wanted field is known.
+fn airport_facts() -> airport::AirportFacts {
+    let route = crate::party_line::with_taxi_route(|w| {
+        w.map(|w| airport::RouteFacts {
+            source: if crate::party_line::clearance_state().is_some() {
+                "cleared"
+            } else {
+                "crew"
+            },
+            path: w.path.clone(),
+            seg: w.seg.clone(),
+            via: w.via.clone(),
+            holding_point: w.holding_point.clone(),
+            to_stand: crate::party_line::taxi_to_stand(),
+        })
+    });
+    airport::AirportFacts {
+        station: crate::station::active_icao(),
+        diagram: None,
+        unavailable: false,
+        route,
+        card: feed::turn_card(),
+        cleared_runway: crate::party_line::clearance_runway(),
+        arrival_runway: crate::full_auto::arrival_runway(),
     }
 }
 
@@ -394,7 +428,20 @@ async fn current(server: &Arc<Server>) -> state::EfbState {
         .map(|(_, i)| i)
         .collect();
     refresh_metars(server, fields).await;
-    state::build(&gather(server))
+    let mut f = gather(server);
+    // The field the Airport page wants: built once, off this thread.
+    let want = airport::wanted_field(
+        &f.airport,
+        f.tick.as_ref(),
+        f.plan.as_ref(),
+        state::airborne(&f),
+    );
+    if let Some(w) = want {
+        airport::ensure(&w.icao);
+        f.airport.diagram = airport::lookup(&w.icao).map(|r| r.reference.clone());
+        f.airport.unavailable = airport::unavailable(&w.icao);
+    }
+    state::build(&f)
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -508,6 +555,63 @@ async fn state_route(
     ([(header::CACHE_CONTROL, "no-store")], Json(s)).into_response()
 }
 
+#[derive(serde::Deserialize, Default)]
+struct AirportQuery {
+    t: Option<String>,
+    icao: Option<String>,
+}
+
+/// The diagram of a field the page state named (`airport.icao`), with its
+/// version as the ETag: the page fetches it once per field. 404 while it is
+/// still being built, or for a field nobody asked for.
+async fn airport_route(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<AirportQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorised(&live_token(), &headers, q.t.as_deref()) {
+        return refuse(peer, "/airport");
+    }
+    let icao = q.icao.unwrap_or_default().trim().to_ascii_uppercase();
+    let Some(ready) = airport::lookup(&icao) else {
+        return (StatusCode::NOT_FOUND, "no diagram for that field yet").into_response();
+    };
+    let etag = format!("\"{}\"", ready.reference.version);
+    let fresh = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
+    let mut r = if fresh {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            ready.json.clone(),
+        )
+            .into_response()
+    };
+    if let Ok(v) = HeaderValue::from_str(&etag) {
+        r.headers_mut().insert(header::ETAG, v);
+    }
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    r
+}
+
+/// The Airport page's script: code, no data, so like the icon it needs no
+/// token (a `<script src>` carries no header, and a home-screen app's first
+/// load must not depend on the cookie having landed).
+async fn diagram_js() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        DIAGRAM_JS,
+    )
+        .into_response()
+}
+
 async fn events(
     State(server): State<Arc<Server>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -610,6 +714,8 @@ pub(crate) fn router(server: Arc<Server>) -> Router {
         .route("/state", get(state_route))
         .route("/events", get(events))
         .route("/say", post(say))
+        .route("/airport", get(airport_route))
+        .route("/diagram.js", get(diagram_js))
         .route("/manifest.webmanifest", get(manifest_route))
         .route("/icon.svg", get(icon))
         .with_state(server)
@@ -798,6 +904,10 @@ mod tests {
         assert!(PAGE.contains("apple-mobile-web-app-capable"));
         assert!(PAGE.contains("viewport-fit=cover"));
         assert!(!PAGE.contains('\u{2014}') && !PAGE.contains('\u{2013}'));
+        assert!(PAGE.contains("<script src=\"/diagram.js\"></script>"));
+        assert!(DIAGRAM_JS.contains("window.XvlDiagram"));
+        assert!(!DIAGRAM_JS.contains('\u{2014}') && !DIAGRAM_JS.contains('\u{2013}'));
+        assert!(!DIAGRAM_JS.contains("http"), "no tile, no CDN: this server only");
     }
 
     /// The server against a fixture-free app: the page, the state and a

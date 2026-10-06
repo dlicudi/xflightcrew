@@ -200,6 +200,11 @@ form.say input {
 }
 form.say input:focus { outline: 2px solid var(--cyan-line); outline-offset: 0; }
 
+/* Airport page: the map fills the space under the header (diagram.js sets
+   main.apt-on while it shows; :has() for a first paint before it runs). */
+main.apt-on, main:has(#p-apt.on) { padding: 0; overflow: hidden; position: relative; }
+#p-apt.on { position: absolute; inset: 0; gap: 0; }
+
 /* Bottom tab bar: phones only */
 nav.bottom { display: none; }
 
@@ -397,6 +402,9 @@ nav.bottom { display: none; }
         </div>
         <div id="wx-list" style="display: flex; flex-direction: column; gap: 14px"></div>
       </div>
+
+      <!-- AIRPORT (drawn by /diagram.js) -->
+      <div class="page" id="p-apt"><div class="apt-root" id="apt-root"></div></div>
     </main>
   </div>
 
@@ -416,6 +424,7 @@ nav.bottom { display: none; }
   <nav class="bottom" aria-label="EFB pages" id="bottom"></nav>
 </div>
 
+<script src="/diagram.js"></script>
 <script>
 (function () {
   'use strict';
@@ -435,9 +444,10 @@ nav.bottom { display: none; }
     now: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>',
     radio: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 10a8 8 0 0 1 16 0"/><path d="M7.5 11a4.5 4.5 0 0 1 9 0"/><circle cx="12" cy="12" r="1.5"/><path d="M12 14v7"/></svg>',
     plan: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="18" r="2"/><circle cx="19" cy="6" r="2"/><path d="M6.5 16.5 10 12l4 2 3.5-6.5"/></svg>',
-    wx: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 18h10a4 4 0 0 0 0-8 6 6 0 0 0-11.5 1.5A3.5 3.5 0 0 0 7 18z"/></svg>'
+    wx: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 18h10a4 4 0 0 0 0-8 6 6 0 0 0-11.5 1.5A3.5 3.5 0 0 0 7 18z"/></svg>',
+    apt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20 20 4"/><path d="M4 9h7v11"/><circle cx="17" cy="17" r="2"/></svg>'
   };
-  var TABS = [['now', 'Now'], ['radio', 'Radio'], ['plan', 'Plan'], ['wx', 'Weather']];
+  var TABS = [['now', 'Now'], ['radio', 'Radio'], ['plan', 'Plan'], ['wx', 'Weather'], ['apt', 'Airport']];
   var tab = 'now';
   function known(id) { return TABS.some(function (t) { return t[0] === id; }); }
   try { var saved = localStorage.getItem(TAB_KEY); if (saved && known(saved)) tab = saved; } catch (e) {}
@@ -586,6 +596,7 @@ nav.bottom { display: none; }
   }
 
   function render(s) {
+    if (window.XvlDiagram) window.XvlDiagram.update(s);
     var h = s.header;
     setText('h-cs', h.callsign);
     document.getElementById('h-type').textContent = h.aircraft || '';
