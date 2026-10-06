@@ -2260,5 +2260,5 @@ mod tests {
     }
 
     /// (act, verify, call-out) over the Zibo file's own sections, v9.0.
-    const ZIBO_COUNTS: (usize, usize, usize) = (21, 421, 218);
+    const ZIBO_COUNTS: (usize, usize, usize) = (14, 428, 218);
 }

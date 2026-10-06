@@ -412,14 +412,15 @@ checklist_map_only: true
 # - lights: the file's beacon, nav, strobe (stock) and taxi (the Zibo's
 #   own switch) through the declared light commands. "Position lights,
 #   steady" is nav AND NOT strobe: two terms, a read.
+# NOT mapped (2026-10-06 review): `electrical/battery_on` (the stock battery
+# reads 1 with the Zibo's off, and the STANDBY POWER guard item would fire
+# the battery) and `transponder_pos` (the knob ladder is unprobed). Both read.
 checklist_map:
   - { match: parking_brake_ratio,       action: parking_brake }
-  - { match: transponder_pos,           action: transponder }
   - { match: beacon_lights_on,          action: !light beacon }
   - { match: navigation_lights_on,      action: !light nav }
   - { match: strobe_lights_on,          action: !light strobe }
   - { match: taxi_light_brightness_pos, action: !light taxi }
-  - { match: electrical/battery_on,     action: !electrical battery }
 # The tracker's phases and the syllabus's ramp lists, by the file's titles.
 # A phase split into parts runs as ONE list, the parts in order (the US/CA
 # variants, for a transition altitude at or above 18,000 ft, are not the
