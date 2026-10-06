@@ -1464,16 +1464,51 @@ fn ring_dist_nm(s: &Snapshot) -> Option<f64> {
 /// Within this of the flight's peak the aircraft is still at its cruise.
 const CRUISE_BAND_FT: f64 = 1000.0;
 
-struct TodAhead;
+/// How long the run-up's episode outlives a tick that drops it. The flight
+/// model's phase flickered Cruise, Descent, Cruise at FL190 and each return
+/// was a new episode: "Descent coming up" three times in 115 s (LEGR-LXGB,
+/// 2026-10-06, sortie 1791275171-full_auto).
+const TOD_AHEAD_HOLD: Duration = Duration::from_secs(120);
 
-impl Check for TodAhead {
-    fn id(&self) -> &'static str {
-        "tod_ahead"
+#[derive(Default)]
+struct TodAhead {
+    /// The line last true and when: the episode held through a flicker.
+    held: std::sync::Mutex<Option<(String, Instant)>>,
+}
+
+impl TodAhead {
+    /// The point is behind or the descent has begun, or there is nothing
+    /// left to judge: the episode really ends. Pure.
+    fn ended(s: &Snapshot) -> bool {
+        if s.on_ground {
+            return true;
+        }
+        if let Some(p) = &s.follower_tod {
+            return p.started || p.to_tod_nm < 0.0;
+        }
+        match (ring_dist_nm(s), s.tod_ring_nm) {
+            (Some(d), Some(r)) => d - r < 0.0,
+            _ => true,
+        }
     }
-    fn severity(&self) -> Severity {
-        Severity::Advisory
+
+    /// [`Check::eval`] at a given instant.
+    fn eval_at(&self, s: &Snapshot, now: Instant) -> Option<String> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(line) = self.line(s) {
+            *held = Some((line.clone(), now));
+            return Some(line);
+        }
+        if let Some((line, at)) = held.as_ref() {
+            if now.duration_since(*at) < TOD_AHEAD_HOLD && !Self::ended(s) {
+                return Some(line.clone());
+            }
+        }
+        *held = None;
+        None
     }
-    fn eval(&self, s: &Snapshot) -> Option<String> {
+
+    fn line(&self, s: &Snapshot) -> Option<String> {
         // Only when level: a climb or descent has its own plan. A CLIMB is
         // never announced a top of descent (09-24: "top of descent 11 miles
         // ahead" three times at 1,000 ft climbing out of a short hop).
@@ -1530,6 +1565,18 @@ impl Check for TodAhead {
             "Descent coming up. Top of descent {}.",
             tod_ahead_words(to_tod, s.groundspeed_kts)
         ))
+    }
+}
+
+impl Check for TodAhead {
+    fn id(&self) -> &'static str {
+        "tod_ahead"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Advisory
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        self.eval_at(s, Instant::now())
     }
     fn min_duration(&self) -> Duration {
         Duration::from_secs(3)
@@ -2338,7 +2385,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         Box::new(SinkRate),
         // Descent advisor — armed only when a flight plan gave us a destination
         // (the checks read `Snapshot::dest_*`, `None` without one).
-        Box::new(TodAhead),
+        Box::new(TodAhead::default()),
         Box::new(TodPassed),
         Box::new(HighOnProfile),
         // Universal: every altimeter can be mis-set, and every automation here

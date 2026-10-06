@@ -1016,7 +1016,7 @@
 
     #[test]
     fn tod_ahead_speaks_in_the_runup_band() {
-        let c = TodAhead;
+        let c = TodAhead::default();
         assert!(c.eval(&cruise_with_dest(80.0)).is_none(), "far out → quiet");
         let msg = c
             .eval(&cruise_with_dest(50.0))
@@ -1072,19 +1072,19 @@
             TodPassed.eval(&s).is_none(),
             "the hands are correctly waiting"
         );
-        let msg = TodAhead.eval(&s).expect("the follower's point, 8 nm ahead");
+        let msg = TodAhead::default().eval(&s).expect("the follower's point, 8 nm ahead");
         assert!(msg.contains("8 miles ahead"), "{msg}");
         assert!(msg.contains("down to 3,100 feet"), "{msg}");
         // At the cruise it is said; one step down, the next step is not
         // (LIBP-LEMG 2026-09-26: seven calls down one arrival).
         s.flight_peak_ft = Some(s.alt_ft + 200.0);
-        assert!(TodAhead.eval(&s).is_some(), "still at the cruise");
+        assert!(TodAhead::default().eval(&s).is_some(), "still at the cruise");
         s.flight_peak_ft = Some(s.alt_ft + 5000.0);
-        assert!(TodAhead.eval(&s).is_none(), "a step of a descent already begun");
+        assert!(TodAhead::default().eval(&s).is_none(), "a step of a descent already begun");
         // The ring says "coming up" (50 nm out); the follower is 20 nm away.
         let mut s = cruise_with_dest(50.0);
         s.follower_tod = Some(tod(20.0, false));
-        assert!(TodAhead.eval(&s).is_none(), "far from the follower's point");
+        assert!(TodAhead::default().eval(&s).is_none(), "far from the follower's point");
         // Two miles past its own point and still level: the follower missed.
         let mut s = cruise_with_dest(38.0);
         s.follower_tod = Some(tod(-2.0, false));
@@ -1093,7 +1093,7 @@
         // Descent commanded: both quiet, whatever the ring thinks.
         let mut s = cruise_with_dest(38.0);
         s.follower_tod = Some(tod(0.0, true));
-        assert!(TodAhead.eval(&s).is_none());
+        assert!(TodAhead::default().eval(&s).is_none());
         assert!(TodPassed.eval(&s).is_none());
         // Mid-descent on the follower's slope: the ring's slope never judges it.
         let mut s = cruise_with_dest(30.0);
@@ -1123,7 +1123,7 @@
         };
         let mut s = cruise_with_dest(38.0);
         s.follower_tod = Some(held(5.0));
-        let msg = TodAhead.eval(&s).expect("the plan's descent, reminded");
+        let msg = TodAhead::default().eval(&s).expect("the plan's descent, reminded");
         assert!(msg.contains("19,000 held") && msg.contains("IDREK"), "{msg}");
         s.follower_tod = Some(held(-3.0));
         assert!(TodPassed.eval(&s).is_none(), "the pilot chose the level");
@@ -1133,7 +1133,7 @@
         assert!(TodPassed.eval(&s).is_none(), "a climb is not 'still level'");
         let mut s = cruise_with_dest(50.0);
         s.vsi_fpm = 450.0;
-        assert!(TodAhead.eval(&s).is_none(), "no top of descent in a climb");
+        assert!(TodAhead::default().eval(&s).is_none(), "no top of descent in a climb");
     }
 
     /// EGLF-LFPB, 2026-09-22: between the legs that HAVE a descent the
@@ -1151,7 +1151,7 @@
         let mut s = cruise_with_dest(38.0);
         assert!(TodPassed.eval(&s).is_some(), "the ring alone still speaks");
         let ahead = cruise_with_dest(50.0);
-        assert!(TodAhead.eval(&ahead).is_some(), "and so does its run-up");
+        assert!(TodAhead::default().eval(&ahead).is_some(), "and so does its run-up");
         // Now a follower is flying, on a leg with nothing to descend to yet.
         s.follower_flying = true;
         assert_eq!(s.follower_tod, None, "no point to publish on this leg");
@@ -1162,7 +1162,7 @@
         );
         let mut ahead = ahead;
         ahead.follower_flying = true;
-        assert_eq!(TodAhead.eval(&ahead), None, "nor announce its own point");
+        assert_eq!(TodAhead::default().eval(&ahead), None, "nor announce its own point");
         // ...and the high-on-profile advisor keeps the same rule.
         let mut high = cruise_with_dest(30.0);
         high.vsi_fpm = -700.0;
@@ -1268,7 +1268,7 @@
         for &r in recorded {
             let s = tick(r);
             assert_eq!(TodPassed.eval(&s), None, "t {}: {:?}", r.0, s.phase);
-            assert_eq!(TodAhead.eval(&s), None, "t {}", r.0);
+            assert_eq!(TodAhead::default().eval(&s), None, "t {}", r.0);
         }
         // Level for an instant at 139 ft (the vertical-speed gate alone let
         // this speak): the ring is behind us, the old rule's numbers hold
@@ -1386,20 +1386,20 @@
         // The old comparison, the straight line: "coming up" 2.9 nm out at
         // the first valley fix, 57 nm of route before the real point...
         let old = cruise_at(1, false);
-        assert!(TodAhead.eval(&old).is_some(), "the straight line calls it");
+        assert!(TodAhead::default().eval(&old).is_some(), "the straight line calls it");
         // ...and "past the descent point" 31 nm of route out, at fix 5.
         let old = cruise_at(5, false);
         assert!(TodPassed.eval(&old).is_some(), "the straight line calls it past");
         // Along the legs: nothing on the northern loop...
         for i in 1..=4 {
             let s = cruise_at(i, true);
-            assert_eq!(TodAhead.eval(&s), None, "fix {i}");
+            assert_eq!(TodAhead::default().eval(&s), None, "fix {i}");
             assert_eq!(TodPassed.eval(&s), None, "fix {i}");
         }
         // ...the run-up where the ring is (30.7 nm of route at fix 5)...
         let s = cruise_at(5, true);
         assert_eq!(TodPassed.eval(&s), None, "not past it yet");
-        let msg = TodAhead.eval(&s).expect("the ring 5.7 nm ahead along the route");
+        let msg = TodAhead::default().eval(&s).expect("the ring 5.7 nm ahead along the route");
         assert!(msg.contains("6 miles ahead"), "{msg}");
         // ...and past it once the route to fly is inside the ring (fix 9).
         let s = cruise_at(9, true);
@@ -1477,13 +1477,13 @@
         };
         let before = cruise_at(5.0, true);
         assert_eq!(TodPassed.eval(&before), None, "5 nm before the TOD");
-        let msg = TodAhead.eval(&before).expect("the run-up to the TOD");
+        let msg = TodAhead::default().eval(&before).expect("the run-up to the TOD");
         assert!(msg.contains("ahead"), "{msg}");
         assert!(TodPassed.eval(&cruise_at(-5.0, true)).is_some(), "5 nm past it");
         // The straight line, 20 nm of route before the TOD: "passed".
         assert!(TodPassed.eval(&cruise_at(20.0, false)).is_some(), "the old comparison");
         assert_eq!(TodPassed.eval(&cruise_at(20.0, true)), None);
-        assert_eq!(TodAhead.eval(&cruise_at(20.0, true)), None);
+        assert_eq!(TodAhead::default().eval(&cruise_at(20.0, true)), None);
     }
 
     /// #127: EGKK-EGBB (sortie 1790541304-full_auto +1604) said "Top of
@@ -1501,7 +1501,7 @@
             started: false,
             held_ft: None,
         });
-        let msg = TodAhead.eval(&s).expect("the follower's point, a mile ahead");
+        let msg = TodAhead::default().eval(&s).expect("the follower's point, a mile ahead");
         assert_eq!(
             msg,
             "Descent coming up. Top of descent in under a minute, a mile ahead, down to 18,000 feet."
@@ -2401,4 +2401,25 @@
         assert_eq!(coarse_phase(F::Approach, 2000.0), Phase::Approach);
         assert_eq!(coarse_phase(F::Approach, 900.0), Phase::Landing);
         assert_eq!(coarse_phase(F::TaxiIn, 0.0), Phase::Ground);
-    }
+}
+
+/// LEGR-LXGB, 2026-10-06: the flight model flickered out of the cruise
+/// and back, and the run-up was announced three times in 115 s. One
+/// episode holds through a flicker; it ends when the point is passed.
+#[test]
+fn tod_ahead_is_said_once_through_a_flicker() {
+    let c = TodAhead::default();
+    let t0 = Instant::now();
+    let s = cruise_with_dest(50.0);
+    assert!(c.eval_at(&s, t0).is_some());
+    let mut dip = cruise_with_dest(49.0);
+    dip.vsi_fpm = -800.0;
+    assert!(c.eval_at(&dip, t0 + Duration::from_secs(30)).is_some(), "held through the dip");
+    assert!(c.eval_at(&cruise_with_dest(47.0), t0 + Duration::from_secs(60)).is_some());
+    // The point passed: the episode ends at once.
+    assert!(c.eval_at(&cruise_with_dest(40.0), t0 + Duration::from_secs(70)).is_none());
+    // A dip that outlasts the hold ends it too.
+    let c = TodAhead::default();
+    assert!(c.eval_at(&s, t0).is_some());
+    assert!(c.eval_at(&dip, t0 + TOD_AHEAD_HOLD + Duration::from_secs(1)).is_none());
+}
