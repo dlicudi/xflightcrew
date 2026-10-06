@@ -31,6 +31,7 @@ pub mod ground;
 pub mod heli;
 pub mod instruments;
 pub mod jet_start;
+pub mod lever;
 pub mod lights;
 pub mod loading;
 pub mod power;
@@ -294,6 +295,7 @@ impl Registry {
             tools.push(Box::new(gear::Gear {
                 vlo_kts: profile.vlo_kts,
                 by_command: profile.gear_by_command,
+                commands: profile.gear_commands.clone(),
             }));
         }
 
@@ -468,6 +470,7 @@ impl Registry {
                     piston_mixture: profile.engine,
                     turboprop_start: profile.turboprop_start.clone(),
                     airliner_start: profile.airliner_start.clone(),
+                    boeing_start: profile.boeing_start.clone(),
                     all_electrical_on_cmds: all_electrical_on_cmds(&profile.electrical),
                     all_electrical_toggles: all_electrical_toggles(&profile.electrical),
                     cfg: ap.clone(),
@@ -516,12 +519,19 @@ impl Registry {
         // Declared first because it is the specific one — an airframe with
         // this block never wants the MD-82's bleed/crank sequence as well,
         // and two tools of the same name is a registry that answers twice.
-        if let Some(a) = profile.airliner_start.clone() {
+        // A starter knob and a start lever per engine (the Zibo 737): the
+        // Boeing shape, the most specific of all, so it wins over the rest.
+        let boeing = profile.boeing_start.is_some();
+        if let Some(b) = profile.boeing_start.clone() {
+            tools.push(Box::new(jet_start::BoeingStart::new(b)));
+            tools.push(Box::new(jet_start::StopEngines::new(profile)));
+        }
+        if let Some(a) = profile.airliner_start.clone().filter(|_| !boeing) {
             tools.push(Box::new(jet_start::AirlinerStart::new(a, profile.engines)));
             tools.push(Box::new(jet_start::StopEngines::new(profile)));
         }
         // Turbine start sequence (jets) — distinct from the piston one-shot start.
-        if profile.turbine_start && profile.airliner_start.is_none() {
+        if profile.turbine_start && profile.airliner_start.is_none() && !boeing {
             tools.push(Box::new(jet_start::StartEngines));
             tools.push(Box::new(jet_start::StopEngines::new(profile)));
         }
@@ -534,7 +544,10 @@ impl Registry {
         // "shut down aircraft") and every one of them parsed to a tool the
         // registry had not built, until they gave up with "my aircraft"
         // (2026-09-17).
-        if profile.scripted_auto_start && !profile.turbine_start && profile.airliner_start.is_none()
+        if profile.scripted_auto_start
+            && !profile.turbine_start
+            && profile.airliner_start.is_none()
+            && !boeing
         {
             tools.push(Box::new(jet_start::ScriptedAutoStart));
             tools.push(Box::new(jet_start::StopEngines::new(profile)));
@@ -545,6 +558,7 @@ impl Registry {
         // engines spooling down like every other.
         if !profile.fuel_cutoff_levers.is_empty()
             && profile.airliner_start.is_none()
+            && !boeing
             && !profile.turbine_start
             && !profile.scripted_auto_start
         {

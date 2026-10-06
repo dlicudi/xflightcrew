@@ -60,10 +60,8 @@ const VS_STATUS: &str = autoflight::names::VS_STATUS;
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 /// Gear handle — the circuit lowers it turning base (autoland's own
 /// extension only fires inside 6 nm, which this hands over well inside of).
-const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 /// Flap handle: base and final extend the landing flaps by the placard
 /// gates as the speed allows, the same law autoland runs inside.
-const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 /// The flap the base leg configures toward (the handle ratio): about half
 /// travel, the approach setting on every airframe here; final goes to full.
 const BASE_FLAP_RATIO: f64 = 0.5;
@@ -4620,7 +4618,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     if limits.is_empty() || last_flap.is_none_or(|f| f <= flap + 1e-6) {
                         None
                     } else {
-                        Some(xp.set_float(FLAP_RATIO, flap).await.is_ok())
+                        Some(crate::tools::flaps::set_handle(&xp, flap).await.is_ok())
                     }
                 },);
                 crate::blackbox::record(
@@ -4928,7 +4926,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         if !gear_lowered
             && (matches!(leg, Leg::Base) || (matches!(leg, Leg::Downwind) && a_m < 0.0))
         {
-            let _ = xp.set_float(GEAR_HANDLE, 1.0).await;
+            let _ = crate::tools::gear::set_handle(&xp, false).await;
             alert(&voice, Priority::Advisory, "Gear down.");
             gear_lowered = true;
         }
@@ -5260,7 +5258,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     let flap = crate::autoland::flap_within_limits(wanted, ias, &limits);
                     if last_flap != Some(flap) {
                         last_flap = Some(flap);
-                        let _ = xp.set_float(FLAP_RATIO, flap).await;
+                        let _ = crate::tools::flaps::set_handle(&xp, flap).await;
                         crate::blackbox::record(
                             "circuit",
                             serde_json::json!({"event": "flaps", "leg": format!("{leg:?}"), "ratio": flap, "ias": ias}),
@@ -5297,7 +5295,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     }
                     if let Some(next) = step {
                         flap_pace.stepped(cmd);
-                        let ok = xp.set_float(FLAP_RATIO, next).await.is_ok();
+                        let ok = crate::tools::flaps::set_handle(&xp, next).await.is_ok();
                         last_flap = Some(next);
                         cleaning_up = (next > 1e-6).then_some(next);
                         let detent = crate::aircraft::live_profile().and_then(|lp| {
@@ -5330,7 +5328,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 )
             {
                 gear_up_owed = false;
-                let ok = xp.set_float(GEAR_HANDLE, 0.0).await.is_ok();
+                let ok = crate::tools::gear::set_handle(&xp, true).await.is_ok();
                 if ok {
                     gear_lowered = false;
                 }

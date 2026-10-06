@@ -880,10 +880,10 @@ fn record_settle(verdict: &Settle, dial_ft: f64, s: Option<&SettleSample>) {
 async fn clean_up(xp: &crate::xplane::XPlaneClient) -> (Option<bool>, Option<bool>) {
     let read = |name: &'static str| async move { xp.get_float(name).await.ok() };
     if read(crate::datarefs::GEAR_HANDLE_DOWN).await.is_some_and(|g| g > 0.5) {
-        let _ = xp.set_float(crate::datarefs::GEAR_HANDLE_DOWN, 0.0).await;
+        let _ = crate::tools::gear::set_handle(xp, true).await;
     }
     if read(crate::datarefs::FLAP_RATIO).await.is_some_and(|f| f > 0.01) {
-        let _ = xp.set_float(crate::datarefs::FLAP_RATIO, 0.0).await;
+        let _ = crate::tools::flaps::set_handle(xp, 0.0).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     (

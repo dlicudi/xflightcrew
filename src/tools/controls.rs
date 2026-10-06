@@ -852,9 +852,71 @@ impl Tool for SetPitchTrim {
 
 /// Speedbrake/spoiler lever: 1 = fully extended, 0 = stowed, -0.5 = armed (auto
 /// deploy on touchdown). The MD-82 uses this standard, writable dataref.
-const SPEEDBRAKE: &str = "sim/cockpit2/controls/speedbrake_ratio";
+pub const SPEEDBRAKE: &str = "sim/cockpit2/controls/speedbrake_ratio";
 /// Gear handle (1 = down). Read by the speedbrake-on-final guard.
 const GEAR_HANDLE_DOWN: &str = crate::datarefs::GEAR_HANDLE_DOWN;
+
+/// The live airframe's speedbrake lever stepped by commands
+/// (`speedbrake_lever:`), `None` where the stock lever takes a write.
+fn live_speedbrake_lever() -> Option<crate::aircraft::SpeedbrakeLever> {
+    crate::aircraft::lever_profile().and_then(|p| p.speedbrake_lever.clone())
+}
+
+/// THE speedbrake seam, in the STOCK sense every caller already speaks
+/// (-0.5 armed, 0 down, 0.5 the flight detent, 1 full): the tool, the
+/// takeoff and landing configuration, the reject, the follower's descent
+/// drag and undo all go through it. The stock `speedbrake_ratio` is written
+/// where the airframe takes it (byte-identical to the write it replaced);
+/// where the profile declares `speedbrake_lever` the lever is stepped by
+/// its commands and `speedbrake_ratio` is never written (on the Zibo that
+/// write sticks while its lever never moves: a lying readback).
+pub async fn speedbrake_set(xp: &dyn crate::xplane::XPlane, stock: f64) -> Result<()> {
+    speedbrake_set_with(xp, live_speedbrake_lever().as_ref(), stock).await
+}
+
+/// [`speedbrake_set`] with the lever given.
+pub async fn speedbrake_set_with(
+    xp: &dyn crate::xplane::XPlane,
+    lever: Option<&crate::aircraft::SpeedbrakeLever>,
+    stock: f64,
+) -> Result<()> {
+    let Some(l) = lever else {
+        return xp.set_float(SPEEDBRAKE, stock).await;
+    };
+    let s = super::lever::step_lever(
+        xp,
+        &l.commands(),
+        l.lever_for(stock),
+        crate::aircraft::SpeedbrakeLever::TOLERANCE,
+    )
+    .await;
+    if s.took() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("the speedbrake lever did not take: {s:?}"))
+    }
+}
+
+/// The speedbrake in the stock sense: the declared lever's reading mapped
+/// back, else the stock `speedbrake_ratio`.
+pub async fn speedbrake_read(xp: &dyn crate::xplane::XPlane) -> Result<f64> {
+    speedbrake_read_with(xp, live_speedbrake_lever().as_ref()).await
+}
+
+/// [`speedbrake_read`] with the lever given.
+pub async fn speedbrake_read_with(
+    xp: &dyn crate::xplane::XPlane,
+    lever: Option<&crate::aircraft::SpeedbrakeLever>,
+) -> Result<f64> {
+    match lever {
+        None => xp.get_float(SPEEDBRAKE).await,
+        Some(l) => {
+            let v = xp.get_float(&l.readback).await?;
+            anyhow::ensure!(v.is_finite(), "speedbrake lever reads {v}");
+            Ok(l.stock_for(v))
+        }
+    }
+}
 
 pub struct SetSpeedbrake;
 
@@ -923,8 +985,25 @@ impl Tool for SetSpeedbrake {
                 ));
             }
         }
-        ctx.xplane.set_float(SPEEDBRAKE, target).await?;
-        let actual = ctx.xplane.get_float(SPEEDBRAKE).await.unwrap_or(target);
+        let lever = live_speedbrake_lever();
+        let actual = match &lever {
+            None => {
+                ctx.xplane.set_float(SPEEDBRAKE, target).await?;
+                ctx.xplane.get_float(SPEEDBRAKE).await.unwrap_or(target)
+            }
+            // Stepped by its commands; the answer is what the LEVER reads
+            // (a press that did not take reads where it stayed).
+            Some(l) => {
+                let _ = speedbrake_set_with(ctx.xplane, Some(l), target).await;
+                match speedbrake_read_with(ctx.xplane, Some(l)).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Ok("Speedbrake selected, but I can't read the lever. Check it."
+                            .to_string())
+                    }
+                }
+            }
+        };
         let state = if actual > 0.05 {
             "extended"
         } else if actual < -0.05 {
@@ -1160,5 +1239,51 @@ mod tests {
             !trim_needs_reset(0.1),
             "a hand-set takeoff trim is left alone"
         );
+    }
+
+    fn zibo_lever() -> crate::aircraft::SpeedbrakeLever {
+        crate::aircraft::load("zibo_738")
+            .expect("zibo profile loads")
+            .speedbrake_lever
+            .expect("the zibo steps its speedbrake by command")
+    }
+
+    #[test]
+    fn the_stock_sense_maps_to_the_lever_and_back() {
+        let l = zibo_lever();
+        assert_eq!(l.lever_for(-0.5), l.armed);
+        assert_eq!(l.lever_for(0.0), l.down);
+        assert_eq!(l.lever_for(0.5), l.flight);
+        assert_eq!(l.lever_for(1.0), l.full);
+        assert_eq!(l.stock_for(0.0889), -0.5, "the probed ARMED lever");
+        assert_eq!(l.stock_for(0.0), 0.0);
+        assert_eq!(l.stock_for(l.flight), 0.5);
+        assert_eq!(l.stock_for(l.full), 1.0);
+        let mid = l.stock_for((l.flight + l.full) / 2.0);
+        assert!(mid > 0.5 && mid < 1.0, "{mid}");
+    }
+
+    /// The Zibo: a stock write sticks while the lever never moves. The seam
+    /// steps the lever and never writes `speedbrake_ratio`; without a lever
+    /// it is the stock write it replaced.
+    #[tokio::test(start_paused = true)]
+    async fn a_stepped_speedbrake_is_never_written_and_reads_from_its_lever() {
+        let l = zibo_lever();
+        let xp = FakeXPlane::with_reads(&[(&l.readback, 0.0)]);
+        xp.set_on_command(&l.more, &l.readback, 0.0889);
+        speedbrake_set_with(&xp, Some(&l), -0.5).await.unwrap();
+        assert_eq!(speedbrake_read_with(&xp, Some(&l)).await.unwrap(), -0.5);
+        assert!(xp.ran(&l.more) && !xp.wrote(SPEEDBRAKE));
+
+        let dead = FakeXPlane::with_reads(&[(&l.readback, 0.0)]);
+        assert!(
+            speedbrake_set_with(&dead, Some(&l), -0.5).await.is_err(),
+            "named, not Roger"
+        );
+
+        let stock = FakeXPlane::new();
+        speedbrake_set_with(&stock, None, -0.5).await.unwrap();
+        assert_eq!(stock.writes_to(SPEEDBRAKE), vec![-0.5]);
+        assert!(!stock.ran(&l.more));
     }
 }

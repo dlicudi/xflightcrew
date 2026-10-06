@@ -1609,6 +1609,15 @@ async fn run_session(
                         } else if let Some(d) = autoflight::dial_named(dr) {
                             // An autopilot dial goes back through its owner.
                             autoflight::set_dial(&xplane, d, *old).await.is_ok()
+                        } else if dr == datarefs::FLAP_RATIO {
+                            // The flaps, the speedbrake and the gear go back
+                            // through their seams: stepped by command where
+                            // the airframe's lever ignores a write.
+                            tools::flaps::set_handle(&xplane, *old).await.is_ok()
+                        } else if dr == tools::controls::SPEEDBRAKE {
+                            tools::controls::speedbrake_set(&xplane, *old).await.is_ok()
+                        } else if dr == datarefs::GEAR_HANDLE_DOWN {
+                            tools::gear::set_handle(&xplane, *old < 0.5).await.is_ok()
                         } else if *is_int {
                             xplane.set_int(dr, old.round() as i64).await.is_ok()
                         } else {
@@ -3518,7 +3527,16 @@ async fn run_session(
             // contribute nothing and simply can't be undone.
             let mut pre: Vec<(String, String, f64, bool)> = Vec::new();
             for (dr, label, is_int) in undo_targets(&call.name) {
-                if let Ok(v) = xplane.get_float(&dr).await {
+                // A lever the airframe steps by command is read where the
+                // lever is (the same seam that will put it back).
+                let read = if dr == datarefs::FLAP_RATIO {
+                    tools::flaps::read_handle(&xplane).await
+                } else if dr == tools::controls::SPEEDBRAKE {
+                    tools::controls::speedbrake_read(&xplane).await
+                } else {
+                    xplane.get_float(&dr).await
+                };
+                if let Ok(v) = read {
                     pre.push((dr, label.to_string(), v, is_int));
                 }
             }

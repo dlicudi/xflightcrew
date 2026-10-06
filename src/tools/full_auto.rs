@@ -343,6 +343,9 @@ pub struct FullAuto {
     /// catches on a turbine).
     pub turboprop_start: Option<crate::aircraft::TurbineStartProfile>,
     pub airliner_start: Option<crate::aircraft::AirlinerStartProfile>,
+    /// A starter knob and a start lever per engine (the Zibo 737): the
+    /// airliner class, flown by `jet_start::BoeingStart`.
+    pub boeing_start: Option<crate::aircraft::BoeingStartProfile>,
     /// Jet with an APU (profile `turbine_start`): full auto cranks it with the
     /// `start_engines` sequence — bleed air, N2, fuel at 20% — not the piston
     /// start. THREE airframe classes, three starts; the missing third had full
@@ -604,7 +607,7 @@ impl FullAuto {
             self.jet_start,
             self.piston_engine,
             self.scripted_auto_start,
-            self.airliner_start.is_some(),
+            self.airliner_start.is_some() || self.boeing_start.is_some(),
         );
         crate::full_auto::SubTools {
             lights: crate::tools::lights::SetLights::new(self.lights.clone()),
@@ -621,6 +624,11 @@ impl FullAuto {
             // on a turbine cranks something that isn't there and reports
             // "check fuel and mixture" about levers the aircraft hasn't got.
             start_engine: match (kind, &self.turboprop_start) {
+                (StartKind::Airliner, _) if self.boeing_start.is_some() => {
+                    Box::new(crate::tools::jet_start::BoeingStart::new(
+                        self.boeing_start.clone().expect("checked"),
+                    ))
+                }
                 (StartKind::Airliner, _) if self.airliner_start.is_some() => {
                     Box::new(crate::tools::jet_start::AirlinerStart::new(
                         self.airliner_start.clone().expect("checked"),
@@ -2157,6 +2165,8 @@ mod tests {
             // have an engine start for this aircraft" — the class it
             // dispatches on had never heard of the block (2026-09-20).
             ("airbus_a330_300", StartKind::Airliner),
+            // A starter knob and a start lever per engine (2026-10-06).
+            ("zibo_738", StartKind::Airliner),
         ] {
             let p = crate::aircraft::load(id).unwrap_or_else(|| panic!("{id} profile loads"));
             let got = start_kind(
@@ -2164,7 +2174,7 @@ mod tests {
                 p.turbine_start,
                 p.engine || p.piston_start.is_some(),
                 p.scripted_auto_start,
-                p.airliner_start.is_some(),
+                p.airliner_start.is_some() || p.boeing_start.is_some(),
             );
             // Whatever class it lands in, the mission must be able to BUILD
             // a start for it: a class with no tool behind it is the hole

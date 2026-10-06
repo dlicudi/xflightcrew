@@ -168,7 +168,6 @@ const HDG_BUG: &str = Dial::HeadingBug.read_name();
 #[cfg(test)]
 const VS_DIAL: &str = Dial::Vs.read_name();
 const ALT_IND_FT: &str = crate::datarefs::ALTITUDE_FT;
-const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 // Rollout: nose steering + proportional wheel brakes through the plugin, the
 // same channels the taxi governor drives.
@@ -3220,7 +3219,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     let _ = tokio::join!(
                         xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
                         autoflight::set_dial(&xp, Dial::Vs, 0.0),
-                        xp.set_float(FLAP_RATIO, 0.0),
+                        crate::tools::flaps::set_handle(&xp, 0.0),
                     );
                     announce(
                         format!(
@@ -4436,7 +4435,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     && (g.dist_nm < 6.0 || plan_flap.is_some_and(|f| f >= 0.5 - 1e-6))
                     && gear_may_extend(ias, crate::aircraft::gear_limit_kts())
                 {
-                    let _ = xp.set_float(GEAR_HANDLE, 1.0).await;
+                    let _ = crate::tools::gear::set_handle(&xp, false).await;
                     gear_down = true;
                 }
                 // The landing's own checklist items, with the gear: ground
@@ -4493,7 +4492,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 );
                 if last_flap != Some(flap) {
                     last_flap = Some(flap);
-                    let _ = xp.set_float(FLAP_RATIO, flap).await;
+                    let _ = crate::tools::flaps::set_handle(&xp, flap).await;
                 }
 
                 // Watchdog: the AP not FLYING the commanded vertical speed is how

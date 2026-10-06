@@ -72,7 +72,26 @@ autopilot: true
 throttle: true         # VERIFY: override_throttles is held at 1 by zibomod
 # The `autothrottle` tool is written against laminar/md82 names.
 autothrottle: false
-speedbrake: false      # probed 2026-10-06: a stock speedbrake_ratio write STICKS but the Zibo's lever (flt_ctrls/speedbrake_lever) never moves, so the readback would lie. The stock speed_brakes_down_one/up_one commands drive it (down_one from DOWN is ARMED, lever 0.089). Off until the tool steps by command.
+# Probed 2026-10-06: a stock speedbrake_ratio write STICKS but the Zibo's
+# lever (flt_ctrls/speedbrake_lever) never moves, so a write's readback would
+# lie. The stock speed_brakes_down_one / up_one commands drive the lever
+# (down_one from DOWN is ARMED, lever 0.089, the speedbrake_armed lamp; up_one
+# back to 0). So the lever is STEPPED by those commands and read back from
+# itself (`speedbrake_lever:` below), and speedbrake_ratio is never written:
+# the tool, the takeoff config's DOWN, the reject, arm-for-landing and the
+# descent drag all go through that one seam.
+speedbrake: true
+speedbrake_lever:
+  more: sim/flight_controls/speed_brakes_down_one
+  less: sim/flight_controls/speed_brakes_up_one
+  readback: laminar/B738/flt_ctrls/speedbrake_lever
+  down: 0.0
+  armed: 0.089
+  # VERIFY: the flight detent's lever value (the 737's lever runs ARMED,
+  # FLIGHT DETENT, UP); 0.667 is a hypothesis. A notch past it stops at the
+  # nearest, never hunts back and forth.
+  flight: 0.667
+  full: 1.0
 # The Zibo's reversers are its own levers (flt_ctrls/reverse_lever1/2) under
 # override_throttles: the stock beta/reverse write is not expected to reach
 # them. Off until probed.
@@ -121,33 +140,106 @@ autoflight:
 parking_brake: true    # stock ratio reads 1 with laminar/B738/parking_brake_pos 1 parked. VERIFY the write
 retractable_gear: true
 # The stock gear commands are the Zibo's own (B738_Commands.txt "Rewrite
-# default commands": up = UP, down = "off, down", so a down from UP may need
-# two presses). The readback is the stock handle. VERIFY.
+# default commands": up = UP, down = "off, down", so a down from UP takes two
+# presses). Its own buttons go straight there: `push_button/gear_up` and
+# `gear_down` (B738_Commands.txt, the same commands its sim_cockpit Lua
+# fires). The lever is `controls/gear_handle_down`, 0 UP, 0.5 OFF, 1 DOWN
+# (B738.zz.sim_cockpit.lua:736-751; probed parked 1.0 with the stock handle
+# 1). `switches/landing_gear` is a cockpit builder's INPUT, not the lever (it
+# reads 0 parked). The tool and every loop press these and read the handle
+# back; the legs (deploy_ratio) are blackboxed `gear`. VERIFY in the air.
 gear_by_command: true
+gear_commands:
+  up: laminar/B738/push_button/gear_up
+  down: laminar/B738/push_button/gear_down
+  handle: laminar/B738/controls/gear_handle_down
+  handle_up: 0.0
+  handle_down: 1.0
 cabin_crew: true       # 189 seats and an interphone
 pressurised: true
 engines: 2
 
-# ENGINE START: none of the shapes the code has fits a 737. There is no
-# scripted start (`sim/operation/auto_start` is not replaced here, so it
-# would be X-Plane's generic start under the Zibo's systems), the MD-82
-# sequence is laminar/md82, and `airliner_start` is an Airbus ENG MODE knob
-# plus a master ARRAY. The 737 is a starter knob PER ENGINE
-# (`laminar/B738/rotary/eng1_start_grd`, position `laminar/B738/engine/
-# starter1_pos`, 0 GRD 1 AUTO/OFF 2 CONT 3 FLT) and a start lever per engine
-# brought to IDLE at 25 % N2 (`laminar/B738/engine/mixture1_idle`). Left to
-# the pilot until the code has that shape.
+# ENGINE START: the Boeing shape (`boeing_start`, `jet_start::BoeingStart`).
+# None of the older shapes fits: there is no scripted start here
+# (`sim/operation/auto_start` is not replaced, so it would be X-Plane's
+# generic start under the Zibo's systems), the MD-82 sequence is laminar/md82,
+# and `airliner_start` is an Airbus ENG MODE knob plus a master ARRAY.
+# The steps are the aircraft's own checklist's (clist.txt ENGINE START &
+# PUSHBACK): ENGINE START SWITCH 2 GROUND (`starter2_pos` 0), START LEVER 2
+# IDLE reaching 25 % N2 (`mixture_ratio2` 1), monitor EGT, STABLE when the
+# starter is back at AUTO (`starter2_pos` 1, the knob springs back at about
+# 56 % N2), then engine 1 the same. Starter positions 0 GRD 1 AUTO/OFF 2 CONT
+# 3 FLT (B738_Datarefs.txt). Every name probed 2026-10-06 (parked, cold):
+# the starters read 1, the levers 0, the duct pressures 0 (APU off), the
+# Zibo's own N2 and EGT gauges 0 and 11 C. VERIFY the whole start on the
+# ground: nothing here has been pressed.
 turbine_start: false
 auto_prep: false
 scripted_auto_start: false
+boeing_start:
+  engines:
+    - engine: 1
+      starter_grd_command: laminar/B738/rotary/eng2_start_grd
+      starter_off_command: laminar/B738/rotary/eng2_start_off
+      starter_position: laminar/B738/engine/starter2_pos
+      lever_idle_command: laminar/B738/engine/mixture2_idle
+      lever_cutoff_command: laminar/B738/engine/mixture2_cutoff
+      lever_position: laminar/B738/engine/mixture_ratio2
+      n2: laminar/B738/engine/indicators/N2_percent_2
+      egt: laminar/B738/engine/eng2_egt
+    - engine: 0
+      starter_grd_command: laminar/B738/rotary/eng1_start_grd
+      starter_off_command: laminar/B738/rotary/eng1_start_off
+      starter_position: laminar/B738/engine/starter1_pos
+      lever_idle_command: laminar/B738/engine/mixture1_idle
+      lever_cutoff_command: laminar/B738/engine/mixture1_cutoff
+      lever_position: laminar/B738/engine/mixture_ratio1
+      n2: laminar/B738/engine/indicators/N2_percent_1
+      egt: laminar/B738/engine/eng1_egt
+  # Start air from the APU bleed: the checklist only asks for the ducts to
+  # be "working"; 25 psi is the type's minimum for a start. The APU and its
+  # bleed are the pilot's (or the preflight flow's): this start refuses,
+  # with the number, rather than turn a starter with no air.
+  duct_pressure: [laminar/B738/indicators/duct_press_L, laminar/B738/indicators/duct_press_R]
+  min_duct_psi: 25.0
+  starter_grd: 0.0
+  starter_released: 1.0
+  lever_idle: 1.0
+  lever_cutoff: 0.0
+  fuel_on_n2: 25.0
+  stable_n2: 55.0
+  egt_start_limit_c: 725.0
+  # Before the first starter: the beacon and the packs OFF (the checklist's
+  # "ANTI COLLISION LIGHT ON", "LEFT & RIGHT AIR CONDITIONING PACKS OFF").
+  # Packs are 0 OFF, 1 AUTO, 2 HIGH (B738_Datarefs.txt); `l_pack_up` is
+  # taken to step toward OFF, as the stock 737's Lpack_up does
+  # (B738.systems.lua:1393). VERIFY the direction: a wrong one reads back
+  # and is named, never "Roger".
+  pre_start_steps:
+    - { command: sim/lights/beacon_lights_on, position: sim/cockpit2/switches/beacon_on, want: 1 }
+    - { command: laminar/B738/toggle_switch/l_pack_dn, down_command: laminar/B738/toggle_switch/l_pack_up, position: laminar/B738/air/l_pack_pos, want: 0 }
+    - { command: laminar/B738/toggle_switch/r_pack_dn, down_command: laminar/B738/toggle_switch/r_pack_up, position: laminar/B738/air/r_pack_pos, want: 0, say: "Packs off." }
+  # After both are stable (BEFORE TAXI): generators on, packs AUTO, APU
+  # bleed off. The APU itself is left running for the pilot.
+  post_start_steps:
+    - { command: laminar/B738/toggle_switch/gen1_dn, position: "sim/cockpit/electrical/generator_on[0]", want: 1 }
+    - { command: laminar/B738/toggle_switch/gen2_dn, position: "sim/cockpit/electrical/generator_on[1]", want: 1, say: "Generators on." }
+    - { command: laminar/B738/toggle_switch/l_pack_dn, down_command: laminar/B738/toggle_switch/l_pack_up, position: laminar/B738/air/l_pack_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/r_pack_dn, down_command: laminar/B738/toggle_switch/r_pack_up, position: laminar/B738/air/r_pack_pos, want: 1, say: "Packs auto." }
+    - { command: laminar/B738/toggle_switch/bleed_air_apu, position: laminar/B738/toggle_switch/bleed_air_apu_pos, want: 0, say: "A.P.U. bleed off." }
 
-# Cutoff: the start levers. B738_Datarefs.txt lists `laminar/B738/engine/
-# mixture_ratio1/2` as read/write (0..1), and the API says writable. VERIFY:
-# the shutdown watches the engines down, so a lever that is only an
-# animation output is caught and said, never "Roger".
+# Cutoff: the start levers, moved by their OWN commands (`mixture1_cutoff`,
+# `mixture2_cutoff`, B738_Commands.txt calc.lua block), the same ones the
+# start's abort fires. A write to `mixture_ratio1/2` (writable on the API)
+# is not trusted on this aircraft: its flap and speedbrake writes proved to
+# be outputs. The shutdown watches the engines down either way, so a lever
+# that did not go is said, never "Roger".
 fuel_cutoff_levers:
   - laminar/B738/engine/mixture_ratio1
   - laminar/B738/engine/mixture_ratio2
+fuel_cutoff_commands:
+  - laminar/B738/engine/mixture1_cutoff
+  - laminar/B738/engine/mixture2_cutoff
 
 # Jet: none of the piston systems apply.
 engine: false
@@ -269,9 +361,8 @@ vs_clean_kts: 139.0
 vlo_kts: 235.0
 
 # Boeing practice (the stock 737's, the same airframe type): the speedbrake
-# DOWN for takeoff, armed at the gear. Written on the STOCK speedbrake_ratio:
-# VERIFY that the Zibo's lever (`flt_ctrls/speedbrake_lever`, the
-# `speedbrake_armed` annunciator) follows. The autobrake, flight directors,
+# DOWN for takeoff, armed at the gear. Through `speedbrake_lever:` above:
+# stepped by command, read back on `flt_ctrls/speedbrake_lever`. The autobrake, flight directors,
 # A/T arm and V2 window are NOT declared: each is written on a stock name
 # this aircraft has its own switch for (autobrake: `laminar/B738/knob/
 # autobrake_rto` and `autobrake_pos`; FD: `autopilot/flight_director_toggle`
@@ -368,14 +459,21 @@ reference:
 # Nine positions in the aircraft file (`_flap_detents` 8), the 737's
 # UP/1/2/5/10/15/25/30/40 handle gates, at eighths of the stock handle
 # (probed parked: stock flap_ratio 0.5 with the Zibo's
-# `laminar/B738/flt_ctrls/flap_lever` 0.5). The tool writes the stock
-# handle; probed 2026-10-06 a write to it is put straight back (a silent
-# no-op, caught by the readback), while the stock flaps_down / flaps_up
-# commands step the Zibo's lever one detent each (0.5 to 0.625 and back). Placard
-# limits are the type's; the acf agrees at both ends (Vfe1 250, Vfem 162).
+# `laminar/B738/flt_ctrls/flap_lever` 0.5). Probed 2026-10-06 a write to the
+# stock handle is put straight back (a silent no-op), while the stock
+# flaps_down / flaps_up commands step the Zibo's lever one detent each (0.5
+# to 0.625 and back). So the lever is STEPPED (`by_command:`), each press
+# read back on the lever, a press that moves nothing named: the tool, the
+# takeoff config, the climb-out, the circuit, the follower and autoland all
+# go through that one seam (`tools::flaps::set_handle`). Placard limits are
+# the type's; the acf agrees at both ends (Vfe1 250, Vfem 162).
 # No `idle_decel_kts_s`: those were fitted to the stock 737's flight model.
 flaps:
   takeoff_ratio: 0.375
+  by_command:
+    more: sim/flight_controls/flaps_down
+    less: sim/flight_controls/flaps_up
+    readback: laminar/B738/flt_ctrls/flap_lever
   detents:
     - { label: up,   spoken: up,          ratio: 0.0,   retract_above_kts: 210.0 }
     - { label: "1",  spoken: one,         ratio: 0.125, vfe_kts: 250.0, retract_above_kts: 190.0 }
@@ -402,7 +500,9 @@ checklist: acf:clist.txt
 # back), so an unmapped item is read and confirmed, never written.
 checklist_map_only: true
 # The tools that work here per this profile, nothing else: the flaps,
-# speedbrake, gear, autobrake and MCP items stay reads (see above).
+# speedbrake, gear, autobrake and MCP items stay reads (see above; the
+# tools themselves now step the flaps and speedbrake by command, but the
+# list's items are not mapped to them until flown).
 # - battery: the file tests the stock `battery_on[0]` (with the guard and
 #   its failure); the tool fires battery_dn and reads `battery_pos`.
 # - transponder: the knob `transponder_pos`, decoded by the shared stock

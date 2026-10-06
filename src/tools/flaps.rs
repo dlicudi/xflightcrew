@@ -12,8 +12,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::lever::{step_lever, Stepped};
 use super::{Tool, ToolCtx};
-use crate::aircraft::{FlapDetent, FlapProfile};
+use crate::aircraft::{FlapDetent, FlapProfile, LeverCommands};
+use crate::xplane::XPlane;
 
 /// X-Plane flap handle position, 0.0 (up) .. 1.0 (full). Writable; the actual
 /// surfaces animate toward it. Reading it back gives the commanded notch.
@@ -96,7 +98,8 @@ impl Tool for SetFlaps {
             }
         };
 
-        let current_ratio = ctx.xplane.get_float(FLAP_HANDLE).await?;
+        let by_command = self.flaps.by_command.as_ref();
+        let current_ratio = read_handle_with(ctx.xplane, by_command).await?;
 
         // Already at the commanded detent? Say so instead of re-commanding.
         if (target.ratio - current_ratio).abs() <= crate::aircraft::FLAP_DETENT_TOLERANCE {
@@ -122,11 +125,81 @@ impl Tool for SetFlaps {
             }
         }
 
+        // A lever that answers only to its commands: stepped a detent at a
+        // time, each press read back, the reply what the lever READS.
+        if let Some(c) = by_command {
+            let s = step_lever(ctx.xplane, c, target.ratio, STEP_TOLERANCE).await;
+            return Ok(match s {
+                Stepped::At { at, .. } | Stepped::Nearest { at, .. } => {
+                    format!("Roger, flaps {}.", self.describe(at))
+                }
+                Stepped::DidNotTake { at, .. } => {
+                    format!("The flap lever didn't take. Flaps {}.", self.describe(at))
+                }
+                Stepped::Unread { .. } => {
+                    "Flaps selected, but I can't read the lever. Check the flaps.".to_string()
+                }
+            });
+        }
+
         // Write, then read back the actual value and confirm *that*.
         ctx.xplane.set_float(FLAP_HANDLE, target.ratio).await?;
         let actual = ctx.xplane.get_float(FLAP_HANDLE).await?;
 
         Ok(format!("Roger, flaps {}.", self.describe(actual)))
+    }
+}
+
+/// How close a stepped flap lever must read to its detent.
+const STEP_TOLERANCE: f64 = 0.01;
+
+/// The live airframe's flap stepping commands (`flaps: by_command:`),
+/// `None` on every airframe whose stock handle takes a write.
+fn live_commands() -> Option<LeverCommands> {
+    crate::aircraft::lever_profile().and_then(|p| p.flaps.as_ref()?.by_command.clone())
+}
+
+/// THE flap handle seam: every caller that moves the flaps (the tool, the
+/// takeoff configuration, the climb-out's retraction, the circuit, the
+/// follower, autoland, the reject, undo, the enroute setup) goes through
+/// here. The stock handle is written where the airframe takes a write
+/// (byte-identical to the write it replaced); where the profile declares
+/// `by_command` the lever is stepped by its commands, each press read
+/// back, and a lever that did not go is an `Err`, never a silent no-op.
+pub async fn set_handle(xp: &dyn XPlane, ratio: f64) -> Result<()> {
+    set_handle_with(xp, live_commands().as_ref(), ratio).await
+}
+
+/// [`set_handle`] with the commands given (the tool's own, and tests).
+pub async fn set_handle_with(
+    xp: &dyn XPlane,
+    by_command: Option<&LeverCommands>,
+    ratio: f64,
+) -> Result<()> {
+    match by_command {
+        None => xp.set_float(FLAP_HANDLE, ratio).await,
+        Some(c) => {
+            let s = step_lever(xp, c, ratio, STEP_TOLERANCE).await;
+            if s.took() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("the flap lever did not take: {s:?}"))
+            }
+        }
+    }
+}
+
+/// The flap handle as the airframe reads it: the declared lever where it is
+/// stepped by command, else the stock handle.
+pub async fn read_handle(xp: &dyn XPlane) -> Result<f64> {
+    read_handle_with(xp, live_commands().as_ref()).await
+}
+
+/// [`read_handle`] with the commands given.
+pub async fn read_handle_with(xp: &dyn XPlane, by_command: Option<&LeverCommands>) -> Result<f64> {
+    match by_command {
+        None => xp.get_float(FLAP_HANDLE).await,
+        Some(c) => xp.get_float(&c.readback).await,
     }
 }
 
@@ -217,5 +290,56 @@ mod tests {
             assert_eq!(t.resolve(alias).unwrap().label, "full", "{alias}");
         }
         assert!(t.resolve("crazy").is_none());
+    }
+
+    fn zibo_flaps() -> FlapProfile {
+        aircraft::load("zibo_738").unwrap().flaps.unwrap()
+    }
+
+    fn ctx<'a>(fake: &'a crate::xplane::FakeXPlane, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
+        ToolCtx {
+            xplane: fake,
+            config: cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        }
+    }
+
+    /// The Zibo, probed 2026-10-06: flaps_down steps its lever one detent
+    /// (0.5 to 0.625); a write to the stock handle is put straight back.
+    #[tokio::test(start_paused = true)]
+    async fn a_lever_stepped_by_command_is_pressed_detent_by_detent_and_read_back() {
+        let f = zibo_flaps();
+        let c = f.by_command.clone().expect("the zibo steps its flaps");
+        let cfg = crate::config::Config::default();
+        let xp = crate::xplane::FakeXPlane::with_reads(&[(&c.readback, 0.5), (IAS_KTS, 150.0)]);
+        xp.step_on_command(&c.more, &c.readback, 0.125);
+        xp.step_on_command(&c.less, &c.readback, -0.125);
+        let out = SetFlaps::new(f.clone())
+            .execute(&json!({"notch": "30"}), &ctx(&xp, &cfg))
+            .await
+            .unwrap();
+        assert_eq!(out, "Roger, flaps thirty.");
+        assert_eq!(xp.ran_count(&c.more), 3, "10 to 30 is three detents");
+        assert!(!xp.wrote(FLAP_HANDLE), "never the stock handle");
+
+        // A press the lever ignores is said, never "Roger".
+        let dead = crate::xplane::FakeXPlane::with_reads(&[(&c.readback, 0.0), (IAS_KTS, 150.0)]);
+        let out = SetFlaps::new(f)
+            .execute(&json!({"notch": "5"}), &ctx(&dead, &cfg))
+            .await
+            .unwrap();
+        assert_eq!(out, "The flap lever didn't take. Flaps up.");
+        assert_eq!(dead.ran_count(&c.more), 1);
+    }
+
+    /// Every other airframe: the seam is the stock write it replaced.
+    #[tokio::test]
+    async fn the_seam_writes_the_stock_handle_where_no_commands_are_declared() {
+        let xp = crate::xplane::FakeXPlane::new();
+        set_handle(&xp, 0.5).await.unwrap();
+        assert_eq!(xp.writes_to(FLAP_HANDLE), vec![0.5]);
+        assert!(!xp.ran("sim/flight_controls/flaps_down"));
     }
 }

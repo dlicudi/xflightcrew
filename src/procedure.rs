@@ -1849,7 +1849,6 @@ pub fn floor_indicated(floor_true_ft: f64, true_alt_ft: f64, indicated_alt_ft: f
     floor_true_ft - (true_alt_ft - indicated_alt_ft)
 }
 
-const SPEEDBRAKE: &str = "sim/cockpit2/controls/speedbrake_ratio";
 /// The flight detent: half. Full is a ground spoiler setting on most jets.
 const SPEEDBRAKE_FLIGHT: f64 = 0.5;
 /// The follower put the speedbrake out, so the follower puts it away. A
@@ -2896,7 +2895,7 @@ pub fn start_scoped(
             )
             .await;
             if DRAG_OURS.swap(false, Ordering::SeqCst) {
-                let _ = stow.set_float(SPEEDBRAKE, 0.0).await;
+                let _ = crate::tools::controls::speedbrake_set(&stow, 0.0).await;
                 crate::blackbox::record(
                     "procedure",
                     serde_json::json!({"event": "speedbrake", "out": false, "why": "follower_ended"}),
@@ -3521,7 +3520,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             };
             if on_map_final {
                 if !gear_set && crate::autoland::gear_may_extend(ias, crate::aircraft::gear_limit_kts()) {
-                    gear_set = xp.set_float(GEAR_HANDLE, 1.0).await.is_ok();
+                    gear_set = crate::tools::gear::set_handle(&xp, false).await.is_ok();
                 }
                 // A MAP ON the runway is an ordinary final: flap as the
                 // approach goes (half inside 6 nm, full a mile before the 1,000 ft gate on the
@@ -3551,7 +3550,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 };
                 let flap = crate::autoland::flap_within_limits(wanted, ias, &crate::aircraft::flap_limits());
                 if last_flap.is_none_or(|f: f64| (f - flap).abs() > 0.01)
-                    && xp.set_float(FLAP_RATIO, flap).await.is_ok()
+                    && crate::tools::flaps::set_handle(&xp, flap).await.is_ok()
                 {
                     last_flap = Some(flap);
                     crate::blackbox::record(
@@ -4439,14 +4438,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             if want_out != ours && has_speedbrake {
                 // Read first: a lever already out is the pilot's, and an
                 // ARMED one (negative) is stowed-and-armed, ours to use.
-                let at = xp.get_float(SPEEDBRAKE).await.ok();
+                let at = crate::tools::controls::speedbrake_read(&xp).await.ok();
                 let write = match (want_out, at) {
                     (true, Some(v)) if v <= 0.05 => Some(SPEEDBRAKE_FLIGHT),
                     (false, Some(_)) => Some(0.0),
                     _ => None,
                 };
                 if let Some(v) = write {
-                    if xp.set_float(SPEEDBRAKE, v).await.is_ok() {
+                    if crate::tools::controls::speedbrake_set(&xp, v).await.is_ok() {
                         DRAG_OURS.store(want_out, Ordering::SeqCst);
                         drag_changed = Some(std::time::Instant::now());
                         let said = drag_voice.say(want_out, drag_clock.elapsed().as_secs_f64());

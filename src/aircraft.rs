@@ -942,6 +942,21 @@ pub struct AircraftProfile {
     /// (see `tools::gear::Gear::by_command`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gear_by_command: bool,
+    /// The gear lever's own commands and handle ([`GearCommands`]): the
+    /// tool and every loop press these and read the handle back. Wins over
+    /// `gear_by_command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gear_commands: Option<GearCommands>,
+    /// The speedbrake lever stepped by commands ([`SpeedbrakeLever`]):
+    /// every caller of the speedbrake (the tool, the takeoff and landing
+    /// configuration, the reject, the descent drag) goes through it and the
+    /// stock `speedbrake_ratio` is never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speedbrake_lever: Option<SpeedbrakeLever>,
+    /// A Boeing start: starter knob and start lever per engine
+    /// ([`BoeingStartProfile`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boeing_start: Option<BoeingStartProfile>,
     /// Thrust levers (`set_throttle`) without the piston controls — for turbine
     /// aircraft that have a throttle but no mixture/magnetos/piston start. A piston
     /// `engine` already implies a throttle, so it's only set for jets/turboprops.
@@ -984,6 +999,12 @@ pub struct AircraftProfile {
     /// the `_target` pair, and only a readback can tell the two apart.
     #[serde(default)]
     pub fuel_cutoff_levers: Vec<String>,
+    /// Per-engine CUTOFF commands, fired instead of writing the levers when
+    /// the lever is an output its plugin owns (the Zibo's
+    /// `mixture1_cutoff` / `mixture2_cutoff`). The levers above are still
+    /// the readback where declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fuel_cutoff_commands: Vec<String>,
     /// The value those levers take at CUTOFF. Defaults to 0.0, which is cutoff
     /// on every lever seen so far; a lever whose sense is inverted says so here.
     #[serde(default)]
@@ -1969,6 +1990,201 @@ pub struct FlapProfile {
     /// (the 172) still matters — it ensures the config before the roll.
     #[serde(default)]
     pub takeoff_ratio: Option<f64>,
+    /// The lever is stepped by commands, one detent per press, never
+    /// written (`tools::flaps::set_handle`). The Zibo 737: a write to the
+    /// stock `flap_ratio` is put straight back, while the stock
+    /// `flaps_down` / `flaps_up` move its own lever one detent each
+    /// (probed parked, 2026-10-06). `None` writes the stock handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_command: Option<LeverCommands>,
+}
+
+/// A lever that answers only to its step commands: one notch per press, read
+/// back from the lever itself after every press
+/// ([`crate::tools::lever::step_lever`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeverCommands {
+    /// One notch toward MORE (flaps down, speedbrake out).
+    pub more: String,
+    /// One notch toward LESS (flaps up, speedbrake in).
+    pub less: String,
+    /// The lever's own position, read before every press and after it.
+    pub readback: String,
+    /// How long a press is given to MOVE the lever before it is named as
+    /// not taken.
+    #[serde(default = "lever_step_timeout_default")]
+    pub step_timeout_s: f64,
+}
+
+fn lever_step_timeout_default() -> f64 {
+    1.5
+}
+
+/// A speedbrake lever stepped by commands (`tools::controls::speedbrake_set`),
+/// for an airframe whose own lever ignores the stock `speedbrake_ratio` (the
+/// Zibo: the stock write sticks in the stock dataref while the lever never
+/// moves, 2026-10-06). The positions are the LEVER's; the callers keep the
+/// stock sense (-0.5 armed, 0 down, 0.5 the flight detent, 1 full), mapped
+/// here both ways.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeedbrakeLever {
+    pub more: String,
+    pub less: String,
+    pub readback: String,
+    #[serde(default = "lever_step_timeout_default")]
+    pub step_timeout_s: f64,
+    #[serde(default)]
+    pub down: f64,
+    pub armed: f64,
+    /// The flight detent: what the stock sense calls 0.5.
+    pub flight: f64,
+    #[serde(default = "one")]
+    pub full: f64,
+}
+
+impl SpeedbrakeLever {
+    /// How close the lever must read to a position to be AT it.
+    pub const TOLERANCE: f64 = 0.02;
+
+    pub fn commands(&self) -> LeverCommands {
+        LeverCommands {
+            more: self.more.clone(),
+            less: self.less.clone(),
+            readback: self.readback.clone(),
+            step_timeout_s: self.step_timeout_s,
+        }
+    }
+
+    /// The lever position for a stock-sense value: armed below -0.25, down
+    /// to 0.05, the flight detent short of full, else full. Pure.
+    pub fn lever_for(&self, stock: f64) -> f64 {
+        if stock < -0.25 {
+            self.armed
+        } else if stock <= 0.05 {
+            self.down
+        } else if stock < 0.99 {
+            self.flight
+        } else {
+            self.full
+        }
+    }
+
+    /// The stock sense of a lever reading: -0.5 armed, 0 down, the flight
+    /// detent 0.5, full 1, between them in proportion. Pure.
+    pub fn stock_for(&self, lever: f64) -> f64 {
+        let tol = Self::TOLERANCE;
+        if (lever - self.armed).abs() <= tol {
+            -0.5
+        } else if lever <= self.down + tol {
+            0.0
+        } else if lever >= self.full - tol {
+            1.0
+        } else if lever <= self.flight {
+            let span = (self.flight - self.armed).max(1e-6);
+            (0.5 * (lever - self.armed) / span).clamp(0.0, 0.5)
+        } else {
+            let span = (self.full - self.flight).max(1e-6);
+            (0.5 + 0.5 * (lever - self.flight) / span).clamp(0.5, 1.0)
+        }
+    }
+}
+
+/// The gear lever's OWN commands and handle, for an airframe whose script
+/// rewrites the stock gear commands (the Zibo: stock `landing_gear_down` is
+/// "off, down", two presses from UP). Declared, both the `gear` tool and
+/// every loop that raises or lowers the gear go through
+/// [`crate::tools::gear::set_handle`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GearCommands {
+    pub up: String,
+    pub down: String,
+    /// The handle's own position, and its values UP and DOWN.
+    pub handle: String,
+    #[serde(default)]
+    pub handle_up: f64,
+    #[serde(default = "one")]
+    pub handle_down: f64,
+}
+
+/// A Boeing start: a starter knob and a start lever PER ENGINE (the 737:
+/// starter to GRD, the lever to IDLE at 25 % N2, the knob springs back to
+/// AUTO at about 56 %). Flown by `tools::jet_start::BoeingStart`; the steps
+/// and limits are the aircraft's own checklist's (the Zibo's `clist.txt`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoeingStartProfile {
+    /// The engines, IN START ORDER (a 737 starts number two first).
+    pub engines: Vec<BoeingEngineStart>,
+    /// Start air: the duct pressure gauges; the highest must read
+    /// `min_duct_psi` before a starter is turned.
+    pub duct_pressure: Vec<String>,
+    #[serde(default = "min_duct_psi_default")]
+    pub min_duct_psi: f64,
+    /// The starter knob's GRD value and the value it reads once released
+    /// (AUTO / OFF).
+    #[serde(default)]
+    pub starter_grd: f64,
+    #[serde(default = "one")]
+    pub starter_released: f64,
+    /// The start lever's IDLE and CUTOFF values.
+    #[serde(default = "one")]
+    pub lever_idle: f64,
+    #[serde(default)]
+    pub lever_cutoff: f64,
+    /// N2 at which fuel goes in.
+    #[serde(default = "fuel_on_n2_default")]
+    pub fuel_on_n2: f64,
+    /// N2 at which the engine is stable at idle (with the starter released).
+    #[serde(default = "stable_n2_default")]
+    pub stable_n2: f64,
+    /// The EGT start limit, deg C: past it the lever goes to CUTOFF.
+    #[serde(default = "egt_start_limit_default")]
+    pub egt_start_limit_c: f64,
+    /// How long the starter may crank to `fuel_on_n2`, and how long from
+    /// fuel to stable, seconds.
+    #[serde(default = "crank_secs_default")]
+    pub crank_secs: f64,
+    #[serde(default = "light_secs_default")]
+    pub light_secs: f64,
+    /// Before the first starter (packs off, beacon) and after the last
+    /// engine is stable: read before fire, read back, at a crew's pace.
+    #[serde(default)]
+    pub pre_start_steps: Vec<StartStep>,
+    #[serde(default)]
+    pub post_start_steps: Vec<StartStep>,
+}
+
+/// One engine's switches and gauges in a [`BoeingStartProfile`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoeingEngineStart {
+    /// The engine index (0 = number one), for the spoken name.
+    pub engine: usize,
+    pub starter_grd_command: String,
+    pub starter_off_command: String,
+    pub starter_position: String,
+    pub lever_idle_command: String,
+    pub lever_cutoff_command: String,
+    pub lever_position: String,
+    pub n2: String,
+    pub egt: String,
+}
+
+fn min_duct_psi_default() -> f64 {
+    25.0
+}
+fn fuel_on_n2_default() -> f64 {
+    25.0
+}
+fn stable_n2_default() -> f64 {
+    55.0
+}
+fn egt_start_limit_default() -> f64 {
+    725.0
+}
+fn crank_secs_default() -> f64 {
+    60.0
+}
+fn light_secs_default() -> f64 {
+    90.0
 }
 
 /// The climb-out retraction schedule from a flap profile: `(handle ratio,
@@ -3153,6 +3369,34 @@ pub fn publish_throttle_dataref(dref: Option<String>) {
     THROTTLE_DREF_T.with(|t| *t.borrow_mut() = dref);
 }
 
+/// The live profile as the lever seams read it (`tools::flaps::set_handle`,
+/// `tools::controls::speedbrake_set`, `tools::gear::set_handle`): the
+/// stepped-by-command declarations. Under test it is per THREAD, like the
+/// throttle lever above, so one test's stepped lever never reaches another
+/// test's stock writes running beside it.
+pub fn lever_profile() -> Option<std::sync::Arc<AircraftProfile>> {
+    #[cfg(not(test))]
+    {
+        live_profile()
+    }
+    #[cfg(test)]
+    {
+        LEVER_PROFILE_T.with(|t| t.borrow().clone())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEVER_PROFILE_T: std::cell::RefCell<Option<std::sync::Arc<AircraftProfile>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Publish the profile the lever seams read, on this thread alone.
+#[cfg(test)]
+pub fn publish_lever_profile(p: Option<AircraftProfile>) {
+    LEVER_PROFILE_T.with(|t| *t.borrow_mut() = p.map(std::sync::Arc::new));
+}
+
 /// X-Plane's landing-gear warning, as Plane Maker models it: with the gear
 /// not down and the speed below `below_kias`, the horn sounds when the
 /// throttle is under `below_throttle_pct` or the flaps are past
@@ -4237,6 +4481,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
         p.flaps = Some(FlapProfile {
             detents: list,
             takeoff_ratio: Some(0.0),
+            by_command: None,
         });
     }
 
@@ -4471,6 +4716,10 @@ fn cessna_172sp() -> AircraftProfile {
         airliner_start: None,
         retractable_gear: false,
         gear_by_command: false,
+        gear_commands: None,
+        speedbrake_lever: None,
+        boeing_start: None,
+        fuel_cutoff_commands: Vec::new(),
         rotorcraft: false,
         heli_start: None,
         transition_altitude_ft: 18_000.0,
@@ -4630,6 +4879,7 @@ fn cessna_172sp() -> AircraftProfile {
                 detent("full", "full", 1.0, Some(85.0)),
             ],
             takeoff_ratio: Some(0.0), // 172 takes off clean
+            by_command: None,
         }),
         fuel: Some(FuelProfile {
             reserve_caution_min: 45.0,
@@ -4834,6 +5084,10 @@ fn cirrus_sr22() -> AircraftProfile {
         airliner_start: None,
         retractable_gear: false,
         gear_by_command: false,
+        gear_commands: None,
+        speedbrake_lever: None,
+        boeing_start: None,
+        fuel_cutoff_commands: Vec::new(),
         rotorcraft: false,
         heli_start: None,
         transition_altitude_ft: 18_000.0,
@@ -5024,6 +5278,7 @@ fn cirrus_sr22() -> AircraftProfile {
                 detent("full", "full", 1.0, Some(110.0)),
             ],
             takeoff_ratio: None,
+            by_command: None,
         }),
         // SR22 ~92 gal usable, ~17 gal/hr cruise (~46 kg/hr). Verify.
         fuel: Some(FuelProfile {

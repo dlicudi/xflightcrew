@@ -50,8 +50,6 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 #[cfg(test)]
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
-const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
-const FLAP_HANDLE: &str = "sim/cockpit2/controls/flap_ratio";
 /// Clean up the takeoff flaps this high AGL, once safely above Vy — a
 /// conservative "positive climb, gear up, then flaps" point.
 const FLAP_RETRACT_AGL_FT: f64 = 400.0;
@@ -2923,7 +2921,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // Takeoff flaps from the profile, set before speed builds. 0.0 on a
     // clean-takeoff type still runs, guaranteeing the config off the gate.
     if let Some(ratio) = p.takeoff_flap_ratio {
-        let _ = xp.set_float(FLAP_HANDLE, ratio).await;
+        let _ = crate::tools::flaps::set_handle(&xp, ratio).await;
     }
     // Nothing to retract if we took off clean (<= a whisker of flap).
     let mut flaps_retracted = p.takeoff_flap_ratio.unwrap_or(0.0) <= 0.01;
@@ -3552,7 +3550,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             )
         {
             gear_raised = true;
-            let _ = xp.set_float(GEAR_HANDLE, 0.0).await;
+            let _ = crate::tools::gear::set_handle(&xp, true).await;
             alert(&voice, Priority::Advisory, "Gear up.");
             crate::blackbox::record(
                 "autotakeoff",
@@ -3569,7 +3567,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             if p.flap_schedule.is_empty() {
                 if ias > p.initial_climb_kts {
                     flaps_retracted = true;
-                    let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
+                    let _ = crate::tools::flaps::set_handle(&xp, 0.0).await;
                     alert(&voice, Priority::Advisory, "Flaps up.");
                     move_speed_window(&xp, &mut window_owed, window_kts, "flap_step", agl_ft, ias)
                         .await;
@@ -3599,7 +3597,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     flap_pace.stepped(flap_cmd);
                     flap_cmd = next;
                     flaps_retracted = next <= 1e-6;
-                    let _ = xp.set_float(FLAP_HANDLE, next).await;
+                    let _ = crate::tools::flaps::set_handle(&xp, next).await;
                     let detent = crate::aircraft::live_profile()
                         .and_then(|lp| crate::aircraft::flap_detent_spoken(lp.flaps.as_ref(), next));
                     crate::blackbox::record(
@@ -3808,7 +3806,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 clean_up_at_handoff(flaps_retracted, ias, floor).filter(|_| !flaps_left)
             {
                 if up {
-                    let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
+                    let _ = crate::tools::flaps::set_handle(&xp, 0.0).await;
                     alert(&voice, Priority::Advisory, "Flaps up.");
                 } else {
                     alert(
@@ -3826,7 +3824,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // Nobody takes an aircraft with the gear still hanging: a gear
             // held for its warning speed comes up at the handoff at the latest.
             if !gear_raised {
-                let _ = xp.set_float(GEAR_HANDLE, 0.0).await;
+                let _ = crate::tools::gear::set_handle(&xp, true).await;
                 alert(&voice, Priority::Advisory, "Gear up.");
                 crate::blackbox::record(
                     "autotakeoff",

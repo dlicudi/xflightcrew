@@ -19,10 +19,12 @@ use crate::autoflight::{self, Button, Dial};
 use crate::aircraft::TakeoffConfigProfile;
 use crate::xplane::XPlane;
 
+#[cfg(test)]
 const FLAP_HANDLE: &str = crate::datarefs::FLAP_RATIO;
 /// Where the flaps ARE, following the handle at the airframe's own rate.
 /// The climb-out's retraction reads it too: each step waits for the last.
 pub(crate) const FLAP_DEPLOY: &str = "sim/cockpit2/controls/flap_handle_deploy_ratio";
+#[cfg(test)]
 const SPEEDBRAKE: &str = TakeoffConfigProfile::SPEEDBRAKE;
 /// 0 RTO, 1 off, 2..5 the landing levels.
 const AUTOBRAKE: &str = TakeoffConfigProfile::AUTOBRAKE;
@@ -157,11 +159,12 @@ pub async fn set_for_takeoff(
     }
 
     if let Some(want) = flap_ratio {
-        match xp.get_float(FLAP_HANDLE).await {
+        // Through the flap seam: a lever stepped by its commands where the
+        // airframe declares them, the stock handle elsewhere.
+        match crate::tools::flaps::read_handle(xp).await {
             Ok(at) if (at - want).abs() > 0.01 => {
-                let ok = xp.set_float(FLAP_HANDLE, want).await.is_ok()
-                    && xp
-                        .get_float(FLAP_HANDLE)
+                let ok = crate::tools::flaps::set_handle(xp, want).await.is_ok()
+                    && crate::tools::flaps::read_handle(xp)
                         .await
                         .is_ok_and(|v| (v - want).abs() <= 0.01);
                 if ok {
@@ -189,10 +192,14 @@ pub async fn set_for_takeoff(
             None => {}
         }
     } else if af.arm_spoilers {
-        match xp.get_float(SPEEDBRAKE).await {
+        match crate::tools::controls::speedbrake_read(xp).await {
             Ok(at) if at > -0.25 => {
-                let ok = xp.set_float(SPEEDBRAKE, SPEEDBRAKE_ARMED).await.is_ok()
-                    && xp.get_float(SPEEDBRAKE).await.is_ok_and(|v| v < -0.25);
+                let ok = crate::tools::controls::speedbrake_set(xp, SPEEDBRAKE_ARMED)
+                    .await
+                    .is_ok()
+                    && crate::tools::controls::speedbrake_read(xp)
+                        .await
+                        .is_ok_and(|v| v < -0.25);
                 if ok {
                     out.set.push("spoilers armed".into());
                 } else {
@@ -293,11 +300,12 @@ async fn levers_to_idle(xp: &dyn XPlane) -> Option<bool> {
 /// take). `armed_only` leaves a lever that is OUT alone: in the air that one
 /// is in somebody's hand.
 async fn speedbrake_down(xp: &dyn XPlane, armed_only: bool) -> Option<bool> {
-    match xp.get_float(SPEEDBRAKE).await {
+    match crate::tools::controls::speedbrake_read(xp).await {
         Ok(at) if at < -0.25 || (!armed_only && at > 0.05) => Some(
-            xp.set_float(SPEEDBRAKE, 0.0).await.is_ok()
-                && xp
-                    .get_float(SPEEDBRAKE)
+            crate::tools::controls::speedbrake_set(xp, 0.0)
+                .await
+                .is_ok()
+                && crate::tools::controls::speedbrake_read(xp)
                     .await
                     .is_ok_and(|v| v.abs() <= 0.05),
         ),
@@ -333,7 +341,9 @@ pub async fn on_reject(xp: &dyn XPlane) {
         .await
         .is_ok_and(|ms| ms.abs() * 1.943_84 > REJECT_SPOILER_KTS);
     if rolling {
-        let ok = xp.set_float(SPEEDBRAKE, 1.0).await.is_ok();
+        let ok = crate::tools::controls::speedbrake_set(xp, 1.0)
+            .await
+            .is_ok();
         crate::blackbox::record(
             "autotakeoff",
             serde_json::json!({"event": "reject_speedbrake", "ok": ok}),
@@ -349,13 +359,17 @@ pub async fn set_for_landing(xp: &dyn XPlane) -> Outcome {
         return out;
     };
     if af.arm_spoilers {
-        match xp.get_float(SPEEDBRAKE).await {
+        match crate::tools::controls::speedbrake_read(xp).await {
             // Only from stowed: a speedbrake the descent is USING is not ours
             // to pull in.
             Ok(at) if at >= 0.05 => out.deferred = true,
             Ok(at) if at > -0.25 => {
-                let ok = xp.set_float(SPEEDBRAKE, SPEEDBRAKE_ARMED).await.is_ok()
-                    && xp.get_float(SPEEDBRAKE).await.is_ok_and(|v| v < -0.25);
+                let ok = crate::tools::controls::speedbrake_set(xp, SPEEDBRAKE_ARMED)
+                    .await
+                    .is_ok()
+                    && crate::tools::controls::speedbrake_read(xp)
+                        .await
+                        .is_ok_and(|v| v < -0.25);
                 if ok {
                     out.set.push("spoilers armed".into());
                 } else {
@@ -961,5 +975,83 @@ mod tests {
             line("Takeoff config", &o).as_deref(),
             Some("Takeoff config: flaps, spoilers armed.")
         );
+    }
+
+    /// A lever stepped by command for the tests: armed a quarter up, the
+    /// flight detent at half, full at one, a quarter per press.
+    fn stepped_zibo() -> crate::aircraft::AircraftProfile {
+        let mut p = crate::aircraft::load("zibo_738").expect("zibo profile loads");
+        let sb = p
+            .speedbrake_lever
+            .as_mut()
+            .expect("the zibo declares its lever");
+        sb.armed = 0.25;
+        sb.flight = 0.5;
+        sb.full = 1.0;
+        p
+    }
+
+    /// The Zibo, 2026-10-06: a write to the stock flap handle is put
+    /// straight back and a stock speedbrake write sticks while its lever
+    /// never moves. The takeoff config steps both levers by their commands,
+    /// reads them back on the levers, and never writes either stock name.
+    #[tokio::test(start_paused = true)]
+    async fn the_zibo_is_configured_by_its_lever_commands_never_by_writes() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p = stepped_zibo();
+        publish(p.takeoff_config.clone());
+        crate::aircraft::publish_lever_profile(Some(p.clone()));
+        let flaps = p.flaps.as_ref().unwrap().by_command.clone().unwrap();
+        let sb = p.speedbrake_lever.clone().unwrap();
+        let xp = FakeXPlane::with_reads(&[
+            (&flaps.readback, 0.0),
+            (&sb.readback, 0.25),
+            (ALT_DIAL, 25000.0),
+            (crate::datarefs::ELEVATION_M, 41.0),
+            (crate::datarefs::ELEVATOR_TRIM, 0.0),
+        ]);
+        xp.step_on_command(&flaps.more, &flaps.readback, 0.125);
+        xp.step_on_command(&flaps.less, &flaps.readback, -0.125);
+        xp.step_on_command(&sb.more, &sb.readback, 0.25);
+        xp.step_on_command(&sb.less, &sb.readback, -0.25);
+        let o = set_for_takeoff(&xp, Some(0.375), None, false).await;
+        assert_eq!(xp.ran_count(&flaps.more), 3, "UP to 5 is three detents");
+        assert_eq!(xp.read_value(&flaps.readback), Some(0.375));
+        assert_eq!(xp.ran_count(&sb.less), 1, "armed to DOWN is one notch");
+        assert_eq!(xp.read_value(&sb.readback), Some(0.0));
+        assert!(
+            !xp.wrote(FLAP_HANDLE) && !xp.wrote(SPEEDBRAKE),
+            "never a stock write"
+        );
+        assert!(o.not_taken.is_empty(), "{o:?}");
+        assert!(
+            o.set.contains(&"flaps".to_string()) && o.set.contains(&"speedbrake down".to_string())
+        );
+
+        // A reject at speed raises the lever to full, notch by notch.
+        xp.set_read(GROUNDSPEED_MS, 50.0);
+        on_reject(&xp).await;
+        assert_eq!(xp.read_value(&sb.readback), Some(1.0));
+        assert!(!xp.wrote(SPEEDBRAKE));
+
+        // At the gear: armed from DOWN, read back on the lever.
+        xp.set_read(&sb.readback, 0.0);
+        let o = set_for_landing(&xp).await;
+        assert_eq!(xp.read_value(&sb.readback), Some(0.25));
+        assert_eq!(o.set, vec!["spoilers armed".to_string()]);
+
+        // A lever that ignores its command is named, never "set".
+        let dead = FakeXPlane::with_reads(&[
+            (&flaps.readback, 0.0),
+            (&sb.readback, 0.0),
+            (ALT_DIAL, 25000.0),
+            (crate::datarefs::ELEVATION_M, 41.0),
+            (crate::datarefs::ELEVATOR_TRIM, 0.0),
+        ]);
+        let o = set_for_takeoff(&dead, Some(0.375), None, false).await;
+        assert_eq!(o.not_taken, vec!["the flaps".to_string()]);
+        assert_eq!(dead.ran_count(&flaps.more), 1, "one press, then it is said");
+        crate::aircraft::publish_lever_profile(None);
+        publish(None);
     }
 }
