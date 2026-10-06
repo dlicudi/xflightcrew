@@ -818,6 +818,38 @@ pub trait Check: Send {
     fn fix_write(&self, _s: &Snapshot) -> Option<(&'static str, f64)> {
         None
     }
+    /// The crew's own job that a landing does NOT do for itself, so the
+    /// landing's mute ([`check_muted`]) lets it through. `false` (the
+    /// default): pilot-directed advice, backwards while the copilot lands.
+    fn acts_while_crew_lands(&self, _s: &Snapshot) -> bool {
+        false
+    }
+}
+
+/// Whether a check's line (and the fix it carries) is held this tick.
+/// `taking` the loop taking every lever ([`crate::flight_state::
+/// crew_taking_every_lever`]): a recovery mutes everything, a landing all
+/// but the checks that are the crew's own job ([`Check::acts_while_crew_lands`]);
+/// the panel's mute, everything. Pure.
+///
+/// LEGR-LXGB, 2026-10-06 (sortie 1791275171-full_auto): the follower
+/// levelled at 12,700 above LXGB's 7,000 ft transition level, autoland flew
+/// the arrival down from there, and the landing's mute swallowed both
+/// altimeter checks with their resets: the whole approach on 29.92 against
+/// a 30.06 QNH, the field at minus 108 ft on the ground, and the first word
+/// about it ("Altimeter check, QNH is three zero zero six") after landing.
+fn check_muted(
+    taking: Option<crate::flight_state::Owner>,
+    panel_mute: bool,
+    acts_while_crew_lands: bool,
+) -> bool {
+    use crate::flight_state::Owner;
+    panel_mute
+        || match taking {
+            None => false,
+            Some(Owner::Autoland) => !acts_while_crew_lands,
+            Some(o) => o.takes_every_lever(),
+        }
 }
 
 /// Per-check firing state: enforces edge-triggering and Warning repeats.
@@ -896,13 +928,19 @@ impl FireState {
         voice: &Voice,
         status: Option<&StatusSink>,
         now: Instant,
+        acts_while_crew_lands: bool,
     ) -> bool {
         // While the copilot is flying the aircraft (an active recovery/autoland),
         // stay quiet: it announces its own actions, and pilot-directed advice
         // ("lower the nose, add power") is backwards when the copilot is the one
         // doing it. The panel's "mute monitor" setting silences callouts too.
-        let flying = crate::flight_state::crew_landing_or_recovering()
-            || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
+        // A landing's own crew job (the altimeter) is not advice
+        // ([`check_muted`]).
+        let flying = check_muted(
+            crate::flight_state::crew_taking_every_lever(),
+            PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed),
+            acts_while_crew_lands,
+        );
         if !flying
             && self.sustained(min_duration, now)
             && self.should_speak(
@@ -1809,6 +1847,10 @@ struct AltimeterSetting {
     crossing: bool,
 }
 
+/// Under this height a landing's mute holds the altimeter checks too
+/// ([`Check::acts_while_crew_lands`]): short final is no place for the knob.
+const ALTIMETER_LANDING_FLOOR_AGL_FT: f64 = 1_000.0;
+
 /// The transition crossing's sustain: a single-sample altimeter glitch is
 /// not a crossing; two seconds at 2,000 fpm is under 70 ft past it.
 const ALTIMETER_CROSSING_SUSTAIN_MS: u64 = 2_000;
@@ -1920,6 +1962,13 @@ impl Check for AltimeterSetting {
             return None;
         }
         self.wanted(s).map(|(_, want)| (BARO_KNOB, want))
+    }
+    /// An autoland is handed the altimeter the crew sets: the QNH through
+    /// the transition level on the way down is the crew's, landing or not.
+    /// Not on short final: nobody turns the knob there, and the indicated
+    /// altitude a reset steps is no longer anyone's to fly.
+    fn acts_while_crew_lands(&self, s: &Snapshot) -> bool {
+        s.agl_ft > ALTIMETER_LANDING_FLOOR_AGL_FT
     }
 }
 
@@ -4323,6 +4372,7 @@ pub async fn run(
                                 &voice,
                                 status.as_ref(),
                                 now,
+                                check.acts_while_crew_lands(&snap),
                             );
                             speed_spoke |= speed && spoke;
                             cabin_spoke |= cabin && spoke;

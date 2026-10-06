@@ -534,7 +534,14 @@ pub(crate) fn crew_in_critical_phase() -> bool {
 /// (the altimeter reset) ride the spoken edge. Four inline copies of this
 /// pair, now one.
 pub(crate) fn crew_landing_or_recovering() -> bool {
-    innermost(Owner::active, Owner::takes_every_lever).is_some()
+    crew_taking_every_lever().is_some()
+}
+
+/// WHICH loop takes every lever now, innermost first: a recovery or a
+/// landing (`None` when neither). The monitor tells them apart: a landing
+/// still owes the altimeter its QNH, a recovery owes nothing but itself.
+pub(crate) fn crew_taking_every_lever() -> Option<Owner> {
+    innermost(Owner::active, Owner::takes_every_lever)
 }
 
 /// The innermost owner `active` says is set among those `keep` admits. Pure

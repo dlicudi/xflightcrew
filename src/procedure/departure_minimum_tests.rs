@@ -295,7 +295,8 @@
                 }
             };
             carry = v.carry;
-            let dial = dial_target_ft(want, alt, v.carry, None, None);
+            let path_fpm = if (want - v.want_alt).abs() < 1.0 { v.target_fpm } else { 0.0 };
+            let dial = dial_target_ft(want, alt, v.carry, None, None, path_fpm);
             if last_dial.is_none_or(|d| (d - dial).abs() > 50.0) {
                 ap.alt_dial = dial;
                 last_dial = Some(dial);

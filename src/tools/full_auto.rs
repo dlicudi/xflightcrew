@@ -1169,6 +1169,17 @@ impl FullAuto {
                 ),
                 _ => format!("{lead}Flying the approach to {}. Say my controls to take over.", fp.destination),
             };
+            // The flight's transition here too, already descending: this
+            // path returned before the route's publish below, so a restart
+            // that resumed onto the arrival flew it on the airframe's
+            // 18,000 ft, or on whatever the last flight left.
+            crate::tools::instruments::publish_flight_transition(Some(
+                crate::tools::instruments::FlightTransition::for_resume(
+                    fp.transition_altitude_ft,
+                    fp.transition_level_ft,
+                    true,
+                ),
+            ));
             return Ok(ResumeArm::Arrival { ack, dest: fp.destination.clone(), rwy });
         }
         // Clamped before the drain: a resume inside the arrival still owes
@@ -1250,11 +1261,11 @@ impl FullAuto {
         // 2026-09-24). Already descending past the top of descent is the
         // follower's to note.
         crate::tools::instruments::publish_flight_transition(Some(
-            crate::tools::instruments::FlightTransition {
-                altitude_ft: fp.transition_altitude_ft,
-                level_ft: fp.transition_level_ft,
-                descending: false,
-            },
+            crate::tools::instruments::FlightTransition::for_resume(
+                fp.transition_altitude_ft,
+                fp.transition_level_ft,
+                false,
+            ),
         ));
         Ok(ResumeArm::Route(
             Mission::Resume(Route {

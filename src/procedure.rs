@@ -573,19 +573,33 @@ pub fn map_path(leg: &ProcLeg, dist_nm: Option<f64>, gs_kts: f64) -> Option<(f64
 /// pilot's level; climbing, the higher of the target and the constraint;
 /// level, the level held; on a published path, the bottom of it. Whole
 /// hundreds, rounded UP so a floor or a minimum is never under-set. Pure.
+///
+/// `path_fpm` is the target's own rate (`Vertical::target_fpm`, zero when
+/// the target is a level or not the plan's): while the target is WALKING
+/// DOWN its path the descent is not over, whatever the band says. An
+/// aircraft that has caught its paced target sits inside the 100 ft band
+/// for most of a good descent, and the band used to put the dial at the
+/// target there, a hundred feet under the aircraft: the 737 captured it,
+/// held level 10 to 15 s, the dial went back to the constraint, VS was
+/// pressed again, five times from FL190 to 12,700 at about 1,450 fpm for
+/// a planned 1,800 (LEGR-LXGB, 2026-10-06, sortie 1791275171-full_auto,
+/// `vs_mode` `leave` with the dial at 18,200, 16,600, 14,800, 13,200 and
+/// 12,900, each the paced target rounded).
 pub fn dial_target_ft(
     want_ft: f64,
     alt_ft: f64,
     carry_ft: f64,
     held_ft: Option<f64>,
     path_bottom_ft: Option<f64>,
+    path_fpm: f64,
 ) -> f64 {
     const BAND_FT: f64 = 100.0;
     let up = |v: f64| (v / 100.0).ceil() * 100.0;
     if let Some(b) = path_bottom_ft {
         return up(b.max(held_ft.unwrap_or(f64::MIN)));
     }
-    if want_ft < alt_ft - BAND_FT {
+    let walking_down = path_fpm < 0.0 && carry_ft < want_ft - BAND_FT;
+    if want_ft < alt_ft - BAND_FT || walking_down {
         up(carry_ft.max(held_ft.unwrap_or(f64::MIN)))
     } else if want_ft > alt_ft + BAND_FT {
         up(want_ft.max(carry_ft))
@@ -4105,12 +4119,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // A terrain floor or a pilot's level is a level the dial must not
         // go under.
         let held = if v.pilot || v.floored.is_some() { Some(want_alt) } else { None };
+        // The target's own rate only while the plan's path IS the target
+        // (the VS law's feed-forward rule below).
+        let path_fpm = if (want_alt - v.want_alt).abs() < 1.0 { v.target_fpm } else { 0.0 };
         let dial = dial_target_ft(
             want_alt,
             alt_ft,
             v.carry,
             held,
             path.and(leg.alt1_ft),
+            path_fpm,
         );
         if !autoflight::set_dial_confirmed(
             "procedure",
