@@ -370,9 +370,14 @@ impl Rapport {
 
     fn offers(&mut self, v: &View, a: &Airframe, p: &Persona) -> Vec<Line> {
         let mut out = Vec::new();
-        let arriving = v.vsi_fpm < -250.0
-            || v.dest_dist_nm.is_some_and(|d| d < 12.0)
-            || (v.agl_ft < 3000.0 && v.flap_ratio > 0.01);
+        // Never up high: a descent at the cruise is no arrival, and no flap
+        // goes out above the airframes' 20,000 ft limit ("Speed's good for
+        // flaps one" at FL360, the 737 descending to recover its speed,
+        // 2026-10-06).
+        let arriving = v.agl_ft < FLAP_OFFER_MAX_AGL_FT
+            && (v.vsi_fpm < -250.0
+                || v.dest_dist_nm.is_some_and(|d| d < 12.0)
+                || (v.agl_ft < 3000.0 && v.flap_ratio > 0.01));
 
         // The next detent, once the speed has come down through its placard.
         let next = a.detents.iter().find(|d| d.ratio > v.flap_ratio + 0.02);
@@ -619,6 +624,9 @@ pub fn go_around_line(n: u32, by_automation: bool, p: &Persona) -> Option<String
         n => Some(format!("That's our {} go-around.", ordinal(n))),
     }
 }
+
+/// No flap is offered above this height.
+const FLAP_OFFER_MAX_AGL_FT: f64 = 20_000.0;
 
 pub fn flap_offer_line(spoken: &str, d: Dialect) -> String {
     match d {
@@ -1130,6 +1138,25 @@ mod tests {
             said.extend(r.tick(&v, &a, &p).into_iter().map(|l| l.text().to_string()));
         }
         (r, said)
+    }
+
+    /// 2026-10-06: the 737 at FL360 slowed through flaps one's 250 kt
+    /// placard and descended to recover its speed; "Speed's good for flaps
+    /// one" was offered at the cruise. Only below 20,000 ft.
+    #[test]
+    fn no_flap_is_offered_at_the_cruise() {
+        let a = c172();
+        let p = persona(Chatter::Normal);
+        let fast = |agl: f64| View { agl_ft: agl, ias_kts: 150.0, vsi_fpm: -1100.0, ..View::default() };
+        let slow = |agl: f64| View { agl_ft: agl, ias_kts: 80.0, vsi_fpm: -1100.0, ..View::default() };
+        let flaps = |r: &mut Rapport, agl: f64| {
+            r.track_placards(&fast(agl), &a);
+            r.offers(&slow(agl), &a, &p)
+                .iter()
+                .any(|l| l.text().contains("flaps"))
+        };
+        assert!(!flaps(&mut Rapport::new(), 35_700.0), "at the cruise");
+        assert!(flaps(&mut Rapport::new(), 3_000.0), "on the arrival");
     }
 
     #[test]
