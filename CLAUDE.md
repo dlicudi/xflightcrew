@@ -562,6 +562,12 @@ as held, never written (one writer per dataref).
   (`flow::summary_line`). The laws act; the list audits.
 - **Instruct** ("talk me through", `instruct_request`): never writes; says, watches, moves on.
 
+**A compound test is read whole** (`checklist::Expr`, `&&` over `||`): every term read, a term
+that does not read is no verdict; an ACT only through its ONE settable term that maps, else a
+read. History operators (`><`, `a:b`, `+>`) stay call-outs. A file the aircraft ships is
+`checklist: acf:<file>`, resolved at detection (`checklist::resolve_acf_path`), never copied
+here; a phase split into parts is ONE list (`checklist_flow:` key: [titles]).
+
 **Who starts one**: `flow::Tracker`, one-shot per flight, every boundary SUSTAINED. Under an
 automation Monitor starts at once (BEFORE LANDING only once configured,
 `flow::landing_config_for`); with a pilot flying the copilot PROPOSES and never acts by itself;

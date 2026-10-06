@@ -23,6 +23,23 @@
 //! - A dataref we don't actuate → **verify**: read it, confirm or flag.
 //! - No dataref (`FUEL QUANTITY|SUFFICIENT`) → **call-out**: the pilot's item.
 //! - `sw_remark` / reference lines → narration.
+//!
+//! ## Compound conditions
+//!
+//! A pass test may join `dataref:cond` terms with `&&` and `||` under
+//! parentheses (`(generator_on[0]:1)&&(rel_genera0:0)&&...`), `&&` binding
+//! tighter than `||` as in C (the files read that way: "the GPU powered AND
+//! not failed, OR the cart deployed"). Such an item is a VERIFY: every term
+//! is read and the expression judged, and a term that does not read is no
+//! measurement for the whole item ([`Expr::judge`]). It is an ACT only when
+//! exactly one of its terms is something we could set (a mapped tool or a
+//! writable switch), that term maps to a tool, and every other term is
+//! read-only or a `sim/operation/failures/*` state. A term whose operator we
+//! cannot judge from one read leaves the item a call-out: `><` (the value
+//! CHANGED since the list began), `a:b` (it moved FROM a TO b), `+>` / `-<`
+//! (rising / falling) and `{dataref}` arithmetic all need history or another
+//! read, and an `||` with an unjudgeable branch could pass on the branch we
+//! cannot see.
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -56,6 +73,10 @@ pub enum Cond {
     Lt(f64),
     /// `:!N` — not equal.
     Ne(f64),
+    /// `:>=N`
+    Ge(f64),
+    /// `:<=N`
+    Le(f64),
     /// `:min|max` — within an inclusive range.
     Range(f64, f64),
 }
@@ -68,6 +89,12 @@ impl Cond {
         }
         if let Some((a, b)) = s.split_once('|') {
             return Some(Cond::Range(a.trim().parse().ok()?, b.trim().parse().ok()?));
+        }
+        if let Some(n) = s.strip_prefix(">=") {
+            return Some(Cond::Ge(n.trim().parse().ok()?));
+        }
+        if let Some(n) = s.strip_prefix("<=") {
+            return Some(Cond::Le(n.trim().parse().ok()?));
         }
         let (ctor, rest): (fn(f64) -> Cond, &str) = match s.as_bytes()[0] {
             b'>' => (Cond::Gt, &s[1..]),
@@ -85,6 +112,8 @@ impl Cond {
             Cond::Gt(n) => v > n,
             Cond::Lt(n) => v < n,
             Cond::Ne(n) => (v - n).abs() >= 0.5,
+            Cond::Ge(n) => v >= n,
+            Cond::Le(n) => v <= n,
             Cond::Range(a, b) => v >= a && v <= b,
         }
     }
@@ -93,7 +122,7 @@ impl Cond {
     /// target when acting (e.g. a throttle range → its midpoint).
     pub(crate) fn target(&self) -> f64 {
         match *self {
-            Cond::Eq(n) | Cond::Ne(n) => n,
+            Cond::Eq(n) | Cond::Ne(n) | Cond::Ge(n) | Cond::Le(n) => n,
             Cond::Range(a, b) => (a + b) / 2.0,
             // "more than": full if near the top, else just over the line.
             Cond::Gt(n) => {
@@ -120,11 +149,203 @@ impl Cond {
         match *self {
             Cond::Eq(n) => n > 0.5,
             Cond::Ne(n) => n < 0.5, // "not 0" → on
-            Cond::Gt(_) => true,
-            Cond::Lt(_) => false,
+            Cond::Gt(_) | Cond::Ge(_) => true,
+            Cond::Lt(_) | Cond::Le(_) => false,
             Cond::Range(a, b) => (a + b) / 2.0 > 0.5,
         }
     }
+}
+
+/// One `dataref:cond` term of a pass test.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Atom {
+    /// The dataref without its `[index]`.
+    pub dataref: String,
+    pub index: Option<usize>,
+    pub cond: Cond,
+}
+
+impl Atom {
+    /// `dataref:cond`; `None` for an operator we cannot judge from one read.
+    fn parse(s: &str) -> Option<Atom> {
+        let (dataref, cond) = s.trim().split_once(':')?;
+        let cond = Cond::parse(cond)?;
+        let (dataref, index) = split_index(dataref.trim());
+        Some(Atom {
+            dataref,
+            index,
+            cond,
+        })
+    }
+
+    /// The dataref as the file names it, `[index]` included (what the
+    /// action map matches: a per-element entry only matches the full name).
+    pub fn name(&self) -> String {
+        match self.index {
+            Some(i) => format!("{}[{i}]", self.dataref),
+            None => self.dataref.clone(),
+        }
+    }
+}
+
+/// A compound pass test: terms joined by `&&` (`All`) and `||` (`Any`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Atom(Atom),
+    All(Vec<Expr>),
+    Any(Vec<Expr>),
+}
+
+/// A token of a condition spec.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tok<'a> {
+    Open,
+    Close,
+    And,
+    Or,
+    Term(&'a str),
+}
+
+fn tokens<'a>(s: &'a str) -> Vec<Tok<'a>> {
+    let mut out = Vec::new();
+    let b = s.as_bytes();
+    let (mut i, mut start) = (0, 0);
+    let flush = |out: &mut Vec<Tok<'a>>, from: usize, to: usize| {
+        let t = s[from..to].trim();
+        if !t.is_empty() {
+            out.push(Tok::Term(t));
+        }
+    };
+    while i < b.len() {
+        let tok = match b[i] {
+            b'(' => Some((Tok::Open, 1)),
+            b')' => Some((Tok::Close, 1)),
+            b'&' if b.get(i + 1) == Some(&b'&') => Some((Tok::And, 2)),
+            b'|' if b.get(i + 1) == Some(&b'|') => Some((Tok::Or, 2)),
+            _ => None,
+        };
+        match tok {
+            Some((t, len)) => {
+                flush(&mut out, start, i);
+                out.push(t);
+                i += len;
+                start = i;
+            }
+            None => i += 1,
+        }
+    }
+    flush(&mut out, start, b.len());
+    out
+}
+
+impl Expr {
+    /// Parse a whole condition spec. `None` when any part of it is beyond
+    /// us: an unbalanced parenthesis, a function call, an operator a single
+    /// read cannot judge. Never a partial expression.
+    pub fn parse(spec: &str) -> Option<Expr> {
+        let toks = tokens(spec);
+        let mut at = 0;
+        let e = Self::or(&toks, &mut at)?;
+        (at == toks.len()).then_some(e)
+    }
+
+    fn or(t: &[Tok<'_>], at: &mut usize) -> Option<Expr> {
+        let mut terms = vec![Self::and(t, at)?];
+        while t.get(*at) == Some(&Tok::Or) {
+            *at += 1;
+            terms.push(Self::and(t, at)?);
+        }
+        Some(if terms.len() == 1 {
+            terms.remove(0)
+        } else {
+            Expr::Any(terms)
+        })
+    }
+
+    fn and(t: &[Tok<'_>], at: &mut usize) -> Option<Expr> {
+        let mut terms = vec![Self::primary(t, at)?];
+        while t.get(*at) == Some(&Tok::And) {
+            *at += 1;
+            terms.push(Self::primary(t, at)?);
+        }
+        Some(if terms.len() == 1 {
+            terms.remove(0)
+        } else {
+            Expr::All(terms)
+        })
+    }
+
+    fn primary(t: &[Tok<'_>], at: &mut usize) -> Option<Expr> {
+        match *t.get(*at)? {
+            Tok::Open => {
+                *at += 1;
+                let e = Self::or(t, at)?;
+                if t.get(*at) != Some(&Tok::Close) {
+                    return None;
+                }
+                *at += 1;
+                Some(e)
+            }
+            Tok::Term(s) => {
+                *at += 1;
+                Atom::parse(s).map(Expr::Atom)
+            }
+            _ => None,
+        }
+    }
+
+    /// Every term, in the file's order.
+    pub fn atoms(&self) -> Vec<&Atom> {
+        let mut out = Vec::new();
+        self.collect(&mut out);
+        out
+    }
+
+    fn collect<'a>(&'a self, out: &mut Vec<&'a Atom>) {
+        match self {
+            Expr::Atom(a) => out.push(a),
+            Expr::All(es) | Expr::Any(es) => es.iter().for_each(|e| e.collect(out)),
+        }
+    }
+
+    /// Judge the expression from each term's value. ANY term that did not
+    /// read is no measurement: `None`, never a pass or a fail (an `||` whose
+    /// other branch passes included: the list must not confirm what it did
+    /// not read). Pure.
+    pub fn judge(&self, value_of: impl Fn(&Atom) -> Option<f64>) -> Option<bool> {
+        let values: Vec<f64> = self
+            .atoms()
+            .into_iter()
+            .map(&value_of)
+            .collect::<Option<_>>()?;
+        let mut at = 0;
+        Some(self.eval_in_order(&values, &mut at))
+    }
+
+    /// Every term is visited (no short circuit) so `at` walks the values in
+    /// [`Expr::atoms`] order.
+    fn eval_in_order(&self, values: &[f64], at: &mut usize) -> bool {
+        match self {
+            Expr::Atom(a) => {
+                let v = values[*at];
+                *at += 1;
+                a.cond.eval(v)
+            }
+            Expr::All(es) => es
+                .iter()
+                .map(|e| e.eval_in_order(values, at))
+                .fold(true, |acc, b| acc && b),
+            Expr::Any(es) => es
+                .iter()
+                .map(|e| e.eval_in_order(values, at))
+                .fold(false, |acc, b| acc || b),
+        }
+    }
+}
+
+/// A `sim/operation/failures/*` state: judged with the item, never acted on.
+fn is_failure_dataref(d: &str) -> bool {
+    d.contains("/operation/failures/")
 }
 
 /// One interpreted line of a checklist.
@@ -148,6 +369,10 @@ pub enum Item {
         dataref: String,
         index: Option<usize>,
         cond: Cond,
+        /// The whole pass test when the file gave a compound one; the
+        /// `dataref`/`index`/`cond` above are then the term the tool acts
+        /// on. `None`: that term IS the test.
+        expr: Option<Expr>,
     },
     /// A dataref outside our curated tools: read it and check the state. When
     /// `settable` it's an actionable switch we may write to the condition's target
@@ -161,7 +386,112 @@ pub enum Item {
         index: Option<usize>,
         cond: Cond,
         settable: bool,
+        /// The whole pass test when the file gave a compound one; the
+        /// `dataref`/`index`/`cond` above are then its first term that is
+        /// not a failure state (what a loop's ownership is judged by), and
+        /// the item is never `settable`. `None`: that term IS the test.
+        expr: Option<Expr>,
     },
+}
+
+impl Item {
+    /// The pass test's datarefs (base names), the acted-on term first.
+    /// Empty for narration and call-outs.
+    pub fn datarefs(&self) -> Vec<&str> {
+        match self {
+            Item::Act { dataref, expr, .. } | Item::Verify { dataref, expr, .. } => {
+                let mut out = vec![dataref.as_str()];
+                for a in expr.iter().flat_map(Expr::atoms) {
+                    if !out.contains(&a.dataref.as_str()) {
+                        out.push(a.dataref.as_str());
+                    }
+                }
+                out
+            }
+            Item::Narrate(_) | Item::CallOut(_) => Vec::new(),
+        }
+    }
+
+    /// Does the item carry a pass test (a dataref to read)?
+    pub fn has_test(&self) -> bool {
+        matches!(self, Item::Act { .. } | Item::Verify { .. })
+    }
+
+    /// Every term the item's pass test reads, in the file's order.
+    pub fn atoms(&self) -> Vec<Atom> {
+        match self {
+            Item::Act {
+                dataref,
+                index,
+                cond,
+                expr,
+                ..
+            }
+            | Item::Verify {
+                dataref,
+                index,
+                cond,
+                expr,
+                ..
+            } => match expr {
+                Some(e) => e.atoms().into_iter().cloned().collect(),
+                None => vec![Atom {
+                    dataref: dataref.clone(),
+                    index: *index,
+                    cond: cond.clone(),
+                }],
+            },
+            Item::Narrate(_) | Item::CallOut(_) => Vec::new(),
+        }
+    }
+
+    /// Judge the item from values already read: the compound expression,
+    /// else the one term. `None` for no test, or a term that did not read.
+    /// Pure.
+    pub fn judge_with(&self, value_of: impl Fn(&Atom) -> Option<f64>) -> Option<bool> {
+        match self {
+            Item::Act { expr: Some(e), .. } | Item::Verify { expr: Some(e), .. } => {
+                e.judge(value_of)
+            }
+            Item::Act { .. } | Item::Verify { .. } => {
+                let a = self.atoms().remove(0);
+                value_of(&a).map(|v| a.cond.eval(v))
+            }
+            Item::Narrate(_) | Item::CallOut(_) => None,
+        }
+    }
+}
+
+/// What the runner read of one item: its verdict (`None` = no test, or a
+/// term that did not read) and every term's value, in the file's order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    pub satisfied: Option<bool>,
+    pub values: Vec<Option<f64>>,
+}
+
+/// Read every term of an item's pass test, in one join, and judge it.
+pub async fn read_item(xp: &XPlaneClient, item: &Item) -> Reading {
+    let atoms = item.atoms();
+    let values: Vec<Option<f64>> =
+        futures::future::join_all(atoms.iter().map(|a| read_dataref(xp, &a.dataref, a.index)))
+            .await;
+    Reading {
+        satisfied: judge_read(item, &values),
+        values,
+    }
+}
+
+/// The item's verdict from its terms' values, read in [`Item::atoms`] order.
+/// Pure.
+pub fn judge_read(item: &Item, values: &[Option<f64>]) -> Option<bool> {
+    // `judge_with` asks for each term once, in `atoms` order.
+    let next = std::cell::Cell::new(0usize);
+    item.judge_with(|_| {
+        let i = next.get();
+        next.set(i + 1);
+        values.get(i).copied().flatten()
+    })
 }
 
 /// One interpreted checklist. Carries the profile bits its actions need (lights,
@@ -182,6 +512,9 @@ pub struct Checklist {
     /// Per-airframe pitot-heat switch override (see
     /// [`crate::aircraft::AircraftProfile::pitot_heat_dataref`]).
     pub pitot_heat_dataref: Option<String>,
+    /// The `checklist_flow:` key this list was JOINED for (its parts read in
+    /// order as one list); `None` for a section as the file has it.
+    pub section: Option<String>,
 }
 
 /// Read and interpret the airframe's XChecklist file into runnable checklists.
@@ -190,9 +523,53 @@ pub fn load(profile: &AircraftProfile) -> Result<Vec<Checklist>> {
     let Some(path) = &profile.checklist else {
         return Ok(Vec::new());
     };
+    if let Some(file) = path.strip_prefix(ACF_PREFIX) {
+        bail!(
+            "the checklist is {file} in the aircraft's own folder, and no loaded aircraft named that folder"
+        );
+    }
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading checklist file {path}"))?;
     Ok(parse(&text, profile))
+}
+
+/// A profile's `checklist:` naming a file in the aircraft's own folder:
+/// `acf:clist.txt`. The file ships with the aircraft and is not ours to copy.
+pub const ACF_PREFIX: &str = "acf:";
+
+/// Resolve an `acf:<file>` checklist against the loaded aircraft: the
+/// `.acf`'s directory (`acf_relative_path`, relative to the install `root`).
+/// Any other value is returned as it is; `None` when the `.acf` path names
+/// no folder. Pure.
+pub fn resolve_acf_path(checklist: &str, acf_relative_path: &str, root: &str) -> Option<String> {
+    let Some(file) = checklist.strip_prefix(ACF_PREFIX) else {
+        return Some(checklist.to_string());
+    };
+    let rel = acf_relative_path.trim().replace('\\', "/");
+    let dir = std::path::Path::new(&rel).parent()?.to_str()?;
+    if dir.is_empty() {
+        return None;
+    }
+    Some(format!("{root}/{dir}/{}", file.trim()))
+}
+
+/// The line said once when the profile names a checklist the copilot
+/// cannot read (an `acf:` file missing from the aircraft's folder, a moved
+/// file): no flows run for this airframe, and the pilot should know why.
+/// `None` when there is no checklist or it reads.
+pub fn unavailable_line(profile: &AircraftProfile) -> Option<String> {
+    let path = profile.checklist.as_deref()?;
+    let file = path.strip_prefix(ACF_PREFIX).unwrap_or(path);
+    let name = std::path::Path::new(file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(file);
+    let readable = !path.starts_with(ACF_PREFIX) && std::fs::metadata(path).is_ok();
+    (!readable).then(|| {
+        format!(
+            "I can't find this aircraft's checklist file, {name}, so I won't run its checklists."
+        )
+    })
 }
 
 /// Does the utterance ask for a checklist at all? One place for the whisper
@@ -397,6 +774,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
                     magnetos_per_engine: profile.magnetos_per_engine,
                     park_brake_valve_set: profile.park_brake_valve_set,
                     pitot_heat_dataref: profile.pitot_heat_dataref.clone(),
+                    section: None,
                 });
             }
             // Both narration directives: arm the run-up confirm when the file
@@ -415,6 +793,13 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
             "sw_item" => {
                 if let Some(c) = cur.as_mut() {
                     let mut item = parse_item(rest, map, fuel_positions);
+                    // Only the map acts on this airframe: the verify path
+                    // reads, never writes.
+                    if profile.checklist_map_only {
+                        if let Item::Verify { settable, .. } = &mut item {
+                            *settable = false;
+                        }
+                    }
                     // Arm the run-up confirm on the first actioned step after the
                     // magneto-test remark (the throttle-up).
                     if arm_runup {
@@ -431,7 +816,122 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
         }
     }
     finish(&mut out, &mut cur);
+    join_flows(&mut out, profile);
     out
+}
+
+/// Join the sections a `checklist_flow:` entry lists (more than one title)
+/// into ONE list, read in the order given, appended after the file's own
+/// sections, which stay as they are (a spoken "climb procedure one of two"
+/// still finds its part). The joined list is titled by the parts' shared
+/// name ("CLIMB PROCEDURE (1/2)" -> "Climb procedure"). A title the file
+/// lacks is skipped and logged; none found, no list.
+fn join_flows(out: &mut Vec<Checklist>, profile: &AircraftProfile) {
+    for (key, titles) in &profile.checklist_flow {
+        let titles = titles.titles();
+        if titles.len() < 2 {
+            continue;
+        }
+        let parts: Vec<usize> = titles
+            .iter()
+            .filter_map(|t| {
+                let i = out
+                    .iter()
+                    .position(|c| c.section.is_none() && c.title.eq_ignore_ascii_case(t.trim()));
+                if i.is_none() {
+                    tracing::warn!(key = %key, title = %t, "checklist_flow names a section the file lacks");
+                }
+                i
+            })
+            .collect();
+        let Some(&first) = parts.first() else {
+            continue;
+        };
+        let base = joined_title(titles[0]);
+        let title = if out.iter().any(|c| c.title.eq_ignore_ascii_case(&base)) {
+            format!("{base} (all parts)")
+        } else {
+            base
+        };
+        let items = parts
+            .iter()
+            .flat_map(|&i| out[i].items.iter().map(clone_item))
+            .collect();
+        let f = &out[first];
+        let joined = Checklist {
+            id: slug(&title),
+            title,
+            items,
+            lights: f.lights.clone(),
+            flaps: f.flaps.clone(),
+            electrical: f.electrical.clone(),
+            fuel_selector: f.fuel_selector.clone(),
+            engines: f.engines,
+            magnetos_per_engine: f.magnetos_per_engine,
+            park_brake_valve_set: f.park_brake_valve_set,
+            pitot_heat_dataref: f.pitot_heat_dataref.clone(),
+            section: Some(section_key(key)),
+        };
+        out.push(joined);
+    }
+}
+
+/// "before_landing" / "Before Landing" -> "before landing": a
+/// `checklist_flow:` key as the flow module compares it.
+pub fn section_key(k: &str) -> String {
+    k.to_ascii_lowercase().replace('_', " ").trim().to_string()
+}
+
+/// "CLIMB PROCEDURE (1/2)" -> "Climb procedure": the title without its
+/// trailing parenthesised part.
+fn joined_title(t: &str) -> String {
+    let t = t.trim();
+    let base = match t.rfind(" (") {
+        Some(i) if t.ends_with(')') => &t[..i],
+        _ => t,
+    };
+    humanize(base)
+}
+
+fn clone_item(i: &Item) -> Item {
+    match i {
+        Item::Narrate(t) => Item::Narrate(t.clone()),
+        Item::CallOut(t) => Item::CallOut(t.clone()),
+        Item::Act {
+            say,
+            tool,
+            args,
+            confirm,
+            dataref,
+            index,
+            cond,
+            expr,
+        } => Item::Act {
+            say: say.clone(),
+            tool,
+            args: args.clone(),
+            confirm: *confirm,
+            dataref: dataref.clone(),
+            index: *index,
+            cond: cond.clone(),
+            expr: expr.clone(),
+        },
+        Item::Verify {
+            say,
+            dataref,
+            index,
+            cond,
+            settable,
+            expr,
+        } => Item::Verify {
+            say: say.clone(),
+            dataref: dataref.clone(),
+            index: *index,
+            cond: cond.clone(),
+            settable: *settable,
+            expr: expr.clone(),
+        },
+    }
 }
 
 /// Parse one item body: `CHALLENGE|RESPONSE[:condition]`. The text carries no
@@ -450,27 +950,29 @@ fn parse_item(rest: &str, map: &[ChecklistMapEntry], fuel: &[FuelPosition]) -> I
         // No condition → the pilot's call-out.
         return Item::CallOut(say);
     };
-    // Compound (`&&`/`||`/parenthesised) and function (`closer_than(...)`)
-    // conditions are beyond our single-dataref evaluator — we can't act on or
-    // verify them honestly, so they become call-outs (the pilot's item).
-    if is_compound_condition(condspec) {
-        return Item::CallOut(say);
-    }
-    // A simple `dataref:cond` (dataref has no colon; cond uses `>`/`<`/`|`/etc.).
-    let Some((dataref, cond_str)) = condspec.split_once(':') else {
+    // A test we can't judge from one read of each term (a function such as
+    // `closer_than(...)`, `{dataref}` arithmetic, `><`, `a:b`, an unbalanced
+    // parenthesis) - we can't act on or verify it honestly, so it is a
+    // call-out (the pilot's item).
+    let Some(expr) = Expr::parse(condspec) else {
         return Item::CallOut(say);
     };
-    let Some(cond) = Cond::parse(cond_str) else {
-        // An operator we don't model (`><`, `+>`, `-<`, …) — don't fake it.
-        return Item::CallOut(say);
+    let atom = match expr {
+        Expr::Atom(a) => a,
+        compound => return compound_item(say, compound, map, fuel),
     };
-    let (base, index) = split_index(dataref.trim());
+    let name = atom.name();
+    let Atom {
+        dataref: base,
+        index,
+        cond,
+    } = atom;
 
     // The map sees the dataref WITH its index: a per-element entry
     // ("landing_lights_switch[1]", the A330's taxi light on a three-position
     // nose-light switch, 2026-09-20) can only match against the full name,
     // and a base-only entry matches the full name just the same.
-    match action_for(map, dataref.trim(), &cond, fuel) {
+    match action_for(map, &name, &cond, fuel) {
         Some((tool, args)) => {
             let confirm = confirm_for(tool, &args);
             Item::Act {
@@ -481,6 +983,7 @@ fn parse_item(rest: &str, map: &[ChecklistMapEntry], fuel: &[FuelPosition]) -> I
                 dataref: base,
                 index,
                 cond,
+                expr: None,
             }
         }
         None => {
@@ -496,8 +999,61 @@ fn parse_item(rest: &str, map: &[ChecklistMapEntry], fuel: &[FuelPosition]) -> I
                 index,
                 cond,
                 settable,
+                expr: None,
             }
         }
+    }
+}
+
+/// A compound pass test. A VERIFY, never written raw; an ACT only when
+/// exactly ONE term is something we could set (a mapped tool, or a writable
+/// switch) and that term maps: two settable terms ("generators 1 AND 2",
+/// "nav AND NOT strobe", "knob at 1 OR at 2") name no single action. Failure
+/// states (`sim/operation/failures/*`) are judged with the item but never
+/// counted or acted on.
+fn compound_item(
+    say: String,
+    expr: Expr,
+    map: &[ChecklistMapEntry],
+    fuel: &[FuelPosition],
+) -> Item {
+    let atoms = expr.atoms();
+    let live: Vec<&Atom> = atoms
+        .iter()
+        .copied()
+        .filter(|a| !is_failure_dataref(&a.dataref))
+        .collect();
+    let settable: Vec<(&Atom, Option<(&'static str, Value)>)> = live
+        .iter()
+        .map(|a| (*a, action_for(map, &a.name(), &a.cond, fuel)))
+        .filter(|(a, act)| act.is_some() || !is_readonly_dataref(&a.dataref))
+        .collect();
+    if let [(a, Some((tool, args)))] = settable.as_slice() {
+        let (tool, args, a) = (*tool, args.clone(), (*a).clone());
+        let confirm = confirm_for(tool, &args);
+        return Item::Act {
+            say,
+            tool,
+            args,
+            confirm,
+            dataref: a.dataref,
+            index: a.index,
+            cond: a.cond,
+            expr: Some(expr),
+        };
+    }
+    let primary = (*live
+        .first()
+        .or(atoms.first())
+        .expect("an expression has a term"))
+    .clone();
+    Item::Verify {
+        say,
+        dataref: primary.dataref,
+        index: primary.index,
+        cond: primary.cond,
+        settable: false,
+        expr: Some(expr),
     }
 }
 
@@ -528,13 +1084,6 @@ fn is_readonly_dataref(d: &str) -> bool {
         || d.contains("/warnings/")
         || d.contains("/failures/")
         || d.contains("/gauges/")
-}
-
-/// A condition we can't evaluate as a single `dataref:cond` — boolean compounds
-/// (`(a:1)&&(b:1)`, `||`), function predicates (`closer_than(...)`), or anything
-/// with braces/parens. Such items degrade to call-outs.
-fn is_compound_condition(c: &str) -> bool {
-    c.starts_with('(') || c.contains("&&") || c.contains("||") || c.contains('(') || c.contains('{')
 }
 
 /// Hazard text for pulling the mixture to idle cutoff. Only worth confirming
@@ -921,13 +1470,17 @@ mod tests {
             }
             other => panic!("expected Act, got {}", variant(&other)),
         }
-        // Compound (&&) condition → call-out (can't evaluate honestly).
-        assert!(matches!(
-            parse_item(
-                r"\green\Batteries\yellow\, both on|\white\CHECK:(sim/.../battery_on[0]:1)&&(sim/.../battery_on[1]:1)"
-            ),
-            Item::CallOut(_)
-        ));
+        // Compound (&&) condition → a verify of both terms (two batteries
+        // name no single action), never written raw.
+        match parse_item(
+            r"\green\Batteries\yellow\, both on|\white\CHECK:(sim/.../battery_on[0]:1)&&(sim/.../battery_on[1]:1)",
+        ) {
+            Item::Verify { settable, expr, .. } => {
+                assert!(!settable);
+                assert_eq!(expr.expect("compound").atoms().len(), 2);
+            }
+            other => panic!("expected Verify, got {}", variant(&other)),
+        }
         // Function predicate → call-out.
         assert!(matches!(
             parse_item(
@@ -1337,4 +1890,375 @@ mod tests {
             .collect();
         assert_eq!(gated, vec!["set_throttle"]);
     }
+
+    // ---- compound conditions -------------------------------------------
+
+    fn atom(d: &str, cond: Cond) -> Expr {
+        Expr::Atom(Atom {
+            dataref: d.into(),
+            index: None,
+            cond,
+        })
+    }
+
+    #[test]
+    fn compound_grammar_binds_and_over_or() {
+        // `a && b || c` is `(a && b) || c`, as in C.
+        assert_eq!(
+            Expr::parse("(a:1)&&(b:>0)||(c:1)"),
+            Some(Expr::Any(vec![
+                Expr::All(vec![atom("a", Cond::Eq(1.0)), atom("b", Cond::Gt(0.0))]),
+                atom("c", Cond::Eq(1.0)),
+            ]))
+        );
+        assert_eq!(
+            Expr::parse("(c:1)||(a:1)&&(b:0)"),
+            Some(Expr::Any(vec![
+                atom("c", Cond::Eq(1.0)),
+                Expr::All(vec![atom("a", Cond::Eq(1.0)), atom("b", Cond::Eq(0.0))]),
+            ]))
+        );
+        // Parentheses group; doubled ones are harmless; an index survives.
+        assert_eq!(
+            Expr::parse("((x[2]:1))&&((y:0)||(z:0))"),
+            Some(Expr::All(vec![
+                Expr::Atom(Atom {
+                    dataref: "x".into(),
+                    index: Some(2),
+                    cond: Cond::Eq(1.0),
+                }),
+                Expr::Any(vec![atom("y", Cond::Eq(0.0)), atom("z", Cond::Eq(0.0))]),
+            ]))
+        );
+        // A range's single `|` is the range, not an `||`.
+        assert_eq!(
+            Expr::parse("(r:-0.005|0.005)&&(s:!2000)"),
+            Some(Expr::All(vec![
+                atom("r", Cond::Range(-0.005, 0.005)),
+                atom("s", Cond::Ne(2000.0)),
+            ]))
+        );
+        // `>=` / `<=` are the inclusive bounds.
+        assert_eq!(Cond::parse(">=0.125"), Some(Cond::Ge(0.125)));
+        assert_eq!(Cond::parse("<=3"), Some(Cond::Le(3.0)));
+        assert!(Cond::Ge(0.125).eval(0.125) && !Cond::Ge(0.125).eval(0.124));
+        assert!(Cond::Le(3.0).eval(3.0) && !Cond::Le(3.0).eval(3.1));
+        // Never a partial expression: any term or shape we cannot judge from
+        // one read is no expression at all.
+        for spec in [
+            "(a:1)&&(b:><0)",              // changed since the start
+            "(a:0:1)||(b:1)",              // moved from 0 to 1
+            "(a:+>0.9)",                   // rising
+            "a:{other/dref}",              // another dataref's value
+            "a:round({x})-1|round({x})+1", // arithmetic
+            "1:closer_than({a},{b},0.02)", // a function
+            "(a:1)&&b:1)",                 // unbalanced (the MD-82's)
+            "(a:1)&&",                     // dangling operator
+            "(a:1)(b:1)",                  // no operator
+            "",
+        ] {
+            assert_eq!(Expr::parse(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn a_term_that_did_not_read_is_no_measurement() {
+        let e = Expr::parse("(gen0:1)&&(rel_gen0:0)||(gpu:1)").unwrap();
+        let read = |vals: [Option<f64>; 3]| {
+            let names = ["gen0", "rel_gen0", "gpu"];
+            e.judge(|a| vals[names.iter().position(|n| *n == a.dataref).unwrap()])
+        };
+        assert_eq!(read([Some(1.0), Some(0.0), Some(0.0)]), Some(true));
+        assert_eq!(read([Some(1.0), Some(6.0), Some(0.0)]), Some(false));
+        assert_eq!(read([Some(0.0), Some(0.0), Some(1.0)]), Some(true));
+        assert_eq!(read([Some(0.0), Some(0.0), Some(0.0)]), Some(false));
+        // One failed read: no verdict either way, even where the other
+        // branch alone would pass.
+        assert_eq!(read([None, Some(0.0), Some(0.0)]), None);
+        assert_eq!(read([Some(0.0), Some(0.0), None]), None);
+        assert_eq!(read([None, Some(0.0), Some(1.0)]), None);
+
+        // The item judges the same way, through `judge_read`'s term order.
+        let it = super::parse_item(
+            "GENERATORS|ON:(sim/a/generator_on[0]:1)&&(sim/operation/failures/rel_genera0:0)",
+            &[],
+            &[],
+        );
+        assert_eq!(judge_read(&it, &[Some(1.0), Some(0.0)]), Some(true));
+        assert_eq!(judge_read(&it, &[Some(1.0), Some(6.0)]), Some(false));
+        assert_eq!(judge_read(&it, &[Some(1.0), None]), None);
+        // A simple item: its one term.
+        let simple = super::parse_item(
+            "PARKING BRAKE|ON:sim/flightmodel/controls/parkbrake:1",
+            &[],
+            &[],
+        );
+        assert_eq!(judge_read(&simple, &[Some(1.0)]), Some(true));
+        assert_eq!(judge_read(&simple, &[None]), None);
+    }
+
+    #[test]
+    fn a_compound_item_acts_only_through_one_mapped_term() {
+        let m = p172().checklist_map;
+        let parse_item = |r: &str| super::parse_item(r, &m, &[]);
+        // One switch plus its failure state: an act on that switch, the
+        // whole test kept for the read.
+        match parse_item(
+            "BEACON|ON:(sim/cockpit/electrical/beacon_lights_on:1)&&(sim/operation/failures/rel_lites_beac:0)",
+        ) {
+            Item::Act {
+                tool,
+                args,
+                dataref,
+                expr,
+                ..
+            } => {
+                assert_eq!(tool, "set_lights");
+                assert_eq!(args, json!({ "light": "beacon", "on": true }));
+                assert_eq!(dataref, "sim/cockpit/electrical/beacon_lights_on");
+                assert_eq!(expr.unwrap().atoms().len(), 2);
+            }
+            other => panic!("expected Act, got {}", variant(&other)),
+        }
+        // A mapped switch and a read-only guard: still one thing to set.
+        assert!(matches!(
+            parse_item("BEACON|ON:(sim/cockpit/electrical/beacon_lights_on:1)&&(laminar/x/cover_position[2]:0)"),
+            Item::Act { .. }
+        ));
+        // Two settable terms name no single action: nav AND NOT strobe.
+        assert!(matches!(
+            parse_item(
+                "POSITION|STEADY:(sim/cockpit2/switches/navigation_lights_on:1)&&(sim/cockpit2/switches/strobe_lights_on:0)"
+            ),
+            Item::Verify { settable: false, .. }
+        ));
+        // A mapped switch and an unmapped writable one: a read, never a
+        // half-done act.
+        assert!(matches!(
+            parse_item("BEACON|ON:(sim/cockpit/electrical/beacon_lights_on:1)&&(sim/cockpit2/switches/other:1)"),
+            Item::Verify { settable: false, .. }
+        ));
+        // The same mapped term twice ("knob at 4 OR knob at 4"): two terms.
+        assert!(matches!(
+            parse_item("BEACON|ON:(sim/cockpit/electrical/beacon_lights_on:1)||(sim/cockpit/electrical/beacon_lights_on:1)"),
+            Item::Verify { .. }
+        ));
+        // Nothing mapped: a read whose primary is the first live term.
+        match parse_item("FIRE|TEST:(sim/operation/failures/rel_x:0)&&(laminar/b/fire_test:>0)") {
+            Item::Verify {
+                dataref, settable, ..
+            } => {
+                assert_eq!(dataref, "laminar/b/fire_test");
+                assert!(!settable);
+            }
+            other => panic!("expected Verify, got {}", variant(&other)),
+        }
+        // A lone parenthesised term is a simple item.
+        assert!(matches!(
+            parse_item("BEACON|OFF:(sim/cockpit/electrical/beacon_lights_on:0)"),
+            Item::Act { expr: None, .. }
+        ));
+    }
+
+    #[test]
+    fn an_acf_checklist_resolves_in_the_aircraft_folder() {
+        let root = "/X-Plane 12";
+        assert_eq!(
+            resolve_acf_path("acf:clist.txt", "Aircraft/B737-800X/b738_4k.acf", root).as_deref(),
+            Some("/X-Plane 12/Aircraft/B737-800X/clist.txt")
+        );
+        assert_eq!(
+            resolve_acf_path("acf:clist.txt", r"Aircraft\B737-800X\b738_4k.acf", root).as_deref(),
+            Some("/X-Plane 12/Aircraft/B737-800X/clist.txt")
+        );
+        // Not an `acf:` path: as it is.
+        assert_eq!(
+            resolve_acf_path("checklists/md82.txt", "Aircraft/x/y.acf", root).as_deref(),
+            Some("checklists/md82.txt")
+        );
+        // No folder named: nothing to resolve against.
+        assert_eq!(resolve_acf_path("acf:clist.txt", "", root), None);
+        assert_eq!(resolve_acf_path("acf:clist.txt", "b738.acf", root), None);
+
+        // Unresolved (a profile loaded by id, no aircraft): refused, said,
+        // never a crash.
+        let mut p = p172();
+        p.checklist = Some("acf:clist.txt".into());
+        assert!(load(&p).is_err());
+        assert!(unavailable_line(&p).unwrap().contains("clist.txt"));
+        p.checklist = Some("/nonexistent/folder/clist.txt".into());
+        assert!(load(&p).is_err());
+        assert!(unavailable_line(&p).is_some());
+        assert_eq!(unavailable_line(&p172()), None);
+    }
+
+    /// The Zibo's own XChecklist, where it is installed (CI has no X-Plane:
+    /// skipped there). The counts pin what the interpreter makes of the
+    /// file; the mapped flows must all resolve, joined parts in order.
+    #[test]
+    fn the_zibo_file_reads_and_its_flows_resolve() {
+        let root = crate::tools::autoland::xplane_root();
+        let Some(path) = resolve_acf_path("acf:clist.txt", "Aircraft/B737-800X/b738_4k.acf", &root)
+        else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("no Zibo checklist at {path}: skipped");
+            return;
+        };
+        let mut p = crate::aircraft::load("zibo_738").expect("zibo profile");
+        p.checklist = Some(path);
+        assert!(p.checklist_map_only);
+        let lists = parse(&text, &p);
+        let file_lists: Vec<&Checklist> = lists.iter().filter(|c| c.section.is_none()).collect();
+        let (mut acts, mut verifies, mut callouts, mut compound) = (0, 0, 0, 0);
+        let mut tools = std::collections::BTreeSet::new();
+        for it in file_lists.iter().flat_map(|c| &c.items) {
+            match it {
+                Item::Act { tool, expr, .. } => {
+                    acts += 1;
+                    tools.insert(*tool);
+                    compound += expr.is_some() as usize;
+                }
+                Item::Verify { settable, expr, .. } => {
+                    verifies += 1;
+                    assert!(!settable, "map only: nothing is written raw");
+                    compound += expr.is_some() as usize;
+                }
+                Item::CallOut(_) => callouts += 1,
+                Item::Narrate(_) => {}
+            }
+        }
+        eprintln!("zibo: {acts} act, {verifies} verify ({compound} compound), {callouts} call-out; tools {tools:?}");
+        assert_eq!((acts, verifies, callouts), ZIBO_COUNTS, "{tools:?}");
+        // Only the tools the profile says work here.
+        for t in &tools {
+            assert!(
+                [
+                    "set_parking_brake",
+                    "set_transponder_mode",
+                    "set_lights",
+                    "set_electrical"
+                ]
+                .contains(t),
+                "acts through {t}"
+            );
+        }
+        // Every phase and ramp key resolves; a joined phase is its parts in
+        // order, under its shared name.
+        let overrides = crate::flow::overrides_for(&p, &lists);
+        for key in [
+            "climb",
+            "cruise",
+            "descent",
+            "before landing",
+            "after landing",
+            "preflight",
+            "engine start",
+            "before taxi",
+            "before takeoff",
+            "shutdown",
+        ] {
+            let i = crate::flow::find_section_in(&lists, key, &overrides)
+                .unwrap_or_else(|| panic!("no list for {key}"));
+            assert!(!lists[i].items.is_empty(), "{key}");
+        }
+        let climb = &lists[crate::flow::find_section_in(&lists, "climb", &overrides).unwrap()];
+        assert_eq!(climb.title, "Climb procedure");
+        let part = |t: &str| {
+            lists
+                .iter()
+                .find(|c| c.title.eq_ignore_ascii_case(t))
+                .unwrap()
+                .items
+                .len()
+        };
+        assert_eq!(
+            climb.items.len(),
+            part("CLIMB PROCEDURE (1/2)") + part("CLIMB PROCEDURE (2/2)")
+        );
+        // Spoken titles: "procedure" is "checklist", the parts' suffixes no
+        // obstacle, the joined list wins its own name.
+        for (asked, want) in [
+            ("before taxi checklist", "Before taxi procedure"),
+            ("the before takeoff checklist", "Before takeoff procedure"),
+            ("climb", "Climb procedure"),
+            ("descent checklist", "Descent procedure"),
+            ("after landing", "After landing procedure"),
+        ] {
+            let i = crate::flow::find_titled(&lists, asked)
+                .unwrap_or_else(|e| panic!("{asked}: {e:?}"));
+            assert_eq!(lists[i].title, want, "{asked}");
+        }
+        assert_eq!(
+            match_request("run the before taxi checklist", &lists).map(|c| c.title.as_str()),
+            Some("Before taxi procedure")
+        );
+        assert_eq!(
+            match_request("climb checklist", &lists).map(|c| c.title.as_str()),
+            Some("Climb procedure")
+        );
+    }
+
+    /// The Zibo's ground lists judged against the LIVE sim, read-only (GETs
+    /// only, nothing written, no command fired): every tested item's verdict
+    /// and term values, for a parked-state survey. Needs X-Plane with the
+    /// Zibo loaded: `cargo test -- --ignored live_zibo_ground_lists
+    /// --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_zibo_ground_lists() {
+        let root = crate::tools::autoland::xplane_root();
+        let path =
+            resolve_acf_path("acf:clist.txt", "Aircraft/B737-800X/b738_4k.acf", &root).unwrap();
+        let text = std::fs::read_to_string(&path).expect("the Zibo's clist.txt");
+        let mut p = crate::aircraft::load("zibo_738").expect("zibo profile");
+        p.checklist = Some(path);
+        let lists = parse(&text, &p);
+        let xp = XPlaneClient::new("http://localhost:8086".into());
+        for title in ["Before taxi procedure", "Before takeoff procedure"] {
+            let cl = lists.iter().find(|c| c.title == title).expect(title);
+            let (mut pass, mut fail, mut none) = (0, 0, 0);
+            for it in &cl.items {
+                let kind = match it {
+                    Item::Act { .. } => "act",
+                    Item::Verify { .. } => "verify",
+                    _ => continue,
+                };
+                let r = read_item(&xp, it).await;
+                let verdict = match r.satisfied {
+                    Some(true) => {
+                        pass += 1;
+                        "PASS"
+                    }
+                    Some(false) => {
+                        fail += 1;
+                        "FAIL"
+                    }
+                    None => {
+                        none += 1;
+                        "NO MEASUREMENT"
+                    }
+                };
+                let terms: Vec<String> = it
+                    .atoms()
+                    .iter()
+                    .zip(&r.values)
+                    .map(|(a, v)| format!("{}={v:?}", a.name()))
+                    .collect();
+                eprintln!("{title} [{kind}] {verdict}: {} {terms:?}", item_line_for_test(it));
+            }
+            eprintln!("{title}: {pass} pass, {fail} fail, {none} no measurement");
+        }
+    }
+
+    fn item_line_for_test(i: &Item) -> &str {
+        match i {
+            Item::Narrate(t) | Item::CallOut(t) => t,
+            Item::Act { say, .. } | Item::Verify { say, .. } => say,
+        }
+    }
+
+    /// (act, verify, call-out) over the Zibo file's own sections, v9.0.
+    const ZIBO_COUNTS: (usize, usize, usize) = (21, 421, 218);
 }

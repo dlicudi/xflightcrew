@@ -887,22 +887,37 @@ pub struct AircraftProfile {
     /// A330 ran 66 to 67 m through at LEMG 30 (2026-09-29, #189).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_final_lead_s: Option<f64>,
-    /// Path to an XChecklist file to interpret (relative to the working dir).
-    /// `None` means no checklists for this airframe. The file is read-only input;
-    /// the copilot interprets it (see [`crate::checklist`]).
+    /// Path to an XChecklist file to interpret (relative to the working dir),
+    /// or `acf:<file>` for a file the aircraft ships in its own folder (the
+    /// Zibo's `clist.txt`: not ours to copy into this repo), resolved against
+    /// the loaded `.acf`'s directory when detection picks the profile
+    /// ([`crate::checklist::resolve_acf_path`]). `None` means no checklists
+    /// for this airframe. The file is read-only input; the copilot interprets
+    /// it (see [`crate::checklist`]).
     #[serde(default)]
     pub checklist: Option<String>,
     /// Maps the checklist file's datarefs to curated actions, per-airframe. Empty
     /// means the copilot only verifies/calls out checklist items (never acts).
     #[serde(default)]
     pub checklist_map: Vec<ChecklistMapEntry>,
+    /// Only the mapped tools act: every other checklist item is read and
+    /// confirmed, never written raw by the verify path. For an aircraft
+    /// whose stock datarefs are its plugin's OUTPUTS (the Zibo: a stock
+    /// speedbrake write sticks while its own lever never moves, so the
+    /// readback would lie). `false` (the default) keeps the verify path's
+    /// write for settable switches.
+    #[serde(default)]
+    pub checklist_map_only: bool,
     /// Which file section the checklist flow ([`crate::flow`]) reads at each
     /// phase boundary, for files whose titles the section words do not find:
     /// `climb`, `cruise`, `descent`, `before_landing`, `after_landing` -> the
     /// file's own section title. Empty (the default) means the section words
-    /// match the titles themselves, as they do in the 172 and SR22 files.
+    /// match the titles themselves, as they do in the 172 and SR22 files. A
+    /// LIST of titles is one flow read in order (a file that splits a phase
+    /// into "CLIMB PROCEDURE (1/2)" and "(2/2)"): the parts are joined into
+    /// one list, titled by their shared name ([`crate::checklist::parse`]).
     #[serde(default)]
-    pub checklist_flow: std::collections::BTreeMap<String, String>,
+    pub checklist_flow: std::collections::BTreeMap<String, FlowTitles>,
     /// Phase-expectation advisor: switch states the airframe *should* be in per
     /// flight phase; the monitor advises on the delta ("yaw damper's still off"
     /// at climb). Declarative SOP knowledge — the deterministic version of a
@@ -2726,6 +2741,24 @@ pub struct PumpCommands {
     pub readback: Vec<String>,
 }
 
+/// One `checklist_flow:` entry: a file section title, or several read in
+/// order as one list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FlowTitles {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl FlowTitles {
+    pub fn titles(&self) -> Vec<&str> {
+        match self {
+            FlowTitles::One(t) => vec![t.as_str()],
+            FlowTitles::Many(ts) => ts.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
 /// One entry of the checklist action map: a dataref *substring* and the curated
 /// action it drives. When the interpreter ([`crate::checklist`]) meets a file
 /// item whose dataref contains `match_`, it runs that action — so *which*
@@ -4126,6 +4159,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
     p.checklist = None;
     p.checklist_map = Vec::new();
     p.checklist_flow = Default::default();
+    p.checklist_map_only = false;
     p.bus_volts_nominal = None;
 
     let vs = kts("acf/_Vs_kts");
@@ -4699,6 +4733,7 @@ fn cessna_172sp() -> AircraftProfile {
             ]
         },
         checklist_flow: Default::default(),
+        checklist_map_only: false,
         altimeter: None,
         anti_ice: None,
         autoflight: None,
@@ -5115,6 +5150,7 @@ fn cirrus_sr22() -> AircraftProfile {
             ]
         },
         checklist_flow: Default::default(),
+        checklist_map_only: false,
         altimeter: None,
         anti_ice: None,
         autoflight: None,

@@ -264,7 +264,11 @@ pub(crate) fn pick_profile(who: &AcfIdentity) -> Picked {
     let resolution = resolve(who, &aircraft::profile_matchers());
     let icao = who.icao.trim().to_uppercase();
     let (id, profile, line) = match &resolution {
-        Resolution::Profile { id, .. } => (id.clone(), aircraft::load(id), None),
+        Resolution::Profile { id, .. } => (
+            id.clone(),
+            aircraft::load(id).map(|p| with_acf_checklist(p, who)),
+            None,
+        ),
         other => {
             let id = generic_profile_id(who);
             let model = matches!(other, Resolution::UnknownModel);
@@ -300,6 +304,27 @@ pub(crate) fn pick_profile(who: &AcfIdentity) -> Picked {
         resolution,
         who: who.clone(),
     }
+}
+
+/// A profile whose checklist ships in the aircraft's own folder (`checklist:
+/// acf:clist.txt`, the Zibo's) reads it from THIS aircraft's folder: the
+/// `.acf` the sim names, under the install. Detection is the one place that
+/// knows both; a profile loaded by id alone keeps the `acf:` token, which
+/// `checklist::load` refuses (said, no flows).
+fn with_acf_checklist(
+    mut p: aircraft::AircraftProfile,
+    who: &AcfIdentity,
+) -> aircraft::AircraftProfile {
+    if let Some(c) = p.checklist.as_deref() {
+        if let Some(path) = crate::checklist::resolve_acf_path(
+            c,
+            &who.relative_path,
+            &tools::autoland::xplane_root(),
+        ) {
+            p.checklist = Some(path);
+        }
+    }
+    p
 }
 
 /// The names a profile relies on that the running sim does not have, from
@@ -659,6 +684,14 @@ pub(crate) fn spawn_aircraft_detector(
                                     );
                                     if let Some(line) = aircraft::probe_summary(&missing, profile_total) {
                                         det_voice.alert(voice::Priority::Caution, line);
+                                    }
+                                    // A checklist the profile names but
+                                    // nothing can read (an `acf:` file not
+                                    // in this aircraft's folder): no flows,
+                                    // said once with the probe.
+                                    if let Some(line) = crate::checklist::unavailable_line(&live.get()) {
+                                        tracing::warn!(profile = %id, checklist = ?live.get().checklist, "checklist unavailable");
+                                        det_voice.alert(voice::Priority::Advisory, line);
                                     }
                                     tracing::info!(total = health::PLUGIN_DATAREFS.len(), missing = ?plugin_missing, "plugin probe");
                                     blackbox::record(

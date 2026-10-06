@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::aircraft::AircraftProfile;
-use crate::checklist::{self, Checklist, Cond, Item};
+use crate::checklist::{self, Checklist, Item};
 use crate::config::Config;
 use crate::tools::ToolCtx;
 use crate::voice::{Priority, Voice};
@@ -113,7 +113,8 @@ static WAITING: Mutex<Option<Waiting>> = Mutex::new(None);
 static REPLY: Mutex<Option<Reply>> = Mutex::new(None);
 
 /// The installed lists (the airframe's), and the profile's section title
-/// overrides (`checklist_flow:` in the YAML, section key -> file title).
+/// overrides (`checklist_flow:` in the YAML, section key -> list title; a
+/// key naming several file sections maps to the list they were joined into).
 static LISTS: Mutex<Option<Arc<Vec<Checklist>>>> = Mutex::new(None);
 static OVERRIDES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
@@ -144,13 +145,36 @@ pub fn install(profile: &AircraftProfile) -> Arc<Vec<Checklist>> {
     }));
     abort();
     *lock(&PROPOSAL) = None;
-    *lock(&OVERRIDES) = profile
-        .checklist_flow
-        .iter()
-        .map(|(k, v)| (section_key(k), v.clone()))
-        .collect();
+    *lock(&OVERRIDES) = overrides_for(profile, &lists);
     *lock(&LISTS) = Some(lists.clone());
     lists
+}
+
+/// The section overrides: a one-title entry names its file section; a
+/// several-title entry names the list `checklist::parse` joined them into
+/// (by its own key), or its first title when nothing was joined (the file
+/// lacks them all, so it resolves to nothing).
+pub(crate) fn overrides_for(
+    profile: &AircraftProfile,
+    lists: &[Checklist],
+) -> Vec<(String, String)> {
+    profile
+        .checklist_flow
+        .iter()
+        .map(|(k, v)| {
+            let key = section_key(k);
+            let titles = v.titles();
+            let title = match titles.as_slice() {
+                [one] => one.to_string(),
+                many => lists
+                    .iter()
+                    .find(|c| c.section.as_deref() == Some(key.as_str()))
+                    .map(|c| c.title.clone())
+                    .unwrap_or_else(|| many.first().map(|t| t.to_string()).unwrap_or_default()),
+            };
+            (key, title)
+        })
+        .collect()
 }
 
 fn lists() -> Arc<Vec<Checklist>> {
@@ -159,7 +183,7 @@ fn lists() -> Arc<Vec<Checklist>> {
 
 /// "before_landing" / "Before Landing" -> "before landing".
 fn section_key(k: &str) -> String {
-    k.to_ascii_lowercase().replace('_', " ").trim().to_string()
+    checklist::section_key(k)
 }
 
 /// The phase sections a flow can be triggered for, in flight order.
@@ -181,7 +205,7 @@ pub fn find_section(key: &str) -> Option<usize> {
     find_section_in(&lists, key, &lock(&OVERRIDES))
 }
 
-fn find_section_in(
+pub(crate) fn find_section_in(
     lists: &[Checklist],
     key: &str,
     overrides: &[(String, String)],
@@ -207,10 +231,7 @@ pub fn find_titled(lists: &[Checklist], request: &str) -> Result<usize, Vec<Stri
         .trim_start_matches("the ")
         .trim_end_matches(" checklist")
         .to_string();
-    let query: Vec<_> = request
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let query = title_words(&request);
     if query.is_empty() {
         return Err(lists.iter().map(|c| c.title.clone()).collect());
     }
@@ -218,15 +239,17 @@ pub fn find_titled(lists: &[Checklist], request: &str) -> Result<usize, Vec<Stri
         .iter()
         .enumerate()
         .filter(|(_, cl)| {
-            let title = cl.title.to_ascii_lowercase();
-            let title: Vec<_> = title.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+            let title = title_words(&cl.title);
             query.iter().all(|w| title.contains(w))
         })
         .map(|(i, _)| i)
         .collect();
+    // Exact: the same words, "procedure" and "checklist" aside, so "before
+    // taxi" is the Zibo's BEFORE TAXI PROCEDURE, and "climb" its joined
+    // CLIMB PROCEDURE over the (1/2) and (2/2) parts that also carry it.
     if let Some(i) = candidates
         .iter()
-        .find(|i| lists[**i].title.eq_ignore_ascii_case(&request))
+        .find(|i| title_words(&lists[**i].title) == query)
     {
         return Ok(*i);
     }
@@ -235,6 +258,18 @@ pub fn find_titled(lists: &[Checklist], request: &str) -> Result<usize, Vec<Stri
         [] => Err(lists.iter().map(|c| c.title.clone()).collect()),
         many => Err(many.iter().map(|i| lists[*i].title.clone()).collect()),
     }
+}
+
+/// A title's or a request's words, lowercase, without the words that only
+/// say it is a list ("procedure", "checklist"): the Zibo's file names its
+/// sections PROCEDUREs where a pilot asks for a checklist.
+fn title_words(s: &str) -> Vec<String> {
+    const LIST_WORDS: &[&str] = &["procedure", "procedures", "checklist", "checklists"];
+    s.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty() && !LIST_WORDS.contains(w))
+        .map(str::to_string)
+        .collect()
 }
 
 // ---- the phase tracker -----------------------------------------------------
@@ -1189,8 +1224,17 @@ pub fn held_by_automation(dataref: &str) -> Option<&'static str> {
     None
 }
 
-/// Decide the step for `item`. `value` is the live read of its dataref.
+/// Decide the step for a SIMPLE `item` from the one read of its dataref
+/// (the tests' view; the runner judges every term with [`decide`]).
+#[cfg(test)]
 pub fn plan(flavour: Flavour, item: &Item, value: Option<f64>, held: Option<&str>) -> Step {
+    let satisfied = item.judge_with(|_| value);
+    decide(flavour, item, satisfied, held)
+}
+
+/// Decide the step for `item`. `satisfied` is its pass test judged from
+/// the live reads: `None` for no test or a term that did not read.
+pub fn decide(flavour: Flavour, item: &Item, satisfied: Option<bool>, held: Option<&str>) -> Step {
     match item {
         Item::Narrate(t) => match flavour {
             Flavour::Monitor => Step::Skip,
@@ -1201,26 +1245,19 @@ pub fn plan(flavour: Flavour, item: &Item, value: Option<f64>, held: Option<&str
             Flavour::Monitor => Step::Skip,
             Flavour::Crew => Step::Say(t.clone()),
         },
-        Item::Act { say, cond, .. } => stateful(flavour, say, cond, value, held, true),
-        Item::Verify {
-            say,
-            cond,
-            settable,
-            ..
-        } => stateful(flavour, say, cond, value, held, *settable),
+        Item::Act { say, .. } => stateful(flavour, say, satisfied, held, true),
+        Item::Verify { say, settable, .. } => stateful(flavour, say, satisfied, held, *settable),
     }
 }
 
 fn stateful(
     flavour: Flavour,
     say: &str,
-    cond: &Cond,
-    value: Option<f64>,
+    satisfied: Option<bool>,
     held: Option<&str>,
     settable: bool,
 ) -> Step {
-    let satisfied = value.is_some_and(|v| cond.eval(v));
-    if satisfied {
+    if satisfied == Some(true) {
         return match flavour {
             Flavour::Instruct => Step::Say(format!("{say} Already done.")),
             // The monitor confirms in silence: the mission's laws set the
@@ -1239,7 +1276,7 @@ fn stateful(
         Flavour::Crew => Step::Say(say.to_string()),
         // Unreadable is not a discrepancy: the monitor blackboxes it and
         // moves on rather than accuse.
-        Flavour::Monitor if value.is_none() => Step::Skip,
+        Flavour::Monitor if satisfied.is_none() => Step::Skip,
         Flavour::Monitor => Step::Discrepancy(format!("{say} Not set.")),
         Flavour::Instruct => Step::Wait(say.to_string()),
     }
@@ -1276,13 +1313,9 @@ fn take_pending_reply() -> Option<Reply> {
     lock(&REPLY).take()
 }
 
-/// Watch for the pilot to satisfy `cond` on `dataref` (when there is one),
+/// Watch for the pilot to satisfy the item's pass test (when it has one),
 /// or to say next/skip; the clock restarts on "wait".
-async fn wait_for(
-    xp: &XPlaneClient,
-    dataref: Option<(&str, Option<usize>, &Cond)>,
-    secs: f64,
-) -> Waited {
+async fn wait_for(xp: &XPlaneClient, item: &Item, secs: f64) -> Waited {
     *lock(&WAITING) = Some(Waiting::Advance);
     let mut deadline = Instant::now() + Duration::from_secs_f64(secs);
     let out = loop {
@@ -1296,13 +1329,8 @@ async fn wait_for(
             Some(Reply::Hold) => deadline = Instant::now() + Duration::from_secs_f64(secs),
             _ => {}
         }
-        if let Some((d, i, cond)) = dataref {
-            if checklist::read_dataref(xp, d, i)
-                .await
-                .is_some_and(|v| cond.eval(v))
-            {
-                break Waited::Satisfied;
-            }
+        if item.has_test() && checklist::read_item(xp, item).await.satisfied == Some(true) {
+            break Waited::Satisfied;
         }
         if Instant::now() >= deadline {
             break Waited::TimedOut;
@@ -1334,24 +1362,6 @@ async fn confirm(voice: &Voice, hazard: &str) -> Waited {
     };
     *lock(&WAITING) = None;
     out
-}
-
-fn item_cond(item: &Item) -> Option<(&str, Option<usize>, &Cond)> {
-    match item {
-        Item::Act {
-            dataref,
-            index,
-            cond,
-            ..
-        }
-        | Item::Verify {
-            dataref,
-            index,
-            cond,
-            ..
-        } => Some((dataref.as_str(), *index, cond)),
-        _ => None,
-    }
 }
 
 fn item_line(item: &Item) -> &str {
@@ -1442,34 +1452,43 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
         }
         DETAIL.set(format!("{title_lc}, {} of {n}", i + 1));
         sheet_item(sheet_gen, i, ItemState::Now, None);
-        let cond = item_cond(item);
-        let value = match cond {
-            Some((d, idx, _)) => checklist::read_dataref(xp, d, idx).await,
-            None => None,
+        let tested = item.has_test();
+        // Every term of the pass test, read in one join (a compound item
+        // reads them all; one that does not read is no measurement).
+        let reading = if tested {
+            Some(checklist::read_item(xp, item).await)
+        } else {
+            None
         };
-        let held = cond
-            .and_then(|(d, _, _)| held_by_automation(d))
+        let judged = reading.as_ref().and_then(|r| r.satisfied);
+        // The value(s) blackboxed with a discrepancy: the one term's, or
+        // every term's for a compound test.
+        let value = match reading.as_ref().map(|r| r.values.as_slice()) {
+            Some([one]) => json!(one),
+            Some(many) => json!(many),
+            None => json!(null),
+        };
+        let held = item
+            .datarefs()
+            .into_iter()
+            .find_map(held_by_automation)
             .or_else(|| {
                 // Under a mission a Crew list writes nothing: every item not in
                 // state is the mission's (one writer per dataref).
-                if flavour == Flavour::Crew && cond.is_some() {
+                if flavour == Flavour::Crew && tested {
                     mission_owner()
                 } else {
                     None
                 }
             });
-        let satisfied = match (cond, value) {
-            (Some((_, _, c)), Some(v)) => Some(c.eval(v)),
-            (Some(_), None) => None,
-            (None, _) => Some(false),
-        };
+        let satisfied = if tested { judged } else { Some(false) };
         let mark = |state: ItemState| sheet_item(sheet_gen, i, state, None);
         let read_state = || match satisfied {
             Some(true) => ItemState::Done,
             None => ItemState::Unread,
             Some(false) => ItemState::Said,
         };
-        match plan(flavour, item, value, held) {
+        match decide(flavour, item, judged, held) {
             Step::Skip => mark(read_state()),
             Step::Say(line) => {
                 mark(read_state());
@@ -1501,7 +1520,7 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
             }
             Step::Wait(line) => {
                 say(&line);
-                match wait_for(xp, cond, INSTRUCT_WAIT_SECS).await {
+                match wait_for(xp, item, INSTRUCT_WAIT_SECS).await {
                     Waited::Satisfied => {
                         mark(ItemState::Done);
                         say("Good.")
@@ -1682,6 +1701,7 @@ async fn act(
             tool,
             args,
             confirm: hazard,
+            expr,
             ..
         } => {
             // Mixture-to-cutoff only stops a RUNNING engine; pre-start it is
@@ -1714,11 +1734,18 @@ async fn act(
             )
             .await
             .is_ok();
-            Some(if ok {
-                Acted::Ok
-            } else {
-                Acted::Failed("Didn't take, check it.")
-            })
+            if !ok {
+                return Some(Acted::Failed("Didn't take, check it."));
+            }
+            // A compound item is more than the term the tool set ("battery
+            // on AND its guard closed"): judged whole once the tool has read
+            // its own back. Unreadable is no verdict, the tool's stands.
+            if expr.is_some() && checklist::read_item(xp, item).await.satisfied == Some(false) {
+                return Some(Acted::Failed(
+                    "Set, but the rest of the item is not as listed, check it.",
+                ));
+            }
+            Some(Acted::Ok)
         }
         // The verify path's write: the file's own target, then a re-read.
         Item::Verify {
@@ -1726,6 +1753,7 @@ async fn act(
             index,
             cond,
             settable: true,
+            expr: None,
             ..
         } => {
             let target = cond.target();
@@ -1747,6 +1775,7 @@ async fn act(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checklist::Cond;
 
     /// The sheet records each item's verdict for readers, in the flight the
     /// list began in only: a late write from the last flight's runner is
@@ -2294,6 +2323,7 @@ mod tests {
             dataref: "sim/cockpit/electrical/landing_lights_on".into(),
             index: None,
             cond,
+            expr: None,
         }
     }
 
@@ -2349,6 +2379,7 @@ mod tests {
             index: None,
             cond: Cond::Lt(50.0),
             settable: false,
+            expr: None,
         };
         assert_eq!(
             plan(Flavour::Crew, &v, Some(70.0), None),
