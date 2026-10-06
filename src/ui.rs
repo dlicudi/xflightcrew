@@ -141,6 +141,7 @@ impl Reporter {
         });
     }
     pub fn status(&self, phase: Phase) {
+        crate::efb::feed::note_activity(phase_code(phase));
         if let Some(s) = &self.status {
             s.phase(phase_code(phase));
         }

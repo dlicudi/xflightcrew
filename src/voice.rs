@@ -1498,6 +1498,15 @@ impl Voice {
     /// own voice); caution/warning use the coloured alert slot so the chip keeps
     /// its amber/red salience. Cheap, non-blocking, a no-op when unwired.
     fn mirror_to_panel(&self, priority: Priority, text: &str) {
+        // The EFB keeps the same line at the same level (its banner and chip).
+        crate::efb::feed::note_alert(
+            match priority {
+                Priority::Warning => "warning",
+                Priority::Caution => "caution",
+                Priority::Advisory | Priority::Readback => "advisory",
+            },
+            text,
+        );
         if let Some(s) = self
             .inner
             .status
