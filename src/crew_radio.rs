@@ -270,6 +270,13 @@ pub fn forget_flight_calls() {
     *LAST_READBACK.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// Withdraw every call still queued, unsent: the mission that queued them
+/// has ended (`full_auto::give_up`). Returns their words for the blackbox.
+pub fn withdraw_queued() -> Vec<String> {
+    let mut q = CREW_RADIO.lock().unwrap_or_else(|e| e.into_inner());
+    q.drain(..).map(|c| call_words(&c.call)).collect()
+}
+
 /// Drain the pending crew radio calls (main loop only).
 pub fn take_crew_radio() -> Vec<Queued> {
     let mut q = CREW_RADIO.lock().unwrap_or_else(|e| e.into_inner());

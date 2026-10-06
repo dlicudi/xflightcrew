@@ -488,6 +488,28 @@ impl Drop for SortieGuard {
 }
 
 /// Give up cleanly.
+/// Every call full auto makes goes out through here: once the mission is
+/// aborted it says nothing more. A step already past its abort check queued
+/// "request IFR clearance" and the fallback "request clearance" 0.3 s after
+/// a cancel, and both went out 34 and 57 s later from a mission that had
+/// handed back (LXGB 2026-10-06, sortie 1791289470-full_auto).
+fn radio_out(call: String) {
+    if ABORT.load(SeqCst) {
+        event("radio_withheld", json!({ "call": call }));
+        return;
+    }
+    crate::circuit::transmit(call);
+}
+
+/// [`radio_out`] for a readback.
+fn radio_readback(call: String, owed_copy: bool) {
+    if ABORT.load(SeqCst) {
+        event("radio_withheld", json!({ "call": call, "readback": true }));
+        return;
+    }
+    crate::circuit::transmit_readback(call, owed_copy);
+}
+
 async fn give_up(
     xp: &XPlaneClient,
     valve_set: Option<f64>,
@@ -505,6 +527,12 @@ async fn give_up(
     // the rest, never quietly re-trimming under the pilot's hand.
     crate::tools::engine::release_mixture();
     event("give_up", json!({ "reason": reason }));
+    // A request or readback the mission queued and the main loop has not
+    // yet sent is the mission's, and the mission is over.
+    let withdrawn = crate::crew_radio::withdraw_queued();
+    if !withdrawn.is_empty() {
+        event("radio_withdrawn", json!({ "calls": withdrawn }));
+    }
     crate::blackbox::end_sortie("gave_up", json!({ "reason": reason, "line": line }));
     // Held before it is said: the line claims the pilot has the aircraft, so
     // whatever is going to hold it should already be holding it.
@@ -743,7 +771,7 @@ async fn judge_cleared_runway(
         return Err(format!("{line} Your aircraft."));
     };
     announce(voice, Priority::Advisory, &line);
-    crate::circuit::transmit(crate::circuit::radio_call(
+    radio_out(crate::circuit::radio_call(
         callsign,
         &runway_request_call(&cleared, &ask),
     ));
@@ -840,7 +868,7 @@ pub(crate) async fn get_zone_clearance(
     // its own hands (LIPK 2026-09-26: said, queued behind the tower, and
     // dropped stale, or heard after the call it announced).
     let circuits = flying_circuits();
-    crate::circuit::transmit(crate::circuit::radio_call(callsign, zone_clearance_call(circuits)));
+    radio_out(crate::circuit::radio_call(callsign, zone_clearance_call(circuits)));
     event("request_clearance", json!({ "circuits": circuits }));
     // The tower answers with a discrete squawk; wait for it, then dial it
     // into the transponder and read it back — the crew's clearance copy.
@@ -862,7 +890,7 @@ pub(crate) async fn get_zone_clearance(
     // nothing, and answers a correct one with silence). Never done
     // before 2026-09-15: the squawk was set and the taxi asked for.
     if let Some(rb) = crate::party_line::readback_owed() {
-        crate::circuit::transmit_readback(rb.trim_end_matches('.').to_string(), true);
+        radio_readback(rb.trim_end_matches('.').to_string(), true);
         event("clearance_readback", json!({}));
     }
 }
@@ -932,7 +960,7 @@ async fn zone_clearance_from_the_strip(
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
     }
     let owed_before = crate::party_line::readback_owed();
-    crate::circuit::transmit(crate::circuit::radio_call(
+    radio_out(crate::circuit::radio_call(
         callsign,
         &strip_clearance_call(runway, flying_circuits()),
     ));
@@ -957,7 +985,7 @@ async fn zone_clearance_from_the_strip(
     );
     ensure_squawk(xp, ctx, voice).await;
     if let Some(rb) = crate::party_line::readback_owed() {
-        crate::circuit::transmit_readback(rb.trim_end_matches('.').to_string(), true);
+        radio_readback(rb.trim_end_matches('.').to_string(), true);
         event("clearance_readback", json!({}));
     }
 }
@@ -995,7 +1023,7 @@ async fn get_ifr_clearance(
     callsign: &Option<String>,
     dest: &str,
 ) -> bool {
-    crate::circuit::transmit(ifr_request_call(callsign, dest));
+    radio_out(ifr_request_call(callsign, dest));
     event("request_clearance", json!({ "ifr": true, "dest": dest }));
     // The same queue arithmetic as the zone call's wait: the call rides the
     // speech queue behind anyone the tower is working.
@@ -1011,7 +1039,7 @@ async fn get_ifr_clearance(
     // The readback is ENFORCED: the SID, the altitude and the code, in the
     // tower's own words (the coach line), so it is right first time.
     if let Some(rb) = ifr_readback_line(crate::party_line::readback_owed().as_deref()) {
-        crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+        radio_out(rb.trim_end_matches('.').to_string());
         event("clearance_readback", json!({ "ifr": true }));
     }
     // The acceptance clock starts when the readback GOES OUT, not when it
@@ -1351,7 +1379,7 @@ pub(crate) async fn obey_departure_handoff(
     khz: i64,
     climb_to_ft: f64,
 ) {
-    crate::circuit::transmit(crate::circuit::radio_call(
+    radio_out(crate::circuit::radio_call(
         callsign,
         &format!("{to} on {}", crate::atis::spoken_mhz(khz)),
     ));
@@ -1407,7 +1435,7 @@ pub(crate) async fn obey_region_handoff(
     readback: bool,
 ) {
     if readback {
-        crate::circuit::transmit(region_readback(callsign, &h));
+        radio_out(region_readback(callsign, &h));
         tokio::time::sleep(Duration::from_secs(HANDOFF_READBACK_SECS)).await;
     }
     let squawk_ok = if h.squawk_vfr {
@@ -2436,7 +2464,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // unless the wind really favours another end): a SID exists for
             // one runway, and in calm air the pick could have been the other.
             let cleared_rwy = crate::party_line::assigned_clearance().map(|c| c.runway);
-            crate::circuit::transmit(crate::circuit::radio_call(
+            radio_out(crate::circuit::radio_call(
                 &callsign,
                 &taxi_call(&tools.mission, cleared_rwy.as_deref()),
             ));
@@ -3975,7 +4003,7 @@ async fn fly_route(
             Some(rwy) => format!("final runway {}", crate::circuit::spell_runway(&rwy.id)),
             None => "final".to_string(),
         };
-        crate::circuit::transmit(crate::circuit::radio_call(callsign, &call));
+        radio_out(crate::circuit::radio_call(callsign, &call));
         event(
             "final_call",
             json!({ "runway": landing_rwy.as_ref().map(|r| &r.id),
@@ -4671,7 +4699,7 @@ async fn call_inbound(
         Some(r) => format!("inbound for landing, runway {}", crate::circuit::spell_runway(r)),
         None => "inbound for landing".to_string(),
     };
-    crate::circuit::transmit(crate::circuit::radio_call(callsign, &words));
+    radio_out(crate::circuit::radio_call(callsign, &words));
     INBOUND_MADE.store(true, SeqCst);
     // From here the destination's tower is OURS: the region's service-weighted
     // nearest-field pick may not hand the station to a closer field while we
@@ -5437,7 +5465,7 @@ pub fn sid_request_call(callsign: &Option<String>, cleared: Option<&str>, want: 
 /// held clearance to name it (`party_line::assigned_clearance`). True when
 /// it does; blackbox `full_auto` `sid_requested` either way.
 async fn request_sid(callsign: &Option<String>, cleared: Option<&str>, want: &str) -> bool {
-    crate::circuit::transmit(sid_request_call(callsign, cleared, want));
+    radio_out(sid_request_call(callsign, cleared, want));
     waiting("the tower to approve the departure");
     let named = |c: Option<crate::party_line::IfrClearance>| {
         c.and_then(|c| c.sid).is_some_and(|s| s.eq_ignore_ascii_case(want))
@@ -5863,7 +5891,7 @@ async fn request_departure(callsign: &Option<String>, on_runway: Option<&str>) {
     // The call itself is heard; a line announcing it first is a crew narrating
     // its own hands (LIPK 2026-09-26: said, queued behind the tower, and
     // dropped stale, or heard after the call it announced).
-    crate::circuit::transmit(crate::circuit::radio_call(
+    radio_out(crate::circuit::radio_call(
         callsign,
         ready_call(flying_circuits()),
     ));
@@ -5977,7 +6005,7 @@ async fn backtrack_from_runway_start(
         );
         let mut approved = false;
         for attempt in 0..BACKTRACK_ASKS {
-            crate::circuit::transmit(crate::circuit::radio_call(callsign, &call));
+            radio_out(crate::circuit::radio_call(callsign, &call));
             event(
                 "request_backtrack",
                 json!({ "runway": runway, "attempt": attempt }),
@@ -5996,7 +6024,7 @@ async fn backtrack_from_runway_start(
             // Held for traffic: "hold position" is read back like any
             // instruction, then asked again once it has had its minute.
             if let Some(rb) = crate::party_line::readback_owed() {
-                crate::circuit::transmit_readback(rb.trim_end_matches('.').to_string(), true);
+                radio_readback(rb.trim_end_matches('.').to_string(), true);
             }
         }
         if ABORT.load(SeqCst) {
@@ -6011,7 +6039,7 @@ async fn backtrack_from_runway_start(
             ));
         }
         if let Some(rb) = crate::party_line::readback_owed() {
-            crate::circuit::transmit_readback(rb.trim_end_matches('.').to_string(), true);
+            radio_readback(rb.trim_end_matches('.').to_string(), true);
             event("backtrack_readback", json!({}));
         }
     }
@@ -6153,7 +6181,7 @@ async fn ensure_takeoff_cleared(
         let owed = crate::party_line::readback_owed();
         let last = crate::circuit::last_readback();
         if let Some(rb) = OwedReadback::due(owed.as_deref(), last.as_ref(), Instant::now()) {
-            crate::circuit::transmit_readback(rb.trim_end_matches('.').to_string(), true);
+            radio_readback(rb.trim_end_matches('.').to_string(), true);
             event("readback_hold", json!({ "call": rb }));
             last_call = Instant::now();
         } else if owed.is_some() {
@@ -6169,7 +6197,7 @@ async fn ensure_takeoff_cleared(
                     "reask_held",
                     json!({ "why": "held", "since_call_s": last_call.elapsed().as_secs() }),
                 );
-                crate::circuit::transmit(crate::circuit::radio_call(
+                radio_out(crate::circuit::radio_call(
                     callsign,
                     ready_call(flying_circuits()),
                 ));
@@ -6189,7 +6217,7 @@ async fn ensure_takeoff_cleared(
                 announced_hold = true;
             }
         } else if last_call.elapsed() >= NUDGE_EVERY {
-            crate::circuit::transmit(crate::circuit::radio_call(
+            radio_out(crate::circuit::radio_call(
                 callsign,
                 ready_call(flying_circuits()),
             ));
@@ -6208,7 +6236,7 @@ async fn ensure_takeoff_cleared(
         let sent = if lined_up_only {
             let call =
                 crate::circuit::radio_call(callsign, &format!("lining up runway {spelled}"));
-            crate::circuit::transmit_readback(call.clone(), false);
+            radio_readback(call.clone(), false);
             event("readback_line_up", json!({ "runway": rwy }));
             Some(call)
         } else if !*read_back {
@@ -6217,7 +6245,7 @@ async fn ensure_takeoff_cleared(
                 callsign,
                 &format!("cleared for takeoff runway {spelled}"),
             );
-            crate::circuit::transmit_readback(call.clone(), false);
+            radio_readback(call.clone(), false);
             event("readback_takeoff", json!({ "runway": rwy }));
             Some(call)
         } else {

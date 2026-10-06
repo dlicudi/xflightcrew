@@ -23,6 +23,9 @@ use crate::plugin_status::StatusSink;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
+/// A taxi clearance this soon after full auto ran answers the mission's own
+/// request: the pilot's short-runway advice leaves it alone.
+const MISSION_CLEARANCE_SECS: f64 = 15.0;
 const MS_TO_KTS: f64 = 1.943_844;
 const M_TO_FT: f64 = 3.280_84;
 
@@ -3131,6 +3134,11 @@ pub async fn run(
     // The taxi clearance whose runway the crew last judged for a pilot
     // taxiing (full auto judges its own): said once per clearance.
     let mut cleared_runway_judged: Option<String> = None;
+    // When full auto last ran: a clearance answering its request is its own
+    // even when it lands just after a cancel (LXGB 2026-10-06: the mission's
+    // "request taxi" went out, the cancel handed back, and the reply was
+    // judged as the pilot's with the waiver gone).
+    let mut full_auto_seen: Option<std::time::Instant> = None;
     // Landing-clearance coach: when the approach hands us to the tower we owe
     // a "final" report before "cleared to land". `seen` starts the grace so a
     // prompt reporter is never nagged; `spoken` fires the nudge once.
@@ -3915,10 +3923,14 @@ pub async fn run(
                         == Some(crate::tower::State::TaxiCleared))
                     .then(crate::party_line::clearance_runway)
                     .flatten();
+                    if crate::full_auto::running() {
+                        full_auto_seen = Some(std::time::Instant::now());
+                    }
+                    let missions = full_auto_seen
+                        .is_some_and(|t| t.elapsed().as_secs_f64() < MISSION_CLEARANCE_SECS);
                     if taxi_to != cleared_runway_judged {
                         cleared_runway_judged = taxi_to.clone();
-                        if let Some(rwy) =
-                            taxi_to.filter(|_| crew_on && snap.on_ground && !crate::full_auto::running())
+                        if let Some(rwy) = taxi_to.filter(|_| crew_on && snap.on_ground && !missions)
                         {
                             let (roll, mtow) = crate::aircraft::profile_takeoff_roll(&live.get());
                             let needed =

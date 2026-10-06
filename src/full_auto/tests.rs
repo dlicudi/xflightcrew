@@ -2100,3 +2100,35 @@
             assert!(!text.contains("set_takeoff_margin_waived("), "{rel} writes the waiver");
         }
     }
+
+/// Full auto's calls go out through `radio_out` / `radio_readback`, which
+/// hold every call once the mission is aborted: a raw transmit sent "request
+/// IFR clearance" 34 s after a cancel (LXGB 2026-10-06).
+#[test]
+fn every_mission_call_goes_through_the_abort_door() {
+    let src = include_str!("../full_auto.rs");
+    let raw: Vec<&str> = src
+        .lines()
+        .filter(|l| {
+            (l.contains("circuit::transmit(") || l.contains("circuit::transmit_readback("))
+                && !l.trim_start().starts_with("//")
+        })
+        .collect();
+    assert_eq!(raw.len(), 2, "only the door transmits: {raw:#?}");
+}
+
+/// A give-up withdraws what the mission queued and the main loop had not
+/// yet sent.
+#[test]
+fn a_withdraw_empties_the_crew_queue() {
+    let _q = crate::crew_radio::QUEUE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::crew_radio::forget_flight_calls();
+    crate::circuit::transmit("Gibraltar Tower, request IFR clearance".into());
+    crate::circuit::transmit("Gibraltar Tower, request clearance".into());
+    assert!(crate::crew_radio::crew_radio_pending());
+    let gone = crate::crew_radio::withdraw_queued();
+    assert_eq!(gone.len(), 2, "{gone:?}");
+    assert!(!crate::crew_radio::crew_radio_pending());
+}
