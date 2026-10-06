@@ -809,7 +809,10 @@ pub(crate) async fn flight_plan_report(
     if let Ok(kg) = xp.get_float(datarefs::FUEL_TOTAL_KG).await {
         let aboard = crate::aircraft::fuel_in_unit_kg(kg).round();
         let need = crate::aircraft::fuel_in_unit_kg(fp.block_fuel_kg).round();
-        if aboard >= need {
+        // Within 1% is the plan's fuel: the APU and a start burn that much
+        // on the stand, and "short" over 35 pounds sent the pilot to the
+        // load sheet for nothing (LXGB 2026-10-06).
+        if aboard >= need * 0.99 {
             line.push_str(&format!(
                 " You have {} aboard, enough for the plan.",
                 crate::aircraft::say_fuel_figure(aboard)
@@ -821,27 +824,42 @@ pub(crate) async fn flight_plan_report(
                 crate::aircraft::fuel_figure_kg(fp.block_fuel_kg),
                 crate::aircraft::say_fuel_figure(need - aboard),
             ));
-            act = format!(
-                " Short about {} of fuel.",
-                crate::aircraft::say_fuel_figure(need - aboard)
-            );
+            // Spoken: that it is short and what to do; the figure is on the
+            // page with the rest (LXGB 2026-10-06: "super verbose").
+            act = " Short on fuel.".to_string();
             // The crew can do the load sheet, on the ground only.
             if on_ground {
                 line.push_str(" Say load the aircraft and I'll set it from the plan.");
-                act.push_str(" Say load the aircraft and I'll set it from the plan.");
+                act = " Short on fuel, say load the aircraft.".to_string();
             }
         }
     }
     match panel {
         Some(p) => {
             p.brief(&format!("Flight plan\n{line}"));
-            format!("{}{act} Details on the Brief tab.", short_plan_line(fp))
+            format!("{}{act} {}", short_plan_line(fp), details_pointer())
         }
         None => line,
     }
 }
 
-/// The plan in one spoken line: where, how far, how long, how high. Pure.
+/// Where the detail behind a short spoken line is read: the EFB's pages when
+/// it is served, else the panel's Brief tab. One phrase for every brief line.
+pub(crate) fn details_pointer() -> &'static str {
+    details_pointer_for(crate::settings::live().efb)
+}
+
+/// [`details_pointer`] with the EFB state given. Pure.
+pub(crate) fn details_pointer_for(efb: bool) -> &'static str {
+    if efb {
+        "Details on the EFB."
+    } else {
+        "Details on the Brief tab."
+    }
+}
+
+/// The plan in one spoken line: where and how long. The distance and the
+/// cruise level are on the page. Pure.
 pub(crate) fn short_plan_line(fp: &simbrief::FlightPlan) -> String {
     let h = (fp.ete_min / 60.0).floor() as i32;
     let m = (fp.ete_min % 60.0).round() as i32;
@@ -850,13 +868,7 @@ pub(crate) fn short_plan_line(fp: &simbrief::FlightPlan) -> String {
         1 => format!("1 hour {m}"),
         _ => format!("{h} hours {m}"),
     };
-    format!(
-        "Plan {} to {}, {:.0} miles, {ete}, cruise {}.",
-        fp.origin,
-        fp.destination,
-        fp.distance_nm,
-        crate::flightplan::spoken_feet(fp.cruise_alt_ft)
-    )
+    format!("Plan {} to {}, {ete}.", fp.origin, fp.destination)
 }
 
 /// "Check the flight plan": the arm's whole-flight audit, spoken in full,

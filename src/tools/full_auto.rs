@@ -1735,7 +1735,10 @@ impl FullAuto {
                 "line": load_line,
             }),
         );
-        notes.extend(load_line);
+        // Spoken short like the tool's; the figures are on the page.
+        notes.extend(
+            load_line.map(|l| super::loading::spoken_load_line(&l, "").trim_end().to_string()),
+        );
 
         // The preflight: tanks, load and all-up weight as the sim has them
         // now, against the plan and the book. A refusal here costs nothing;
@@ -1968,10 +1971,9 @@ impl FullAuto {
         let ack = spoken_arm_line(
             &fp.origin,
             &fp.destination,
-            fp.cruise_alt_ft,
             &waived,
-            audit_line.as_deref(),
-            ctx.status.is_some(),
+            audit.cautions().count(),
+            crate::plan::details_pointer(),
         );
         Ok((
             Mission::Flight(Route {
@@ -2033,31 +2035,32 @@ fn record_step_climbs(legs: &mut [crate::nav::ProcLeg], schedule: &crate::simbri
     );
 }
 
-/// The arming ack as SPOKEN: the flight, the pilot's own waivers, the
-/// plan's cautions, and where the rest is. Without a panel the brief has
-/// nowhere to be read, so it says only the essentials. Pure.
+/// The arming ack as SPOKEN: the flight, the pilot's own waivers by name,
+/// how many cautions the plan carries, and where the rest is. The numbers
+/// were said when the gate refused and are on the page; said again at the
+/// arm they made a paragraph (LXGB 2026-10-06: "super verbose"). Pure.
 pub fn spoken_arm_line(
     origin: &str,
     dest: &str,
-    cruise_ft: f64,
     waived: &str,
-    cautions: Option<&str>,
-    panel: bool,
+    cautions: usize,
+    pointer: &str,
 ) -> String {
-    let mut line = format!(
-        "I'll fly from {origin} to {dest}, cruise {}. ",
-        crate::flightplan::spoken_feet(cruise_ft)
-    );
-    line.push_str(waived.trim());
-    if !waived.trim().is_empty() {
-        line.push(' ');
+    let mut line = format!("Flying {origin} to {dest}. ");
+    if waived.contains("runway margin") {
+        line.push_str("Runway margin waived. ");
     }
-    if let Some(c) = cautions {
-        line.push_str(c.trim());
-        line.push(' ');
+    if waived.contains("weight limit") {
+        line.push_str("Weight limit waived. ");
     }
-    if panel && cautions.is_some() {
-        line.push_str("Details on the brief. ");
+    match cautions {
+        0 => {}
+        1 => line.push_str("One caution on the plan. "),
+        n => line.push_str(&format!("{n} cautions on the plan. ")),
+    }
+    if cautions > 0 {
+        line.push_str(pointer);
+        line.push(' ');
     }
     // How to take it back, the first arm of a session only (the taxi's
     // `take_back_hint` rule: a person says it once).
@@ -2103,23 +2106,27 @@ mod tests {
     }
 
     #[test]
-    fn the_arm_says_the_flight_and_the_route_tab_holds_the_brief() {
+    fn the_arm_says_the_flight_and_the_page_holds_the_brief() {
         // The first arm of a session says how to take it back; the next
         // does not. No caution, no pointer to a brief with nothing in it.
-        let l = spoken_arm_line("LIME", "LIPE", 19000.0, "", None, true);
-        assert_eq!(l, "I'll fly from LIME to LIPE, cruise 19,000 feet. Cancel or my controls any time.");
-        let again = spoken_arm_line("LIME", "LIPE", 19000.0, "", None, true);
-        assert_eq!(again, "I'll fly from LIME to LIPE, cruise 19,000 feet.");
+        let p = "Details on the EFB.";
+        let l = spoken_arm_line("LIME", "LIPE", "", 0, p);
+        assert_eq!(l, "Flying LIME to LIPE. Cancel or my controls any time.");
+        let again = spoken_arm_line("LIME", "LIPE", "", 0, p);
+        assert_eq!(again, "Flying LIME to LIPE.");
+        // LXGB 2026-10-06: the waiver's numbers and the terrain caution
+        // were a paragraph at the arm; now a name and a count.
         let w = spoken_arm_line(
-            "LILB",
-            "LIPK",
-            25000.0,
-            "No runway margin, your call: 1,970 feet of runway, 1,640 feet needed without it. ",
-            Some("One thing on the plan."),
-            true,
+            "LXGB",
+            "EGKK",
+            "No runway margin, your call: 5,786 feet of runway, 4,665 feet needed without it. ",
+            1,
+            p,
         );
-        assert!(w.contains("your call") && w.contains("One thing on the plan"), "{w}");
-        assert!(w.contains("Details on the brief"), "{w}");
+        assert_eq!(
+            w,
+            "Flying LXGB to EGKK. Runway margin waived. One caution on the plan. Details on the EFB."
+        );
     }
 
     /// Every shipped profile is exactly ONE airframe class, and full auto

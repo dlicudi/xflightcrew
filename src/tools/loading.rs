@@ -143,7 +143,25 @@ impl Tool for LoadAircraft {
             Ok(fp) => fp,
             Err(line) => return Ok(line),
         };
-        load_from_plan(ctx.xplane, &fp, what).await
+        let full = load_from_plan(ctx.xplane, &fp, what).await?;
+        if let Some(st) = ctx.status {
+            st.brief(&format!("Load sheet\n{full}"));
+        }
+        Ok(spoken_load_line(&full, crate::plan::details_pointer()))
+    }
+}
+
+/// The load as SPOKEN: a clean load is one line and the figures are on the
+/// page; anything the pilot must hear (a trim, a limit, a write that did not
+/// take, a refusal) is said in full (LXGB 2026-10-06: "super verbose"). Pure.
+pub(crate) fn spoken_load_line(full: &str, pointer: &str) -> String {
+    let clean = full.starts_with("Loaded for")
+        && !["did not take", "trimmed", "over the plan", "can't read"]
+            .iter()
+            .any(|w| full.contains(w));
+    match full.split_once('.') {
+        Some((first, _)) if clean => format!("{first}. {pointer}"),
+        _ => full.to_string(),
     }
 }
 
@@ -413,6 +431,24 @@ pub async fn load_from_plan(xp: &dyn XPlane, fp: &FlightPlan, what: What) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_clean_load_is_one_line_and_a_problem_is_said_in_full() {
+        let p = "Details on the EFB.";
+        let clean = "Loaded for LXGB to EGKK. Fuel 20,880 pounds. Payload 35,560 pounds, \
+                     152 passengers. All up 147,740 pounds.";
+        assert_eq!(
+            super::spoken_load_line(clean, p),
+            "Loaded for LXGB to EGKK. Details on the EFB."
+        );
+        for bad in [
+            "Loaded for LIPR to LIBP. Fuel 300 pounds, trimmed from the plan's 400 to stay inside its takeoff limit.",
+            "Loading for EGPH to EGTE. The fuel did not take: 5,840 kilos aboard against the plan's 7,200 kilos.",
+            "Negative, we're airborne.",
+        ] {
+            assert_eq!(super::spoken_load_line(bad, p), bad);
+        }
+    }
+
     /// LIPR-LIBP 172 (2026-09-26): 2,550 lb all up with the plan's block,
     /// the plan's limit 2,450: trimmed by 100 lb, still over the minimum.
     #[test]
