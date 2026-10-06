@@ -3548,10 +3548,15 @@ pub async fn run(
                 // Clear is the BAR coming off, not the rolling stopping: now
                 // that `pushing_back` is motion-based, a pause mid-push would
                 // otherwise announce a tug that is still hooked to the nose.
+                // And only after a push: a bar that comes off unmoved is no
+                // pushback done (LXGB 2026-10-06: the 737's tug from a
+                // cancelled push went with the 737, and the 172 loaded in
+                // its place was told "Pushback done, tug's clear").
+                let pushed = push_called;
                 if !snap.tug_attached {
                     push_called = false;
                 }
-                if !snap.tug_attached && prev_attached {
+                if !snap.tug_attached && prev_attached && pushed {
                     say(crate::readback::one_of(&[
                         "Pushback complete, tug clear.",
                         "Pushback done, tug's clear.",
