@@ -37,6 +37,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("autoland::GLIDEPATH_DEG", 'L'),
     ("autoland::LANDED_RUNWAY", 'F'),
     ("autoland::LANDING_CONFIGURED", 'L'),
+    ("autoland::ON_FINAL", 'L'),
     ("autoland::PANEL", 'L'),
     ("autoland::RUN", 'L'),
     ("autoland::TRACKING_ERROR", 'F'),

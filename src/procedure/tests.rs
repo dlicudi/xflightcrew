@@ -2832,7 +2832,7 @@
             "LFOS",
             3000.0,
         );
-        assert!(extend_to_arrival_gateway(&mut legs, &destination));
+        assert!(extend_to_arrival_gateway(&mut legs, &destination, Some(512.0)));
         let gate = legs.last().and_then(|l| l.fix.as_ref()).unwrap();
         assert!(
             (crate::nav::haversine_nm(gate.lat, gate.lon, destination.lat, destination.lon)
@@ -2844,8 +2844,46 @@
         assert_eq!(legs.last().unwrap().fix_ident, "LFOS arrival");
 
         let n = legs.len();
-        assert!(!extend_to_arrival_gateway(&mut legs, &destination));
+        assert!(!extend_to_arrival_gateway(&mut legs, &destination, Some(512.0)));
         assert_eq!(legs.len(), n, "an arrival already at the gate is unchanged");
+    }
+
+    /// LEGR-LXGB, 2026-10-06 (sortie 1791275171-full_auto, 737): no STAR
+    /// served 09 from the north, the route ended at PIMOS and the gateway
+    /// copied its 12,700 ft; autoland took the arrival 12 nm east of the
+    /// field at 13,300 and the reposition began 10,100 ft over its platform.
+    /// The gateway is crossed on the field's 3 degree path, and the descent
+    /// to it starts before PIMOS (the plan's own ceilings ahead).
+    #[test]
+    fn a_route_only_arrival_crosses_its_gateway_on_the_path_not_at_the_last_fix() {
+        let destination = wp("LXGB", 36.1512, -5.3497, 15.0);
+        let mut legs = enroute_legs(
+            &[
+                wp("LEGR", 37.1887, -3.7774, 0.0),
+                wp("PIMOS", 36.5000, -4.9000, 12_700.0),
+                destination.clone(),
+            ],
+            "LEGR",
+            "LXGB",
+            19_000.0,
+        );
+        assert!(needs_arrival_gateway(&legs, &destination));
+        assert!(extend_to_arrival_gateway(&mut legs, &destination, Some(15.0)));
+        let gate = legs.last().unwrap();
+        assert_eq!(gate.fix_ident, "LXGB arrival");
+        // 15 + 12 nm x 318 = 3,831, in hundreds.
+        assert_eq!(gate.alt1_ft, Some(3_800.0));
+        // The descent to it is begun on the leg before, not at PIMOS.
+        let grad = arrival_ft_per_nm(2_000.0, 250.0);
+        let pimos = legs.iter().position(|l| l.fix_ident == "PIMOS").unwrap();
+        let ceiling = profile_ceiling_ft(&legs, pimos, grad).unwrap();
+        assert!(ceiling < 12_700.0 - 2_000.0, "PIMOS crossed lower: {ceiling}");
+        // A route already below the path keeps its own altitude; an unread
+        // field keeps the route's (the old behaviour).
+        assert_eq!(arrival_gateway_alt_ft(Some(3_000.0), Some(15.0)), Some(3_000.0));
+        assert_eq!(arrival_gateway_alt_ft(Some(12_700.0), None), Some(12_700.0));
+        // A high field's path is its own: LSZS at 5,600 ft.
+        assert_eq!(arrival_gateway_alt_ft(Some(14_000.0), Some(5_600.0)), Some(9_400.0));
     }
 
     #[test]
