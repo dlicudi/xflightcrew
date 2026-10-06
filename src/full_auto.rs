@@ -500,7 +500,7 @@ async fn give_up(
     stop_active();
     // "Your aircraft" means every lever: the mixture manager stands down with
     // the rest, never quietly re-trimming under the pilot's hand.
-    crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
+    crate::tools::engine::release_mixture();
     event("give_up", json!({ "reason": reason }));
     crate::blackbox::end_sortie("gave_up", json!({ "reason": reason, "line": line }));
     // Held before it is said: the line claims the pilot has the aircraft, so
