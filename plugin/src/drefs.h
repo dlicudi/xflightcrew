@@ -40,6 +40,12 @@ void start();
 void stop_first();
 void stop_rest();
 
+// The pedal channel's pilot yield (xcopilot/steer_yield), for the tiller
+// channel: read it to let go with the pedals, latch it when the pilot's hand
+// is on the tiller so the app's drive stands down on the one flag it polls.
+bool steer_yielded();
+void yield_steering();
+
 // The app heartbeats the phase ~1/s; a stale timestamp = not running.
 bool app_connected();
 

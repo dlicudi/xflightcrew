@@ -3339,6 +3339,10 @@ async fn drive(
     // so the assist's own slew has something to move from.
     let mut bs_on = false;
     let mut brakes = BrakeSteer::default();
+    // An airliner's pedals steer the nose a few degrees: where the airframe
+    // declares a tiller the same command goes to it too (`crate::tiller`).
+    let mut tiller = crate::tiller::Tiller::for_airframe();
+    tiller.arm(&xp).await;
     // A nose with no steering of its own flies the one ground law on the
     // route (`ground_steer`), on the sim's own yaw rate.
     let free_nose = crate::aircraft::nose_free();
@@ -3982,14 +3986,25 @@ async fn drive(
         if let Some(g) = ground_rec {
             drive_rec["gsteer"] = g;
         }
+        // The tiller as written, where the airframe has one.
+        if let Some(c) = tiller.command(steer, gs_kts) {
+            drive_rec["tiller"] = serde_json::json!(c);
+        }
         crate::blackbox::record("autotaxi", drive_rec);
         let steer_write = if route.pace.brake_steer || crate::aircraft::nose_castors() {
-            let (s, a, b) = tokio::join!(
+            let (s, a, b, ()) = tokio::join!(
                 xp.set_float(TAXI_STEER, steer),
                 xp.set_float(LEFT_BRAKE, bl),
                 xp.set_float(RIGHT_BRAKE, br),
+                tiller.write(&xp, steer, gs_kts),
             );
             let _ = (a, b);
+            s
+        } else if tiller.declared() {
+            let (s, ()) = tokio::join!(
+                xp.set_float(TAXI_STEER, steer),
+                tiller.write(&xp, steer, gs_kts),
+            );
             s
         } else {
             xp.set_float(TAXI_STEER, steer).await
@@ -4040,6 +4055,7 @@ async fn drive(
     }
     // Politeness on the way out — expiry would do it within the second.
     let _ = xp.set_float(TAXI_STEER, 0.0).await;
+    tiller.release(&xp).await;
     // The brake-steer datarefs do NOT expire like the plugin channel does, so
     // a braked wheel left behind would drag forever. Every exit is a `break`
     // to here (checked — no returns inside the loop), so one release covers

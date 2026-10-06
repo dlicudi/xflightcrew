@@ -1612,6 +1612,10 @@ fn spawn_autoland(launch: AutolandLaunch) {
             // A castoring nosewheel steers the rollout on its brakes too
             // (`RolloutBrakeSteer`, issue #166).
             let rollout_brake_steer = rollout_brake_steers();
+            // The tiller below the hand-off, where the airframe has one
+            // (`crate::tiller`): the 737's pedals turn the nose 7 degrees.
+            let mut rollout_tiller = crate::tiller::Tiller::for_airframe();
+            rollout_tiller.arm(&xp).await;
             let mut rollout_brakes = RolloutBrakeSteer::for_airframe();
             // A steered nosewheel that declares its own rollout law
             // (`RolloutSteer`, issue #197); else the takeoff roll's default.
@@ -2202,6 +2206,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         writes.set(&thr_name, 0.0);
                     }
                     writes.set(TAXI_STEER, steer);
+                    if let Some(c) = rollout_tiller.command(steer, gs_kts) {
+                        writes.set(crate::tiller::TILLER, c);
+                    }
                     if let Some(e) = touch_elev {
                         // Ours, not a hand (the scorer's yoke check).
                         crate::monitor::note_crew_yoke();
@@ -2219,6 +2226,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         writes.flush(&xp).await;
                         let _ = xp.set_float(TAXI_BRAKE, 0.0).await;
                         let _ = xp.set_float(TAXI_STEER, 0.0).await;
+                        rollout_tiller.release(&xp).await;
                         if rollout_brake_steer {
                             let _ = tokio::join!(
                                 xp.set_float(crate::autotaxi::LEFT_BRAKE, 0.0),
@@ -2259,6 +2267,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     writes.flush(&xp).await;
                     let _ = xp.set_float(TAXI_BRAKE, ROLLOUT_BRAKE_HOLD).await;
                     let _ = xp.set_float(TAXI_STEER, 0.0).await;
+                    rollout_tiller.release(&xp).await;
                     if rollout_brake_steer {
                         let _ = tokio::join!(
                             xp.set_float(crate::autotaxi::LEFT_BRAKE, 0.0),

@@ -2682,6 +2682,93 @@ pub struct TaxiProfile {
     /// 3.6 m off, and 9.5 m past its stop (2026-09-30, #196).
     #[serde(default)]
     pub backtrack_kts: Option<f64>,
+    /// The nosewheel TILLER, where the pedals do not turn the aircraft
+    /// ([`TillerProfile`]). `None`: the pedal channel alone, as before.
+    #[serde(default)]
+    pub tiller: Option<TillerProfile>,
+}
+
+/// An airliner's large-angle ground steering. The pedal channel is the rudder
+/// pedals, and a 737's pedals steer the nose about 7 degrees: auto taxi held
+/// full pedal on the Zibo for many seconds with 152 degrees to turn and rolled
+/// 90 m off EGHL's route (2026-10-07; probed parked, 0.5 on the pedals gave
+/// 3.5 degrees of nosewheel). The tiller turns it 78. The steer law's command
+/// goes to the plugin's `xcopilot/tiller` channel as well as the pedals (the
+/// 737 sums the two), faded out between [`TillerProfile::full_below_kts`] and
+/// [`TillerProfile::hand_off_kts`] (`crate::tiller::share`): a crew hands the
+/// tiller off and steers on the pedals for the takeoff roll and the fast part
+/// of the rollout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TillerProfile {
+    /// What the plugin drives with the channel ([`TillerMethod`]).
+    pub method: TillerMethod,
+    /// Full tiller deflection, nosewheel degrees: needed by the stock method
+    /// (the channel becomes `tire_steer_command_deg`).
+    #[serde(default)]
+    pub max_deg: Option<f64>,
+    /// Groundspeed at and above which the tiller is let go, knots. Default 30.
+    #[serde(default)]
+    pub hand_off_kts: Option<f64>,
+    /// Groundspeed below which the tiller takes the whole command, knots.
+    /// Default 20.
+    #[serde(default)]
+    pub full_below_kts: Option<f64>,
+}
+
+/// Which input the plugin's tiller channel drives (`xcopilot/tiller_method`).
+/// The codes are the plugin's (`plugin/src/tiller.cpp`); the names it writes
+/// are listed by [`TillerMethod::references`] so the swap-time probe says a
+/// missing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TillerMethod {
+    /// The Zibo's NOSEWHEEL AXIS option held at VR while steering and
+    /// `laminar/B738/nosewheel_steer_ratio` written; the pilot's option put
+    /// back at release.
+    ZiboVr,
+    /// The Zibo's NOSEWHEEL AXIS option held at YAW: the tiller value rides
+    /// the pedal channel's yaw ratio.
+    ZiboYaw,
+    /// `laminar/B738/nosewheel_steer_override` and the ratio.
+    ZiboOverride,
+    /// `override_wheel_steer` and `tire_steer_command_deg[0]`, any airframe.
+    Stock,
+}
+
+impl TillerMethod {
+    /// The plugin's code for the method.
+    pub fn code(self) -> i32 {
+        match self {
+            TillerMethod::ZiboVr => 1,
+            TillerMethod::ZiboYaw => 2,
+            TillerMethod::ZiboOverride => 3,
+            TillerMethod::Stock => 4,
+        }
+    }
+
+    /// The airframe and sim names the plugin writes for this method.
+    pub fn references(self) -> &'static [&'static str] {
+        match self {
+            TillerMethod::ZiboVr => &[
+                "laminar/B738/effects/nosewheel",
+                "laminar/B738/nosewheel_steer_ratio",
+            ],
+            TillerMethod::ZiboYaw => &["laminar/B738/effects/nosewheel"],
+            TillerMethod::ZiboOverride => &[
+                "laminar/B738/nosewheel_steer_override",
+                "laminar/B738/nosewheel_steer_ratio",
+            ],
+            TillerMethod::Stock => &[
+                "sim/operation/override/override_wheel_steer",
+                "sim/flightmodel2/gear/tire_steer_command_deg",
+            ],
+        }
+    }
+}
+
+/// The live airframe's tiller, when it declares one.
+pub fn tiller() -> Option<TillerProfile> {
+    live_profile().and_then(|p| p.taxi.as_ref().and_then(|t| t.tiller.clone()))
 }
 
 /// A switch whose only control is a TOGGLE command, paired with the dataref
@@ -4644,6 +4731,14 @@ pub fn profile_references(p: &AircraftProfile) -> Vec<String> {
     // stock ones behind each ([`TakeoffConfigProfile::references`]).
     if let Some(tc) = &p.takeoff_config {
         for name in tc.references() {
+            if !out.iter().any(|o| o == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    // The tiller's method names no dataref in the YAML: the plugin's.
+    if let Some(t) = p.taxi.as_ref().and_then(|t| t.tiller.as_ref()) {
+        for name in t.method.references() {
             if !out.iter().any(|o| o == name) {
                 out.push(name.to_string());
             }

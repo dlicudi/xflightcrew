@@ -159,6 +159,12 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/terrain/gen",
     "xcopilot/terrain/query",
     "xcopilot/terrain/valid",
+    "xcopilot/tiller",
+    "xcopilot/tiller_applied",
+    "xcopilot/tiller_echo",
+    "xcopilot/tiller_max_deg",
+    "xcopilot/tiller_method",
+    "xcopilot/tiller_phases",
     "xcopilot/typed",
     "xcopilot/typed_age",
 ];

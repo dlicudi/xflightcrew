@@ -449,6 +449,24 @@ taxi:
   turn_kts: 10.0
   sharp_kts: 6.0
   max_yaw_dps: 15.0
+  # The nosewheel TILLER (crate::tiller, plugin/src/tiller.cpp). The pedal
+  # channel is the rudder pedals, and zibomod steers the nose only 7 degrees
+  # from them (acf_nw_steerdeg2; 0.5 gave 3.5 degrees, probed parked
+  # 2026-10-07): auto taxi rolled 90 m off EGHL's route at full pedal. The
+  # tiller is 78 (acf_nw_steerdeg1). zibomod owns override_wheel_steer and
+  # writes tire_steer_command_deg itself; its NOSEWHEEL AXIS option
+  # (laminar/B738/effects/nosewheel, 0 ON = hardware tiller, 1 YAW, 2 ROLL,
+  # 3 VR) picks the input, and in VR the input is
+  # laminar/B738/nosewheel_steer_ratio (Zibo README 3.26g). zibo_vr holds the
+  # option at VR while steering and puts the pilot's back at release.
+  # HYPOTHESIS until a reloaded plugin is probed: the method that turns the
+  # nose may yet be zibo_yaw, zibo_override or stock (one reload tests all
+  # four through xcopilot/tiller_method).
+  tiller:
+    method: zibo_vr
+    max_deg: 78.0
+    hand_off_kts: 30.0
+    full_below_kts: 20.0
 
 fuel:
   reserve_caution_min: 60.0

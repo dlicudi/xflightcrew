@@ -20,6 +20,7 @@
 #include "flightinit.h"
 #include "audio.h"
 #include "panel.h"
+#include "tiller.h"
 
 // ---- PTT --------------------------------------------------------------------
 
@@ -775,8 +776,13 @@ static float TaxiAssistLoop(float, float, int, void*) {
             }
         }
         if (!g_steer_yield) {
+            // The tiller riding the yaw axis (the Zibo's YAW nosewheel
+            // option) takes the ratio in place of the pedal value: one
+            // writer for yoke_heading_ratio.
+            float yaw_out = g_taxi_steer;
+            tiller::yaw_override(&yaw_out);
             if (g_override_heading) XPLMSetDatai(g_override_heading, 1);
-            if (g_yoke_heading) XPLMSetDataf(g_yoke_heading, g_taxi_steer);
+            if (g_yoke_heading) XPLMSetDataf(g_yoke_heading, yaw_out);
         }
     }
     if ((!steer_fresh || g_steer_yield) && g_taxi_steer_applied) {
@@ -1447,6 +1453,7 @@ void start() {
     g_joy_axis_values = XPLMFindDataRef("sim/joystick/joystick_axis_values");
     g_joy_axis_assignments = XPLMFindDataRef("sim/joystick/joystick_axis_assignments");
     XPLMRegisterFlightLoopCallback(TaxiAssistLoop, -1.0f, nullptr);
+    tiller::start();
     StartPosition();
     StartState();
 }
@@ -1455,6 +1462,8 @@ void stop_first() {
     StopState();
     StopPosition();
     XPLMUnregisterFlightLoopCallback(TaxiAssistLoop, nullptr);
+    // The tiller lets go first: it may be holding an airframe option.
+    tiller::stop();
     // Leave no brake behind: if the loop was mid-apply, release the ratios
     // and drop the override ourselves — nobody else will after the callback
     // is gone.
@@ -1544,6 +1553,9 @@ void stop_rest() {
     if (g_radio_ptt_dref) { XPLMUnregisterDataAccessor(g_radio_ptt_dref); g_radio_ptt_dref = nullptr; }
     if (g_radio_ptt_cmd) { XPLMUnregisterCommandHandler(g_radio_ptt_cmd, RadioPttCommandHandler, 1, nullptr); g_radio_ptt_cmd = nullptr; }
 }
+
+bool steer_yielded() { return g_steer_yield != 0; }
+void yield_steering() { g_steer_yield = 1; }
 
 bool app_connected() {
     // The app heartbeats the phase ~1/s; a stale timestamp = not running.
