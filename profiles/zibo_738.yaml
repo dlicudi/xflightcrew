@@ -72,7 +72,7 @@ autopilot: true
 throttle: true         # VERIFY: override_throttles is held at 1 by zibomod
 # The `autothrottle` tool is written against laminar/md82 names.
 autothrottle: false
-speedbrake: true       # stock speedbrake_ratio; the Zibo's lever is laminar/B738/flt_ctrls/speedbrake_lever. VERIFY
+speedbrake: false      # probed 2026-10-06: a stock speedbrake_ratio write STICKS but the Zibo's lever (flt_ctrls/speedbrake_lever) never moves, so the readback would lie. The stock speed_brakes_down_one/up_one commands drive it (down_one from DOWN is ARMED, lever 0.089). Off until the tool steps by command.
 # The Zibo's reversers are its own levers (flt_ctrls/reverse_lever1/2) under
 # override_throttles: the stock beta/reverse write is not expected to reach
 # them. Off until probed.
@@ -194,10 +194,9 @@ anti_ice:
 # Electrical on the Zibo's own switches. Probed parked: the stock
 # `battery_on` reads 1 while the Zibo's `laminar/B738/electric/battery_pos`
 # reads 0, so the stock battery is NOT this switch. The battery sits under
-# guard cover 02 (`cover_position[2]` reads 1, open, with the battery off).
-# VERIFY: which of battery_up / battery_dn is ON, and that the cover is the
-# battery's (zibomod also has `push_button/batt_full_off`, "Battery and Guard
-# cover off").
+# guard cover 02 (`cover_position[2]` reads 1 throughout). Probed parked
+# 2026-10-06: `battery_dn` is ON (`battery_pos` 0 to 1, stock `battery_on`
+# 1,0,0 to 1,1,1) and `battery_up` is OFF; the cover never had to move.
 # The generator switches are spring-loaded ON/OFF (gen1_up / gen1_dn); on the
 # real panel OFF is up and ON is down. Read back on the stock generator_on,
 # which reads 0 parked with the engines off. VERIFY both directions.
@@ -205,8 +204,8 @@ anti_ice:
 electrical:
   - key: battery
     spoken: battery
-    on_commands:  [laminar/B738/switch/battery_up]
-    off_commands: [laminar/B738/switch/battery_dn]
+    on_commands:  [laminar/B738/switch/battery_dn]
+    off_commands: [laminar/B738/switch/battery_up]
     readback:     [laminar/B738/electric/battery_pos]
     guards:
       - { command: laminar/B738/button_switch_cover02, dataref: "laminar/B738/button_switch/cover_position[2]" }
@@ -370,8 +369,9 @@ reference:
 # UP/1/2/5/10/15/25/30/40 handle gates, at eighths of the stock handle
 # (probed parked: stock flap_ratio 0.5 with the Zibo's
 # `laminar/B738/flt_ctrls/flap_lever` 0.5). The tool writes the stock
-# handle; zibomod names the stock flaps_up/down commands and has its own
-# `push_button/flaps_0..40`. VERIFY the stock write moves the lever. Placard
+# handle; probed 2026-10-06 a write to it is put straight back (a silent
+# no-op, caught by the readback), while the stock flaps_down / flaps_up
+# commands step the Zibo's lever one detent each (0.5 to 0.625 and back). Placard
 # limits are the type's; the acf agrees at both ends (Vfe1 250, Vfem 162).
 # No `idle_decel_kts_s`: those were fitted to the stock 737's flight model.
 flaps:
