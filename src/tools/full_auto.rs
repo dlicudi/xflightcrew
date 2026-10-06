@@ -613,6 +613,7 @@ impl FullAuto {
                 self.flood_toggle.clone(),
             ),
             no_start_sequence: kind == StartKind::None,
+            start_scripted: kind == StartKind::Scripted,
             // One start per airframe CLASS: a turboprop cranks with the PT6
             // sequence, a jet with the APU/bleed-air sequence, a piston with
             // the one-shot start. All run behind full auto's own bus-power

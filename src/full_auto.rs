@@ -337,6 +337,10 @@ pub struct SubTools {
     /// Run the electrical/APU power-up before the engine start. Only turbine
     /// True when the airframe declares no start sequence we can fly at all.
     pub no_start_sequence: bool,
+    /// The aircraft's own script starts it (`StartKind::Scripted`, the
+    /// 737): the script resets the ramp to cold and dark as it begins, so
+    /// the ramp items are a check AFTER it, never set before it.
+    pub start_scripted: bool,
     /// airframes need it — a piston's `start_engine` brings its own battery up,
     /// and running PowerUp on a 172 had the copilot narrating an APU it doesn't
     /// have ("APU not coming up", 2026-07-23).
@@ -456,6 +460,75 @@ pub(crate) fn event(stage: &str, detail: serde_json::Value) {
 /// ignored, so an airframe with no beacon is not a failed departure.
 async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool {
     light_state(tools, ctx, key, on).await == Some(true)
+}
+
+/// The ramp items before anything turns: beacon, nav lights, panel
+/// lighting, seat belt signs, each called only once its switch READ BACK
+/// on and named when it did not take. True when the beacon is on.
+async fn ramp_items(
+    tools: &SubTools,
+    ctx: &ToolCtx<'_>,
+    xp: &XPlaneClient,
+    voice: &Option<Voice>,
+) -> bool {
+    let beacon_state = light_state(tools, ctx, "beacon", true).await;
+    let beacon = beacon_state == Some(true);
+    if tools.lights.declares("beacon") {
+        crate::crew_pace::checked(
+            voice.as_ref(),
+            beacon_state,
+            "Beacon on.",
+            "The beacon did not come on.",
+        )
+        .await;
+    }
+    if tools.lights.declares("nav") {
+        let nav = light_state(tools, ctx, "nav", true).await;
+        crate::crew_pace::checked(
+            voice.as_ref(),
+            nav,
+            "Nav lights on.",
+            "Nav lights did not come on.",
+        )
+        .await;
+    }
+    // Panel lighting with them. The bus is live and the pilot is about to
+    // be asked to read instruments. The tool's Ok is not a readback: the
+    // switch is read back here.
+    {
+        use crate::tools::Tool;
+        let sent = tools
+            .flood
+            .execute(&json!({ "on": true }), ctx)
+            .await
+            .is_ok();
+        let lit = if sent {
+            tools.flood.read_on(xp).await
+        } else {
+            Some(false)
+        };
+        event("lights_panel", json!({ "on": lit }));
+        crate::crew_pace::checked(
+            voice.as_ref(),
+            lit,
+            "Panel lights on.",
+            "Panel lights did not come on.",
+        )
+        .await;
+    }
+    event("lights_beacon", json!({ "beacon": beacon_state }));
+    // Seat belt signs on before anything turns (see `tools::signs`).
+    if let Some(ok) = crate::tools::signs::set(xp, true).await {
+        event("seat_belt_signs", json!({ "on": true, "ok": ok }));
+        crate::crew_pace::checked(
+            voice.as_ref(),
+            Some(ok),
+            "Seat belt signs on.",
+            "The seat belt signs did not come on.",
+        )
+        .await;
+    }
+    beacon
 }
 
 /// A light driven and READ BACK (`SetLights::switch`): `None` when the
@@ -2010,63 +2083,15 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // One item at a time, at a person's pace (`crew_pace`): the whole
         // ramp used to be done in the same second. Each is called only once
         // its switch READ BACK on, and named when it did not take.
-        let beacon_state = light_state(&tools, &ctx, "beacon", true).await;
-        let beacon = beacon_state == Some(true);
-        if tools.lights.declares("beacon") {
-            crate::crew_pace::checked(
-                voice.as_ref(),
-                beacon_state,
-                "Beacon on.",
-                "The beacon did not come on.",
-            )
-            .await;
-        }
-        if tools.lights.declares("nav") {
-            let nav = light_state(&tools, &ctx, "nav", true).await;
-            crate::crew_pace::checked(
-                voice.as_ref(),
-                nav,
-                "Nav lights on.",
-                "Nav lights did not come on.",
-            )
-            .await;
-        }
-        // Panel lighting with them. The bus is live and the pilot is about to
-        // be asked to read instruments. The tool's Ok is not a readback: the
-        // switch is read back here.
-        {
-            use crate::tools::Tool;
-            let sent = tools
-                .flood
-                .execute(&json!({ "on": true }), &ctx)
-                .await
-                .is_ok();
-            let lit = if sent {
-                tools.flood.read_on(&xp).await
-            } else {
-                Some(false)
-            };
-            event("lights_panel", json!({ "on": lit }));
-            crate::crew_pace::checked(
-                voice.as_ref(),
-                lit,
-                "Panel lights on.",
-                "Panel lights did not come on.",
-            )
-            .await;
-        }
-        event("lights_beacon", json!({ "beacon": beacon_state }));
-        // Seat belt signs on before anything turns (see `tools::signs`).
-        if let Some(ok) = crate::tools::signs::set(&xp, true).await {
-            event("seat_belt_signs", json!({ "on": true, "ok": ok }));
-            crate::crew_pace::checked(
-                voice.as_ref(),
-                Some(ok),
-                "Seat belt signs on.",
-                "The seat belt signs did not come on.",
-            )
-            .await;
-        }
+        // A scripted start resets the ramp to cold and dark as it begins
+        // (B738.Z.autostart step 1 turned our beacon, nav lights and seat
+        // belts back off, LXGB 2026-10-06) and lights its own beacon before
+        // the starters: its ramp is checked once the engines run.
+        let beacon = if tools.start_scripted {
+            false
+        } else {
+            ramp_items(&tools, &ctx, &xp, &voice).await
+        };
         // Only claim the beacon on an airframe that has one — the Lancair's
         // switch row is NAV / LAND / STRB and nothing else.
         announce(
@@ -2133,6 +2158,12 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             return;
         }
         event("engine_running", json!({}));
+        if tools.start_scripted {
+            // The aircraft's script has had the ramp; this is the crew's
+            // check of it, set where it is not.
+            ramp_items(&tools, &ctx, &xp, &voice).await;
+            bail_if_abort!();
+        }
 
         // Complete the electrical now the engine's turning: generators AND
         // bleed air on. On the Twin Otter the bleeds feed the autopilot and
