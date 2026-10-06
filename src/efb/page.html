@@ -200,6 +200,11 @@ form.say input {
 }
 form.say input:focus { outline: 2px solid var(--cyan-line); outline-offset: 0; }
 
+/* Airport page: the map fills the space under the header (diagram.js sets
+   main.apt-on while it shows; :has() for a first paint before it runs). */
+main.apt-on, main:has(#p-apt.on) { padding: 0; overflow: hidden; position: relative; }
+#p-apt.on { position: absolute; inset: 0; gap: 0; }
+
 /* Bottom tab bar: phones only */
 nav.bottom { display: none; }
 
@@ -388,11 +393,42 @@ nav.bottom { display: none; }
   .seg { flex: 1 1 100%; }
   .seg button { flex: 1 1 auto; padding: 0 8px; }
 }
+
+/* Seven pages: a phone's bar (and a phone on its side's rail) shows four
+   and More; More opens a sheet with the rest. Wide and medium show all. */
+nav .more-tab { display: none !important; }
+.more-sheet {
+  position: fixed; z-index: 20; display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  background: var(--bar); border: 1px solid var(--line2); border-radius: 14px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  right: max(10px, env(safe-area-inset-right)); bottom: calc(64px + env(safe-area-inset-bottom)); min-width: 200px;
+}
+.sheet-tab {
+  min-height: 52px; display: flex; align-items: center; gap: 12px; padding: 0 16px; border-radius: 10px;
+  border: 1px solid transparent; background: transparent; color: var(--text); font-size: 16px; cursor: pointer; text-align: left;
+}
+.sheet-tab svg { width: 22px; height: 22px; flex: 0 0 auto; }
+.sheet-tab[aria-current="page"] { border-color: var(--cyan-line); background: var(--cyan-bg); font-weight: 700; }
+@media (max-width: 700px) {
+  nav.bottom .tab[data-more] { display: none; }
+  nav.bottom .more-tab { display: flex !important; }
+}
+@media (max-height: 500px) and (min-width: 701px) {
+  /* Icons two abreast, the words kept for a screen reader: the rail never scrolls. */
+  nav.tabs { width: 100px; padding: 6px; gap: 4px; overflow: hidden; display: grid; grid-template-columns: 1fr 1fr; align-content: start; }
+  nav.tabs .tab[data-more] { display: none; }
+  nav.tabs .more-tab { display: flex !important; }
+  nav.tabs .tab { min-height: 44px; padding: 0; justify-content: center; }
+  nav.tabs .tab span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  nav.tabs .tab svg { width: 22px; height: 22px; }
+  .more-sheet { left: calc(106px + env(safe-area-inset-left)); right: auto; bottom: 64px; }
+}
 /* Medium (iPad portrait): with more tabs the top bar keeps its words and
    drops its icons, so MY CONTROLS stays in view. */
 @media (max-width: 1000px) and (min-width: 701px) and (min-height: 501px) {
+  nav.tabs { gap: 4px; padding: 8px 10px; }
   nav.tabs .tab svg { display: none; }
-  nav.tabs .tab { padding: 0 10px; flex: 1 1 auto; }
+  nav.tabs .tab { padding: 0 8px; flex: 1 1 auto; }
+  nav.tabs .mc { padding: 0 12px; }
 }
 @media (max-height: 500px) and (min-width: 701px) {
   .banner { min-height: 40px; padding-top: 4px; padding-bottom: 4px; }
@@ -525,6 +561,9 @@ nav.bottom { display: none; }
         <div id="wx-list" style="display: flex; flex-direction: column; gap: 14px"></div>
       </div>
 
+      <!-- AIRPORT (drawn by /diagram.js) -->
+      <div class="page" id="p-apt"><div class="apt-root" id="apt-root"></div></div>
+
       <!-- CHECKLIST (EFB v2) -->
       <div class="page" id="p-check">
         <div class="cl-head">
@@ -568,8 +607,10 @@ nav.bottom { display: none; }
   </footer>
 
   <nav class="bottom" aria-label="EFB pages" id="bottom"></nav>
+  <div class="more-sheet" id="more-sheet" role="menu" aria-label="More pages" hidden></div>
 </div>
 
+<script src="/diagram.js"></script>
 <script>
 (function () {
   'use strict';
@@ -589,13 +630,17 @@ nav.bottom { display: none; }
     now: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>',
     radio: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 10a8 8 0 0 1 16 0"/><path d="M7.5 11a4.5 4.5 0 0 1 9 0"/><circle cx="12" cy="12" r="1.5"/><path d="M12 14v7"/></svg>',
     plan: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="18" r="2"/><circle cx="19" cy="6" r="2"/><path d="M6.5 16.5 10 12l4 2 3.5-6.5"/></svg>',
-    wx: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 18h10a4 4 0 0 0 0-8 6 6 0 0 0-11.5 1.5A3.5 3.5 0 0 0 7 18z"/></svg>'
+    wx: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 18h10a4 4 0 0 0 0-8 6 6 0 0 0-11.5 1.5A3.5 3.5 0 0 0 7 18z"/></svg>',
+    apt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20 20 4"/><path d="M4 9h7v11"/><circle cx="17" cy="17" r="2"/></svg>'
   };
-  var TABS = [['now', 'Now'], ['radio', 'Radio'], ['plan', 'Plan'], ['wx', 'Weather']];
-  // EFB v2: the checklist and settings pages.
+  // The pages in the order a flight uses them. On a phone (and a phone on
+  // its side) the first four ride the bar and the rest open from More.
+  var TABS = [['now', 'Now'], ['radio', 'Radio'], ['apt', 'Airport'], ['check', 'Checklist'],
+    ['plan', 'Plan'], ['wx', 'Weather'], ['set', 'Settings']];
+  var MORE = { plan: 1, wx: 1, set: 1 };
+  ICONS.more = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>';
   ICONS.check = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6h11M9 12h11M9 18h11"/><path d="m3.5 6 1.5 1.5L7.5 5M3.5 12l1.5 1.5L7.5 11M3.5 18l1.5 1.5L7.5 17"/></svg>';
   ICONS.set = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>';
-  TABS.push(['check', 'Checklist'], ['set', 'Settings']);
   var tab = 'now';
   function known(id) { return TABS.some(function (t) { return t[0] === id; }); }
   try { var saved = localStorage.getItem(TAB_KEY); if (saved && known(saved)) tab = saved; } catch (e) {}
@@ -627,11 +672,35 @@ nav.bottom { display: none; }
         b.type = 'button';
         b.setAttribute('data-tab', t[0]);
         b.setAttribute('aria-current', t[0] === tab ? 'page' : 'false');
+        if (MORE[t[0]]) b.setAttribute('data-more', '1');
+        b.title = t[1];
         b.innerHTML = ICONS[t[0]];
         b.appendChild(el('span', null, t[1]));
         b.addEventListener('click', function () { pick(t[0]); });
         nav.appendChild(b);
       });
+    });
+    // More: shown only where the bar is short (CSS), opens the sheet.
+    [rail, bottom].forEach(function (nav) {
+      var m = el('button', 'tab more-tab');
+      m.type = 'button';
+      m.setAttribute('aria-haspopup', 'true');
+      m.setAttribute('aria-current', MORE[tab] ? 'page' : 'false');
+      m.innerHTML = ICONS.more;
+      m.appendChild(el('span', null, 'More'));
+      m.addEventListener('click', function (e) { e.stopPropagation(); toggleMore(); });
+      nav.appendChild(m);
+    });
+    var sheet = document.getElementById('more-sheet');
+    clear(sheet);
+    TABS.filter(function (t) { return MORE[t[0]]; }).forEach(function (t) {
+      var b = el('button', 'sheet-tab');
+      b.type = 'button';
+      b.setAttribute('data-tab', t[0]);
+      b.innerHTML = ICONS[t[0]];
+      b.appendChild(el('span', null, t[1]));
+      b.addEventListener('click', function () { toggleMore(false); pick(t[0]); });
+      sheet.appendChild(b);
     });
     rail.appendChild(el('div', 'grow'));
     var mc = el('button', 'mc', 'MY CONTROLS');
@@ -640,8 +709,19 @@ nav.bottom { display: none; }
     rail.appendChild(mc);
     wireMc(mc);
   }
+  function toggleMore(open) {
+    var sheet = document.getElementById('more-sheet');
+    sheet.hidden = open === undefined ? !sheet.hidden : !open;
+  }
+  document.addEventListener('click', function (e) {
+    var sheet = document.getElementById('more-sheet');
+    if (!sheet.hidden && !sheet.contains(e.target)) sheet.hidden = true;
+  });
   function pick(id) {
     tab = id;
+    document.querySelectorAll('.more-tab').forEach(function (b) {
+      b.setAttribute('aria-current', MORE[id] ? 'page' : 'false');
+    });
     try { localStorage.setItem(TAB_KEY, id); } catch (e) {}
     document.querySelectorAll('[data-tab]').forEach(function (b) {
       b.setAttribute('aria-current', b.getAttribute('data-tab') === id ? 'page' : 'false');
@@ -744,6 +824,7 @@ nav.bottom { display: none; }
   }
 
   function render(s) {
+    if (window.XvlDiagram) window.XvlDiagram.update(s);
     var h = s.header;
     setText('h-cs', h.callsign);
     document.getElementById('h-type').textContent = h.aircraft || '';

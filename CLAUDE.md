@@ -625,6 +625,11 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   to the panel (`feed::note_alert`, flight-scoped; a warning banner acknowledged on the page only);
   Checklist reads `flow::sheet`, a record nothing reads back. **The EFB's PTT is a heartbeat**
   (`efb::ptt`): held only while beats are fresh (600 ms), capped at 60 s, OR'd into the intercom key.
+- **The Airport page** (`efb::airport`): apt.dat through the nav crate's parsers, built once per
+  field in a LOCAL metric frame (`Frame`, east/north metres) and served as `GET /airport` with its
+  version as the ETag; the live overlay (tick position, `party_line` taxi route, the guide's
+  `TurnCard` via `feed::note_turn_card`, the cleared runway) is one pure `airport::page`. The field
+  is `airport::wanted_field`: destination airborne, the field we are at on the ground.
 - Off by default (`XCOPILOT_EFB`, `_PORT`, `_TOKEN`; the registry's `efb*`); every request needs
   the token, a wrong one is a 403 blackboxed `efb` `auth_failed`; one line per 500 ms. Its own
   thread and runtime, never the command loop's; no lock held across an await.

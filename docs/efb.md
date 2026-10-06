@@ -1,10 +1,16 @@
 # The EFB
 
 A browser Electronic Flight Bag served by `xvl` on your LAN, for an iPad, an iPhone or a second
-screen: the copilot's knowledge as six pages (Now, Radio, Plan, Weather, Checklist, Settings), the
-crew's warnings and cautions, a hold-to-talk button, and buttons that speak for you. Code:
-`src/efb/` (`mod.rs` the server, `state.rs` the page state, `feed.rs` the taps, `ptt.rs` the
-push to talk, `page.html` the page, `icons/` the home-screen icons).
+screen: the copilot's knowledge as seven pages (Now, Radio, Airport, Checklist, Plan, Weather,
+Settings, in the order a flight uses them), the crew's warnings and cautions, a hold-to-talk
+button, and buttons that speak for you. Code: `src/efb/` (`mod.rs` the server, `state.rs` the page
+state, `feed.rs` the taps, `ptt.rs` the push to talk, `airport.rs` and `diagram.js` the airport
+map, `page.html` the page, `icons/` the home-screen icons).
+
+A wide screen shows every page in its rail, an iPad upright in its top bar (words only). A phone's
+bottom bar shows Now, Radio, Airport, Checklist and More, which opens Plan, Weather and Settings;
+a phone on its side shows the same five as icons in a rail that never scrolls. MY CONTROLS and HOLD
+TO TALK are one tap on every size.
 
 ## Turn it on
 
@@ -69,10 +75,40 @@ is a dash, never a guess.
 | Settings | every row of the settings registry, as the terminal's Settings screen shows it | `settings::ALL` |
 | Every page | the crew's warning as a banner until acknowledged on the page, the latest caution as an amber chip, a dot for idle / listening / thinking / speaking | `feed::note_alert` (tapped where `Voice::alert`, `narrate` and `say_crew` mirror to the panel), `feed::note_activity` (the reporter's status phase), `Voice::is_speaking` |
 | Weather | METAR raw and plain for destination, origin, alternate, with the runway picked or cleared | the sim's real-weather file (`weather::latest_file`, re-read at most once a minute), `full_auto::arrival_runway`, `party_line::clearance_runway`, else the plan's runways |
+| Airport | the field's diagram (runways, pavement, taxi lines, taxiway names, holding positions, stands), the aircraft, the taxi route held (driven part dimmed, crossings and its end marked), the turn card as the panel draws it, the cleared or arrival runway | apt.dat as `nav::find_airport` and `nav::find_taxi_net` parse it (built once per field, `efb::airport`), the monitor's tick with its true heading, `party_line::with_taxi_route` / `taxi_to_stand`, the guide's `TurnCard` (`feed::note_turn_card`), `party_line::clearance_runway`, `full_auto::arrival_runway`, the plan's runways |
 
 The plan check and preflight were spoken once and dropped before the EFB; they are now kept in
 flight-scoped cells (`efb::feed::AUDIT`, `PREFLIGHT`: a `Scoped` cell, so a new flight never shows
 the last one's verdict).
+
+## The Airport page
+
+Which field: in the air, the plan's destination (else the station's field); on the ground, the
+field we are at (the plan's origin or destination, or the station's, within 5 nm), else the
+departure (`airport::wanted_field`). The info box says which and why.
+
+The geometry is `GET /airport?icao=XXXX` (token required), JSON in a local frame: east and north
+metres from the middle of the field's runways, so the page does no geodesy. It is built once per
+field from apt.dat off the server's thread (about 0.1 to 0.4 s; LEMG is 76 kB, EGKK 60 kB, rings
+and lines thinned to 0.4 m) and kept for the last three fields; its `version` (a hash) is the
+ETag, and the page state names the field and version (`airport.icao`, `airport.version`), so the
+page fetches it only when the field changes. The layers: runways (100 rows, both ends, width),
+pavement (110 polygons; where a field draws none, the 1202 network at a nominal 20 m, said on the
+page), taxi centrelines (120, types 1 and 51), taxiway names (on each name's longest 1202 edges),
+holding positions (where a 1204 runway zone meets a taxiway outside it), stands (1300).
+
+The live picture rides the page state (`airport`): the aircraft (`own`, true heading and track),
+the route (`route.driven`, `route.remaining`, `holds`, `dest`; drawn only when it starts within
+15 km), the card (`card`: kind, banner text, aim bearing true, cross-track signed, positive right),
+the runway (`runway`: cleared, arrival, or the plan's). The card exists only while the copilot's
+taxi guide runs (the crew on, `taxi_guide` on, a taxi clearance held).
+
+On the page: pinch or wheel to zoom, drag to pan, double tap to follow the aircraft again (or to
+see the whole field with no aircraft on it). The buttons: zoom, the whole field, north up or track
+up, follow. The aircraft glides between the one-second updates; a jump over 400 m is a jump.
+The script is `/diagram.js` (code, no data, served without the token like the icon). To look at
+it without a sim: `EFB_DIAGRAM_OUT=target/efb cargo test --release -- --ignored
+real_install_page_states` writes the real LEMG and EGKK diagrams and a taxiing page state.
 
 ## The buttons
 
@@ -136,3 +172,6 @@ The voice pickers, the audio bus, camera snap, the negative tone and the UI scal
 - The tower's runway in use at a field other than the one we are cleared at.
 - Wind and temperature at the aircraft, V speeds, landing performance: each needs a new read or
   a new publisher.
+- On the Airport page: other traffic, the auto taxi's paint-ridden path (the page draws the route
+  as the party line holds it), Custom Scenery airports (only Global Airports' apt.dat is read, as
+  everywhere else in the app).

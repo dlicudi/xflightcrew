@@ -336,6 +336,8 @@ pub(crate) struct Facts {
     pub(crate) proposal: Option<String>,
     /// What the running list waits on: "confirm" or "advance".
     pub(crate) flow_waiting: Option<&'static str>,
+    /// The Airport page's facts (`efb::airport`).
+    pub(crate) airport: crate::efb::airport::AirportFacts,
 }
 
 /// What a setting accepts, as the registry declares it (`settings::Kind`).
@@ -636,6 +638,7 @@ pub(crate) struct EfbState {
     pub(crate) ptt: Ptt,
     pub(crate) my_controls: Button,
     pub(crate) last_sent: Option<Sent>,
+    pub(crate) airport: crate::efb::airport::AirportOut,
 }
 
 // ---------------------------------------------------------------- build
@@ -1572,6 +1575,20 @@ pub(crate) fn build(f: &Facts) -> EfbState {
             t: *t,
             text: s.clone(),
         }),
+        airport: crate::efb::airport::page(
+            &f.airport,
+            f.tick.as_ref(),
+            f.plan.as_ref(),
+            airborne(f),
+        ),
+    }
+}
+
+/// In the air: the tick says so, else the flight model's phase.
+pub(crate) fn airborne(f: &Facts) -> bool {
+    match &f.tick {
+        Some(t) => !t.on_ground,
+        None => f.flight.as_ref().is_some_and(|s| s.phase.airborne()),
     }
 }
 
@@ -1629,6 +1646,7 @@ pub(crate) mod tests {
                 gs_kts: 461.0,
                 on_ground: false,
                 track_deg: Some(11.6),
+                heading_deg: 9.8,
                 fuel_kg: Some(8_412.0),
                 endurance_min: Some(210.0),
             }),
@@ -1896,6 +1914,7 @@ pub(crate) mod tests {
             }),
             proposal: None,
             flow_waiting: None,
+            airport: Default::default(),
         }
     }
 
