@@ -195,6 +195,11 @@ pub fn normalize(transcript: &str) -> String {
         // The load sheet, verb pluralised: "Loads the aircraft." (737,
         // 2026-09-22). The whole phrase, so a bare "loads" is untouched.
         ("loads the aircraft", "load the aircraft"),
+        // "Fold flaps." then "Full flaps." and "Can you set up ALS?" then
+        // "Can you arm ILS?" (2026-10-01): the whole phrase, so no other
+        // "fold" or "als" is touched.
+        ("fold flaps", "full flaps"),
+        ("set up als", "set up ils"),
     ] {
         s = s.replace(heard, meant);
     }
@@ -795,8 +800,9 @@ pub fn resume_plan_request(t: &str) -> bool {
     // A CLOSED set, so "resume taxi" or "resume the checklist" never lands.
     const RESUME_TAIL: &[&str] = &[
         "the", "my", "flight", "fight", "plan", "now", "right", "like", "that", "9", "nine",
-        // "Resume flight then." (LXGB 2026-10-06).
-        "then", "please",
+        // "Resume flight then." (LXGB 2026-10-06); "Resume slides." twice and
+        // "Resume flying." (2026-10-01/02).
+        "then", "please", "flying", "flights", "slides",
     ];
     let lead = t.strip_prefix("resumes ").or_else(|| t.strip_prefix("resume "));
     if let Some(rest) = lead {
@@ -806,7 +812,12 @@ pub fn resume_plan_request(t: &str) -> bool {
             .collect();
         if !words.is_empty()
             && words.iter().all(|w| RESUME_TAIL.contains(w))
-            && words.iter().any(|w| matches!(*w, "flight" | "fight" | "now" | "like" | "right"))
+            && words.iter().any(|w| {
+                matches!(
+                    *w,
+                    "flight" | "fight" | "now" | "like" | "right" | "flying" | "flights" | "slides"
+                )
+            })
         {
             return true;
         }

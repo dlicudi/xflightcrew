@@ -2356,6 +2356,11 @@ fn thrust_is_the_throttle_and_landing_is_asked_plainly() {
         assert_eq!(one(w).map(|c| c.0), Some("autoland".into()), "{w}");
     }
     assert!(one("bring us down to 3000 feet").is_none_or(|c| c.0 != "autoland"));
-    // "Resume flight then." (LXGB, 2026-10-06).
-    assert!(resume_plan_request("Resume flight then."));
+    // "Resume flight then." (LXGB, 2026-10-06); "Resume slides.",
+    // "Resume flying." (2026-10-01/02).
+    for w in ["Resume flight then.", "Resume slides.", "Resume flying."] {
+        assert!(resume_plan_request(w), "{w}");
+    }
+    assert_eq!(one("Fold flaps.").map(|c| c.0), Some("set_flaps".into()));
+    assert_eq!(one("Can you set up ALS?").map(|c| c.0), Some("prepare_ils".into()));
 }
