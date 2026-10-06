@@ -393,8 +393,25 @@ pub async fn set_for_landing(xp: &dyn XPlane) -> Outcome {
     out
 }
 
-/// Flight directors on: read, `fdir_on` only when off, read back.
+/// Flight directors on: read, `fdir_on` only when off, read back. A panel
+/// that declares its FD switches (`autoflight:` `flight_director`, the
+/// Zibo) has each brought up on its own toggle, read first.
 async fn flight_directors_on(xp: &dyn XPlane, out: &mut Outcome) {
+    let p = autoflight::panel();
+    if p.fd.is_some() {
+        let mut taken = Vec::new();
+        for s in [autoflight::Switch::FlightDirector, autoflight::Switch::FlightDirectorFo] {
+            if p.switch(s).is_some() {
+                taken.push(autoflight::ensure_switch(xp, s, true, "takeoff_config").await);
+            }
+        }
+        if taken.iter().all(|t| *t == Some(true)) {
+            out.set.push("flight directors on".into());
+        } else {
+            out.not_taken.push("the flight directors".into());
+        }
+        return;
+    }
     match xp.get_float(FD_MODE).await {
         Ok(at) if at < 0.5 => {
             let ok = autoflight::press(xp, Button::FlightDirectorOn).await.is_ok()
@@ -434,7 +451,16 @@ pub fn autothrottle_engaged(mode: f64) -> bool {
 /// A reject owns the levers: an ENGAGED autothrottle is taken out and read
 /// back. `None` when none was engaged or it could not be read (nothing to
 /// take out, nothing claimed); `Some(out)` when it was, with the read-back.
+/// A panel with its own lamps goes through the owner's take.
 pub async fn autothrottle_off(xp: &dyn XPlane) -> Option<bool> {
+    if autoflight::panel().lamps.is_some() {
+        let out = autoflight::take_thrust(xp, "reject").await;
+        crate::blackbox::record(
+            "autotakeoff",
+            serde_json::json!({"event": "reject_autothrottle_off", "was": "lamps", "out": out}),
+        );
+        return out;
+    }
     let mode = xp.get_float(AT_MODE).await.ok()?;
     if !autothrottle_engaged(mode) {
         return None;
@@ -452,6 +478,16 @@ pub async fn autothrottle_off(xp: &dyn XPlane) -> Option<bool> {
 }
 
 async fn autothrottle_armed(xp: &dyn XPlane, out: &mut Outcome) {
+    // A panel's own A/T arm switch (the Zibo's): armed is its position, an
+    // engaged mode the owner's to take out first.
+    if autoflight::panel().at_arm.is_some() {
+        let _ = autoflight::drop_thrust_now(xp, "takeoff_config").await;
+        match autoflight::ensure_switch(xp, autoflight::Switch::AutothrottleArm, true, "takeoff_config").await {
+            Some(true) => out.set.push("autothrottle armed".into()),
+            _ => out.not_taken.push("the autothrottle arm".into()),
+        }
+        return;
+    }
     match xp.get_float(AT_MODE).await {
         Ok(at) => {
             if let Some(button) = autothrottle_step(at) {

@@ -1206,8 +1206,8 @@ async fn read_ap(xp: &crate::xplane::XPlaneClient) -> ApRead {
     use crate::datarefs as d;
     let ok = |r: anyhow::Result<f64>| r.ok().filter(|v| v.is_finite());
     let (servos, state, alt, vs, hdg) = tokio::join!(
-        xp.get_float(d::SERVOS_ON),
-        xp.get_float(crate::autoflight::names::AP_STATE),
+        crate::autoflight::read_status(&*xp, d::SERVOS_ON),
+        crate::autoflight::read_ap_state(&*xp),
         crate::autoflight::read_dial(xp, crate::autoflight::Dial::Altitude),
         crate::autoflight::read_dial(xp, crate::autoflight::Dial::Vs),
         crate::autoflight::read_dial(xp, crate::autoflight::Dial::HeadingBug),

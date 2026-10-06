@@ -128,7 +128,7 @@ pub async fn engage(xp: &dyn crate::xplane::XPlane, mode: ApMode, on: bool) -> E
         return Engaged::Already;
     }
     if on && sw.needs_servos {
-        match xp.get_float(SERVOS_ON).await {
+        match crate::autoflight::read_status(&*xp, SERVOS_ON).await {
             Ok(s) if s >= 0.5 => {}
             Ok(_) => return Engaged::NoServos,
             Err(_) => return Engaged::Unread,

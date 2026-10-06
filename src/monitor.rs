@@ -360,8 +360,7 @@ impl Snapshot {
         // under them the checks fix rather than advise (refactor audit
         // 2026-10-04, duplicates #1).
         let automation_flying = crate::flight_state::crew_flying().is_some();
-        let ap_servos_on = xp
-            .get_float(autoflight::names::SERVOS_ON)
+        let ap_servos_on = crate::autoflight::read_status(&*xp, autoflight::names::SERVOS_ON)
             .await
             .unwrap_or(0.0)
             > 0.5;
@@ -2797,7 +2796,7 @@ async fn read_inputs(xp: &crate::xplane::XPlaneClient, pitch_due: bool) -> Input
     ) = tokio::join!(
         async {
             tokio::join!(
-                xp.get_float(autoflight::names::AP_STATE),
+                crate::autoflight::read_ap_state(&*xp),
                 xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE),
                 xp.get_float(crate::datarefs::WIND_SPEED_MSC),
                 xp.get_float("sim/time/sim_speed"),

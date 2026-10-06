@@ -2004,7 +2004,7 @@ async fn give_up_pattern(
     let hdg_mag = psi.map(|p| true_to_mag(p, mag_var).round().rem_euclid(360.0));
     let ours = !matches!(trip, PatternTrip::ServosOff { .. });
     if ours {
-        let servos = xp.get_float(SERVOS_ON).await.ok();
+        let servos = crate::autoflight::read_status(&*xp, SERVOS_ON).await.ok();
         if servos.is_some_and(|v| v < 0.5) {
             // FD first, on the tape (`ap_engage`); the read-back below
             // judges whether it is holding.
@@ -2016,15 +2016,15 @@ async fn give_up_pattern(
         if let Some(h) = hdg_mag {
             write_bug(xp, h).await;
         }
-        if xp.get_float(VS_STATUS).await.is_ok_and(|v| v <= 0.5) {
+        if crate::autoflight::read_status(&*xp, VS_STATUS).await.is_ok_and(|v| v <= 0.5) {
             let _ = autoflight::press(xp, Button::VerticalSpeed).await;
         }
         let _ = autoflight::set_dial(xp, Dial::Vs, 0.0).await;
     }
     let (servos_after, hdg_st, vs_st) = tokio::join!(
-        xp.get_float(SERVOS_ON),
-        xp.get_float(HDG_STATUS),
-        xp.get_float(VS_STATUS)
+        crate::autoflight::read_status(&*xp, SERVOS_ON),
+        crate::autoflight::read_status(&*xp, HDG_STATUS),
+        crate::autoflight::read_status(&*xp, VS_STATUS)
     );
     let holding = ours
         && [&servos_after, &hdg_st, &vs_st]
@@ -2151,7 +2151,7 @@ async fn hold_clear_of_terrain(
     alert(voice, Priority::Warning, &terrain_hold_line(why, hold_ft));
     // The autopilot's own capture holds the level: the dial on the hold.
     let bug_mag = true_to_mag(hdg_true, mag_var).rem_euclid(360.0);
-    if xp.get_float(SERVOS_ON).await.is_ok_and(|v| v < 0.5) {
+    if crate::autoflight::read_status(&*xp, SERVOS_ON).await.is_ok_and(|v| v < 0.5) {
         // FD first, on the tape (`ap_engage`); the hold's own guard watches
         // the servos from here.
         crate::ap_engage::press_logged(
@@ -2179,9 +2179,9 @@ async fn hold_clear_of_terrain(
         let (pos, ias_r, servos_r, hdg_st, vs_st) = tokio::join!(
             sim::position::read(xp),
             xp.get_float(IAS),
-            xp.get_float(SERVOS_ON),
-            xp.get_float(HDG_STATUS),
-            xp.get_float(VS_STATUS),
+            crate::autoflight::read_status(&*xp, SERVOS_ON),
+            crate::autoflight::read_status(&*xp, HDG_STATUS),
+            crate::autoflight::read_status(&*xp, VS_STATUS),
         );
         // A failed read is no measurement: the tick is skipped.
         let Some(alt) = sim::position::field(&pos, |p| p.elev_m)
@@ -3498,11 +3498,11 @@ async fn fly_authored_route(
             sim::position::read(&xp),
             xp.get_float(HPATH),
             xp.get_float(PHI),
-            xp.get_float(HDG_STATUS),
-            xp.get_float(VS_STATUS),
+            crate::autoflight::read_status(&xp, HDG_STATUS),
+            crate::autoflight::read_status(&xp, VS_STATUS),
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
-            xp.get_float(SERVOS_ON),
+            crate::autoflight::read_status(&xp, SERVOS_ON),
         );
         let (lat_r, lon_r) = sim::position::lat_lon(&pos);
         let elev_r = sim::position::field(&pos, |p| p.elev_m);
@@ -3510,7 +3510,7 @@ async fn fly_authored_route(
         // Read only where the capture is declared: nothing else uses them.
         let (dial_r, alt_hold_r) = if ap_capture {
             let (d, h) =
-                tokio::join!(autoflight::read_dial(&xp, Dial::Altitude), xp.get_float(ALT_HOLD_STATUS));
+                tokio::join!(autoflight::read_dial(&xp, Dial::Altitude), crate::autoflight::read_status(&xp, ALT_HOLD_STATUS));
             (d.ok(), h.ok())
         } else {
             (None, None)
@@ -4551,8 +4551,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let (pos, hpath_r, hdg_st, vs_st) = tokio::join!(
             sim::position::read(&xp),
             xp.get_float(HPATH),
-            xp.get_float(HDG_STATUS),
-            xp.get_float(VS_STATUS),
+            crate::autoflight::read_status(&xp, HDG_STATUS),
+            crate::autoflight::read_status(&xp, VS_STATUS),
         );
         let (lat, lon) = sim::position::lat_lon(&pos);
         let agl_m = sim::position::field(&pos, |p| p.agl_m);
@@ -4563,9 +4563,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             xp.get_float(IAS),
             xp.get_float(&thr_dref),
             autoflight::read_dial(&xp, Dial::Altitude),
-            xp.get_float(ALT_HOLD_STATUS),
+            crate::autoflight::read_status(&xp, ALT_HOLD_STATUS),
             xp.get_float(PHI),
-            xp.get_float(SERVOS_ON),
+            crate::autoflight::read_status(&xp, SERVOS_ON),
         );
         let (Ok(lat), Ok(lon)) = (lat, lon) else {
             continue;

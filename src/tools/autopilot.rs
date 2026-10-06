@@ -248,7 +248,7 @@ pub use crate::autoflight::{bug_step_from, drive_heading_bug, drive_heading_bug_
 
 /// Read the servo status as a bool ("is the autopilot actually flying").
 async fn servos_engaged(ctx: &ToolCtx<'_>) -> Result<bool> {
-    Ok(ctx.xplane.get_float(SERVOS_ON).await? > 0.5)
+    Ok(crate::autoflight::read_status(&*ctx.xplane, SERVOS_ON).await? > 0.5)
 }
 
 /// Raise the flight director (if this airframe needs it) then engage the servos.
@@ -282,7 +282,7 @@ async fn no_engage_reason(ctx: &ToolCtx<'_>, cfg: &ApConfig) -> &'static str {
 
 /// Read a mode's 0/1-ish status dataref ("is this mode armed/engaged").
 async fn mode_engaged(ctx: &ToolCtx<'_>, status: &str) -> bool {
-    ctx.xplane.get_float(status).await.unwrap_or(0.0) > 0.5
+    crate::autoflight::read_status(ctx.xplane, status).await.unwrap_or(0.0) > 0.5
 }
 
 /// Engage an autopilot mode *idempotently*. The `sim/autopilot/*` mode commands
@@ -699,8 +699,7 @@ fn capture_at_altitude(
                         // Idempotent (the command is a toggle): if the AP already
                         // captured on its own, leave it engaged.
                         let _ = autoflight::set_dial(&xp, Dial::Altitude, target).await;
-                        let held = xp
-                            .get_float(ALT_HOLD_STATUS)
+                        let held = crate::autoflight::read_status(&xp, ALT_HOLD_STATUS)
                             .await
                             .map(|v| v > 0.5)
                             .unwrap_or(false);

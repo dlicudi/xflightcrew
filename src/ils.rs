@@ -653,7 +653,7 @@ pub fn spawn_setup_watch(base: String, ils: crate::nav::Ils, mut watch: SetupWat
                     xp.get_float(VDEF),
                     xp.get_float(LOC_VALID),
                     xp.get_float(GS_VALID),
-                    xp.get_float(autoflight::names::AP_STATE),
+                    crate::autoflight::read_ap_state(&xp),
                     xp.get_float(SERVOS),
                     xp.get_float(crate::datarefs::LATITUDE),
                     xp.get_float(crate::datarefs::LONGITUDE),

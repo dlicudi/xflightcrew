@@ -125,9 +125,9 @@ approach_command: laminar/B738/autopilot/app_press
 # The MCP buttons, all the aircraft's own (zibomod; B738_Commands.txt
 # "glareshield.lua" block; the same names the pilot's cockpitdecks MCP page
 # presses). CMD B is never named (stock 737 lesson, LEMG 2026-10-05).
-# VERIFY: the owner reads modes from `autopilot_state`, which the Zibo may
-# not keep in step with these lamps; and it writes stock dials. A press here
-# is real, a readback may lie. Blackbox `autoflight` `press` and `ap_state`.
+# Since 2026-10-07 the owner reads this MCP's own lamps and writes its own
+# windows (below, `lamps:` and `windows:`). Blackbox `autoflight` `press`,
+# `switch`, `knob` and `ap_state`.
 autoflight:
   engage_command: laminar/B738/autopilot/cmd_a_press
   heading_command: laminar/B738/autopilot/hdg_sel_press
@@ -140,6 +140,76 @@ autoflight:
   # Boeing MCP: a V/S only toward the window (the stock 737's measured
   # behaviour; the Zibo's is unmeasured). VERIFY.
   vs_toward_window: true
+  # ---- The Zibo's own MCP through the panel owner (autoflight.rs) ----------
+  # Probed parked 2026-10-07 (battery only, engines off, park brake set),
+  # every press undone after: the stock modes do NOT follow this MCP.
+  # HDG SEL, ALT HLD, LVL CHG and APP each lit their lamp (0 to 1) while
+  # autopilot_state stayed 132 and heading_status, vvi_status and
+  # altitude_hold_status stayed 0. So the modes are READ from the lamps
+  # (`lamps:`), never the bitfield. On the ground each mode button is a
+  # toggle (a second press put the lamp out); LVL CHG put ALT HLD out. V/S
+  # would not engage on the ground (lamp stayed 0), so its lamp, its wheel
+  # and every engaged-in-flight behaviour are unflown.
+  engage_status: laminar/B738/autopilot/cmd_a_status
+  # The yoke's A/P disengage, never the MCP bar (`disconnect_toggle`): a
+  # bar left down blocks every later CMD A. VERIFY in the air.
+  disconnect_command: laminar/B738/autopilot/capt_disco_press
+  level_change_command: laminar/B738/autopilot/lvl_chg_press
+  lamps:
+    heading: laminar/B738/autopilot/hdg_sel_status
+    vs: laminar/B738/autopilot/vs_status
+    altitude_hold: laminar/B738/autopilot/alt_hld_status
+    level_change: laminar/B738/autopilot/lvl_chg_status
+    # Lit armed OR captured: APP lit with nothing tuned on the ramp.
+    approach: laminar/B738/autopilot/app_status
+    vorloc: laminar/B738/autopilot/vorloc_status
+    vnav: laminar/B738/autopilot/vnav_status1
+    speed: laminar/B738/autopilot/speed_status1
+    n1: laminar/B738/autopilot/n1_status
+  windows:
+    # Written 270 and 5,000: read back, and the stock dials followed within
+    # a second. The stock dials written 100 and 3,000 were put back to the
+    # MCP's values: a stock dial write here is a silent no-op.
+    heading:
+      write: laminar/B738/autopilot/mcp_hdg_dial
+    altitude:
+      write: laminar/B738/autopilot/mcp_alt_dial
+    # The speed window undoes a write (150 read back 100). The stock
+    # airspeed_up the glareshield Lua replaces steps it a knot (its own
+    # handler, B738.glaresheild.lua:3958), but cold the window stayed 100
+    # (the stock dial took 101). VERIFY powered: the knob is the hypothesis.
+    airspeed:
+      up: sim/autopilot/airspeed_up
+      down: sim/autopilot/airspeed_down
+      step: 1.0
+      readback: laminar/B738/autopilot/mcp_speed_dial_kts_mach
+    # B738_Datarefs.txt names the stock VVI dial as the MCP's. Written -500
+    # with V/S off it read 0 (blanked, as a 737's is). VERIFY in V/S.
+    vs:
+      write: sim/cockpit2/autopilot/vvi_dial_fpm
+  # The switches, each a toggle read before it is fired. FD: the toggle
+  # moved flight_director_pos 0 to 1 (master_capt_status and pfd_fd_cmd 1;
+  # the stock flight_director_mode stayed 0; fd_ca stayed 0) and back.
+  flight_director:
+    command: laminar/B738/autopilot/flight_director_toggle
+    position: laminar/B738/autopilot/flight_director_pos
+  flight_director_fo:
+    command: laminar/B738/autopilot/flight_director_fo_toggle
+    position: laminar/B738/autopilot/flight_director_fo_pos
+  # A/T arm: the toggle did NOT move autothrottle_arm_pos on battery power
+  # (the arm switch is solenoid-held; the stock autothrottle_enabled stayed
+  # 0). VERIFY powered. An ENGAGED A/T (SPEED or N1 lamp) is taken out by
+  # the A/T disengage button: it drops the arm too, never "armed, no mode".
+  autothrottle_arm:
+    command: laminar/B738/autopilot/autothrottle_arm_toggle
+    position: laminar/B738/autopilot/autothrottle_arm_pos
+  autothrottle_off_command: laminar/B738/autopilot/left_at_dis_press
+  # TO/GA (the Zibo also rewrites sim/autopilot/take_off_go_around): with
+  # the A/T armed it sets the takeoff N1 (Skymatix Zibomod checklist
+  # C-0030: 40 % N1, stable, then TO/GA). Declared and probed; nothing
+  # presses it yet.
+  toga_command: laminar/B738/autopilot/left_toga_press
+  # ---- end of the Zibo's own MCP ------------------------------------------
 
 parking_brake: true
 # The Zibo owns its parking brake. Probed stopped 2026-10-06: a stock ratio
