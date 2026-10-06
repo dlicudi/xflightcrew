@@ -2325,7 +2325,7 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         set_channel_speaking(inner, &gate, true, true);
         interrupt_intercom_for_radio(inner);
         if let Some(who) = utt.station {
-            crate::efb::feed::note_station(&utt.text, who);
+            crate::efb::feed::note_station(&utt.text, who, utt.overheard);
         }
         if !utt.overheard {
             if let Some(who) = utt.station {

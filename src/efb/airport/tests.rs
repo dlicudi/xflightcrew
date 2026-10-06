@@ -254,6 +254,7 @@ fn diagram_ref(icao: &str, f: &Frame) -> DiagramRef {
         version: "0123456789abcdef".into(),
         lat0: f.lat0,
         lon0: f.lon0,
+        runways: Vec::new(),
     }
 }
 
@@ -629,6 +630,7 @@ fn real_install_page_states() {
                 version: d.version.clone(),
                 lat0: d.ref_lat,
                 lon0: d.ref_lon,
+                runways: runway_ends(&d),
             }),
             unavailable: false,
             route: Some(RouteFacts {

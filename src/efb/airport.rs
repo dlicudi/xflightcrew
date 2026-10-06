@@ -505,6 +505,53 @@ pub(crate) struct DiagramRef {
     pub(crate) version: String,
     pub(crate) lat0: f64,
     pub(crate) lon0: f64,
+    /// Every runway end of the field, as drawn (the Flight tab's available
+    /// length and the wind's components).
+    pub(crate) runways: Vec<RunwayEnd>,
+}
+
+/// One runway end of a drawn field: its ident, the strip's length and the
+/// true heading flown along it from this end.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RunwayEnd {
+    pub(crate) ident: String,
+    pub(crate) length_m: f64,
+    pub(crate) heading_true: f64,
+}
+
+/// Both ends of every runway in a diagram. Pure.
+pub(crate) fn runway_ends(d: &Diagram) -> Vec<RunwayEnd> {
+    let mut out = Vec::new();
+    for r in &d.runways {
+        let ab = (r.b.x - r.a.x)
+            .atan2(r.b.y - r.a.y)
+            .to_degrees()
+            .rem_euclid(360.0);
+        out.push(RunwayEnd {
+            ident: r.a.id.clone(),
+            length_m: r.length_m,
+            heading_true: ab,
+        });
+        out.push(RunwayEnd {
+            ident: r.b.id.clone(),
+            length_m: r.length_m,
+            heading_true: (ab + 180.0).rem_euclid(360.0),
+        });
+    }
+    out
+}
+
+/// A runway end by ident ("08R", "RW08R", "8R" all name 08R).
+pub(crate) fn runway_end<'a>(ends: &'a [RunwayEnd], ident: &str) -> Option<&'a RunwayEnd> {
+    let norm = |s: &str| {
+        let s = s.trim().to_ascii_uppercase();
+        let s = s.strip_prefix("RW").unwrap_or(&s).to_string();
+        s.trim_start_matches('0').to_string()
+    };
+    let want = norm(ident);
+    (!want.is_empty())
+        .then(|| ends.iter().find(|e| norm(&e.ident) == want))
+        .flatten()
 }
 
 pub(crate) struct Ready {
@@ -571,6 +618,7 @@ fn store(icao: &str, built: Option<Diagram>) {
                 version: d.version.clone(),
                 lat0: d.ref_lat,
                 lon0: d.ref_lon,
+                runways: runway_ends(&d),
             };
             let json = serde_json::to_string(&d).unwrap_or_default();
             c.ready.retain(|r| r.reference.icao != icao);

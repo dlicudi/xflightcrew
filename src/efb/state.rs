@@ -9,7 +9,7 @@
 
 use serde::Serialize;
 
-use crate::efb::feed::{Alert, Line, Tick, Verdict, Who};
+use crate::efb::feed::{Alert, Line, Tick, Verdict};
 use crate::flight::{ClearanceFact, Control, Phase, Status};
 use crate::flow::{Flavour, ItemState, Sheet};
 
@@ -128,6 +128,14 @@ pub(crate) const PHRASES: &[Phrase] = &[
         "fetch the flight plan",
         Route::Capture("flight plan brief"),
     ),
+    // The approach's one suggested action (the pilot's go-around, flown
+    // like the tower's: `go_around::GoAroundWatch`).
+    p(
+        "go_around",
+        "Go around",
+        "go around",
+        Route::Tool("go_around"),
+    ),
     // The checklist's closed vocabulary: shown only while a list waits for
     // that answer (or a proposal stands), so each lands at the flow's door.
     p(
@@ -178,6 +186,21 @@ pub(crate) fn phrase(id: &str) -> &'static Phrase {
 /// "what's the weather at EGKK" (the loop's remote weather question).
 pub(crate) fn weather_words(icao: &str) -> String {
     format!("what's the weather at {}", icao.trim().to_ascii_uppercase())
+}
+
+/// "Gatwick Tower, ready for departure": the taxi phase's suggested call,
+/// addressed to the station by name so the tower takes it unkeyed. `None`
+/// without a tower tuned.
+pub(crate) fn station_ready_for_departure(field: &str, tag: &str) -> Option<String> {
+    let position = match tag {
+        "TWR" => "Tower",
+        _ => return None,
+    };
+    let name = crate::station::spoken_airport(field).trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("{name} {position}, ready for departure"))
 }
 
 /// "Gatwick Tower, say again": the frequency's say again, addressed to the
@@ -338,6 +361,18 @@ pub(crate) struct Facts {
     pub(crate) flow_waiting: Option<&'static str>,
     /// The Airport page's facts (`efb::airport`).
     pub(crate) airport: crate::efb::airport::AirportFacts,
+    /// Our callsign as the labels write it ("WAT519",
+    /// `transcript::written_callsign`).
+    pub(crate) callsign_written: Option<String>,
+    /// Who has the lateral while the follower flies (`feed::lateral`):
+    /// `Some(true)` LNAV, `Some(false)` the follower's bug.
+    pub(crate) lateral: Option<bool>,
+    /// The one takeoff rule for the plan's takeoff weight
+    /// (`aircraft::takeoff_needed_m`), metres; `None` without a book roll.
+    pub(crate) takeoff_need_m: Option<f64>,
+    /// The one landing rule, the book figure (`aircraft::planned_landing_needed_ft`),
+    /// metres; `None` when the profile recites none.
+    pub(crate) landing_need_m: Option<f64>,
 }
 
 /// What a setting accepts, as the registry declares it (`settings::Kind`).
@@ -379,7 +414,7 @@ pub(crate) struct Button {
 }
 
 impl Button {
-    fn of(p: &Phrase) -> Button {
+    pub(crate) fn of(p: &Phrase) -> Button {
         Button {
             id: p.id.to_string(),
             label: p.label.to_string(),
@@ -392,56 +427,36 @@ impl Button {
 pub(crate) struct Header {
     pub(crate) callsign: Option<String>,
     pub(crate) aircraft: Option<String>,
+    pub(crate) origin: Option<String>,
+    pub(crate) destination: Option<String>,
+    /// "LEMG 13 to EGKK 26L", for a reader without the arrow.
     pub(crate) route: Option<String>,
+    /// The flight model's phase, as a word ("Cruise").
     pub(crate) phase: Option<String>,
-    /// Who flies, as the chip says it ("CREW: FULL AUTO", "YOU").
+    /// The altitude beside it in the air ("35,000 ft").
+    pub(crate) alt: Option<String>,
+    /// Who flies, as the chip says it ("Full auto", "You").
     pub(crate) who: Option<String>,
     /// An automation of ours holds the aircraft.
     pub(crate) crew: bool,
     pub(crate) com1: Option<String>,
+    /// The station COM1 is on ("Brest Approach"), when it is ours.
+    pub(crate) com1_name: Option<String>,
     /// "idle", "listening", "thinking" or "speaking".
     pub(crate) activity: Option<&'static str>,
 }
 
+/// One transcript line, labelled FROM -> TO (`efb::transcript`).
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct StripCell {
-    pub(crate) label: &'static str,
-    /// "past", "now" or "next".
-    pub(crate) state: &'static str,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct Next {
-    pub(crate) title: String,
-    pub(crate) detail: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct Gauge {
-    pub(crate) k: &'static str,
-    pub(crate) v: Option<String>,
-    pub(crate) sub: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct Talk {
+pub(crate) struct TLine {
     pub(crate) t: f64,
-    pub(crate) who: String,
-    pub(crate) kind: Who,
     pub(crate) text: String,
-    pub(crate) radio: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct Now {
-    pub(crate) strip: Vec<StripCell>,
-    pub(crate) next: Option<Next>,
-    /// The automation feed's headline and its lines, as the panel shows them.
-    pub(crate) automation: Option<String>,
-    pub(crate) automation_lines: Vec<String>,
-    pub(crate) gauges: Vec<Gauge>,
-    pub(crate) talk: Vec<Talk>,
-    pub(crate) buttons: Vec<Button>,
+    /// COM1 when it went out, for the Radio page's frequency headers.
+    pub(crate) freq: Option<String>,
+    /// Who that frequency is ("Brest Approach", "Tower").
+    pub(crate) station: Option<String>,
+    #[serde(flatten)]
+    pub(crate) label: crate::efb::transcript::Labelled,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -471,7 +486,6 @@ pub(crate) struct Radio {
     pub(crate) tower_state: Option<String>,
     pub(crate) readback_owed: Option<String>,
     pub(crate) last_call: Option<LastCall>,
-    pub(crate) log: Vec<Talk>,
     pub(crate) buttons: Vec<Button>,
 }
 
@@ -628,7 +642,11 @@ pub(crate) struct ChecklistOut {
 pub(crate) struct EfbState {
     pub(crate) t: f64,
     pub(crate) header: Header,
-    pub(crate) now: Now,
+    /// The Flight tab, laid out for the phase (`efb::flight_tab`).
+    pub(crate) flight: crate::efb::flight_tab::FlightOut,
+    /// Every line said, oldest first, labelled: the Flight tab's intercom
+    /// log and the Radio tab's frequency log are filters of it.
+    pub(crate) transcript: Vec<TLine>,
     pub(crate) radio: Radio,
     pub(crate) plan: Plan,
     pub(crate) weather: Weather,
@@ -637,34 +655,17 @@ pub(crate) struct EfbState {
     pub(crate) alerts: Alerts,
     pub(crate) ptt: Ptt,
     pub(crate) my_controls: Button,
+    /// The one suggested action for the phase, beside MY CONTROLS.
+    pub(crate) action: Option<Button>,
     pub(crate) last_sent: Option<Sent>,
     pub(crate) airport: crate::efb::airport::AirportOut,
+    /// The Map tab's route picture (`efb::route_map`).
+    pub(crate) map: crate::efb::route_map::MapOut,
 }
 
 // ---------------------------------------------------------------- build
 
-/// The phase strip's cells, in a flight's order.
-const STRIP: [&str; 9] = [
-    "RAMP", "TAXI", "TAKEOFF", "CLIMB", "CRUISE", "DESCENT", "APPROACH", "LANDING", "TAXI IN",
-];
-
-/// Where a phase sits on the strip; `None` for a hover (no cell is honest).
-pub(crate) fn strip_index(p: Phase) -> Option<usize> {
-    Some(match p {
-        Phase::Parked | Phase::EngineStart | Phase::Ready | Phase::Pushback => 0,
-        Phase::TaxiOut | Phase::Holding | Phase::LinedUp => 1,
-        Phase::TakeoffRoll | Phase::RejectedTakeoff | Phase::InitialClimb => 2,
-        Phase::Climb => 3,
-        Phase::Cruise => 4,
-        Phase::Descent => 5,
-        Phase::Approach | Phase::GoAround => 6,
-        Phase::Landing | Phase::Rollout => 7,
-        Phase::TaxiIn => 8,
-        Phase::Hover => return None,
-    })
-}
-
-fn phase_label(p: Phase) -> &'static str {
+pub(crate) fn phase_label(p: Phase) -> &'static str {
     match p {
         Phase::Parked => "PARKED",
         Phase::EngineStart => "ENGINE START",
@@ -706,19 +707,19 @@ pub(crate) fn thousands(v: f64) -> String {
     }
 }
 
-fn feet(v: f64) -> String {
+pub(crate) fn feet(v: f64) -> String {
     format!("{} ft", thousands((v / 10.0).round() * 10.0))
 }
 
-fn kg(v: f64) -> Option<String> {
+pub(crate) fn kg(v: f64) -> Option<String> {
     (v.is_finite() && v > 0.0).then(|| format!("{} kg", thousands(v)))
 }
 
-fn freq(khz: i64) -> String {
+pub(crate) fn freq(khz: i64) -> String {
     format!("{:.3}", khz as f64 / 1000.0)
 }
 
-fn service_label(word: &str) -> String {
+pub(crate) fn service_label(word: &str) -> String {
     match word {
         "atis" => "ATIS".into(),
         "clearance" => "Delivery".into(),
@@ -736,7 +737,18 @@ fn service_label(word: &str) -> String {
     }
 }
 
-fn position_name(tag: &str) -> &'static str {
+/// Who a frequency is: our station's service on it ("Brest Approach").
+pub(crate) fn station_name(f: &Facts, khz: i64) -> Option<String> {
+    let st = f.station.as_ref()?;
+    let (w, _) = st.services.iter().find(|(_, k)| (khz - k).abs() <= 5)?;
+    Some(format!(
+        "{} {}",
+        crate::station::spoken_airport(&st.field).trim(),
+        service_label(w)
+    ))
+}
+
+pub(crate) fn position_name(tag: &str) -> &'static str {
     match tag {
         "TWR" => "Tower",
         "APP" => "Approach",
@@ -746,52 +758,31 @@ fn position_name(tag: &str) -> &'static str {
     }
 }
 
-fn who_label(l: &Line) -> String {
-    match l.who {
-        Who::Pilot => "You".into(),
-        Who::Crew => "Crew".into(),
-        Who::Cabin => "Cabin".into(),
-        Who::Atc => l.tag.map(position_name).unwrap_or("ATC").into(),
-        Who::Atis => "ATIS".into(),
-        Who::Traffic => "Traffic".into(),
-    }
-}
-
-fn talk(l: &Line) -> Talk {
-    Talk {
-        t: l.t,
-        who: who_label(l),
-        kind: l.who,
-        text: l.text.clone(),
-        radio: l.radio,
-    }
-}
-
 /// Who has the aircraft, as the header chip says it.
-fn who_flies(f: &Facts) -> (Option<String>, bool) {
+pub(crate) fn who_flies(f: &Facts) -> (Option<String>, bool) {
     if let Some(o) = f.owner {
         let m = f.mission.filter(|m| *m != o);
         let s = match m {
-            Some(m) => format!("CREW: {} ({})", m.to_uppercase(), o.to_uppercase()),
-            None => format!("CREW: {}", o.to_uppercase()),
+            Some(m) => format!("{} ({o})", capitalise(m)),
+            None => capitalise(o),
         };
         return (Some(s), true);
     }
     match f.flight.as_ref().map(|s| s.control) {
-        Some(Control::Automation(n)) => (Some(format!("CREW: {}", n.to_uppercase())), true),
-        Some(Control::Autopilot) => (Some("YOU, AUTOPILOT".into()), false),
-        Some(Control::Pilot) => (Some("YOU".into()), false),
+        Some(Control::Automation(n)) => (Some(capitalise(n)), true),
+        Some(Control::Autopilot) => (Some("You, autopilot".into()), false),
+        Some(Control::Pilot) => (Some("You".into()), false),
         Some(Control::Unknown) | None => (None, false),
     }
 }
 
 /// The plan's route as flown from here: (lat, lon) in order.
-fn route_points(p: &PlanFacts) -> Vec<(f64, f64)> {
+pub(crate) fn route_points(p: &PlanFacts) -> Vec<(f64, f64)> {
     p.waypoints.iter().map(|w| (w.1, w.2)).collect()
 }
 
 /// Miles still to fly along the plan, when the aircraft is on it.
-fn remaining_nm(f: &Facts) -> Option<f64> {
+pub(crate) fn remaining_nm(f: &Facts) -> Option<f64> {
     let (p, t) = (f.plan.as_ref()?, f.tick.as_ref()?);
     crate::monitor::route_remaining_nm(&route_points(p), t.lat, t.lon)
 }
@@ -802,7 +793,7 @@ pub(crate) fn zulu(t: f64) -> String {
     format!("{:02}:{:02}Z", s / 3600, (s % 3600) / 60)
 }
 
-fn minutes_words(min: f64) -> String {
+pub(crate) fn minutes_words(min: f64) -> String {
     let m = min.round().max(0.0) as i64;
     if m < 1 {
         "under a minute".into()
@@ -815,66 +806,7 @@ fn minutes_words(min: f64) -> String {
     }
 }
 
-/// The NEXT card: the follower's own top of descent first, then the fix it
-/// steers at, then the plan's ring against the route still to fly.
-fn next_card(f: &Facts) -> Option<Next> {
-    let gs = f.tick.as_ref().map(|t| t.gs_kts).filter(|g| *g > 40.0);
-    let time = |nm: f64| gs.map(|g| minutes_words(nm / g * 60.0));
-    if let Some(t) = &f.tod {
-        if !t.started && t.held_ft.is_none() && t.to_tod_nm > 0.0 {
-            let mut detail = vec![format!("Descent to {} for {}.", feet(t.target_ft), t.fix)];
-            if let Some(w) = time(t.to_tod_nm) {
-                detail.insert(0, format!("{}.", capitalise(&w)));
-            }
-            return Some(Next {
-                title: format!("Top of descent in {:.0} nm", t.to_tod_nm),
-                detail: Some(detail.join(" ")),
-            });
-        }
-        if let Some(h) = t.held_ft {
-            return Some(Next {
-                title: format!("Holding {} above the plan's descent", feet(h)),
-                detail: Some(format!(
-                    "The plan descends to {} for {}.",
-                    feet(t.target_ft),
-                    t.fix
-                )),
-            });
-        }
-    }
-    if let Some((fix, dist)) = &f.active_fix {
-        let title = match dist {
-            Some(d) => format!("{fix} in {d:.0} nm"),
-            None => format!("Next fix {fix}"),
-        };
-        return Some(Next {
-            title,
-            detail: dist.and_then(time).map(|w| format!("{}.", capitalise(&w))),
-        });
-    }
-    let airborne = f.flight.as_ref().is_some_and(|s| s.phase.airborne());
-    if let (true, Some(p), Some(rem)) = (airborne, f.plan.as_ref(), remaining_nm(f)) {
-        let in_cruise = f
-            .flight
-            .as_ref()
-            .is_some_and(|s| matches!(s.phase, Phase::Cruise | Phase::Climb));
-        if in_cruise && p.tod_to_dest_nm > 0.0 && rem > p.tod_to_dest_nm {
-            let to = rem - p.tod_to_dest_nm;
-            return Some(Next {
-                title: format!("Plan's top of descent in {to:.0} nm"),
-                detail: time(to)
-                    .map(|w| format!("{}. SimBrief's point, along the route.", capitalise(&w))),
-            });
-        }
-        return Some(Next {
-            title: format!("{} in {rem:.0} nm", p.destination),
-            detail: time(rem).map(|w| format!("{}.", capitalise(&w))),
-        });
-    }
-    None
-}
-
-fn capitalise(s: &str) -> String {
+pub(crate) fn capitalise(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
@@ -882,96 +814,8 @@ fn capitalise(s: &str) -> String {
     }
 }
 
-fn gauges(f: &Facts) -> Vec<Gauge> {
-    let t = f.tick.as_ref();
-    let s = f.flight.as_ref();
-    let ias = t.map(|t| t.ias_kts).or(s.map(|s| s.ias_kts));
-    let alt = t.map(|t| t.alt_ft).or(s.map(|s| s.alt_ft));
-    let gs = t.map(|t| t.gs_kts).or(s.map(|s| s.gs_kts));
-    let rem = remaining_nm(f);
-    let eta = match (rem, gs) {
-        (Some(r), Some(g)) if g > 40.0 && s.is_some_and(|s| s.phase.airborne()) => {
-            Some(f.now_t + r / g * 3600.0)
-        }
-        _ => None,
-    };
-    let fuel = t.and_then(|t| t.fuel_kg);
-    vec![
-        Gauge {
-            k: "IAS",
-            v: ias.map(|v| format!("{v:.0}")),
-            sub: Some("kt".into()).filter(|_| ias.is_some()),
-        },
-        Gauge {
-            k: "ALT",
-            v: alt.map(|v| thousands((v / 10.0).round() * 10.0)),
-            sub: t.map(|t| format!("{} ft AGL", thousands((t.agl_ft / 10.0).round() * 10.0))),
-        },
-        Gauge {
-            k: "GS",
-            v: gs.map(|v| format!("{v:.0}")),
-            sub: t
-                .and_then(|t| t.track_deg)
-                .map(|d| format!("track {:03.0}", d.rem_euclid(360.0))),
-        },
-        Gauge {
-            k: "ETA",
-            v: eta.map(zulu),
-            sub: match (f.plan.as_ref(), rem) {
-                (Some(p), Some(r)) => Some(format!("{} in {r:.0} nm", p.destination)),
-                _ => None,
-            },
-        },
-        Gauge {
-            k: "FUEL",
-            v: fuel.map(|v| thousands(v)),
-            sub: fuel.map(|_| match t.and_then(|t| t.endurance_min) {
-                Some(m) if m < 6000.0 => format!(
-                    "kg, {} h {:02} at this burn",
-                    (m as i64) / 60,
-                    (m as i64) % 60
-                ),
-                _ => "kg".into(),
-            }),
-        },
-    ]
-}
-
-/// The Now page's buttons for the phase: the ground's, the air's.
-fn now_buttons(f: &Facts) -> Vec<Button> {
-    let airborne = f.flight.as_ref().is_some_and(|s| s.phase.airborne());
-    let mut out = Vec::new();
-    if airborne {
-        out.push(Button::of(phrase("check_plan")));
-        out.push(Button::of(phrase("tod")));
-        if f.plan.is_some() {
-            out.push(Button::of(phrase("brief_arrival")));
-        }
-        if let Some(p) = f.plan.as_ref().filter(|p| !p.destination.is_empty()) {
-            out.push(Button {
-                id: "wx_dest".into(),
-                label: format!("{} weather", p.destination),
-                say: weather_words(&p.destination),
-            });
-        }
-        out.push(Button::of(phrase("land")));
-    } else {
-        out.push(Button::of(phrase("load_plan")));
-        if f.plan.is_some() {
-            out.push(Button::of(phrase("load_aircraft")));
-            out.push(Button::of(phrase("check_plan")));
-            out.push(Button::of(phrase("fly_plan")));
-        }
-        if f.com1_tag.is_some() {
-            out.push(Button::of(phrase("request_taxi")));
-        }
-    }
-    out.push(Button::of(phrase("status")));
-    out
-}
-
 /// The automation feed: "1NAME|stage\nline..." (marker, headline, extras).
-fn automation(auto: &str) -> (Option<String>, Vec<String>) {
+pub(crate) fn automation(auto: &str) -> (Option<String>, Vec<String>) {
     let mut chars = auto.chars();
     if chars.next() != Some('1') {
         return (None, Vec::new());
@@ -992,7 +836,7 @@ fn automation(auto: &str) -> (Option<String>, Vec<String>) {
     )
 }
 
-fn clearance_line(c: &IfrFacts) -> String {
+pub(crate) fn clearance_line(c: &IfrFacts) -> String {
     let after = match &c.sid {
         Some(s) => format!("{s} departure"),
         None => "runway heading".to_string(),
@@ -1006,7 +850,7 @@ fn clearance_line(c: &IfrFacts) -> String {
     )
 }
 
-fn tower_state(c: &ClearanceFact) -> String {
+pub(crate) fn tower_state(c: &ClearanceFact) -> String {
     let mut parts = vec![c.state.clone()];
     if let Some(r) = &c.runway {
         parts.push(format!("runway {r}"));
@@ -1019,17 +863,7 @@ fn tower_state(c: &ClearanceFact) -> String {
 
 fn radio(f: &Facts) -> Radio {
     let com1 = f.com1_khz.map(freq);
-    let tuned_service = |khz: i64| {
-        f.station
-            .as_ref()
-            .and_then(|s| s.services.iter().find(|(_, k)| (khz - k).abs() <= 5))
-            .map(|(w, _)| service_label(w))
-    };
-    let com1_who = match (f.com1_khz, f.station.as_ref()) {
-        (Some(k), Some(st)) => tuned_service(k)
-            .map(|w| format!("{} {w}", crate::station::spoken_airport(&st.field).trim())),
-        _ => None,
-    };
+    let com1_who = f.com1_khz.and_then(|k| station_name(f, k));
     let services = f
         .station
         .as_ref()
@@ -1050,7 +884,6 @@ fn radio(f: &Facts) -> Radio {
         freq: c.khz.map(freq),
         age_s: c.age_s,
     });
-    let log: Vec<Talk> = f.lines.iter().filter(|l| l.radio).map(talk).collect();
     let mut buttons = Vec::new();
     if let (Some(st), Some(tag)) = (f.station.as_ref(), f.com1_tag) {
         if let Some(words) = station_say_again(&st.field, tag) {
@@ -1076,7 +909,6 @@ fn radio(f: &Facts) -> Radio {
             .map(tower_state),
         readback_owed: f.readback_owed.clone(),
         last_call,
-        log: log.into_iter().rev().take(40).rev().collect(),
         buttons,
     }
 }
@@ -1363,7 +1195,14 @@ fn setting_row(s: &SettingFacts) -> SettingRow {
             max,
             step,
             unit,
-        } => ("num", Vec::new(), Some(*min), Some(*max), Some(*step), *unit),
+        } => (
+            "num",
+            Vec::new(),
+            Some(*min),
+            Some(*max),
+            Some(*step),
+            *unit,
+        ),
         SettingKind::Choice(o) => (
             "choice",
             o.iter().map(|x| x.to_string()).collect(),
@@ -1385,8 +1224,16 @@ fn setting_row(s: &SettingFacts) -> SettingRow {
         max,
         step,
         unit: unit.to_string(),
-        value: if secret { masked(&s.value) } else { s.value.clone() },
-        shown: if secret { masked(&s.value) } else { s.shown.clone() },
+        value: if secret {
+            masked(&s.value)
+        } else {
+            s.value.clone()
+        },
+        shown: if secret {
+            masked(&s.value)
+        } else {
+            s.shown.clone()
+        },
         locked: setting_locked(s.key, s.pinned_env),
         confirm: setting_confirm(s.key),
     }
@@ -1496,70 +1343,100 @@ fn checklist(f: &Facts) -> ChecklistOut {
     }
 }
 
-/// The page, from the facts. Pure.
-pub(crate) fn build(f: &Facts) -> EfbState {
-    let phase = f.flight.as_ref().map(|s| s.phase);
-    let idx = phase.and_then(strip_index);
-    let strip = STRIP
+/// The transcript, labelled: every line the taps kept, FROM -> TO, the
+/// frequency it went out on, and "readback owed" on the controller's last
+/// call to us while the party line holds the debt.
+pub(crate) fn transcript(f: &Facts) -> Vec<TLine> {
+    let ctx = crate::efb::transcript::Ctx {
+        spoken: f.callsign.as_deref(),
+        written: f.callsign_written.as_deref(),
+    };
+    let mut out: Vec<TLine> = f
+        .lines
         .iter()
-        .enumerate()
-        .map(|(i, label)| StripCell {
-            label,
-            state: match idx {
-                Some(n) if i < n => "past",
-                Some(n) if i == n => "now",
-                _ => "next",
-            },
+        .map(|l| {
+            let label = crate::efb::transcript::label(l, &ctx);
+            let khz = l.khz.filter(|_| l.radio);
+            TLine {
+                t: l.t,
+                text: l.text.clone(),
+                freq: khz.map(freq),
+                station: khz.and_then(|k| station_name(f, k)).or_else(|| {
+                    l.tag
+                        .filter(|_| l.radio)
+                        .map(|t| position_name(t).to_string())
+                }),
+                label,
+            }
         })
         .collect();
-    let (who, crew) = who_flies(f);
-    let phase_text = f.flight.as_ref().map(|s| {
-        let p = phase_label(s.phase);
-        if s.phase.airborne() && s.alt_ft > 0.0 {
-            format!("{p} {}", feet(s.alt_ft))
-        } else {
-            p.to_string()
+    if f.readback_owed.is_some() {
+        if let Some(last) = out
+            .iter_mut()
+            .rev()
+            .find(|x| x.label.cls == "atc" && !x.label.dim)
+        {
+            last.label.tags.push("readback owed");
         }
-    });
+    }
+    out
+}
+
+/// The page, from the facts. Pure.
+pub(crate) fn build(f: &Facts) -> EfbState {
+    let (who, crew) = who_flies(f);
+    let phase = f
+        .flight
+        .as_ref()
+        .map(|s| capitalise(&phase_label(s.phase).to_lowercase()));
+    let alt = f
+        .flight
+        .as_ref()
+        .filter(|s| s.phase.airborne() && s.alt_ft > 0.0)
+        .map(|s| feet(s.alt_ft));
+    let end = |icao: &str, rwy: &Option<String>| match rwy {
+        Some(r) if !r.is_empty() => format!("{icao} {r}"),
+        _ => icao.to_string(),
+    };
     let route = f.plan.as_ref().map(|p| {
-        let o = match &p.origin_rwy {
-            Some(r) if !r.is_empty() => format!("{} {r}", p.origin),
-            _ => p.origin.clone(),
-        };
-        let d = match &p.dest_rwy {
-            Some(r) if !r.is_empty() => format!("{} {r}", p.destination),
-            _ => p.destination.clone(),
-        };
-        format!("{o} to {d}")
+        format!(
+            "{} to {}",
+            end(&p.origin, &p.origin_rwy),
+            end(&p.destination, &p.dest_rwy)
+        )
     });
     let radio = radio(f);
     let header = Header {
-        callsign: f.callsign.clone(),
+        callsign: f.callsign_written.clone().or(f.callsign.clone()),
         aircraft: f.aircraft_type.clone().or(f.aircraft_name.clone()),
+        origin: f
+            .plan
+            .as_ref()
+            .map(|p| p.origin.clone())
+            .filter(|s| !s.is_empty()),
+        destination: f
+            .plan
+            .as_ref()
+            .map(|p| p.destination.clone())
+            .filter(|s| !s.is_empty()),
         route,
-        phase: phase_text,
+        phase,
+        alt,
         who,
         crew,
-        com1: radio.com1.as_ref().map(|c| match &radio.com1_who {
-            Some(w) => format!("{c} {w}"),
-            None => c.clone(),
-        }),
+        com1: radio.com1.clone(),
+        com1_name: radio.com1_who.clone(),
         activity: f.activity,
     };
-    let (automation, automation_lines) = automation(&f.auto);
-    let talk: Vec<Talk> = f.lines.iter().rev().take(8).rev().map(talk).collect();
+    let airport =
+        crate::efb::airport::page(&f.airport, f.tick.as_ref(), f.plan.as_ref(), airborne(f));
+    let flight = crate::efb::flight_tab::build(f, &airport);
+    let map = crate::efb::route_map::build(f, &airport);
     EfbState {
         t: f.now_t,
         header,
-        now: Now {
-            strip,
-            next: next_card(f),
-            automation,
-            automation_lines,
-            gauges: gauges(f),
-            talk,
-            buttons: now_buttons(f),
-        },
+        flight,
+        transcript: transcript(f),
         radio,
         plan: plan(f),
         weather: weather(f),
@@ -1571,16 +1448,13 @@ pub(crate) fn build(f: &Facts) -> EfbState {
             held: f.ptt_held,
         },
         my_controls: Button::of(phrase("my_controls")),
+        action: crate::efb::flight_tab::action(f),
         last_sent: f.last_sent.as_ref().map(|(t, s)| Sent {
             t: *t,
             text: s.clone(),
         }),
-        airport: crate::efb::airport::page(
-            &f.airport,
-            f.tick.as_ref(),
-            f.plan.as_ref(),
-            airborne(f),
-        ),
+        airport,
+        map,
     }
 }
 
@@ -1595,6 +1469,7 @@ pub(crate) fn airborne(f: &Facts) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::efb::feed::Who;
     use crate::flight::{Abnormal, PlanFact, Situation};
 
     /// A 737 in the cruise from Malaga to Gatwick, the follower flying.
@@ -1605,6 +1480,9 @@ pub(crate) mod tests {
             text: text.into(),
             radio,
             tag,
+            khz: radio.then_some(124_650),
+            overheard: false,
+            readback: false,
         };
         Facts {
             now_t: 1_791_280_800.0, // 2026-10-06 10:00Z
@@ -1650,7 +1528,7 @@ pub(crate) mod tests {
                 fuel_kg: Some(8_412.0),
                 endurance_min: Some(210.0),
             }),
-            callsign: Some("XVL 214".into()),
+            callsign: Some("X-ray Victor Lima two one four".into()),
             aircraft_type: Some("B738".into()),
             aircraft_name: Some("Boeing 737-800".into()),
             plan: Some(PlanFacts {
@@ -1730,15 +1608,22 @@ pub(crate) mod tests {
                 line(
                     1_791_280_760.0,
                     Who::Atc,
-                    "XVL 214, Brest, contact London Control 132.860",
+                    "X-ray Victor Lima two one four, Brest, contact London Control 132.860",
                     true,
                     Some("APP"),
                 ),
                 line(
                     1_791_280_765.0,
                     Who::Crew,
-                    "London 132.860, XVL 214.",
+                    "London 132.860, X-ray Victor Lima two one four.",
                     true,
+                    Some("APP"),
+                ),
+                line(
+                    1_791_280_770.0,
+                    Who::Cabin,
+                    "Coffee for the flight deck?",
+                    false,
                     None,
                 ),
             ],
@@ -1915,56 +1800,43 @@ pub(crate) mod tests {
             proposal: None,
             flow_waiting: None,
             airport: Default::default(),
+            callsign_written: Some("XVL214".into()),
+            lateral: None,
+            takeoff_need_m: None,
+            landing_need_m: None,
         }
     }
 
     #[test]
     fn the_cruise_page_is_built_from_the_facts() {
         let s = build(&cruise());
-        assert_eq!(s.header.callsign.as_deref(), Some("XVL 214"));
+        assert_eq!(s.header.callsign.as_deref(), Some("XVL214"));
         assert_eq!(s.header.aircraft.as_deref(), Some("B738"));
         assert_eq!(s.header.route.as_deref(), Some("LEMG 13 to EGKK 26L"));
-        assert_eq!(s.header.phase.as_deref(), Some("CRUISE 35,000 ft"));
-        assert_eq!(s.header.who.as_deref(), Some("CREW: FULL AUTO (FOLLOWER)"));
+        assert_eq!(s.header.origin.as_deref(), Some("LEMG"));
+        assert_eq!(s.header.phase.as_deref(), Some("Cruise"));
+        assert_eq!(s.header.alt.as_deref(), Some("35,000 ft"));
+        assert_eq!(s.header.who.as_deref(), Some("Full auto (follower)"));
         assert!(s.header.crew);
-        assert_eq!(s.header.com1.as_deref(), Some("124.650 Brest Approach"));
-        let now: Vec<&str> = s.now.strip.iter().map(|c| c.state).collect();
-        assert_eq!(now[4], "now");
-        assert_eq!(now[3], "past");
-        assert_eq!(now[5], "next");
-        let next = s.now.next.as_ref().expect("next");
-        assert_eq!(next.title, "Top of descent in 42 nm");
-        assert_eq!(
-            next.detail.as_deref(),
-            Some("About 5 minutes. Descent to 11,000 ft for BOGNA.")
-        );
-        assert_eq!(s.now.automation.as_deref(), Some("FULL AUTO: cruise"));
-        assert_eq!(s.now.automation_lines.len(), 2);
-        let g = |k: &str| s.now.gauges.iter().find(|g| g.k == k).unwrap().clone();
-        assert_eq!(g("IAS").v.as_deref(), Some("274"));
-        assert_eq!(g("ALT").v.as_deref(), Some("35,000"));
-        assert_eq!(g("GS").v.as_deref(), Some("461"));
-        assert_eq!(g("FUEL").v.as_deref(), Some("8,412"));
-        assert!(
-            g("ETA").v.is_some(),
-            "the route still to fly at the groundspeed"
-        );
-        assert_eq!(s.now.talk.len(), 4);
-        assert_eq!(s.now.talk[2].who, "Approach");
-        let ids: Vec<&str> = s.now.buttons.iter().map(|b| b.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                "check_plan",
-                "tod",
-                "brief_arrival",
-                "wx_dest",
-                "land",
-                "status"
-            ]
-        );
-        assert_eq!(s.now.buttons[3].say, "what's the weather at EGKK");
+        assert_eq!(s.header.com1.as_deref(), Some("124.650"));
+        assert_eq!(s.header.com1_name.as_deref(), Some("Brest Approach"));
+        assert_eq!(s.flight.layout, "cruise");
         assert_eq!(s.my_controls.say, "my controls");
+        assert_eq!(s.action.as_ref().map(|b| b.id.as_str()), Some("tod"));
+        // The transcript, labelled.
+        let t = &s.transcript;
+        assert_eq!(t.len(), 5);
+        let ft = |i: usize| format!("{} -> {}", t[i].label.from, t[i].label.to);
+        assert_eq!(ft(0), "YOU -> COPILOT");
+        assert_eq!(ft(1), "COPILOT -> YOU");
+        assert_eq!(ft(2), "APPROACH -> XVL214");
+        assert_eq!(t[2].freq.as_deref(), Some("124.650"));
+        assert_eq!(t[2].station.as_deref(), Some("Brest Approach"));
+        assert_eq!(ft(3), "XVL214 -> APPROACH");
+        assert_eq!(t[3].label.tags, ["by copilot"]);
+        assert_eq!(ft(4), "CABIN -> FLIGHT DECK");
+        assert_eq!(t[0].label.chan, "intercom");
+        assert_eq!(t[3].label.chan, "radio");
         // Radio.
         assert_eq!(
             s.radio.clearance.as_deref(),
@@ -1974,7 +1846,6 @@ pub(crate) mod tests {
             s.radio.tower_state.as_deref(),
             Some("Airborne, squawk 4521")
         );
-        assert_eq!(s.radio.log.len(), 2, "radio lines only");
         assert!(s
             .radio
             .services
@@ -2010,11 +1881,30 @@ pub(crate) mod tests {
             s.weather.metars[0].runway.as_deref(),
             Some("Runway 26L (full auto's arrival)")
         );
-        // The whole thing is JSON.
+        // The map: the route in the cruise.
+        assert_eq!(s.map.mode, "route");
+        // The whole thing is JSON, the label flattened into each line.
         let j = serde_json::to_value(&s).unwrap();
-        assert_eq!(j["now"]["talk"][0]["kind"], "pilot");
+        assert_eq!(j["transcript"][0]["from"], "YOU");
+        assert_eq!(j["transcript"][0]["cls"], "you");
+        assert_eq!(j["flight"]["layout"], "cruise");
         assert_eq!(s.header.activity, Some("listening"));
         assert!(s.ptt.available && !s.ptt.held);
+    }
+
+    /// A readback owed rides the controller's last call to us.
+    #[test]
+    fn a_readback_owed_is_tagged_on_the_call_that_owes_it() {
+        let mut f = cruise();
+        f.readback_owed = Some("Contact London 132.860".into());
+        let s = build(&f);
+        let owed: Vec<&TLine> = s
+            .transcript
+            .iter()
+            .filter(|l| l.label.tags.contains(&"readback owed"))
+            .collect();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].label.from, "APPROACH");
     }
 
     /// The Settings page is the registry: every row, its control, the
@@ -2103,24 +1993,27 @@ pub(crate) mod tests {
     }
 
     /// Nothing known: every box is None (a dash on the page), no number
-    /// invented, and the ground's buttons only.
+    /// invented, the ramp's layout and its one action.
     #[test]
     fn a_page_with_no_facts_shows_dashes() {
         let s = build(&Facts::default());
         assert_eq!(s.header.callsign, None);
         assert_eq!(s.header.phase, None);
         assert_eq!(s.header.who, None);
-        assert!(s.now.next.is_none());
-        assert!(s
-            .now
-            .gauges
-            .iter()
-            .all(|g| g.v.is_none() && g.sub.is_none()));
-        assert!(s.now.strip.iter().all(|c| c.state == "next"));
+        assert_eq!(s.flight.layout, "parked");
+        assert!(
+            s.flight
+                .tiles
+                .iter()
+                .all(|t| t.value.is_none() && t.unit.is_none()),
+            "{:?}",
+            s.flight.tiles
+        );
         assert!(s.plan.plan.is_none());
         assert!(s.radio.com1.is_none() && s.radio.last_call.is_none());
-        let ids: Vec<&str> = s.now.buttons.iter().map(|b| b.id.as_str()).collect();
-        assert_eq!(ids, ["load_plan", "status"]);
+        assert!(s.transcript.is_empty());
+        assert_eq!(s.map.mode, "airport");
+        assert_eq!(s.action.map(|b| b.id), Some("fetch_plan".into()));
     }
 
     #[test]
@@ -2128,10 +2021,11 @@ pub(crate) mod tests {
         let mut f = cruise();
         f.tod.as_mut().unwrap().held_ft = Some(19_000.0);
         let s = build(&f);
-        assert_eq!(
-            s.now.next.unwrap().title,
-            "Holding 19,000 ft above the plan's descent"
-        );
+        assert!(s
+            .flight
+            .sub
+            .as_deref()
+            .is_some_and(|x| x.contains("Holding 19,000 ft above the plan's descent")));
         let mut f = cruise();
         f.flight.as_mut().unwrap().phase = Phase::Ready;
         f.owner = None;
@@ -2140,42 +2034,70 @@ pub(crate) mod tests {
         f.tod = None;
         f.active_fix = None;
         let s = build(&f);
-        assert_eq!(s.header.who.as_deref(), Some("YOU"));
+        assert_eq!(s.header.who.as_deref(), Some("You"));
         assert!(!s.header.crew);
-        let ids: Vec<&str> = s.now.buttons.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(s.flight.layout, "parked");
+        assert_eq!(s.action.map(|b| b.id), Some("fly_plan".into()));
+        // Holding short with a tower tuned and the pilot flying: the call.
+        let mut f = cruise();
+        f.flight.as_mut().unwrap().phase = Phase::Holding;
+        f.owner = None;
+        f.mission = None;
+        f.com1_tag = Some("TWR");
+        f.station = Some(StationFacts {
+            field: "London Gatwick".into(),
+            services: vec![("tower".into(), 124_225)],
+        });
+        let s = build(&f);
+        assert_eq!(s.flight.layout, "taxi");
         assert_eq!(
-            ids,
-            [
-                "load_plan",
-                "load_aircraft",
-                "check_plan",
-                "fly_plan",
-                "request_taxi",
-                "status"
-            ]
+            s.action.map(|b| b.say),
+            Some("London Gatwick Tower, ready for departure".into())
         );
-        assert!(
-            s.now.next.is_none(),
-            "on the ground no route ETA is invented"
-        );
-        assert!(s
-            .now
-            .gauges
-            .iter()
-            .find(|g| g.k == "ETA")
-            .unwrap()
-            .v
-            .is_none());
     }
 
-    /// The fixture's page state as JSON, for a look at the page without a
-    /// sim: `EFB_FIXTURE_OUT=/tmp/efb.json cargo test -- --ignored efb_fixture_json`.
+    /// The fixture's page states as JSON, one per Flight tab layout, for a
+    /// look at the page without a sim: `EFB_FIXTURE_OUT=target/efb cargo
+    /// test -- --ignored efb_fixture_json` writes `cruise.json`,
+    /// `parked.json` and `approach.json` there.
     #[test]
     #[ignore]
     fn efb_fixture_json() {
-        let out = std::env::var("EFB_FIXTURE_OUT").expect("EFB_FIXTURE_OUT");
-        let json = serde_json::to_string_pretty(&build(&cruise())).unwrap();
-        std::fs::write(out, json).unwrap();
+        let dir = std::env::var("EFB_FIXTURE_OUT").expect("EFB_FIXTURE_OUT");
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, f: &Facts| {
+            let json = serde_json::to_string_pretty(&build(f)).unwrap();
+            std::fs::write(format!("{dir}/{name}.json"), json).unwrap();
+        };
+        write("cruise", &cruise());
+        let mut f = cruise();
+        f.flight.as_mut().unwrap().phase = Phase::Parked;
+        f.flight.as_mut().unwrap().situation.clearance = None;
+        f.owner = None;
+        f.mission = None;
+        f.auto = String::new();
+        f.flight.as_mut().unwrap().control = Control::Pilot;
+        f.checklist = None;
+        f.tick.as_mut().unwrap().on_ground = true;
+        f.takeoff_need_m = Some(1_421.0);
+        write("parked", &f);
+        let mut f = cruise();
+        f.flight.as_mut().unwrap().phase = Phase::Approach;
+        f.landing_need_m = Some(1_650.0);
+        f.readback_owed = Some("Cleared ILS 26L".into());
+        f.airport.diagram = Some(crate::efb::airport::DiagramRef {
+            icao: "EGKK".into(),
+            name: "Gatwick".into(),
+            version: "v".into(),
+            lat0: 51.15,
+            lon0: -0.19,
+            runways: vec![crate::efb::airport::RunwayEnd {
+                ident: "26L".into(),
+                length_m: 3_159.0,
+                heading_true: 257.8,
+            }],
+        });
+        write("approach", &f);
     }
 
     #[test]
@@ -2263,6 +2185,20 @@ pub(crate) mod tests {
             assert!(crate::station::is_radio_call(&tl, &name), "{words}");
         }
         assert_eq!(station_say_again("Malaga", "ATIS"), None);
+        // The taxi phase's suggested call: addressed to the tower by name,
+        // a radio call the tower parses (`try_route_content_atc`).
+        for field in ["London Gatwick", "Gibraltar", "Malaga"] {
+            let words = station_ready_for_departure(field, "TWR").expect("a tower");
+            let tl = words.to_ascii_lowercase();
+            let name = crate::station::spoken_airport(field).to_lowercase();
+            assert!(crate::station::is_radio_call(&tl, &name), "{words}");
+            assert_ne!(
+                crate::tower::parse_intent(&tl),
+                crate::tower::Intent::Unknown,
+                "{words}"
+            );
+        }
+        assert_eq!(station_ready_for_departure("Malaga", "APP"), None);
         // "my controls" is the release guard's while a loop holds a
         // control, the autopilot_off tool otherwise: either way the pilot's.
         assert_eq!(

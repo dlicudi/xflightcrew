@@ -172,7 +172,8 @@
   ].join('\n');
 
   function readColours() {
-    var cs = getComputedStyle(document.documentElement);
+    // The map keeps the night palette in a day theme: read where it is drawn.
+    var cs = getComputedStyle(root || document.documentElement);
     function v(n, d) { var x = cs.getPropertyValue(n).trim(); return x || d; }
     C = {
       bg: v('--bg', '#07090C'),

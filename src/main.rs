@@ -1451,7 +1451,7 @@ async fn run_session(
                         if queued_readback {
                             circuit::note_readback_out(&call);
                         }
-                        efb::feed::crew_transmits(&format!("{call}."));
+                        efb::feed::crew_transmits(&format!("{call}."), queued_readback);
                         say_or(
                             &voice,
                             &reporter,
@@ -4449,6 +4449,9 @@ async fn try_route_content_atc(
         tempo::set_radio_turn(false);
         return false;
     };
+    // The station took the pilot's words: the EFB's transcript puts them on
+    // the frequency, not the intercom.
+    efb::feed::pilot_line_was_radio();
     // The pilot's own "going around" to the tower is flown too.
     go_around::note_radio_call(tl);
     reporter.status(ui::Phase::Speaking);
