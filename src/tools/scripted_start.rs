@@ -561,13 +561,13 @@ pub async fn run(
                 tracing::info!(target: "xvoicelayer::scripted_start", call = c.kind(), %line, spoken);
                 if spoken {
                     if let Some(v) = voice {
-                        // `alert` mirrors to the panel itself.
-                        let pri = if matches!(c, Call::Aborted(_)) {
-                            Priority::Caution
+                        // `alert` mirrors to the panel itself; an aborted
+                        // start is a hazard the EFB shows as its caution.
+                        if matches!(c, Call::Aborted(_)) {
+                            v.hazard(crate::monitor::Severity::Caution, line);
                         } else {
-                            Priority::Advisory
-                        };
-                        v.alert(pri, line);
+                            v.alert(Priority::Advisory, line);
+                        }
                     }
                 }
             }

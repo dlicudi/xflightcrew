@@ -1490,7 +1490,7 @@ async fn watch(
                 fan.clear();
             }
             Act::Warn(line) => {
-                say(&voice, &status, crate::voice::Priority::Warning, &line);
+                say(&voice, &status, crate::monitor::Severity::Warning, &line);
             }
             Act::TakeOver { alt_ft, why } => {
                 hold.took_over();
@@ -1509,7 +1509,7 @@ async fn watch(
                     say(
                         &voice,
                         &status,
-                        crate::voice::Priority::Warning,
+                        crate::monitor::Severity::Warning,
                         &take_over_line(alt_ft),
                     );
                 }
@@ -1531,9 +1531,9 @@ async fn watch(
                 hold.written(cmd, now_s, tick.air.alt_ft, Some(ap_after));
                 if took {
                     let prio = if escape {
-                        crate::voice::Priority::Warning
+                        crate::monitor::Severity::Warning
                     } else {
-                        crate::voice::Priority::Caution
+                        crate::monitor::Severity::Caution
                     };
                     say(&voice, &status, prio, &hold_line(&cmd, escape, cause));
                 } else {
@@ -1559,7 +1559,7 @@ async fn watch(
                         say(
                             &voice,
                             &status,
-                            crate::voice::Priority::Warning,
+                            crate::monitor::Severity::Warning,
                             &take_over_line(Some(cmd.alt_ft)),
                         );
                     }
@@ -1583,7 +1583,7 @@ pub fn take_over_line(alt_ft: Option<f64>) -> String {
 fn say(
     voice: &crate::voice::Voice,
     status: &Option<crate::plugin_status::StatusSink>,
-    prio: crate::voice::Priority,
+    prio: crate::monitor::Severity,
     line: &str,
 ) {
     // `Voice::alert` mirrors to the panel transcript itself; the action line
@@ -1591,7 +1591,7 @@ fn say(
     if let Some(s) = status {
         s.action(line);
     }
-    voice.alert(prio, line.to_string());
+    voice.hazard(prio, line.to_string());
 }
 
 /// Set the hold through the panel's owner (`autoflight`, the safe hold its

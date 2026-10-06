@@ -619,7 +619,7 @@ fn say(voice: &Option<Voice>, status: &Option<crate::plugin_status::StatusSink>,
         s.action(line);
     }
     if let Some(v) = voice {
-        v.alert(Priority::Warning, line.to_string());
+        v.hazard(crate::monitor::Severity::Warning, line.to_string());
     }
 }
 

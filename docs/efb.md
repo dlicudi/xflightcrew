@@ -4,7 +4,7 @@ A browser Electronic Flight Bag served by `xvl` on your LAN, for an iPad, an iPh
 screen: the copilot's knowledge as four tabs (Flight, Map, Plan, Radio) and Settings behind the
 gear, the crew's warnings and cautions, a hold-to-talk button, and buttons that speak for you.
 Code: `src/efb/` (`mod.rs` the server, `state.rs` the page state, `flight_tab.rs` the Flight tab's
-phase layouts, `transcript.rs` the FROM -> TO labels, `route_map.rs` the route picture, `feed.rs`
+phase layouts, `transcript.rs` the FROM -> TO labels, `route_map.rs` the route picture and its fit, `basemap.rs` the water under it, `feed.rs`
 the taps, `ptt.rs` the push to talk, `airport.rs` and `diagram.js` the airport map, `page.html`
 the page, `icons/` the home-screen icons). The approved design is
 `docs/tasks/efb-v3/mockup.html` (2026-10-06).
@@ -73,11 +73,11 @@ is a dash, never a guess.
 |---|---|---|
 | Strip | callsign (written, "WAT519"), type, route, phase and altitude, who flies, COM1 and its station | the monitor's callsign resolve (`feed::note_callsign`) written by `transcript::written_callsign` over the override and the plan's id, the live profile, the plan on the shelf, `flight::published()`, `flight_state::crew_has_aircraft` / `crew_mission`, the runway watch's COM1 read (`feed::note_com1`) named by the station's services |
 | Flight | the layout for the phase (below): a headline, four readouts, the cards; the running checklist as a card in any phase; the intercom log | `flight_tab::build` over the same facts; `flow::sheet`, `flow::proposal_title`, `flow::waiting_for`; the transcript's intercom lines |
-| Map | on the ground or near the drawn field, the airport diagram; airborne away from it, the route: legs in magenta, flown legs dimmed, the active fix ringed, the top of descent, the aircraft | `airport::page` (below); `route_map::build` over the plan's legs, `procedure::active_leg`, the monitor's tick, `procedure::planned_tod` (else the plan's ring measured back from the destination) |
+| Map | on the ground or low near the destination, the airport diagram; elsewhere the route over water and coastlines: legs in magenta, flown legs dimmed, the active fix ringed, the top of descent, the plan's fields, the aircraft (below) | `airport::page` (below); `route_map::build` over the plan's legs, `procedure::active_leg`, the monitor's tick, `procedure::planned_tod` (else the plan's ring measured back from the destination), the field directory (`station::field_position`); `GET /basemap` from X-Plane's installed map data |
 | Plan | source and when shelved, the route string, the plan check and preflight, route and procedures, plan fuel, the load sheet, the legs (the follower's fix in magenta), the weather for destination, origin and alternate with the runway picked or cleared | `simbrief::loaded_plan` / `plan_shelved_at`, `procedure::active_leg`, `feed::AUDIT`, `feed::PREFLIGHT`, the sim's real-weather file (`weather::latest_file`, re-read at most once a minute), `full_auto::arrival_runway`, `party_line::clearance_runway` |
 | Radio | COM1 and who it is, the accepted clearance (or the tower's state for us), a readback owed, the controller's last call to us with Say again, the station's frequencies, the frequency log (Radio or All) | `feed::com1`, `station::tuned_station`, `station::active_station_in_range`, `party_line::assigned_clearance`, the flight model's clearance fact, `party_line::readback_owed`, `Voice::last_controller_line`, the labelled transcript |
 | Settings | every row of the settings registry, as the terminal's Settings screen shows it, and this device's theme | `settings::ALL` |
-| Every page | the crew's warning as a banner until acknowledged on the page, the latest caution as an amber chip, a dot for idle / listening / thinking / speaking | `feed::note_alert` (tapped where `Voice::alert`, `narrate` and `say_crew` mirror to the panel), `feed::note_activity`, `Voice::is_speaking` |
+| Every page | the crew's warning as a banner until acknowledged on the page, the latest caution as an amber chip, a dot for idle / listening / thinking / speaking | `feed::note_alert` (tapped where the voice mirrors to the panel; a banner or chip only for a `Voice::hazard`, below), `feed::note_activity`, `Voice::is_speaking` |
 
 ### The Flight tab, phase by phase
 
@@ -124,6 +124,55 @@ the app skips the label and the rows keep their tags.
 The plan check and preflight were spoken once and dropped before the EFB; they are now kept in
 flight-scoped cells (`efb::feed::AUDIT`, `PREFLIGHT`: a `Scoped` cell, so a new flight never shows
 the last one's verdict).
+
+## The Map tab: which picture
+
+The page's own choice (`route_map::mode`, pinned by `the_map_turns_to_the_field_low_near_it`):
+on the ground, the airport diagram; airborne, the destination's diagram once within 15 nm of it
+(where the diagram still draws the aircraft) below 3,000 ft above the ground, or in the landing;
+the route otherwise; airborne with no route to draw, the airport. The Airport and Route buttons
+pick for you until the page's own choice changes. Airborne on the diagram, "follow" frames the
+field and the aircraft together, north up.
+
+## The Map tab: the route
+
+The fit is the state's (`route_map::fit`, pinned by `the_cruise_fits_what_is_ahead`,
+`the_last_fix_near_the_field_fits_the_terminal`, `the_ground_fits_the_whole_plan`):
+
+- Airborne within 40 nm of the destination, or within 60 nm below 10,000 ft: the **terminal**
+  view, the aircraft and the field only.
+- Airborne elsewhere: what is **ahead**, the aircraft, the next fix and the legs still to fly.
+  Flown legs stay drawn, dimmed, and never drive the fit.
+- On the ground, or with no aircraft: the whole **route**.
+- Never narrower than 15 nm either way.
+
+Under the route, water and coastlines from X-Plane's OWN installed map data,
+`Resources/map data/water/<+LL+LLL>/<+LL+LLL>.shp`: one ESRI Shapefile of water polygons per 1x1
+degree tile, named by its south-west corner, in 10x10 degree folders (355 folders, 664 MB). An
+installed file like apt.dat, never a sim read (`efb::basemap`). `GET /basemap?bbox=lat0,lon0,lat1,lon1&px=<width>`
+(token required, ETag'd) reads only the tiles under the view, off the server's thread: the
+rings simplified (Douglas-Peucker) to about a pixel of the view, each vertex on a tile's side
+kept so neighbours meet edge to edge, sent as flat `[lat, lon, ...]` arrays at 4 decimals, under
+400 kB (coarser until it fits). A tile with no file is all water or all land: a neighbour whose
+shared side is water makes it water, a land side land, the answer spreads among missing tiles,
+and none at all is open sea. Tiles are cached (96 read, 1,024 simplified, 16 answers). Measured
+on the real install: the EGKK terminal view 69 kB at 1,400 px (22 kB on a phone), a cruise view
+from Malaga to Gatwick 150 to 200 kB, a few to 30 ms. The page asks again only once its view
+leaves the tiles it holds or its zoom moves by about a step. No map data: the route alone,
+said nowhere. Land is the page's background, water a muted blue grey (`--water`), the coast a
+faint line (`--coast`), day and night.
+
+Fields: the plan's origin, destination and alternate are ringed and labelled with their ICAO
+always (from the field directory the region index loads from apt.dat, else the plan's waypoint).
+Once the view is under 6 degrees across, `/basemap` also sends the towered fields in it (every
+land field under 1.5 degrees): drawn as small dots near the legs still to fly (or anywhere in a
+terminal view), the towered ones lightly labelled.
+
+Labels never overlap: each is placed at the first free spot of eight round its point, clear of
+the labels already placed, the aircraft, the map's buttons, the info box and the scale bar; in
+order the active fix, the destination and the top of descent (never dropped), the origin and
+alternate, the fixes ahead nearest first, the towered fields, the flown fixes. One with no free
+spot is dropped.
 
 ## The Map tab: the airport
 
@@ -176,10 +225,23 @@ waiting for that answer, and pinned in the same routing test.
 
 ## Alerts
 
-Every line the crew says through `Voice::alert` (and `narrate`, `say_crew`) is kept with its level,
-this flight's only (40 at most). A WARNING is a red banner under the strip on every page until you tap Acknowledge
-(the acknowledgement lives on that device only; the app never hears it), for half an hour at most.
-A CAUTION is the amber chip in the header for five minutes. An advisory is in the conversation only.
+The banner and the chip are for HAZARDS, said through `Voice::hazard` with a severity
+(`monitor::Severity`): the monitor's checks at their own Warning or Caution (stall and airspeed,
+sink rate, terrain, overspeed, cabin altitude, fuel...), the safe hold's terrain warning, its
+holds and its take-over, the recovery's lines, "Not stabilised, ..., going around", an aborted
+start, a stale plugin, automation stopped, the sim gone. A line spoken at `Priority::Warning` or
+`Caution` is NOT a hazard by that alone: the priority is how hard a line interrupts (autoland
+says "I'll land at EGKK runway 26L, 8 miles. I have the approach." at Warning only so the radio
+cannot cut it), and such lines stay in the conversation (pinned by
+`only_a_hazard_reaches_the_efb_banner`).
+
+Hazards are kept with their level, this flight's only (40 at most). A WARNING is a red banner
+under the strip on every page until you tap Acknowledge (the acknowledgement lives on that device
+only; the app never hears it), for half an hour at most. A CAUTION is the amber chip in the
+header for five minutes. Everything else the crew says is in the conversation only.
+
+A frequency is set with its point tightened ("124.230", not the mono face's "124. 230") on the
+strip, the Radio tab, the frequency log's headers and the cards.
 
 ## Push to talk
 

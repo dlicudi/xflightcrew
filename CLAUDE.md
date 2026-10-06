@@ -646,6 +646,9 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
 - Settings is the registry through `settings::set` (pinned and the EFB's own link read-only, mode
   and EFB-off confirmed, server-checked); alerts are tapped where the voice mirrors to the panel
   (`feed::note_alert`, flight-scoped; a warning banner acknowledged on the page only). **The
+  banner and chip are HAZARDS** (`Voice::hazard` with a `monitor::Severity`: the monitor's
+  checks, safe hold, recovery, unstable go-around, aborted start), never every line at
+  `Priority::Warning`: a priority is how hard a line interrupts, not how bad it is. **The
   EFB's PTT is a heartbeat** (`efb::ptt`): held only while beats are fresh (600 ms), capped at
   60 s, OR'd into the intercom key.
 - **The Map tab** is the airport on the ground or near the drawn field (`efb::airport`): apt.dat
@@ -653,7 +656,11 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   east/north metres) and served as `GET /airport` with its version as the ETag; the live overlay
   (tick position, `party_line` taxi route, the guide's `TurnCard` via `feed::note_turn_card`, the
   cleared runway) is one pure `airport::page`. The field is `airport::wanted_field`: destination
-  airborne, the field we are at on the ground. Away from it, the route (`efb::route_map`).
+  airborne, the field we are at on the ground. Airborne the diagram only within 15 nm below
+  3,000 ft AGL (`route_map::mode`); else the route (`efb::route_map`), FITTED to what matters
+  (`route_map::fit`: terminal within 40 nm, else the aircraft and the legs ahead; flown legs
+  never drive it) over water from X-Plane's INSTALLED map data (`efb::basemap`, `GET /basemap`,
+  only the tiles under the view, a file read like apt.dat, never a sim read).
 - Off by default (`XCOPILOT_EFB`, `_PORT`, `_TOKEN`; the registry's `efb*`); every request needs
   the token, a wrong one is a 403 blackboxed `efb` `auth_failed`; one line per 500 ms. Its own
   thread and runtime, never the command loop's; no lock held across an await.

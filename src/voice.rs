@@ -1457,12 +1457,32 @@ impl Voice {
     /// Deliberate blocking replies (`say`) are NOT gated: the main loop
     /// mode-routes those itself, and the "copilot is off" note must speak.
     pub fn alert(&self, priority: Priority, text: impl Into<String>) {
+        self.alert_with(priority, text.into(), None);
+    }
+
+    /// A HAZARD the crew calls: a monitor check's Warning or Caution, the
+    /// terrain, a recovery or the safe hold taking the aircraft, a final
+    /// that is not stabilised, an aborted start, the sim gone. Spoken
+    /// exactly as [`Voice::alert`] at the severity's priority, and the EFB
+    /// shows it as its banner (a warning) or chip (a caution). `Priority` is
+    /// an INTERRUPTION order, not a severity: an announcement spoken at
+    /// Warning only so the radio cannot cut it ("I'll land at EGKK") goes
+    /// through `alert` and stays in the transcript (2026-10-06).
+    pub fn hazard(&self, severity: crate::monitor::Severity, text: impl Into<String>) {
+        self.alert_with(severity.into(), text.into(), Some(severity));
+    }
+
+    fn alert_with(
+        &self,
+        priority: Priority,
+        text: String,
+        hazard: Option<crate::monitor::Severity>,
+    ) {
         if !crate::mode::copilot_enabled() {
             return;
         }
-        let text = text.into();
         crate::auto_status::note_said(&text);
-        self.mirror_to_panel(priority, &text);
+        self.mirror_to_panel(priority, &text, hazard);
         // Narration perishes (`ADVISORY_STALE_S`); anything sterner waits its turn.
         let stale_by = match priority {
             Priority::Advisory => {
@@ -1482,7 +1502,7 @@ impl Voice {
         }
         let text = text.into();
         crate::auto_status::note_said(&text);
-        self.mirror_to_panel(priority, &text);
+        self.mirror_to_panel(priority, &text, None);
         let stale_by = Instant::now() + std::time::Duration::from_secs(stale_s);
         self.enqueue(priority, text, None, false, Some(stale_by));
     }
@@ -1497,13 +1517,19 @@ impl Voice {
     /// duplicate-text bug). Advisory rides the green action slot (the crew's
     /// own voice); caution/warning use the coloured alert slot so the chip keeps
     /// its amber/red salience. Cheap, non-blocking, a no-op when unwired.
-    fn mirror_to_panel(&self, priority: Priority, text: &str) {
-        // The EFB keeps the same line at the same level (its banner and chip).
+    fn mirror_to_panel(
+        &self,
+        priority: Priority,
+        text: &str,
+        hazard: Option<crate::monitor::Severity>,
+    ) {
+        // The EFB's banner and chip are for HAZARDS only ([`Voice::hazard`]):
+        // the priority is how hard a line interrupts, not how bad it is.
         crate::efb::feed::note_alert(
-            match priority {
-                Priority::Warning => "warning",
-                Priority::Caution => "caution",
-                Priority::Advisory | Priority::Readback => "advisory",
+            match hazard {
+                Some(crate::monitor::Severity::Warning) => "warning",
+                Some(crate::monitor::Severity::Caution) => "caution",
+                _ => "advisory",
             },
             text,
         );
@@ -1691,7 +1717,7 @@ impl Voice {
             return;
         }
         let text = text.into();
-        self.mirror_to_panel(priority, &text);
+        self.mirror_to_panel(priority, &text, None);
         self.say(priority, text);
     }
 
