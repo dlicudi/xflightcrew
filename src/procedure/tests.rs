@@ -3029,3 +3029,16 @@
         assert!(apply_step_climbs(&mut bare, &nostage).is_empty());
         assert_eq!(alts(&bare), alts(&built));
     }
+
+/// A stood-down follower's tick, past its check when a door began another
+/// flight, stashes its missed approach for the flight it was launched in:
+/// the new flight's go-around never takes it (review 2026-10-06).
+#[test]
+fn a_missed_approach_stashed_by_the_last_flights_run_is_born_dead() {
+    let legs = vec![atc::nav::ProcLeg::default()];
+    let launched = super::MISSED_LEGS.now().wrapping_sub(1);
+    super::stash_missed_legs(launched, legs.clone());
+    assert!(super::take_missed_legs().is_none(), "a late stash flies no go-around");
+    super::stash_missed_legs(super::MISSED_LEGS.now(), legs);
+    assert_eq!(super::take_missed_legs().map(|l| l.len()), Some(1), "this flight's own is kept");
+}

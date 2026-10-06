@@ -495,11 +495,16 @@ pub fn take_missed_legs() -> Option<Vec<ProcLeg>> {
     MISSED_LEGS.take()
 }
 
-fn stash_missed_legs(legs: Vec<ProcLeg>) {
+/// Stash for the flight the follower was launched in (`flight`): a tick of a
+/// stood-down run, past its check when a door began another flight, stashes
+/// nothing for the new one.
+fn stash_missed_legs(flight: u64, legs: Vec<ProcLeg>) {
     if legs.is_empty() {
-        MISSED_LEGS.clear();
+        if flight == MISSED_LEGS.now() {
+            MISSED_LEGS.clear();
+        }
     } else {
-        MISSED_LEGS.set(legs);
+        MISSED_LEGS.set_in(flight, legs);
     }
 }
 
@@ -2876,6 +2881,8 @@ fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
 }
 
 async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Plan) {
+    // The flight this run was launched in: its stash is that flight's.
+    let flight = MISSED_LEGS.now();
     let Plan {
         name,
         mut legs,
@@ -4495,7 +4502,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     // The visual segment: its own angle to the landing, and
                     // the published missed approach for its go-around.
                     hand_down = crate::autoland::HandDown::visual_segment(visual_deg);
-                    stash_missed_legs(missed_legs.clone());
+                    stash_missed_legs(flight, missed_legs.clone());
                     alert(&voice, Priority::Advisory, "Missed approach point. Runway ahead, landing us.");
                 } else {
                     alert(&voice, Priority::Advisory, "At the fix. Landing us.");
