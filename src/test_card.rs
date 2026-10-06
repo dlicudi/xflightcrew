@@ -818,9 +818,16 @@ fn c_own_sid(log: &Log) -> Verdict {
     let (mut fails, mut oks) = (Vec::new(), Vec::new());
     for r in log.of("full_auto", "departure_rechosen") {
         let line = text(r.v, "line").unwrap_or("").to_string();
-        if log.next(r.t, "autotakeoff", "liftoff", 1800.0).is_some() {
+        let liftoff = log.next(r.t, "autotakeoff", "liftoff", 1800.0);
+        // A mission that ended on the ground before any takeoff never flew
+        // its departure: not judged (three gave-up taxis failed the card,
+        // 2026-10-05).
+        let ended_first = log
+            .next(r.t, "sortie", "end", 1800.0)
+            .is_some_and(|e| liftoff.is_none_or(|l| e.t < l.t));
+        if liftoff.is_some() && !ended_first {
             oks.push(format!("{}: {line}", hm(r.t)));
-        } else {
+        } else if !ended_first {
             fails.push(format!("{}: {line}, no liftoff followed", hm(r.t)));
         }
     }
@@ -855,6 +862,10 @@ fn c_plan_audit(log: &Log) -> Verdict {
                     oks.push(line);
                 }
             }
+            // A sortie file begins AT the arm, and the audit is written in the
+            // second before it: a log with nothing from before the begin cannot
+            // judge it (the card failed every sortie file, 2026-10-06).
+            None if !log.recs.first().is_some_and(|r| r.t < b.t - 1.0) => {}
             None if flag(b.v, "resume") != Some(true) => fails.push(format!(
                 "{} {route}: armed with no plan_audit record",
                 hm(b.t)
@@ -2832,6 +2843,30 @@ mod tests {
     }
 
     const T: f64 = 1_790_430_000.0; // 2026-09-26 13:40Z, after every S0926 up to E
+
+    /// A sortie file begins at the arm; the audit is written just before
+    /// it. Judged on the whole blackbox it is found; on the sortie file
+    /// alone it is not judged, never failed (2026-10-06).
+    #[test]
+    fn plan_audit_is_not_failed_on_a_log_that_begins_at_the_arm() {
+        let begin = json!({"kind":"sortie","event":"begin","origin":"LXGB","dest":"EGKK","resume":false,"t":T});
+        let audit = json!({"kind":"plan_audit","findings":[],"t":T-1.5});
+        let early = json!({"kind":"state","t":T-60.0});
+        assert!(matches!(judged("plan_audit", &[begin.clone()]), Verdict::NotExercised));
+        assert!(matches!(judged("plan_audit", &[early.clone(), audit, begin.clone()]), Verdict::Verified(_)));
+        assert!(matches!(judged("plan_audit", &[early, begin]), Verdict::Failed(_)));
+    }
+
+    /// A mission that gave up in the taxi never flew its departure.
+    #[test]
+    fn own_sid_is_not_failed_by_a_mission_that_never_took_off() {
+        let chosen = json!({"kind":"full_auto","stage":"departure_rechosen","detail":{"line":"Cleared via LGL2U."},"t":T});
+        let end = json!({"kind":"sortie","event":"end","outcome":"gave_up","t":T+300.0});
+        let lift = json!({"kind":"autotakeoff","event":"liftoff","t":T+400.0});
+        assert!(matches!(judged("own_sid", &[chosen.clone(), end]), Verdict::NotExercised));
+        assert!(matches!(judged("own_sid", &[chosen.clone(), lift]), Verdict::Verified(_)));
+        assert!(matches!(judged("own_sid", &[chosen]), Verdict::Failed(_)));
+    }
 
     /// Issue #64: the tower's end outranks the crew's pick. A landing on it
     /// passes when the one arrival runway moved by clearance; a landing on
