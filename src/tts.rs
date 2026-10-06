@@ -306,11 +306,11 @@ static BUS_IDS: [std::sync::atomic::AtomicI64; 2] = [
 
 /// Where the sim's Web API is, for the bus writes, and the environment's
 /// verdict. Called once at startup.
-pub fn configure_audio_bus(enabled: bool, base_url: &str) {
+pub fn configure_audio_bus(enabled: bool, pinned: bool, base_url: &str) {
     *BUS_BASE_URL.lock().unwrap_or_else(|e| e.into_inner()) =
         base_url.trim_end_matches('/').to_string();
     AUDIO_BUS.store(enabled, std::sync::atomic::Ordering::Relaxed);
-    AUDIO_BUS_PINNED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    AUDIO_BUS_PINNED.store(pinned, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// What the sim's own radio audio should be, given whether OUR stations own
@@ -340,8 +340,10 @@ pub fn sim_radio(own_atc: bool, bus: bool) -> SimRadio {
 
 /// The panel's pick. Refused (false) when the environment pinned it on.
 pub fn set_audio_bus(on: bool) -> bool {
+    // Pinned by the environment, either way: the registry's rule for every
+    // env-pinned knob.
     if AUDIO_BUS_PINNED.load(std::sync::atomic::Ordering::Relaxed) {
-        return on;
+        return false;
     }
     AUDIO_BUS.store(on, std::sync::atomic::Ordering::Relaxed);
     true

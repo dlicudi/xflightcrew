@@ -697,6 +697,21 @@ pub const ALL: &[Setting] = &[
         },
     },
     Setting {
+        key: "audio_bus",
+        env: "XCOPILOT_AUDIO_BUS",
+        label: "voices through X-Plane audio",
+        help: "play the crew and ATC through the sim's own audio (the plugin's bus) instead of the Mac's output",
+        kind: Kind::Bool,
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || Value::Bool(crate::tts::AUDIO_BUS.load(std::sync::atomic::Ordering::Relaxed)),
+        apply: |v| {
+            let Some(b) = v.as_bool() else { return false };
+            update(|c| c.audio_bus = b);
+            crate::tts::set_audio_bus(b)
+        },
+    },
+    Setting {
         key: "efb",
         env: "XCOPILOT_EFB",
         label: "EFB",
@@ -951,6 +966,29 @@ mod tests {
         assert!(err.contains("XCOPILOT_TAXI_GUIDE"), "{err}");
         unsafe { std::env::remove_var(s.env) };
         assert!(!s.env_pinned());
+    }
+
+    /// #228: the "voices through X-Plane audio" pick was applied from the
+    /// panel and never saved. It is a registry setting now: a saved pick is
+    /// applied at startup, and the environment still pins it.
+    #[test]
+    fn the_audio_bus_pick_survives_a_restart() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let s = ALL.iter().find(|s| s.key == "audio_bus").expect("declared");
+        unsafe { std::env::remove_var(s.env) };
+        crate::tts::configure_audio_bus(false, false, "http://127.0.0.1:8086");
+        assert!(apply_saved(s, Some("on")) || apply_saved(s, Some("true")), "a saved pick applies");
+        assert_eq!(s.value(), Value::Bool(true));
+        assert!(live().audio_bus);
+        // Pinned by the environment: the saved pick and a new one are refused.
+        // SAFETY: the lock above serialises every env-mutating test.
+        unsafe { std::env::set_var(s.env, "false") };
+        crate::tts::configure_audio_bus(false, true, "http://127.0.0.1:8086");
+        assert!(!apply_saved(s, Some("on")));
+        assert!(set("audio_bus", &Value::Bool(true)).is_err());
+        assert_eq!(s.value(), Value::Bool(false));
+        unsafe { std::env::remove_var(s.env) };
+        crate::tts::configure_audio_bus(false, false, "http://127.0.0.1:8086");
     }
 
     fn text_setting(key: &str) -> &'static Setting {

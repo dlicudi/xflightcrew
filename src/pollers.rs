@@ -479,12 +479,13 @@ pub(crate) fn spawn_settings_poller(base_url: String) {
             published: None,
             current: || tts::AUDIO_BUS.load(std::sync::atomic::Ordering::Relaxed) as i64,
             apply: |v| {
-                // Pinned on by XCOPILOT_AUDIO_BUS: the pick is refused and
-                // the poller republishes the truth, so the box snaps back.
-                if !tts::set_audio_bus(v > 0) {
-                    tracing::info!("audio bus pinned on by XCOPILOT_AUDIO_BUS; panel pick ignored");
-                } else {
-                    tracing::info!(audio_bus = v > 0, "panel audio bus pick");
+                // Through the registry, so the pick is saved (#228: it was
+                // applied and never persisted). Pinned by XCOPILOT_AUDIO_BUS:
+                // refused, and the poller republishes the truth, so the box
+                // snaps back.
+                match crate::settings::set("audio_bus", &crate::settings::Value::Bool(v > 0)) {
+                    Ok(()) => tracing::info!(audio_bus = v > 0, "panel audio bus pick"),
+                    Err(e) => tracing::info!("audio bus panel pick refused: {e}"),
                 }
             },
         },

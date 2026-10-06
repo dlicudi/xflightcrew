@@ -470,9 +470,13 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("unknown aircraft profile: {aircraft_id}"))?,
     };
 
-    // Voices through the sim's audio: the boot value from the environment; the
-    // panel's Settings switch (xcopilot/opt/audio_bus) turns it on live.
-    tts::configure_audio_bus(config.audio_bus, &config.xplane_base_url);
+    // Voices through the sim's audio: the `audio_bus` setting, the saved pick
+    // already applied by `settings::install`; the environment pins it (#228).
+    tts::configure_audio_bus(
+        config.audio_bus,
+        std::env::var("XCOPILOT_AUDIO_BUS").is_ok(),
+        &config.xplane_base_url,
+    );
     tracing::info!(
         aircraft = %profile.display_name,
         mode = %config.listen_mode,
