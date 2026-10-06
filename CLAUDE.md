@@ -632,16 +632,28 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   controller line, the METAR file); `efb::feed` taps the speakers, the command loop and the monitor's
   tick as they already run. A fact nobody holds is a dash. The plan check and preflight are kept in
   flight-scoped cells (`feed::AUDIT`, `PREFLIGHT`).
-- **v2 pages**: Settings is the registry through `settings::set` (pinned and the EFB's own link
-  read-only, mode and EFB-off confirmed, server-checked); alerts are tapped where the voice mirrors
-  to the panel (`feed::note_alert`, flight-scoped; a warning banner acknowledged on the page only);
-  Checklist reads `flow::sheet`, a record nothing reads back. **The EFB's PTT is a heartbeat**
-  (`efb::ptt`): held only while beats are fresh (600 ms), capped at 60 s, OR'd into the intercom key.
-- **The Airport page** (`efb::airport`): apt.dat through the nav crate's parsers, built once per
-  field in a LOCAL metric frame (`Frame`, east/north metres) and served as `GET /airport` with its
-  version as the ETag; the live overlay (tick position, `party_line` taxi route, the guide's
-  `TurnCard` via `feed::note_turn_card`, the cleared runway) is one pure `airport::page`. The field
-  is `airport::wanted_field`: destination airborne, the field we are at on the ground.
+- **Four tabs** (v3, `docs/tasks/efb-v3/mockup.html`): Flight, Map, Plan, Radio, Settings behind
+  the gear; MY CONTROLS, HOLD TO TALK and the phase's ONE suggested action (a `PHRASES` entry) in
+  a fixed bar. **The Flight tab is laid out by the flight model's phase**
+  (`efb::flight_tab::layout_for`, `each_phase_has_its_layout`): a readout with no source is
+  dropped, never filled. The running checklist (`flow::sheet`) is a card on it in any phase.
+- **The transcript is labelled FROM -> TO by one pure rule** (`efb::transcript::label`): our
+  transmissions by OUR CALLSIGN ("by copilot" when the crew keyed), a controller to the callsign
+  it opens with, the cabin address, the party line dimmed. The taps carry what it needs from
+  their call sites (the voice's `overheard`, the drain's readback flag, COM1's position, the
+  follower's LNAV via `feed::note_lateral`). The sim panel rows get the same label on
+  `xcopilot/status/fromto` (`panel_label`), skipped for a plugin without it.
+- Settings is the registry through `settings::set` (pinned and the EFB's own link read-only, mode
+  and EFB-off confirmed, server-checked); alerts are tapped where the voice mirrors to the panel
+  (`feed::note_alert`, flight-scoped; a warning banner acknowledged on the page only). **The
+  EFB's PTT is a heartbeat** (`efb::ptt`): held only while beats are fresh (600 ms), capped at
+  60 s, OR'd into the intercom key.
+- **The Map tab** is the airport on the ground or near the drawn field (`efb::airport`): apt.dat
+  through the nav crate's parsers, built once per field in a LOCAL metric frame (`Frame`,
+  east/north metres) and served as `GET /airport` with its version as the ETag; the live overlay
+  (tick position, `party_line` taxi route, the guide's `TurnCard` via `feed::note_turn_card`, the
+  cleared runway) is one pure `airport::page`. The field is `airport::wanted_field`: destination
+  airborne, the field we are at on the ground. Away from it, the route (`efb::route_map`).
 - Off by default (`XCOPILOT_EFB`, `_PORT`, `_TOKEN`; the registry's `efb*`); every request needs
   the token, a wrong one is a 403 blackboxed `efb` `auth_failed`; one line per 500 ms. Its own
   thread and runtime, never the command loop's; no lock held across an await.

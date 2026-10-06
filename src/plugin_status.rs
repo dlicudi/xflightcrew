@@ -34,6 +34,10 @@ const DR_BRIEF: &str = "xcopilot/status/brief";
 const DR_STATE: &str = "xcopilot/status/state";
 const DR_TAXI: &str = "xcopilot/status/taxi";
 const DR_CALLSIGN: &str = "xcopilot/status/callsign";
+/// The next transcript row's "FROM > TO" label, written just before the
+/// heard or action line it labels (`efb::transcript::panel_label`). A plugin
+/// without it never resolves the id, and the label is simply not sent.
+const DR_FROMTO: &str = "xcopilot/status/fromto";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
@@ -84,6 +88,8 @@ enum Update {
     /// The Settings tab's resolved callsign, "spoken|source"
     /// (`atc::callsign::resolve`; source override, simbrief or tail).
     Callsign(String),
+    /// The next transcript row's "FROM > TO" label.
+    FromTo(String),
 }
 
 /// Severity of a panel alert — drives the chip colour/label in the plugin.
@@ -126,11 +132,34 @@ impl StatusSink {
     pub fn phase(&self, code: u8) {
         let _ = self.0.send(Update::Phase(code));
     }
-    pub fn heard(&self, text: &str) {
+    /// The pilot's heard line (`radio`: keyed on the radio), labelled
+    /// "YOU > COPILOT" or our callsign to the station.
+    pub fn heard(&self, text: &str, radio: bool) {
+        let tag = radio.then(crate::efb::feed::tuned_tag).flatten();
+        self.label(text, crate::efb::transcript::Panel::Pilot { radio, tag });
         let _ = self.0.send(Update::Heard(clip(text)));
     }
     pub fn action(&self, text: &str) {
+        let kind = if crate::efb::feed::crew_radio_pending(text) {
+            crate::efb::transcript::Panel::CrewRadio {
+                tag: crate::efb::feed::tuned_tag(),
+            }
+        } else {
+            crate::efb::transcript::Panel::Feed
+        };
+        self.label(text, kind);
         let _ = self.0.send(Update::Action(clip(text)));
+    }
+    /// The transcript row's "FROM > TO", sent just before the row (the
+    /// same writer, in order), by the EFB's own labelling rules.
+    fn label(&self, text: &str, kind: crate::efb::transcript::Panel) {
+        let (spoken, written) = crate::efb::transcript::ours();
+        let ctx = crate::efb::transcript::Ctx {
+            spoken: spoken.as_deref(),
+            written: written.as_deref(),
+        };
+        let label = crate::efb::transcript::panel_label(text, kind, &ctx);
+        let _ = self.0.send(Update::FromTo(clip(&label)));
     }
     pub fn alert(&self, level: AlertLevel, text: &str) {
         let _ = self.0.send(Update::Alert(level, clip(text)));
@@ -239,6 +268,7 @@ enum Slot {
     State,
     Taxi,
     Callsign,
+    FromTo,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -261,6 +291,7 @@ struct Ids {
     state: Option<i64>,
     taxi: Option<i64>,
     callsign: Option<i64>,
+    fromto: Option<i64>,
 }
 
 impl Ids {
@@ -282,6 +313,7 @@ impl Ids {
             Slot::State => self.state,
             Slot::Taxi => self.taxi,
             Slot::Callsign => self.callsign,
+            Slot::FromTo => self.fromto,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -310,6 +342,7 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         state: resolve_id(http, rest, DR_STATE),
         taxi: resolve_id(http, rest, DR_TAXI),
         callsign: resolve_id(http, rest, DR_CALLSIGN),
+        fromto: resolve_id(http, rest, DR_FROMTO),
     }
 }
 
@@ -422,7 +455,13 @@ fn run(base: String, rx: Receiver<Update>) {
                 Update::State(text) => (Slot::State, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Taxi(text) => (Slot::Taxi, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Callsign(text) => (Slot::Callsign, json!(STANDARD.encode(text.as_bytes()))),
+                Update::FromTo(text) => (Slot::FromTo, json!(STANDARD.encode(text.as_bytes()))),
             };
+            // A plugin older than the label never registered it: nothing to
+            // send, and nothing wrong with the link.
+            if slot == Slot::FromTo && ids.fromto.is_none() {
+                continue;
+            }
             if crate::xplane::sim_loading() {
                 // A flight is loading: keep the newest per slot for after.
                 match held.iter_mut().find(|(s, _)| *s == slot) {

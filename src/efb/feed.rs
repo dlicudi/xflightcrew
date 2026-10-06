@@ -41,8 +41,17 @@ pub(crate) struct Line {
     /// Said on the frequency (a controller, traffic, the crew's or the
     /// pilot's transmission) rather than the intercom.
     pub(crate) radio: bool,
-    /// The station position's tag ("TWR", "APP"), for a station line.
+    /// The station position's tag ("TWR", "APP"): the speaker of a station
+    /// line, the position COM1 was on for our own transmission.
     pub(crate) tag: Option<&'static str>,
+    /// COM1 (kHz) as the runway watch last read it, for a radio line: the
+    /// Radio page groups the log under its frequency.
+    pub(crate) khz: Option<i64>,
+    /// A party-line exchange not addressed to us (the voice's `overheard`).
+    pub(crate) overheard: bool,
+    /// The crew's transmission was a readback (the radio drain's
+    /// `queued_readback`).
+    pub(crate) readback: bool,
 }
 
 /// Lines kept: the Now page shows eight, the Radio page's log the rest.
@@ -51,10 +60,20 @@ const LINES_MAX: usize = 80;
 /// The conversation, oldest first (session: a log of what was said).
 static LINES: Mutex<VecDeque<Line>> = Mutex::new(VecDeque::new());
 
-/// Crew transmissions handed to the intercom speaker but not yet started:
-/// the crew's radio calls are spoken by the copilot's own voice, so the
-/// speaker thread cannot tell them from intercom lines by itself.
-static RADIO_PENDING: Mutex<Vec<(Instant, String)>> = Mutex::new(Vec::new());
+/// Crew transmissions handed to the intercom speaker but not yet started
+/// (with whether each is a readback): the crew's radio calls are spoken by
+/// the copilot's own voice, so the speaker thread cannot tell them from
+/// intercom lines by itself.
+static RADIO_PENDING: Mutex<Vec<(Instant, String, bool)>> = Mutex::new(Vec::new());
+
+/// COM1 now and the position it is on, for a radio line's frequency header.
+fn tuned_now() -> (Option<i64>, Option<&'static str>) {
+    let khz = com1();
+    (
+        khz,
+        khz.and_then(crate::station::tuned_station).map(|s| s.tag()),
+    )
+}
 
 fn now_unix() -> f64 {
     SystemTime::now()
@@ -77,51 +96,95 @@ fn push(line: Line) {
 /// The pilot's line, as the command loop took it (`radio`: keyed on the
 /// radio PTT).
 pub(crate) fn note_pilot(text: &str, radio: bool) {
+    let (khz, tag) = if radio { tuned_now() } else { (None, None) };
     push(Line {
         t: now_unix(),
         who: Who::Pilot,
         text: crate::phrase::scrub_dashes(text.trim()),
         radio,
-        tag: None,
+        tag,
+        khz,
+        overheard: false,
+        readback: false,
     });
+}
+
+/// The station took the pilot's last line as a radio call (an unkeyed
+/// call the content router handed to the tower): it went out on the
+/// frequency, not the intercom.
+pub(crate) fn pilot_line_was_radio() {
+    let (khz, tag) = tuned_now();
+    let mut l = LINES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(last) = l.iter_mut().rev().find(|x| x.who == Who::Pilot) {
+        if !last.radio {
+            last.radio = true;
+            last.khz = khz;
+            last.tag = tag;
+        }
+    }
 }
 
 /// The crew is about to key the radio with these words (the crew radio
 /// drain, before `say`): the intercom speaker marks the line as radio when
 /// it starts.
-pub(crate) fn crew_transmits(text: &str) {
+pub(crate) fn crew_transmits(text: &str, readback: bool) {
     let mut p = RADIO_PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    p.retain(|(at, _)| at.elapsed() < Duration::from_secs(120));
+    p.retain(|(at, _, _)| at.elapsed() < Duration::from_secs(120));
     p.push((
         Instant::now(),
         crate::phrase::scrub_dashes(text.trim()).trim().to_string(),
+        readback,
     ));
+}
+
+/// Is this line a crew transmission handed to the speaker and not yet
+/// started? (The panel's transcript labels it as ours on the radio.)
+pub(crate) fn crew_radio_pending(text: &str) -> bool {
+    let text = crate::phrase::scrub_dashes(text.trim());
+    let text = text.trim();
+    RADIO_PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(_, t, _)| t == text)
+}
+
+/// COM1's position now ("TWR"), for a label of a line keyed on it.
+pub(crate) fn tuned_tag() -> Option<&'static str> {
+    tuned_now().1
 }
 
 /// An intercom line started playing (the copilot or the cabin).
 pub(crate) fn note_intercom(text: &str, cabin: bool) {
     let text = text.trim();
-    let radio = !cabin && {
+    let sent = if cabin {
+        None
+    } else {
         let mut p = RADIO_PENDING.lock().unwrap_or_else(|e| e.into_inner());
-        match p.iter().position(|(_, t)| t == text) {
-            Some(i) => {
-                p.remove(i);
-                true
-            }
-            None => false,
-        }
+        p.iter()
+            .position(|(_, t, _)| t == text)
+            .map(|i| p.remove(i).2)
+    };
+    let (khz, tag) = if sent.is_some() {
+        tuned_now()
+    } else {
+        (None, None)
     };
     push(Line {
         t: now_unix(),
         who: if cabin { Who::Cabin } else { Who::Crew },
         text: text.to_string(),
-        radio,
-        tag: None,
+        radio: sent.is_some(),
+        tag,
+        khz,
+        overheard: false,
+        readback: sent.unwrap_or(false),
     });
 }
 
-/// A station line started playing on the radio.
-pub(crate) fn note_station(text: &str, speaker: crate::voice::StationSpeaker) {
+/// A station line started playing on the radio (`overheard`: a party-line
+/// exchange not addressed to us).
+pub(crate) fn note_station(text: &str, speaker: crate::voice::StationSpeaker, overheard: bool) {
     use crate::voice::StationSpeaker as S;
     let who = match speaker {
         S::Tower | S::Approach | S::Departure => Who::Atc,
@@ -134,6 +197,9 @@ pub(crate) fn note_station(text: &str, speaker: crate::voice::StationSpeaker) {
         text: text.trim().to_string(),
         radio: true,
         tag: Some(speaker.tag()),
+        khz: com1(),
+        overheard,
+        readback: false,
     });
 }
 
@@ -203,6 +269,26 @@ pub(crate) fn turn_card() -> Option<crate::efb::airport::CardFacts> {
         .as_ref()
         .filter(|(at, _)| at.elapsed() < TICK_FRESH)
         .and_then(|(_, c)| c.clone())
+}
+
+/// Who has the lateral while the follower flies, as its loop last decided:
+/// `true` while the aircraft's LNAV flies the leg (`LnavLateral::owns_lateral`),
+/// `false` while the follower's heading bug does. Its own expiry: the loop
+/// gone, nobody's lateral is shown.
+static LATERAL: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+
+pub(crate) fn note_lateral(lnav_owns: bool) {
+    *LATERAL.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), lnav_owns));
+}
+
+/// `Some(true)`: LNAV flies; `Some(false)`: the follower's bug; `None`: no
+/// follower ticked lately.
+pub(crate) fn lateral() -> Option<bool> {
+    LATERAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|(at, _)| at.elapsed() < TICK_FRESH)
+        .map(|(_, v)| v)
 }
 
 /// COM1 as the runway watch read it (kHz), with its own expiry.
@@ -392,7 +478,7 @@ mod tests {
     #[test]
     fn a_crew_transmission_is_marked_radio_once() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        crew_transmits("Gatwick Tower, XVL214, ready.");
+        crew_transmits("Gatwick Tower, XVL214, ready.", true);
         note_intercom("Gatwick Tower, XVL214, ready.", false);
         note_intercom("Gatwick Tower, XVL214, ready.", false);
         let l = lines();
@@ -403,6 +489,7 @@ mod tests {
         assert!(mine.len() >= 2);
         let last_two = &mine[mine.len() - 2..];
         assert!(last_two[0].radio, "the transmission");
+        assert!(last_two[0].readback, "a readback, as the drain said");
         assert!(!last_two[1].radio, "the same words again are the intercom");
     }
 

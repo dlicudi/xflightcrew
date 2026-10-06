@@ -56,6 +56,9 @@ struct LogEntry {
     // Overheard, not addressed to this aircraft (the party line's ghost
     // exchanges) — rendered dim so calls with our name on them stay bright.
     bool ambient;
+    // Who to whom, as the app labelled it ("WAT519 > TOWER"); empty from an
+    // app that sends none. The chip then names the FROM, the text the TO.
+    std::string route;
 };
 static std::vector<LogEntry> g_log;
 static bool g_log_scroll = false;
@@ -72,14 +75,14 @@ static bool g_flt_others = true;
 static bool g_log_unseen = false;
 
 static void AppendLog(const char* tag, ImU32 color, const char* text,
-                      bool ambient = false) {
+                      bool ambient = false, const char* route = nullptr) {
     if (text == nullptr || text[0] == '\0') return;
     char ts[16] = {0};
     time_t now = time(nullptr);
     struct tm lt;
     localtime_r(&now, &lt);
     strftime(ts, sizeof ts, "%H:%M:%S", &lt);
-    g_log.push_back({ts, tag, color, text, ambient});
+    g_log.push_back({ts, tag, color, text, ambient, route ? route : ""});
     if (g_log.size() > 200) g_log.erase(g_log.begin());
     if (g_log_autoscroll) g_log_scroll = true;
     g_log_unseen = true;
@@ -855,7 +858,19 @@ protected:
         // reads as a transcript, not a ragged debug feed.
         const float pad = 8.0f;
         const float kTimeW = ImGui::CalcTextSize("88:88:88").x + pad;
-        const float kTagW = ImGui::CalcTextSize("COPILOT").x + 14.0f; // widest tag
+        // The widest chip: the tags, or a row's FROM (a callsign, a position),
+        // capped so a long callsign never squeezes the text out.
+        float tagMax = ImGui::CalcTextSize("COPILOT").x;
+        const float tagCap = ImGui::CalcTextSize("DEPARTURE").x;
+        for (const LogEntry& e : g_log) {
+            if (e.route.empty()) continue;
+            const size_t gt = e.route.find(" > ");
+            const std::string from = e.route.substr(0, gt);
+            float w = ImGui::CalcTextSize(from.c_str()).x;
+            if (w > tagCap) w = tagCap;
+            if (w > tagMax) tagMax = w;
+        }
+        const float kTagW = tagMax + 14.0f;
         // The coach's suggested next call pins BELOW the well, a footer strip
         // that never scrolls away with the transcript (it lived as a ghost
         // row inside the log until 2026-07-13, where a busy frequency kept
@@ -908,8 +923,20 @@ protected:
             const ImU32 col = e.ambient ? COL_DIM : e.color;
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", e.time.c_str());
             ImGui::SameLine(kTimeW + pad);
-            TagChip(e.tag.c_str(), col, kTagW);
+            // FROM on the chip, "> TO" leading the text, dim: who said it to
+            // whom. A row without a route keeps its tag (an older app).
+            std::string chip = e.tag, to;
+            if (!e.route.empty()) {
+                const size_t gt = e.route.find(" > ");
+                chip = e.route.substr(0, gt);
+                if (gt != std::string::npos) to = "> " + e.route.substr(gt + 3);
+            }
+            TagChip(chip.c_str(), col, kTagW);
             ImGui::SameLine(kTimeW + kTagW + pad * 2);
+            if (!to.empty()) {
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", to.c_str());
+                ImGui::SameLine();
+            }
             // Wrap long readbacks at the panel edge instead of running off it.
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
             ImGui::PushTextWrapPos(0.0f);
@@ -1694,8 +1721,9 @@ void destroy() {
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
 }
 
-void append_log(const char* tag, ImU32 color, const char* text, bool ambient) {
-    AppendLog(tag, color, text, ambient);
+void append_log(const char* tag, ImU32 color, const char* text, bool ambient,
+                const char* route) {
+    AppendLog(tag, color, text, ambient, route);
 }
 
 } // namespace panel

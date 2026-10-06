@@ -142,6 +142,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/status/callout",
     "xcopilot/status/callsign",
     "xcopilot/status/coach",
+    "xcopilot/status/fromto",
     "xcopilot/status/heard",
     "xcopilot/status/loadsheet",
     "xcopilot/status/phase",

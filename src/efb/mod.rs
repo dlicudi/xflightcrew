@@ -21,8 +21,11 @@
 
 pub(crate) mod airport;
 pub(crate) mod feed;
+pub(crate) mod flight_tab;
 pub(crate) mod ptt;
+pub(crate) mod route_map;
 pub(crate) mod state;
+pub(crate) mod transcript;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -394,6 +397,24 @@ fn gather(server: &Server) -> state::Facts {
         })
         .collect();
     drop(metar);
+    let (callsign, callsign_written) = transcript::ours();
+    // The one takeoff rule at the plan's takeoff weight, and the one landing
+    // rule's book figure: arithmetic over the profile, never a read.
+    let reference = profile.as_ref().and_then(|p| p.reference.clone());
+    let takeoff_need_m = profile.as_ref().and_then(|p| {
+        let (roll, mtow) = crate::aircraft::profile_takeoff_roll(p);
+        roll?;
+        let tow = plan
+            .as_ref()
+            .and_then(|p| p.weights.as_ref())
+            .map(|w| w.est_tow_kg)
+            .filter(|w| *w > 0.0);
+        Some(crate::aircraft::takeoff_needed_m(roll, tow, mtow, 500.0))
+    });
+    let landing_need_m = reference.as_ref().and_then(|r| {
+        crate::aircraft::planned_landing_needed_ft(r.landing_distance_ft, r.takeoff_distance_ft)
+            .map(|ft| ft * 0.3048)
+    });
     state::Facts {
         now_t: now_unix(),
         flight: crate::flight::published(),
@@ -401,7 +422,11 @@ fn gather(server: &Server) -> state::Facts {
         mission: crate::flight_state::crew_mission().map(|o| o.name()),
         auto: crate::auto_status::compose(),
         tick,
-        callsign: feed::callsign(),
+        callsign,
+        callsign_written,
+        lateral: feed::lateral(),
+        takeoff_need_m,
+        landing_need_m,
         aircraft_type: profile
             .as_ref()
             .and_then(|p| p.matcher.as_ref())
@@ -1172,6 +1197,17 @@ mod tests {
         assert!(PAGE.contains("viewport-fit=cover"));
         assert!(!PAGE.contains('\u{2014}') && !PAGE.contains('\u{2013}'));
         assert!(PAGE.contains("<script src=\"/diagram.js\"></script>"));
+        for tab in ["flight", "map", "plan", "radio"] {
+            assert!(
+                PAGE.contains(&format!("data-tab=\"{tab}\"")),
+                "the {tab} tab"
+            );
+        }
+        assert!(
+            PAGE.contains("id=\"t-settings\""),
+            "settings behind the gear"
+        );
+        assert!(!PAGE.contains("more-sheet"), "four tabs, no More sheet");
         assert!(DIAGRAM_JS.contains("window.XvlDiagram"));
         assert!(!DIAGRAM_JS.contains('\u{2014}') && !DIAGRAM_JS.contains('\u{2013}'));
         assert!(!DIAGRAM_JS.contains("http"), "no tile, no CDN: this server only");
@@ -1228,6 +1264,12 @@ mod tests {
             assert_eq!(r.status(), 200);
             let v: serde_json::Value = r.json().await.unwrap();
             assert_eq!(v["my_controls"]["say"], "my controls");
+            assert_eq!(
+                v["flight"]["layout"], "parked",
+                "no flight model: the ramp's layout"
+            );
+            assert!(v["transcript"].is_array());
+            assert!(v["map"]["mode"].is_string());
             let say = |text: &str| {
                 http.post(format!("{base}/say?t=testtoken0123456"))
                     .json(&serde_json::json!({ "text": text }))

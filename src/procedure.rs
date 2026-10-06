@@ -3796,6 +3796,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             && !holding
             && !final_join.flying_pattern()
             && crate::lnav::leg_flyable(leg);
+        // The EFB's "who has the lateral": a tap on the follower's own
+        // decision, never a read.
+        crate::efb::feed::note_lateral(lnav.owns_lateral());
         if lnav_on && !lnav.retired() && (lnav_eligible || lnav.in_play()) {
             let now_s = started.elapsed().as_secs_f64();
             let (fms_r, xtk_r, engaged) = tokio::join!(
