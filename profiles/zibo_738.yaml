@@ -222,8 +222,8 @@ boeing_start:
   # After both are stable (BEFORE TAXI): generators on, packs AUTO, APU
   # bleed off. The APU itself is left running for the pilot.
   post_start_steps:
-    - { command: laminar/B738/toggle_switch/gen1_dn, position: "sim/cockpit/electrical/generator_on[0]", want: 1 }
-    - { command: laminar/B738/toggle_switch/gen2_dn, position: "sim/cockpit/electrical/generator_on[1]", want: 1, say: "Generators on." }
+    - { command: laminar/B738/toggle_switch/gen1_dn, held_secs: 1.0, position: "sim/cockpit/electrical/generator_on[0]", want: 1 }
+    - { command: laminar/B738/toggle_switch/gen2_dn, held_secs: 1.0, position: "sim/cockpit/electrical/generator_on[1]", want: 1, say: "Generators on." }
     - { command: laminar/B738/toggle_switch/l_pack_dn, down_command: laminar/B738/toggle_switch/l_pack_up, position: laminar/B738/air/l_pack_pos, want: 1 }
     - { command: laminar/B738/toggle_switch/r_pack_dn, down_command: laminar/B738/toggle_switch/r_pack_up, position: laminar/B738/air/r_pack_pos, want: 1, say: "Packs auto." }
     - { command: laminar/B738/toggle_switch/bleed_air_apu, position: laminar/B738/toggle_switch/bleed_air_apu_pos, want: 0, say: "A.P.U. bleed off." }
