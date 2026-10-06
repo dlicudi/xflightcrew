@@ -666,18 +666,24 @@ fn parse_waypoints(v: &Value) -> Vec<Waypoint> {
     out
 }
 
-/// The plugin's `xcopilot/fms/route` mailbox is a `TextRef`: 512 bytes, and a
-/// longer write is truncated at 511 — mid-entry, silently. So the GPS route is
-/// thinned to fit, and thinned in the MIDDLE: the origin and the destination
+/// The plugin's `xcopilot/fms/route` mailbox is a `TextRef`: 2,048 bytes
+/// since 2026-09-25 (`plugin/src/common.h`), and a longer write is truncated
+/// at 2,047, mid-entry, silently. So a route too long for it is thinned to
+/// fit, and thinned in the MIDDLE: the origin and the destination
 /// are the two points that must survive, because they are what fills the CDU's
 /// ORIGIN/DEST and what the whole-plan load needs to read as a flight. Dropping
 /// from the end instead is what cost the EGPH arrival its last hundred miles.
 ///
-/// A thinned GPS route costs the crew nothing: the follower flies the PLAN's
-/// own fixes, and `xcopilot/fms/goto` moves the pointer for the idents the
-/// loaded plan does hold — an ident it lacks changes nothing on the plugin side.
+/// A thinned route is NOT free once LNAV flies the FMS: the app kept the old
+/// 511-byte cap after the plugin grew, and a 28-fix LXGB-EGKK plan lost
+/// YURZI, ERIGA and ARTIV, so the 737's LNAV flew NENEM direct REVTU and
+/// `xcopilot/fms/goto` could not find them (probed 2026-10-06). The cap is
+/// the mailbox's own now; about 80 fixes fit before anything is thinned.
+/// The longest route payload the plugin's mailbox holds whole.
+pub const FMS_ROUTE_MAILBOX_BYTES: usize = 2047;
+
 pub fn fms_route_payload(waypoints: &[Waypoint]) -> String {
-    const FMS_ROUTE_MAX_BYTES: usize = 511;
+    const FMS_ROUTE_MAX_BYTES: usize = FMS_ROUTE_MAILBOX_BYTES;
     let entry =
         |w: &Waypoint| format!("{},{:.4},{:.4},{}", fms_ident(&w.ident), w.lat, w.lon, w.alt as i64);
     let join = |ws: &[&Waypoint]| ws.iter().map(|w| entry(w)).collect::<Vec<_>>().join("|");
@@ -962,14 +968,14 @@ mod tests {
         assert!(!ws.iter().any(|w| w.ident == "TOC" || w.ident == "TOD"));
     }
 
-    /// The plugin's mailbox is 512 bytes and truncates at 511 mid-entry. The
+    /// The plugin's mailbox truncates at 2,047 bytes mid-entry. The
     /// route is thinned to fit — from the MIDDLE, so both ends of the flight
     /// survive, which is the whole point of loading a plan at all.
     #[test]
     fn a_long_route_is_thinned_in_the_middle_to_fit_the_mailbox() {
-        let ws = parse_waypoints(&navlog(40));
+        let ws = parse_waypoints(&navlog(120));
         let payload = fms_route_payload(&ws);
-        assert!(payload.len() <= 511, "{} bytes", payload.len());
+        assert!(payload.len() <= FMS_ROUTE_MAILBOX_BYTES, "{} bytes", payload.len());
         let entries: Vec<&str> = payload.split('|').collect();
         assert!(entries.len() > 2, "not thinned to nothing: {entries:?}");
         assert!(entries[0].starts_with("FIX00,"), "{}", entries[0]);
@@ -981,7 +987,7 @@ mod tests {
     }
 
     /// Nothing in the tree builds an FMS route entry by hand. The mailbox
-    /// rule — thin from the middle, cap at 511 — lives in
+    /// rule — thin from the middle, cap at the mailbox — lives in
     /// [`fms_route_payload`] and nowhere else, so a caller cannot reach the
     /// plugin with a payload that has never met it.
     ///
@@ -1028,12 +1034,23 @@ mod tests {
         assert!(files.len() > 10, "the walk found the tree: {}", files.len());
     }
 
+    /// LXGB-EGKK, 2026-10-06: 28 fixes lost three in the middle to the old
+    /// 511-byte cap; a route that size, and up to 60 fixes, now goes whole.
+    #[test]
+    fn a_continental_route_is_sent_whole() {
+        for n in [28, 60] {
+            let ws = parse_waypoints(&navlog(n));
+            let payload = fms_route_payload(&ws);
+            assert_eq!(payload.split('|').count(), ws.len(), "{n} fixes");
+        }
+    }
+
     /// A route that already fits is sent whole — every fix, in order.
     #[test]
     fn a_short_route_keeps_every_fix() {
         let ws = parse_waypoints(&navlog(8));
         let payload = fms_route_payload(&ws);
-        assert!(payload.len() <= 511, "{} bytes", payload.len());
+        assert!(payload.len() <= FMS_ROUTE_MAILBOX_BYTES, "{} bytes", payload.len());
         assert_eq!(payload.split('|').count(), ws.len());
         assert!(
             payload.starts_with("FIX00,51.5000,-2.5000,32000|"),
