@@ -62,6 +62,7 @@ mod hover;
 mod instructor;
 mod interaction;
 mod livestate;
+mod lnav;
 mod mic;
 mod mode;
 mod monitor;

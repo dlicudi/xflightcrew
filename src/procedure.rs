@@ -326,6 +326,15 @@ async fn sequence_fms(xp: &XPlaneClient, idx: usize, leg: &ProcLeg) {
     );
 }
 
+/// LNAV out through the panel's owner, the bug to the heading flown (no
+/// lurch); the follower's next steer sets its own. The heading written and
+/// whether HDG SEL read back in (#227).
+async fn lnav_hand_back(xp: &XPlaneClient, psi_true: f64, mag_var: f64) -> (f64, Option<bool>) {
+    let hdg = true_to_mag(psi_true, mag_var);
+    let taken = autoflight::lnav_out(xp, hdg, "procedure_lnav").await;
+    (hdg, taken)
+}
+
 /// Great-circle distance and, at a usable groundspeed, minutes to the leg's fix.
 pub fn leg_progress(leg: &ActiveLeg, lat: f64, lon: f64, gs_kts: f64) -> (f64, Option<f64>) {
     let dist = crate::nav::haversine_nm(lat, lon, leg.lat, leg.lon);
@@ -3142,6 +3151,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut tick_clock = std::time::Instant::now();
     // The FMS is sequenced once per leg, when the follower first steers at it.
     let mut fms_leg: Option<usize> = None;
+    // The aircraft's own LNAV flies the lateral of the plain legs where the
+    // airframe declares it, on the full-auto enroute plan only; the heading
+    // bug is the watched fallback (#227, `crate::lnav`).
+    let lnav_on = matches!(end, EndAction::Enroute) && autoflight::panel().lnav_declared();
+    let mut lnav = crate::lnav::LnavLateral::default();
     // The leg index last published with the route (`route_ahead`).
     let mut route_published: Option<usize> = None;
     // Terrain look-ahead: probed on its own slow cadence (the ground does not
@@ -3770,6 +3784,115 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // course is already magnetic; add crab to hold it as a track.
             leg.course_mag.map(|c| (c + crab).rem_euclid(360.0))
         };
+        // --- LNAV (#227): the FMS flies a plain leg to a fix once its active
+        // leg IS this one; the bug flies everything else, and is the
+        // fallback, said once, retried on the next leg. Read only where it
+        // can matter (an eligible leg, or LNAV in play to hand back).
+        let lnav_eligible = lnav_on
+            && steer == Steer::Direct
+            && steer_track.is_none()
+            && steer_line.is_none()
+            && arc.is_none()
+            && !holding
+            && !final_join.flying_pattern()
+            && crate::lnav::leg_flyable(leg);
+        if lnav_on && !lnav.retired() && (lnav_eligible || lnav.in_play()) {
+            let now_s = started.elapsed().as_secs_f64();
+            let (fms_r, xtk_r, engaged) = tokio::join!(
+                xp.get_string(crate::datarefs::GPS_NAV_ID),
+                xp.get_float(crate::datarefs::GPS_XTK),
+                autoflight::read_lnav(&xp),
+            );
+            let fms = fms_r.ok();
+            let xtk = xtk_r.ok().filter(|v| v.is_finite());
+            // The capture's best, before a drop resets it (for the tape).
+            let best_xtk = lnav.best_xtk();
+            let d = lnav.decide(crate::lnav::Tick {
+                now_s,
+                idx,
+                eligible: lnav_eligible,
+                leg_ident: &leg.fix_ident,
+                next_ident: legs.get(idx + 1).map(|l| l.fix_ident.as_str()),
+                fms_ident: fms.as_deref(),
+                engaged,
+                xtk_nm: xtk,
+                gs_kts,
+            });
+            match d.note {
+                Some(crate::lnav::Note::Engaged {
+                    say,
+                    reengage,
+                    presses,
+                }) => {
+                    crate::blackbox::record(
+                        "lnav",
+                        serde_json::json!({"event": if reengage { "reengaged" } else { "engaged" },
+                            "idx": idx, "fix": leg.fix_ident, "fms": fms, "xtk": xtk, "presses": presses}),
+                    );
+                    if say {
+                        alert(&voice, Priority::Advisory, crate::lnav::ENGAGE_LINE);
+                    }
+                }
+                Some(crate::lnav::Note::Captured { secs }) => crate::blackbox::record(
+                    "lnav",
+                    serde_json::json!({"event": "captured", "idx": idx, "fix": leg.fix_ident,
+                        "xtk": xtk, "secs": secs}),
+                ),
+                None => {}
+            }
+            match d.act {
+                crate::lnav::Act::Nothing => {}
+                crate::lnav::Act::Press => {
+                    let sent = autoflight::press_lnav(&xp, "procedure_lnav").await;
+                    crate::blackbox::record(
+                        "lnav",
+                        serde_json::json!({"event": "engage", "idx": idx, "fix": leg.fix_ident,
+                            "fms": fms, "xtk": xtk, "press": lnav.presses(), "sent": sent}),
+                    );
+                }
+                crate::lnav::Act::ReGoto => {
+                    crate::blackbox::record(
+                        "lnav",
+                        serde_json::json!({"event": "regoto", "idx": idx, "fix": leg.fix_ident,
+                            "fms": fms, "owned": lnav.owns_lateral()}),
+                    );
+                    sequence_fms(&xp, idx, leg).await;
+                }
+                crate::lnav::Act::Drop(why) => {
+                    crate::blackbox::record(
+                        "lnav",
+                        serde_json::json!({"event": "dropped", "why": why.word(), "idx": idx,
+                            "fix": leg.fix_ident, "fms": fms, "xtk": xtk, "status": engaged,
+                            "best_xtk": best_xtk, "fallbacks": lnav.fallbacks()}),
+                    );
+                    let (hdg, taken) = lnav_hand_back(&xp, psi, mag_var).await;
+                    bug_mag = hdg;
+                    heading_hold.reset();
+                    crate::blackbox::record(
+                        "lnav",
+                        serde_json::json!({"event": "fallback", "idx": idx, "fix": leg.fix_ident,
+                            "hdg": hdg, "heading_on": taken}),
+                    );
+                    alert(&voice, Priority::Caution, crate::lnav::FALLBACK_LINE);
+                    if lnav.retired() {
+                        crate::blackbox::record(
+                            "lnav",
+                            serde_json::json!({"event": "retired", "fallbacks": lnav.fallbacks()}),
+                        );
+                    }
+                }
+                crate::lnav::Act::HandBack(why) => {
+                    let (hdg, taken) = lnav_hand_back(&xp, psi, mag_var).await;
+                    bug_mag = hdg;
+                    heading_hold.reset();
+                    crate::blackbox::record(
+                        "lnav",
+                        serde_json::json!({"event": "handback", "why": why, "idx": idx,
+                            "fix": leg.fix_ident, "fms": fms, "hdg": hdg, "heading_on": taken}),
+                    );
+                }
+            }
+        }
         // A course leg flown on its course is done abeam its fix, as a
         // fly-by is: the intercept may still be closing the line.
         // An arc is done at its end radial; a hold when it says so.
@@ -3814,6 +3937,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                         "cap_nm": capture_nm,
                     }),
                 );
+                // LNAV out first: the bug and HDG SEL are the rejoin's.
+                if lnav.drop_now(idx, started.elapsed().as_secs_f64()) {
+                    let (_, taken) = lnav_hand_back(&xp, psi, mag_var).await;
+                    crate::blackbox::record(
+                        "lnav",
+                        serde_json::json!({"event": "dropped", "why": crate::lnav::Why::LegStalled.word(),
+                            "idx": idx, "fix": leg.fix_ident, "heading_on": taken,
+                            "fallbacks": lnav.fallbacks()}),
+                    );
+                    alert(&voice, Priority::Caution, crate::lnav::FALLBACK_LINE);
+                }
                 let heading = true_to_mag(psi, mag_var);
                 if autoflight::set_dial(&xp, Dial::HeadingBug, heading).await.is_ok() {
                     bug_mag = heading;
@@ -3836,7 +3970,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 return;
             }
         }
-        if let Some(t) = target_mag {
+        // One writer: never the bug while LNAV flies the lateral.
+        if let Some(t) = target_mag.filter(|_| lnav.bug_write_allowed()) {
             let now_s = started.elapsed().as_secs_f64();
             // Keyed by the phase too: a new intercept, course or pattern leg
             // is set at once, corrections inside one wait (`HeadingHold`).
@@ -3872,9 +4007,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         if st.confirmed_now {
             crate::ap_engage::record_engaged("procedure", "lateral", st.try_n);
         }
-        if autoflight::bring_heading(&xp, Some(hdg_st), "procedure_lateral")
-            .await
-            .pressed(Button::Heading)
+        // Not over LNAV, its engage, or a hand-back's HDG SEL settling.
+        if lnav.heading_mode_wanted(started.elapsed().as_secs_f64())
+            && autoflight::bring_heading(&xp, Some(hdg_st), "procedure_lateral")
+                .await
+                .pressed(Button::Heading)
         {
             crate::blackbox::record(
                 "procedure",
@@ -4623,6 +4760,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         }
     }
 
+    // The route flown: LNAV goes out through the owner before the arrival
+    // takes the aircraft (it seeds HDG SEL on its own bug).
+    if lnav.in_play() {
+        if let Ok(psi) = xp.get_float(PSI_TRUE).await {
+            let (hdg, taken) = lnav_hand_back(&xp, psi, mag_var).await;
+            crate::blackbox::record(
+                "lnav",
+                serde_json::json!({"event": "handback", "why": "route_complete", "hdg": hdg, "heading_on": taken}),
+            );
+        }
+    }
     RUN.record(if matches!(end, EndAction::Approach { .. }) {
         sim::run::Outcome::Failed("approach ended without handoff".into())
     } else {

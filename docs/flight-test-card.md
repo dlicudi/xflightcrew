@@ -143,6 +143,7 @@ the debrief.
 | `a330_spoilers_disarmed` Ground spoilers armed for the roll are disarmed after the gear | 2026-09-21 3950a94 | A330 full-auto departure | autotakeoff spoilers_disarmed: ok; gear_up | one disarm per gear retraction, every one taken | not exercised |
 | `a330_runway_start` A runway start still calls ready for departure and waits for the clearance | 2026-09-21 3950a94 | A330 spawned on the numbers, full auto | full_auto request_departure, readback_takeoff; atc party_line | the call and the clearance precede the roll (read the tower states Parked, LinedUp, TakeoffCleared) (by hand) | unflown (by hand) |
 | `a330_alt_capture` The autopilot's own capture holds the circuit's level legs | 2026-09-21 3950a94 | A330 circuit | circuit leg: ap_level, vs_on; circuit vs_refused | ap_level true on the level legs, no vs_refused | not exercised |
+| `lnav_flown` The 737 follower flies its plain legs on LNAV, the heading bug the watched fallback | 2026-10-06 #227 | 737 enroute setup over a fix, then "fly the flight plan" | lnav engage, engaged, captured: idx, fix, xtk, secs; dropped: why, xtk, status; fallback; reengaged; handback; retired | 3 or more legs captured on LNAV, every fallback followed by a re-engage, never retired | not exercised |
 
 ### Light aircraft circuit or hop (172, SF50, Evolution, SR22)
 

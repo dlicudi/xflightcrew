@@ -158,7 +158,10 @@ drift READ BACK fell (`monitor::GyroSync`), else latched off per airframe.
 
 - **FMS injection is plugin-only**: `xcopilot/fms/route` then `xcopilot/fms/load`; the plugin
   loads the plan WHOLE (only a load fills ORIGIN/DEST), in its flight loop (`FmsLoop`).
-- **The follower sequences the FMS** (it flies the bug, never GPS mode) via `xcopilot/fms/goto`.
+- **The follower sequences the FMS** via `xcopilot/fms/goto`, from its OWN active leg. Where the
+  airframe declares LNAV (`autoflight:` `lnav_command`/`lnav_status`, the 737) the enroute
+  follower's plain legs to a fix fly on it once the FMS's active ident IS the leg, the bug the
+  watched fallback, said and retried next leg (`src/lnav.rs`, #227); elsewhere the bug, never GPS.
 - **The plan is the WHOLE navlog** (`simbrief::fms_route_payload`): thinned from the MIDDLE. A cap
   on the front of a list amputates its end.
 - **Local planner** (`src/flightplan.rs`, `src/route_finder.rs`; "plan a flight to X"): the same

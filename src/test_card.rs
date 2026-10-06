@@ -1809,6 +1809,56 @@ fn c_duty(log: &Log) -> Verdict {
     }
 }
 
+fn c_lnav_flown(log: &Log) -> Verdict {
+    let recs: Vec<&Rec> = log.recs.iter().filter(|r| r.kind == "lnav").collect();
+    let mut fails = Vec::new();
+    let mut drops = 0;
+    for (i, r) in recs.iter().enumerate() {
+        match r.name {
+            "retired" => fails.push(format!(
+                "{}: retired after {} fallbacks",
+                hm(r.t),
+                num(r.v, "fallbacks").unwrap_or(0.0)
+            )),
+            "dropped" => {
+                drops += 1;
+                if !recs[i + 1..].iter().any(|x| x.name == "reengaged") {
+                    fails.push(format!(
+                        "{}: dropped ({}) at {}, never re-engaged",
+                        hm(r.t),
+                        text(r.v, "why").unwrap_or("?"),
+                        text(r.v, "fix").unwrap_or("?")
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut legs: Vec<String> = recs
+        .iter()
+        .filter(|r| r.name == "captured")
+        .map(|r| {
+            format!(
+                "{}:{}",
+                num(r.v, "idx").unwrap_or(-1.0),
+                text(r.v, "fix").unwrap_or("?")
+            )
+        })
+        .collect();
+    legs.sort();
+    legs.dedup();
+    if !fails.is_empty() {
+        Verdict::Failed(fails.join("; "))
+    } else if legs.len() >= 3 {
+        Verdict::Verified(format!(
+            "{} legs captured on LNAV, {drops} fallbacks, all re-engaged",
+            legs.len()
+        ))
+    } else {
+        Verdict::NotExercised
+    }
+}
+
 fn c_flight_model_touchdowns(log: &Log) -> Verdict {
     let (mut fails, mut oks) = (Vec::new(), Vec::new());
     for r in log.of("rapport", "touchdown") {
@@ -1856,6 +1906,7 @@ const S0926I: f64 = 1_790_440_265.0; // 3b29f25
 const S0926J: f64 = 1_790_442_119.0; // 3a64155
 const S0926K: f64 = 1_790_443_683.0; // f107203
 const S0926L: f64 = 1_790_444_833.0; // 18627ec
+const S1006L: f64 = 1_791_302_000.0; // #227, LNAV on the FMS
 
 const B738: Option<&str> = Some("boeing_737");
 const A330: Option<&str> = Some("airbus_a330");
@@ -2283,6 +2334,18 @@ pub static ITEMS: &[Item] = &[
         evidence: "autoland self_pick: destination, rwy, min_length_m",
         pass: "the picked runway is at the destination",
         check: Some(c_self_pick_destination),
+    },
+    Item {
+        id: "lnav_flown",
+        sortie: Sortie::Airliner,
+        what: "The 737 follower flies its plain legs on LNAV, the heading bug the watched fallback",
+        shipped: "2026-10-06 #227",
+        since: S1006L,
+        airframe: B738,
+        fly: "737 enroute setup over a fix, then \"fly the flight plan\"",
+        evidence: "lnav engage, engaged, captured: idx, fix, xtk, secs; dropped: why, xtk, status; fallback; reengaged; handback; retired",
+        pass: "3 or more legs captured on LNAV, every fallback followed by a re-engage, never retired",
+        check: Some(c_lnav_flown),
     },
     // --- Light aircraft circuit or hop.
     Item {
@@ -3006,6 +3069,31 @@ mod tests {
             Verdict::Failed(d) => assert!(d.contains("Crosswind 360 deg"), "{d}"),
             v => panic!("{v:?}"),
         }
+    }
+
+    /// #227: legs captured on LNAV verify it; a fallback never re-engaged
+    /// fails it.
+    #[test]
+    fn lnav_is_judged_on_legs_flown_and_recoveries() {
+        let ac = json!({"kind": "flight_meta", "t": 1_791_310_000.0, "aircraft": "boeing_737_800"});
+        let cap = |t: f64, idx: u32, fix: &str| json!({"kind": "lnav", "event": "captured", "t": t, "idx": idx, "fix": fix, "xtk": 0.1});
+        let recs = vec![
+            ac.clone(),
+            cap(1_791_310_100.0, 3, "BLN"),
+            cap(1_791_310_200.0, 4, "NENEM"),
+            json!({"kind": "lnav", "event": "dropped", "t": 1_791_310_250.0, "why": "cross_track", "fix": "NENEM"}),
+            json!({"kind": "lnav", "event": "reengaged", "t": 1_791_310_400.0, "idx": 5}),
+            cap(1_791_310_500.0, 5, "YURZI"),
+        ];
+        assert!(matches!(judged("lnav_flown", &recs), Verdict::Verified(_)));
+        let recs = vec![
+            ac.clone(),
+            cap(1_791_310_100.0, 3, "BLN"),
+            json!({"kind": "lnav", "event": "dropped", "t": 1_791_310_250.0, "why": "status_lost", "fix": "BLN"}),
+        ];
+        assert!(matches!(judged("lnav_flown", &recs), Verdict::Failed(_)));
+        let recs = vec![ac, cap(1_791_310_100.0, 3, "BLN")];
+        assert_eq!(judged("lnav_flown", &recs), Verdict::NotExercised);
     }
 
     #[test]
