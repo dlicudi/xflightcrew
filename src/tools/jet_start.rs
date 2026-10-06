@@ -1282,6 +1282,64 @@ impl BoeingStart {
     /// The whole start, from cold engines to both stable and the after-start
     /// flow done. `say` is the voice (milestones only), `panel` the
     /// transcript (every switch). Returns the closing line.
+    /// Start air from the APU: brought up from cold where the profile
+    /// declares how (`apu_steps`, only while `apu_n1` reads under ready),
+    /// then its generators and bleed every time (read before fire), then a
+    /// wait for the ducts. A failed N1 read is no measurement: the cold
+    /// steps are skipped and the duct check that follows judges the air.
+    /// `Err` is the line to hand back with.
+    async fn apu_up(
+        &self,
+        xp: &dyn crate::xplane::XPlane,
+        say: &mut (dyn FnMut(&str) + Send),
+        panel: &mut (dyn FnMut(&str) + Send),
+        not_taken: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let Some(n1_name) = self.p.apu_n1.as_deref() else {
+            return Ok(());
+        };
+        let n1 = xp.get_float(n1_name).await.ok().filter(|v| v.is_finite());
+        if n1.is_some_and(|v| v < self.p.apu_ready_n1) && !self.p.apu_steps.is_empty() {
+            say("Starting the A.P.U.");
+            not_taken.extend(run_steps(xp, &self.p.apu_steps, say, panel).await);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let v = xp.get_float(n1_name).await.unwrap_or(0.0);
+                if v >= self.p.apu_ready_n1 {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    crate::blackbox::record(
+                        "boeing_start",
+                        serde_json::json!({"event": "apu", "detail": {"n1": v, "ready": false}}),
+                    );
+                    return Err(
+                        "The A.P.U. hasn't come up, so there's no start air. Your aircraft."
+                            .into(),
+                    );
+                }
+            }
+            // Its generators would not take the instant it reached speed.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            crate::blackbox::record(
+                "boeing_start",
+                serde_json::json!({"event": "apu", "detail": {"ready": true}}),
+            );
+            say("A.P.U. running.");
+        }
+        not_taken.extend(run_steps(xp, &self.p.apu_power_steps, say, panel).await);
+        // The bleed opens over a few seconds.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            if self.duct_psi(xp).await.is_some_and(|p| p >= self.p.min_duct_psi) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Ok(())
+    }
+
     pub async fn run(
         &self,
         xp: &dyn crate::xplane::XPlane,
@@ -1292,6 +1350,9 @@ impl BoeingStart {
         // Seat belt signs before anything turns, whoever asked for the start.
         if crate::tools::signs::set(xp, true).await == Some(false) {
             not_taken.push("seat belt signs".into());
+        }
+        if let Err(line) = self.apu_up(xp, say, panel, &mut not_taken).await {
+            return not_taken_suffix(&line, &not_taken);
         }
         not_taken.extend(run_steps(xp, &self.p.pre_start_steps, say, panel).await);
 
@@ -1419,6 +1480,10 @@ mod boeing_start_tests {
             light_secs: 90.0,
             pre_start_steps: vec![],
             post_start_steps: vec![],
+            apu_steps: vec![],
+            apu_n1: None,
+            apu_ready_n1: 95.0,
+            apu_power_steps: vec![],
         }
     }
 
@@ -1487,6 +1552,51 @@ mod boeing_start_tests {
             _ = engines(xp, hot) => unreachable!(),
         };
         (line, said)
+    }
+
+    /// A cold APU is started before anything else (START held, a momentary
+    /// with no position), its bleed opened, and the engines started on it;
+    /// a running APU is never started again (2026-10-06).
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_apu_is_started_first_and_a_running_one_left_alone() {
+        let mut p = profile();
+        p.apu_n1 = Some("apu_n1".into());
+        p.apu_steps = vec![crate::aircraft::StartStep {
+            command: "apu_start".into(),
+            position: None,
+            want: 1.0,
+            // Held on the Zibo; the fake applies only a plain press.
+            held_secs: None,
+            down_command: None,
+            say: None,
+        }];
+        p.apu_power_steps = vec![crate::aircraft::StartStep {
+            command: "apu_bleed".into(),
+            position: Some("apu_bleed_pos".into()),
+            want: 1.0,
+            held_secs: None,
+            down_command: None,
+            say: None,
+        }];
+        for (n1, started) in [(0.0, true), (100.0, false)] {
+            let xp = cockpit();
+            xp.set_read("apu_n1", n1);
+            xp.set_on_command("apu_start", "apu_n1", 100.0);
+            xp.set_read("apu_bleed_pos", 0.0);
+            xp.set_on_command("apu_bleed", "apu_bleed_pos", 1.0);
+            let tool = BoeingStart::new(p.clone());
+            let mut said = Vec::new();
+            let mut say = |s: &str| said.push(s.to_string());
+            let mut panel = |_: &str| {};
+            let line = tokio::select! {
+                l = tool.run(&xp, &mut say, &mut panel) => l,
+                _ = engines(&xp, None) => unreachable!(),
+            };
+            assert_eq!(line, "Both engines running. After-start flow complete.");
+            assert_eq!(xp.ran("apu_start"), started, "n1 {n1}");
+            assert_eq!(said.first().map(String::as_str) == Some("Starting the A.P.U."), started);
+            assert!(xp.ran("apu_bleed"), "the bleed every time");
+        }
     }
 
     #[tokio::test(start_paused = true)]

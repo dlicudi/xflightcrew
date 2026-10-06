@@ -2189,6 +2189,24 @@ pub struct BoeingStartProfile {
     pub pre_start_steps: Vec<StartStep>,
     #[serde(default)]
     pub post_start_steps: Vec<StartStep>,
+    /// The APU from cold, run only when `apu_n1` reads under `apu_ready_n1`
+    /// (battery, fuel pump, the switch to ON, START held: the Zibo's START
+    /// is spring-loaded back to ON, so its step carries no position).
+    /// Empty: the APU is the pilot's, as before 2026-10-06.
+    #[serde(default)]
+    pub apu_steps: Vec<StartStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apu_n1: Option<String>,
+    #[serde(default = "apu_ready_n1_default")]
+    pub apu_ready_n1: f64,
+    /// Once the APU runs, every start: its generators and its bleed, read
+    /// before fire (the Zibo's generator switches need a HELD press).
+    #[serde(default)]
+    pub apu_power_steps: Vec<StartStep>,
+}
+
+fn apu_ready_n1_default() -> f64 {
+    95.0
 }
 
 /// One engine's switches and gauges in a [`BoeingStartProfile`].

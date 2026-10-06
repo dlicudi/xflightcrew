@@ -232,6 +232,22 @@ boeing_start:
   # taken to step toward OFF, as the stock 737's Lpack_up does
   # (B738.systems.lua:1393). VERIFY the direction: a wrong one reads back
   # and is named, never "Roger".
+  # The APU from cold (probed by hand 2026-10-06, EGHL): battery ON is its
+  # _dn; the left aft pump; the APU switch is a three-position knob
+  # (`spring_toggle_switch/APU_start_pos` 0 OFF, 1 ON, 2 START, the clist's
+  # name, NOT `switches/apu_start` which never moved), _dn one notch toward
+  # START, START held 2 s and sprung back to ON. 21 % N1 a few seconds later,
+  # 100 % in about 30 s. Its generators took only on a HELD press.
+  apu_n1: sim/cockpit2/electrical/APU_N1_percent
+  apu_steps:
+    - { command: laminar/B738/switch/battery_dn, position: laminar/B738/electric/battery_pos, want: 1 }
+    - { command: laminar/B738/toggle_switch/fuel_pump_lft1, position: laminar/B738/fuel/fuel_tank_pos_lft1, want: 1 }
+    - { command: laminar/B738/spring_toggle_switch/APU_start_pos_dn, down_command: laminar/B738/spring_toggle_switch/APU_start_pos_up, position: laminar/B738/spring_toggle_switch/APU_start_pos, want: 1 }
+    - { command: laminar/B738/spring_toggle_switch/APU_start_pos_dn, held_secs: 2.0 }
+  apu_power_steps:
+    - { command: laminar/B738/toggle_switch/apu_gen1_dn, held_secs: 1.0, position: laminar/B738/electrical/apu_power_bus1, want: 1 }
+    - { command: laminar/B738/toggle_switch/apu_gen2_dn, held_secs: 1.0, position: laminar/B738/electrical/apu_power_bus2, want: 1, say: "A.P.U. generators on." }
+    - { command: laminar/B738/toggle_switch/bleed_air_apu, position: laminar/B738/toggle_switch/bleed_air_apu_pos, want: 1, say: "A.P.U. bleed on." }
   pre_start_steps:
     - { command: sim/lights/beacon_lights_on, position: sim/cockpit2/switches/beacon_on, want: 1 }
     - { command: laminar/B738/toggle_switch/l_pack_dn, down_command: laminar/B738/toggle_switch/l_pack_up, position: laminar/B738/air/l_pack_pos, want: 0 }
