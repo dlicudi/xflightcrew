@@ -136,6 +136,22 @@ pub struct AltimeterProfile {
     /// The first officer's STD button, pressed the same number of times.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copilot_std_command: Option<String>,
+    /// The knob's own commands, where the add-on ignores the stock
+    /// `sim/instruments/barometer_up/down` (the Zibo: one press of its
+    /// `laminar/B738/pilot/barometer_up` is a hundredth, the stock one does
+    /// nothing, and both dials are read-only, probed 2026-10-06). `None`
+    /// keeps the stock knob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knob: Option<BaroKnob>,
+}
+
+/// Each side's altimeter knob, up and down ([`AltimeterProfile::knob`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BaroKnob {
+    pub up: String,
+    pub down: String,
+    pub copilot_up: String,
+    pub copilot_down: String,
 }
 
 fn one_press() -> usize {

@@ -74,8 +74,8 @@ const CMD_BARO_COPILOT_DOWN: &str = "sim/instruments/barometer_copilot_down";
 struct Side<'a> {
     name: &'static str,
     dial: &'static str,
-    up: &'static str,
-    down: &'static str,
+    up: &'a str,
+    down: &'a str,
     std: Option<(&'a str, usize)>,
 }
 
@@ -84,8 +84,8 @@ impl<'a> Side<'a> {
         Self {
             name: "pilot",
             dial: BARO,
-            up: CMD_BARO_UP,
-            down: CMD_BARO_DOWN,
+            up: cfg.knob.as_ref().map_or(CMD_BARO_UP, |k| k.up.as_str()),
+            down: cfg.knob.as_ref().map_or(CMD_BARO_DOWN, |k| k.down.as_str()),
             std: cfg.std_command.as_deref().map(|c| (c, cfg.std_presses.max(1))),
         }
     }
@@ -93,8 +93,11 @@ impl<'a> Side<'a> {
         Self {
             name: "copilot",
             dial: BARO_COPILOT,
-            up: CMD_BARO_COPILOT_UP,
-            down: CMD_BARO_COPILOT_DOWN,
+            up: cfg.knob.as_ref().map_or(CMD_BARO_COPILOT_UP, |k| k.copilot_up.as_str()),
+            down: cfg
+                .knob
+                .as_ref()
+                .map_or(CMD_BARO_COPILOT_DOWN, |k| k.copilot_down.as_str()),
             std: cfg
                 .copilot_std_command
                 .as_deref()
@@ -992,6 +995,28 @@ mod tests {
         assert!(std_fast_path_pays(17.50, STANDARD_INHG));
     }
 
+    /// The Zibo's knob is its own: a declared knob is the one stepped, the
+    /// stock command (which does nothing there) never pressed.
+    #[tokio::test]
+    async fn a_declared_knob_is_the_one_stepped() {
+        use crate::xplane::FakeXPlane;
+        let cfg = crate::aircraft::AltimeterProfile {
+            knob: Some(crate::aircraft::BaroKnob {
+                up: "laminar/B738/pilot/barometer_up".into(),
+                down: "laminar/B738/pilot/barometer_down".into(),
+                copilot_up: "laminar/B738/copilot/barometer_up".into(),
+                copilot_down: "laminar/B738/copilot/barometer_down".into(),
+            }),
+            ..Default::default()
+        };
+        let fake = FakeXPlane::with_reads(&[(BARO, 29.92)]);
+        fake.step_on_command("laminar/B738/pilot/barometer_up", BARO, BARO_STEP_INHG);
+        let now = set_altimeter_with(&fake, 30.11, &cfg).await.unwrap();
+        assert!(altimeter_took(now, 30.11), "{now}");
+        assert_eq!(fake.ran_count("laminar/B738/pilot/barometer_up"), 19);
+        assert!(!fake.ran(CMD_BARO_UP));
+    }
+
     /// A STD button that does nothing costs its presses and no more: the
     /// knob steps from where the dial really is.
     #[tokio::test]
@@ -1001,6 +1026,7 @@ mod tests {
             std_command: Some("laminar/fake/std".into()),
             std_presses: 2,
             copilot_std_command: None,
+            knob: None,
         };
         let fake = FakeXPlane::with_reads(&[(BARO, 29.00)]);
         fake.step_on_command(CMD_BARO_UP, BARO, BARO_STEP_INHG);

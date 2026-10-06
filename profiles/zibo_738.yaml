@@ -96,14 +96,18 @@ speedbrake_lever:
 # override_throttles: the stock beta/reverse write is not expected to reach
 # them. Off until probed.
 reverse_thrust: false
-# The Zibo's baro knob is `laminar/B738/EFIS/baro_sel_in_hg_pilot` (writable
-# double, 29.92 parked) and its knob commands `laminar/B738/pilot/
-# barometer_up/down` (glaresheild.lua:3483-3484). The tool writes the stock
-# dial and steps the STOCK knob commands, which this aircraft does not
-# replace. The readback will say whether the stock dial is an input here.
-# VERIFY. No `altimeter:` STD fast path: the STD button exists
-# (`laminar/B738/EFIS_control/capt/push_button/std_press`, glaresheild.lua:3421)
-# but its two-press behaviour is the stock 737's, unproven on this code.
+# The Zibo owns its altimeters. Probed parked 2026-10-06: a stock dial write
+# is undone, `laminar/B738/EFIS/baro_sel_in_hg_pilot` is read-only (HTTP 400),
+# the stock `sim/instruments/barometer_up` does nothing, and ONE press of its
+# own `laminar/B738/pilot/barometer_up` is a hundredth (29.92 to 29.93), the
+# stock dial following. So the knob is stepped on its own commands. No STD
+# fast path: its two-press behaviour is the stock 737's, unproven here.
+altimeter:
+  knob:
+    up: laminar/B738/pilot/barometer_up
+    down: laminar/B738/pilot/barometer_down
+    copilot_up: laminar/B738/copilot/barometer_up
+    copilot_down: laminar/B738/copilot/barometer_down
 barometer: true
 pitch_trim: true       # stock elevator_trim; zibomod names the stock trim commands. VERIFY
 com_radio: true        # stock COM/NAV datarefs (the pilot's cockpitdecks reads them)
