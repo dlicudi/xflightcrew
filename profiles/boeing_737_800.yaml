@@ -41,6 +41,7 @@ throttle: true         # thrust levers — jet, so NO piston engine group
 autothrottle: false
 speedbrake: true       # the xlua implements the stock speedbrake commands
 reverse_thrust: true   # rollout only, self-stowing (VERIFY on this airframe)
+rollout_reverse: true  # autoland selects it on settled wheels (#222; unflown)
 # The stock dial is this xlua's OUTPUT: `B738_baro_memory` copies its own
 # laminar/B738/barometer/capt_setting into it every frame, and that dataref
 # is not writable over the API (403). A dial write is a silent no-op (probed

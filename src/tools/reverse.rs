@@ -129,30 +129,82 @@ impl Tool for ReverseThrust {
         if gs_kts < MIN_ENGAGE_KTS {
             return Ok("We're stopped — no call for reverse.".to_string());
         }
-        // Reverse owns the power levers: the speed governor lets go first.
-        if super::speedhold::release() {
-            tracing::info!("reverse thrust: released the speed governor");
-        }
-        let engines = self.engines.max(1);
-        glide_levers(ctx.xplane, engines, FULL_REVERSE, 400).await;
-        // Watcher on its own thread + runtime (the main runtime blocks on the
-        // mic between commands — same reasoning as the speed governor).
-        if let Some(run) = WATCH.claim() {
-            let base = ctx.config.xplane_base_url.clone();
-            std::thread::spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                rt.block_on(watcher(XPlaneClient::new(base), engines, &run));
-            });
-        }
+        let _ = select(
+            ctx.xplane,
+            ctx.config.xplane_base_url.clone(),
+            self.engines,
+            "pilot",
+        )
+        .await;
         Ok(format!(
             "Reverse thrust — stowing below {STOW_KTS:.0} knots, or say cancel reverse."
         ))
     }
+}
+
+/// Select reverse and start the watcher: the pilot's call and autoland's
+/// rollout ([`rollout_reverse_due`]) go through this one door, so the stow at
+/// [`STOW_KTS`], the stow on a bounce and the yield to a hand are the same for
+/// both. The caller has checked the gates. `by` is blackboxed. Returns
+/// whether the lever READ BACK in reverse (`None`: no reading).
+pub async fn select(xp: &dyn XPlane, base: String, engines: usize, by: &str) -> Option<bool> {
+    // Reverse owns the power levers: the speed governor lets go first, and an
+    // engaged autothrottle comes out so it does not drive them back up.
+    if super::speedhold::release() {
+        tracing::info!("reverse thrust: released the speed governor");
+    }
+    let at_off = crate::autoflight::drop_thrust_now(xp, "reverse").await;
+    let engines = engines.max(1);
+    glide_levers(xp, engines, FULL_REVERSE, 400).await;
+    let lever = xp
+        .get_float_array(BETA_REV)
+        .await
+        .ok()
+        .and_then(|v| v.first().copied());
+    crate::blackbox::record(
+        "reverse",
+        json!({"event": "selected", "by": by, "engines": engines,
+            "lever": lever, "at_off": at_off}),
+    );
+    // Watcher on its own thread + runtime (the main runtime blocks on the
+    // mic between commands — same reasoning as the speed governor).
+    if let Some(run) = WATCH.claim() {
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(watcher(XPlaneClient::new(base), engines, &run));
+        });
+    }
+    lever.map(|l| l <= -1.0)
+}
+
+/// Wheels on this long before autoland selects reverse: the mains touch
+/// first, and reverse with the nose still in the air pitches it up. No
+/// nosewheel dataref is read; a second and a half settled is the proxy.
+pub const ROLLOUT_WHEELS_ON_S: f64 = 1.5;
+/// Below this on the rollout reverse is not worth selecting (it would stow
+/// again within seconds of [`STOW_KTS`]).
+pub const ROLLOUT_MIN_KTS: f64 = 60.0;
+
+/// Autoland's rollout selects reverse once, on an airframe that declares
+/// `rollout_reverse`, when the wheels have been on [`ROLLOUT_WHEELS_ON_S`]
+/// without a bounce and there is still speed to take off. Pure.
+pub fn rollout_reverse_due(
+    declared: bool,
+    already: bool,
+    airborne: bool,
+    wheels_on_s: Option<f64>,
+    gs_kts: f64,
+) -> bool {
+    declared
+        && !already
+        && !airborne
+        && wheels_on_s.is_some_and(|s| s >= ROLLOUT_WHEELS_ON_S)
+        && gs_kts >= ROLLOUT_MIN_KTS
 }
 
 /// Glide all engines' levers to `to` in 50 ms micro-steps, together — one hand
@@ -199,7 +251,11 @@ async fn watcher(xp: XPlaneClient, engines: usize, run: &sim::run::Lease<'_>) {
             break;
         }
         let gs_kts = xp.get_float(GS_MS).await.unwrap_or(0.0) * MS_TO_KTS;
-        let on_ground = xp.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) > 0.5;
+        let on_ground = xp
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .unwrap_or(1.0)
+            > 0.5;
         if should_stow(gs_kts, on_ground) {
             tracing::info!(gs_kts, on_ground, "reverse thrust: stowing");
             run.lower_flag();
@@ -229,5 +285,21 @@ mod tests {
         // Airborne again — a bounce — stow IMMEDIATELY regardless of speed.
         assert!(should_stow(80.0, false));
         assert!(should_stow(24.0, false));
+    }
+
+    #[test]
+    fn autoland_selects_reverse_once_on_settled_wheels() {
+        // Settled on the wheels, fast, declared: select.
+        assert!(rollout_reverse_due(true, false, false, Some(2.0), 120.0));
+        // Not declared: the pilot's call only.
+        assert!(!rollout_reverse_due(false, false, false, Some(2.0), 120.0));
+        // Once per landing.
+        assert!(!rollout_reverse_due(true, true, false, Some(2.0), 120.0));
+        // Mains only just down (the nose still flying), or a bounce.
+        assert!(!rollout_reverse_due(true, false, false, Some(0.5), 120.0));
+        assert!(!rollout_reverse_due(true, false, false, None, 120.0));
+        assert!(!rollout_reverse_due(true, false, true, Some(2.0), 120.0));
+        // Too slow to be worth it.
+        assert!(!rollout_reverse_due(true, false, false, Some(4.0), 50.0));
     }
 }

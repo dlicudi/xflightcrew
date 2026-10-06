@@ -1576,6 +1576,13 @@ fn spawn_autoland(launch: AutolandLaunch) {
             // A steered nosewheel that declares its own rollout law
             // (`RolloutSteer`, issue #197); else the takeoff roll's default.
             let mut rollout_steer = crate::aircraft::rollout_steer().map(RolloutSteer::new);
+            // Reverse on the rollout, where the airframe declares it
+            // (`rollout_reverse`, #222): its engine count, and whether this
+            // landing has selected it (once; the watcher stows it).
+            let rollout_reverse_engines = crate::aircraft::live_profile()
+                .filter(|p| p.reverse_thrust && p.rollout_reverse)
+                .map(|p| p.engines);
+            let mut reverse_selected = false;
             // The wheels off again after the rollout latched (a bounce).
             let mut bounce_hold = BounceHold::default();
             // A hold-off airframe held on from its first contact
@@ -2043,6 +2050,35 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         // The rollout entry's centring, again at the wheels.
                         writes.set(FLARE_ROLL, 0.0);
                     }
+                    // Reverse once the wheels have settled (`reverse::select`,
+                    // the pilot's own door): the watcher stows it at taxi pace
+                    // or on a bounce, and while it is in the levers are its,
+                    // so the idle write below stands aside (#222).
+                    if crate::tools::reverse::rollout_reverse_due(
+                        rollout_reverse_engines.is_some(),
+                        reverse_selected,
+                        airborne,
+                        wheels_on,
+                        gs_kts,
+                    ) {
+                        reverse_selected = true;
+                        let took = crate::tools::reverse::select(
+                            &xp,
+                            base_url.clone(),
+                            rollout_reverse_engines.unwrap_or(1),
+                            "autoland",
+                        )
+                        .await;
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "reverse", "took": took,
+                                "gs": gs_kts, "wheels_on_s": wheels_on}),
+                        );
+                        if took == Some(false) {
+                            announce("Reverse didn't take.".into(), Priority::Caution);
+                        }
+                    }
+                    let reverse_in = crate::tools::reverse::ACTIVE.load(Ordering::SeqCst);
                     // Brake by wanted deceleration, not a fixed clamp: a
                     // comfortable rate when the runway allows it, harder
                     // only when stopping in what remains demands it; on a
@@ -2113,9 +2149,14 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             "phi": phi_roll, "trk": track_roll,
                             "air_ail": air_ail,
                             "bank_tgt": airborne.then_some(air_bank_tgt).flatten(),
+                            // Reverse in (#222): the idle write stood aside.
+                            "rev": reverse_in,
                         }),
                     );
-                    writes.set(&thr_name, 0.0).set(TAXI_STEER, steer);
+                    if !reverse_in {
+                        writes.set(&thr_name, 0.0);
+                    }
+                    writes.set(TAXI_STEER, steer);
                     if let Some(e) = touch_elev {
                         // Ours, not a hand (the scorer's yoke check).
                         crate::monitor::note_crew_yoke();
@@ -2128,6 +2169,8 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     // The vacate drive arms the governor from the current
                     // position, which takes a rolling aircraft like any join.
                     if vacate_follows && gs_kts <= VACATE_HANDOFF_KTS {
+                        // Stowed by now (25 kt); never handed to the drive in.
+                        crate::tools::reverse::stow();
                         writes.flush(&xp).await;
                         let _ = xp.set_float(TAXI_BRAKE, 0.0).await;
                         let _ = xp.set_float(TAXI_STEER, 0.0).await;
@@ -2167,6 +2210,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     // it let go the moment this loop ended, and at EGSS the
                     // 737 sat on the runway after "Brakes on" with
                     // `parking_brake_ratio` at 0.03 (2026-09-22).
+                    crate::tools::reverse::stow();
                     writes.flush(&xp).await;
                     let _ = xp.set_float(TAXI_BRAKE, ROLLOUT_BRAKE_HOLD).await;
                     let _ = xp.set_float(TAXI_STEER, 0.0).await;

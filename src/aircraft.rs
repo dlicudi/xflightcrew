@@ -968,6 +968,10 @@ pub struct AircraftProfile {
     /// range on `throttle_beta_rev_ratio` (the Twin Otter).
     #[serde(default)]
     pub reverse_thrust: bool,
+    /// Autoland's rollout selects reverse itself (`reverse::select`) once the
+    /// wheels have settled; needs `reverse_thrust`. Off: the pilot's call only.
+    #[serde(default)]
+    pub rollout_reverse: bool,
     /// Adjustable altimeter (`set_barometer`).
     #[serde(default)]
     pub barometer: bool,
@@ -4523,6 +4527,7 @@ fn cessna_172sp() -> AircraftProfile {
         fuel_pump_commands: None,
         fuel_tank_pumps_off_when_empty: Vec::new(),
         reverse_thrust: false,
+        rollout_reverse: false,
         magnetos: true,
         carb_heat: true,
         // The 172 selector is LEFT/BOTH/RIGHT (OFF is a separate shutoff valve,
@@ -4904,6 +4909,7 @@ fn cirrus_sr22() -> AircraftProfile {
         fuel_pump_commands: None,
         fuel_tank_pumps_off_when_empty: Vec::new(),
         reverse_thrust: false,
+        rollout_reverse: false,
         // OFF / LEFT / RIGHT — no "both" (low-wing twin tanks, fed one at a
         // time). Selector commands verified against the rustdecks deck. The
         // standard sim/cockpit2/fuel/fuel_tank_selector (0=off/1=left/2=right) is
