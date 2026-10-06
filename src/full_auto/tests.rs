@@ -1343,7 +1343,9 @@
         assert!(!route.fms_payload.contains("ME609"), "the GPS drops 28's SID");
         // A climb that makes no runway-10 SID: direct to the PLANNED SID's
         // exit (LEGL1P's LEGLO), never another SID's further join (SRN).
-        crate::procedure::publish_vs_limits(None);
+        // 400 fpm: the GA default of 700 makes LEGL1W's 318 feet a mile.
+        let slow = crate::aircraft::ReferenceProfile { enroute_climb_fpm: Some(400.0), ..Default::default() };
+        crate::procedure::publish_vs_limits(Some(&slow));
         let mut route = fallback_route;
         let line = super::choose_departure(&config, &mut route, "10", 105.0, None, false)
             .await
@@ -1352,6 +1354,7 @@
         println!("{line}");
         assert!(line.contains("direct to LEGLO"), "{line}");
         assert_eq!(route.legs.first().map(|l| l.fix_ident.as_str()), Some("LEGLO"));
+        crate::procedure::publish_vs_limits(None);
     }
 
     /// LILB 03 (2026-09-25): lined up with 508 m ahead, 595 needed with the
