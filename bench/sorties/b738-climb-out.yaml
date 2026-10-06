@@ -1,0 +1,17 @@
+# #226: the 737's acceleration segment. A runway start on LEMG 13, "take
+# off", and at 3,000 ft a reposition to a 4 mile final so nobody is left
+# holding the climb. Check autotakeoff `climb` law_vs dropping toward 1,200
+# fpm past 1,000 ft, the `flap_step` heights, and `ap_engage` tries.
+#   xvl sortie bench/sorties/b738-climb-out.yaml
+after: stop
+
+cases:
+  - name: 737 LEMG 13 climb-out
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      runway_start: { field: LEMG, runway: 13, engines_running: true }
+    command: take off
+    steps:
+      - { say: put us on a 4 mile final to LEMG runway 13, when: { agl_above: 3000 }, tool: setup_approach }
+    traffic: off
+    deadline_min: 10

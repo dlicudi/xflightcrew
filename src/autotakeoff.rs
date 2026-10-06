@@ -2093,6 +2093,28 @@ const CLIMB_SPEED_TRIM_FPM_S_PER_KT: f64 = 2.5;
 /// A speed-holding climb never commands less than this: airborne, it climbs.
 const CLIMB_HOLD_FLOOR_FPM: f64 = 150.0;
 
+/// The share of the airframe's best climb flown from the acceleration
+/// height until the flaps are clean: the nose lowered so the speed builds
+/// for the schedule. LEGR, 2026-10-06 (sortie 1791274391-full_auto, #226):
+/// the 737 went back to its 3,000 fpm at 1,000 ft, gained 0.4 kt a second
+/// and stepped flaps 5 to 1 at 3,066 ft; at 1,200 fpm the same excess makes
+/// about 2.3 kt a second.
+pub const CLIMB_ACCEL_FRACTION: f64 = 0.4;
+/// Never less than this while accelerating: still a climb.
+pub const CLIMB_ACCEL_FLOOR_FPM: f64 = 800.0;
+
+/// The acceleration segment's rate for a declared climb-out. Pure.
+pub fn climb_accel_fpm(c: ClimbOut) -> f64 {
+    (c.max_fpm * CLIMB_ACCEL_FRACTION).max(CLIMB_ACCEL_FLOOR_FPM)
+}
+
+/// Whether the climb is in its acceleration segment: a declared, finite
+/// acceleration height passed and the flap schedule not yet finished. Pure.
+pub fn accelerating(climb_out: Option<ClimbOut>, agl_ft: f64, flaps_retracted: bool) -> bool {
+    climb_out.is_some_and(|c| c.accel_agl_ft.is_finite() && agl_ft >= c.accel_agl_ft)
+        && !flaps_retracted
+}
+
 /// The autopilot's climb from the 300 ft engage to the handoff (#150).
 ///
 /// The engage TAKES the climb the pitch was flying (`flown_fpm`, the flight
@@ -2126,6 +2148,7 @@ impl ClimbVs {
         climb_out: Option<ClimbOut>,
         flown_fpm: Option<f64>,
         dt_s: f64,
+        accelerating: bool,
     ) -> (f64, f64) {
         let flown = flown_fpm.filter(|v| v.is_finite()).map(|v| v.max(0.0));
         let p = climb_out_vs_fpm(ias_kts, target_kts, base_fpm, vne_kts, agl_ft, climb_out);
@@ -2149,6 +2172,11 @@ impl ClimbVs {
                 let trim = trim.clamp(lo - p, hi - p);
                 self.trim = Some(trim);
                 p + trim
+            }
+            // From the acceleration height to clean: the nose lowered.
+            Some(c) if accelerating => {
+                self.trim = None;
+                p.min(climb_accel_fpm(c))
             }
             _ => {
                 self.trim = None;
@@ -2645,12 +2673,25 @@ async fn no_pitch_take_over(xp: &XPlaneClient, p: &Params, voice: &Option<Voice>
 /// the caller re-calls this every tick until everything reads back, so the
 /// confirmation is this function's own read-back, and the VS dial is still
 /// written AFTER the modes (an engage syncs it away).
+/// How long the engage leaves the panel after a press before judging the
+/// modes again. The 737's annunciators lag the press: the climb engage
+/// pressed servos and VS six times in 0.7 s (LEGR 2026-10-06, sortie
+/// 1791274391-full_auto, #226), each a toggle.
+const ENGAGE_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Whether the engage may press again: nothing pressed yet, or the last
+/// press has had [`ENGAGE_SETTLE`]. Pure.
+pub fn engage_may_press(pressed_at: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    pressed_at.is_none_or(|t| now.duration_since(t) >= ENGAGE_SETTLE)
+}
+
 async fn engage_climb(
     xp: &dyn crate::xplane::XPlane,
     fd: &[String],
     tries: &mut u32,
     vs: f64,
     last: &mut Option<f64>,
+    pressed_at: &mut Option<std::time::Instant>,
 ) -> bool {
     if crate::xplane::sim_frozen(xp).await {
         return false;
@@ -2666,6 +2707,11 @@ async fn engage_climb(
         return false;
     };
     if heading <= 0.5 || vertical <= 0.5 || servos <= 0.5 {
+        let now = std::time::Instant::now();
+        if !engage_may_press(*pressed_at, now) {
+            return false;
+        }
+        *pressed_at = Some(now);
         *tries += 1;
         if !crate::ap_engage::press_logged(xp, fd, "autotakeoff", "climb", *tries).await {
             return false;
@@ -2932,6 +2978,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut last_vs_cmd: Option<f64> = None;
     // The servo presses of the 300 ft engage (`engage_climb`).
     let mut engage_tries: u32 = 0;
+    let mut engage_pressed_at: Option<std::time::Instant> = None;
     // The autopilot's climb from the engage on: the climb flown, carried
     // into the law without a step (#150).
     let mut climb_vs = ClimbVs::default();
@@ -3664,8 +3711,17 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             climb_out,
             vs_flown,
             dt,
+            accelerating(climb_out, agl_ft, flaps_retracted),
         );
-        if !engage_climb(&xp, &p.cfg.fd_commands, &mut engage_tries, vs, &mut last_vs_cmd).await {
+        if !engage_climb(
+            &xp,
+            &p.cfg.fd_commands,
+            &mut engage_tries,
+            vs,
+            &mut last_vs_cmd,
+            &mut engage_pressed_at,
+        )
+        .await {
             continue;
         }
         if !ap_engaged {

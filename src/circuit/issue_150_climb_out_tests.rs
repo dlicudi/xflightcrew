@@ -142,7 +142,7 @@
                 if handoff_t.is_none() {
                     cmd = if new {
                         takeoff
-                            .step(ias, 170.0, 1500.0, vne, agl, None, Some(ap.vs), dt)
+                            .step(ias, 170.0, 1500.0, vne, agl, None, Some(ap.vs), dt, false)
                             .1
                     } else {
                         climb_out_vs_fpm(ias, 170.0, 1500.0, vne, agl, None)

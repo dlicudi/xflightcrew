@@ -414,23 +414,23 @@
             (super::VS_DIAL, 700.0),
         ]);
         let mut last = None;
-        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await);
+        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last, &mut None).await);
         assert!(!xp.ran(super::CMD_SERVOS_ON));
         assert!(!xp.wrote(super::VS_DIAL));
         xp.set_read(crate::datarefs::PAUSED, 0.0);
-        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await); // commands ignored
+        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last, &mut None).await); // commands ignored
         assert!(xp.ran(super::CMD_VS_MODE));
         xp.set_read(super::HDG_STATUS, 1.0);
         xp.set_read(super::VS_STATUS, 1.0);
         // Lit modes with the servos out are not an autopilot flying (#160).
-        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await);
+        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last, &mut None).await);
         xp.set_read(super::SERVOS_ON, 1.0);
-        assert!(super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await);
+        assert!(super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last, &mut None).await);
         xp.set_read(super::VS_STATUS, f64::NAN);
-        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await);
+        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last, &mut None).await);
         xp.set_read(super::VS_STATUS, 1.0);
         xp.set_read(super::SERVOS_ON, f64::NAN);
-        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last).await);
+        assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last, &mut None).await);
     }
 
     /// LEMG 13 SF50 (1790607325, #160): the roll began with HDG and VS lit
@@ -450,7 +450,7 @@
             (super::VS_DIAL, 1500.0),
         ]);
         let mut last = None;
-        let _ = super::engage_climb(&xp, &[], &mut 0, 1500.0, &mut last).await;
+        let _ = super::engage_climb(&xp, &[], &mut 0, 1500.0, &mut last, &mut None).await;
         assert!(xp.ran(super::CMD_SERVOS_ON), "the servos are pressed in");
         // A clean start (every other recorded takeoff: HDG and VS off) is
         // left alone on the ground.
@@ -4558,7 +4558,7 @@
             // The circuit's takeoff (no climb-out below 500 ft): the law is
             // the old rate, the command starts at the climb flown.
             let (law, first) =
-                ClimbVs::default().step(ias, 170.0, 1500.0, vne, agl, None, Some(flown), dt);
+                ClimbVs::default().step(ias, 170.0, 1500.0, vne, agl, None, Some(flown), dt, false);
             assert_eq!(law, 1500.0, "{}", r.sortie);
             assert!(
                 (first - flown).abs() <= CLIMB_VS_SLEW_FPM_S * dt + 1e-6,
@@ -4567,12 +4567,12 @@
             );
             // A departure's speed hold starts where the pitch is.
             let (law, first) =
-                ClimbVs::default().step(ias, 170.0, 1500.0, vne, agl, jet, Some(flown), dt);
+                ClimbVs::default().step(ias, 170.0, 1500.0, vne, agl, jet, Some(flown), dt, false);
             assert!((law - flown).abs() < 1.0, "{}: law {law:.0}", r.sortie);
             assert!((first - flown).abs() < 1.0, "{}", r.sortie);
             // A failed read is no measurement: the law, as it always was.
             let (law, first) =
-                ClimbVs::default().step(ias, 170.0, 1500.0, vne, agl, None, None, dt);
+                ClimbVs::default().step(ias, 170.0, 1500.0, vne, agl, None, None, dt, false);
             assert_eq!((law, first), (1500.0, 1500.0));
         }
     }
@@ -4602,7 +4602,7 @@
             let mut reversals = (0usize, 0.0_f64);
             while agl < 1300.0 {
                 let cmd = if new {
-                    law.step(ias, 170.0, 1500.0, vne, agl, c, Some(ap.vs), dt).1
+                    law.step(ias, 170.0, 1500.0, vne, agl, c, Some(ap.vs), dt, false).1
                 } else {
                     climb_out_vs_fpm(ias, 170.0, 1500.0, vne, agl, c)
                 };
@@ -4644,6 +4644,70 @@
         );
         assert!((160.0..=180.0).contains(&at), "at the height {at:.1}");
         assert!(reversals <= 1, "the speed hold hunted: {reversals}");
+    }
+
+    /// #226, LEGR 2026-10-06 (sortie 1791274391-full_auto): past the 1,000
+    /// ft acceleration height the 737 went back to its 3,000 fpm, gained
+    /// 0.4 kt a second and stepped flaps 5 to 1 at 3,066 ft (190 kt). On
+    /// the same plant (old law: 190 at 3,580 ft) the acceleration segment
+    /// lowers the nose at a crew's pace and makes 190 at 1,575 ft and the
+    /// 210 kt flaps-up speed at 1,743; clean, it climbs at the full rate.
+    #[test]
+    fn a_jet_accelerates_at_the_height_until_clean() {
+        let (tw, dt) = (0.185, 0.4);
+        let c = Some(ClimbOut {
+            accel_agl_ft: 1000.0,
+            max_fpm: 3000.0,
+        });
+        let vne = climb_guard_vne(Some(340.0));
+        // Altitude at which each speed is first reached, flying from the
+        // height at the LEGR numbers (171 kt, 3,000 fpm).
+        let fly = |segment: bool| {
+            let (mut agl, mut ias) = (1000.0_f64, 171.0_f64);
+            let mut ap = climb_out_bench::VsMode::new(3000.0, dt);
+            let mut law = ClimbVs::default();
+            let (mut at190, mut at210, mut max_step, mut prev) = (None, None, 0.0_f64, 3000.0);
+            while agl < 4000.0 && at210.is_none() {
+                let clean = at210.is_some();
+                let accel = segment && accelerating(c, agl, clean);
+                let cmd = law.step(ias, 170.0, 3000.0, vne, agl, c, Some(ap.vs), dt, accel).1;
+                max_step = max_step.max((cmd - prev).abs());
+                prev = cmd;
+                let vs = ap.step(cmd, dt);
+                ias += climb_out_bench::accel_kts_s(tw, ias, vs) * dt;
+                agl += vs / 60.0 * dt;
+                if ias >= 190.0 && at190.is_none() {
+                    at190 = Some(agl);
+                }
+                if ias >= 210.0 {
+                    at210 = Some(agl);
+                }
+            }
+            (at190.unwrap_or(f64::INFINITY), at210.unwrap_or(f64::INFINITY), max_step)
+        };
+        let (old190, _, _) = fly(false);
+        assert!(old190 > 2500.0, "the old climb reaches 190 at {old190:.0} ft");
+        let (at190, at210, step) = fly(true);
+        assert!(at190 < 1700.0, "190 kt at {at190:.0} ft");
+        assert!(at210 < 2000.0, "210 kt at {at210:.0} ft");
+        assert!(step <= CLIMB_VS_SLEW_FPM_S * dt + 1e-6, "stepped {step:.0} fpm");
+        // The segment is the flaps': clean, or before the height, or a
+        // SID's best-rate climb (no finite height), it is the old law.
+        assert!(!accelerating(c, 1200.0, true));
+        assert!(!accelerating(c, 900.0, false));
+        let sid = Some(ClimbOut { accel_agl_ft: f64::INFINITY, max_fpm: 3000.0 });
+        assert!(!accelerating(sid, 5000.0, false));
+        assert_eq!(climb_accel_fpm(c.unwrap()), 1200.0);
+    }
+
+    /// #226: the engage pressed servos and VS six times in 0.7 s while the
+    /// 737's annunciators caught up; a press now settles first.
+    #[test]
+    fn the_engage_lets_a_press_settle() {
+        let t0 = std::time::Instant::now();
+        assert!(engage_may_press(None, t0));
+        assert!(!engage_may_press(Some(t0), t0 + std::time::Duration::from_millis(100)));
+        assert!(engage_may_press(Some(t0), t0 + std::time::Duration::from_millis(1600)));
     }
 
     /// #150: the circuit takes the aircraft at 500 ft and walks the schedule
