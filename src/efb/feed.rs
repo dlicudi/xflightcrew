@@ -435,6 +435,17 @@ pub(crate) fn note_alert(level: &'static str, text: &str) {
     }
 }
 
+/// Withdraw every alert whose text starts with `prefix`: the condition it
+/// reported is gone (a stale plugin replaced and reloaded, 2026-10-06: the
+/// EFB kept "Plugin check: the loaded plugin is out of date" after a
+/// reload had fixed it). Returns how many went.
+pub(crate) fn withdraw_alerts(prefix: &str) -> usize {
+    let mut a = ALERTS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = a.len();
+    a.retain(|x| !x.text.starts_with(prefix));
+    before - a.len()
+}
+
 /// This flight's alerts, oldest first: a new flight never shows the last
 /// one's warning.
 pub(crate) fn alerts() -> Vec<Alert> {

@@ -673,6 +673,11 @@ pub(crate) fn spawn_aircraft_detector(
                                             det_voice.alert(voice::Priority::Caution, line);
                                         }
                                     }
+                                    // Fixed by a rebuild and reload: the
+                                    // EFB's caution about it goes too.
+                                    if already_said && plugin_missing.is_empty() {
+                                        crate::efb::feed::withdraw_alerts("Plugin check:");
+                                    }
                                     health::set_plugin_missing(plugin_missing);
                                 }
                                 // Sim unreachable: ask again next tick.
