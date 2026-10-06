@@ -1732,6 +1732,10 @@ impl FullAuto {
         };
         let waived = crate::full_auto::waived_for(&fp);
         let preflight = crate::full_auto::preflight_gated(&fp, &facts, &waived);
+        crate::efb::feed::note_preflight(
+            crate::efb::feed::PREFLIGHT.now(),
+            &preflight.as_ref().map(String::clone).map_err(|(_, why)| why.clone()),
+        );
         crate::full_auto::event(
             "preflight",
             json!({

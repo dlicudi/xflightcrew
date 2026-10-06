@@ -1077,6 +1077,9 @@ pub async fn check(
     let (Some(o), Some(d)) = (fp.waypoints.first(), fp.waypoints.last()) else {
         return Audit::default();
     };
+    // The flight this check belongs to: a verdict that lands after a new
+    // flight began is that old flight's, and the EFB never shows it.
+    let generation = crate::efb::feed::AUDIT.now();
     let fix = fix_data_path.to_string();
     let mora = tokio::task::spawn_blocking(move || mora_grid(&fix))
         .await
@@ -1130,6 +1133,7 @@ pub async fn check(
             "mora": mora.is_some(),
         }),
     );
+    crate::efb::feed::note_audit(generation, &audit);
     audit
 }
 

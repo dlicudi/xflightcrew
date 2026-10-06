@@ -36,6 +36,13 @@ pub enum PlanSource {
 static SHELF: std::sync::Mutex<Option<FlightPlan>> = std::sync::Mutex::new(None);
 pub fn publish_plan(plan: &FlightPlan) {
     *SHELF.lock().unwrap() = Some(plan.clone());
+    *SHELF_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::SystemTime::now());
+}
+/// When the plan on the shelf was put there (the EFB's "fetched at"): set
+/// with it, so it lives exactly as long as the shelf's plan.
+static SHELF_AT: std::sync::Mutex<Option<std::time::SystemTime>> = std::sync::Mutex::new(None);
+pub fn plan_shelved_at() -> Option<std::time::SystemTime> {
+    *SHELF_AT.lock().unwrap_or_else(|e| e.into_inner())
 }
 pub fn loaded_plan() -> Option<FlightPlan> {
     SHELF.lock().unwrap().clone()

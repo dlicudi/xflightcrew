@@ -64,6 +64,11 @@ reqwest = { workspace = true }
 # WebSocket for the live-state subscription cache (see src/livestate.rs); sync,
 # matching the rustdecks X-Plane client it's ported from.
 tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
+# The EFB's small LAN web server (src/efb/): GET the page, the state and
+# its Server-Sent Events, POST a line. axum rides the hyper 1 / tower stack
+# reqwest already pulls in, so it adds little; default features off (no
+# WebSocket, no multipart, no tracing layer).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
 # Global keyboard state for push-to-talk — polled so it works while X-Plane has
 # focus (needs macOS Input Monitoring permission). No event-tap run-loop quirks.
 device_query = "2"

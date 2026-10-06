@@ -199,6 +199,15 @@ pub struct Config {
     /// `XCOPILOT_TAXI_GUIDE=false` for pilots who want the diagram to
     /// themselves.
     pub taxi_guide: bool,
+    /// The EFB: a page served on the LAN (`src/efb/`) for an iPad, iPhone
+    /// or a second screen. Off by default. `XCOPILOT_EFB=true`, else the
+    /// registry's `efb`.
+    pub efb: bool,
+    /// The EFB's TCP port. `XCOPILOT_EFB_PORT`, default 8787.
+    pub efb_port: u16,
+    /// The EFB's access token, asked of every request. Empty = generated at
+    /// the first enable and saved as a pref. `XCOPILOT_EFB_TOKEN`.
+    pub efb_token: String,
     /// Radio (transmit) push-to-talk dataref, set by the bundled plugin's
     /// `xcopilot/radio_ptt` command — the transmit switch, as distinct from the
     /// intercom PTT above. An utterance captured while THIS is held goes to
@@ -357,6 +366,9 @@ impl Config {
             mute_xp_radio: env_or("XCOPILOT_MUTE_XP_RADIO", "true") != "false",
             atc_readback: env_or("XCOPILOT_ATC_READBACK", "true") != "false",
             taxi_guide: env_or("XCOPILOT_TAXI_GUIDE", "true") != "false",
+            efb: env_or("XCOPILOT_EFB", "false") == "true",
+            efb_port: env_or("XCOPILOT_EFB_PORT", "8787").parse().unwrap_or(8787),
+            efb_token: env_or("XCOPILOT_EFB_TOKEN", "").trim().to_string(),
             radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
             atc_piper_voice: env_or("XCOPILOT_ATC_PIPER_VOICE", "models/en_GB-alba-medium.onnx"),
             // ryan-high: the only high-quality model in the folder, and clearly
