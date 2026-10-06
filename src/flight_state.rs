@@ -294,7 +294,7 @@ fn forget_flight() {
 /// every `Slot` declared under `src`, so a new loop cannot outlive a swap by
 /// being forgotten here (the old check matched names, and `BRAKES_HELD`, the
 /// capture watcher and the start sequences slipped through it).
-pub(crate) static LOOPS: [(&str, &sim::run::Slot); 20] = [
+pub(crate) static LOOPS: [(&str, &sim::run::Slot); 22] = [
     ("full_auto::RUN", &crate::full_auto::RUN),
     ("procedure::RUN", &crate::procedure::RUN),
     ("autotakeoff::RUN", &crate::autotakeoff::RUN),
@@ -313,6 +313,8 @@ pub(crate) static LOOPS: [(&str, &sim::run::Slot); 20] = [
     ("tools::autopilot::CAPTURE", &crate::tools::autopilot::CAPTURE),
     ("tools::power::POWER_UP", &crate::tools::power::POWER_UP),
     ("tools::jet_start::JET_START", &crate::tools::jet_start::JET_START),
+    ("tools::engine::MIXTURE_MANAGER", &crate::tools::engine::MIXTURE_MANAGER),
+    ("tools::engine::LEAN_SEEK", &crate::tools::engine::LEAN_SEEK),
     ("ils::SETUP", &crate::ils::SETUP),
     ("flow::RUN", &crate::flow::RUN),
 ];
@@ -325,8 +327,6 @@ pub(crate) static LOOPS: [(&str, &sim::run::Slot); 20] = [
 /// hand back a flyable aircraft, clear a backtrack or a hand-down), then
 /// every run in [`LOOPS`] cancelled, then the loops not yet on a run.
 pub(crate) fn stand_down() {
-    use std::sync::atomic::Ordering::SeqCst;
-
     crate::full_auto::abort();
     crate::circuit::abort();
     crate::procedure::abort();
@@ -341,15 +341,14 @@ pub(crate) fn stand_down() {
     // Every run, whoever holds it: the recovery, the helicopter loops, the
     // governor, reverse, the brake hold (its held command expires), the
     // capture watcher (it writes the dial, ALT hold and throttle), a
-    // power-up or jet start (stopped at its next step), the ILS setup watch
+    // power-up or jet start (stopped at its next step), the mixture manager
+    // and a lean seek (their writes refused from now), the ILS setup watch
     // and a checklist (stopped where it is, its summary says so).
     for (_, run) in &LOOPS {
         run.cancel();
     }
     // Loops not on a run yet: each its own door.
     crate::approach_guide::cancel();
-    crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
-    crate::tools::engine::LEAN_SEEKING.store(false, SeqCst);
     // The arrival's hold on the station is a fact about a flight, not about
     // the world: nothing is flying to that destination any more, so the
     // region's ordinary nearest-field handoffs resume.

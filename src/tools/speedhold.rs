@@ -292,7 +292,10 @@ pub fn arm_flight_with_floor(
             else {
                 return;
             };
-            rt.block_on(governor(XPlaneClient::new(base_url), voice, &run));
+            // Scoped to the run: once released, a tick past its check writes
+            // nothing under whoever took the lever.
+            let xp = XPlaneClient::new(base_url).with_cancel(run.cancel.clone());
+            rt.block_on(governor(xp, voice, &run));
         });
     }
 }
@@ -1057,7 +1060,8 @@ impl Tool for HoldSpeed {
                 else {
                     return;
                 };
-                rt.block_on(governor(XPlaneClient::new(base), voice, &run));
+                let xp = XPlaneClient::new(base).with_cancel(run.cancel.clone());
+                rt.block_on(governor(xp, voice, &run));
             });
         }
         Ok(if taxi {
@@ -1590,6 +1594,9 @@ async fn governor(
         }
     }
     tracing::info!("speed governor stopped");
+    // The exit's safety moves go out whoever stopped us: a released run's
+    // client refuses every write, and these are not the lever's law.
+    let xp = xp.unscoped();
     life("governor_stopped");
     // A lever left in beta goes back to idle: the next thing on this lever
     // may be a takeoff, and a roll must never start with the prop in beta.
@@ -1629,6 +1636,36 @@ async fn governor(
 
 #[cfg(test)]
 mod tests {
+    /// `release()` is the door the takeoff, autoland's handoff, reverse and
+    /// the brake hold go through before writing the levers themselves, but
+    /// the governor's client was unscoped: a tick already past its `live()`
+    /// check went on gliding the throttle (200 ms of steps) under the loop
+    /// that had just taken it, two writers on one lever. Its client is now
+    /// scoped to its run, so a released governor's writes are refused, and
+    /// only the exit's own safety moves (beta to idle, the brake channel
+    /// under a set parking brake) go out unscoped.
+    #[test]
+    fn a_released_governor_writes_nothing_more() {
+        let src = crate::test_support::module_source("tools/speedhold");
+        let production = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let spawns = production.matches("rt.block_on(governor(").count();
+        assert_eq!(spawns, 2, "the two arms");
+        let scoped = production
+            .matches("XPlaneClient::new(base).with_cancel(run.cancel.clone())")
+            .count()
+            + production
+                .matches("XPlaneClient::new(base_url).with_cancel(run.cancel.clone())")
+                .count();
+        assert_eq!(scoped, spawns, "every governor's client is its run's");
+        let body = production.split("async fn governor(").nth(1).unwrap();
+        let exit = body.split("tracing::info!(\"speed governor stopped\");").nth(1).unwrap();
+        assert!(
+            exit.trim_start().starts_with("let xp = xp.unscoped();")
+                || exit.contains("\n    let xp = xp.unscoped();"),
+            "the exit's safety moves are unscoped"
+        );
+    }
+
     #[test]
     fn idle_and_still_fast_is_said_once_after_it_lasts() {
         // LOWI: 234 kt against 180 at idle, speed not coming down.

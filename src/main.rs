@@ -2561,8 +2561,7 @@ async fn run_session(
                         released.push("speed hold off, your throttle");
                     }
                     if mix_held && (names_mix || generic) {
-                        tools::engine::MIX_MANAGED.store(false, Relaxed);
-                        tools::engine::LEAN_SEEKING.store(false, Relaxed);
+                        tools::engine::release_mixture();
                         released.push("mixture's yours");
                     }
                     // Reverse rides the same levers as the speed hold — any

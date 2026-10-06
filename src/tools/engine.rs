@@ -243,8 +243,7 @@ impl Tool for SetMixture {
         // An explicit percentage is the pilot taking the lever — the continuous
         // manager stands down rather than re-trimming over their setting, and
         // a lean seek mid-hunt lets go the same way.
-        MIX_MANAGED.store(false, std::sync::atomic::Ordering::Relaxed);
-        LEAN_SEEKING.store(false, std::sync::atomic::Ordering::Relaxed);
+        release_mixture();
         let ratio = (p.percent / 100.0).clamp(0.0, 1.0);
         // Ease the mixture lever to the target instead of snapping it.
         ramp_actuator(ctx, MIXTURE, ratio).await?;
@@ -293,7 +292,7 @@ async fn seek_metric_peak(
     let mut flipped = false;
     let mut first = true;
     loop {
-        if lean_seek_cancelled() {
+        if lean_seek_cancelled(ctx.xplane) {
             return Ok(None);
         }
         let next = (mix + dir * COARSE).clamp(MIX_LEAN_FLOOR, 1.0);
@@ -322,7 +321,7 @@ async fn seek_metric_peak(
     ramp_actuator(ctx, MIXTURE, fine).await?;
     tokio::time::sleep(std::time::Duration::from_millis(FINE_SETTLE_MS)).await;
     while fine > floor {
-        if lean_seek_cancelled() {
+        if lean_seek_cancelled(ctx.xplane) {
             return Ok(None);
         }
         fine = (fine - FINE).max(floor);
@@ -342,18 +341,44 @@ async fn seek_metric_peak(
 /// True while the continuous mixture manager runs — armed by `lean_mixture`,
 /// released by the pilot ("my mixture"), by an explicit `set_mixture`, or by
 /// touching the lever. Mirrors `speedhold::ACTIVE`.
+/// Owned by its run, [`MIXTURE_MANAGER`]: read it, never write it.
 pub static MIX_MANAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The continuous mixture manager's run: the ONE writer of [`MIX_MANAGED`],
+/// cancelled by `flight_state::stand_down` with every loop in its `LOOPS`
+/// (a bare flag stored false let a re-arm inside the manager's sleep run a
+/// second manager beside the first), and its client refuses every write
+/// once cancelled, so a trim already under way never lands a lean lever
+/// over the landing's full rich.
+pub(crate) static MIXTURE_MANAGER: sim::run::Slot = sim::run::Slot::flagged(&MIX_MANAGED);
 
 /// True while a `lean_mixture` seek is hunting the peak in the background —
 /// guards re-entry, and clearing it (pilot "my mixture", an explicit
 /// `set_mixture`) stops the hunt mid-step.
+/// Owned by its run, [`LEAN_SEEK`]: read it, never write it.
 pub static LEAN_SEEKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A `lean_mixture` seek's run, the one writer of [`LEAN_SEEKING`]: in
+/// `flight_state::LOOPS` like the manager, its client cancelled with it.
+pub(crate) static LEAN_SEEK: sim::run::Slot = sim::run::Slot::flagged(&LEAN_SEEKING);
+
+/// The pilot takes the mixture back ("my mixture", an explicit percentage,
+/// "your aircraft"), or a landing wants it rich: the manager and any seek
+/// stop, their writes refused from now. Whether either was running.
+pub(crate) fn release_mixture() -> bool {
+    let managed = MIXTURE_MANAGER.cancel();
+    let seeking = LEAN_SEEK.cancel();
+    managed || seeking
+}
+
 /// True when a background lean seek must stand down: the pilot took the
-/// mixture back, or a recovery/autoland owns the levers now.
-fn lean_seek_cancelled() -> bool {
+/// mixture back (its run cancelled, or superseded by another seek), or a
+/// recovery/autoland owns the levers now.
+fn lean_seek_cancelled(xp: &dyn crate::xplane::XPlane) -> bool {
     use std::sync::atomic::Ordering;
-    !LEAN_SEEKING.load(Ordering::Relaxed) || crate::flight_state::crew_landing_or_recovering()
+    !LEAN_SEEKING.load(Ordering::Relaxed)
+        || xp.cancellation().iter().any(|c| c.load(Ordering::SeqCst))
+        || crate::flight_state::crew_landing_or_recovering()
 }
 
 /// One-line status for the dashboard's "managing" panel, when a lean seek is
@@ -403,9 +428,7 @@ pub fn manager_seek_window(mix: f64) -> (f64, f64, f64) {
 /// `Some(true)` when the lever moved, `Some(false)` when it was already rich,
 /// `None` when the lever could not be read (nothing written).
 pub async fn mixture_rich_for_landing(xp: &crate::xplane::XPlaneClient) -> Option<bool> {
-    use std::sync::atomic::Ordering;
-    MIX_MANAGED.store(false, Ordering::Relaxed);
-    LEAN_SEEKING.store(false, Ordering::Relaxed);
+    release_mixture();
     let mix = xp.get_float(MIXTURE).await.ok()?;
     if mix >= 0.98 {
         return Some(false);
@@ -418,21 +441,21 @@ pub async fn mixture_rich_for_landing(xp: &crate::xplane::XPlaneClient) -> Optio
 /// world moved (altitude, power) and quietly re-trim — full rich below the
 /// leaning floor, a short fine EGT seek around the current lever above it.
 /// Yields to recovery/autoland, and to the pilot's hand on the lever.
-async fn mixture_manager(xp: crate::xplane::XPlaneClient) {
-    use std::sync::atomic::Ordering;
+#[cfg_attr(test, allow(dead_code))]
+async fn mixture_manager(xp: crate::xplane::XPlaneClient, run: &sim::run::Lease<'_>) {
     tracing::info!("mixture manager started");
     let mut last_alt = f64::MIN; // force an immediate first trim decision
     let mut last_thr = f64::MIN;
     let mut last_cmd: Option<f64> = None;
     loop {
-        if !MIX_MANAGED.load(Ordering::Relaxed) {
+        if !run.live() {
             break;
         }
         if crate::flight_state::crew_landing_or_recovering() {
             // Whoever owns the levers now wants them rich (a recovery, a
             // landing): a lever the manager leaned is pushed back up on the
             // way out, never left lean under an approach.
-            MIX_MANAGED.store(false, Ordering::Relaxed);
+            run.lower_flag();
             if last_cmd.is_some_and(|lc| lc < 0.98) {
                 glide_lever(&xp, MIXTURE, 1.0).await;
                 tracing::info!("mixture manager: yielding, full rich");
@@ -450,7 +473,7 @@ async fn mixture_manager(xp: crate::xplane::XPlaneClient) {
         // Pilot's hand on the lever → theirs, immediately.
         if last_cmd.is_some_and(|lc| (mix - lc).abs() > 0.10) {
             tracing::info!("mixture manager: pilot override, releasing");
-            MIX_MANAGED.store(false, Ordering::Relaxed);
+            run.lower_flag();
             break;
         }
         let running = xp
@@ -481,7 +504,7 @@ async fn mixture_manager(xp: crate::xplane::XPlaneClient) {
                 while m > floor {
                     // Released mid-seek (the pilot, a landing's full-rich):
                     // stop moving the lever, and leave it where THEY put it.
-                    if !MIX_MANAGED.load(Ordering::Relaxed) {
+                    if !run.live() {
                         released = true;
                         break;
                     }
@@ -541,17 +564,29 @@ async fn read_egt(xp: &crate::xplane::XPlaneClient) -> f64 {
 /// own runtime, like every background loop here — the main runtime blocks on
 /// the mic and starves tokio tasks (learned the hard way with the speed hold).
 pub fn arm_mixture_manager(base_url: String) {
-    use std::sync::atomic::Ordering;
-    if !MIX_MANAGED.swap(true, Ordering::Relaxed) {
+    let Some(run) = MIXTURE_MANAGER.claim() else {
+        return;
+    };
+    // The manager drives the REAL sim, so it is compiled out under test:
+    // there the run is only held, until cancelled.
+    #[cfg(not(test))]
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let xp = crate::xplane::XPlaneClient::new(base_url).with_cancel(run.cancel.clone());
+        rt.block_on(mixture_manager(xp, &run));
+    });
+    #[cfg(test)]
+    {
+        let _ = base_url;
         std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                MIX_MANAGED.store(false, Ordering::Relaxed);
-                return;
-            };
-            rt.block_on(mixture_manager(crate::xplane::XPlaneClient::new(base_url)));
+            while run.live() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         });
     }
 }
@@ -633,18 +668,18 @@ impl Tool for LeanMixture {
                             .to_string(),
                     );
                 }
-                if LEAN_SEEKING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let Some(run) = LEAN_SEEK.claim() else {
                     return Ok("Already working the mixture, stand by.".to_string());
-                }
-                spawn_lean_seek(ctx, true);
+                };
+                spawn_lean_seek(ctx, true, run);
                 Ok("Roger, leaning to peak EGT. Give me ten seconds or so.".to_string())
             }
             _ => {
                 // power: lean for max RPM (the high-DA takeoff / climb procedure).
-                if LEAN_SEEKING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let Some(run) = LEAN_SEEK.claim() else {
                     return Ok("Already working the mixture, stand by.".to_string());
-                }
-                spawn_lean_seek(ctx, false);
+                };
+                spawn_lean_seek(ctx, false, run);
                 Ok("Roger, leaning for max power. Stand by.".to_string())
             }
         }
@@ -657,8 +692,7 @@ impl Tool for LeanMixture {
 /// ("did it register at all?", 2026-07-14) and, worse, blocked the voice
 /// loop, so the copilot was deaf the whole time too. Own thread + runtime
 /// like every background loop here (the main runtime blocks on the mic).
-fn spawn_lean_seek(ctx: &ToolCtx<'_>, economy: bool) {
-    use std::sync::atomic::Ordering;
+fn spawn_lean_seek(ctx: &ToolCtx<'_>, economy: bool, run: sim::run::Lease<'static>) {
     let config = ctx.config.clone();
     let voice = ctx.voice.cloned();
     let status = ctx.status.cloned();
@@ -667,11 +701,11 @@ fn spawn_lean_seek(ctx: &ToolCtx<'_>, economy: bool) {
             .enable_all()
             .build()
         else {
-            LEAN_SEEKING.store(false, Ordering::Relaxed);
             return;
         };
         rt.block_on(async move {
-            let xp = crate::xplane::XPlaneClient::new(config.xplane_base_url.clone());
+            let xp = crate::xplane::XPlaneClient::new(config.xplane_base_url.clone())
+                .with_cancel(run.cancel.clone());
             let ctx = ToolCtx {
                 xplane: &xp,
                 config: &config,
@@ -679,10 +713,11 @@ fn spawn_lean_seek(ctx: &ToolCtx<'_>, economy: bool) {
                 status: status.as_ref(),
                 reminders: None,
             };
-            let line = lean_seek(&ctx, economy).await;
-            LEAN_SEEKING.store(false, Ordering::Relaxed);
-            // Released mid-hunt (None): whoever took the mixture back already
-            // spoke, the seek just stops moving the lever.
+            // Released mid-hunt (None, or a last write refused once the run
+            // was cancelled): whoever took the mixture back already spoke,
+            // the seek just stops moving the lever.
+            let line = lean_seek(&ctx, economy).await.filter(|_| run.live());
+            drop(run);
             // The voice mirrors what it speaks onto the panel itself, so the
             // line is posted here ONLY when there is no voice to say it (both
             // paths wrote it twice, blue then green, 2026-09-12).
@@ -1498,6 +1533,53 @@ impl Tool for StopEngine {
 mod tests {
     use super::*;
 
+    static MIX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The mixture manager and the lean seek wrote the lever on bare flags,
+    /// outside every stand-down registry: a stand-down (swap, instructor, a
+    /// new flight) stored false and a re-arm inside the manager's 2 s sleep
+    /// spawned a SECOND manager the first one woke up beside, both trimming;
+    /// and a tick already past its check (the seek's last step, the lean
+    /// glide after it) wrote a lean lever over the landing's full rich. Each
+    /// is now a run (`sim::run::Slot`) in `flight_state::LOOPS`: a cancel
+    /// drops the flag, the old run's client refuses every write, and a
+    /// re-arm supersedes it, so one manager trims at a time.
+    #[test]
+    fn a_stand_down_ends_the_mixture_runs_and_a_rearm_runs_one() {
+        use std::sync::atomic::Ordering;
+        let _g = MIX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let names: Vec<&str> = crate::flight_state::LOOPS.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"tools::engine::MIXTURE_MANAGER"), "{names:?}");
+        assert!(names.contains(&"tools::engine::LEAN_SEEK"), "{names:?}");
+
+        let first = MIXTURE_MANAGER.claim().expect("idle");
+        assert!(MIX_MANAGED.load(Ordering::SeqCst));
+        assert!(MIXTURE_MANAGER.claim().is_none(), "one manager at a time");
+        // What stand_down does to every run in LOOPS.
+        MIXTURE_MANAGER.cancel();
+        assert!(!MIX_MANAGED.load(Ordering::SeqCst), "the flag drops at once");
+        let xp = crate::xplane::XPlaneClient::new("http://127.0.0.1:9".into())
+            .with_cancel(first.cancel.clone());
+        assert!(xp.cancelled(), "the old manager's writes are refused");
+        // A re-arm while the old run is still winding down supersedes it.
+        let second = MIXTURE_MANAGER.claim().expect("a cancelled run is superseded");
+        assert!(!first.live() && second.live());
+        assert!(MIX_MANAGED.load(Ordering::SeqCst));
+        drop(first);
+        assert!(MIX_MANAGED.load(Ordering::SeqCst), "the old run's exit is not the new one's");
+        drop(second);
+        assert!(!MIX_MANAGED.load(Ordering::SeqCst));
+
+        // The seek and the pilot's "my mixture" ([`release_mixture`]).
+        let seek = LEAN_SEEK.claim().expect("idle");
+        assert!(LEAN_SEEKING.load(Ordering::SeqCst) && seek.live());
+        let manager = MIXTURE_MANAGER.claim().expect("idle");
+        assert!(release_mixture(), "something was held");
+        assert!(!LEAN_SEEKING.load(Ordering::SeqCst) && !MIX_MANAGED.load(Ordering::SeqCst));
+        assert!(!seek.live() && !manager.live());
+        assert!(!release_mixture(), "nothing left to release");
+    }
+
     /// The manager armed below the floor and flown through it found the lever
     /// full rich and bracketed ±0.05 around it: one sample at 0.95, "peak"
     /// there, lever parked at 0.98 for the whole cruise. A rich lever is a
@@ -1700,6 +1782,7 @@ mod tests {
 
     #[test]
     fn released_seek_stops_without_touching_the_lever() {
+        let _g = MIX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // "My mixture" (or an explicit set_mixture) clears LEAN_SEEKING while
         // the background hunt runs; the hunt must stand down at the next step
         // and leave the lever alone. LEAN_SEEKING is false here — the

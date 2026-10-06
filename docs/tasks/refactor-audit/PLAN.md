@@ -96,3 +96,13 @@ struct with per-phase methods. Gate: bench replays, `xvl sortie --check`, real s
   `ALTIMETER_TRUTH`). P3.2 `scoped::Scoped<T>` (flight generation) on `autoland::LANDED_RUNWAY`,
   `TRACKING_ERROR` (written with the launch's flight) and `procedure::MISSED_LEGS`; owed:
   `monitor::DESTINATION` and the atc-side leaks.
+- 2026-10-06: Phase 0 rechecked on current code: items 1 to 7 all fixed (1, 2 by 3509dac; 3 by the
+  airframe snapshot; 4 by 425cdf8's leases in `LOOPS`; 5 by `forget_flight` / `stop_active`; 6 by
+  `run_autoland_scoped` with the recheck, no `autoland::ABORT` left; 7 by `Scoped` cells, the
+  `HandDown` launch args, `monitor::forget_destination` and the atc lifetime groups, so the
+  "owed" above is done). Siblings fixed: the mixture manager and lean seek are runs in `LOOPS`
+  (`engine::release_mixture`); the speed governor's client is scoped to its run. Owed: the other
+  runs whose client is unscoped (autotaxi, taxi_in, pushback, hover, heli loops, recover, flow,
+  reverse's watch) rely on a `live()` check per tick, so a write after an await can still land
+  once after a cancel; an X-Plane map reposition (`NewFlight::Reposition`) keeps every flight
+  fact by design.
