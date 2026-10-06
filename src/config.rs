@@ -161,6 +161,11 @@ pub struct Config {
     /// and the flight's memory, `chatty` a little more. Answers and safety
     /// calls are never gated by it. `XCOPILOT_CREW_CHATTER`.
     pub crew_chatter: String,
+    /// How much of a start-up the copilot calls (`crew_pace::StartCalls`):
+    /// `milestones` the callouts a crew makes, `every item` each switch as it
+    /// is confirmed. Separate from `crew_chatter`: quiet chatter never
+    /// silences a procedure call. `XCOPILOT_START_CALLS`.
+    pub start_calls: String,
     /// The copilot's idiom (`persona::Dialect`): `auto` follows the voice's
     /// own accent (an en_GB model says "cheers", an en_US one "you bet"),
     /// or `british` / `american`. `XCOPILOT_CREW_DIALECT`.
@@ -358,6 +363,7 @@ impl Config {
             atc_region: env_or("XCOPILOT_ATC_REGION", "auto"),
             atc_chatter: env_or("XCOPILOT_ATC_CHATTER", "true") != "false",
             crew_chatter: env_or("XCOPILOT_CREW_CHATTER", "normal"),
+            start_calls: env_or("XCOPILOT_START_CALLS", "milestones"),
             crew_dialect: env_or("XCOPILOT_CREW_DIALECT", "auto"),
             pilot_name: env_or("XCOPILOT_PILOT_NAME", "").trim().to_string(),
             copilot_name: env_or("XCOPILOT_COPILOT_NAME", "").trim().to_string(),

@@ -214,6 +214,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("tools::recover::RUN", 'L'),
     ("tools::reverse::ACTIVE", 'L'),
     ("tools::reverse::WATCH", 'L'),
+    ("tools::scripted_start::STATE", 'A'),
     ("tools::setup::KNOWN_INIT_SEQ", 'S'),
     ("tools::setup::LIB", 'C'),
     ("tools::setup::NEW_FLIGHT_LOADING", 'S'),

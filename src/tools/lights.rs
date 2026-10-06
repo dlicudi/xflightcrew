@@ -240,6 +240,20 @@ impl SetLights {
         self.resolve_light(key).is_some()
     }
 
+    /// Drive a declared light through [`apply`] and report what it READ BACK:
+    /// `None` when the airframe has no such light or the readback failed (no
+    /// measurement), `Some(on)` when it reached the wanted state. The crew's
+    /// own ramp items use this, never the tool's reply (an Ok "didn't move"
+    /// was counted as done under `.is_ok()`).
+    pub async fn switch(&self, xp: &dyn XPlane, key: &str, on: bool) -> Option<bool> {
+        let light = self.resolve_light(key)?;
+        let actual = apply(xp, light, on).await.ok()?;
+        if light.auto_at_night {
+            crate::cockpit_auto::note_pilot_moved_lights();
+        }
+        Some(actual == on)
+    }
+
     fn resolve_light(&self, input: &str) -> Option<&LightProfile> {
         let want = input.trim().to_ascii_lowercase();
         if let Some(l) = self
@@ -434,6 +448,24 @@ impl SetFloodLights {
             override_dataref,
             toggle,
         }
+    }
+}
+
+impl SetFloodLights {
+    /// Whether the floods read as on, from the switch this tool drives:
+    /// the toggle's position, the override, else the pilot-side rheostat.
+    /// `None` is no measurement.
+    pub async fn read_on(&self, xp: &dyn XPlane) -> Option<bool> {
+        if let Some(t) = &self.toggle {
+            return read_switch(xp, &t.dataref).await;
+        }
+        let dr = self.override_dataref.as_deref().unwrap_or(FLOOD_PILOT);
+        let (base, idx) = split_index(dr);
+        let v = match idx {
+            Some(i) => xp.get_float_array(base).await.ok()?.get(i).copied()?,
+            None => xp.get_float(base).await.ok()?,
+        };
+        v.is_finite().then_some(v > 0.5)
     }
 }
 

@@ -599,6 +599,28 @@ pub const ALL: &[Setting] = &[
         },
     },
     Setting {
+        key: "start_calls",
+        env: "XCOPILOT_START_CALLS",
+        label: "start-up calls",
+        help: "milestones: the start callouts a crew makes (default); every item: each switch called as it is confirmed",
+        kind: Kind::Choice(&["milestones", "every item"]),
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || {
+            Value::Choice(
+                crate::crew_pace::StartCalls::parse(&live().start_calls)
+                    .as_str()
+                    .to_string(),
+            )
+        },
+        apply: |v| {
+            let Some(c) = v.as_choice() else { return false };
+            let c = crate::crew_pace::StartCalls::parse(c).as_str().to_string();
+            update(|cfg| cfg.start_calls = c);
+            true
+        },
+    },
+    Setting {
         key: "crew_dialect",
         env: "XCOPILOT_CREW_DIALECT",
         label: "copilot idiom",

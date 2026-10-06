@@ -189,6 +189,12 @@ pub const ENGINE_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 pub const N1_PERCENT: &str = "sim/cockpit2/engine/indicators/N1_percent";
 pub const N2_PERCENT: &str = "sim/cockpit2/engine/indicators/N2_percent";
 pub const PROP_SPEED_RPM: &str = "sim/cockpit2/engine/indicators/prop_speed_rpm";
+/// Per engine, 1 while its starter is turning it.
+pub const STARTER_IS_RUNNING: &str = "sim/flightmodel2/engines/starter_is_running";
+/// The APU's N1, percent.
+pub const APU_N1_PERCENT: &str = "sim/cockpit2/electrical/APU_N1_percent";
+/// The APU bleed valve, 1 open.
+pub const APU_BLEED: &str = "sim/cockpit2/bleedair/actuators/apu_bleed";
 /// Per bus, volts.
 pub const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
 pub const STALL_WARNING_RATIO: &str = "sim/cockpit2/annunciators/stall_warning_ratio";

@@ -50,6 +50,9 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::full_auto::forget_mission();
     // A claim on the masks never outlives its airframe.
     crate::tools::cabin_air::forget_masks();
+    // A scripted start's verdict (an abort latched the last load) is the
+    // last airframe's.
+    crate::tools::scripted_start::forget();
     // A plan's transition belongs to the flight it was armed for.
     crate::tools::instruments::publish_flight_transition(None);
     // The altimeter cross-check was about the last airframe's instruments.
