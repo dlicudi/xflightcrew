@@ -163,6 +163,10 @@ pub(crate) async fn drive_park_brake(
     on: bool,
     valve_set: Option<f64>,
 ) -> Result<bool> {
+    let toggle = crate::aircraft::lever_profile().and_then(|p| p.park_brake_toggle.clone());
+    if let Some(t) = toggle {
+        return drive_park_brake_toggle(xp, on, &t).await;
+    }
     ensure_park_brake_valve(xp, on, valve_set).await;
     xp.run_command(if on { CMD_PARK_SET } else { CMD_PARK_RELEASE })
         .await?;
@@ -174,6 +178,30 @@ pub(crate) async fn drive_park_brake(
         set = xp.get_float(PARK_BRAKE).await? > 0.5;
     }
     Ok(set == on)
+}
+
+/// [`drive_park_brake`] where the add-on owns the brake and follows only a
+/// toggle (`park_brake_toggle`): read its OWN position first (a toggle fired
+/// at a brake already where we want it undoes it), fire once, and confirm on
+/// that position after a settle, twice, because the stock ratio the Zibo
+/// briefly took from `park_brake_set` read 0.54 and was gone a second later.
+/// A failed read is no measurement: an `Err`, never a "set".
+pub(crate) async fn drive_park_brake_toggle(
+    xp: &dyn crate::xplane::XPlane,
+    on: bool,
+    t: &crate::aircraft::ParkBrakeToggle,
+) -> Result<bool> {
+    let is_on = |v: f64| v >= 0.5;
+    if is_on(xp.get_float(&t.position).await?) != on {
+        xp.run_command(&t.command).await?;
+    }
+    for _ in 0..2 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if is_on(xp.get_float(&t.position).await?) != on {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// What [`set_park_brake_confirmed`] found: whether the brake reads set, how
@@ -1142,6 +1170,26 @@ mod tests {
     /// a routine that picked either one would strand half the fleet with the
     /// valve backwards — which on the trapping airframes means arming the very
     /// latch this exists to prevent.
+    /// The Zibo's brake follows only its toggle: read first, never fired at a
+    /// brake already where we want it, and a toggle that did not move the
+    /// add-on's OWN position is not "set" (it said so at EGHL with the
+    /// aircraft about to roll to 20 kt, 2026-10-06).
+    #[tokio::test(start_paused = true)]
+    async fn a_toggled_brake_is_read_first_and_confirmed_on_its_own_position() {
+        let t = crate::aircraft::ParkBrakeToggle {
+            command: "sim/flight_controls/brakes_toggle_max".into(),
+            position: "laminar/B738/parking_brake_pos".into(),
+        };
+        let fake = FakeXPlane::with_reads(&[(t.position.as_str(), 1.0)]);
+        assert!(drive_park_brake_toggle(&fake, true, &t).await.unwrap());
+        assert!(!fake.ran(&t.command), "already set: never toggled off");
+
+        let fake = FakeXPlane::with_reads(&[(t.position.as_str(), 0.0)]);
+        assert!(!drive_park_brake_toggle(&fake, true, &t).await.unwrap());
+        assert!(fake.ran(&t.command), "off: toggled once");
+        assert!(!fake.ran(CMD_PARK_SET), "never the stock set on this airframe");
+    }
+
     #[tokio::test]
     async fn the_valve_follows_the_airframes_declared_sense() {
         let fake = FakeXPlane::new();

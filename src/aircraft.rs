@@ -1108,6 +1108,19 @@ pub struct AircraftProfile {
     /// touch the valve (ratio only), the safe default for unknown airframes.
     #[serde(default)]
     pub park_brake_valve_set: Option<f64>,
+    /// An add-on whose own script owns the parking brake: the stock
+    /// `park_brake_set` nudged the Zibo's ratio to 0.54 and its script put it
+    /// back to 0 seconds later, after the reject had said "parking brake set"
+    /// (the aircraft rolled to 20 kt, 2026-10-06). Its brake follows only a
+    /// TOGGLE command, read before firing and confirmed on its own position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub park_brake_toggle: Option<ParkBrakeToggle>,
+    /// A turbofan's spool from the lever at takeoff power to the thrust, in
+    /// seconds, added to the takeoff's stagnation clock, which then starts
+    /// only once the lever is up ([`crate::autotakeoff::roll_stagnant`]).
+    /// `None`: the clock runs from brake release, as it always has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeoff_spool_s: Option<f64>,
     /// Electrical systems the `set_electrical` tool exposes (per-airframe wiring).
     /// Empty means no electrical tool.
     #[serde(default)]
@@ -2087,6 +2100,15 @@ impl SpeedbrakeLever {
             (0.5 + 0.5 * (lever - self.flight) / span).clamp(0.5, 1.0)
         }
     }
+}
+
+/// The parking brake's toggle and the add-on's own position
+/// ([`AircraftProfile::park_brake_toggle`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParkBrakeToggle {
+    pub command: String,
+    /// The add-on's own brake position, `>= 0.5` set.
+    pub position: String,
 }
 
 /// The gear lever's OWN commands and handle, for an airframe whose script
@@ -4788,6 +4810,8 @@ fn cessna_172sp() -> AircraftProfile {
         cabin_air: None,
         pressurised: Some(false),
         park_brake_valve_set: None,
+        park_brake_toggle: None,
+        takeoff_spool_s: None,
         electrical: {
             let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| {
                 ElectricalSystem {
@@ -5129,6 +5153,8 @@ fn cirrus_sr22() -> AircraftProfile {
         cabin_air: None,
         pressurised: Some(false),
         park_brake_valve_set: None,
+        park_brake_toggle: None,
+        takeoff_spool_s: None,
         pitot_heat: true,
         pitot_heat_dataref: None,
         advisor: vec![],

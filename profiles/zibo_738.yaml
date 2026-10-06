@@ -137,7 +137,18 @@ autoflight:
   # behaviour; the Zibo's is unmeasured). VERIFY.
   vs_toward_window: true
 
-parking_brake: true    # stock ratio reads 1 with laminar/B738/parking_brake_pos 1 parked. VERIFY the write
+parking_brake: true
+# The Zibo owns its parking brake. Probed stopped 2026-10-06: a stock ratio
+# write is undone at once, `park_brake_set` nudged the ratio to 0.54 and the
+# script put it back to 0 (the reject said "parking brake set" and the
+# aircraft rolled to 20 kt); `brakes_toggle_max` (rewritten by the Zibo) sets
+# its own `parking_brake_pos` and the stock ratio follows it.
+park_brake_toggle:
+  command: sim/flight_controls/brakes_toggle_max
+  position: laminar/B738/parking_brake_pos
+# Two CFM56s spool for seconds after the lever is up: rejected as stagnant
+# 6 s after the lever reached takeoff power at EGHL (2026-10-06).
+takeoff_spool_s: 8.0
 retractable_gear: true
 # The stock gear commands are the Zibo's own (B738_Commands.txt "Rewrite
 # default commands": up = UP, down = "off, down", so a down from UP takes two

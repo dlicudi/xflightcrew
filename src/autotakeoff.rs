@@ -129,6 +129,33 @@ const REJECT_REMAINING_M: f64 = 250.0;
 /// hadn't started reading yet.
 const STAGNANT_SECS: f64 = 12.0;
 const STAGNANT_GS_KTS: f64 = 18.0;
+/// The lever counts as at takeoff power from here, for a spooling engine.
+const STAGNANT_FULL_THR: f64 = 0.95;
+
+/// Is the roll stagnant? Without a declared spool (every airframe until
+/// 2026-10-06) the clock runs from brake release, unchanged. A turbofan
+/// declares `takeoff_spool_s`: its clock starts once the lever has reached
+/// takeoff power and the spool is added, because the Zibo 737 at EGHL was
+/// rejected 6 s after the lever got there, engines still spooling, and
+/// surged to 20 kt after the reject. A lever that never gets there (a held
+/// nose) still rejects at twice the whole allowance from brake release.
+pub fn roll_stagnant(
+    elapsed_s: f64,
+    full_thr_at_s: Option<f64>,
+    spool_s: Option<f64>,
+    gs_kts: f64,
+) -> bool {
+    if gs_kts >= STAGNANT_GS_KTS {
+        return false;
+    }
+    match spool_s {
+        None => elapsed_s > STAGNANT_SECS,
+        Some(s) => {
+            full_thr_at_s.is_some_and(|t0| elapsed_s - t0 > STAGNANT_SECS + s)
+                || elapsed_s > 2.0 * (STAGNANT_SECS + s)
+        }
+    }
+}
 /// Full P deflection at this much heading error on the roll — much tighter
 /// than the taxi law's 30°: at roll speeds a runway is held with degrees.
 pub(crate) const ROLL_FULL_DEG: f64 = 12.0;
@@ -2988,6 +3015,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let window_kts = clean_up_speed_kts(&p.flap_schedule, p.vy_kts);
     publish_climb_handover(None);
     let mut last_thr_cmd = 0.3_f64;
+    let mut full_thr_at: Option<f64> = None;
+    let spool_s = crate::aircraft::lever_profile().and_then(|a| a.takeoff_spool_s);
     // The manual's takeoff torque, for this airframe, read once per roll.
     let power_limit = takeoff_power();
     // The roll section's heading error, one tick stale, for the throttle's
@@ -3233,10 +3262,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // Queued, and sent with the tick's other writes in ONE round.
         writes.set(&thr_dref, thr_cmd);
         last_thr_cmd = thr_cmd;
+        if full_thr_at.is_none() && thr_cmd >= STAGNANT_FULL_THR {
+            full_thr_at = Some(elapsed);
+        }
 
         if !airborne {
             // Not accelerating: something is holding the aircraft.
-            if elapsed > STAGNANT_SECS && gs_kts < STAGNANT_GS_KTS {
+            if roll_stagnant(elapsed, full_thr_at, spool_s, gs_kts) {
                 reject_rolling(
                     &xp,
                     &voice,
@@ -3959,3 +3991,30 @@ mod tests;
 /// aircraft".
 #[cfg(test)]
 mod reject_stop_tests;
+
+#[cfg(test)]
+mod stagnant_tests {
+    use super::roll_stagnant;
+
+    /// Every airframe without a declared spool keeps the old clock.
+    #[test]
+    fn no_spool_keeps_the_brake_release_clock() {
+        assert!(!roll_stagnant(11.9, None, None, 0.0));
+        assert!(roll_stagnant(12.1, None, None, 0.0));
+        assert!(!roll_stagnant(30.0, None, None, 18.0));
+    }
+
+    /// The EGHL Zibo reject: lever up at 6.7 s, rejected at 12.6 s with the
+    /// engines still spooling. With the spool declared it waits.
+    #[test]
+    fn a_spooling_jet_is_judged_from_the_lever_at_takeoff_power() {
+        let spool = Some(8.0);
+        assert!(!roll_stagnant(12.6, Some(6.7), spool, 0.1));
+        assert!(!roll_stagnant(26.0, Some(6.7), spool, 3.0));
+        assert!(roll_stagnant(27.0, Some(6.7), spool, 3.0));
+        assert!(!roll_stagnant(27.0, Some(6.7), spool, 25.0));
+        // A lever that never got there still rejects, later.
+        assert!(!roll_stagnant(39.0, None, spool, 0.0));
+        assert!(roll_stagnant(40.5, None, spool, 0.0));
+    }
+}
