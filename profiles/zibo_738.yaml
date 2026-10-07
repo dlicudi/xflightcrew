@@ -776,7 +776,11 @@ pitch_authority_down: 0.5
 climb_pitch_max_deg: 18.0
 
 # The approach is flown on thrust; the flare retards progressively (the
-# type, from the stock 737; VERIFY on this flight model).
+# type, from the stock 737). Through the fitted flare plant (the model
+# under `flare_elevator:`) the stock numbers stand: the retard's top at 15
+# ft or a cap of 0.03 to 0.06 moves no landing past 20 fpm, at 30 ft or a
+# float's 0.12 the still-air spread widens (7 to 11 of 36 out of 100 to
+# 250). VERIFY: autoland `power` `retard` keys.
 approach_thrust_min: 0.3
 flare_power:
   reduction_per_second: 0.08
@@ -838,17 +842,75 @@ roll_rudder:
   dead_s: 1.0
   lag_s: 0.2
   track_lag_s: 0.75
-# The flare's elevator: the stock 737's tracker settings, pull-only. Its
-# fitted plant model is NOT carried over (another flight model).
+# The flare's elevator (our own flare: no ILS, or `autopilot_lands` lost
+# below `own_flare_below_agl_ft`), fitted to THIS aircraft. Until
+# 2026-10-07 it was the stock 737's P+D tracker with no model, and the six
+# LEMG 30 arrests that day touched at 450, 203, 209, 259, 326 and 475 fpm
+# (bench/landings/zibo_lemg30_flares.jsonl). Fitted to every arrest tick
+# of the six, the column as written through the plugin's yoke route
+# (servos out), the lever, the airspeed as read: a STANDING sink of 7,918
+# fpm per unit through lags of 0.42 and 6.5 s after 1.44 s of dead time,
+# the lever pitching the nose as 0.20 of column per unit (a retard is a
+# push: the engines hang under the wing), 650 fpm more sink at the wheels
+# from 19 ft (the ground) and 49 fpm per knot lost; 17 fpm rms over the
+# six, each arrest's own gain 6,833 to 9,767 and dead time 1.28 to 1.59 s
+# in calm air (3,870 to 4,620 in the rough). The nose answers the column
+# in 0.6 s (`rotate_elevator:`), the path a second behind it (the dead
+# time), and a held column is still building sink six seconds on.
+# Why they scattered: the tracker held the pull it reached and added only
+# for an error it saw, a dead time and a 6.5 s lag after the sink did;
+# every arrest met the runway with the sink GROWING (the ground, the
+# retard's push, the knots bled) and the column 0.1 to 0.2 behind it: 475
+# held -460 from 20 ft to the wheels while its pull went 0.18 to 0.34;
+# 259 floated at 18 ft, then the float's retard and the bleed rebuilt
+# -70 to -355 in 3 s; 326 sat on the exponential's own -500 at 30 ft and
+# its pull came too late. And the autopilot's column at the release (0.01
+# to 0.08, the trim it left) goes on arriving for seconds after the take.
+# Replayed through the plant (src/autoland/zibo_lemg30_flare_tests.rs),
+# the tracker as flown lands each record within 70 fpm of its touchdown,
+# and from every recorded gate on six plants spans 202 to 581 (5 of 36 at
+# 100 to 250).
+# Declared, the arrest is flown on the model (autoland::FlareModel): a
+# law gain of 5,000 under every calm fit (it pulls for the weak end), the
+# dead time 1.7 s (the fits' slow end), the exponential 6.5 s to 180 fpm
+# judged 3 s ahead (under the path from 54 ft at 128 kt over the ground,
+# where 5.5 s waited to 46: the slow path wants the arrest begun higher),
+# the speed's trend as sink (49 fpm a knot) and the prediction flown in
+# rough air too
+# (`rough_hold: false`: holding the pull from the flare gate in gusts
+# floated 8 of 90 and dropped 11 past 400). From every recorded gate on
+# six plants in still air 72 to 283 fpm (33 of 36 at 100 to 250), none
+# climbing, the wheels 377 to 948 m past the threshold; the six recorded
+# arrests through their own fits and air 146, 164, 225, 206, 226 and 171
+# (flown: 450, 203, 209, 259, 326, 475); in 40 fpm rms gusts 220 mean,
+# 433 worst, 1 of 90 past 400 (the tracker 363, 631, 33). Pull-only, as
+# before: forward column a few feet up is a nosewheel landing. VERIFY:
+# autoland ticks carry flare_target, flare_ahead, flare_ask and
+# flare_unexplained to the wheels; rapport touchdown 100 to 250 fpm.
+# Offline only.
 flare_elevator:
   gain: 0.6
   max: 0.45
   max_push: 0.0
-  tau_s: 5.5
+  tau_s: 6.5
   balloon_ease_per_s: 0.15
+  model:
+    fpm_per_elevator: 5000.0
+    lag_s: 0.42
+    lag2_s: 6.46
+    dead_s: 1.7
+    ground_fpm: 650.0
+    ground_ft: 19.0
+    horizon_s: 3.0
+    touchdown_fpm: 180.0
+    observer_s: 0.3
+    rough_hold: false
+    fpm_per_kt: 49.0
 # How the landing arrest leads the V/S mode: the stock 737's fit, a
 # hypothesis for this autopilot. The MCP V/S wheel here IS the stock
-# vvi_dial_fpm (B738_Datarefs.txt "MCP VVI").
+# vvi_dial_fpm (B738_Datarefs.txt "MCP VVI"). Our own flare never flies
+# it: the arrest takes the servos out on the tick it begins
+# (`arrest_hands_step`), so the dial it leads has no autopilot behind it.
 arrest_lead:
   gain: 1.5
   max_climb_fpm: 100.0

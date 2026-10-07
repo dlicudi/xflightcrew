@@ -9371,6 +9371,13 @@ mod lemg13_sr22_rollout_split_tests;
 #[cfg(test)]
 mod a330_lemg30_flare_tests;
 
+/// LEMG 30, the Zibo 737's six own-flare arrests of 2026-10-07: its column
+/// with the servos out fitted to them (a standing plant, the lever's pitch,
+/// the ground and the speed), the tracker as flown replayed through it, and
+/// the declared model flare from every gate on every fit.
+#[cfg(test)]
+mod zibo_lemg30_flare_tests;
+
 /// #199: the missed approach flies a speed.
 #[cfg(test)]
 mod missed_approach_speed_tests;
