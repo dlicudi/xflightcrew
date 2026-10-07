@@ -1538,11 +1538,22 @@ pub async fn probe_mode(xp: &dyn XPlane, p: &Panel, m: &ModeProbe, all: &[ModePr
         Some(f) if f != before => press_and_wait(xp, p, m, f).await,
         _ => first,
     };
-    let (v, mut d) = toggle_verdict(Some(before), first, second);
+    let (mut v, mut d) = toggle_verdict(Some(before), first, second);
     if first == Some(before) {
         // The Zibo's V/S would not engage parked (2026-10-07): a FAIL here
         // is the ground's as often as the channel's.
         d.push_str("; some modes will not engage on the ground");
+        // LNAV arms only on a route: no route, nothing to judge.
+        if m.label == "lnav" {
+            v = Verdict::Skipped;
+            d = "LNAV did not arm: it needs a route in the FMS".into();
+        }
+    } else if first != Some(before) && second == first {
+        // Set-only, not a toggle: the Zibo's V/S stays on under a second
+        // press (the owner never presses a lit mode, so that is safe). Put
+        // back where it was with the mode that cancels it, if one moved it.
+        v = Verdict::Pass;
+        d = format!("{d}; set-only (a second press leaves it on)");
     }
     let others_after = snapshot(xp, p, all).await;
     let moved: Vec<String> = all
@@ -2658,8 +2669,10 @@ mod tests {
         let xp = FakeXPlane::with_reads(&[("hdg_lamp", 0.0)]);
         xp.set_on_command("hdg_press", "hdg_lamp", 1.0);
         let r = probe_mode(&xp, &p, &m, std::slice::from_ref(&m)).await;
-        assert_eq!(r.verdict, Verdict::Fail);
-        assert!(r.detail.contains("not a toggle, left on"), "{}", r.detail);
+        // Set-only is how the Zibo's V/S behaves, and safe for the owner
+        // (it never presses a lit mode): a PASS that says so.
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert!(r.detail.contains("set-only"), "{}", r.detail);
         assert_eq!(xp.ran_count("hdg_press"), 2);
     }
 
