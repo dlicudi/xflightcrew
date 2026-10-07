@@ -2375,3 +2375,60 @@ fn thrust_is_the_throttle_and_landing_is_asked_plainly() {
     assert_eq!(one("Fold flaps.").map(|c| c.0), Some("set_flaps".into()));
     assert_eq!(one("Can you set up ALS?").map(|c| c.0), Some("prepare_ils".into()));
 }
+
+/// The grammar's differential snapshot: every line of the corpus at
+/// `GRAMMAR_CORPUS` (one utterance a line) through `parse_one` and through
+/// `try_parse` for every profile, written to `GRAMMAR_SNAPSHOT`. A refactor
+/// of the matchers must leave the file byte-identical. The corpus is built
+/// from the pilot's own logs and never committed.
+#[test]
+#[ignore]
+fn grammar_snapshot() {
+    use std::fmt::Write as _;
+    let corpus = std::env::var("GRAMMAR_CORPUS").expect("GRAMMAR_CORPUS");
+    let out = std::env::var("GRAMMAR_SNAPSHOT").expect("GRAMMAR_SNAPSHOT");
+    let text = std::fs::read_to_string(&corpus).expect("corpus");
+    let mut ids: Vec<String> = std::fs::read_dir("profiles")
+        .expect("profiles")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let n = e.file_name().into_string().ok()?;
+            n.strip_suffix(".yaml").map(str::to_string)
+        })
+        .collect();
+    ids.sort();
+    let planes: Vec<(String, Registry, aircraft::AircraftProfile)> = ids
+        .into_iter()
+        .filter_map(|id| {
+            let p = aircraft::load(&id)?;
+            Some((id, Registry::for_aircraft(&p), p))
+        })
+        .collect();
+    // A line that panics anywhere in the chain is recorded as a panic, so the
+    // snapshot still covers the rest of the corpus.
+    let quiet = |f: &dyn Fn() -> String| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .unwrap_or_else(|_| "PANIC".to_string())
+    };
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut s = String::new();
+    for u in text.lines().filter(|l| !l.trim().is_empty()) {
+        writeln!(s, "== {u}").unwrap();
+        let raw = quiet(&|| normalize(u));
+        writeln!(s, "one raw: {}", quiet(&|| format!("{:?}", parse_one(&raw)))).unwrap();
+        let live = quiet(&|| {
+            normalize(&crate::phrase::normalize_numbers(
+                &crate::phrase::fix_mishears(u),
+            ))
+        });
+        writeln!(s, "live: {live}").unwrap();
+        writeln!(s, "one live: {}", quiet(&|| format!("{:?}", parse_one(&live)))).unwrap();
+        for (id, reg, p) in &planes {
+            let got = quiet(&|| format!("{:?}", try_parse(&live, reg, p)));
+            writeln!(s, "{id}: {got}").unwrap();
+        }
+    }
+    std::panic::set_hook(hook);
+    std::fs::write(&out, s).expect("snapshot");
+}
