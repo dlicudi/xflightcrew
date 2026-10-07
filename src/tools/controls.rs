@@ -434,7 +434,7 @@ pub(crate) async fn hand_back_hold(
     while kts >= HAND_BACK_STOPPED_KTS && t0.elapsed().as_secs_f64() < stop_s {
         // Maximum effort from a rollout's speed, the regular one at a taxi's.
         let effort = if kts >= HAND_BACK_BRAKE_MAX_KTS {
-            crate::autotakeoff::BRAKES_MAX
+            crate::tools::BRAKES_MAX
         } else {
             super::BRAKES_REGULAR
         };
@@ -528,7 +528,7 @@ impl Tool for SetParkingBrake {
         // stopping: the governor sees the brake within a tick and closes the
         // throttle itself — read the flag BEFORE the write so the readback
         // can say so (the governor may already be standing down after it).
-        let taxi_hold = args.on && super::speedhold::taxi_hold_active();
+        let taxi_hold = args.on && crate::flight_state::taxi_speed_held();
         // Where the profile declares the valve's SET value, the valve must agree
         // with the request — on airframes that pin the ratio from it (C90B) a
         // release can't stick otherwise, and the handle animates from it either
@@ -776,9 +776,9 @@ impl Tool for HoldBrakes {
         // stopping: the governor stands down and the throttle closes before
         // the boot goes on, never brake against thrust. The short sleep lets
         // an in-flight glide land before the close sticks.
-        let taxi_hold = super::speedhold::taxi_hold_active();
+        let taxi_hold = crate::flight_state::taxi_speed_held();
         if taxi_hold {
-            super::speedhold::release();
+            crate::flight_state::release_speed_hold();
             tokio::time::sleep(std::time::Duration::from_millis(350)).await;
             let _ = ctx.xplane.set_float(&crate::aircraft::throttle_dataref(), 0.0).await;
         }

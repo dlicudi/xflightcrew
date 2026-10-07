@@ -9,7 +9,8 @@
             .and_then(|p| p.circuit_final_lead_s)
             .expect("the A330 declares its final's lead")
     }
-    use crate::autoland::{along_track_nm, cross_track_nm, landing_xtk_limit_m};
+    use crate::autoland::landing_xtk_limit_m;
+    use crate::runway::{along_track_nm, cross_track_nm};
 
     /// The recorded airspeed from the final turn of sortie 1790710769
     /// (`circuit` leg ticks, seconds from `final_turn`).

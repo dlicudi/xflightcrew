@@ -34,7 +34,7 @@
     }
 
     /// EGKK's two strips, the rows as apt.dat has them.
-    fn egkk() -> Vec<crate::autoland::Runway> {
+    fn egkk() -> Vec<crate::runway::Runway> {
         use std::io::Write;
         let apt = std::env::temp_dir().join("xvl-runway-start-egkk-apt.dat");
         let mut f = std::fs::File::create(&apt).unwrap();
@@ -42,7 +42,7 @@
         writeln!(f, "100 46.00 26 1527 0.25 1 3 0 08R 51.1450993 -0.2123748 395 0 7 4 1 3 26L 51.1514994 -0.1659296 425 30 7 4 1 3").unwrap();
         writeln!(f, "100 46.00 23 853 0.25 0 1 0 08L 51.1468901 -0.2126029 321 0 7 0 0 3 26R 51.1518321 -0.1767408 415 0 7 0 0 3").unwrap();
         f.flush().unwrap();
-        crate::autoland::nearby_runways(apt.to_str().unwrap(), 51.1477, -0.1935, 3.0).unwrap()
+        crate::runway::nearby_runways(apt.to_str().unwrap(), 51.1477, -0.1935, 3.0).unwrap()
     }
 
     /// Sortie 1790527340 (EGKK, 2026-09-27): stopped on 26L's centreline
@@ -54,7 +54,7 @@
     fn the_egkk_runway_start_backtracks_on_26l() {
         let cands = egkk();
         let (lat, lon, psi, need) = (51.14768083914999, -0.19354614043732044, 256.3, 1897.0);
-        assert!(crate::autotakeoff::runway_fit(&cands, lat, lon, psi, need).is_none());
+        assert!(crate::runway::runway_fit(&cands, lat, lon, psi, need).is_none());
         // The coin toss the old diagnosis made: 26R is the better-aligned.
         let best_aligned = cands
             .iter()
@@ -64,8 +64,8 @@
             })
             .unwrap();
         assert_eq!(best_aligned.id, "26R");
-        let why = crate::autotakeoff::why_no_fit_cleared(&cands, lat, lon, psi, need, None);
-        let crate::autotakeoff::NoFit::TooLittleLeft { id, remaining_m, .. } = &why else {
+        let why = crate::runway::why_no_fit_cleared(&cands, lat, lon, psi, need, None);
+        let crate::runway::NoFit::TooLittleLeft { id, remaining_m, .. } = &why else {
             panic!("{why:?}");
         };
         assert_eq!(id, "26L");
@@ -81,7 +81,7 @@
         );
         // Off any runway: the taxied departure.
         assert_eq!(classify_runway_start(Err(None), 0.0), RunwayStart::None);
-        let none_near = crate::autotakeoff::NoFit::NoneNear {
+        let none_near = crate::runway::NoFit::NoneNear {
             id: "26L".into(),
             lateral_m: 300.0,
         };
@@ -90,7 +90,7 @@
 
     /// LEMG's two strips, the rows as apt.dat has them (12/30 with 190 m
     /// displaced on 12; 13/31 with 75 m on each end).
-    fn lemg() -> Vec<crate::autoland::Runway> {
+    fn lemg() -> Vec<crate::runway::Runway> {
         use std::io::Write;
         let apt = std::env::temp_dir().join("xvl-runway-start-lemg-apt.dat");
         let mut f = std::fs::File::create(&apt).unwrap();
@@ -98,7 +98,7 @@
         writeln!(f, "100 45.11 1 1 0.00 1 3 0  12 36.6910753 -4.5078270 0 190 3 1 1 1 30 36.6795648 -4.4805125 0 489 3 0 0 1").unwrap();
         writeln!(f, "100 45.11 27 27 0.00 1 3 0  13 36.6845573 -4.5126253 0 75 3 1 0 2 31 36.6654027 -4.4858140 0 75 3 1 0 3").unwrap();
         f.flush().unwrap();
-        crate::autoland::nearby_runways(apt.to_str().unwrap(), 36.68, -4.50, 3.0).unwrap()
+        crate::runway::nearby_runways(apt.to_str().unwrap(), 36.68, -4.50, 3.0).unwrap()
     }
 
     /// #134 (LEMG, 2026-09-28): the runner's runway start for 13 DID put the
@@ -115,7 +115,7 @@
         let cands = lemg();
         let need = 2019.3635616820702;
         let (r, remaining) =
-            crate::autotakeoff::runway_fit(&cands, 36.684288506540085, -4.51224958630406, 131.4, need)
+            crate::runway::runway_fit(&cands, 36.684288506540085, -4.51224958630406, 131.4, need)
                 .expect("lined up on 13");
         assert_eq!(r.id, "13");
         assert!(remaining > 3000.0, "{remaining}");
@@ -129,9 +129,9 @@
             (-4.5078270 + -4.4805125) / 2.0,
         );
         assert!((lat - 36.68532005).abs() < 1e-7 && (lon + 4.49416975).abs() < 1e-7);
-        assert!(crate::autotakeoff::runway_fit(&cands, lat, lon, 131.4, need).is_none());
-        let why = crate::autotakeoff::why_no_fit_cleared(&cands, lat, lon, 131.4, need, None);
-        let crate::autotakeoff::NoFit::TooLittleLeft { id, remaining_m, .. } = &why else {
+        assert!(crate::runway::runway_fit(&cands, lat, lon, 131.4, need).is_none());
+        let why = crate::runway::why_no_fit_cleared(&cands, lat, lon, 131.4, need, None);
+        let crate::runway::NoFit::TooLittleLeft { id, remaining_m, .. } = &why else {
             panic!("{why:?}");
         };
         assert_eq!(id, "12");
@@ -146,7 +146,7 @@
     fn a_runway_start_asks_its_clearance_for_its_own_runway() {
         use crate::tower::{parse_intent, stated_runway, wants_circuits, Intent};
         for circuits in [false, true] {
-            let call = crate::circuit::radio_call(
+            let call = crate::crew_radio::radio_call(
                 &Some("November eight one six November November".into()),
                 &strip_clearance_call("13", circuits),
             );

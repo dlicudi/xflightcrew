@@ -1,6 +1,7 @@
     use super::*;
     use crate::autoland::lemg_replay::{at, fly_final, lemg, FinalLoop, Flown, Jet, LEMG_WIDTH_M};
-    use crate::autoland::{along_track_nm, cross_track_nm, landing_xtk_limit_m};
+    use crate::autoland::landing_xtk_limit_m;
+    use crate::runway::{along_track_nm, cross_track_nm};
 
     /// The recorded airspeed, by leg: from the start of the base turn
     /// (212 kt slowing to 156 through the turn, 167 by its end), and from

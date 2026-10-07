@@ -752,12 +752,12 @@ impl FullAuto {
         }
         crate::autoland::run_autoland_scoped(
             ctx.config.xplane_base_url.clone(),
-            crate::tools::autoland::apt_dat_path(),
+            crate::config::apt_dat_path(),
             self.cfg.clone(),
             self.approach_ias,
             ctx.voice.cloned(),
             ctx.status.cloned(),
-            rwy.map(|r| crate::autoland::PlannedRunway::at(dest, r)),
+            rwy.map(|r| crate::runway::PlannedRunway::at(dest, r)),
             ctx.xplane.cancellation(),
             crate::autoland::HandDown::default(),
         );
@@ -1448,8 +1448,8 @@ impl FullAuto {
                     .to_string(),
             );
         };
-        let apt_dat = super::autoland::apt_dat_path();
-        let here = crate::autoland::nearby_runways(&apt_dat, lat, lon, 4.0)
+        let apt_dat = crate::config::apt_dat_path();
+        let here = crate::runway::nearby_runways(&apt_dat, lat, lon, 4.0)
             .unwrap_or_default()
             .into_iter()
             .any(|r| r.icao.eq_ignore_ascii_case(&fp.origin));
@@ -1499,7 +1499,7 @@ impl FullAuto {
                     self.takeoff_distance_ft,
                 )
                 .unwrap_or(0.0),
-                crate::weather::surface_wind(&super::autoland::xplane_root(), &fp.destination),
+                crate::weather::surface_wind(&crate::config::xplane_root(), &fp.destination),
             )?;
             let xp = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
             // The probe answers only inside the loaded scenery (about 100 nm
@@ -1600,7 +1600,7 @@ impl FullAuto {
             &ctx.config.fix_data_path,
             &ctx.config.nav_data_path,
             &ctx.config.apt_data_path,
-            crate::weather::surface_wind(&super::autoland::xplane_root(), &fp.destination),
+            crate::weather::surface_wind(&crate::config::xplane_root(), &fp.destination),
             &mut fp,
             &mut legs,
         );
@@ -1894,7 +1894,7 @@ impl FullAuto {
         let arrival = if let Some(runway) = &local_runway {
             format!(
                 "I'll fly the checked visual final on runway {}.",
-                crate::circuit::spell_runway(runway)
+                crate::crew_radio::spell_runway(runway)
             )
         } else {
             // Briefed on the runway the arm chose, the one the arrival flies.

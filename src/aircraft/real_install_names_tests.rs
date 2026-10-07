@@ -60,7 +60,7 @@
     #[test]
     #[ignore]
     fn every_hardcoded_sim_name_exists_in_the_install() {
-        // Same resolution as `tools::autoland::xplane_root` (a bin-side
+        // Same resolution as `crate::config::xplane_root` (a bin-side
         // function; this module also compiles into the lib).
         let root = PathBuf::from(std::env::var("XCOPILOT_XPLANE_ROOT").unwrap_or_else(|_| {
             format!("{}/X-Plane 12", std::env::var("HOME").unwrap_or_default())

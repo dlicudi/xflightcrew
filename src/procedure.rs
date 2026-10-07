@@ -29,10 +29,10 @@
 use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::autoland::{mag_to_true, true_to_mag};
 use crate::control::measurements;
 #[cfg(test)]
 use crate::control::set_confirmed;
+use crate::runway::{mag_to_true, true_to_mag};
 use crate::heading_bug::HeadingHold;
 use crate::nav::ProcLeg;
 use crate::tools::autopilot::ApConfig;
@@ -429,7 +429,7 @@ pub enum EndAction {
         /// on 13 against a clearance for 12 (LEMG, 2026-09-12). The airport
         /// travels with it because an ident alone resolves by proximity, and
         /// on the EGPH arrival that found EGPJ (2026-09-20).
-        rwy_id: Option<crate::autoland::PlannedRunway>,
+        rwy_id: Option<crate::runway::PlannedRunway>,
     },
     /// Departure/arrival that ends in the enroute structure: level at the last
     /// constraint and hand back to the pilot.
@@ -529,7 +529,7 @@ pub const MAP_AUTOLAND: bool = false;
 /// later one measures the segment actually being flown. Slope clamped to
 /// 3..6 degrees. Pure.
 pub fn map_handover_path(
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     lat: f64,
     lon: f64,
     alt_ft: f64,
@@ -2133,7 +2133,7 @@ pub fn approach_plan_for(
     lon: f64,
     end: EndAction,
 ) -> Result<Plan, String> {
-    let spoken = crate::circuit::spell_runway(rwy_id);
+    let spoken = crate::crew_radio::spell_runway(rwy_id);
     // Prefer a full CIFP approach; fall back to a straight-in reconstructed from
     // the runway's published DME fixes (the way a pilot flies the DME approach
     // when there's no coded procedure — Gibraltar's whole story).
@@ -2316,7 +2316,7 @@ fn faf_off_course(
          Autoland can't line up from there, so that approach is out.",
         faf.ident,
         xtk_m.abs() / 1852.0,
-        crate::circuit::spell_runway(rwy_id),
+        crate::crew_radio::spell_runway(rwy_id),
         along_m.max(0.0) / 1852.0
     ))
 }
@@ -4571,9 +4571,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                         Some(r) => {
                             let apt = apt_dat.clone();
                             tokio::task::spawn_blocking(move || {
-                                crate::autoland::runway_by_id(&apt, lat, lon, &r.id, 10.0, r.icao.as_deref())
-                                    .ok()
-                                    .flatten()
+                                crate::runway::runway_by_id(
+                                    &apt,
+                                    lat,
+                                    lon,
+                                    &r.id,
+                                    10.0,
+                                    r.icao.as_deref(),
+                                )
+                                .ok()
+                                .flatten()
                             })
                             .await
                             .ok()
@@ -4594,7 +4601,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                             format!(
                                 "Missed approach point. Runway {} ahead, {:.1} miles. Your aircraft. \
                                  The autopilot is holding the descent; I'll talk you down.",
-                                crate::circuit::spell_runway(&r.id),
+                                crate::crew_radio::spell_runway(&r.id),
                                 crate::nav::haversine_nm(lat, lon, r.thr_lat, r.thr_lon)
                             )
                         }

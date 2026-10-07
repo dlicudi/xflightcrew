@@ -75,7 +75,7 @@
     /// starts "on glidepath" on the steep segment instead of 300 ft high on 3.
     #[test]
     fn a_map_handover_talks_down_the_path_actually_flown() {
-        let rwy = crate::autoland::Runway {
+        let rwy = crate::runway::Runway {
             icao: "LSZS".into(),
             id: "03".into(),
             thr_lat: 46.5270195,
@@ -1618,7 +1618,7 @@
                     run.established_nm = Some(along);
                 }
             }
-            let mag = |t: f64| crate::autoland::true_to_mag(t, VAR);
+            let mag = |t: f64| crate::runway::true_to_mag(t, VAR);
             if let Some(h) = hold.decide(steer.key(idx), mag(track), mag(hdg), bank, now) {
                 bug_true = h - VAR;
             }

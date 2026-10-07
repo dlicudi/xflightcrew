@@ -393,9 +393,9 @@ impl Refs {
                 r.and_then(|r| r.vs0_kts)
                     .map(|v| (v * crate::aircraft::APPROACH_VSO_RATIO).round())
             });
-        let pattern_agl = crate::tools::circuit::pattern_alt_agl_ft(approach.unwrap_or(65.0));
+        let pattern_agl = crate::aircraft::pattern_alt_agl_ft(approach.unwrap_or(65.0));
         let pattern_kts = match (vy, approach) {
-            (Some(vy), Some(app)) => Some(crate::circuit::pattern_speed_kts(vy, app, vs)),
+            (Some(vy), Some(app)) => Some(crate::aircraft::pattern_speed_kts(vy, app, vs)),
             _ => None,
         };
         Refs {
@@ -2284,16 +2284,12 @@ impl Demo {
 #[cfg(not(test))]
 fn demo_loop_running(task: Task) -> bool {
     // owners-by-name: each task demonstrates its own loop.
-    use std::sync::atomic::Ordering::Relaxed;
+    use crate::flight_state::Owner;
     match task {
-        Task::Taxi => crate::autotaxi::ACTIVE.load(Relaxed),
-        Task::Takeoff => crate::autotakeoff::running() || crate::autotakeoff::ACTIVE.load(Relaxed),
-        Task::Pattern => {
-            crate::full_auto::running()
-                || crate::full_auto::ACTIVE.load(Relaxed)
-                || crate::circuit::ACTIVE.load(Relaxed)
-        }
-        Task::Landing => crate::autoland::ACTIVE.load(Relaxed),
+        Task::Taxi => Owner::Autotaxi.active(),
+        Task::Takeoff => Owner::Autotakeoff.live(),
+        Task::Pattern => Owner::FullAuto.live() || Owner::Circuit.active(),
+        Task::Landing => Owner::Autoland.active(),
         _ => false,
     }
 }
@@ -2315,19 +2311,18 @@ fn demo_loop_running(_: Task) -> bool {
 /// circuit or a landing gives back a flyable aircraft.
 #[cfg(not(test))]
 fn stop_demo_loop(task: Task) {
+    use crate::flight_state::Owner;
     match task {
         Task::Taxi => {
-            crate::autotaxi::halt();
-            crate::tools::speedhold::release();
+            Owner::Autotaxi.stop();
+            crate::flight_state::release_speed_hold();
         }
-        Task::Takeoff => crate::autotakeoff::cancel(),
+        Task::Takeoff => Owner::Autotakeoff.stop(),
         Task::Pattern => {
-            crate::full_auto::abort();
-            crate::circuit::abort();
+            Owner::FullAuto.stop();
+            Owner::Circuit.stop();
         }
-        Task::Landing => {
-            crate::autoland::abort();
-        }
+        Task::Landing => Owner::Autoland.stop(),
         _ => {}
     }
     crate::flight::note_pilot_takeover("my controls");

@@ -116,12 +116,10 @@ const STOP_SHORT_M: f64 = 5.0;
 /// pursuit error was still honest at 8 m to run (-8°) and had begun walking
 /// by 4 m (+1°), so the swap happens before it degrades rather than after.
 const STOP_HEADING_HOLD_M: f64 = 8.0;
-/// Lateral drift at which the loop stops the aircraft and gives steering
-/// back, once ESTABLISHED on the route. Deliberately much tighter than the
-/// guide/compliance 60 m: the law holds a couple of meters in normal work,
-/// so 25 m off means something is wrong (bad fix, blocked nosewheel, a
-/// route the geometry can't follow).
-pub(crate) const OFF_ROUTE_STOP_M: f64 = 25.0;
+// The drive's route limits (the established stop, the engage limit, the
+// join's room) live with the route geometry in `taxi_guide`, which judges
+// the same joins (pillars audit 2026-10-07, stage A).
+use crate::taxi_guide::{JOIN_GROW_M, OFF_ROUTE_STOP_M};
 /// How far off the route's line a stop at its end may sit and still be an
 /// ARRIVAL. The law holds a couple of metres; the scorer calls 3 m off the
 /// line and 5 m inside a corner a miss (`scorecard` `TAXI_MAX_CUT_M`), so
@@ -160,14 +158,6 @@ pub fn route_end_fix(route: &Route, lat: f64, lon: f64) -> Option<(f64, f64)> {
     let (progress, offset) = route.fix_signed(lat, lon)?;
     Some((route.remaining(progress), offset.abs()))
 }
-/// Farther off than this at engage is a refusal: the projection onto the
-/// route stops meaning anything, and a blind cross-country drive to it
-/// isn't a join, it's a new route the tower never gave us.
-pub(crate) const MAX_JOIN_M: f64 = 150.0;
-/// Extra lateral allowance granted while joining, on top of the engage
-/// distance: room for the turning circle of a turn-around without ever
-/// letting a broken law wander further from the route than it started.
-pub(crate) const JOIN_GROW_M: f64 = 40.0;
 /// An engage further off than [`OFF_ROUTE_STOP_M`] or with the nose more than
 /// this far off the aim is a JOIN (the widened guard, the join pace).
 const JOIN_ALLOW_ERR_DEG: f64 = 45.0;
@@ -627,7 +617,7 @@ pub struct Route {
     /// ...and the runway it lines up on with the takeoff fit's need, m: the
     /// alignment rolls only the runway the fit can spare
     /// ([`LineUpAlign::with_spare`]). `None` keeps [`ALIGN_MAX_ROLL_M`].
-    pub align_runway: Option<(crate::autoland::Runway, f64)>,
+    pub align_runway: Option<(crate::runway::Runway, f64)>,
     /// The way a reversal at the route's start is turned (+1 right, -1
     /// left), when the geometry knows it: a backtrack's turn-round turns
     /// TOWARD the centreline ([`turn_round_hint`]). `None` leaves the
@@ -1517,11 +1507,11 @@ pub fn align_roll_limit_m(spare_m: Option<f64>) -> f64 {
 
 /// The runway an alignment at `(lat, lon)` can spare: what is ahead on
 /// `rwy` less what the takeoff fit needs (`need_m`, floored at the fit's
-/// own [`crate::autotakeoff::MIN_REMAINING_M`], as `runway_fit` judges it).
+/// own [`crate::runway::MIN_REMAINING_M`], as `runway_fit` judges it).
 /// Negative when the fit is already lost. Pure.
-pub fn align_spare_m(rwy: &crate::autoland::Runway, need_m: f64, lat: f64, lon: f64) -> f64 {
-    let past_m = (-crate::autoland::along_track_nm(lat, lon, rwy) * M_PER_NM).max(0.0);
-    rwy.length_m - past_m - need_m.max(crate::autotakeoff::MIN_REMAINING_M)
+pub fn align_spare_m(rwy: &crate::runway::Runway, need_m: f64, lat: f64, lon: f64) -> f64 {
+    let past_m = (-crate::runway::along_track_nm(lat, lon, rwy) * M_PER_NM).max(0.0);
+    rwy.length_m - past_m - need_m.max(crate::runway::MIN_REMAINING_M)
 }
 
 /// One step of the aligning pivot's standing-yaw trim (signed brake, +
@@ -2125,7 +2115,7 @@ impl JoinCapture {
 // ---- Line-up: from the hold-short position onto the runway centreline ----
 
 /// Farther than this from the centreline is not a hold-short position —
-/// the same reasoning as [`MAX_JOIN_M`]: the geometry stops meaning
+/// the same reasoning as [`crate::taxi_guide::MAX_JOIN_M`]: the geometry stops meaning
 /// "line up" and starts meaning "drive somewhere".
 pub(crate) const LINE_UP_MAX_LATERAL_M: f64 = 150.0;
 /// Runway that must remain beyond the alignment stop — lined up with less
@@ -2141,7 +2131,7 @@ const LINE_UP_ALIGN_M: f64 = 80.0;
 /// centreline ahead, and down it far enough to finish aligned. `None` when
 /// the geometry refuses (too far off, or not enough runway past the stop).
 pub fn line_up_path(
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     lat: f64,
     lon: f64,
     heading_deg: Option<f64>,
@@ -2172,12 +2162,13 @@ pub fn line_up_path(
 /// down and the drive stopped 84 m down, 516.1 m left against 500 (the
 /// alignment then crept 40 m more and lost the fit).
 pub fn backtrack_leg_two_path(
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     lat: f64,
     lon: f64,
     turn: TurnRound,
 ) -> Option<Vec<(f64, f64)>> {
-    use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
+    use crate::autoland::project_latlon;
+    use crate::runway::{along_track_nm, cross_track_nm};
     let lateral = (cross_track_nm(lat, lon, rwy) * M_PER_NM).abs();
     if lateral > LINE_UP_MAX_LATERAL_M {
         return None;
@@ -2214,8 +2205,8 @@ const PIVOT_SETTLE_M: f64 = 12.0;
 /// of the centreline heading 172 for a 024 runway, turned left through
 /// 113 and 44 with the aircraft carried out to 21.6 m, in the grass of a
 /// 15 m strip, and crossed back 58 degrees off. Pure.
-pub fn turn_round_hint(rwy: &crate::autoland::Runway, lat: f64, lon: f64) -> Option<f64> {
-    let ct_m = crate::autoland::cross_track_nm(lat, lon, rwy) * M_PER_NM;
+pub fn turn_round_hint(rwy: &crate::runway::Runway, lat: f64, lon: f64) -> Option<f64> {
+    let ct_m = crate::runway::cross_track_nm(lat, lon, rwy) * M_PER_NM;
     (ct_m.abs() >= TURN_HINT_MIN_OFFSET_M).then(|| ct_m.signum())
 }
 const TURN_HINT_MIN_OFFSET_M: f64 = 1.0;
@@ -2283,12 +2274,12 @@ const PIVOT_POCKET_MIN_OFFSET_M: f64 = 4.0;
 /// diagonal across to it (the "beeline" the pilot saw, 2026-07-23); `None`
 /// keeps the old diagonal (backtrack leg two, tests).
 pub fn line_up_stops_m(
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     lat: f64,
     lon: f64,
     heading_deg: Option<f64>,
 ) -> Option<(f64, f64)> {
-    use crate::autoland::{along_track_nm, cross_track_nm};
+    use crate::runway::{along_track_nm, cross_track_nm};
     let x0 = cross_track_nm(lat, lon, rwy) * M_PER_NM; // signed, right of course +
     let lateral = x0.abs();
     if lateral > LINE_UP_MAX_LATERAL_M {
@@ -2344,12 +2335,13 @@ const LEAD_ON_JUNCTION_XT_M: f64 = 35.0;
 const LEAD_ON_BEHIND_END_M: f64 = 30.0;
 
 pub fn line_up_path_from_lead_on(
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     lat: f64,
     lon: f64,
     lead_on: &[(f64, f64)],
 ) -> Option<(Vec<(f64, f64)>, f64)> {
-    use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
+    use crate::autoland::project_latlon;
+    use crate::runway::{along_track_nm, cross_track_nm};
     let (&first, &last) = (lead_on.first()?, lead_on.last()?);
     // OURS, not another stub's: compare ALONG-TRACK positions, not straight-
     // line distance — the stub runs perpendicular to the runway, so a legit
@@ -2485,13 +2477,14 @@ const BACKTRACK_MIN_M: f64 = 150.0;
 /// reach the east half, so a full-length 09 departure backtracks ~1.2 km
 /// (2026-07-22, held at Charlie with 580 m ahead).
 pub fn backtrack_pocket_path(
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     lat: f64,
     lon: f64,
     turn: TurnRound,
 ) -> Option<Vec<(f64, f64)>> {
     let (turn_start_m, pocket_m, pocket_off_m) = turn.pocket();
-    use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
+    use crate::autoland::project_latlon;
+    use crate::runway::{along_track_nm, cross_track_nm};
     let lateral = (cross_track_nm(lat, lon, rwy) * M_PER_NM).abs();
     if lateral > LINE_UP_MAX_LATERAL_M {
         return None;
@@ -2535,13 +2528,14 @@ pub fn backtrack_pocket_path(
 /// entry is not ours to invent: the stub is drawn, and the only question is
 /// which way we turn at the top of it.
 pub fn backtrack_pocket_path_from_lead_on(
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     lat: f64,
     lon: f64,
     lead_on: &[(f64, f64)],
     turn: TurnRound,
 ) -> Option<Vec<(f64, f64)>> {
-    use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
+    use crate::autoland::project_latlon;
+    use crate::runway::{along_track_nm, cross_track_nm};
     let (turn_start_m, pocket_m, pocket_off_m) = turn.pocket();
     let (&first, &last) = (lead_on.first()?, lead_on.last()?);
     // OURS, and ending on THIS centreline — the same two tests the plain
@@ -2602,7 +2596,7 @@ pub enum LineUpPlan {
 /// the pilot asked for the full length in so many words).
 #[allow(clippy::too_many_arguments)]
 pub fn pick_line_up_plan(
-    cands: &[crate::autoland::Runway],
+    cands: &[crate::runway::Runway],
     lat: f64,
     lon: f64,
     cleared: Option<&str>,
@@ -2611,11 +2605,11 @@ pub fn pick_line_up_plan(
     heading_deg: Option<f64>,
     lead_on: Option<&[(f64, f64)]>,
     turn: TurnRound,
-) -> Option<(crate::autoland::Runway, LineUpPlan)> {
-    let mut best: Option<(crate::autoland::Runway, LineUpPlan, f64)> = None;
+) -> Option<(crate::runway::Runway, LineUpPlan)> {
+    let mut best: Option<(crate::runway::Runway, LineUpPlan, f64)> = None;
     for r in cands {
         let turn = TurnRound {
-            width_m: turn.width_m.or_else(|| crate::autoland::runway_width_m(r)),
+            width_m: turn.width_m.or_else(|| crate::runway::runway_width_m(r)),
             ..turn
         };
         if let Some(c) = cleared {
@@ -2699,13 +2693,13 @@ pub fn pick_line_up_plan(
 /// there enters 30 to 60 m further on and leaves less than the 500 m fit,
 /// so the one retry a failed line-up gets would have been hopeless. Pure.
 pub fn on_strip_settle_path(
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     lat: f64,
     lon: f64,
     heading_deg: Option<f64>,
     turn: TurnRound,
 ) -> Option<(Vec<(f64, f64)>, f64)> {
-    use crate::autoland::{along_track_nm, cross_track_nm};
+    use crate::runway::{along_track_nm, cross_track_nm};
     let hdg = heading_deg?;
     let err = crate::angles::abs_diff_deg(hdg, rwy.course_deg);
     if err > ON_STRIP_MAX_ERR_DEG {
@@ -2732,13 +2726,13 @@ const ON_STRIP_HALF_WIDTH_M: f64 = 10.0;
 /// clearance is the backwards trap, refused upstream by returning the
 /// match only). Nearest threshold among the feasible wins.
 pub fn pick_line_up(
-    cands: &[crate::autoland::Runway],
+    cands: &[crate::runway::Runway],
     lat: f64,
     lon: f64,
     cleared: Option<&str>,
     heading_deg: Option<f64>,
-) -> Option<(crate::autoland::Runway, Vec<(f64, f64)>)> {
-    type LineUpCandidate = (crate::autoland::Runway, Vec<(f64, f64)>, f64);
+) -> Option<(crate::runway::Runway, Vec<(f64, f64)>)> {
+    type LineUpCandidate = (crate::runway::Runway, Vec<(f64, f64)>, f64);
     let mut best: Option<LineUpCandidate> = None;
     for r in cands {
         if let Some(c) = cleared {
@@ -2992,7 +2986,7 @@ pub fn start_backtrack(
     base_url: String,
     voice: Option<Voice>,
     route: Route,
-    rwy: crate::autoland::Runway,
+    rwy: crate::runway::Runway,
     base_kts: f64,
     need_m: f64,
 ) {
@@ -3001,7 +2995,7 @@ pub fn start_backtrack(
     let pace = route.pace;
     let turn = TurnRound {
         pivots: pace.brake_steer || crate::aircraft::nose_castors(),
-        width_m: crate::autoland::runway_width_m(&rwy),
+        width_m: crate::runway::runway_width_m(&rwy),
     };
     BACKTRACKING.store(true, Ordering::Relaxed);
     start(base_url.clone(), voice.clone(), route, base_kts);
@@ -3073,8 +3067,8 @@ pub fn start_backtrack(
                 serde_json::json!({"event": "backtrack_turn", "rwy": rwy.id,
                                    "pivots": turn.pivots, "width_m": turn.width_m,
                                    "turn_hint": route2.turn_hint,
-                                   "from_along_m": -crate::autoland::along_track_nm(lat, lon, &rwy) * M_PER_NM,
-                                   "from_ct_m": crate::autoland::cross_track_nm(lat, lon, &rwy) * M_PER_NM}),
+                                   "from_along_m": -crate::runway::along_track_nm(lat, lon, &rwy) * M_PER_NM,
+                                   "from_ct_m": crate::runway::cross_track_nm(lat, lon, &rwy) * M_PER_NM}),
             );
             crate::tools::speedhold::set_taxi_target(base_kts);
             start(base_url, voice, route2, base_kts);
@@ -3111,7 +3105,7 @@ async fn align_on_the_runway(
     xp: &XPlaneClient,
     voice: &Option<Voice>,
     course: f64,
-    fit: Option<&(crate::autoland::Runway, f64)>,
+    fit: Option<&(crate::runway::Runway, f64)>,
     gen: &sim::run::Lease<'_>,
 ) -> AlignEnd {
     // The runway it may roll is judged from where the drive stopped.
@@ -3188,7 +3182,7 @@ async fn align_on_the_runway(
         let t_s = t0.elapsed().as_secs_f64() - frozen_s;
         last_err = judge.err_deg(psi);
         // The lateral off the runway's centreline, when the runway is known.
-        let lat_m = fit.map(|(rwy, _)| crate::autoland::cross_track_nm(lat, lon, rwy) * M_PER_NM);
+        let lat_m = fit.map(|(rwy, _)| crate::runway::cross_track_nm(lat, lon, rwy) * M_PER_NM);
         last_lat = lat_m;
         let step = judge.step_on_line(t_s, psi, gs_kts, yaw, rolled_m, lat_m);
         let (bl, br, creep) = match step {

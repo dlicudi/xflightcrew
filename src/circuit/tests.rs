@@ -516,7 +516,7 @@
     /// final where a 3° path is well above a trainer's 1,000 ft.
     #[test]
     fn the_pattern_altitude_follows_the_airframe() {
-        use crate::tools::circuit::pattern_alt_agl_ft;
+        use crate::aircraft::pattern_alt_agl_ft;
         assert_eq!(pattern_alt_agl_ft(65.0), 1000.0, "trainer");
         assert_eq!(pattern_alt_agl_ft(90.0), 1000.0, "fast single");
         assert_eq!(pattern_alt_agl_ft(140.0), 1500.0, "jet");
@@ -1018,8 +1018,8 @@
     #[ignore]
     fn real_install_lxgb_side_pick() {
         let apt =
-            &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
-        let air = &crate::tools::autoland::xplane_path("Custom Data/airspaces/airspace.txt");
+            &crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let air = &crate::config::xplane_path("Custom Data/airspaces/airspace.txt");
         let cands = nearby_runways(apt, 36.1515, -5.3412, 2.0).expect("apt.dat");
         let rwy = cands
             .iter()
@@ -1267,8 +1267,8 @@
         assert!(!pattern_advance(Leg::Final, -800.0, 0.0, &g(), L, true));
     }
 
-    fn lxgb_rwy() -> crate::autoland::Runway {
-        crate::autoland::Runway {
+    fn lxgb_rwy() -> crate::runway::Runway {
+        crate::runway::Runway {
             icao: "LXGB".into(),
             id: "27".into(),
             thr_lat: 36.1508,

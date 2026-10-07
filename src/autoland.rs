@@ -20,9 +20,9 @@ pub fn last_tracking_error() -> Option<f64> {
 
 pub(crate) const M_PER_NM: f64 = 1852.0;
 
-// Runway data and geometry moved to `runway.rs` (phase 2); re-exported so
-// every `autoland::` path keeps compiling.
-pub use crate::runway::*;
+// Runway data and geometry moved to `runway.rs` (phase 2): autoland's own
+// code names it unqualified, nobody else reaches it through here.
+use crate::runway::*;
 
 
 /// The emergency self-pick as autoland arms it: the AIRFRAME's minimum length
@@ -31,7 +31,7 @@ pub use crate::runway::*;
 /// numbers it chose on.
 fn self_pick(apt_dat: &str, lat: f64, lon: f64, track_deg: f64) -> std::io::Result<Option<Runway>> {
     let min_length_m = self_pick_min_length_m(crate::aircraft::landing_distance_m());
-    let root = crate::tools::autoland::xplane_root();
+    let root = crate::config::xplane_root();
     let wind_at = |icao: &str| crate::weather::surface_wind(&root, icao);
     let destination = crate::simbrief::loaded_plan().map(|p| p.destination);
     let picked = best_landing_runway_in_wind(
@@ -1218,9 +1218,9 @@ async fn arm_runway(
                                 voice,
                                 format!(
                                     "Tower cleared us for runway {}, not the planned {}. Landing runway {}.",
-                                    crate::circuit::spell_runway(&r.id),
-                                    crate::circuit::spell_runway(&planned.id),
-                                    crate::circuit::spell_runway(&r.id)
+                                    crate::crew_radio::spell_runway(&r.id),
+                                    crate::crew_radio::spell_runway(&planned.id),
+                                    crate::crew_radio::spell_runway(&r.id)
                                 ),
                                 Priority::Caution,
                             );
@@ -1282,7 +1282,7 @@ async fn arm_runway(
             voice,
             format!(
                 "I.L.S. runway {} is set. The autopilot will land it, I'll monitor.",
-                crate::circuit::spell_runway(&runway.id)
+                crate::crew_radio::spell_runway(&runway.id)
             ),
             Priority::Advisory,
         );
@@ -1338,13 +1338,13 @@ async fn arm_runway(
         let line = if gs_aim.is_some() {
             format!(
                 "Runway {} on the glideslope, aiming at {:.0} feet.",
-                crate::circuit::spell_runway(&runway.id),
+                crate::crew_radio::spell_runway(&runway.id),
                 aim
             )
         } else {
             format!(
                 "Runway {} threshold is {:.0} feet {} the field elevation. Aiming at {:.0} feet.",
-                crate::circuit::spell_runway(&runway.id),
+                crate::crew_radio::spell_runway(&runway.id),
                 diff.abs(),
                 if diff < 0.0 { "below" } else { "above" },
                 aim
@@ -1904,14 +1904,14 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         Some(owed) if landing_readback(&owed) && readback_sent.as_deref() != Some(&owed) => {
                             readback_sent = Some(owed.clone());
                             if runtime.going_around_callsign.is_none() {
-                                runtime.going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                                runtime.going_around_callsign = Some(crate::crew_radio::crew_callsign(&xp).await);
                             }
                             let cs = runtime.going_around_callsign.clone().flatten();
                             let rwy_words = cleared
                                 .as_deref()
-                                .map(|r| format!(" runway {}", crate::circuit::spell_runway(r)))
+                                .map(|r| format!(" runway {}", crate::crew_radio::spell_runway(r)))
                                 .unwrap_or_default();
-                            crate::circuit::transmit(crate::circuit::radio_call(
+                            crate::crew_radio::transmit(crate::crew_radio::radio_call(
                                 &cs,
                                 &format!("cleared to land{rwy_words}"),
                             ));
@@ -1952,15 +1952,15 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                     if resequenced {
                                         format!(
                                             "Tower expects us on runway {}. Setting up for runway {}.",
-                                            crate::circuit::spell_runway(&r.id),
-                                            crate::circuit::spell_runway(&r.id)
+                                            crate::crew_radio::spell_runway(&r.id),
+                                            crate::crew_radio::spell_runway(&r.id)
                                         )
                                     } else {
                                         format!(
                                             "Tower cleared us for runway {}, not {}. Setting up for runway {}.",
-                                            crate::circuit::spell_runway(&r.id),
-                                            crate::circuit::spell_runway(&rwy.id),
-                                            crate::circuit::spell_runway(&r.id)
+                                            crate::crew_radio::spell_runway(&r.id),
+                                            crate::crew_radio::spell_runway(&rwy.id),
+                                            crate::crew_radio::spell_runway(&r.id)
                                         )
                                     },
                                     Priority::Caution,
@@ -2643,14 +2643,14 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 ) {
                     Some(UnclearedStep::Ask) => {
                         if runtime.going_around_callsign.is_none() {
-                            runtime.going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                            runtime.going_around_callsign = Some(crate::crew_radio::crew_callsign(&xp).await);
                         }
                         let cs = runtime.going_around_callsign.clone().flatten();
-                        crate::circuit::transmit(crate::circuit::radio_call(
+                        crate::crew_radio::transmit(crate::crew_radio::radio_call(
                             &cs,
                             &format!(
                                 "final runway {}, request landing clearance",
-                                crate::circuit::spell_runway(&rwy.id)
+                                crate::crew_radio::spell_runway(&rwy.id)
                             ),
                         ));
                         crate::blackbox::record(
@@ -2904,7 +2904,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             format!(
                                 "I can't get us established for runway {}. Your aircraft. \
                                  The autopilot is holding heading and altitude{}.",
-                                crate::circuit::spell_runway(&rwy.id),
+                                crate::crew_radio::spell_runway(&rwy.id),
                                 if gear_down { ", gear is down" } else { "" }
                             ),
                             Priority::Warning,
@@ -2987,7 +2987,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                     format!(
                                         "No pattern for runway {} clears the ground: {why}. \
                                          Climbing straight ahead to {:.0} feet and holding it.",
-                                        crate::circuit::spell_runway(&rwy.id),
+                                        crate::crew_radio::spell_runway(&rwy.id),
                                         to
                                     ),
                                     Priority::Warning,
@@ -3030,7 +3030,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                 }
                                 announce(
                                     crate::reversal::reposition_line(
-                                        &crate::circuit::spell_runway(&rwy.id),
+                                        &crate::crew_radio::spell_runway(&rwy.id),
                                         plan.side,
                                         plan.platform_ft,
                                         plan.why,
@@ -3210,10 +3210,10 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     // can be cleared again — the call that earns it.
                     runtime.owe_final_report = true;
                     if runtime.going_around_callsign.is_none() {
-                        runtime.going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                        runtime.going_around_callsign = Some(crate::crew_radio::crew_callsign(&xp).await);
                     }
                     let cs = runtime.going_around_callsign.clone().flatten();
-                    crate::circuit::transmit(crate::circuit::radio_call(&cs, "going around"));
+                    crate::crew_radio::transmit(crate::crew_radio::radio_call(&cs, "going around"));
                     // `radio` and `why` are the BALK's (the debrief's
                     // "GO-AROUND at N ft radio: why"); `called_radio` is
                     // where the climb made it real.
@@ -3241,12 +3241,12 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 {
                     runtime.owe_final_report = false;
                     if runtime.going_around_callsign.is_none() {
-                        runtime.going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                        runtime.going_around_callsign = Some(crate::crew_radio::crew_callsign(&xp).await);
                     }
                     let cs = runtime.going_around_callsign.clone().flatten();
-                    crate::circuit::transmit(crate::circuit::radio_call(
+                    crate::crew_radio::transmit(crate::crew_radio::radio_call(
                         &cs,
-                        &format!("final runway {}", crate::circuit::spell_runway(&rwy.id)),
+                        &format!("final runway {}", crate::crew_radio::spell_runway(&rwy.id)),
                     ));
                     crate::blackbox::record(
                         "autoland",
@@ -4926,7 +4926,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             "We're {:.0} miles from runway {} and opening. Abandoning the approach. \
                              Your aircraft — the vertical speed dial is zero.",
                             g.dist_nm,
-                            crate::circuit::spell_runway(&rwy.id)
+                            crate::crew_radio::spell_runway(&rwy.id)
                         ),
                         Priority::Warning,
                     );

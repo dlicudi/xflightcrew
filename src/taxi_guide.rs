@@ -376,7 +376,7 @@ impl Guide {
             return None;
         }
         // A tug has us: nothing about the route ahead is a cue yet.
-        if crate::pushback::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        if crate::flight_state::Owner::Pushback.active() {
             self.prev_fix = None;
             return None;
         }
@@ -815,17 +815,32 @@ pub(crate) fn project_signed_facing(
     }
 }
 
+/// Lateral drift at which the auto taxi stops the aircraft and gives steering
+/// back, once ESTABLISHED on the route. Deliberately much tighter than the
+/// guide/compliance 60 m: the law holds a couple of meters in normal work,
+/// so 25 m off means something is wrong (bad fix, blocked nosewheel, a
+/// route the geometry can't follow).
+pub(crate) const OFF_ROUTE_STOP_M: f64 = 25.0;
+/// Farther off than this at engage is a refusal: the projection onto the
+/// route stops meaning anything, and a blind cross-country drive to it
+/// isn't a join, it's a new route the tower never gave us.
+pub(crate) const MAX_JOIN_M: f64 = 150.0;
+/// Extra lateral allowance granted while joining, on top of the engage
+/// distance: room for the turning circle of a turn-around without ever
+/// letting a broken law wander further from the route than it started.
+pub(crate) const JOIN_GROW_M: f64 = 40.0;
+
 /// How much further off than the plain nearest paint a facing leg may lie
 /// and still be the leg we join: the join's own room past the plain answer
 /// (the established guard plus the turning circle), so a pick the drive
 /// would call off route is never made.
-const FACING_JUMP_M: f64 = crate::autotaxi::OFF_ROUTE_STOP_M + crate::autotaxi::JOIN_GROW_M;
+const FACING_JUMP_M: f64 = OFF_ROUTE_STOP_M + JOIN_GROW_M;
 
 /// How far off a facing segment may lie and still be read as the leg the
 /// aircraft is joining. The auto-taxi's own engage limit
-/// ([`crate::autotaxi::MAX_JOIN_M`]): further off than that is a refusal
+/// ([`MAX_JOIN_M`]): further off than that is a refusal
 /// there, so it cannot be the thing we are steering at here either.
-const FACING_REACH_M: f64 = crate::autotaxi::MAX_JOIN_M;
+const FACING_REACH_M: f64 = MAX_JOIN_M;
 
 /// How far past the route's end the offset is still taken square to the last
 /// leg. An overshoot of a stop is metres; further on, the end point is the

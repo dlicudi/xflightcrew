@@ -4414,9 +4414,66 @@ pub fn climb_full_rate_kts(leg_kts: f64, vy_kts: f64, floor_kts: f64) -> f64 {
     leg_kts.min(vy_kts).max(floor_kts + 2.0)
 }
 
-/// The least pattern speed, x clean Vs (`circuit::PATTERN_MIN_STALL_MULT`),
+/// The least pattern speed, x clean Vs ([`PATTERN_MIN_STALL_MULT`]),
 /// and the speed an upset recovery holds ([`recovery_hold_kts`]).
 pub const PATTERN_MIN_RATIO: f64 = 1.3;
+
+/// Ceiling on the pattern speed, as a multiple of the approach speed.
+const PATTERN_MAX_APPROACH_MULT: f64 = 1.5;
+
+/// The speed the pattern legs are flown at: the airframe's climb speed, but
+/// never more than [`PATTERN_MAX_APPROACH_MULT`] times its approach speed.
+///
+/// Vy is not a pattern speed on a jet. The Citation X's published best-rate
+/// figure is 300 KIAS (a cruise-climb number) and flown as a circuit speed it
+/// would ask for a turn radius of about ten kilometres from geometry that
+/// clamps at 2.5. The MD-82's 200 kt was the same mistake in a milder form.
+/// A pattern at 1.5x the approach speed is what these aircraft actually fly,
+/// and for every GA profile Vy already sits below that, so nothing changes.
+pub fn pattern_speed_kts(vy_kts: f64, approach_ias: f64, vs_clean_kts: Option<f64>) -> f64 {
+    let base = vy_kts
+        .max(60.0)
+        .min((approach_ias * PATTERN_MAX_APPROACH_MULT).max(60.0));
+    // ...and never near the CLEAN stall, because the pattern is flown clean.
+    // The Baron's Vy is 105 against an 84 kt clean stall: 1.25 Vs, which is
+    // four knots above the airspeed caution band (1.2 Vs = 100.8) and so every
+    // normal variation on downwind, base and final dipped into it. Six
+    // callouts in one circuit, and every one of them was correct: the aeroplane
+    // really was that close to the band. A flapped approach speed is not a
+    // clean pattern speed, and nothing here knew the difference.
+    let floor = vs_clean_kts.map_or(0.0, |v| v * PATTERN_MIN_STALL_MULT);
+    base.max(floor)
+}
+
+/// The clean pattern is flown no slower than this multiple of the CLEAN stall.
+/// 1.3 Vs is the usual approach minimum, and it is applied to the clean figure
+/// here because the circuit never lowers flap before the handoff. Only bites on
+/// an airframe whose Vy sits close to its clean stall: a 172 (Vy 74, stall 48)
+/// and an MD-82 (Vy 200, stall 100) are both untouched.
+const PATTERN_MIN_STALL_MULT: f64 = PATTERN_MIN_RATIO;
+
+/// Default pattern altitude above the field, feet (a standard light-aircraft
+/// circuit height). Not yet pilot-selectable by voice; a constant for now.
+const DEFAULT_TPA_AGL_FT: f64 = 1000.0;
+/// ...and the one a jet flies, which is the real-world figure and not
+/// decoration. The pattern feeds autoland, and the wider a pattern is the
+/// farther out it turns final: the MD-82's base leg reaches the centreline
+/// around 4 nm, where a 3° path is 1,340 ft up. Handing over from a 1,000 ft
+/// circuit there means arriving low and having to make it up, which is exactly
+/// what went wrong at Luton (2026-07-28).
+const JET_TPA_AGL_FT: f64 = 1500.0;
+/// Approach speed at or above which the pattern is a jet's, not a trainer's.
+const JET_APPROACH_KTS: f64 = 110.0;
+
+/// The pattern altitude this airframe should fly, from the only figure that
+/// distinguishes them here: how fast it flies its approach.
+pub fn pattern_alt_agl_ft(approach_ias: f64) -> f64 {
+    if approach_ias >= JET_APPROACH_KTS {
+        JET_TPA_AGL_FT
+    } else {
+        DEFAULT_TPA_AGL_FT
+    }
+}
 
 /// The approach speed an airframe that declares none flies, x Vso.
 pub const APPROACH_VSO_RATIO: f64 = 1.3;

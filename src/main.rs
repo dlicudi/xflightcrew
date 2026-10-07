@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
     let config: Config = (*settings::install(config)).clone();
     // The station's callsign resolver asks the crew for the override and the
     // plan's callsign through this provider, read fresh each time.
-    callsign::provide_inputs(circuit::callsign_inputs);
+    callsign::provide_inputs(crew_radio::callsign_inputs);
     // ...and the pilot's own airline telephony ("WAT=Walker"), asked before
     // its built-in tables, the same way.
     callsign::provide_telephony(settings::airline_telephony);
@@ -646,7 +646,7 @@ async fn main() -> Result<()> {
                                 .await
                                 .map(|v| v > 0.5)
                                 .unwrap_or(true);
-                            let callsign = crate::circuit::crew_callsign(&xp)
+                            let callsign = crate::crew_radio::crew_callsign(&xp)
                                 .await
                                 .unwrap_or_else(|| "your callsign".to_string());
                             let dist = party_line::active_field()
@@ -1343,21 +1343,21 @@ async fn run_session(
             // "my controls" was taken at +0.0 and routed at +26.1 s, after the
             // crew's "request taxi" and the tower's whole taxi clearance.
             let pilot_waiting = || loop_owed(input.is_some());
-            let calls = circuit::take_crew_radio();
+            let calls = crew_radio::take_crew_radio();
             // A discarded transmission is never silent. The queue is drained
             // unconditionally, so a failed gate loses the call for good — and
             // the caller (full auto) reads the resulting silence as the TOWER
             // not answering, which sent it hunting a clearance that was never
             // asked for (Heathrow 2026-07-27).
             // A readback that cannot go out is OUT for the crew waiting on it
-            // (`circuit::readback_out`): it is gone either way.
+            // (`crew_radio::readback_out`): it is gone either way.
             let delivered =
                 mode::atc_enabled() && voice.radio_powered() && atc_station.is_some();
             if !delivered {
                 for q in &calls {
-                    if let circuit::CrewCall::Text(t) = &q.call {
-                        if q.readback != circuit::Readback::No {
-                            circuit::note_readback_out(t);
+                    if let crew_radio::CrewCall::Text(t) = &q.call {
+                        if q.readback != crew_radio::Readback::No {
+                            crew_radio::note_readback_out(t);
                         }
                     }
                 }
@@ -1376,13 +1376,13 @@ async fn run_session(
                         // behind the one before it): LEMG's "5 mile final"
                         // went out 93 s late, in the flare (#143).
                         let age_s = queued.at.elapsed().as_secs_f64();
-                        if queued.holds != circuit::Holds::Always {
+                        if queued.holds != crew_radio::Holds::Always {
                             let facts = crew_radio_facts(&xplane).await;
-                            if let Some(why) = circuit::stale_reason(queued.holds, age_s, &facts)
+                            if let Some(why) = crew_radio::stale_reason(queued.holds, age_s, &facts)
                             {
                                 tracing::info!(
                                     target: "xvoicelayer::radio",
-                                    call = %circuit::call_words(&queued.call),
+                                    call = %crew_radio::call_words(&queued.call),
                                     why,
                                     age_s,
                                     "crew radio call dropped: no longer true"
@@ -1391,7 +1391,7 @@ async fn run_session(
                                     "crew_radio",
                                     serde_json::json!({
                                         "event": "crew_radio_stale",
-                                        "call": circuit::call_words(&queued.call),
+                                        "call": crew_radio::call_words(&queued.call),
                                         "why": why,
                                         "age_s": (age_s * 10.0).round() / 10.0,
                                         "on_ground": facts.on_ground,
@@ -1406,12 +1406,12 @@ async fn run_session(
                         // while the tower still waits for those words: a copy
                         // queued twice went out in the takeoff roll (LEMG 13,
                         // 2026-09-28, #172).
-                        if let (circuit::Readback::OwedCopy, circuit::CrewCall::Text(t)) =
+                        if let (crew_radio::Readback::OwedCopy, crew_radio::CrewCall::Text(t)) =
                             (queued.readback, &queued.call)
                         {
                             let owed = crate::party_line::readback_owed();
-                            if circuit::owed_copy_stale(t, owed.as_deref()) {
-                                circuit::note_readback_out(t);
+                            if crew_radio::owed_copy_stale(t, owed.as_deref()) {
+                                crew_radio::note_readback_out(t);
                                 blackbox::record(
                                     "crew_radio",
                                     serde_json::json!({
@@ -1428,19 +1428,19 @@ async fn run_session(
                             "crew_radio",
                             serde_json::json!({
                                 "event": "crew_radio_sent",
-                                "call": circuit::call_words(&queued.call),
+                                "call": crew_radio::call_words(&queued.call),
                                 "age_s": (age_s * 10.0).round() / 10.0,
-                                "readback": queued.readback != circuit::Readback::No,
+                                "readback": queued.readback != crew_radio::Readback::No,
                             }),
                         );
-                        let queued_readback = queued.readback != circuit::Readback::No;
+                        let queued_readback = queued.readback != crew_radio::Readback::No;
                         let call = queued.call;
                         // A check-in is rendered NOW, with the frequency quiet
                         // (bounded), so the altitude it names is the one being
                         // passed as it is spoken.
                         let call = match call {
-                            circuit::CrewCall::Text(t) => t,
-                            circuit::CrewCall::CheckIn {
+                            crew_radio::CrewCall::Text(t) => t,
+                            crew_radio::CrewCall::CheckIn {
                                 callsign,
                                 to,
                                 climb_to_ft,
@@ -1476,7 +1476,7 @@ async fn run_session(
                             .handle_transmission(&call.to_ascii_lowercase(), xplane.view())
                             .await;
                         if queued_readback {
-                            circuit::note_readback_out(&call);
+                            crew_radio::note_readback_out(&call);
                         }
                         efb::feed::crew_transmits(&format!("{call}."), queued_readback);
                         say_or(
@@ -2152,7 +2152,7 @@ async fn run_session(
                 config.fix_data_path.clone(),
             );
             let line = tokio::task::spawn_blocking(move || {
-                rapport::arrival_brief(&apt, &cifp, &fixes, &tools::autoland::xplane_root())
+                rapport::arrival_brief(&apt, &cifp, &fixes, &crate::config::xplane_root())
             })
             .await
             .unwrap_or_else(|_| "I couldn't put the arrival brief together.".to_string());
@@ -2474,161 +2474,17 @@ async fn run_session(
             // giving it back. Naming a lever releases just that one; a generic
             // "my controls" / "let go" releases everything held.
             {
-                // owners-by-name: each lever is released by its own loop.
-                use std::sync::atomic::Ordering::Relaxed;
-                let speed_held = tools::speedhold::ACTIVE.load(Relaxed);
-                // Holding the mixture is the continuous manager OR a lean
-                // seek still hunting the peak — "my mixture" stops either.
-                let mix_held = tools::engine::MIX_MANAGED.load(Relaxed)
-                    || tools::engine::LEAN_SEEKING.load(Relaxed);
-                let reverse_in = tools::reverse::ACTIVE.load(Relaxed);
-                let taxi_driving = autotaxi::ACTIVE.load(Relaxed);
-                let takeoff_flying = autotakeoff::ACTIVE.load(Relaxed);
-                let circuit_flying = circuit::ACTIVE.load(Relaxed);
-                let procedure_flying = procedure::ACTIVE.load(Relaxed);
-                let full_auto_running = full_auto::ACTIVE.load(Relaxed);
-                // A taxi-in between its drives (the request's wait) holds
-                // the aircraft with no auto taxi running.
-                let taxi_in_running = crate::taxi_in::running();
-                let hover_holding = hover::ACTIVE.load(Relaxed);
-                // A helicopter's route or circuit: in cruise the hover loop
-                // is not running, and the route's speed law owns the
-                // collective until it is told to let go.
-                let heli_flying =
-                    heli_route::ACTIVE.load(Relaxed) || heli_circuit::ACTIVE.load(Relaxed);
-                if (hover_holding
-                    || heli_flying
-                    || speed_held
-                    || mix_held
-                    || reverse_in
-                    || taxi_driving
-                    || taxi_in_running
-                    || takeoff_flying
-                    || circuit_flying
-                    || procedure_flying
-                    || full_auto_running)
+                // The one read of what the crew holds and the one door that
+                // lets each go (`flight_state::Held`), in its own order.
+                let held = flight_state::Held::now();
+                if held.any()
                     && release_intent(&tl)
                     // "Put us on final, my controls" is a new flight the
                     // pilot will fly, not a hand-back of this one.
                     && !grammar::approach_setup_request(&tl)
                     && !grammar::enroute_setup_request(&tl)
                 {
-                    let names_mix = tl.contains("mixture") || tl.contains("mix");
-                    let names_speed = tl.contains("throttle")
-                        || tl.contains("speed")
-                        || tl.contains("power")
-                        || tl.contains("taxi")
-                        || tl.contains("thr");
-                    // The steering half of an auto taxi, releasable on its
-                    // own: "my steering" keeps the speed hold — the
-                    // pre-existing "you steer, I have the throttle" split.
-                    let names_steer = tl.contains("steer")
-                        || tl.contains("pedal")
-                        || tl.contains("rudder")
-                        || tl.contains("nosewheel");
-                    let names_reverse = tl.contains("reverse");
-                    // "Release parking brake" names a lever NOBODY here holds:
-                    // it's for the brake tool, so it must not count as a
-                    // generic release — that dropped the speed hold instead
-                    // and left the throttle up with the brake still set
-                    // (SR22, 2026-07-11).
-                    let generic = !names_mix
-                        && !names_speed
-                        && !names_reverse
-                        && !names_steer
-                        && !tl.contains("brake");
-                    let mut released: Vec<&str> = Vec::new();
-                    // A helicopter's hover: the collective is ours and the
-                    // autopilot holds the position. "My controls" or naming
-                    // the collective hands both back where they are.
-                    if heli_flying && (generic || tl.contains("collective")) {
-                        // The route lets go of the collective where it is and
-                        // leaves the autopilot in the mode it is flying.
-                        heli_route::abort();
-                        heli_circuit::abort();
-                        released.push("route off");
-                    }
-                    if hover_holding && (generic || tl.contains("collective")) {
-                        hover::abort();
-                        released.push("hover off, your controls");
-                    }
-                    // Full auto owns the entire chain (engine, taxi, line-up,
-                    // circuit); cancelling it stands them all down and wins the
-                    // release, so the per-loop branches below are skipped.
-                    if full_auto_running && (names_speed || names_steer || generic) {
-                        full_auto::abort();
-                        released.push("full auto off, your aircraft");
-                    }
-                    // A circuit in progress owns whichever sub-loop is flying
-                    // (takeoff or autoland); aborting it stands them ALL down,
-                    // so it wins the generic release and the per-loop branches
-                    // below are skipped (they'd double up on its sub-loops).
-                    if !full_auto_running
-                        && circuit_flying
-                        && (names_speed || names_steer || generic)
-                    {
-                        circuit::abort();
-                        released.push("circuit off, your aircraft");
-                    }
-                    // A published-procedure follower is airborne on the AP (it
-                    // aborts its autoland handoff too); a lever-shaped or generic
-                    // release hands it back.
-                    if !full_auto_running
-                        && !circuit_flying
-                        && procedure_flying
-                        && (names_speed || generic)
-                    {
-                        procedure::abort();
-                        released.push("procedure off, your aircraft");
-                    }
-                    // A takeoff in progress: "my controls" is a HANDOVER, not
-                    // a reject — the loop stands down silently, steering
-                    // expires, and the power stays set for the pilot now
-                    // flying it ("abort takeoff" is the arresting path).
-                    if !circuit_flying
-                        && !full_auto_running
-                        && takeoff_flying
-                        && (names_speed || names_steer || generic)
-                    {
-                        autotakeoff::cancel();
-                        released.push("your takeoff, power is set");
-                    }
-                    // The taxi-in ends where it is, braked to a stop and
-                    // parked: a stopped drive alone was driven again to the
-                    // stand 7 s later (LEMG, 2026-09-28).
-                    let taxi_in_ended = taxi_in_running && (names_speed || generic);
-                    if taxi_in_ended {
-                        crate::taxi_in::abort(true);
-                        released.push("taxi in off, your aircraft");
-                    }
-                    if !circuit_flying
-                        && !full_auto_running
-                        && !taxi_in_ended
-                        && taxi_driving
-                        && (names_speed || names_steer || generic)
-                    {
-                        autotaxi::halt();
-                        if names_steer && !names_speed && !generic {
-                            released.push("steering's yours, I still have the speed");
-                        } else {
-                            tools::speedhold::release();
-                            released.push("auto taxi off, your aircraft");
-                        }
-                    } else if speed_held && !taxi_in_ended && (names_speed || generic) {
-                        tools::speedhold::release();
-                        released.push("speed hold off, your throttle");
-                    }
-                    if mix_held && (names_mix || generic) {
-                        tools::engine::release_mixture();
-                        released.push("mixture's yours");
-                    }
-                    // Reverse rides the same levers as the speed hold — any
-                    // lever-shaped release stows it (the watcher glides the
-                    // levers back to idle on its way out).
-                    if reverse_in && (names_reverse || names_speed || generic) {
-                        tools::reverse::stow();
-                        released.push("stowing reverse");
-                    }
+                    let released = held.release_to_pilot(&tl);
                     if !released.is_empty() {
                         crate::flight::note_pilot_takeover("my controls");
                         let line = format!("Copy — {}.", released.join("; "));
@@ -2704,7 +2560,7 @@ async fn run_session(
                         .await
                         .map(|v| v > 0.5)
                         .unwrap_or(true);
-                    let callsign = crate::circuit::crew_callsign(&xplane)
+                    let callsign = crate::crew_radio::crew_callsign(&xplane)
                         .await
                         .unwrap_or_else(|| "your callsign".to_string());
                     let dist = match (position(&xplane).await, party_line::active_field()) {
@@ -2892,8 +2748,7 @@ async fn run_session(
                                 .to_string()
                         }
                         RemoteWeather::Station { icao, label } => {
-                            match weather::briefing(&tools::autoland::xplane_root(), &icao, &label)
-                            {
+                            match weather::briefing(&crate::config::xplane_root(), &icao, &label) {
                                 Ok(l) | Err(l) => l,
                             }
                         }
@@ -4128,13 +3983,13 @@ fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
 
 /// The live facts a queued crew call is judged against (#143), read together.
 /// A failed read is `None`: no measurement, never a reason to drop a call.
-async fn crew_radio_facts(xp: &XPlaneClient) -> circuit::RadioFacts {
+async fn crew_radio_facts(xp: &XPlaneClient) -> crew_radio::RadioFacts {
     let (ground, agl, gs) = tokio::join!(
         xp.get_float(datarefs::ON_GROUND_ANY),
         xp.get_float(datarefs::AGL_METERS),
         xp.get_float(autotaxi::GS_MS),
     );
-    circuit::RadioFacts {
+    crew_radio::RadioFacts {
         on_ground: ground.ok().map(|v| v > 0.5),
         agl_ft: agl.ok().map(|m| m * 3.28084),
         gs_kts: gs.ok().map(|ms| ms.abs() * 1.943_844),

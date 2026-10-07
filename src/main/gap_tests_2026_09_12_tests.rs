@@ -107,7 +107,7 @@
     #[test]
     fn the_runway_length_question_is_answered_from_the_takeoffs_own_fit() {
         use crate::answers::{takeoff_runway_line, takeoff_runway_query};
-        use crate::autotakeoff::NoFit;
+        use crate::runway::NoFit;
         for q in [
             "Do we have enough runway for takeoff?",
             "is the runway long enough",

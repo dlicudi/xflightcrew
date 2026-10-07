@@ -519,6 +519,15 @@ impl Config {
     }
 }
 
+/// Where the Global Airports apt.dat lives: `XCOPILOT_APT_DAT` overrides the
+/// standard install path.
+pub fn apt_dat_path() -> String {
+    if let Ok(p) = std::env::var("XCOPILOT_APT_DAT") {
+        return p;
+    }
+    xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat")
+}
+
 /// The X-Plane install the sim is running from: `XCOPILOT_XPLANE_ROOT`
 /// overrides the standard location, `$HOME/X-Plane 12`.
 pub fn xplane_root() -> String {

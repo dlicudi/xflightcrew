@@ -918,7 +918,7 @@ impl ClearanceWatch {
 /// The final report's words: the runway the spot lands on, else plain.
 pub fn final_words(rwy: Option<&str>, asking: bool) -> String {
     let base = match rwy {
-        Some(r) => format!("final runway {}", crate::circuit::spell_runway(r)),
+        Some(r) => format!("final runway {}", crate::crew_radio::spell_runway(r)),
         None => "final".to_string(),
     };
     if asking {
@@ -1298,7 +1298,7 @@ async fn call_departure(xp: &XPlaneClient, voice: &Option<Voice>, config: &crate
     let Some(khz) = crate::party_line::home_tower_khz() else {
         return;
     };
-    let callsign = crate::circuit::crew_callsign(xp).await;
+    let callsign = crate::crew_radio::crew_callsign(xp).await;
     DETAIL.set("waiting for the zone clearance");
     let ctx = crate::tools::ToolCtx {
         xplane: xp,
@@ -1319,7 +1319,10 @@ async fn call_departure(xp: &XPlaneClient, voice: &Option<Voice>, config: &crate
         .set_float(crate::datarefs::COM1_FREQ_KHZ, khz as f64)
         .await;
     crate::full_auto::transponder_before_departure(xp, voice, "heli_pad").await;
-    crate::circuit::transmit(crate::circuit::radio_call(&callsign, "ready for departure"));
+    crate::crew_radio::transmit(crate::crew_radio::radio_call(
+        &callsign,
+        "ready for departure",
+    ));
     DETAIL.set("waiting for the departure clearance");
     crate::blackbox::record(
         "heli_route",
@@ -1374,7 +1377,7 @@ fn obey_handoffs(base_url: &str, voice: &Option<Voice>, climb_to_ft: f64) {
             status: None,
             reminders: None,
         };
-        let callsign = crate::circuit::crew_callsign(&xp).await;
+        let callsign = crate::crew_radio::crew_callsign(&xp).await;
         if let Some((to, khz)) = departure {
             crate::blackbox::record(
                 "heli_route",
@@ -1479,8 +1482,11 @@ fn call_inbound(base_url: &str, khz: i64) {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        let callsign = crate::circuit::crew_callsign(&xp).await;
-        crate::circuit::transmit(crate::circuit::radio_call(&callsign, "inbound for landing"));
+        let callsign = crate::crew_radio::crew_callsign(&xp).await;
+        crate::crew_radio::transmit(crate::crew_radio::radio_call(
+            &callsign,
+            "inbound for landing",
+        ));
         INBOUND_SENT.store(true, Ordering::SeqCst);
         crate::blackbox::record(
             "heli_route",
@@ -1534,12 +1540,15 @@ fn call_transit(base_url: &str, level_ft: f64) {
     let base = base_url.to_string();
     tokio::spawn(async move {
         let xp = XPlaneClient::new(base);
-        let callsign = crate::circuit::crew_callsign(&xp).await;
+        let callsign = crate::crew_radio::crew_callsign(&xp).await;
         let alt = xp
             .get_float(crate::datarefs::ALTITUDE_FT)
             .await
             .unwrap_or(level_ft);
-        crate::circuit::transmit(crate::circuit::radio_call(&callsign, &transit_words(alt)));
+        crate::crew_radio::transmit(crate::crew_radio::radio_call(
+            &callsign,
+            &transit_words(alt),
+        ));
     });
 }
 
@@ -2003,7 +2012,7 @@ async fn fly(
                     Priority::Readback,
                     format!(
                         "Tower wants runway {}. Landing on it.",
-                        crate::circuit::spell_runway(&id)
+                        crate::crew_radio::spell_runway(&id)
                     ),
                 );
                 pad_rwy = Some(id);
@@ -2657,15 +2666,21 @@ async fn fly(
                                 && readback_sent.as_deref() != Some(owed.as_str()) =>
                         {
                             readback_sent = Some(owed.clone());
-                            let cs = crate::circuit::crew_callsign(&xp).await;
+                            let cs = crate::crew_radio::crew_callsign(&xp).await;
                             let rwy = crate::party_line::clearance_runway();
                             let words = match rwy.as_deref() {
                                 Some(r) if !route.on_pad => {
-                                    format!("cleared to land runway {}", crate::circuit::spell_runway(r))
+                                    format!(
+                                        "cleared to land runway {}",
+                                        crate::crew_radio::spell_runway(r)
+                                    )
                                 }
                                 _ => "cleared to land".to_string(),
                             };
-                            crate::circuit::transmit_readback(crate::circuit::radio_call(&cs, &words), false);
+                            crate::crew_radio::transmit_readback(
+                                crate::crew_radio::radio_call(&cs, &words),
+                                false,
+                            );
                             crate::blackbox::record(
                                 "heli_route",
                                 serde_json::json!({ "event": "landing_readback", "rwy": rwy, "to_pad_m": to_pad }),
@@ -2678,8 +2693,8 @@ async fn fly(
                 match clearance.step(t0.elapsed().as_secs_f64(), needs, tower_ready, cleared, held) {
                     Some(step @ (ClearanceStep::ReportFinal | ClearanceStep::Ask)) => {
                         let asking = step == ClearanceStep::Ask;
-                        let cs = crate::circuit::crew_callsign(&xp).await;
-                        crate::circuit::transmit(crate::circuit::radio_call(
+                        let cs = crate::crew_radio::crew_callsign(&xp).await;
+                        crate::crew_radio::transmit(crate::crew_radio::radio_call(
                             &cs,
                             &final_words(pad_rwy.as_deref(), asking),
                         ));
@@ -3458,7 +3473,7 @@ mod tests {
             words,
             "helicopter, two thousand two hundred feet, request zone transit"
         );
-        let call = crate::circuit::radio_call(&Some("Delta Hotel Xray".into()), &words);
+        let call = crate::crew_radio::radio_call(&Some("Delta Hotel Xray".into()), &words);
         assert_eq!(
             crate::tower::parse_intent(&call),
             crate::tower::Intent::RequestTransit,
@@ -3693,7 +3708,7 @@ mod tests {
     #[ignore]
     fn real_install_ethc_helipads() {
         let pads = helipads(
-            &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat"),
+            &crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat"),
             "ETHC",
         );
         assert!(pads.len() >= 18, "{}", pads.len());
@@ -3853,7 +3868,10 @@ mod tests {
             final_words(None, false),
             final_words(None, true),
         ] {
-            let call = crate::circuit::radio_call(&Some("November five seven six X-ray Papa".into()), &w);
+            let call = crate::crew_radio::radio_call(
+                &Some("November five seven six X-ray Papa".into()),
+                &w,
+            );
             assert_eq!(
                 crate::tower::parse_intent(&call.to_ascii_lowercase()),
                 crate::tower::Intent::ReportFinal,

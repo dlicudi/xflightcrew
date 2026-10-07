@@ -72,6 +72,9 @@ pub(crate) const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 /// fight (flaky "stop" since 2026-07-11, pinned 2026-07-13). A command can't
 /// be stomped and can't stick.
 pub(crate) const BRAKES_REGULAR: &str = "sim/flight_controls/brakes_regular";
+/// Maximum braking, held: a rejected takeoff is a maximum-effort stop, and a
+/// hand-back from a rollout's speed brakes as hard.
+pub(crate) const BRAKES_MAX: &str = "sim/flight_controls/brakes_max";
 /// How long each activation holds the brakes. Comfortably longer than a
 /// renewal tick, so the hold is continuous while renewed, and any end of the
 /// holder (release, crash, kill -9) frees the brakes within this long, by

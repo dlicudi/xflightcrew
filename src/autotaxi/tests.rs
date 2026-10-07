@@ -179,7 +179,7 @@
     #[test]
     #[ignore] // needs the real X-Plane install
     fn live_lemg_190_join_turn_stays_on_the_pavement() {
-        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let apt = &crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
         let Ok(Some(net)) = atc::nav::find_taxi_net(apt, "LEMG") else {
             return;
         };
@@ -1107,7 +1107,7 @@
 
     #[test]
     fn line_up_enters_ahead_and_finishes_down_the_centreline() {
-        use crate::autoland::{along_track_nm, cross_track_nm, Runway};
+        use crate::runway::{along_track_nm, cross_track_nm, Runway};
         // A 2,000 m runway taking off due north from (0,0); hold-short spot
         // 40 m EAST of the centreline, abeam the numbers.
         let rwy = Runway {
@@ -1153,7 +1153,8 @@
 
     #[test]
     fn line_up_rolls_forward_along_the_heading_not_a_diagonal() {
-        use crate::autoland::{bearing_deg, cross_track_nm, Runway};
+        use crate::autoland::bearing_deg;
+        use crate::runway::{cross_track_nm, Runway};
         // Runway 36 (course 0, due north) from (0,0). Hold-short 40 m EAST of
         // the centreline, abeam the numbers.
         let rwy = Runway {
@@ -1200,7 +1201,7 @@
     #[ignore]
     fn live_lxgb_line_up_lead_on() {
         let apt =
-            &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+            &crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
         let net = crate::nav::find_taxi_net(apt, "LXGB")
             .unwrap()
             .expect("LXGB network");
@@ -1236,7 +1237,7 @@
         );
         // Now the picker, from the route's actual end (where the taxi stops).
         let &(hlat, hlon) = plan.path.last().unwrap();
-        let cands = crate::autoland::nearby_runways(apt, hlat, hlon, 1.0).unwrap();
+        let cands = crate::runway::nearby_runways(apt, hlat, hlon, 1.0).unwrap();
         let picked = pick_line_up_plan(
             &cands,
             hlat,
@@ -1280,7 +1281,7 @@
     #[ignore]
     fn live_lfpb_line_up_finds_runway_07() {
         let apt =
-            &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+            &crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
         let Ok(Some(net)) = crate::nav::find_taxi_net(apt, "LFPB") else {
             return; // no install, no verdict
         };
@@ -1301,7 +1302,7 @@
         // From the route's own end — where the drive stops, 48.962592,
         // 2.421745 on the day, heading 266.9 (the hold faces west).
         let &(hlat, hlon) = plan.path.last().unwrap();
-        let cands = crate::autoland::nearby_runways(apt, hlat, hlon, 1.0).unwrap();
+        let cands = crate::runway::nearby_runways(apt, hlat, hlon, 1.0).unwrap();
         let (rwy, lp) = pick_line_up_plan(
             &cands,
             hlat,
@@ -1335,12 +1336,12 @@
     #[test]
     #[ignore] // needs the real X-Plane install
     fn live_lemg_13_lead_on_runs_one_way() {
-        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let apt = &crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
         let Ok(Some(net)) = atc::nav::find_taxi_net(apt, "LEMG") else {
             return;
         };
         let (hlat, hlon) = (36.684854, -4.511439);
-        let rwy = crate::autoland::runway_by_id(apt, hlat, hlon, "13", 5.0, Some("LEMG"))
+        let rwy = crate::runway::runway_by_id(apt, hlat, hlon, "13", 5.0, Some("LEMG"))
             .unwrap()
             .expect("LEMG 13");
         let runways = atc::nav::find_runways(apt, "LEMG").unwrap();
@@ -1418,7 +1419,7 @@
     #[test]
     #[ignore] // needs the real X-Plane install
     fn real_install_corner_caps_are_never_faster() {
-        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let apt = &crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
         if !std::path::Path::new(apt).exists() {
             return;
         }
@@ -1788,7 +1789,7 @@
     #[test]
     #[ignore] // needs the real X-Plane install
     fn live_lemg_194_route_rides_its_fillets() {
-        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let apt = &crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
         let Ok(Some(net)) = atc::nav::find_taxi_net(apt, "LEMG") else {
             return;
         };
@@ -1834,7 +1835,8 @@
     /// dropped, so both projections of a stopped aircraft agree.
     #[test]
     fn a_line_up_from_past_the_hold_never_runs_back_to_it() {
-        use crate::autoland::{project_latlon, Runway};
+        use crate::autoland::project_latlon;
+        use crate::runway::Runway;
         let rwy = Runway {
             icao: "TEST".into(),
             id: "36".into(),
@@ -1873,7 +1875,8 @@
 
     #[test]
     fn line_up_drives_the_authored_lead_on_when_it_is_ours() {
-        use crate::autoland::{project_latlon, Runway};
+        use crate::autoland::project_latlon;
+        use crate::runway::Runway;
         // Runway 36 from (0,0); hold 40 m east of the centreline, abeam 100 m.
         let rwy = Runway {
             icao: "TEST".into(),
@@ -1919,7 +1922,7 @@
         // The arc stays between the two legs: every sampled point is on the
         // hold side of the centreline and short of the stop.
         for p in &path[4..path.len() - 1] {
-            let x = crate::autoland::cross_track_nm(p.0, p.1, &rwy) * 1852.0;
+            let x = crate::runway::cross_track_nm(p.0, p.1, &rwy) * 1852.0;
             assert!(
                 (-1.0..=40.0).contains(&x),
                 "arc point off the corner: x={x}"
@@ -1962,7 +1965,8 @@
     /// direction it turns at the top is ours to choose.
     #[test]
     fn a_backtrack_enters_along_the_drawn_stub_not_across_the_grass() {
-        use crate::autoland::{cross_track_nm, project_latlon, Runway};
+        use crate::autoland::project_latlon;
+        use crate::runway::{cross_track_nm, Runway};
         let rwy = Runway {
             icao: "TEST".into(),
             id: "36".into(),
@@ -1987,7 +1991,7 @@
         // Every point of the entry, up to the junction, stays on the stub's
         // own along-track station — it never drifts down the runway before
         // reaching the centreline, which is exactly what crossed the grass.
-        let a_of = |p: (f64, f64)| -crate::autoland::along_track_nm(p.0, p.1, &rwy) * 1852.0;
+        let a_of = |p: (f64, f64)| -crate::runway::along_track_nm(p.0, p.1, &rwy) * 1852.0;
         let mut reached = false;
         for p in &path {
             let x = cross_track_nm(p.0, p.1, &rwy) * 1852.0;
@@ -2020,7 +2024,7 @@
 
     #[test]
     fn line_up_pick_honors_the_cleared_runway() {
-        use crate::autoland::Runway;
+        use crate::runway::Runway;
         let mk = |id: &str, course: f64, thr: (f64, f64), dist: f64| Runway {
             icao: "TEST".into(),
             id: id.into(),
@@ -2057,7 +2061,7 @@
     /// straightens inside 60 m.
     #[test]
     fn a_backtracks_leg_two_spends_little_runway() {
-        use crate::autoland::{along_track_nm, Runway};
+        use crate::runway::{along_track_nm, Runway};
         let rwy = Runway {
             icao: "LILB".into(),
             id: "03".into(),
@@ -2083,7 +2087,7 @@
 
     #[test]
     fn backtrack_drives_to_a_pocket_beside_the_numbers() {
-        use crate::autoland::{along_track_nm, cross_track_nm, Runway};
+        use crate::runway::{along_track_nm, cross_track_nm, Runway};
         // The LXGB shape: a 1,712 m runway, hold-short stub 1,170 m down it
         // (holding point Charlie left 580 m ahead for a 09 departure,
         // 2026-07-22). Runway 36 from (0,0) for test geometry.
@@ -2136,7 +2140,7 @@
 
     #[test]
     fn line_up_plan_backtracks_to_the_numbers_from_a_deep_intersection() {
-        use crate::autoland::Runway;
+        use crate::runway::Runway;
         let rwy = Runway {
             icao: "TEST".into(),
             id: "36".into(),
@@ -2534,9 +2538,9 @@
     }
 
     /// LILB 03 as apt.dat draws it: 601 m of 15 m pavement.
-    fn lilb_03() -> crate::autoland::Runway {
+    fn lilb_03() -> crate::runway::Runway {
         let (a, b) = ((45.7671573, 9.1605458), (45.7720916, 9.1636892));
-        crate::autoland::Runway {
+        crate::runway::Runway {
             icao: "LILB".into(),
             id: "03".into(),
             thr_lat: a.0,
@@ -2784,7 +2788,7 @@
     /// airframe that does not pivot.
     #[test]
     fn a_pivoting_turn_round_turns_across_the_strip_near_the_numbers() {
-        use crate::autoland::{along_track_nm, cross_track_nm};
+        use crate::runway::{along_track_nm, cross_track_nm};
         let rwy = lilb_03();
         let pivot = super::TurnRound { pivots: true, width_m: Some(15.0) };
         let (start, pocket_m, off) = pivot.pocket();
@@ -2912,7 +2916,7 @@
     /// 6.6 m, and from the good flight's 5.1 m (1790724857) 6.7.
     #[test]
     fn a_turn_round_pocket_keeps_the_outer_wheel_on_the_pavement() {
-        use crate::autoland::cross_track_nm;
+        use crate::runway::cross_track_nm;
         const HALF_TRACK_M: f64 = 1.6;
         let rwy = lilb_03();
         let pivot = super::TurnRound { pivots: true, width_m: Some(15.0) };
@@ -2936,7 +2940,7 @@
     /// 21 hold, off the strip, the plan is unchanged.
     #[test]
     fn a_line_up_from_on_the_strip_settles_onto_the_centreline() {
-        use crate::autoland::{along_track_nm, cross_track_nm};
+        use crate::runway::{along_track_nm, cross_track_nm};
         let rwy = lilb_03();
         let pivot = super::TurnRound { pivots: true, width_m: Some(15.0) };
         let (lat, lon, hdg) = (45.767_514_4, 9.160_694_0, 9.7);

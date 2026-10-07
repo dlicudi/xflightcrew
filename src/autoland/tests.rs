@@ -3269,7 +3269,7 @@
     /// the loop sends against the parser that has to understand it.
     #[test]
     fn the_going_around_call_reads_as_a_go_around_to_the_tower() {
-        let call = crate::circuit::radio_call(
+        let call = crate::crew_radio::radio_call(
             &Some("November five five two Alpha Alpha".to_string()),
             "going around",
         );
@@ -3279,7 +3279,7 @@
             "{call}"
         );
         // ...and without a readable tail number it still parses.
-        let bare = crate::circuit::radio_call(&None, "going around");
+        let bare = crate::crew_radio::radio_call(&None, "going around");
         assert_eq!(
             crate::tower::parse_intent(&bare),
             crate::tower::Intent::GoAround
@@ -3295,7 +3295,7 @@
     fn the_vectored_arrival_calls_read_as_the_tower_expects() {
         let cs = Some("November five five two Alpha Alpha".to_string());
 
-        let ask = crate::circuit::radio_call(&cs, "request vectors");
+        let ask = crate::crew_radio::radio_call(&cs, "request vectors");
         assert_eq!(
             crate::tower::parse_intent(&ask.to_ascii_lowercase()),
             crate::tower::Intent::RequestVectors,
@@ -3303,14 +3303,14 @@
         );
         // ...and with no readable tail number.
         assert_eq!(
-            crate::tower::parse_intent(&crate::circuit::radio_call(&None, "request vectors")),
+            crate::tower::parse_intent(&crate::crew_radio::radio_call(&None, "request vectors")),
             crate::tower::Intent::RequestVectors
         );
 
         // "established" is the report the ILS clearance asks for, and it must
         // reach the tower as the FINAL report that earns the landing
         // clearance — not as an unknown.
-        let est = crate::circuit::radio_call(&cs, "established");
+        let est = crate::crew_radio::radio_call(&cs, "established");
         assert_ne!(
             crate::tower::parse_intent(&est.to_ascii_lowercase()),
             crate::tower::Intent::Unknown,

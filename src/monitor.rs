@@ -635,8 +635,8 @@ impl Snapshot {
             dest_route_nm,
             follower_tod: crate::procedure::planned_tod(),
             follower_flying: follower_flying(
-                crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
-                crate::heli_route::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                crate::flight_state::Owner::Procedure.active(),
+                crate::flight_state::Owner::HeliRoute.active(),
             ),
             flight_peak_ft: crate::flight::published().map(|f| f.peak_alt_ft).filter(|p| *p > 0.0),
             baro_inhg,
@@ -763,7 +763,7 @@ fn flight_sample(s: &Snapshot, t: f64, crashed: bool) -> crate::flight::Sample {
         } else {
             None
         },
-        approach: Some(crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)),
+        approach: Some(crate::flight_state::Owner::Autoland.active()),
         automation: flying_loop(),
         autopilot: Some(s.ap_servos_on),
         crashed: Some(crashed),
@@ -2327,7 +2327,7 @@ impl Check for StepClimb {
             "We're {} feet below optimum at this weight. Flight level {} would burn less if \
              you can get it.{}",
             crate::auto_status::commas(((optimum - s.alt_ft) / 100.0).round() as i64 * 100),
-            crate::circuit::spell_runway(&format!("{:03}", (step / 100.0).round() as i64)),
+            crate::crew_radio::spell_runway(&format!("{:03}", (step / 100.0).round() as i64)),
             wind.unwrap_or_default(),
         ))
     }
@@ -3971,8 +3971,10 @@ pub async fn run(
                             };
                             v.alert(prio, &said);
                             if let Some(words) = readback {
-                                let cs = crate::circuit::crew_callsign(&xp).await;
-                                crate::circuit::transmit(crate::circuit::radio_call(&cs, &words));
+                                let cs = crate::crew_radio::crew_callsign(&xp).await;
+                                crate::crew_radio::transmit(crate::crew_radio::radio_call(
+                                    &cs, &words,
+                                ));
                             }
                         });
                     }
@@ -4012,7 +4014,7 @@ pub async fn run(
                                 let line = match &ask {
                                     Some(a) => format!(
                                         "Runway {} is {:.0} metres, we need {:.0}. Ask the tower: {}.",
-                                        crate::circuit::spell_runway(&cleared),
+                                        crate::crew_radio::spell_runway(&cleared),
                                         length_m,
                                         needed_m,
                                         crate::runway::runway_request_call(&cleared, a)
@@ -4418,7 +4420,7 @@ pub async fn run(
                     snap.agl_ft,
                     snap.vsi_fpm,
                     snap.groundspeed_kts,
-                    crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                    crate::flight_state::Owner::Autoland.active(),
                     xtk,
                 ) {
                     // The record for the debrief; the SPOKEN word about the
@@ -5063,7 +5065,7 @@ fn feed_surface_wind() {
         *last = Some((std::time::Instant::now(), icao.clone()));
     }
     tokio::task::spawn_blocking(move || {
-        let wind = crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &icao);
+        let wind = crate::weather::surface_wind(&crate::config::xplane_root(), &icao);
         crate::party_line::set_surface_wind(lat, lon, wind);
     });
 }

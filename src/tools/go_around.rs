@@ -31,9 +31,9 @@ impl Tool for GoAround {
         json!({"type": "object", "properties": {}})
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        use std::sync::atomic::Ordering;
-        let autoland = crate::autoland::ACTIVE.load(Ordering::SeqCst);
-        let circuit = crate::circuit::ACTIVE.load(Ordering::SeqCst);
+        use crate::flight_state::Owner;
+        let autoland = Owner::Autoland.active();
+        let circuit = Owner::Circuit.active();
         // An unread ground flag is not a landing: the loop's own latch
         // refuses an order on the wheels anyway.
         let on_ground = ctx

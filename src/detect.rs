@@ -316,11 +316,9 @@ fn with_acf_checklist(
     who: &AcfIdentity,
 ) -> aircraft::AircraftProfile {
     if let Some(c) = p.checklist.as_deref() {
-        if let Some(path) = crate::checklist::resolve_acf_path(
-            c,
-            &who.relative_path,
-            &tools::autoland::xplane_root(),
-        ) {
+        if let Some(path) =
+            crate::checklist::resolve_acf_path(c, &who.relative_path, &crate::config::xplane_root())
+        {
             p.checklist = Some(path);
         }
     }
@@ -467,7 +465,7 @@ pub(crate) async fn acf_text(xp: &XPlaneClient) -> Option<String> {
         .await
         .ok()
         .filter(|r| !r.is_empty())?;
-    std::fs::read_to_string(format!("{}/{}", tools::autoland::xplane_root(), rel)).ok()
+    std::fs::read_to_string(format!("{}/{}", crate::config::xplane_root(), rel)).ok()
 }
 
 /// A profile for an unmatched airframe from its own `.acf`: the identity names
@@ -480,7 +478,7 @@ pub(crate) fn generic_profile(who: &AcfIdentity, id: &str) -> Option<aircraft::A
         tracing::warn!(icao = %who.icao, "no profile for this airframe and the sim names no .acf");
         return None;
     }
-    let path = format!("{}/{}", tools::autoland::xplane_root(), rel);
+    let path = format!("{}/{}", crate::config::xplane_root(), rel);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
             let mut p = aircraft::generic_from_acf(&who.icao, &text);
