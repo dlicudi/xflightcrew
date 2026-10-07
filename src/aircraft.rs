@@ -977,6 +977,20 @@ pub struct RollRudderProfile {
     /// how long the yaw read takes to answer a steer that has arrived.
     #[serde(default)]
     pub lag_s: Option<f64>,
+    /// How far the ground TRACK lags the heading on the wheels, seconds:
+    /// the tyres turn the aircraft's path after its nose. Where declared, the
+    /// centreline cut (`roll_steer::RollCut`) leads on the track the heading
+    /// is making (heading plus the drift) instead of the cross-track rate
+    /// read, which is that heading this much late, and the drift is read
+    /// against the heading delayed the same way. `None` leads on the rate
+    /// read, as every airframe did before it. The Zibo's track follows its
+    /// heading through 0.5 to 1.0 s at 70 to 110 KIAS and 1 to 2 s toward
+    /// Vr (LEMG 30, five rolls of 2026-10-07); led on the rate read, the cut
+    /// saw its own correction a second or two late, crossed the centreline
+    /// at the rotation still moving 1 to 2 m/s, and the track carried that
+    /// to the liftoff 5 to 11 m off.
+    #[serde(default)]
+    pub track_lag_s: Option<f64>,
 }
 
 impl RollRudderProfile {
@@ -991,6 +1005,7 @@ impl RollRudderProfile {
         let trim_per_s = self.trim_per_s.filter(|c| (0.05..=1.0).contains(c));
         let dead_s = self.dead_s.filter(|d| (0.05..=3.0).contains(d));
         let lag_s = self.lag_s.filter(|l| (0.0..=2.0).contains(l));
+        let track_lag_s = self.track_lag_s.filter(|l| (0.05..=3.0).contains(l));
         ((0.5..=100.0).contains(&self.yaw_dps) && (20.0..=200.0).contains(&self.at_kts))
             .then_some(Self {
                 power_steer,
@@ -1001,6 +1016,7 @@ impl RollRudderProfile {
                 trim_per_s,
                 dead_s,
                 lag_s,
+                track_lag_s,
                 ..self
             })
     }

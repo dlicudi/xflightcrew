@@ -130,11 +130,22 @@ impl XtkRate {
 /// not read as drift, then low-passed over [`DRIFT_TAU_S`] and bounded.
 /// Nothing below [`DRIFT_FROM_KTS`], where a centimetre of position jitter
 /// is a degree of track.
+///
+/// Where the tyres make the track follow the heading late (`roll_rudder:`
+/// `track_lag_s`, [`DriftFilter::with_track_lag`]) the heading is delayed by
+/// that lag as well: the track read is the heading that much late, and
+/// against the heading smoothed by the rate's second alone a swing of the
+/// nose read as drift the other way. The Zibo's LEMG 30 roll 1791388851
+/// (2026-10-07) swung 2.4 degrees right from 106 kt, the track behind it,
+/// and the drift read -0.6: the target held 0.6 degrees right while the
+/// aircraft ran right across the line into the rotation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DriftFilter {
     /// Heading less course, smoothed like the cross-track rate.
     heading: Option<f64>,
     est: Option<f64>,
+    /// The track's lag behind the heading, seconds (0: none declared).
+    track_lag_s: f64,
 }
 
 /// The drift is read from this groundspeed (the cut's own reference pace).
@@ -148,6 +159,14 @@ pub(crate) const DRIFT_RAW_MAX_DEG: f64 = 3.0;
 pub const DRIFT_MAX_DEG: f64 = 2.0;
 
 impl DriftFilter {
+    /// The filter for an airframe whose track lags its heading by `lag_s`.
+    pub fn with_track_lag(lag_s: f64) -> Self {
+        Self {
+            track_lag_s: if lag_s.is_finite() { lag_s.max(0.0) } else { 0.0 },
+            ..Self::default()
+        }
+    }
+
     /// One tick: heading less runway course (degrees, right positive), the
     /// smoothed cross-track rate ([`XtkRate`], m/s right positive),
     /// groundspeed and the tick. Returns the drift to take off the target,
@@ -159,7 +178,7 @@ impl DriftFilter {
         if !dt_s.is_finite() || dt_s <= 0.0 {
             return self.value();
         }
-        let a = (dt_s / (XTK_RATE_TAU_S + dt_s)).clamp(0.0, 1.0);
+        let a = (dt_s / (XTK_RATE_TAU_S + self.track_lag_s + dt_s)).clamp(0.0, 1.0);
         let heading = match self.heading {
             Some(h) => h + (psi_off_deg - h) * a,
             None => psi_off_deg,
@@ -199,6 +218,11 @@ pub const ROLL_CUT_FAST_MULT: f64 = 2.0;
 pub const XTK_TRIM_DEG_PER_M_S: f64 = 0.06;
 /// ...and the most it may cut at that pace, degrees (less as the speed rises).
 pub const XTK_TRIM_MAX_DEG: f64 = 1.0;
+/// Where the airframe declares its track lag, the cut's lead goes over from
+/// the rate read to the heading's own rate over this many knots from
+/// [`DRIFT_FROM_KTS`], where the drift that keeps the heading's rate true
+/// begins to be read.
+pub(crate) const HEADING_LEAD_BLEND_KTS: f64 = 20.0;
 /// Ceiling on the scheduled law's gain from the declared rudder's speed:
 /// never more than full steer per this many degrees (the default law's
 /// [`ROLL_FULL_DEG`] below [`XTK_GAIN_REF_KTS`], blended between).
@@ -225,8 +249,12 @@ pub struct CutTick {
     /// The cross-track the cut was taken on, metres right (the read, or on a
     /// scheduled roll the median of the last three reads).
     pub xtk_m: f64,
-    /// The smoothed cross-track rate it leads with, m/s right.
+    /// The smoothed cross-track rate read, m/s right.
     pub rate_m_s: f64,
+    /// The rate the cut leads with, m/s right: the rate read, or where the
+    /// airframe declares its track lag the rate its heading is making
+    /// ([`RollCut`]).
+    pub lead_m_s: f64,
     /// The drift fed forward ([`DriftFilter`]), degrees; zero on the default law.
     pub drift_deg: f64,
     /// The proportional cut, degrees (right of the line positive).
@@ -261,10 +289,28 @@ pub struct CutTick {
 /// - A slow trim on the cross-track itself ([`XTK_TRIM_DEG_PER_M_S`], capped
 ///   at [`XTK_TRIM_MAX_DEG`]): whatever the drift feed and the heading trim
 ///   leave standing, it takes out by rotation.
+///
+/// Where the airframe declares how far its track lags its heading on the
+/// wheels (`roll_rudder:` `track_lag_s`), the cut leads on the rate the
+/// HEADING is making, the heading plus the drift (blended in over
+/// [`HEADING_LEAD_BLEND_KTS`] from [`DRIFT_FROM_KTS`]), not on the
+/// cross-track rate read: that rate is the heading's answer that lag late,
+/// so a cut led on it sees its own correction late, holds the nose across
+/// the line and crosses it still moving. The drift (read slowly from the
+/// same rate) keeps the lead true over seconds; the heading makes it early.
+/// The Zibo's track follows its heading through 0.5 to 1.0 s at 70 to 110
+/// KIAS, 1 to 2 s toward Vr and 1.5 s or more once the nose is up (the five
+/// LEMG 30 rolls of 2026-10-07): the four that drifted crossed the
+/// centreline at the rotation 0.9 to 2.2 m/s right, nothing after the
+/// rotation turned the track back in time, and they lifted off 5.3 to 11.1 m
+/// right.
 #[derive(Debug, Default, Clone)]
 pub struct RollCut {
     /// The declared rudder's speed on a scheduled roll; `None` on the default law.
     rudder_at_kts: Option<f64>,
+    /// The declared track lag (`roll_rudder:` `track_lag_s`): the cut then
+    /// leads on the heading's rate.
+    track_lag_s: Option<f64>,
     /// The cut as flown on 2026-09-28, for the replays that pin the change.
     #[cfg(test)]
     as_flown: bool,
@@ -288,7 +334,19 @@ impl RollCut {
 
     /// The cut for the roll this steering law flies.
     pub fn for_law(law: &RollSteer) -> Self {
-        Self::new(law.rudder.map(|r| r.at_kts))
+        let cut = Self::new(law.rudder.map(|r| r.at_kts));
+        match law.rudder.and_then(|r| r.track_lag_s) {
+            Some(lag) => cut.with_track_lag(lag),
+            None => cut,
+        }
+    }
+
+    /// The cut for an airframe whose track lags its heading by `lag_s` on
+    /// the wheels (`roll_rudder:` `track_lag_s`).
+    pub fn with_track_lag(mut self, lag_s: f64) -> Self {
+        self.track_lag_s = Some(lag_s);
+        self.drift = DriftFilter::with_track_lag(lag_s);
+        self
     }
 
     #[cfg(test)]
@@ -335,7 +393,16 @@ impl RollCut {
         } else {
             0.0
         };
-        let mut cut = roll_cut_deg(xtk, rate, gs_kts);
+        let lead = match self.track_lag_s {
+            Some(_) if improved && psi_off_deg.is_finite() && gs_kts.is_finite() => {
+                let v = gs_kts.abs() * 0.514_444;
+                let heading_rate = v * (psi_off_deg + drift).to_radians().sin();
+                let share = ((gs_kts - DRIFT_FROM_KTS) / HEADING_LEAD_BLEND_KTS).clamp(0.0, 1.0);
+                rate + (heading_rate - rate) * share
+            }
+            _ => rate,
+        };
+        let mut cut = roll_cut_deg(xtk, lead, gs_kts);
         let mut cut_i = 0.0;
         if improved {
             let at = self.rudder_at_kts.unwrap_or(XTK_GAIN_REF_KTS);
@@ -355,6 +422,7 @@ impl RollCut {
         CutTick {
             xtk_m: xtk,
             rate_m_s: rate,
+            lead_m_s: lead,
             drift_deg: drift,
             cut_deg: cut,
             cut_i_deg: cut_i,
@@ -401,6 +469,10 @@ pub struct RollSteer {
     /// The schedule as flown on 2026-09-28, for the replays that pin the change.
     #[cfg(test)]
     pub(crate) as_flown: bool,
+    /// The dead-time predictor as flown until 2026-10-07: the declared rudder
+    /// extrapolated past its speed.
+    #[cfg(test)]
+    pub(crate) predictor_past_fit: bool,
 }
 
 /// The rudder led in WITH the power: proportional to the throttle
@@ -691,7 +763,21 @@ impl RollSteer {
                 self.arrived = s;
             }
         }
-        let k = rudder.yaw_dps_at(gs_kts);
+        // Believed to the speed it was measured at and not past it, as the
+        // gain is (`schedule`). Extrapolated, the Zibo's v^0.75 read 17 to
+        // 21 deg/s a unit from 110 kt to the liftoff, where its five LEMG 30
+        // rolls of 2026-10-07 answered about its 80 kt figure until the
+        // rotation and a third of it after: the law credited each write with
+        // a turn it did not make, wrote 0.1 against 2 degrees of error and,
+        // once rotated, alternated -0.5 and +0.3 (1791374430).
+        #[cfg(test)]
+        let k = if self.predictor_past_fit {
+            rudder.yaw_dps_at(gs_kts)
+        } else {
+            rudder.yaw_dps_at(gs_kts.min(rudder.at_kts))
+        };
+        #[cfg(not(test))]
+        let k = rudder.yaw_dps_at(gs_kts.min(rudder.at_kts));
         let in_transit: f64 = self
             .pipe
             .iter()

@@ -806,6 +806,30 @@ flare_power:
 # 8 kt of crosswind either side: within 1.8 m, 1.3 m from 90 kt, no weave.
 # Replayed through the three rolls: 2.1, 4.2 and 4.7 m where they flew 6.2,
 # 9.1 and 8.9. Offline only.
+# track_lag_s: the five rolls this law flew at LEMG 30 (2026-10-07, 1791371247
+# to 1791388851) held 1.7 to 4.6 m to 110 kt, then four of them lifted off
+# 5.3 to 11.1 m right. Nothing in the law changes at the rotation; the
+# aircraft does. Fitted from the cross-track and the heading, the track
+# follows the heading through 0.5 to 1.0 s at 70 to 110 KIAS, 1 to 2 s
+# toward Vr and 1.5 s or more once the nose is up, and the pedals answer
+# about their 80 kt figure to the rotation and a fifth to two fifths of it
+# after (the column unloads the nosewheel). The four crossed the line at the
+# rotation 0.9 to 2.2 m/s right, the heading 1 to 2 degrees right, and
+# nothing after it turned the track back in time. Led on the rate read, the
+# heading's answer that late, the cut had held the nose across the line.
+# With the lag declared the cut leads on the heading's own rate and the
+# drift is read against the heading delayed by it (`RollCut`); the predictor
+# now believes the rudder only to `at_kts` (extrapolated it credited each
+# write with 17 to 21 deg/s a unit, wrote 0.1 against 2 degrees of error and
+# once rotated alternated -0.5 and +0.3). Replayed through the five rolls
+# (src/autotakeoff/zibo_liftoff_tests.rs): at the liftoff 0.5 to 2.4 m where
+# they flew 1.6 to 11.1 (8.0 m over the five against 30.7); through the
+# plant fitted to them, from 1.4 m and 2 degrees off, within 0.7 m in calm
+# air and 2.6 m in 8 kt across where the law flew 10.8. The three earlier
+# rolls replay 2.6, 3.1 and 3.7 m (2.1, 4.2 and 4.7 above). VERIFY:
+# autotakeoff `roll` `xtk_m` within 2.5 m at the last tick before the
+# `liftoff`, `xtk_rate` near zero at the `rotate`, `xtk_lead` leading
+# `xtk_rate`. Offline only.
 roll_rudder:
   yaw_dps: 12.7
   at_kts: 80.0
@@ -813,6 +837,7 @@ roll_rudder:
   close_per_s: 0.9
   dead_s: 1.0
   lag_s: 0.2
+  track_lag_s: 0.75
 # The flare's elevator: the stock 737's tracker settings, pull-only. Its
 # fitted plant model is NOT carried over (another flight model).
 flare_elevator:

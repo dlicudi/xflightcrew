@@ -1247,6 +1247,7 @@
             trim_per_s: None,
             dead_s: None,
             lag_s: None,
+            track_lag_s: None,
         };
         assert!(!RollSteer::with_rudder(true, silly).scheduled());
     }
@@ -1929,6 +1930,7 @@
             trim_per_s: Some(0.3),
             dead_s: None,
             lag_s: None,
+            track_lag_s: None,
         }
     }
 
