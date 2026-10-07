@@ -100,6 +100,7 @@ mod taxi_guide;
 mod taxi_in;
 mod tempo;
 mod terrain;
+mod takeoff_trim;
 mod tiller;
 mod yoke;
 // Test-only (the file's own `#![cfg(test)]`), as `free_nose_replay` above.

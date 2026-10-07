@@ -603,6 +603,37 @@ takeoff_config:
   thrust_reduction_agl_ft: 1000.0
   climb_thrust_ratio: 0.9
 
+# Takeoff trim, set as a crew sets it (`crate::takeoff_trim`): the 737-800
+# FCOM table for flaps 1 and 5 at 26K, units by CG (% MAC, rows) and weight
+# (t, columns), as the aircraft's own FMC computes it (B738.calc.lua
+# `flaps_1_5`). The stabilizer is set on ITS switch (the stock trim command
+# does nothing here; pitch_trim_down held 2 s took 5.02 units to 4.84 on the
+# battery) and read back on its gauge. The generic neutral trim was 8.35
+# units, near the 8.5 stop: the aircraft rotated itself at 112 kt and lifted
+# off at 118 against Vr 145 (LEMG, 2026-10-07, #231). Its FMC's own figure
+# (FMS/trim_calc) needs PERF INIT, whose fields are read-only to the API.
+takeoff_trim:
+  units: laminar/B738/flight_model/stab_trim_units
+  cg_mac: laminar/B738/real_cg_mac
+  nose_up: laminar/B738/flight_controls/pitch_trim_up
+  nose_down: laminar/B738/flight_controls/pitch_trim_down
+  min_units: 2.25
+  max_units: 8.5
+  cg: [6, 8, 9, 11, 16, 21, 26, 30, 32, 34, 36]
+  weights_t: [40, 45, 50, 55, 60, 65, 70, 75, 80, 85]
+  table:
+    - [6.0,  6.0,  6.5,  6.75, 7.25, 7.75, 8.0,  8.25, 8.5,  8.5]
+    - [5.75, 5.75, 6.0,  6.5,  7.0,  7.25, 7.75, 8.0,  8.5,  8.5]
+    - [5.5,  5.5,  6.0,  6.5,  6.75, 7.0,  7.5,  7.75, 8.25, 8.5]
+    - [5.5,  5.5,  5.75, 6.25, 6.5,  6.75, 7.25, 7.5,  7.75, 8.25]
+    - [4.75, 4.75, 5.0,  5.5,  5.75, 6.0,  6.25, 6.5,  6.75, 7.0]
+    - [4.0,  4.0,  4.5,  4.75, 5.0,  5.25, 5.5,  5.75, 6.0,  6.25]
+    - [3.5,  3.5,  3.75, 4.25, 4.25, 4.5,  4.75, 5.0,  5.25, 5.5]
+    - [3.0,  3.0,  3.25, 3.5,  3.75, 4.0,  4.25, 4.5,  4.5,  4.75]
+    - [2.5,  2.5,  3.0,  3.25, 3.5,  3.75, 3.75, 4.0,  4.25, 4.5]
+    - [2.5,  2.5,  2.75, 3.0,  3.25, 3.25, 3.5,  3.75, 4.0,  4.25]
+    - [2.25, 2.25, 2.25, 2.75, 2.75, 3.0,  3.25, 3.5,  3.5,  3.75]
+
 # The attitude at which the tail touches: about 11 degrees on the -800.
 tail_strike_deg: 11.0
 # The yoke: zibomod holds override_joystick_pitch/roll and rewrites the

@@ -992,6 +992,10 @@ pub struct AircraftProfile {
     /// read alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throttle_hardware_axis: Option<String>,
+    /// The takeoff stabilizer trim set from the type's table, as a crew sets
+    /// it (`crate::takeoff_trim`). `None` = the generic neutral trim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeoff_trim: Option<TakeoffTrimProfile>,
     /// Pitch attitude at which this airframe's tail touches the runway,
     /// degrees. The auto-takeoff rotation will not command within a margin of
     /// it. `None` on airframes short enough that elevator authority runs out
@@ -4778,6 +4782,29 @@ pub fn flap_limits() -> Vec<(f64, Option<f64>)> {
 /// crosswind, 373 on downwind against a 198 kt target, past both Vmo figures,
 /// still climbing with a descent commanded. The copilot could not slow it down
 /// and had no way to know.
+/// The takeoff trim table and the switches that set it
+/// (`crate::takeoff_trim`): the stabilizer read on its own gauge in units,
+/// the centre of gravity in % MAC, and the type's FCOM table of units by CG
+/// (rows) and weight in tonnes (columns), for the takeoff flap the profile
+/// flies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TakeoffTrimProfile {
+    pub units: String,
+    pub cg_mac: String,
+    pub nose_up: String,
+    pub nose_down: String,
+    pub min_units: f64,
+    pub max_units: f64,
+    pub cg: Vec<f64>,
+    pub weights_t: Vec<f64>,
+    pub table: Vec<Vec<f64>>,
+}
+
+/// The live airframe's takeoff trim table, when it declares one.
+pub fn takeoff_trim() -> Option<TakeoffTrimProfile> {
+    live_profile().and_then(|p| p.takeoff_trim.clone())
+}
+
 /// The live airframe's hardware thrust-lever axis, when it declares one.
 pub fn throttle_hardware_axis() -> Option<String> {
     live_profile().and_then(|p| p.throttle_hardware_axis.clone())
@@ -5135,6 +5162,7 @@ fn cessna_172sp() -> AircraftProfile {
     };
     AircraftProfile {
         id: "cessna_172sp".into(),
+        takeoff_trim: None,
         throttle_hardware_axis: None,
         yoke_input: None,
         display_name: "Cessna 172SP Skyhawk".into(),
@@ -5509,6 +5537,7 @@ fn cirrus_sr22() -> AircraftProfile {
     };
     AircraftProfile {
         id: "cirrus_sr22".into(),
+        takeoff_trim: None,
         throttle_hardware_axis: None,
         yoke_input: None,
         display_name: "Cirrus SR22".into(),

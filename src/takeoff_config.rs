@@ -181,7 +181,19 @@ pub async fn set_for_takeoff(
         }
     }
 
-    if crate::tools::controls::trim_for_takeoff(xp).await.is_some() {
+    // The type's table where the airframe declares it, as a crew sets the
+    // stabilizer; else the generic band.
+    if let Some(t) = crate::aircraft::takeoff_trim() {
+        match crate::takeoff_trim::set(xp, &t).await {
+            Some(crate::takeoff_trim::Setting::Set { now, .. }) => {
+                out.set.push(format!("trim {now:.1}"));
+            }
+            Some(crate::takeoff_trim::Setting::NotTaken { want, now }) => {
+                out.not_taken.push(format!("the trim, {now:.1} for {want:.1}"));
+            }
+            None => out.not_taken.push("the trim, no weight or C.G. to set it by".into()),
+        }
+    } else if crate::tools::controls::trim_for_takeoff(xp).await.is_some() {
         out.set.push("trim".into());
     }
 
