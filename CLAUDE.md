@@ -700,6 +700,9 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   `cargo test --release -p atc -- --ignored atc_world_sweep`; ILS smoke
   `cargo test -- --ignored real_install_ils`; `docs/atc-chaos-card.md`.
 - `xvl debrief` (`src/debrief.rs`) after every flight, before diagnosing by hand.
+- **A new airframe or profile edit is checked parked first** (`xvl conform [--only <area>]`,
+  `src/conform.rs`, `docs/conform.md`): every declared channel through its own seam, read back,
+  put back; a row per channel and a blackbox `conform` record each.
 - **A sortie is one file with a verdict** (`full_auto::SortieGuard`, `logs/sorties/<id>.jsonl`,
   `src/scorecard.rs` `sortie_result`): PASS needs no failure, give-up or crash, the ground at the
   end, and UNATTENDED (no `intervention`, no `tool` record). A complaint not yet a scorecard number
