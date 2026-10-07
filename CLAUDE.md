@@ -47,7 +47,7 @@ Rust: a latency- and audio-sensitive real-time loop.
 |---|---|
 | Mic capture | `cpal` |
 | STT | `whisper-rs` (whisper.cpp bindings), push-to-talk |
-| Intent | deterministic: `src/router.rs` (command / question / follow-up / echo), `src/grammar.rs` (the tool), `src/conversation.rs`, `src/answers.rs`, `src/plan.rs` (questions), `src/dialogue.rs` (back-references); `main.rs` boot and command loop, `src/detect.rs` airframe swap |
+| Intent | deterministic: `src/router.rs` (command / question / follow-up / echo), `src/grammar.rs` (the tool: an ordered `MATCHERS` table over `src/grammar/*`, order is semantics), `src/conversation.rs`, `src/answers.rs`, `src/plan.rs` (questions), `src/dialogue.rs` (back-references); `main.rs` boot, the command loop in `src/main/` (`session.rs`: take, route, dispatch, answer, speak), `src/detect.rs` airframe swap |
 | X-Plane write | `reqwest` PATCH to the Web API (`PATCH /api/v1/datarefs/{id}/value`) |
 | TTS readback | in-process piper VITS via the `ort` crate |
 

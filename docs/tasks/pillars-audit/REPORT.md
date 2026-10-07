@@ -158,3 +158,11 @@ Redesign, for the 172, after the pillars, REPLACING the frozen code rather than 
   `simbrief.rs`); heading-bug writes and the tracing filter pinned; the eight giant files split
   into child modules (only `autoland/run.rs`, `spawn_autoland` whole, stays over 3,000 lines).
   Next: stage B.
+- 2026-10-08: **Stage B done** (offline, pure refactors, all green: 2,160 crew, 87 lib, 268
+  atc, 54 sim). `run_session` 2,665 lines to 26: `src/main/` stages take, route, dispatch,
+  answer, speak over a `Session` struct; no function over 205 lines; `sortie --check`
+  identical on all 37 specs. `grammar::parse_one` 1,392 lines to a 17-line driver over an
+  ordered `MATCHERS` table (21 entries, 13 files under `src/grammar/`); a 12,527-utterance
+  snapshot from the real logs byte-identical (ignored test `grammar_snapshot`), `xvl analyze
+  --now` unchanged. Found on the way: a multi-byte panic in `phrase::fix_value_mishear`, fixed.
+  Next: stage C.
