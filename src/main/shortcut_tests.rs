@@ -13,10 +13,25 @@
     /// cannot see.
     #[test]
     fn the_loop_asks_every_shortcut_in_order() {
-        let src = crate::test_support::module_source("main");
-        let start = src.find("async fn run_session(").expect("the command loop");
-        let end = start + src[start..].find("\n}\n").expect("its end");
-        let body = &src[start..end];
+        // The loop's stages are `src/main/*.rs`; its shortcut answers are one
+        // of them (`answer.rs`), asked in the loop's order, and no other stage
+        // asks one.
+        let stages: Vec<_> = crate::test_support::module_files("main")
+            .into_iter()
+            .filter(|p| !crate::test_support::is_test_file(p))
+            .filter(|p| p.parent().is_some_and(|d| d.ends_with("main")))
+            .collect();
+        let read = |p: &std::path::PathBuf| std::fs::read_to_string(p).unwrap();
+        let answer = stages
+            .iter()
+            .find(|p| p.file_name().is_some_and(|n| n == "answer.rs"))
+            .expect("the command loop's answer stage");
+        for other in stages.iter().filter(|p| *p != answer) {
+            assert!(!read(other).contains("Some(Shortcut::"), "{}", other.display());
+        }
+        let src = read(answer);
+        let body = src.as_str();
+        let all_stages: String = stages.iter().map(read).collect();
         let asked: Vec<String> = body
             .match_indices("Some(Shortcut::")
             .map(|(i, _)| {
@@ -32,7 +47,7 @@
         // The loop's own copies of the conditions are gone.
         let gone = ["let is_reminder", "let wants_load", "let is_plan", "is_fuel_query(&command)"];
         for gone in gone {
-            assert!(!body.contains(gone), "{gone}");
+            assert!(!all_stages.contains(gone), "{gone}");
         }
     }
 
