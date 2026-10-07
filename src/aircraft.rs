@@ -1903,8 +1903,9 @@ pub struct AlignWait {
     /// into POS INIT ([`PositionEntry`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position_entry: Option<PositionEntry>,
-    /// The mode knobs cycled OFF and back when every system reads off after
-    /// the preflight's switches ([`KnobCycle`]): a knob already at NAV
+    /// The mode knobs, one per entry of `modes` in its order, each cycled
+    /// OFF and back when its system reads off after the preflight's
+    /// switches or at the taxi's wait ([`KnobCycle`]): a knob already at NAV
     /// begins nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restart: Vec<KnobCycle>,

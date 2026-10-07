@@ -60,29 +60,37 @@ pub async fn run(
     Ok(not_taken)
 }
 
-/// Pause between knob presses: the Zibo's knob animates between detents.
-const KNOB_PRESS_GAP: Duration = Duration::from_millis(400);
+/// Pause between knob presses: the Zibo's knob animates between detents,
+/// and presses 0.4 s apart left the right IRS off at NAV (LEMG 2026-10-07);
+/// a second apart, every detent read back and the IRS began aligning.
+const KNOB_PRESS_GAP: Duration = Duration::from_secs(1);
 
-/// Every system reading OFF after the switches (a knob found already at
-/// NAV begins nothing): cycle the declared knobs once, OFF and back. A
-/// failed read is no measurement and cycles nothing. True when it cycled.
-pub async fn restart_if_off(xp: &dyn XPlane, a: &AlignWait) -> bool {
+/// Each system reading OFF with its knob declared (`restart[i]` turns the
+/// knob of `modes[i]`): that knob cycled once, OFF and back. A knob found
+/// already at NAV begins nothing (a runway start, LEMG 2026-10-07). It runs
+/// after the preflight's switches AND at the taxi's wait, so a system a
+/// first cycle did not start gets a second. A failed read is no
+/// measurement and cycles nothing. The systems it cycled, by index.
+pub async fn restart_if_off(xp: &dyn XPlane, a: &AlignWait) -> Vec<usize> {
     if a.restart.is_empty() {
-        return false;
+        return Vec::new();
     }
     let modes = read_modes(xp, a).await;
-    if !all_off(&modes) {
-        return false;
+    let off: Vec<usize> = (0..a.restart.len().min(modes.len()))
+        .filter(|&i| modes[i].is_some_and(|v| v.abs() < 0.5))
+        .collect();
+    if off.is_empty() {
+        return off;
     }
-    for k in &a.restart {
-        for _ in 0..k.presses {
-            let _ = xp.run_command(&k.off).await;
+    for &i in &off {
+        for _ in 0..a.restart[i].presses {
+            let _ = xp.run_command(&a.restart[i].off).await;
             tokio::time::sleep(KNOB_PRESS_GAP).await;
         }
     }
-    for k in &a.restart {
-        for _ in 0..k.presses {
-            let _ = xp.run_command(&k.on).await;
+    for &i in &off {
+        for _ in 0..a.restart[i].presses {
+            let _ = xp.run_command(&a.restart[i].on).await;
             tokio::time::sleep(KNOB_PRESS_GAP).await;
         }
     }
@@ -90,9 +98,9 @@ pub async fn restart_if_off(xp: &dyn XPlane, a: &AlignWait) -> bool {
     let after = read_modes(xp, a).await;
     crate::blackbox::record(
         "preflight",
-        json!({"event": "align_restart", "before": modes, "after": after}),
+        json!({"event": "align_restart", "cycled": off, "before": modes, "after": after}),
     );
-    true
+    off
 }
 
 /// Every system read and OFF. Pure.
@@ -209,9 +217,13 @@ pub async fn wait_aligned(
     stop: &(dyn Fn() -> bool + Send + Sync),
     say: &mut (dyn FnMut(&str) + Send),
 ) -> AlignVerdict {
-    let first = read_modes(xp, a).await;
+    let mut first = read_modes(xp, a).await;
     if aligned(&first, a.want) == Some(true) {
         return AlignVerdict::Aligned { waited: false };
+    }
+    // A system still off now the generators are on: its knob cycled.
+    if !restart_if_off(xp, a).await.is_empty() {
+        first = read_modes(xp, a).await;
     }
     // Every system OFF: nothing is aligning, and no wait will change that
     // (an engine started by hand on a dark overhead, then full auto).
@@ -309,35 +321,46 @@ mod tests {
                 dataref: "pos_fmc_set".into(),
                 command: "fmc_to_irs".into(),
             }),
-            restart: vec![crate::aircraft::KnobCycle {
-                off: "irs_L_left".into(),
-                on: "irs_L_right".into(),
-                presses: 2,
-            }],
+            restart: vec![
+                crate::aircraft::KnobCycle {
+                    off: "irs_L_left".into(),
+                    on: "irs_L_right".into(),
+                    presses: 2,
+                },
+                crate::aircraft::KnobCycle {
+                    off: "irs_R_left".into(),
+                    on: "irs_R_right".into(),
+                    presses: 2,
+                },
+            ],
         }
     }
 
-    /// Knobs found at NAV with the IRS off (the LEMG runway start): cycled
-    /// once, OFF and back. Aligning, or a mode that does not read: nothing.
+    /// Knobs found at NAV with the IRS off (the LEMG runway start): each off
+    /// system's knob cycled once, OFF and back; one aligning is left alone, a
+    /// mode that does not read cycles nothing.
     #[tokio::test(start_paused = true)]
     async fn an_irs_left_off_at_nav_is_restarted_once() {
         let a = align(false);
         let xp = FakeXPlane::new();
         xp.set_read("irs_mode", 0.0);
         xp.set_read("irs2_mode", 0.0);
-        assert!(restart_if_off(&xp, &a).await);
+        assert_eq!(restart_if_off(&xp, &a).await, vec![0, 1]);
         assert_eq!(xp.ran_count("irs_L_left"), 2);
         assert_eq!(xp.ran_count("irs_L_right"), 2);
+        assert_eq!(xp.ran_count("irs_R_left"), 2);
 
+        // Only the one left off (the right IRS without bus 2).
         let xp = FakeXPlane::new();
         xp.set_read("irs_mode", 1.0);
         xp.set_read("irs2_mode", 0.0);
-        assert!(!restart_if_off(&xp, &a).await);
+        assert_eq!(restart_if_off(&xp, &a).await, vec![1]);
         assert_eq!(xp.ran_count("irs_L_left"), 0);
+        assert_eq!(xp.ran_count("irs_R_right"), 2);
 
         let xp = FakeXPlane::new();
-        xp.set_read("irs_mode", 0.0);
-        assert!(!restart_if_off(&xp, &a).await, "irs2_mode did not read");
+        xp.set_read("irs_mode", 2.0);
+        assert!(restart_if_off(&xp, &a).await.is_empty(), "irs2_mode did not read");
     }
 
     fn knob(cmd: &str, down: &str, pos: &str, want: f64) -> StartStep {
