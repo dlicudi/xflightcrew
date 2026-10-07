@@ -3573,6 +3573,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
                     // three reads on the scheduled law), its proportional
                     // cut and the cross-track trim's (see [`RollCut`]).
                     "xtk_used": cut.xtk_m, "cut": cut.cut_deg, "cut_i": cut.cut_i_deg,
+                    // The rate the cut led with: `xtk_rate`, or on an
+                    // airframe declaring its track lag the heading's rate.
+                    "xtk_lead": cut.lead_m_s,
                     // Which read the position came from: "plugin" is one
                     // frame (xcopilot/position), "split" the separate stock
                     // reads of an older plugin (#157).
@@ -4119,6 +4122,12 @@ mod tests;
 /// The Zibo 737's rotation, fitted to LEMG 30 (2026-10-07) and flown.
 #[cfg(test)]
 mod zibo_rotation_tests;
+
+/// The Zibo 737 from the rotation to the liftoff: the track's lag behind the
+/// heading fitted to LEMG 30 (2026-10-07), the rolls replayed and the plant
+/// flown through the rotation.
+#[cfg(test)]
+mod zibo_liftoff_tests;
 
 /// The pilot's reject at LEMG 13 (2026-09-28, sortie 1790627884-full_auto,
 /// stock 737), replayed through a plant: the stop is flown, the throttles
