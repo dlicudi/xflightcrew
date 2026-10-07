@@ -171,7 +171,7 @@ pub struct PlannedTod {
     /// True once the follower has commanded the descent.
     pub started: bool,
     /// The PILOT's altitude is holding the follower above this descent
-    /// (`take_altitude`, sticky by design): the point is the plan's, and the
+    /// (`pilot_altitude::take`, sticky by design): the point is the plan's, and the
     /// hands will not move at it. LIME-LIPE (2026-09-25): "climb to 19,000"
     /// held the follower level over four of the plan's descents while the
     /// monitor said "descent coming up" and "past the descent point and
@@ -1404,10 +1404,6 @@ pub fn commanded_alt_ft(leg: &ProcLeg, carry: f64) -> f64 {
     leg.alt1_ft.unwrap_or(carry)
 }
 
-/// Clearance the follower keeps over the highest ground AHEAD, feet. The
-/// non-mountainous IFR figure, and the least an instructor would accept from
-/// an automation flying a leg it cannot see.
-pub const TERRAIN_CLEARANCE_FT: f64 = 1_000.0;
 /// How far ahead along the track the terrain probe looks, nm. Far enough that
 /// a 700 fpm climb clears what it finds at light-aircraft speeds (15 nm is
 /// over six minutes at 135 kt), short enough that the answer is about the leg
@@ -1420,68 +1416,6 @@ const TERRAIN_PROBE_SECS: f64 = 10.0;
 const TERRAIN_POINTS: usize = 16;
 /// Re-speak the terrain floor when it rises by more than this, feet.
 const TERRAIN_RESAY_FT: f64 = 200.0;
-
-/// The lowest altitude the follower may command: the highest ground within
-/// [`TERRAIN_LOOK_NM`] ahead plus [`TERRAIN_CLEARANCE_FT`]. `None` means no
-/// terrain answer (old plugin, probe timed out) and the floor is not applied:
-/// the module's standing contract, degrade rather than refuse.
-///
-/// This exists because a plan's altitude is only as good as the ground under
-/// it. The LEMG-LEJR leg to JRZ carried 2,700 ft across the Sierra de
-/// Grazalema, whose ridge probes at 3,861 ft; the follower flew it down to
-/// 220 ft AGL (2026-09-13). The planner floors its own CRUISE altitude over
-/// this same probe, but a constraint handed down from a plan was flown as
-/// given. Nothing the follower commands is trusted over the ground again.
-static TERRAIN_FLOOR: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
-
-/// The highest-ground floor the follower is currently holding itself to, feet
-/// MSL. `None` outside a procedure or with no terrain answer. Read by the
-/// autopilot tool so a PILOT's altitude is judged against the same ground the
-/// follower can see ahead, not merely what is under the wheels.
-pub fn terrain_floor_ahead_ft() -> Option<f64> {
-    if !ACTIVE.load(Ordering::Relaxed) {
-        return None;
-    }
-    *TERRAIN_FLOOR.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn publish_terrain_floor(v: Option<f64>) {
-    *TERRAIN_FLOOR.lock().unwrap_or_else(|e| e.into_inner()) = v;
-}
-
-/// An altitude the PILOT commanded while the follower was flying.
-///
-/// The follower is the ONE writer of the altitude dial and rewrites it every
-/// tick. So a spoken "climb to four thousand" was obeyed by the autopilot tool
-/// and undone within 500 ms, twice, while the aircraft oscillated at 220 ft
-/// over rising ground (2026-09-13): the pilot's own override was the thing the
-/// automation was strongest against. It is now not a fight over a dataref: the
-/// tool hands the number here and the follower flies it as its target until the
-/// pilot says another one, keeping every leg's lateral steering.
-static PILOT_ALT: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
-
-/// Hand the follower an altitude the pilot asked for. `false` (and nothing
-/// taken) when no procedure is flying, so the caller drives the autopilot
-/// itself the way it always has.
-pub fn take_altitude(ft: f64) -> bool {
-    if !ACTIVE.load(Ordering::Relaxed) {
-        return false;
-    }
-    *PILOT_ALT.lock().unwrap_or_else(|e| e.into_inner()) = Some(ft);
-    crate::blackbox::record(
-        "procedure",
-        serde_json::json!({"event": "pilot_altitude", "ft": ft}),
-    );
-    true
-}
-
-/// The pilot's commanded altitude, if they have taken the vertical.
-pub fn pilot_altitude() -> Option<f64> {
-    if !ACTIVE.load(Ordering::Relaxed) {
-        return None;
-    }
-    *PILOT_ALT.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// The altitude an IFR clearance holds the climb to until the departure
 /// controller clears higher (`hold_at_cleared`): a CEILING on the plan's
@@ -1525,7 +1459,7 @@ pub fn cap_at_clearance(
 }
 
 fn clear_pilot_altitude() {
-    *PILOT_ALT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    crate::pilot_altitude::clear();
     *PILOT_SPEED.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
@@ -1553,30 +1487,6 @@ pub fn pilot_speed() -> Option<f64> {
         return None;
     }
     *PILOT_SPEED.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Points along the ground track from `lat`/`lon` on `brg_true`, out to
-/// `look_nm`, for the terrain probe. Flat-earth stepping: over 15 nm the error
-/// is metres, and the answer is a maximum over samples either way.
-pub fn look_ahead_points(
-    lat: f64,
-    lon: f64,
-    brg_true: f64,
-    look_nm: f64,
-    n: usize,
-) -> Vec<(f64, f64)> {
-    let n = n.max(1);
-    let b = brg_true.to_radians();
-    let coslat = lat.to_radians().cos().abs().max(0.01);
-    (1..=n)
-        .map(|i| {
-            let d = look_nm * i as f64 / n as f64;
-            (
-                lat + b.cos() * d / 60.0,
-                lon + b.sin() * d / (60.0 * coslat),
-            )
-        })
-        .collect()
 }
 
 /// The GA vertical rate, fpm, and the default for any airframe whose profile
@@ -2867,7 +2777,7 @@ pub fn start_scoped(
             publish_tod(None);
             publish_fix_dist(None);
             clear_pilot_altitude();
-            publish_terrain_floor(None);
+            crate::terrain::publish_floor_ahead(None);
             publish_route_ahead(None);
             take_splice();
             crate::tools::speedhold::release();
@@ -2926,7 +2836,7 @@ fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
     ACTIVE.store(false, Ordering::SeqCst);
     clear_pilot_altitude();
     hold_at_cleared(None, "stand_down");
-    publish_terrain_floor(None);
+    crate::terrain::publish_floor_ahead(None);
     // Drop any cruise-power hold so nothing keeps working the throttle after we
     // hand back (no-op if it was never armed).
     crate::tools::speedhold::release();
@@ -2973,7 +2883,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     // Process-wide facts must never outlive the flight that set them.
     clear_pilot_altitude();
-    publish_terrain_floor(None);
+    crate::terrain::publish_floor_ahead(None);
     // The altimeter first: every altitude below is read off it. Said only
     // when the knob actually moved (a correct setting earns no chatter).
     if let Some(ta) = transition_altitude_ft {
@@ -3324,7 +3234,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // the clearance until departure clears higher: not a climb to judge
         // (a watch that sees no climb would hand the aircraft back).
         let under_clearance = match (unmet, cleared_ceiling()) {
-            (Some((_, m)), Some(c)) => pilot_altitude().is_none() && m > c + MINIMUM_MET_TOL_FT,
+            (Some((_, m)), Some(c)) => {
+                crate::pilot_altitude::held().is_none() && m > c + MINIMUM_MET_TOL_FT
+            }
             _ => false,
         };
         // The climb rate, from the altimeter itself (smoothed): what the
@@ -4047,11 +3959,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             let look = dist_nm
                 .map(|d| (d + 2.0).min(TERRAIN_LOOK_NM))
                 .unwrap_or(TERRAIN_LOOK_NM);
-            let pts = look_ahead_points(lat, lon, brg, look, TERRAIN_POINTS);
+            let pts = crate::terrain::look_ahead_points(lat, lon, brg, look, TERRAIN_POINTS);
             match crate::terrain::max_elevation_ft(&xp, &pts).await {
                 Some(ground) => {
                     terrain_misses = 0;
-                    publish_terrain_floor(Some(ground + TERRAIN_CLEARANCE_FT))
+                    crate::terrain::publish_floor_ahead(Some(ground + crate::terrain::CLEARANCE_FT))
                 }
                 None if !terrain_probe_fatal(
                     &mut terrain_misses,
@@ -4074,7 +3986,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     // safety feature the pilot believes is still on (two
                     // days of flights without one, 2026-09-16).
                     terrain_available = false;
-                    publish_terrain_floor(None);
+                    crate::terrain::publish_floor_ahead(None);
                     crate::blackbox::record(
                         "procedure",
                         serde_json::json!({"event": "terrain_probe_unavailable"}),
@@ -4132,8 +4044,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             alt_ft,
             owed_if.map(|(_, d)| d).or(pattern_nm).or(dist_nm),
             gs_kts,
-            pilot_altitude(),
-            terrain_floor_ahead_ft().map(|f| floor_indicated(f, true_alt_ft, alt_ft)),
+            crate::pilot_altitude::held(),
+            crate::terrain::floor_ahead_ft().map(|f| floor_indicated(f, true_alt_ft, alt_ft)),
             descent_fpm(),
             DescentProfile {
                 cruise_ft: descent_cruise_ft,
@@ -4282,7 +4194,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // Ground fell away: a later rise is news again.
             None => {
                 if said_floor.is_some_and(|p| {
-                    terrain_floor_ahead_ft().is_none_or(|f| f < p - TERRAIN_RESAY_FT)
+                    crate::terrain::floor_ahead_ft().is_none_or(|f| f < p - TERRAIN_RESAY_FT)
                 }) {
                     said_floor = None;
                 }
@@ -4363,7 +4275,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // and falling (EDLP-LOWI, 2026-09-24). A climb is never worth more
             // than the airspeed left.
             if let Some(floor) = crate::aircraft::speed_floor_kts() {
-                vs_cmd = crate::circuit::climb_limit_fpm(vs_cmd, ias, ias_trend, vy_kts, floor);
+                vs_cmd = crate::aircraft::climb_limit_fpm(vs_cmd, ias, ias_trend, vy_kts, floor);
             }
         }
         if vs_cmd < -DRAG_MIN_DESCENT_FPM {
@@ -4388,9 +4300,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // (#32). Not while the pilot or a clearance holds the altitude
         // (their level, their restrictions).
         let window_climb = window_climb_fpm(vs_cmd, dep.cap_limited);
-        if let (false, true, Some(climb)) =
-            (arrival_constraints.is_empty(), pilot_altitude().is_none(), window_climb)
-        {
+        if let (false, true, Some(climb)) = (
+            arrival_constraints.is_empty(),
+            crate::pilot_altitude::held().is_none(),
+            window_climb,
+        ) {
             if let Some(miss) = star_window_miss(
                 &legs,
                 &arrival_constraints,
@@ -4714,7 +4628,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     hand_down,
                 );
                 clear_pilot_altitude();
-                publish_terrain_floor(None);
+                crate::terrain::publish_floor_ahead(None);
                 RUN.record(sim::run::Outcome::HandedOff);
                 ACTIVE.store(false, Ordering::SeqCst);
                 return;
@@ -4724,7 +4638,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // A to-altitude leg is satisfied by ALTITUDE, so one cannot sequence
         // while the pilot owns that altitude. Say so once rather than orbit a
         // heading in silence waiting for a climb nobody is flying.
-        if dist_nm.is_none() && pilot_altitude().is_some() && !said_alt_hold {
+        if dist_nm.is_none() && crate::pilot_altitude::held().is_some() && !said_alt_hold {
             said_alt_hold = true;
             if let Some(t) = leg.alt1_ft {
                 alert(
@@ -4811,7 +4725,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         }
     }
     clear_pilot_altitude();
-    publish_terrain_floor(None);
+    crate::terrain::publish_floor_ahead(None);
     ACTIVE.store(false, Ordering::SeqCst);
 }
 

@@ -4284,12 +4284,135 @@ pub const CAUTION_HAND_RATIO: f64 = 1.20;
 pub const CAUTION_AUTO_RATIO: f64 = 1.13;
 
 /// The climb limiter's floor, x the stall in the configuration flown
-/// (`circuit::climb_floor_kts`): the speed a climb bleeds to before the
+/// ([`climb_floor_kts`]): the speed a climb bleeds to before the
 /// limiter has taken all of it away. It IS the automation floor: it was
 /// 1.15, under [`SPEED_FLOOR_RATIO`], so a climb could bleed to a speed no
 /// automation may target (CLAUDE.md "No automation target below the speed
 /// floor"; refactor audit 2026-10-04, finding #13).
 pub const CLIMB_FLOOR_RATIO: f64 = SPEED_FLOOR_RATIO;
+
+// --- The climb limiter, shared by every climb a crew flies: the circuit,
+// the follower and the pilot's own climb through the autopilot tool
+// (moved out of `circuit`, pillars audit 2026-10-07, knot 1).
+
+/// How far ahead the climb limiter judges the airspeed, seconds. Long enough
+/// to lead the airframe's own response, short enough not to invent a speed:
+/// the same order as the altitude capture's lead.
+const CLIMB_SPEED_LEAD_S: f64 = 5.0;
+
+/// The slowest the pattern will climb toward: a floor under the speed
+/// protection below. Blue line where the airframe has one, else a margin over
+/// the clean stall: [`CLIMB_FLOOR_RATIO`], the automation
+/// floor itself. It was 1.15 Vs, under the 1.2 Vs no automation target may
+/// go below, so a climb could bleed to a speed the governor would have
+/// refused as a target (refactor audit 2026-10-04, finding #13; the follower
+/// already faded to `speed_floor_kts`).
+///
+/// A twin's Vyse is the honest number here and it is not a comfort figure:
+/// below blue line a light twin cannot climb on one engine at all, and the
+/// margin to Vmca is what is left of the pilot's options.
+pub fn climb_floor_kts(vyse_kts: Option<f64>, vs_clean_kts: Option<f64>) -> f64 {
+    let from_stall = vs_clean_kts.map(|v| v * CLIMB_FLOOR_RATIO);
+    match (vyse_kts, from_stall) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => 0.0,
+    }
+}
+
+/// This airframe's climb-speed floor, from the profile's reference card.
+///
+/// Blue line where the airframe publishes one (a twin below Vyse has no
+/// single-engine climb at all), else a margin over the clean stall. Both are
+/// optional, and a profile carrying neither gets 0, which disables the
+/// protection rather than inventing a number.
+pub fn climb_floor(profile: &AircraftProfile) -> f64 {
+    climb_floor_kts(
+        profile.reference.as_ref().and_then(|r| r.vyse_kts),
+        profile.vs_clean_kts,
+    )
+}
+
+/// How much of a commanded CLIMB the airspeed will actually support. Scales
+/// the rate to zero as the speed falls from the pattern speed to the floor.
+///
+/// The autopilot's vertical mode buys rate with airspeed, and it will keep
+/// buying: a Baron 58 rolled into the crosswind turn at 127 kt and came out at
+/// 85 (one knot over its clean stall and one over Vmca) with the VS law
+/// still asking for 880 fpm and the stabilizer trimmed to the nose-up stop.
+/// Six airspeed callouts fired across one Southampton circuit and every one of
+/// them was right (2026-08-01). The throttle law alone cannot fix this: it is
+/// already commanding more power, and in a climbing turn on a piston twin
+/// there is none left to give. Lowering the nose is the other half, and it is
+/// the half a pilot would do first.
+///
+/// Only ever REDUCES a climb: descents (negative) pass through untouched, and
+/// an aircraft at or above its full-rate speed (see [`climb_full_rate_kts`])
+/// keeps the rate it asked for, so every airframe with power to spare is
+/// unchanged.
+pub fn climb_limit_fpm(
+    vs_cmd: f64,
+    ias: f64,
+    ias_trend_kts_per_s: f64,
+    want_kts: f64,
+    floor_kts: f64,
+) -> f64 {
+    if vs_cmd <= 0.0 || !ias.is_finite() || floor_kts <= 0.0 {
+        return vs_cmd;
+    }
+    // Judge the speed we are HEADING FOR, not the one on the dial. Reacting to
+    // the instantaneous reading made this a bang-bang gate and it limit-cycled
+    // live: the commanded rate went 700 to 0 in four seconds as the speed dipped
+    // through the band, HELD there while the aircraft was already accelerating
+    // back, then slammed open again, the aeroplane porpoising about thirty feet
+    // either side with a period near twenty-five seconds (2026-08-01, felt in the
+    // cockpit before it was seen in the log). The projection fixes both ends: it
+    // starts easing the climb off before the speed is lost, so the dip is
+    // shallower, and it gives the rate back as soon as the speed is genuinely
+    // recovering instead of waiting for it to arrive. Same lead trick
+    // `alt_capture_vs` uses on altitude and the stall callout uses on airspeed.
+    let ias = ias + ias_trend_kts_per_s * CLIMB_SPEED_LEAD_S;
+    // Full rate AT the pattern speed: that is the speed the airframe is meant
+    // to be climbing at, and an aircraft flying it correctly must never be
+    // penalised. The fade runs downward from there to the floor.
+    if ias >= want_kts {
+        return vs_cmd;
+    }
+    if ias <= floor_kts {
+        return 0.0;
+    }
+    // A pattern speed at or below the floor leaves nothing to fade across
+    // (the two checks above have already covered it).
+    vs_cmd * ((ias - floor_kts) / (want_kts - floor_kts))
+}
+
+/// The speed at which [`climb_limit_fpm`] grants the FULL commanded rate: the
+/// speed the climb is actually FLOWN at, never the leg target the throttle
+/// holds.
+///
+/// Those were the same number until the clean-stall floor raised the Baron's
+/// pattern speed to 109.2 kt (four knots ABOVE its Vy of 105) and the two
+/// changes shipped the same evening without meeting. The throttle law holds
+/// the leg speed, so wiring that same speed in as the limiter's full-rate
+/// threshold parks the aircraft at the exact top of a nine-knot fade band:
+/// full climb is unreachable WHILE climbing (climbing at Vy is what the
+/// airframe does), and every knot of normal jitter swings the granted rate
+/// across half its range. Live it porpoised exactly as the projection was
+/// supposed to prevent: cmd_vs 700 to 0 on crosswind with the Baron
+/// DESCENDING at 190 fpm at 670 ft AGL mid-climb-out, then the whole downwind
+/// hung 100 ft below pattern altitude with the capture choked to 0-150 fpm
+/// and the speed see-sawing 104 to 113 on a 25 s cycle (EGHI, 2026-08-02).
+/// The unit test had pinned Vy as `want` all along; the call site passed the
+/// pattern speed, and the four-knot difference was the whole failure.
+///
+/// Capped below the leg speed (a jet's book Vy is a cruise-climb figure far
+/// above its pattern speed, and must not RAISE the threshold), and held a
+/// margin above the floor so a profile whose Vy sits at or under the floor
+/// still leaves a band to fade across instead of a cliff.
+pub fn climb_full_rate_kts(leg_kts: f64, vy_kts: f64, floor_kts: f64) -> f64 {
+    leg_kts.min(vy_kts).max(floor_kts + 2.0)
+}
 
 /// The least pattern speed, x clean Vs (`circuit::PATTERN_MIN_STALL_MULT`),
 /// and the speed an upset recovery holds ([`recovery_hold_kts`]).

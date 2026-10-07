@@ -31,7 +31,7 @@
 //!    direct. Off the route, behind it, beside it: there is always a way in.
 //!
 //! **The height** ([`climb_first`]): the highest ground on the way to the
-//! join (probed, else the grid MORA) plus `procedure::TERRAIN_CLEARANCE_FT`.
+//! join (probed, else the grid MORA) plus `terrain::CLEARANCE_FT`.
 //! Below it, the first leg is a climb on a heading whose ground the climb
 //! clears ([`climb_leg`], a CIFP "VA" leg the follower already flies),
 //! then the join. The follower's own floor ahead watches the rest in flight.

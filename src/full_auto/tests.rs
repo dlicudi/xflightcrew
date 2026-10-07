@@ -1086,7 +1086,7 @@
             .chain(v["navlog"]["fix"].as_array().unwrap().iter().map(|f| f["ident"].as_str().unwrap()))
             .map(|i| crate::simbrief::Waypoint { ident: i.into(), lat: 0.0, lon: 0.0, alt: 0.0 })
             .collect();
-        let filed = super::filed_route_of(Some(&p)).unwrap();
+        let filed = crate::simbrief::filed_route_of(Some(&p)).unwrap();
         assert_eq!(filed.fixes.first().map(String::as_str), Some("D257B"));
         assert_eq!(filed.fixes.last().map(String::as_str), Some("GROVE"), "the fields left out");
         let cifp = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/crates/atc/bench/cifp/EGKK_sids.dat"));

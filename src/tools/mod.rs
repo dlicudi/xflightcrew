@@ -412,7 +412,7 @@ impl Registry {
                 mtow_kg,
                 approach_ias,
                 prop: profile.prop.clone(),
-                climb_floor_kts: circuit::climb_floor(profile),
+                climb_floor_kts: crate::aircraft::climb_floor(profile),
                 vs_clean_kts: profile.vs_clean_kts,
                 park_brake_valve_set: profile.park_brake_valve_set,
             }));
@@ -458,7 +458,7 @@ impl Registry {
                     tail_strike_deg: profile.tail_strike_deg,
                     pitch_authority_down: profile.pitch_authority_down,
                     vne_kts: profile.vne_kts,
-                    climb_floor_kts: circuit::climb_floor(profile),
+                    climb_floor_kts: crate::aircraft::climb_floor(profile),
                     vs_clean_kts: profile.vs_clean_kts,
                     lights: profile.lights.clone(),
                     flood_dataref: profile.flood_lights_dataref.clone(),

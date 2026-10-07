@@ -30,7 +30,8 @@
 //! per FLIGHT rather than per airframe (each reset on its own path today):
 //! `autotaxi::LAST_ARRIVED`, `autoland::VACATE_FOLLOWS`,
 //! `full_auto::INBOUND_MADE` / `STAGE` / `MISSION`, `procedure::TOD` /
-//! `TERRAIN_FLOOR` / `PILOT_ALT` / `LEG`, `taxi_in::ARREST_HOLD`,
+//! `LEG`, `terrain::FLOOR_AHEAD`, `pilot_altitude::PILOT_ALT`,
+//! `taxi_in::ARREST_HOLD`,
 //! `instructor::LESSON`, `flow::*`. `pushback::LEARNED_SENSE` is per SESSION
 //! by design (the sim build's tug sense, learnt once), never per flight.
 

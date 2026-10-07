@@ -1965,7 +1965,7 @@
     /// leg that wanted 2,700: the follower flies the floor, and says so.
     #[test]
     fn terrain_ahead_floors_the_plans_constraint() {
-        let floor = 3861.0 + TERRAIN_CLEARANCE_FT;
+        let floor = 3861.0 + crate::terrain::CLEARANCE_FT;
         let v = tick(&jrz(), 2700.0, 2700.0, 4000.0, 38.0, None, Some(floor));
         assert_eq!(v.want_alt, floor);
         assert_eq!(v.floored, Some(floor));
@@ -2012,7 +2012,7 @@
     /// into the ridge; the follower holds the floor, not the number asked for.
     #[test]
     fn terrain_outranks_the_pilot_as_well() {
-        let floor = 3861.0 + TERRAIN_CLEARANCE_FT;
+        let floor = 3861.0 + crate::terrain::CLEARANCE_FT;
         let v = tick(
             &jrz(),
             2700.0,
@@ -2253,7 +2253,7 @@
     /// ahead of us and the last is the full look-ahead out.
     #[test]
     fn look_ahead_points_walk_down_the_track() {
-        let pts = look_ahead_points(36.6354, -5.2307, 285.0, 15.0, TERRAIN_POINTS);
+        let pts = crate::terrain::look_ahead_points(36.6354, -5.2307, 285.0, 15.0, TERRAIN_POINTS);
         assert_eq!(pts.len(), TERRAIN_POINTS);
         let d = |(a, b): (f64, f64)| crate::nav::haversine_nm(36.6354, -5.2307, a, b);
         assert!(d(pts[0]) < 1.5, "first point is close ahead: {}", d(pts[0]));

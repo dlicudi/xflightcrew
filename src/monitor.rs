@@ -3980,8 +3980,8 @@ pub async fn run(
                 // A taxi clearance to a runway this airframe cannot use
                 // (ETND 2026-09-24: 446 m of grass for an SF50 needing 780):
                 // with a pilot taxiing, the copilot says both numbers and the
-                // request to make, once per clearance. Full auto judges and
-                // asks for itself (`full_auto::judge_cleared_runway`).
+                // request to make, once per clearance, by the same judgement full
+                // auto asks with for itself (`runway::cleared_runway_fit`).
                 {
                     let taxi_to = (crate::party_line::clearance_state()
                         == Some(crate::tower::State::TaxiCleared))
@@ -3999,12 +3999,12 @@ pub async fn run(
                             let (roll, mtow) = crate::aircraft::profile_takeoff_roll(&live.get());
                             let needed =
                                 crate::aircraft::takeoff_needed_now_m(&xp, roll, mtow, 500.0).await;
-                            if let crate::full_auto::ClearedFit::Short {
+                            if let crate::runway::ClearedFit::Short {
                                 cleared,
                                 length_m,
                                 needed_m,
                                 ask,
-                            } = crate::full_auto::cleared_runway_fit(
+                            } = crate::runway::cleared_runway_fit(
                                 &crate::party_line::field_runways(),
                                 &rwy,
                                 needed,
@@ -4015,9 +4015,9 @@ pub async fn run(
                                         crate::circuit::spell_runway(&cleared),
                                         length_m,
                                         needed_m,
-                                        crate::full_auto::runway_request_call(&cleared, a)
+                                        crate::runway::runway_request_call(&cleared, a)
                                     ),
-                                    None => crate::full_auto::short_runway_line(
+                                    None => crate::runway::short_runway_line(
                                         length_m, needed_m, &cleared, None,
                                     ),
                                 };
@@ -4499,7 +4499,7 @@ pub async fn run(
                                     }
                                     if check.id() == "cabin_alt_warning"
                                         && snap.alt_ft > crate::tools::cabin_air::HYPOXIA_DESCENT_FT + 500.0
-                                        && crate::procedure::take_altitude(
+                                        && crate::pilot_altitude::take(
                                             crate::tools::cabin_air::HYPOXIA_DESCENT_FT,
                                         )
                                     {

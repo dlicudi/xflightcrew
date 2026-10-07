@@ -403,7 +403,7 @@ pub struct FullAuto {
     pub pitch_authority_down: Option<f64>,
     /// Vne/Vmo for the climb's overspeed protection.
     pub vne_kts: Option<f64>,
-    /// Slowest the pattern may climb toward — see `circuit::climb_limit_fpm`.
+    /// Slowest the pattern may climb toward: see `aircraft::climb_limit_fpm`.
     pub climb_floor_kts: f64,
     /// Clean stall speed, the floor under the pattern speed (flown clean).
     pub vs_clean_kts: Option<f64>,
@@ -1064,7 +1064,7 @@ impl FullAuto {
         let (mora_ft, msa_ft) = if probed {
             (None, None)
         } else {
-            let mora = crate::plan_audit::mora_grid(&ctx.config.fix_data_path).and_then(|g| {
+            let mora = crate::terrain::mora_grid(&ctx.config.fix_data_path).and_then(|g| {
                 std::iter::once((lat, lon))
                     .chain(pts.iter().copied())
                     .filter_map(|(a, b)| g.at(a, b))
@@ -1507,7 +1507,7 @@ impl FullAuto {
             // MORA's highest ground, which errs high. LEMG-LEBL, 413 nm, was
             // refused outright on 2026-09-28.
             let fix = ctx.config.fix_data_path.clone();
-            let mora = tokio::task::spawn_blocking(move || crate::plan_audit::mora_grid(&fix))
+            let mora = tokio::task::spawn_blocking(move || crate::terrain::mora_grid(&fix))
                 .await
                 .ok()
                 .flatten();

@@ -682,7 +682,7 @@ pub async fn hold_altitude_ahead_ft(
     default_platform_ft: f64,
 ) -> (Option<f64>, f64) {
     let mut pts = vec![(lat, lon)];
-    pts.extend(crate::procedure::look_ahead_points(
+    pts.extend(crate::terrain::look_ahead_points(
         lat,
         lon,
         track_deg,

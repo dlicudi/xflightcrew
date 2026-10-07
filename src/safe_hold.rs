@@ -16,7 +16,7 @@
 //! (`flight_state::crew_has_aircraft()` is `None`), and no pilot is flying it:
 //! then the autopilot's trajectory must stay at or above the SAFE FLOOR, the
 //! highest ground ahead along the track ([`LOOK_NM`]) plus
-//! [`crate::procedure::TERRAIN_CLEARANCE_FT`], from the sim's own terrain
+//! [`crate::terrain::CLEARANCE_FT`], from the sim's own terrain
 //! probe (grid MORA, then the ground under us, when the probe is silent).
 //!
 //! **Who flies** ([`Who`]), judged every second, never assumed:
@@ -83,7 +83,7 @@ pub const FAN_OFFSETS_DEG: [f64; 11] = [
 pub const FAN_LOOK_NM: f64 = 12.0;
 pub const FAN_POINTS: usize = 6;
 /// Clearance over the ground every hold keeps, feet.
-pub const CLEARANCE_FT: f64 = crate::procedure::TERRAIN_CLEARANCE_FT;
+pub const CLEARANCE_FT: f64 = crate::terrain::CLEARANCE_FT;
 /// While climbing, the margin over each point of ground on the way, feet.
 pub const CLIMB_MARGIN_FT: f64 = 500.0;
 /// Room for the turn before the climb is credited, nm.
@@ -1186,7 +1186,7 @@ pub fn split_fan(rays: &[(f64, Vec<(f64, f64, f64)>)], ground: &[f64]) -> Vec<Ra
 
 /// The MORA here and [`LOOK_NM`] ahead, the higher.
 pub fn mora_ahead(air: &Air, fix_data_path: &str) -> Option<f64> {
-    let g = crate::plan_audit::mora_grid(fix_data_path)?;
+    let g = crate::terrain::mora_grid(fix_data_path)?;
     let (la, lo) = crate::nav::project_latlon(air.lat, air.lon, air.track_true, LOOK_NM);
     [g.at(air.lat, air.lon), g.at(la, lo)]
         .into_iter()
