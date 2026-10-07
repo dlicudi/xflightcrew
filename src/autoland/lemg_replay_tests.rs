@@ -56,6 +56,20 @@
         pub wind_mps: f64,
         /// How its autopilot answers the bug.
         pub fit: HeadingFit,
+        /// A heading window that takes whole steps (the Zibo's MCP: 1
+        /// degree, magnetic), the bug rounded to it; `None` flies the bug
+        /// as written.
+        pub window_step: Option<f64>,
+        /// True less magnetic, degrees, for the window's rounding.
+        pub var_deg: f64,
+        /// The nose's yaw about the flight path, degrees and seconds
+        /// (amplitude, period): what the heading mode and the crab filter
+        /// read on top of the heading flown. `None`: none.
+        pub yaw_wobble: Option<(f64, f64)>,
+        /// The heading mode settling off its window, degrees, seconds and
+        /// radians (amplitude, period, phase): `None`, on it.
+        pub ap_offset: Option<(f64, f64, f64)>,
+        t: f64,
         queued: std::collections::VecDeque<f64>,
     }
 
@@ -82,6 +96,26 @@
     /// records agree: 8 degrees of bank 4 s after the bug moved 59, 22 at 8.
     pub const A330_HEADING: HeadingFit =
         HeadingFit { gain: 2.0, bank_max_deg: 25.0, roll_dps: 3.0, lag_s: 2.0, delay_ticks: 2 };
+    /// The Zibo 737's MCP heading select, fitted to the LEMG 30 ticks of
+    /// 2026-10-07 (`bench/approach/lemg30_zibo_2026-10-07.jsonl`, the
+    /// recorded window replayed in 20 s pieces from each piece's recorded
+    /// heading and bank): 1.5 degrees of bank per degree to 25, rolled at 3
+    /// degrees a second through a 4 s lag, the window answered 2 s after it
+    /// was read back (three ticks of the 0.6 s final). The finals fly it 0.8
+    /// degrees rms in heading and in bank, the pattern's turns 1.1 and 0.7;
+    /// the stock 737's fit flies the same finals 0.9 and 1.1, the turns 2.8
+    /// and 2.9 (`the_zibo_heading_fit_flies_the_recorded_windows`). Its
+    /// window takes whole degrees: [`Jet::window_step`].
+    pub const ZIBO_HEADING: HeadingFit =
+        HeadingFit { gain: 1.5, bank_max_deg: 25.0, roll_dps: 3.0, lag_s: 4.0, delay_ticks: 3 };
+
+    impl HeadingFit {
+        /// The bank's rate toward what the heading error asks, deg/s.
+        pub fn roll_rate(&self, heading_err_deg: f64, phi: f64) -> f64 {
+            let want = (self.gain * heading_err_deg).clamp(-self.bank_max_deg, self.bank_max_deg);
+            ((want - phi) / self.lag_s).clamp(-self.roll_dps, self.roll_dps)
+        }
+    }
 
     impl Jet {
         pub fn new(lat: f64, lon: f64, psi: f64, tas_kts: f64) -> Self {
@@ -94,8 +128,37 @@
                 wind_to_deg: 286.0,
                 wind_mps: 6.0,
                 fit: B737_HEADING,
+                window_step: None,
+                var_deg: 0.0,
+                yaw_wobble: None,
+                ap_offset: None,
+                t: 0.0,
                 queued: std::collections::VecDeque::new(),
             }
+        }
+
+        /// The heading read (true): the heading flown plus the yaw wobble.
+        pub fn nose(&self) -> f64 {
+            let w = self.yaw_wobble.map_or(0.0, |(a, p)| {
+                a * (2.0 * std::f64::consts::PI * self.t / p).sin()
+            });
+            (self.psi + w).rem_euclid(360.0)
+        }
+
+        /// The bug (true) as the window takes it.
+        pub fn windowed(&self, bug: f64) -> f64 {
+            match self.window_step.filter(|s| *s > 0.0) {
+                Some(s) => {
+                    (((bug - self.var_deg) / s).round() * s + self.var_deg).rem_euclid(360.0)
+                }
+                None => bug,
+            }
+        }
+
+        fn offset(&self) -> f64 {
+            self.ap_offset.map_or(0.0, |(a, p, ph)| {
+                a * (2.0 * std::f64::consts::PI * self.t / p + ph).sin()
+            })
         }
 
         fn ground(&self) -> (f64, f64) {
@@ -121,7 +184,7 @@
         /// One loop tick of `dt` seconds with this tick's `bug` (true).
         pub fn step(&mut self, bug: f64, dt: f64) {
             let f = self.fit;
-            self.queued.push_back(bug);
+            self.queued.push_back(self.windowed(bug));
             let applied = if self.queued.len() > f.delay_ticks {
                 self.queued.pop_front().unwrap_or(bug)
             } else {
@@ -130,9 +193,9 @@
             let n = 20;
             let h = dt / n as f64;
             for _ in 0..n {
-                let err = crate::angles::signed_diff_deg(applied, self.psi);
-                let want = (f.gain * err).clamp(-f.bank_max_deg, f.bank_max_deg);
-                self.phi += ((want - self.phi) / f.lag_s).clamp(-f.roll_dps, f.roll_dps) * h;
+                let err = crate::angles::signed_diff_deg(applied, self.nose()) + self.offset();
+                self.phi += f.roll_rate(err, self.phi) * h;
+                self.t += h;
                 let rate = (9.81 * self.phi.to_radians().tan() / self.tas_mps).to_degrees();
                 self.psi = (self.psi + rate * h).rem_euclid(360.0);
                 let (e, nn) = self.ground();
@@ -169,6 +232,9 @@
         pub knob_db: Option<crate::heading_bug::BugDeadband>,
         pub moves: u32,
         pub t: f64,
+        /// The airframe's final track law (`final_track:`), as the loop
+        /// composes it ([`final_track_heading`]); `None`, the pursuit.
+        pub final_track: Option<crate::aircraft::FinalTrackProfile>,
     }
 
     impl FinalLoop {
@@ -185,6 +251,7 @@
                 knob_db: None,
                 moves: 0,
                 t: 0.0,
+                final_track: None,
             }
         }
 
@@ -196,11 +263,11 @@
 
         /// One tick: the bug (true) and the guidance behind it.
         pub fn step(&mut self, jet: &Jet, rwy: &Runway, dt: f64) -> (f64, Guidance) {
-            let (psi, trk, gs) = (jet.psi, jet.track(), jet.gs_kts());
+            let (psi, trk, gs) = (jet.nose(), jet.track(), jet.gs_kts());
             let crab = self.crab.update(CrabFilter::raw(Some(psi), Some(trk)), dt);
             let dist = haversine_nm(jet.lat, jet.lon, rwy.thr_lat, rwy.thr_lon);
             let alt = rwy.elev_ft + (dist + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
-            let g = guidance_on(
+            let mut g = guidance_on(
                 jet.lat,
                 jet.lon,
                 alt,
@@ -212,6 +279,14 @@
                 25.0,
                 0.0,
                 self.width_m,
+            );
+            g.target_heading_deg = final_track_heading(
+                &g,
+                rwy.course_deg,
+                cross_track_nm(jet.lat, jet.lon, rwy) * M_PER_NM,
+                Some(trk),
+                gs,
+                self.final_track,
             );
             let trim = self.trim.update_gated(
                 g.phase,
@@ -248,7 +323,13 @@
             if let Some(k) = self.knob.as_mut() {
                 match bug_knob(g.phase, short, None, None) {
                     Some((key, db)) => {
-                        k.decide(key, bug, self.t, self.knob_db.unwrap_or(db));
+                        let wrote = k.decide(key, bug, self.t, self.knob_db.unwrap_or(db));
+                        // A window in whole steps reads back the write
+                        // rounded, and the knob remembers what it reads
+                        // (`BugHold::took`), as the loop's does.
+                        if let (Some(w), Some(_)) = (wrote, jet.window_step) {
+                            k.took(Some(jet.windowed(w)));
+                        }
                         bug = k.set().unwrap_or(bug);
                     }
                     None => k.reset(),

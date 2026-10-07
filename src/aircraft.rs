@@ -660,6 +660,39 @@ impl SpeedGovernorProfile {
     }
 }
 
+/// Autoland's final as a track closure (`autoland::final_track_cut_deg`):
+/// the offset carried `lead_s` ahead on the ground track, closed over
+/// `close_s`. The fixed-lead pursuit asks a degree of cut for 36 m of
+/// offset at 135 kt; an autopilot whose heading window steps in whole
+/// degrees (the Zibo's MCP) cannot fly a correction smaller than its step,
+/// and the pursuit then parks up to 18 m off with the window still, while
+/// the track trim walks it across the step and back: the Zibo's final at
+/// LEMG 30 wove 30 m either side with a period near a minute (2026-10-07).
+/// Closed in `close_s`, a degree of cut answers 14.5 m of offset at 12 s
+/// and 135 kt (69 m/s for 12 s, over 57 degrees a radian). The
+/// lead is the damping the heading's lag takes away (as the circuit's
+/// `circuit_final_lead_s`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FinalTrackProfile {
+    /// The offset is closed over this many seconds.
+    pub close_s: f64,
+    /// ...judged this far ahead on the drift over the ground, seconds.
+    pub lead_s: f64,
+}
+
+impl FinalTrackProfile {
+    /// Used only when every number is a sane one.
+    pub fn valid(self) -> Option<Self> {
+        ((3.0..=60.0).contains(&self.close_s) && (0.0..=30.0).contains(&self.lead_s))
+            .then_some(self)
+    }
+}
+
+/// The live airframe's final track law, when declared and sane.
+pub fn final_track() -> Option<FinalTrackProfile> {
+    live_profile().and_then(|p| p.final_track).and_then(FinalTrackProfile::valid)
+}
+
 /// The live airframe's arrest roll plant, when declared and sane.
 pub fn arrest_roll() -> Option<ArrestRollProfile> {
     live_profile().and_then(|p| p.arrest_roll).and_then(ArrestRollProfile::valid)
@@ -1079,6 +1112,13 @@ pub struct AircraftProfile {
     /// A330 ran 66 to 67 m through at LEMG 30 (2026-09-29, #189).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_final_lead_s: Option<f64>,
+    /// Autoland's final flown as a track closure (`autoland::final_track_cut_deg`)
+    /// instead of the fixed-lead pursuit, for an autopilot whose heading
+    /// answers its bug slowly and in whole degrees. Silent: the pursuit every
+    /// airframe has flown. The Zibo 737 wove 30 m either side of the
+    /// centreline at LEMG 30 (2026-10-07).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_track: Option<FinalTrackProfile>,
     /// Path to an XChecklist file to interpret (relative to the working dir),
     /// or `acf:<file>` for a file the aircraft ships in its own folder (the
     /// Zibo's `clist.txt`: not ours to copy into this repo), resolved against
@@ -5699,6 +5739,7 @@ fn cessna_172sp() -> AircraftProfile {
         pitch_authority_down: None,
         climb_pitch_max_deg: None,
         circuit_final_lead_s: None,
+        final_track: None,
         // Reference figures from the X-Plane C172 Pilot's Operating Manual.
         reference: Some(ReferenceProfile {
             kind: Some("single-engine aircraft".into()),
@@ -6110,6 +6151,7 @@ fn cirrus_sr22() -> AircraftProfile {
         pitch_authority_down: None,
         climb_pitch_max_deg: None,
         circuit_final_lead_s: None,
+        final_track: None,
         // Reference figures from the X-Plane Cirrus SR22 Pilot's Operating Manual
         // (the modeled aircraft is the turbo TSIO-550-K, ceiling 25,000 ft).
         reference: Some(ReferenceProfile {

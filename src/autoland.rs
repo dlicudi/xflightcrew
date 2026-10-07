@@ -1630,6 +1630,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
             // Integral trim on the final's track error — see [`TrackTrim`]
             // for the standing 35 m the crab loop could not see.
             let mut track_trim = TrackTrim::new();
+            // The final's track law, where the airframe declares one (see
+            // [`final_track_heading`]); read once, as the arm's airframe.
+            let final_track_law = crate::aircraft::final_track();
             // Rollout: latched at touchdown, then brakes down — to a full stop,
             // or to taxi pace when a vacate drive follows. The takeoff roll law
             // (P + trim, tested) holds the centreline through the plugin steer
@@ -3503,6 +3506,16 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     // afresh.
                     None => energy_cap = None,
                 }
+                // The final on the airframe's declared track law, where it
+                // has one (`final_track:`): the trim below learns against it.
+                g.target_heading_deg = final_track_heading(
+                    &g,
+                    rwy.course_deg,
+                    xtk_now * M_PER_NM,
+                    hpath_r.as_ref().ok().copied(),
+                    gs_kts,
+                    final_track_law,
+                );
                 let g = g;
                 let outbound = hold.is_some()
                     || pattern.is_some_and(|(_, leg, _)| leg != crate::reversal::Leg::Inbound);
@@ -7008,6 +7021,80 @@ pub fn short_final_cut_deg(xtk_m: f64, side_m_s: f64, gs_kts: f64) -> f64 {
         .clamp(-SHORT_FINAL_MAX_CUT_DEG, SHORT_FINAL_MAX_CUT_DEG)
 }
 
+/// The declared track law's smallest cap on its cut, degrees: the pursuit's
+/// own cut, when bigger, is the cap (a final handed over far off closes no
+/// slower than it did).
+pub const FINAL_TRACK_MAX_CUT_DEG: f64 = 5.0;
+
+/// The final's heading cut off the runway course on a declared track law
+/// (`final_track:`), degrees (left negative), from the offset (`xtk_m`,
+/// right positive) and the drift over the ground (`side_m_s`, right
+/// positive): the short final's shape ([`short_final_cut_deg`]) on the
+/// airframe's own times, capped at the larger of
+/// [`FINAL_TRACK_MAX_CUT_DEG`] and `pursuit_cut_deg`'s size.
+///
+/// Why (LEMG 30, the Zibo 737, 2026-10-07, four finals gone around
+/// `unstabilised_below_floor` 28 to 34 m off): the fixed-lead pursuit cuts
+/// atan(offset / 1.1 nm), a degree for 36 m at 135 kt. The Zibo's heading
+/// select settles off its window and wanders back over a minute (heading
+/// less window 0.6 to 1.0 degrees rms over 20 s on those finals) and its
+/// window takes whole degrees, so every degree it strays costs the pursuit
+/// 36 m before it is answered: 30 m left at 5.8 nm, 18 right at 3.5, 16
+/// right at 1, 31 left at 0.1, about a minute a cycle. On the plant fitted
+/// to those finals (`lemg30_zibo_final_tests`) the pursuit weaves 18 to 28
+/// m and goes around in 9 finals of 24; this law keeps 6 to 11 m and goes
+/// around in none, and with the heading on its window holds 1.4 to 3.3 m
+/// from 1.5 nm where the pursuit parks up to 7 m off, the window still. The
+/// heading answers slowly (1.5 degrees of bank a degree, a 4 s roll lag,
+/// 2 s late, fitted to `bench/approach/lemg30_zibo_2026-10-07.jsonl`), so
+/// the closure is led on the ground track, the derivative the lag takes
+/// away. Pure.
+pub fn final_track_cut_deg(
+    xtk_m: f64,
+    side_m_s: f64,
+    gs_kts: f64,
+    p: crate::aircraft::FinalTrackProfile,
+    pursuit_cut_deg: f64,
+) -> f64 {
+    if !xtk_m.is_finite() || !side_m_s.is_finite() {
+        return pursuit_cut_deg;
+    }
+    let v = (if gs_kts.is_finite() { gs_kts } else { 0.0 } * 0.514_444).max(30.0);
+    let ahead = xtk_m + side_m_s * p.lead_s;
+    let cap = if pursuit_cut_deg.is_finite() {
+        FINAL_TRACK_MAX_CUT_DEG.max(pursuit_cut_deg.abs())
+    } else {
+        FINAL_TRACK_MAX_CUT_DEG
+    };
+    (-(ahead / (v * p.close_s)).atan().to_degrees()).clamp(-cap, cap)
+}
+
+/// The heading the final asks for (true), the guidance's own unless the
+/// airframe declares a track law (`final_track:`, [`final_track_cut_deg`]):
+/// then, on the final outside [`SHORT_FINAL_NM`] and not in an arrest, the
+/// course plus that law's cut. A failed track read flies the pursuit that
+/// tick. The loop and the replays compose it alike. Pure.
+pub fn final_track_heading(
+    g: &Guidance,
+    course_deg: f64,
+    xtk_m: f64,
+    track_true: Option<f64>,
+    gs_kts: f64,
+    p: Option<crate::aircraft::FinalTrackProfile>,
+) -> f64 {
+    let Some(p) = p else {
+        return g.target_heading_deg;
+    };
+    if g.phase != ApproachPhase::Final || g.arresting || g.dist_nm <= SHORT_FINAL_NM {
+        return g.target_heading_deg;
+    }
+    let Some(side) = side_velocity_m_s(track_true, course_deg, gs_kts) else {
+        return g.target_heading_deg;
+    };
+    let pursuit = crate::angles::signed_diff_deg(g.target_heading_deg, course_deg);
+    (course_deg + final_track_cut_deg(xtk_m, side, gs_kts, p, pursuit)).rem_euclid(360.0)
+}
+
 /// How quickly the short final learns what the track does against its bug,
 /// seconds.
 const SHORT_FINAL_BIAS_TAU_S: f64 = 2.0;
@@ -8821,6 +8908,12 @@ pub(crate) mod lemg_replay;
 /// replayed against the real apt.dat geometry.
 #[cfg(test)]
 mod issue_147_tests;
+
+/// LEMG 30, the Zibo 737's finals of 2026-10-07: its heading select fitted
+/// to the recorded windows, its whole-degree window, and the final flown on
+/// the pursuit (weaving) and on its declared track law (`final_track:`).
+#[cfg(test)]
+mod lemg30_zibo_final_tests;
 
 /// Issue #77: EDLP 24, the SF50's balked balloon of 2026-09-24, replayed.
 #[cfg(test)]
