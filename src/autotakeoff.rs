@@ -2128,6 +2128,28 @@ pub const CLIMB_ACCEL_FRACTION: f64 = 0.4;
 /// Never less than this while accelerating: still a climb.
 pub const CLIMB_ACCEL_FLOOR_FPM: f64 = 800.0;
 
+/// How far the hardware lever must move from where it sat as the roll began
+/// to be a pilot's hand.
+pub const HW_THROTTLE_HAND: f64 = 0.1;
+
+/// Whether a lever read below our command is the pilot's hand. With no
+/// hardware axis declared, the lever read alone says so (as always). With
+/// one, the axis must have moved [`HW_THROTTLE_HAND`] from its baseline: the
+/// Zibo snaps its levers to the hardware lever on any twitch of it (noise
+/// lock OFF), and our next write puts them back. Its takeoff at LEMG read
+/// the levers at the hardware's 0.28 against 0.535 twice, 2 s into the roll,
+/// and handed a standing aircraft to nobody (2026-10-07). A read that
+/// failed is no measurement, so no hand. Pure.
+pub fn pilot_moved_throttle(declared: bool, baseline: Option<f64>, now: Option<f64>) -> bool {
+    if !declared {
+        return true;
+    }
+    match (baseline, now) {
+        (Some(b), Some(n)) => (n - b).abs() > HW_THROTTLE_HAND,
+        _ => false,
+    }
+}
+
 /// The acceleration segment's rate for a declared climb-out. Pure.
 pub fn climb_accel_fpm(c: ClimbOut) -> f64 {
     (c.max_fpm * CLIMB_ACCEL_FRACTION).max(CLIMB_ACCEL_FLOOR_FPM)
@@ -2977,6 +2999,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut lights_off = false;
     let mut positive_called = false;
     let mut thr_challenged = false;
+    // The hardware lever where it sat as the roll began, on an airframe that
+    // can snap its levers to it (`throttle_hardware_axis`).
+    let hw_axis = crate::aircraft::throttle_hardware_axis();
+    let hw_baseline = match &hw_axis {
+        Some(name) => xp.get_float(name).await.ok().filter(|v| v.is_finite()),
+        None => None,
+    };
     // The initial climb's speed hold by pitch, on an airframe that declares
     // its climb attitude (`climb_pitch_max_deg`); the fixed rotation
     // attitude elsewhere.
@@ -3245,7 +3274,25 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // The cost is one tick of blindness to a real hand; the alternative is
         // a takeoff handed away by a hiccup.
         let thr_now = thr_read.unwrap_or(thr_cmd);
-        if thr_now < last_thr_cmd - 0.25 && elapsed > 2.0 {
+        let lever_pulled = thr_now < last_thr_cmd - 0.25 && elapsed > 2.0;
+        let hand = if lever_pulled {
+            let now = match &hw_axis {
+                Some(name) => xp.get_float(name).await.ok().filter(|v| v.is_finite()),
+                None => None,
+            };
+            let hand = pilot_moved_throttle(hw_axis.is_some(), hw_baseline, now);
+            if !hand {
+                crate::blackbox::record(
+                    "autotakeoff",
+                    serde_json::json!({"event": "throttle_snap_ignored", "read": thr_now,
+                                       "cmd": last_thr_cmd, "axis": now, "axis_base": hw_baseline}),
+                );
+            }
+            hand
+        } else {
+            false
+        };
+        if hand {
             if thr_challenged {
                 RUN.record(sim::run::Outcome::PilotOverride);
                 alert(&voice, Priority::Warning, "Your throttle. Your aircraft.");

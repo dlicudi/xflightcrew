@@ -984,6 +984,14 @@ pub struct AircraftProfile {
     /// one. `None` = `throttle_ratio_all` (see [`throttle_dataref`]).
     #[serde(default)]
     pub throttle_dataref: Option<String>,
+    /// The pilot's HARDWARE thrust lever as this airframe reads it, when it
+    /// can snap the levers to it on its own (the Zibo's `axis/throttle1`,
+    /// with its throttle noise lock OFF). A lever read below our command is
+    /// then a pilot's hand only when this axis moved too
+    /// ([`crate::autotakeoff::pilot_moved_throttle`]). `None` = the lever
+    /// read alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throttle_hardware_axis: Option<String>,
     /// Pitch attitude at which this airframe's tail touches the runway,
     /// degrees. The auto-takeoff rotation will not command within a margin of
     /// it. `None` on airframes short enough that elevator authority runs out
@@ -4770,6 +4778,11 @@ pub fn flap_limits() -> Vec<(f64, Option<f64>)> {
 /// crosswind, 373 on downwind against a 198 kt target, past both Vmo figures,
 /// still climbing with a descent commanded. The copilot could not slow it down
 /// and had no way to know.
+/// The live airframe's hardware thrust-lever axis, when it declares one.
+pub fn throttle_hardware_axis() -> Option<String> {
+    live_profile().and_then(|p| p.throttle_hardware_axis.clone())
+}
+
 pub fn throttle_dataref() -> String {
     #[cfg(not(test))]
     let published = airframe_facts().throttle_dref.clone();
@@ -5122,6 +5135,7 @@ fn cessna_172sp() -> AircraftProfile {
     };
     AircraftProfile {
         id: "cessna_172sp".into(),
+        throttle_hardware_axis: None,
         yoke_input: None,
         display_name: "Cessna 172SP Skyhawk".into(),
         simbrief_types: Vec::new(),
@@ -5495,6 +5509,7 @@ fn cirrus_sr22() -> AircraftProfile {
     };
     AircraftProfile {
         id: "cirrus_sr22".into(),
+        throttle_hardware_axis: None,
         yoke_input: None,
         display_name: "Cirrus SR22".into(),
         simbrief_types: Vec::new(),

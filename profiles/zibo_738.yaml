@@ -69,7 +69,15 @@ match:
 # copilot can try and READ BACK; expect "did not take" until the owner can
 # write the Zibo's mcp_* windows. VERIFY first thing on the ground.
 autopilot: true
-throttle: true         # VERIFY: override_throttles is held at 1 by zibomod
+# The throttle write moves the engines (LXGB 2026-10-07: lever 1.0 gave
+# 104 % N1, the 0.9 reduction took).
+throttle: true
+# zibomod snaps its levers to the HARDWARE lever on any twitch of it (the
+# tablet's THROTTLE NOISE LOCK, laminar/B738/fms/throttle_noise, is OFF
+# here): LEMG's takeoff read the levers at the hardware's 0.28 against 0.535
+# and handed back a standing aircraft as "your throttle". A yield needs this
+# axis to move too.
+throttle_hardware_axis: laminar/B738/axis/throttle1
 # The `autothrottle` tool is written against laminar/md82 names.
 autothrottle: false
 # Probed 2026-10-06: a stock speedbrake_ratio write STICKS but the Zibo's

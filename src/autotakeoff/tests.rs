@@ -5176,3 +5176,17 @@
             "{east_west:.2} m east-west vs {split:.2} diagonal"
         );
     }
+
+/// A lever read below our command is a hand only when the declared hardware
+/// lever moved too: the Zibo's snap to a still hardware lever handed a
+/// standing aircraft to nobody at LEMG (2026-10-07).
+#[test]
+fn a_lever_snap_with_the_hardware_still_is_no_hand() {
+    use super::pilot_moved_throttle as hand;
+    assert!(hand(false, None, None), "undeclared: the lever read decides");
+    assert!(!hand(true, Some(0.284), Some(0.284)));
+    assert!(!hand(true, Some(0.284), Some(0.33)));
+    assert!(hand(true, Some(0.284), Some(0.05)));
+    assert!(!hand(true, None, Some(0.05)), "no baseline is no measurement");
+    assert!(!hand(true, Some(0.284), None), "a failed read is no measurement");
+}
