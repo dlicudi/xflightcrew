@@ -44,6 +44,9 @@ pub async fn run(
         }
     }
     not_taken.extend(crate::tools::jet_start::run_steps(xp, &p.steps, say, panel).await);
+    if let Some(a) = &p.align {
+        restart_if_off(xp, a).await;
+    }
     if let Some(entry) = p.align.as_ref().and_then(|a| a.position_entry.as_ref()) {
         let entered = enter_position(xp, entry).await;
         if entered == Some(false) {
@@ -55,6 +58,46 @@ pub async fn run(
         json!({"event": "done", "not_taken": not_taken}),
     );
     Ok(not_taken)
+}
+
+/// Pause between knob presses: the Zibo's knob animates between detents.
+const KNOB_PRESS_GAP: Duration = Duration::from_millis(400);
+
+/// Every system reading OFF after the switches (a knob found already at
+/// NAV begins nothing): cycle the declared knobs once, OFF and back. A
+/// failed read is no measurement and cycles nothing. True when it cycled.
+pub async fn restart_if_off(xp: &dyn XPlane, a: &AlignWait) -> bool {
+    if a.restart.is_empty() {
+        return false;
+    }
+    let modes = read_modes(xp, a).await;
+    if !all_off(&modes) {
+        return false;
+    }
+    for k in &a.restart {
+        for _ in 0..k.presses {
+            let _ = xp.run_command(&k.off).await;
+            tokio::time::sleep(KNOB_PRESS_GAP).await;
+        }
+    }
+    for k in &a.restart {
+        for _ in 0..k.presses {
+            let _ = xp.run_command(&k.on).await;
+            tokio::time::sleep(KNOB_PRESS_GAP).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = read_modes(xp, a).await;
+    crate::blackbox::record(
+        "preflight",
+        json!({"event": "align_restart", "before": modes, "after": after}),
+    );
+    true
+}
+
+/// Every system read and OFF. Pure.
+fn all_off(modes: &[Option<f64>]) -> bool {
+    !modes.is_empty() && modes.iter().all(|m| m.is_some_and(|v| v.abs() < 0.5))
 }
 
 /// A position as the 737's POS INIT takes it: hemisphere, whole degrees,
@@ -172,7 +215,7 @@ pub async fn wait_aligned(
     }
     // Every system OFF: nothing is aligning, and no wait will change that
     // (an engine started by hand on a dark overhead, then full auto).
-    if !first.is_empty() && first.iter().all(|m| m.is_some_and(|v| v.abs() < 0.5)) {
+    if all_off(&first) {
         crate::blackbox::record("preflight", json!({"event": "align_off"}));
         return AlignVerdict::Off;
     }
@@ -266,7 +309,35 @@ mod tests {
                 dataref: "pos_fmc_set".into(),
                 command: "fmc_to_irs".into(),
             }),
+            restart: vec![crate::aircraft::KnobCycle {
+                off: "irs_L_left".into(),
+                on: "irs_L_right".into(),
+                presses: 2,
+            }],
         }
+    }
+
+    /// Knobs found at NAV with the IRS off (the LEMG runway start): cycled
+    /// once, OFF and back. Aligning, or a mode that does not read: nothing.
+    #[tokio::test(start_paused = true)]
+    async fn an_irs_left_off_at_nav_is_restarted_once() {
+        let a = align(false);
+        let xp = FakeXPlane::new();
+        xp.set_read("irs_mode", 0.0);
+        xp.set_read("irs2_mode", 0.0);
+        assert!(restart_if_off(&xp, &a).await);
+        assert_eq!(xp.ran_count("irs_L_left"), 2);
+        assert_eq!(xp.ran_count("irs_L_right"), 2);
+
+        let xp = FakeXPlane::new();
+        xp.set_read("irs_mode", 1.0);
+        xp.set_read("irs2_mode", 0.0);
+        assert!(!restart_if_off(&xp, &a).await);
+        assert_eq!(xp.ran_count("irs_L_left"), 0);
+
+        let xp = FakeXPlane::new();
+        xp.set_read("irs_mode", 0.0);
+        assert!(!restart_if_off(&xp, &a).await, "irs2_mode did not read");
     }
 
     fn knob(cmd: &str, down: &str, pos: &str, want: f64) -> StartStep {

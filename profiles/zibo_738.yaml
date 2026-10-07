@@ -496,6 +496,12 @@ preflight:
     position_entry:
       dataref: laminar/B738/FMS/irs_pos_fmc_set
       command: laminar/B738/push_button/fmc_to_irs_pos
+    # A knob already at NAV begins nothing: a runway start left both there
+    # with the IRS off and the preflight read them set (LEMG 2026-10-07).
+    # OFF and back to NAV, probed, read mode 1 with 384 s left.
+    restart:
+      - { off: laminar/B738/toggle_switch/irs_L_left, on: laminar/B738/toggle_switch/irs_L_right, presses: 2 }
+      - { off: laminar/B738/toggle_switch/irs_R_left, on: laminar/B738/toggle_switch/irs_R_right, presses: 2 }
 # The panel's rheostats are the Zibo's own: the stock flood write
 # (`panel_brightness_ratio`) did not stand (probed 2026-10-07) and there is
 # no command for them, so full auto's ramp leaves the panel lighting out.

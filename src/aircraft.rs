@@ -1903,6 +1903,23 @@ pub struct AlignWait {
     /// into POS INIT ([`PositionEntry`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position_entry: Option<PositionEntry>,
+    /// The mode knobs cycled OFF and back when every system reads off after
+    /// the preflight's switches ([`KnobCycle`]): a knob already at NAV
+    /// begins nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart: Vec<KnobCycle>,
+}
+
+/// One knob turned down to its stop and back: `presses` of `off`, then as
+/// many of `on`. The Zibo's IRS begins aligning only on the knob's MOVE with
+/// power: a runway start left both at NAV with the IRS off (mode 0), the
+/// preflight read them "already set", and full auto gave up at the taxi
+/// (LEMG, 2026-10-07); OFF and back to NAV read mode 1, 384 s left.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnobCycle {
+    pub off: String,
+    pub on: String,
+    pub presses: u32,
 }
 
 /// Where the alignment takes its present position: a `data` dataref the
