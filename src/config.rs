@@ -515,8 +515,30 @@ impl Config {
         settle(&mut self.atc_piper_voice);
         settle(&mut self.atc_approach_piper_voice);
         settle(&mut self.atc_departure_piper_voice);
+        // ...and no airport answers in a persona's voice. The pool leaves the
+        // personas' defaults out by hand, but the panel's picker can choose a
+        // pool voice for the pilot: a saved `pilot_voice` of en_US-danny-low
+        // put the first officer in the away-field pool (2026-10-07).
+        let personas = [
+            self.piper_voice.clone(),
+            self.cabin_piper_voice.clone(),
+            self.atc_piper_voice.clone(),
+            self.atc_approach_piper_voice.clone(),
+            self.atc_departure_piper_voice.clone(),
+        ];
+        self.atc_voice_pool = pool_without(&self.atc_voice_pool, &personas);
         self
     }
+}
+
+/// The voice pool with every voice in `taken` removed (empty entries in
+/// `taken` remove nothing).
+fn pool_without(pool: &str, taken: &[String]) -> String {
+    pool.split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && !taken.iter().any(|t| !t.is_empty() && t == v))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Where the Global Airports apt.dat lives: `XCOPILOT_APT_DAT` overrides the
@@ -563,6 +585,19 @@ fn default_ui() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pilot voice picked from the pool leaves the pool, the rest stays in
+    /// order, and an empty persona slot (inherit) removes nothing.
+    #[test]
+    fn a_persona_voice_leaves_the_pool() {
+        let pool = "a.onnx, models/en_US-danny-low.onnx,b.onnx#3,,c.onnx";
+        let taken = [
+            "models/en_US-danny-low.onnx".to_string(),
+            String::new(),
+            "b.onnx#3".to_string(),
+        ];
+        assert_eq!(pool_without(pool, &taken), "a.onnx,c.onnx");
+    }
 
     /// Every voice the ATC pool names must actually be on disk, and the `#N`
     /// speaker suffixes must be in range for their model. A pool entry that
