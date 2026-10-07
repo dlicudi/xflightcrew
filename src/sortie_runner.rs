@@ -3523,11 +3523,22 @@ pub async fn secure_at_end(sim: &dyn RunnerSim) -> bool {
 /// How long the run's end waits for a low, descending aircraft to climb.
 const PAUSE_WAIT_LOW_S: f64 = 90.0;
 
-/// An airborne aircraft may be frozen here: out of the ground's reach, or
-/// not going down.
+/// An airborne aircraft may be frozen here: not going down, or out of the
+/// ground's reach AND a minute from it at the rate it is sinking. Height
+/// alone was not enough: the run's end froze a Zibo 0.6 s into a recovery at
+/// 407 ft going down at 1,850 fpm (13 s from the ground), banked 27 degrees
+/// (LEMG 30, 2026-10-07, #232).
 pub fn pause_safe(agl_ft: f64, vs_fpm: f64) -> bool {
-    agl_ft >= crate::tools::recover::GROUND_ESCAPE_AGL_FT || vs_fpm > -200.0
+    if vs_fpm > -200.0 {
+        return true;
+    }
+    let to_ground_s = agl_ft / (-vs_fpm / 60.0);
+    agl_ft >= crate::tools::recover::GROUND_ESCAPE_AGL_FT && to_ground_s >= PAUSE_TO_GROUND_S
 }
+
+/// The least time from the ground, at the sink rate, a descending aircraft
+/// may be frozen at.
+const PAUSE_TO_GROUND_S: f64 = 60.0;
 
 /// Every case, `repeat` times, in order; a row per case as it ends.
 pub async fn run_all(

@@ -1006,6 +1006,10 @@ cases:
         assert!(!pause_safe(204.0, -2_500.0));
         assert!(pause_safe(204.0, 500.0));
         assert!(pause_safe(3_000.0, -2_500.0));
+        // Above the escape height but 44 s from the ground: the Zibo frozen
+        // 2.6 s into a recovery at LEMG 30 (2026-10-07, #232) waits now.
+        assert!(!pause_safe(1_343.0, -1_811.0));
+        assert!(pause_safe(1_343.0, -150.0));
     }
 
     #[test]
