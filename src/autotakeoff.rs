@@ -2910,6 +2910,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     if xp.cancelled() || !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
+    // The rotation and the climb-out are flown on the plugin's yoke
+    // channels: tell it which input this airframe's yoke is.
+    crate::yoke::arm(&xp, "autotakeoff").await;
     crate::tools::controls::release_park_brake_for_roll(&xp, p.park_brake_valve_set).await;
     tracing::info!(
         icao = %rwy.icao, id = %rwy.id, remaining_m, vr = p.vr_kts, "auto takeoff: rolling"

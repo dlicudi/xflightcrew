@@ -422,6 +422,103 @@ static float g_roll_axis_baseline = 0.5f;
 static int g_roll_engage_frames = 0;
 static int g_roll_deflect_frames = 0;
 
+// The yoke ROUTE (xcopilot/yoke_method, set by the app from the airframe's
+// profile `yoke_input:` on every swap). 0, the default, is the stock path
+// above: yoke_*_ratio under override_joystick_*. 1 is the Zibo 737's own
+// external input: zibomod holds the stock overrides itself and rewrites the
+// yoke ratios every frame (probed parked 2026-10-07: yoke_pitch_ratio 0.5
+// read back 0, the elevator unmoved; the LXGB takeoff of 2026-10-07 held
+// xcopilot/pitch at -0.5 for 3 s while the nose rose 10 to 22 degrees), but
+// with laminar/B738/flt_ctrls/joy_override = 1 it takes joy_pitch, joy_roll
+// and joy_heading as the yoke (joy_pitch 0.5 put the elevator at -8.4
+// degrees, joy_roll 0.5 the ailerons at 7.5/-10, the ratios following with
+// the stock sense). On that route the stock overrides are never touched:
+// dropping one zibomod holds hands the axis to the raw joystick. The route
+// is latched per engage, so a swap mid-hold releases what was held.
+static XPLMDataRef g_yoke_method_dref = nullptr;
+static int g_yoke_method = 0;
+static const int kYokeStock = 0;
+static const int kYokeZiboJoy = 1;
+static XPLMDataRef g_joy_override = nullptr;
+static XPLMDataRef g_joy_pitch = nullptr;
+static XPLMDataRef g_joy_roll = nullptr;
+static XPLMDataRef g_joy_heading = nullptr;
+// Which route each axis was engaged on (valid while *_applied).
+static int g_pitch_route = kYokeStock;
+static int g_roll_route = kYokeStock;
+// The yaw the steer channel wrote this frame (0 when it holds nothing):
+// joy_override also takes the yaw from joy_heading, so while the route holds
+// the yoke it carries the steer channel's value, never a stale centre.
+static float g_yaw_written = 0.0f;
+static int ReadYokeMethod(void*) { return g_yoke_method; }
+static void WriteYokeMethod(void*, int v) {
+    g_yoke_method = (v == kYokeZiboJoy) ? kYokeZiboJoy : kYokeStock;
+}
+static bool joy_good(XPLMDataRef r) { return r && XPLMIsDataRefGood(r); }
+// The route a fresh engage takes: the Zibo's only when all its names exist.
+// Found at engage, never at start: zibomod registers them after we load,
+// and an aircraft unload invalidates them.
+static int yoke_route_now() {
+    if (g_yoke_method != kYokeZiboJoy) return kYokeStock;
+    g_joy_override = XPLMFindDataRef("laminar/B738/flt_ctrls/joy_override");
+    g_joy_pitch = XPLMFindDataRef("laminar/B738/flt_ctrls/joy_pitch");
+    g_joy_roll = XPLMFindDataRef("laminar/B738/flt_ctrls/joy_roll");
+    g_joy_heading = XPLMFindDataRef("laminar/B738/flt_ctrls/joy_heading");
+    if (joy_good(g_joy_override) && joy_good(g_joy_pitch)
+        && joy_good(g_joy_roll) && joy_good(g_joy_heading)) {
+        return kYokeZiboJoy;
+    }
+    return kYokeStock;
+}
+static bool joy_route_held() {
+    return (g_pitch_applied && g_pitch_route == kYokeZiboJoy)
+        || (g_roll_applied && g_roll_route == kYokeZiboJoy);
+}
+// Hold one yoke axis on the Zibo route: the override, the axis, the yaw.
+static void joy_hold(XPLMDataRef axis, float v) {
+    if (!joy_good(g_joy_override) || !joy_good(axis)) return;
+    XPLMSetDataf(g_joy_override, 1.0f);
+    XPLMSetDataf(axis, v);
+    if (joy_good(g_joy_heading)) XPLMSetDataf(g_joy_heading, g_yaw_written);
+}
+// Frames the override is still held, axes centred, before it is dropped.
+// Centring and dropping in one frame left the yoke where it was: zibomod
+// never read the centred joy_roll and yoke_roll_ratio stayed at 0.5, the
+// ailerons at 7.5 degrees (probed parked 2026-10-07); a centre held a
+// second came back to 0.
+static const int kJoyDropFrames = 30;
+static int g_joy_drop_frames = 0;
+static void joy_drop_now() {
+    if (joy_good(g_joy_pitch)) XPLMSetDataf(g_joy_pitch, 0.0f);
+    if (joy_good(g_joy_roll)) XPLMSetDataf(g_joy_roll, 0.0f);
+    if (joy_good(g_joy_heading)) XPLMSetDataf(g_joy_heading, 0.0f);
+    if (joy_good(g_joy_override)) XPLMSetDataf(g_joy_override, 0.0f);
+    g_joy_drop_frames = 0;
+}
+// Centre one axis; once neither axis holds the route, the override is kept
+// centred for kJoyDropFrames and then dropped (call after clearing that
+// axis's *_applied).
+static void joy_release(XPLMDataRef axis) {
+    if (joy_good(axis)) XPLMSetDataf(axis, 0.0f);
+    if (!joy_route_held()) g_joy_drop_frames = kJoyDropFrames;
+}
+// Every frame: the centred hold counting down to the drop.
+static void joy_drop_tick() {
+    if (g_joy_drop_frames <= 0) return;
+    if (joy_route_held()) {
+        g_joy_drop_frames = 0;
+        return;
+    }
+    if (--g_joy_drop_frames > 0) {
+        if (joy_good(g_joy_override)) XPLMSetDataf(g_joy_override, 1.0f);
+        if (joy_good(g_joy_pitch)) XPLMSetDataf(g_joy_pitch, 0.0f);
+        if (joy_good(g_joy_roll)) XPLMSetDataf(g_joy_roll, 0.0f);
+        if (joy_good(g_joy_heading)) XPLMSetDataf(g_joy_heading, g_yaw_written);
+    } else {
+        joy_drop_now();
+    }
+}
+
 // Axis-assignment codes in sim/joystick/joystick_axis_assignments.
 static const int kAxisPitch = 1;
 static const int kAxisRoll = 2;
@@ -783,8 +880,10 @@ static float TaxiAssistLoop(float, float, int, void*) {
             tiller::yaw_override(&yaw_out);
             if (g_override_heading) XPLMSetDatai(g_override_heading, 1);
             if (g_yoke_heading) XPLMSetDataf(g_yoke_heading, yaw_out);
+            g_yaw_written = yaw_out;
         }
     }
+    if (!steer_fresh || g_steer_yield) g_yaw_written = 0.0f;
     if ((!steer_fresh || g_steer_yield) && g_taxi_steer_applied) {
         if (g_yoke_heading) XPLMSetDataf(g_yoke_heading, 0.0f);
         // Dropped last, like the brake: the pilot's yaw hardware re-drives
@@ -814,6 +913,7 @@ static float TaxiAssistLoop(float, float, int, void*) {
             }
             g_pitch_engage_frames = 0;
             g_pitch_deflect_frames = 0;
+            g_pitch_route = yoke_route_now();
             g_pitch_applied = true;
         }
         const float ax = pitch_axis_value();
@@ -827,16 +927,24 @@ static float TaxiAssistLoop(float, float, int, void*) {
             g_pitch_deflect_frames = 0;
         }
         if (!g_pitch_yield) {
-            if (g_override_pitch) XPLMSetDatai(g_override_pitch, 1);
-            if (g_yoke_pitch) XPLMSetDataf(g_yoke_pitch, g_pitch);
+            if (g_pitch_route == kYokeZiboJoy) {
+                joy_hold(g_joy_pitch, g_pitch);
+            } else {
+                if (g_override_pitch) XPLMSetDatai(g_override_pitch, 1);
+                if (g_yoke_pitch) XPLMSetDataf(g_yoke_pitch, g_pitch);
+            }
         }
     }
     if ((!pitch_fresh || g_pitch_yield) && g_pitch_applied) {
-        if (g_yoke_pitch) XPLMSetDataf(g_yoke_pitch, 0.0f);
-        // Dropped last: the pilot's pitch hardware (or the engaged AP servo)
-        // owns the elevator the very next frame.
-        if (g_override_pitch) XPLMSetDatai(g_override_pitch, 0);
         g_pitch_applied = false;
+        if (g_pitch_route == kYokeZiboJoy) {
+            joy_release(g_joy_pitch);
+        } else {
+            if (g_yoke_pitch) XPLMSetDataf(g_yoke_pitch, 0.0f);
+            // Dropped last: the pilot's pitch hardware (or the engaged AP
+            // servo) owns the elevator the very next frame.
+            if (g_override_pitch) XPLMSetDatai(g_override_pitch, 0);
+        }
     }
     if (!pitch_fresh) g_pitch_yield = 0;
 
@@ -855,6 +963,7 @@ static float TaxiAssistLoop(float, float, int, void*) {
             }
             g_roll_engage_frames = 0;
             g_roll_deflect_frames = 0;
+            g_roll_route = yoke_route_now();
             g_roll_applied = true;
         }
         const float ax = roll_axis_value();
@@ -868,16 +977,25 @@ static float TaxiAssistLoop(float, float, int, void*) {
             g_roll_deflect_frames = 0;
         }
         if (!g_roll_yield) {
-            if (g_override_roll) XPLMSetDatai(g_override_roll, 1);
-            if (g_yoke_roll) XPLMSetDataf(g_yoke_roll, g_roll);
+            if (g_roll_route == kYokeZiboJoy) {
+                joy_hold(g_joy_roll, g_roll);
+            } else {
+                if (g_override_roll) XPLMSetDatai(g_override_roll, 1);
+                if (g_yoke_roll) XPLMSetDataf(g_yoke_roll, g_roll);
+            }
         }
     }
     if ((!roll_fresh || g_roll_yield) && g_roll_applied) {
-        if (g_yoke_roll) XPLMSetDataf(g_yoke_roll, 0.0f);
-        if (g_override_roll) XPLMSetDatai(g_override_roll, 0);
         g_roll_applied = false;
+        if (g_roll_route == kYokeZiboJoy) {
+            joy_release(g_joy_roll);
+        } else {
+            if (g_yoke_roll) XPLMSetDataf(g_yoke_roll, 0.0f);
+            if (g_override_roll) XPLMSetDatai(g_override_roll, 0);
+        }
     }
     if (!roll_fresh) g_roll_yield = 0;
+    joy_drop_tick();
     return -1.0f; // every frame: braking rides the physics rate, not REST rate
 }
 // Live flight strip — a status row the app refreshes continuously, not logged.
@@ -1146,6 +1264,7 @@ static const char* const kStateSources[] = {
     "xcopilot/steer_yield",
     "xcopilot/pitch_yield",
     "xcopilot/roll_yield",
+    "xcopilot/yoke_method",
     "xcopilot/brake_yield",
     "sim/aircraft/overflow/pushback_attached",
     "sim/flightmodel/engine/ENGN_TRQ",
@@ -1446,6 +1565,10 @@ void start() {
         "xcopilot/roll_yield", xplmType_Int, 0,
         ReadRollYield, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_yoke_method_dref = XPLMRegisterDataAccessor(
+        "xcopilot/yoke_method", xplmType_Int, 1,
+        ReadYokeMethod, WriteYokeMethod, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_yoke_roll = XPLMFindDataRef("sim/cockpit2/controls/yoke_roll_ratio");
     g_override_roll = XPLMFindDataRef("sim/operation/override/override_joystick_roll");
     g_yoke_heading = XPLMFindDataRef("sim/cockpit2/controls/yoke_heading_ratio");
@@ -1479,17 +1602,27 @@ void stop_first() {
         if (g_override_heading) XPLMSetDatai(g_override_heading, 0);
         g_taxi_steer_applied = false;
     }
-    // And no elevator or aileron.
+    // And no elevator or aileron, each released on the route it was held.
     if (g_pitch_applied) {
-        if (g_yoke_pitch) XPLMSetDataf(g_yoke_pitch, 0.0f);
-        if (g_override_pitch) XPLMSetDatai(g_override_pitch, 0);
         g_pitch_applied = false;
+        if (g_pitch_route == kYokeZiboJoy) {
+            joy_release(g_joy_pitch);
+        } else {
+            if (g_yoke_pitch) XPLMSetDataf(g_yoke_pitch, 0.0f);
+            if (g_override_pitch) XPLMSetDatai(g_override_pitch, 0);
+        }
     }
     if (g_roll_applied) {
-        if (g_yoke_roll) XPLMSetDataf(g_yoke_roll, 0.0f);
-        if (g_override_roll) XPLMSetDatai(g_override_roll, 0);
         g_roll_applied = false;
+        if (g_roll_route == kYokeZiboJoy) {
+            joy_release(g_joy_roll);
+        } else {
+            if (g_yoke_roll) XPLMSetDataf(g_yoke_roll, 0.0f);
+            if (g_override_roll) XPLMSetDatai(g_override_roll, 0);
+        }
     }
+    // The loop is gone: no centred hold can count down, so drop it now.
+    if (g_joy_drop_frames > 0) joy_drop_now();
     if (g_taxi_steer_dref) { XPLMUnregisterDataAccessor(g_taxi_steer_dref); g_taxi_steer_dref = nullptr; }
     if (g_steer_yield_dref) { XPLMUnregisterDataAccessor(g_steer_yield_dref); g_steer_yield_dref = nullptr; }
     if (g_brake_yield_dref) { XPLMUnregisterDataAccessor(g_brake_yield_dref); g_brake_yield_dref = nullptr; }
@@ -1508,6 +1641,7 @@ void stop_first() {
     if (g_terrain_probe) { XPLMDestroyProbe(g_terrain_probe); g_terrain_probe = nullptr; }
     if (g_roll_dref) { XPLMUnregisterDataAccessor(g_roll_dref); g_roll_dref = nullptr; }
     if (g_roll_yield_dref) { XPLMUnregisterDataAccessor(g_roll_yield_dref); g_roll_yield_dref = nullptr; }
+    if (g_yoke_method_dref) { XPLMUnregisterDataAccessor(g_yoke_method_dref); g_yoke_method_dref = nullptr; }
     if (g_taxi_brake_dref) { XPLMUnregisterDataAccessor(g_taxi_brake_dref); g_taxi_brake_dref = nullptr; }
     if (g_steer_brake_l_dref) { XPLMUnregisterDataAccessor(g_steer_brake_l_dref); g_steer_brake_l_dref = nullptr; }
     if (g_steer_brake_r_dref) { XPLMUnregisterDataAccessor(g_steer_brake_r_dref); g_steer_brake_r_dref = nullptr; }

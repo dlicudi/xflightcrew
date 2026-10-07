@@ -584,8 +584,17 @@ takeoff_config:
 
 # The attitude at which the tail touches: about 11 degrees on the -800.
 tail_strike_deg: 11.0
-# Nose-down elevator the rotation law may command: the type's, VERIFY that
-# the pitch channel reaches this aircraft at all (override_joystick_pitch).
+# The yoke: zibomod holds override_joystick_pitch/roll and rewrites the
+# stock yoke ratios every frame, so the plugin's pitch channel reached
+# nothing (LXGB 2026-10-07: full nose-down held 3 s, the nose rose 10 to 22
+# degrees, the AP took a 6,600 fpm climb). Its external input does: probed
+# parked 2026-10-07, joy_override 1 with joy_pitch 0.5 put the elevator at
+# -8.4 degrees (nose up), -0.5 at +13; joy_roll 0.5 the ailerons 7.5/-10;
+# the stock ratios followed with the same sense. joy_override takes the yaw
+# from joy_heading too; the plugin carries the steer channel's value there.
+# Unflown.
+yoke_input: zibo_joy
+# Nose-down elevator the rotation law may command: the type's.
 pitch_authority_down: 0.5
 climb_pitch_max_deg: 18.0
 

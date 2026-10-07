@@ -1379,6 +1379,8 @@ fn spawn_autoland(launch: AutolandLaunch) {
             if xp.cancelled() {
                 return;
             }
+            // The flare and the rollout fly the plugin's yoke channels.
+            crate::yoke::arm(&xp, "autoland").await;
             LANDING_CONFIGURED.store(false, Ordering::SeqCst);
             ON_FINAL.store(false, Ordering::SeqCst);
             let announce = |line: String, sev: Priority| {

@@ -975,6 +975,11 @@ pub struct AircraftProfile {
     /// pace (see [`TaxiProfile`]).
     #[serde(default)]
     pub taxi: Option<TaxiProfile>,
+    /// The input the plugin's yoke channels (`xcopilot/pitch`, `xcopilot/roll`)
+    /// drive, when it is not the stock yoke ratios (`crate::yoke`). `None` =
+    /// the stock path.
+    #[serde(default)]
+    pub yoke_input: Option<YokeInput>,
     /// The thrust-lever dataref this airframe obeys, when it is not the stock
     /// one. `None` = `throttle_ratio_all` (see [`throttle_dataref`]).
     #[serde(default)]
@@ -2969,6 +2974,44 @@ impl TillerMethod {
     }
 }
 
+/// The input the plugin's yoke channels drive (`xcopilot/yoke_method`).
+/// The codes are the plugin's (`plugin/src/drefs.cpp`, `kYoke*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum YokeInput {
+    /// The Zibo 737's external input: `laminar/B738/flt_ctrls/joy_override`
+    /// and its `joy_pitch`, `joy_roll`, `joy_heading`. zibomod rewrites the
+    /// stock yoke ratios every frame, so a stock write is a silent no-op.
+    ZiboJoy,
+}
+
+impl YokeInput {
+    /// The plugin's code; 0 is the stock path.
+    pub fn code(input: Option<YokeInput>) -> i32 {
+        match input {
+            None => 0,
+            Some(YokeInput::ZiboJoy) => 1,
+        }
+    }
+
+    /// The airframe names the plugin writes on this route.
+    pub fn references(self) -> &'static [&'static str] {
+        match self {
+            YokeInput::ZiboJoy => &[
+                "laminar/B738/flt_ctrls/joy_override",
+                "laminar/B738/flt_ctrls/joy_pitch",
+                "laminar/B738/flt_ctrls/joy_roll",
+                "laminar/B738/flt_ctrls/joy_heading",
+            ],
+        }
+    }
+}
+
+/// The live airframe's yoke input, `None` for the stock yoke ratios.
+pub fn yoke_input() -> Option<YokeInput> {
+    live_profile().and_then(|p| p.yoke_input)
+}
+
 /// The live airframe's tiller, when it declares one.
 pub fn tiller() -> Option<TillerProfile> {
     live_profile().and_then(|p| p.taxi.as_ref().and_then(|t| t.tiller.clone()))
@@ -4939,6 +4982,14 @@ pub fn profile_references(p: &AircraftProfile) -> Vec<String> {
             }
         }
     }
+    // Nor does the yoke input: the plugin writes them.
+    if let Some(y) = p.yoke_input {
+        for name in y.references() {
+            if !out.iter().any(|o| o == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
     // The tiller's method names no dataref in the YAML: the plugin's.
     if let Some(t) = p.taxi.as_ref().and_then(|t| t.tiller.as_ref()) {
         for name in t.method.references() {
@@ -5048,6 +5099,7 @@ fn cessna_172sp() -> AircraftProfile {
     };
     AircraftProfile {
         id: "cessna_172sp".into(),
+        yoke_input: None,
         display_name: "Cessna 172SP Skyhawk".into(),
         simbrief_types: Vec::new(),
         matcher: Some(ProfileMatch {
@@ -5420,6 +5472,7 @@ fn cirrus_sr22() -> AircraftProfile {
     };
     AircraftProfile {
         id: "cirrus_sr22".into(),
+        yoke_input: None,
         display_name: "Cirrus SR22".into(),
         simbrief_types: Vec::new(),
         matcher: Some(ProfileMatch {
