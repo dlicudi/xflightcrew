@@ -191,6 +191,11 @@ autoflight:
     # MCP's values: a stock dial write here is a silent no-op.
     heading:
       write: laminar/B738/autopilot/mcp_hdg_dial
+      # Whole degrees only: in flight 295 took and 295.4 was refused (the
+      # window stayed 296), so every fractional correction down LEMG 30's
+      # final was thrown away and both approaches went around 28 to 34 m
+      # off the centreline (2026-10-07). Snapped to the nearest degree.
+      step: 1.0
     altitude:
       write: laminar/B738/autopilot/mcp_alt_dial
     # The speed window undoes a write (150 read back 100). The stock
