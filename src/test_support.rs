@@ -46,8 +46,9 @@ pub fn rust_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The files of the module at `src/<name>` (`"full_auto"`, `"tools/setup"`,
-/// `"main"`): `src/<name>.rs` first, then every `.rs` under `src/<name>/` in
-/// path order (its submodules and moved-out tests).
+/// `"main"`): `src/<name>.rs` first, then its submodules under `src/<name>/`
+/// in path order, then its moved-out tests. The live code comes before every
+/// test file, so a pattern a test quotes is never found in the test first.
 pub fn module_files(name: &str) -> Vec<PathBuf> {
     let src = root().join("src");
     let mut out = Vec::new();
@@ -55,7 +56,10 @@ pub fn module_files(name: &str) -> Vec<PathBuf> {
     if file.is_file() {
         out.push(file);
     }
-    out.extend(rust_files(&src.join(name)));
+    let (tests, live): (Vec<PathBuf>, Vec<PathBuf>) =
+        rust_files(&src.join(name)).into_iter().partition(|p| is_test_file(p));
+    out.extend(live);
+    out.extend(tests);
     assert!(!out.is_empty(), "no source for the module {name}");
     out
 }
@@ -70,4 +74,53 @@ pub fn module_source(name: &str) -> &'static str {
         .collect::<Vec<_>>()
         .join("\n");
     Box::leak(text.into_boxed_str())
+}
+
+/// The live code of a module: its file and each non-test submodule file,
+/// each cut where its first test module is declared (`#[cfg(test)]` then
+/// `mod `), joined in [`module_files`] order. For a scan that must read
+/// production code only, wherever in the module it lives.
+pub fn module_live_source(name: &str) -> &'static str {
+    let text = module_files(name)
+        .iter()
+        .filter(|p| !is_test_file(p))
+        .map(|p| {
+            let t = std::fs::read_to_string(p).unwrap();
+            t.split("#[cfg(test)]\nmod ").next().unwrap().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Box::leak(text.into_boxed_str())
+}
+
+/// The module whose namespace a file's items live in, by its path under
+/// `src/` (`"autoland/flare.rs"`): a child its parent re-exports whole
+/// (`use flare::*;`, a loop split into files) is its parent's, so
+/// `"autoland"`; any other file is its own module (`"tools/autopilot"`).
+pub fn namespace_of(rel: &Path) -> String {
+    let src = root().join("src");
+    let mut parts: Vec<String> = rel
+        .with_extension("")
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    while parts.len() > 1 {
+        let child = parts.last().unwrap().clone();
+        let parent = parts[..parts.len() - 1].join("/");
+        let file = [src.join(format!("{parent}.rs")), src.join(&parent).join("mod.rs")]
+            .into_iter()
+            .find(|f| f.is_file());
+        let Some(file) = file else { break };
+        let text = std::fs::read_to_string(file).unwrap();
+        let glob = format!("use {child}::*;");
+        let re_exported = text.lines().any(|l| {
+            let l = l.trim();
+            l == glob || (l.starts_with("pub") && l.ends_with(&format!(" {glob}")))
+        });
+        if !re_exported {
+            break;
+        }
+        parts.pop();
+    }
+    parts.join("/")
 }

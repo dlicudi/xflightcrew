@@ -1203,7 +1203,7 @@ mod one_check_tests {
                 sources.push(rest[..rest.find('"').unwrap()].to_string());
             }
             if text.contains("climb_watch::disarm_authority()") {
-                disarms.push(rel);
+                disarms.push(format!("{}.rs", crate::test_support::namespace_of(std::path::Path::new(&rel))));
             }
         }
         sources.sort();

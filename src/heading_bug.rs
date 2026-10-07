@@ -371,12 +371,12 @@ mod tests {
     }
 
     /// The heading bug writes that may bypass [`bug_toward`] and the two
-    /// holds, keyed by module (`src/<module>.rs` and everything under
-    /// `src/<module>/`), the function the write sits in, and how many it
-    /// holds, each with why it cannot reverse a turn in progress. Every
-    /// other write of the bug outside this file and `autoflight.rs` fails
-    /// [`every_heading_bug_write_is_turn_safe`]; so does an entry no write
-    /// answers any more.
+    /// holds, keyed by module (a loop's own files are its parent's,
+    /// `test_support::namespace_of`), the function the write sits in, and
+    /// how many it holds, each with why it cannot reverse a turn in
+    /// progress. Every other write of the bug outside this file and
+    /// `autoflight.rs` fails [`every_heading_bug_write_is_turn_safe`]; so
+    /// does an entry no write answers any more.
     const DIRECT_BUG_WRITES: &[(&str, &str, usize, &str)] = &[
         ("procedure", "fly", 3, "the arm seeds the bug on the heading flown and a stalled leg puts it on the nose; the steer is HeadingHold::decide's output"),
         ("circuit", "write_bug", 1, "the circuit's one knob writer, fed by BugHold over bug_toward, or the nose"),
@@ -398,20 +398,6 @@ mod tests {
     #[test]
     fn every_heading_bug_write_is_turn_safe() {
         let src = crate::test_support::root().join("src");
-        let module_of = |rel: &std::path::Path| -> String {
-            let parts: Vec<String> = rel
-                .with_extension("")
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().to_string())
-                .collect();
-            for n in 1..=parts.len() {
-                let p = parts[..n].join("/");
-                if src.join(format!("{p}.rs")).is_file() {
-                    return p;
-                }
-            }
-            parts.join("/")
-        };
         let mut found: std::collections::BTreeMap<(String, String), Vec<String>> = Default::default();
         for f in crate::test_support::rust_files(&src) {
             let rel = f.strip_prefix(&src).unwrap().to_path_buf();
@@ -499,7 +485,7 @@ mod tests {
             }
             for i in hits {
                 found
-                    .entry((module_of(&rel), fn_at(i)))
+                    .entry((crate::test_support::namespace_of(&rel), fn_at(i)))
                     .or_default()
                     .push(format!("{name}:{}", line_at(i)));
             }

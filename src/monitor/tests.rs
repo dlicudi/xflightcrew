@@ -29,8 +29,7 @@
     /// reads `quiet`. Returns the world_tick source and the span of
     /// `runway_watch` in it.
     fn runway_watch_span() -> (&'static str, std::ops::Range<usize>) {
-        let all = crate::test_support::module_source("monitor");
-        let mon = &all[..all.find("\nmod tests;").expect("tests")];
+        let mon = crate::test_support::module_live_source("monitor");
         let quiet_block = mon.find("            if !quiet {\n").expect("world block");
         let calls: Vec<usize> = mon.match_indices("world.runway_watch(").map(|(i, _)| i).collect();
         assert_eq!(calls.len(), 1, "one runway watch call site");

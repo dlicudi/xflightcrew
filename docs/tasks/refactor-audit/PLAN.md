@@ -59,6 +59,12 @@ Note: BSD grep drops `pub static` lines; use `rg` or perl for source scans.
 7. Mission context struct.
 
 ## Phase 4: loops into their own files (whole, unchanged)
+Done 2026-10-07 (stage A item 4): autoland, full_auto, circuit, procedure, autotakeoff,
+autotaxi, monitor and aircraft each split into child files under their own directory, every
+item moved whole (only private to `pub(super)` and `pub(super)` to `pub(crate)`), re-exported
+by its parent so every path is unchanged. The giant functions moved whole: `spawn_autoland`
+(`autoland/run.rs`, 3,671 lines, the one file over 3,000) waits for phase 5. Source scans read
+modules, not files (`test_support::module_live_source`, `namespace_of`).
 
 ## Phase 5: loop state structs (behaviour risk, gated on sorties)
 `spawn_autoland` (2,957 lines), `run_session` (2,784), `monitor::run` (2,201),
