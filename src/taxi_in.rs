@@ -322,6 +322,7 @@ async fn vacate(
     prop: Option<crate::aircraft::PropProfile>,
     pace: crate::autotaxi::Pace,
     rwy: &str,
+    gen: &sim::run::Lease<'_>,
 ) -> VacateEnd {
     use std::sync::atomic::Ordering::Relaxed;
     let planned_at = std::time::Instant::now();
@@ -390,6 +391,13 @@ async fn vacate(
         reminders: None,
     };
     let drive_kts = crate::tools::speedhold::clamp_taxi_target(pace.turn).max(3.0);
+    // "My controls" can land between the plan and the drive: the abort's halt
+    // finds no drive yet, and one started after it drove on at 12 kt with
+    // nobody's say (LEMG 30, 2026-10-07, 0.8 s apart). Checked before each
+    // start; the caller's own check then stops and parks.
+    if cancelled(gen) {
+        return VacateEnd::Carry;
+    }
     let armed = crate::tools::speedhold::HoldSpeed {
         approach_kts: None,
         park_brake_valve_set,
@@ -425,18 +433,32 @@ async fn vacate(
             return VacateEnd::Relocated { said: false };
         }
     }
+    if cancelled(gen) {
+        crate::tools::speedhold::release();
+        return VacateEnd::Carry;
+    }
     crate::autotaxi::start(
         config.xplane_base_url.clone(),
         voice.clone(),
         route,
         drive_kts,
     );
+    if cancelled(gen) {
+        crate::autotaxi::halt();
+        crate::tools::speedhold::release();
+        return VacateEnd::Carry;
+    }
 
     // Wait for it to finish. Bounded, and a timeout is not fatal: the taxi-in
     // request goes out regardless, which is the other way off the pavement.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(budget);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     while crate::autotaxi::driving() {
+        if cancelled(gen) {
+            crate::autotaxi::halt();
+            crate::tools::speedhold::release();
+            return VacateEnd::Carry;
+        }
         if std::time::Instant::now() >= deadline {
             // STOP it, don't just stop waiting for it. A drive left running
             // past its budget is still steering, still holding the arrival
@@ -526,6 +548,7 @@ async fn fly(
             prop.clone(),
             pace,
             &rwy,
+            gen,
         )
         .await;
         if let VacateEnd::Relocated { said } = end {
