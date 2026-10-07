@@ -194,7 +194,8 @@ pub enum AlignVerdict {
     Off,
 }
 
-async fn read_modes(xp: &dyn XPlane, a: &AlignWait) -> Vec<Option<f64>> {
+/// Each system's mode as it reads now, `None` where it did not read.
+pub async fn read_modes(xp: &dyn XPlane, a: &AlignWait) -> Vec<Option<f64>> {
     let mut out = Vec::with_capacity(a.modes.len());
     for m in &a.modes {
         out.push(xp.get_float(m).await.ok().filter(|v| v.is_finite()));
