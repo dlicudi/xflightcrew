@@ -49,7 +49,8 @@
 # Everything the stock profile FITTED to the Laminar 737's flight model and
 # autopilot (roll rudder, flare model, idle decel per flap) is left out: this
 # is another flight model (zibomod writes its own surfaces) and another
-# autopilot, so those numbers are not this aircraft's.
+# autopilot, so those numbers are not this aircraft's. The roll rudder has
+# since been fitted to this one (`roll_rudder:` below).
 
 id: zibo_738
 display_name: Zibo 737-800
@@ -661,6 +662,33 @@ flare_power:
   retard_slow_kts: 5.0
   retard_max_per_s: 0.04
   retard_float_per_s: 0.08
+# The rudder on the takeoff roll (autotakeoff::RollSteer), fitted to THIS
+# aircraft: the pedal channel moves the rudder and zibomod's nosewheel, 7
+# degrees at full pedal. Fitted to all three LEMG 30 rolls of 2026-10-07
+# (1791363565, 1791365303, 1791367701; 30 to 140 kt, 45.7 t, 8 kt/s): the
+# logged steer through a dead time and a first-order lag to the logged yaw
+# rate, a disturbance per roll (a constant and a weathervane on the square of
+# the airspeed): 12.7 deg/s per unit at 80 kt as v^0.75, through 1.0 s of
+# dead time and a 0.2 s lag, 0.21 deg/s rms. The stock 737's 0.3 s and
+# 0.47 s fit 0.25, no dead time 0.32, v^2 0.27. The default law it flew
+# wove 4 m right to 9.5 m left; two rolls of three were rejected 10 m left at
+# 132 and 134 kt, the third lifted off 6.2 m left.
+# A second of dead time is past what the lead covers: steered on the heading
+# read, the law scheduled on this rudder rang 14.6 m off the centreline through
+# the fitted plant, the steer swinging tick to tick. dead_s and lag_s make it
+# steer on the heading the steer already written will make. Closure 0.9 a
+# second: at 1.0 the steer swung on a rudder 1.35 times the fit. Through the
+# fitted plant from 1.4 m and 2 degrees off, 3.2 kt/s to 145 kt, calm and
+# 8 kt of crosswind either side: within 1.8 m, 1.3 m from 90 kt, no weave.
+# Replayed through the three rolls: 2.1, 4.2 and 4.7 m where they flew 6.2,
+# 9.1 and 8.9. Offline only.
+roll_rudder:
+  yaw_dps: 12.7
+  at_kts: 80.0
+  yaw_power: 0.75
+  close_per_s: 0.9
+  dead_s: 1.0
+  lag_s: 0.2
 # The flare's elevator: the stock 737's tracker settings, pull-only. Its
 # fitted plant model is NOT carried over (another flight model).
 flare_elevator:

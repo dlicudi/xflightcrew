@@ -1245,6 +1245,8 @@
             yaw_power: None,
             close_per_s: None,
             trim_per_s: None,
+            dead_s: None,
+            lag_s: None,
         };
         assert!(!RollSteer::with_rudder(true, silly).scheduled());
     }
@@ -1324,13 +1326,28 @@
     /// rudder. `None` is the rudder alone, as every earlier replay flew.
     fn replay_roll_braked(
         ticks: &[serde_json::Value],
+        law: RollSteer,
+        cut: RollCut,
+        rudder: &dyn Fn(f64) -> f64,
+        brake: Option<&dyn Fn(f64) -> f64>,
+    ) -> (Vec<(f64, f64, f64, f64)>, f64) {
+        replay_roll_through(ticks, law, cut, rudder, brake, 0.3, 0.47)
+    }
+
+    /// [`replay_roll_braked`] through an airframe's own transport: `dead_s`
+    /// of dead time and a `lag_s` first-order lag from the steer to the yaw
+    /// rate (the 737's, the SR22's and the Evolution's replays fly 0.3 and
+    /// 0.47; the Zibo's 1.0 and 0.2).
+    fn replay_roll_through(
+        ticks: &[serde_json::Value],
         mut law: RollSteer,
         mut cut: RollCut,
         rudder: &dyn Fn(f64) -> f64,
         brake: Option<&dyn Fn(f64) -> f64>,
+        dead_s: f64,
+        lag_s: f64,
     ) -> (Vec<(f64, f64, f64, f64)>, f64) {
-        const DEAD_S: f64 = 0.3;
-        const LAG_S: f64 = 0.47;
+        let (dead, lag) = (dead_s, lag_s);
         const H: f64 = 0.01;
         let g = |r: &serde_json::Value, k: &str| r[k].as_f64().unwrap_or(0.0);
         let n = ticks.len();
@@ -1392,7 +1409,7 @@
                     }
                     let gs = gs0 + (gs1 - gs0) * (1.0 - (end - t) / dt);
                     let braked = brake.map_or(0.0, |b| b(gs) * applied_brake);
-                    dyaw += (rudder(gs) * applied + braked - dyaw) * H / LAG_S;
+                    dyaw += (rudder(gs) * applied + braked - dyaw) * H / lag;
                     dpsi += dyaw * H;
                     dx += gs / MS_TO_KTS * dpsi.to_radians() * H;
                     t += H;
@@ -1420,7 +1437,7 @@
             } else {
                 0.0
             };
-            queue.push_back((t + DEAD_S, steer - g(r, "steer"), dbrake));
+            queue.push_back((t + dead, steer - g(r, "steer"), dbrake));
             out.push((gs, c.xtk_m, truth[k] + dx, steer));
         }
         (out, dev)
@@ -1695,6 +1712,8 @@
             power_steer_to_kts: Some(250.0),
             close_per_s: None,
             trim_per_s: None,
+            dead_s: None,
+            lag_s: None,
             ..rudder_sr22()
         }
     }
@@ -1828,6 +1847,8 @@
                 crate::aircraft::RollRudderProfile {
                     close_per_s: None,
                     trim_per_s: None,
+                    dead_s: None,
+                    lag_s: None,
                     ..declared
                 },
             ),
@@ -1906,6 +1927,8 @@
             power_steer_per_kftlb: None,
             close_per_s: Some(1.0),
             trim_per_s: Some(0.3),
+            dead_s: None,
+            lag_s: None,
         }
     }
 
@@ -2098,6 +2121,322 @@
         let (with, without) = (worst(declared), worst(torque_only));
         println!("1790736651: {with:.2} m declared, {without:.2} m on eb511f4's schedule");
         assert!(without > with + 0.5, "{without:.2} against {with:.2}");
+    }
+
+    /// The Zibo's three LEMG 30 rolls of 2026-10-07 (1791363565, 1791365303,
+    /// 1791367701), every `roll` tick: the default law, the pedals on the
+    /// plugin's steer channel (zibomod's nosewheel 7 degrees from them, the
+    /// rudder), 5.1 m, 8.4 m and 9.5 m worst, the last two rejected.
+    fn zibo_rolls() -> Vec<(String, Vec<serde_json::Value>)> {
+        const TEXT: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/bench/takeoffs/zibo738_rolls_lemg30_2026-10-07.jsonl"
+        ));
+        let mut rolls: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+        for r in TEXT
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        {
+            let id = r["sortie"].as_str().unwrap_or("").to_string();
+            match rolls.last_mut() {
+                Some((last, ticks)) if *last == id => ticks.push(r),
+                _ => rolls.push((id, vec![r])),
+            }
+        }
+        rolls
+    }
+
+    /// The Zibo's dead time from the steer to the yaw rate, seconds, and the
+    /// lag after it (fitted, see [`rudder_zibo_fit`]).
+    const ZIBO_DEAD_S: f64 = 1.0;
+    const ZIBO_LAG_S: f64 = 0.2;
+
+    /// The Zibo's rudder, deg/s of yaw per unit of steer: fitted to all three
+    /// rolls from 30 kt to the reject, the recorded steer through a dead time
+    /// and a first-order lag to the recorded yaw rate `r`, a disturbance per
+    /// roll (a constant and a weathervane on the square of the airspeed):
+    /// 12.7 at 80 kt as v^0.75, through 1.0 s of dead time and a 0.2 s lag,
+    /// 0.21 deg/s rms (r² 0.89). The stock 737's 0.3 s and 0.47 s fit
+    /// 0.25 rms, no dead time 0.32; v² 0.27. Below 30 kt the pedals' 7
+    /// degrees of nosewheel, kinematically 0.23 deg/s per knot on the
+    /// -800's 15.6 m wheelbase, fading as the rudder takes over.
+    fn rudder_zibo_fit(gs: f64) -> f64 {
+        let gs = gs.max(0.0);
+        12.7 * (gs / 80.0).powf(0.75) + 0.23 * gs * (1.0 - gs / 40.0).max(0.0)
+    }
+
+    /// The Zibo's rudder as the profile declares it (`roll_rudder:`).
+    fn rudder_zibo() -> crate::aircraft::RollRudderProfile {
+        let text = std::fs::read_to_string("profiles/zibo_738.yaml").unwrap();
+        let p: crate::aircraft::AircraftProfile = serde_yaml::from_str(&text).unwrap();
+        p.roll_rudder
+            .and_then(|r| r.valid())
+            .expect("the Zibo declares its rudder")
+    }
+
+    /// A Zibo takeoff roll through the fitted plant ([`rudder_zibo_fit`],
+    /// [`ZIBO_DEAD_S`], [`ZIBO_LAG_S`]) with the live loop's cut
+    /// ([`RollCut`]) at the recorded 0.25 s tick; the crosswind from the
+    /// left as the 737's plant has it (the rolls' own disturbance, at about
+    /// 4 kt, is within half of it). `kscale` makes the real rudder weaker or
+    /// stronger than fitted.
+    fn fly_zibo_roll(
+        mut law: RollSteer,
+        xw_kt: f64,
+        kscale: f64,
+        xtk0: f64,
+        psi_off: f64,
+        accel_kts_s: f64,
+        vr_kts: f64,
+    ) -> Vec<RollTick> {
+        const COURSE: f64 = 297.4;
+        const TICK: f64 = 0.25;
+        const H: f64 = 0.01;
+        let mut cut = RollCut::for_law(&law);
+        let (mut psi, mut yaw, mut xtk, mut gs) = (COURSE + psi_off, 0.0_f64, xtk0, 0.0_f64);
+        let mut queue: std::collections::VecDeque<(f64, f64)> = Default::default();
+        let mut applied = 0.0_f64;
+        let mut t = 0.0_f64;
+        let mut ticks = Vec::new();
+        while gs < vr_kts {
+            let psi_off = crate::angles::signed_diff_deg(psi, COURSE);
+            let c = cut.update(xtk, psi_off, gs, TICK);
+            let err = c.target_off_deg - psi_off;
+            let steer = law.step_with_yaw(err, TICK, gs, 1.0, Some(yaw));
+            queue.push_back((t + ZIBO_DEAD_S, steer));
+            ticks.push(RollTick {
+                gs,
+                err,
+                xtk,
+                steer,
+                trim: law.trim(),
+            });
+            let next = t + TICK;
+            while t < next - 1e-9 {
+                while queue.front().is_some_and(|(at, _)| *at <= t) {
+                    applied = queue.pop_front().map_or(applied, |(_, s)| s);
+                }
+                let rudder = kscale * rudder_zibo_fit(gs);
+                let weathervane = xw_kt / 7.4 * (2.48 * gs / 60.0 - 0.99).max(0.0);
+                yaw += (rudder * applied - weathervane - yaw) * H / ZIBO_LAG_S;
+                psi += yaw * H;
+                xtk += gs / MS_TO_KTS * (psi - COURSE).to_radians().sin() * H;
+                gs += accel_kts_s * H;
+                t += H;
+            }
+        }
+        ticks
+    }
+
+    /// Worst offset from `from_kts` of groundspeed up.
+    fn worst_xtk_from(ticks: &[RollTick], from_kts: f64) -> f64 {
+        ticks
+            .iter()
+            .filter(|k| k.gs >= from_kts)
+            .map(|k| k.xtk.abs())
+            .fold(0.0, f64::max)
+    }
+
+    /// Crossings of the centreline from 30 kt, counted only between
+    /// excursions past 0.5 m: the weave's other signature, slow enough to
+    /// pass [`steer_swings`].
+    fn centreline_crossings(ticks: &[RollTick]) -> usize {
+        let mut n = 0;
+        let mut last = 0.0_f64;
+        for k in ticks.iter().filter(|k| k.gs >= 30.0 && k.xtk.abs() > 0.5) {
+            if k.xtk * last < 0.0 {
+                n += 1;
+            }
+            last = k.xtk;
+        }
+        n
+    }
+
+    /// The Zibo's fitted rudder as declared, steered on the reading: no dead
+    /// time, no lag (the law before the predictor).
+    fn rudder_zibo_on_the_reading() -> crate::aircraft::RollRudderProfile {
+        crate::aircraft::RollRudderProfile {
+            dead_s: None,
+            lag_s: None,
+            close_per_s: None,
+            ..rudder_zibo()
+        }
+    }
+
+    /// The fit itself: the declared rudder is the fitted one, and the plant
+    /// the tests fly is the declared rudder plus the nosewheel at a walk.
+    #[test]
+    fn the_zibo_declares_its_fitted_rudder() {
+        let rd = rudder_zibo();
+        assert_eq!(rd.yaw_dps, 12.7);
+        assert_eq!(rd.at_kts, 80.0);
+        assert_eq!(rd.yaw_power, Some(0.75));
+        assert_eq!(rd.dead_s, Some(ZIBO_DEAD_S));
+        assert_eq!(rd.lag_s, Some(ZIBO_LAG_S));
+        for gs in [40.0, 80.0, 120.0, 145.0] {
+            assert!((rd.yaw_dps_at(gs) - rudder_zibo_fit(gs)).abs() < 1e-9, "{gs}");
+        }
+        // Every other airframe steers on the reading, as before.
+        for r in [rudder_737(), rudder_sr22(), rudder_evolution()] {
+            assert_eq!((r.dead_s, r.lag_s), (None, None));
+        }
+    }
+
+    /// The Zibo's rolls as flown: the default law replayed through each
+    /// writes the recorded steer tick for tick, and the offsets are the
+    /// failures being fixed (the median of five reads): 6.2 m left at
+    /// liftoff, 9.1 and 8.9 m left at the rejects.
+    #[test]
+    fn the_zibo_rolls_replay_as_flown() {
+        let rolls = zibo_rolls();
+        assert_eq!(rolls.len(), 3);
+        let mut worst = Vec::new();
+        for (id, ticks) in &rolls {
+            let (out, dev) = replay_roll_through(
+                ticks,
+                default_737_law(),
+                RollCut::new(None),
+                &rudder_zibo_fit,
+                None,
+                ZIBO_DEAD_S,
+                ZIBO_LAG_S,
+            );
+            assert!(dev < 0.01, "{id}: the replayed law strays {dev:.4}");
+            let (w, end, _) = roll_verdict(&out);
+            println!("{id} as flown: {w:.2} m worst, {end:+.2} m at the end");
+            assert!(end < -6.0, "{id}: {end:+.2}");
+            worst.push(w);
+        }
+        assert!(worst[1] > 9.0 && worst[2] > 8.5, "{worst:?}");
+    }
+
+    /// The fix, on the plant fitted to the Zibo: from 1.4 m and 2 degrees
+    /// off the centreline (either side), 3.2 kt/s to 145 kt, in calm air and
+    /// 8 kt of crosswind from either side, the law scheduled on the declared
+    /// rudder with its dead time stays within 3 m, within 2 m from 90 kt,
+    /// and neither weaves nor crosses the centreline back and forth. The
+    /// same law steered on the reading rang (14.6 m, the steer swinging tick
+    /// to tick); the default law it flew held no crosswind (10.9 m).
+    #[test]
+    fn the_zibo_roll_holds_the_centreline_through_its_dead_time() {
+        let starts = [(1.4, 2.0), (-1.4, -2.0), (1.4, -2.0), (-1.4, 2.0)];
+        let (mut reading_worst, mut reading_swings, mut default_worst) = (0.0_f64, 0, 0.0_f64);
+        for xw in [0.0, 8.0, -8.0] {
+            for (xtk0, psi0) in starts {
+                let new = fly_zibo_roll(
+                    RollSteer::with_rudder(true, rudder_zibo()),
+                    xw,
+                    1.0,
+                    xtk0,
+                    psi0,
+                    3.2,
+                    145.0,
+                );
+                let (worst, fast) = (worst_xtk(&new, 145.0), worst_xtk_from(&new, 90.0));
+                println!(
+                    "xw {xw:+} from {xtk0:+} m {psi0:+} deg: {worst:.2} m, {fast:.2} m from 90 kt"
+                );
+                assert!(worst < 3.0, "xw {xw:+} from {xtk0:+}/{psi0:+}: {worst:.2} m");
+                assert!(fast < 2.0, "xw {xw:+} from {xtk0:+}/{psi0:+}: {fast:.2} m from 90 kt");
+                assert_eq!(steer_swings(&new), 0, "xw {xw:+} from {xtk0:+}/{psi0:+}: weaves");
+                assert!(
+                    centreline_crossings(&new) <= 1,
+                    "xw {xw:+} from {xtk0:+}/{psi0:+}: crosses {} times",
+                    centreline_crossings(&new)
+                );
+                let reading = fly_zibo_roll(
+                    RollSteer::with_rudder(true, rudder_zibo_on_the_reading()),
+                    xw,
+                    1.0,
+                    xtk0,
+                    psi0,
+                    3.2,
+                    145.0,
+                );
+                reading_worst = reading_worst.max(worst_xtk(&reading, 145.0));
+                reading_swings += steer_swings(&reading);
+                let old = fly_zibo_roll(default_737_law(), xw, 1.0, xtk0, psi0, 3.2, 145.0);
+                default_worst = default_worst.max(worst_xtk(&old, 145.0));
+            }
+        }
+        println!("on the reading {reading_worst:.1} m, {reading_swings} swings; default {default_worst:.1} m");
+        assert!(reading_worst > 10.0 && reading_swings > 50, "{reading_worst:.1} {reading_swings}");
+        assert!(default_worst > 10.0, "{default_worst:.1}");
+    }
+
+    /// The fit is a fit: on a rudder three quarters to 1.35 times the
+    /// fitted one, at the 3.2 kt/s of the acceptance and at the 8 kt/s the
+    /// light aircraft flew, the law never weaves, and holds 3.5 m in calm
+    /// air and 6 m in 8 kt of crosswind.
+    #[test]
+    fn the_zibo_roll_law_survives_a_rudder_not_as_fitted() {
+        for kscale in [0.75, 1.35] {
+            for accel in [3.2, 8.0] {
+                for xw in [0.0, 8.0, -8.0] {
+                    for (xtk0, psi0) in [(1.4, 2.0), (-1.4, -2.0)] {
+                        let k = fly_zibo_roll(
+                            RollSteer::with_rudder(true, rudder_zibo()),
+                            xw,
+                            kscale,
+                            xtk0,
+                            psi0,
+                            accel,
+                            145.0,
+                        );
+                        let worst = worst_xtk(&k, 145.0);
+                        let limit = if xw == 0.0 { 3.5 } else { 6.0 };
+                        assert!(
+                            worst < limit,
+                            "x{kscale} at {accel} kt/s, xw {xw:+}: {worst:.2} m"
+                        );
+                        assert_eq!(
+                            steer_swings(&k),
+                            0,
+                            "x{kscale} at {accel} kt/s, xw {xw:+}: weaves"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The three LEMG 30 rolls replayed through the fitted plant under the
+    /// declared law: every one carries its own gusts, slip and need again,
+    /// and every one stays within 5 m (the scorer's roll limit) where they
+    /// flew 6.2, 9.1 and 8.9, without a weave, and none is worse than half
+    /// what it flew.
+    #[test]
+    fn the_zibo_rolls_replay_inside_the_limit() {
+        for (id, ticks) in &zibo_rolls() {
+            let (flown, ..) = roll_verdict(
+                &replay_roll_through(
+                    ticks,
+                    default_737_law(),
+                    RollCut::new(None),
+                    &rudder_zibo_fit,
+                    None,
+                    ZIBO_DEAD_S,
+                    ZIBO_LAG_S,
+                )
+                .0,
+            );
+            let law = RollSteer::with_rudder(true, rudder_zibo());
+            let cut = RollCut::for_law(&law);
+            let (out, _) = replay_roll_through(
+                ticks,
+                law,
+                cut,
+                &rudder_zibo_fit,
+                None,
+                ZIBO_DEAD_S,
+                ZIBO_LAG_S,
+            );
+            let (worst, end, swings) = roll_verdict(&out);
+            println!("{id}: {worst:.2} m worst, {end:+.2} m at the end (flown {flown:.2})");
+            assert!(worst < 5.0, "{id}: {worst:.2} m");
+            assert!(worst < flown * 0.55, "{id}: {worst:.2} m against {flown:.2} flown");
+            assert_eq!(swings, 0, "{id}: the steer weaves");
+        }
     }
 
     /// The cross-track read pairs two frames now and then (latitude and

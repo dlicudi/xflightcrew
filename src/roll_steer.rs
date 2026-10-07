@@ -391,6 +391,13 @@ pub struct RollSteer {
     /// The engine torque last read, ft-lb, for a lead declared on it
     /// (`roll_rudder:` `power_steer_per_kftlb`); `None` leads on the lever.
     pub(crate) torque_ftlb: Option<f64>,
+    /// The steer written inside a declared dead time (`roll_rudder:`
+    /// `dead_s`), oldest first: (age s, steer, seconds it was held).
+    pub(crate) pipe: std::collections::VecDeque<(f64, f64, f64)>,
+    /// The newest write past the dead time...
+    pub(crate) arrived: f64,
+    /// ...and the steer the yaw read answers, that one through the lag.
+    pub(crate) seen: f64,
     /// The schedule as flown on 2026-09-28, for the replays that pin the change.
     #[cfg(test)]
     pub(crate) as_flown: bool,
@@ -586,9 +593,18 @@ impl RollSteer {
         // right with the steer still right, 4.1 m left to 7.5 m right on
         // the wheels. Its lag is shorter than the 737's (0.3 s fitted), and
         // 1.5 per second with a corner of 0.45 holds both of its rolls.
+        //
+        // Where the airframe declares a dead time it can be flown round
+        // (`roll_rudder:` `dead_s`), the loop steers on the heading the steer
+        // already written will make once it has all arrived
+        // ([`RollSteer::predicted`]); the trim still learns on the error read.
+        let (err_now, yaw_now) = match rudder.dead_s {
+            Some(dead) => self.predicted(rudder, err_deg, yaw_dps, gs_kts, dt, dead),
+            None => (err_deg, yaw_dps),
+        };
         let close = rudder.close_per_s.unwrap_or(RUDDER_CLOSE_PER_S);
         let kp = (close / authority).min(1.0 / full_deg);
-        let pd = (kp * (err_deg - STEER_LEAD_S * yaw_dps)).clamp(-1.0, 1.0);
+        let pd = (kp * (err_now - STEER_LEAD_S * yaw_now)).clamp(-1.0, 1.0);
         let cap = LOW_SPEED_STEER_CAP
             + (MAX_ROLL_STEER - LOW_SPEED_STEER_CAP)
                 * (gs_kts / LOW_SPEED_FULL_KTS).clamp(0.0, 1.0);
@@ -623,7 +639,69 @@ impl RollSteer {
         }
         self.prev_gs = Some(gs_kts);
         self.out = slew(self.out, want, STEER_SLEW_PER_S * dt);
+        if rudder.dead_s.is_some() {
+            self.pipe.push_back((0.0, self.out, 0.0));
+        }
         self.out
+    }
+
+    /// The heading error `dead` seconds from now and the yaw rate to lead
+    /// on, from the steer already written. The heading: the yaw read holds
+    /// for the dead time, and the steer it is still catching up with (the
+    /// declared `lag_s`) and each write still in transit add the declared
+    /// rudder's yaw for their difference from it, for as long as each was
+    /// held. Only differences: a standing steer that a crosswind balances
+    /// predicts nothing (the steer integrated whole would read a crosswind's
+    /// rudder as a turn to come). The yaw: the reading plus the lag still to
+    /// come on the steer that has ARRIVED; the writes in transit are in the
+    /// heading already, and led on as well the law answered its own last
+    /// write within the tick and alternated at the slew limit on the fitted
+    /// plant past 90 kt.
+    ///
+    /// The Zibo's pedals reach the yaw through 1.0 s of dead time and a
+    /// 0.2 s lag (LEMG 30, 2026-10-07). Steered on the reading, the error a
+    /// second old, the scheduled law rang through the fitted plant 14.6 m off
+    /// the centreline (the default law flown there wove 4 m right to 9.5 m
+    /// left, and two rolls of three were rejected).
+    fn predicted(
+        &mut self,
+        rudder: crate::aircraft::RollRudderProfile,
+        err_deg: f64,
+        yaw_dps: f64,
+        gs_kts: f64,
+        dt: f64,
+        dead: f64,
+    ) -> (f64, f64) {
+        // The yaw read has answered the steer that was arriving through the
+        // tick just ended, not one arriving now.
+        let lag = rudder.lag_s.unwrap_or(0.0);
+        self.seen = if lag > 0.0 {
+            self.seen + (self.arrived - self.seen) * (1.0 - (-dt / lag).exp())
+        } else {
+            self.arrived
+        };
+        if let Some(last) = self.pipe.back_mut() {
+            last.2 = dt;
+        }
+        for e in self.pipe.iter_mut() {
+            e.0 += dt;
+        }
+        while self.pipe.front().is_some_and(|e| e.0 >= dead - 1e-9) {
+            if let Some((_, s, _)) = self.pipe.pop_front() {
+                self.arrived = s;
+            }
+        }
+        let k = rudder.yaw_dps_at(gs_kts);
+        let in_transit: f64 = self
+            .pipe
+            .iter()
+            .map(|(_, s, held)| (s - self.arrived) * held)
+            .sum();
+        let to_come = k * ((self.arrived - self.seen) * lag + in_transit);
+        (
+            err_deg - yaw_dps * dead - to_come,
+            yaw_dps + k * (self.arrived - self.seen),
+        )
     }
 
     /// The learned standing-rudder trim, for telemetry.

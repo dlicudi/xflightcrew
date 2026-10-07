@@ -781,6 +781,20 @@ pub struct RollRudderProfile {
     /// (`autotakeoff::RUDDER_TRIM_PER_S` when `None`).
     #[serde(default)]
     pub trim_per_s: Option<f64>,
+    /// The dead time from the steer to the yaw, seconds, where it is long
+    /// enough to fly round: the law then steers on the heading the steer
+    /// already written WILL make (`RollSteer`'s predictor), not on the one
+    /// read. `None` steers on the reading, as every airframe did before it
+    /// (their 0.3 s is inside the lead). The Zibo's pedals reach the yaw
+    /// through 1.0 s (LEMG 30, three rolls of 2026-10-07): steered on the
+    /// reading, the scheduled law rang 14.6 m off the centreline through the
+    /// fitted plant.
+    #[serde(default)]
+    pub dead_s: Option<f64>,
+    /// The first-order lag after that dead time, seconds (0 when `None`):
+    /// how long the yaw read takes to answer a steer that has arrived.
+    #[serde(default)]
+    pub lag_s: Option<f64>,
 }
 
 impl RollRudderProfile {
@@ -793,6 +807,8 @@ impl RollRudderProfile {
         let yaw_power = self.yaw_power.filter(|p| (0.0..=3.0).contains(p));
         let close_per_s = self.close_per_s.filter(|c| (0.3..=3.0).contains(c));
         let trim_per_s = self.trim_per_s.filter(|c| (0.05..=1.0).contains(c));
+        let dead_s = self.dead_s.filter(|d| (0.05..=3.0).contains(d));
+        let lag_s = self.lag_s.filter(|l| (0.0..=2.0).contains(l));
         ((0.5..=100.0).contains(&self.yaw_dps) && (20.0..=200.0).contains(&self.at_kts))
             .then_some(Self {
                 power_steer,
@@ -801,6 +817,8 @@ impl RollRudderProfile {
                 yaw_power,
                 close_per_s,
                 trim_per_s,
+                dead_s,
+                lag_s,
                 ..self
             })
     }
