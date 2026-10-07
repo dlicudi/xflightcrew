@@ -1424,10 +1424,30 @@ pub fn reconcile(want: Want, read: ModeRead) -> Vec<Button> {
 /// Press what [`reconcile`] asks, in order, each on the tape. `false` when
 /// any press did not go out (every one is still tried).
 pub async fn apply(xp: &dyn XPlane, presses: &[Button], site: &str) -> bool {
-    apply_on(xp, &panel(), presses, site).await
+    let due = settled(presses, |b| pressed_within(b, PRESS_SETTLE_S));
+    apply_on(xp, &panel(), &due, site).await
 }
 
-/// [`apply`] on a given panel.
+/// The presses still due: a button pressed within [`PRESS_SETTLE_S`] is
+/// left to answer. Pure over `recent`.
+pub fn settled(presses: &[Button], recent: impl Fn(Button) -> bool) -> Vec<Button> {
+    presses.iter().copied().filter(|b| !recent(*b)).collect()
+}
+
+/// How long a mode button is left to answer before [`apply`] presses it
+/// again. The Zibo's lamps ramp in, and its mode buttons toggle: autoland's
+/// 0.3 s tick read V/S dark after each press and pressed again, 120 times
+/// down LEMG 30's final, so V/S flickered and never held and the approach
+/// went around at 138 ft (2026-10-07).
+pub const PRESS_SETTLE_S: f64 = 2.0;
+
+/// Whether we pressed `b` within the last `secs`.
+pub fn pressed_within(b: Button, secs: f64) -> bool {
+    let since = std::time::Instant::now() - Duration::from_secs_f64(secs);
+    ours_since(since).iter().any(|(_, c)| *c == OurChange::Press(b))
+}
+
+/// [`apply`] on a given panel, every press given.
 pub async fn apply_on(xp: &dyn XPlane, p: &Panel, presses: &[Button], site: &str) -> bool {
     let mut all = true;
     for b in presses {
@@ -3065,5 +3085,15 @@ mod tests {
         })
         .unwrap();
         assert_eq!(plain.snap(287.3), 287.3);
+    }
+
+    /// A button pressed within the settle time is left to answer: the Zibo's
+    /// V/S, pressed every 0.3 s tick while its lamp ramped in, flickered
+    /// and never held down LEMG 30's final (2026-10-07).
+    #[test]
+    fn a_button_just_pressed_is_left_to_answer() {
+        let all = [Button::Heading, Button::VerticalSpeed];
+        assert_eq!(settled(&all, |b| b == Button::VerticalSpeed), vec![Button::Heading]);
+        assert_eq!(settled(&all, |_| false), all.to_vec());
     }
 }

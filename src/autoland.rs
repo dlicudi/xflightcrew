@@ -1492,7 +1492,14 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 if let (Ok(dial), Ok(alt_ind)) = (dial_r, alt_r) {
                     if let Some(parked) = parked_window_ft(window_rule, dial, alt_ind, rwy.elev_ft) {
                         let _ = autoflight::set_dial(&xp, Dial::Altitude, parked).await;
-                        autoflight::press_logged(&xp, Button::VerticalSpeed, "autoland_arm").await;
+                        // Read before it is fired: on a toggle MCP (the Zibo)
+                        // pressing a lit V/S turns it OFF, which this press
+                        // did at LEMG 30's arm (2026-10-07). A failed read
+                        // presses nothing; the tick's reconcile brings it.
+                        let vs_on = autoflight::read_status(&xp, autoflight::names::VS_STATUS).await;
+                        if vs_on.is_ok_and(|v| v <= 0.5) {
+                            autoflight::press_logged(&xp, Button::VerticalSpeed, "autoland_arm").await;
+                        }
                         crate::blackbox::record("autoland", serde_json::json!({
                             "event": "alt_dial_parked", "was": dial, "now": parked, "alt_ft": alt_ind,
                             "rule": window_rule,

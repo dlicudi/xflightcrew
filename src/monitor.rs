@@ -4842,10 +4842,15 @@ pub fn endurance_minutes(
     flow_kg_sec: Option<f64>,
     cruise_burn_kg_hr: Option<f64>,
 ) -> Option<f64> {
-    let (kg, flow) = (fuel_kg?, flow_kg_sec?);
+    // With a declared cruise burn the estimate is at THAT burn: steady, and
+    // only ever falling. On the live flow (capped at the cruise burn) a
+    // circuit's idle descents lifted it out of the band and the takeoffs
+    // dropped it back in, and each re-entry said "Fuel's getting low"
+    // again, five times in one circuit (LEMG, 2026-10-07).
+    let kg = fuel_kg?;
     let burn = match cruise_burn_kg_hr {
-        Some(c) if c > 0.0 => flow.min(c / 3600.0),
-        _ => flow,
+        Some(c) if c > 0.0 => c / 3600.0,
+        _ => flow_kg_sec?,
     };
     (burn > 1e-4).then(|| kg / burn / 60.0)
 }
