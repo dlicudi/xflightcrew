@@ -2324,6 +2324,17 @@ pub const EXCURSION_HDG_DEG: f64 = 20.0;
 
 /// Reject when the runway is running out and rotation speed is still short:
 /// inside the margin with less than 90% of Vr there is no takeoff today.
+/// Whether a GROUND reject (runway end, lateral excursion) may fire this
+/// tick: never once rotated, and never with the wheels off the ground. The
+/// light Zibo lifted itself off at 118 kt, before Vr and so before any
+/// rotation; at 2 ft the excursion check rejected it, idled the thrust in the
+/// air, and it zoomed to 394 ft, stalled and crashed (LEMG 30, 2026-10-07,
+/// #231). A failed on-ground read (NaN) is no measurement of the ground, so
+/// no reject on it. Pure.
+pub fn ground_reject_allowed(rotated: bool, on_ground: f64) -> bool {
+    !rotated && on_ground >= 0.5
+}
+
 pub fn must_reject(remaining_m: f64, ias_kts: f64, vr_kts: f64) -> bool {
     remaining_m < REJECT_REMAINING_M && ias_kts < vr_kts * 0.9
 }
@@ -3339,7 +3350,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             }
             let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
             let remaining = rwy.length_m - (-along_m).max(0.0);
-            if !rotated && must_reject(remaining, ias, p.vr_kts) {
+            if ground_reject_allowed(rotated, on_ground) && must_reject(remaining, ias, p.vr_kts) {
                 reject_rolling(
                     &xp,
                     &voice,
@@ -3361,7 +3372,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let target = (rwy.course_deg + cut.target_off_deg).rem_euclid(360.0);
             let err = crate::angles::signed_diff_deg(target, psi);
             last_err = err;
-            if !rotated {
+            if ground_reject_allowed(rotated, on_ground) {
                 let off_course = crate::angles::signed_diff_deg(psi, rwy.course_deg);
                 if let Some(why) = lateral_excursion(xtk_m, off_course, gs_kts) {
                     crate::blackbox::record(

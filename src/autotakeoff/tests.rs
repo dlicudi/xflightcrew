@@ -5190,3 +5190,15 @@ fn a_lever_snap_with_the_hardware_still_is_no_hand() {
     assert!(!hand(true, None, Some(0.05)), "no baseline is no measurement");
     assert!(!hand(true, Some(0.284), None), "a failed read is no measurement");
 }
+
+/// No ground reject with the wheels off: the Zibo lifted off at 118 kt before
+/// Vr, the excursion check rejected it at 2 ft, idled it in the air and it
+/// crashed (#231). Rotated, or a failed read: none either.
+#[test]
+fn no_ground_reject_with_the_wheels_off() {
+    use super::ground_reject_allowed as allowed;
+    assert!(allowed(false, 1.0));
+    assert!(!allowed(false, 0.0), "lifted before Vr");
+    assert!(!allowed(true, 1.0), "rotated");
+    assert!(!allowed(false, f64::NAN), "no measurement");
+}
