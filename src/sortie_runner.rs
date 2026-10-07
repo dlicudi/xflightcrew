@@ -1791,7 +1791,7 @@ pub const READ_SHAPES: &[ReadShape] = &[
         key: "",
         value: "",
         fields: &["name"],
-        producer: &[("src/main.rs", r#""tool", serde_json::json!({ "name": call.name"#)],
+        producer: &[("src/main/dispatch.rs", r#""tool", serde_json::json!({ "name": call.name"#)],
     },
     ReadShape {
         kind: "sortie",
