@@ -102,6 +102,7 @@ mod taxi_guide;
 mod taxi_in;
 mod tempo;
 mod terrain;
+mod takeoff_thrust;
 mod takeoff_trim;
 mod tiller;
 mod yoke;

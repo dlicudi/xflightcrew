@@ -1212,6 +1212,11 @@ pub struct AircraftProfile {
     /// it (`crate::takeoff_trim`). `None` = the generic neutral trim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub takeoff_trim: Option<TakeoffTrimProfile>,
+    /// The takeoff and climb thrust flown to the type's N1 tables, the
+    /// rating chosen for the weight (`crate::takeoff_thrust`). `None` = the
+    /// levers to full, reduced to `takeoff_config.climb_thrust_ratio`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeoff_thrust: Option<TakeoffThrustProfile>,
     /// Reverse selected by HOLDING this command, where the stock reverse
     /// lever write is undone (`tools::reverse`). `None` = the lever write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5293,6 +5298,111 @@ pub struct TakeoffTrimProfile {
     pub cg: Vec<f64>,
     pub weights_t: Vec<f64>,
     pub table: Vec<Vec<f64>>,
+    /// The same table for a derated takeoff, by the rating's name in
+    /// `takeoff_thrust:` (the 737-800's 24K and 22K tables carry more
+    /// nose-up for the slower acceleration). A rating not listed, or no
+    /// rating, flies the table above.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub by_rating: std::collections::BTreeMap<String, TrimTable>,
+}
+
+/// One takeoff trim table: units by CG (% MAC, rows) and weight (t, columns).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrimTable {
+    pub cg: Vec<f64>,
+    pub weights_t: Vec<f64>,
+    pub table: Vec<Vec<f64>>,
+}
+
+impl TakeoffTrimProfile {
+    /// The profile with the table for `rating` in place of the base one,
+    /// where it declares one. Pure.
+    pub fn for_rating(&self, rating: Option<&str>) -> TakeoffTrimProfile {
+        let mut t = self.clone();
+        if let Some(r) = rating.and_then(|r| self.by_rating.get(r)) {
+            t.cg = r.cg.clone();
+            t.weights_t = r.weights_t.clone();
+            t.table = r.table.clone();
+        }
+        t
+    }
+}
+
+/// An N1 table, percent: rows by temperature (degrees C, ascending),
+/// columns by pressure altitude (ft, ascending).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct N1Table {
+    pub temp_c: Vec<f64>,
+    pub alt_ft: Vec<f64>,
+    pub n1: Vec<Vec<f64>>,
+}
+
+/// One takeoff rating: its name as a crew says it, the weight it is chosen
+/// below, and its takeoff N1 by OAT and pressure altitude.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThrustRating {
+    pub name: String,
+    /// Chosen when the aircraft weighs less than this, tonnes; `None` is
+    /// the full rating, taken when no lighter one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub below_t: Option<f64>,
+    /// The rating's thrust, thousands of pounds a side: the roll it needs
+    /// against the full rating's is judged on it.
+    pub klbf: f64,
+    pub takeoff: N1Table,
+    /// A further reduction by assumed temperature, where the runway has
+    /// room for it. `None`: the rating's own N1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assumed: Option<AssumedTemp>,
+}
+
+/// A table by two axes, for the figures that are not an N1 by temperature
+/// and altitude: rows and columns ascending, each use says which is which.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Grid {
+    pub rows: Vec<f64>,
+    pub cols: Vec<f64>,
+    pub values: Vec<Vec<f64>>,
+}
+
+/// The assumed temperature method, as the type's FMC computes it: the
+/// rating's N1 at the assumed temperature, less a correction for how far
+/// it is above the real one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssumedTemp {
+    /// N1 at the assumed temperature (rows) and pressure altitude.
+    pub reduced: N1Table,
+    /// The highest assumed temperature, C: rows OAT, columns pressure
+    /// altitude (the 25 % thrust limit is in it).
+    pub max_temp: Grid,
+    /// The lowest, C, by pressure altitude: the rating's flat-rated one.
+    pub min_temp: Grid,
+    /// N1 taken off the reduced figure: rows the assumed temperature less
+    /// the OAT, columns the OAT.
+    pub adjust: Grid,
+}
+
+/// The takeoff and climb thrust flown to N1 (`crate::takeoff_thrust`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TakeoffThrustProfile {
+    /// Lightest first: the first whose `below_t` the weight is under.
+    pub ratings: Vec<ThrustRating>,
+    /// Climb N1 by total air temperature and pressure altitude, flown from
+    /// the thrust reduction height (`takeoff_config.thrust_reduction_agl_ft`).
+    pub climb: N1Table,
+    /// The lever-to-N1 line the lever is led on before the N1 answers:
+    /// N1 at idle and at `lever_max`.
+    pub idle_n1: f64,
+    pub full_n1: f64,
+    /// The highest lever the law writes. Default 1.0.
+    #[serde(default = "TakeoffThrustProfile::default_lever_max")]
+    pub lever_max: f64,
+}
+
+impl TakeoffThrustProfile {
+    fn default_lever_max() -> f64 {
+        1.0
+    }
 }
 
 /// The live airframe's reverse levers to write down to stow.
@@ -5308,6 +5418,11 @@ pub fn reverse_hold_command() -> Option<String> {
 /// The live airframe's takeoff trim table, when it declares one.
 pub fn takeoff_trim() -> Option<TakeoffTrimProfile> {
     live_profile().and_then(|p| p.takeoff_trim.clone())
+}
+
+/// The live airframe's takeoff thrust law, when it declares one.
+pub fn takeoff_thrust() -> Option<TakeoffThrustProfile> {
+    live_profile().and_then(|p| p.takeoff_thrust.clone())
 }
 
 /// The live airframe's hardware thrust-lever axis, when it declares one.
@@ -5670,6 +5785,7 @@ fn cessna_172sp() -> AircraftProfile {
         reverse_stow_levers: vec![],
         reverse_hold_command: None,
         takeoff_trim: None,
+        takeoff_thrust: None,
         weight_speeds: None,
         throttle_hardware_axis: None,
         yoke_input: None,
@@ -6051,6 +6167,7 @@ fn cirrus_sr22() -> AircraftProfile {
         reverse_stow_levers: vec![],
         reverse_hold_command: None,
         takeoff_trim: None,
+        takeoff_thrust: None,
         weight_speeds: None,
         throttle_hardware_axis: None,
         yoke_input: None,

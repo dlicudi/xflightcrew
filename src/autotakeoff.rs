@@ -134,6 +134,18 @@ const STAGNANT_GS_KTS: f64 = 18.0;
 /// The lever counts as at takeoff power from here, for a spooling engine.
 const STAGNANT_FULL_THR: f64 = 0.95;
 
+/// The thrust reduction height an N1-flown takeoff (`takeoff_thrust:`)
+/// takes when its `takeoff_config:` declares none: the usual 1,000 ft.
+const THRUST_REDUCTION_DEFAULT_FT: f64 = 1000.0;
+
+/// Whether the lever has reached takeoff power, for the stagnation clock:
+/// [`STAGNANT_FULL_THR`], or on an airframe flying its takeoff N1
+/// (`takeoff_thrust:`) the lever that N1 law allows, which a derate holds
+/// well under 0.95 (the Zibo's 22K, about 0.86). Pure.
+pub fn lever_at_takeoff_power(thr_cmd: f64, n1_cap: Option<f64>) -> bool {
+    thr_cmd >= STAGNANT_FULL_THR || n1_cap.is_some_and(|c| thr_cmd >= c - 0.01)
+}
+
 /// Is the roll stagnant? Without a declared spool (every airframe until
 /// 2026-10-06) the clock runs from brake release, unchanged. A turbofan
 /// declares `takeoff_spool_s`: its clock starts once the lever has reached
@@ -2983,10 +2995,45 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
     // Nothing the last flight left engaged flies this one (#160); before the
     // configuration, which sets the flight directors an airframe declares.
     clear_inherited_autopilot(&xp).await;
-    let config =
-        crate::takeoff_config::set_for_takeoff(&xp, p.takeoff_flap_ratio, p.level_ft, true).await;
+    // The takeoff thrust a crew sets for this weight, field and runway
+    // (`takeoff_thrust:`): the rating, its N1, the climb N1 at the
+    // reduction. Nothing read, nothing declared: the levers to full.
+    let thrust_law = crate::aircraft::takeoff_thrust();
+    let thrust_plan = match &thrust_law {
+        Some(t) => {
+            let fit = crate::takeoff_thrust::RunwayFit {
+                needed_full_m: p.needed_m,
+                available_m: remaining_m,
+            };
+            let reduction_agl =
+                crate::takeoff_config::thrust_reduction_agl_ft().unwrap_or(THRUST_REDUCTION_DEFAULT_FT);
+            let plan = crate::takeoff_thrust::plan_now(&xp, t, reduction_agl, Some(fit)).await;
+            crate::blackbox::record(
+                "autotakeoff",
+                serde_json::json!({"event": "thrust_plan", "rating": plan.as_ref().map(|x| &x.rating),
+                    "assumed_c": plan.as_ref().and_then(|x| x.assumed_c),
+                    "to_n1": plan.as_ref().map(|x| x.to_n1), "climb_n1": plan.as_ref().map(|x| x.climb_n1),
+                    "weight_t": plan.as_ref().map(|x| x.weight_t), "oat_c": plan.as_ref().map(|x| x.oat_c),
+                    "field_pa_ft": plan.as_ref().map(|x| x.field_pa_ft),
+                    "needed_full_m": p.needed_m, "available_m": remaining_m}),
+            );
+            plan
+        }
+        None => None,
+    };
+    let config = crate::takeoff_config::set_for_takeoff_rated(
+        &xp,
+        p.takeoff_flap_ratio,
+        p.level_ft,
+        true,
+        thrust_plan.as_ref().map(|x| x.rating.as_str()),
+    )
+    .await;
     if let Some(line) = crate::takeoff_config::line("Takeoff config", &config) {
         alert(&voice, Priority::Advisory, &line);
+    }
+    if let Some(plan) = &thrust_plan {
+        alert(&voice, Priority::Advisory, &crate::takeoff_thrust::line(plan));
     }
     // An abort said during the flap wait: the brakes are still set.
     if xp.cancelled() || !ACTIVE.load(Ordering::Relaxed) {
@@ -3106,6 +3153,16 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
     // Thrust reduction at the declared height (`takeoff_config:`).
     let reduction = crate::takeoff_config::thrust_reduction();
     let mut reduced = false;
+    // The levers flown to the plan's N1 where the airframe declares it: a
+    // ceiling on every other law's lever, led on the line and trimmed on
+    // the measured N1 (`takeoff_thrust::N1Loop`).
+    let mut n1_loop = match (&thrust_law, &thrust_plan) {
+        (Some(t), Some(_)) => Some(crate::takeoff_thrust::N1Loop::new(t)),
+        _ => None,
+    };
+    let n1_reduction_agl =
+        crate::takeoff_config::thrust_reduction_agl_ft().unwrap_or(THRUST_REDUCTION_DEFAULT_FT);
+    let mut n1_climb = false;
     let mut wings = WingsLevel::default();
     let mut last_vs_cmd: Option<f64> = None;
     // The servo presses of the 300 ft engage (`engage_climb`).
@@ -3213,7 +3270,20 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
         let mut extra_names: Vec<String> = vec![thr_dref.clone(), YOKE_PITCH_READ.to_string()];
         extra_names.extend(af_panel.tick_names());
         let extra_refs: Vec<&str> = extra_names.iter().map(String::as_str).collect();
-        let (st, extra) = sim::state::read_with(&xp, sim::state::Want(ROLL_WANT), &extra_refs).await;
+        // The N1 beside the frame, in the same round, where the levers are
+        // flown to it.
+        let n1_read = async {
+            if n1_loop.is_some() {
+                xp.get_float_array(ENGN_N1).await.ok()
+            } else {
+                None
+            }
+        };
+        let ((st, extra), n1_arr) = tokio::join!(
+            sim::state::read_with(&xp, sim::state::Want(ROLL_WANT), &extra_refs),
+            n1_read
+        );
+        let n1_now = n1_arr.as_deref().and_then(crate::takeoff_thrust::mean_n1);
         // Pause or replay: freeze — no writes, and the stagnation clock
         // slides instead of burning (the recover watcher's rule).
         if st.frozen() {
@@ -3333,7 +3403,18 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
             align_hold && !airborne,
             creep_cap,
         );
-        let (thr_want, reducing) = thrust_reduced(thr_want, airborne, agl_ft, reduction);
+        let (thr_want, reducing, n1_cap, n1_step) = match (n1_loop.as_mut(), &thrust_plan) {
+            (Some(lp), Some(plan)) => {
+                n1_climb = n1_climb || (airborne && agl_ft >= n1_reduction_agl);
+                let target = if n1_climb { plan.climb_n1 } else { plan.to_n1 };
+                let (cap, step) = lp.step(target, n1_now, last_thr_cmd, dt);
+                (thr_want.min(cap), n1_climb && thr_want >= cap, Some(cap), Some(step))
+            }
+            _ => {
+                let (w, r) = thrust_reduced(thr_want, airborne, agl_ft, reduction);
+                (w, r, None, None)
+            }
+        };
         let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
         let thr_cmd = if reducing {
             reduction_slew(thr_cmd, last_thr_cmd, dt)
@@ -3347,7 +3428,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
             crate::blackbox::record(
                 "autotakeoff",
                 serde_json::json!({"event": "thrust_reduction", "agl": agl_ft, "ias": ias,
-                                   "from": last_thr_cmd, "to": thr_want, "n1": n1}),
+                                   "from": last_thr_cmd, "to": thr_want, "n1": n1,
+                                   "n1_target": thrust_plan.as_ref().map(|x| x.climb_n1)}),
             );
         }
         // FAIL OPEN, deliberately: a failed throttle read impersonates our own
@@ -3391,7 +3473,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
         // Queued, and sent with the tick's other writes in ONE round.
         writes.set(&thr_dref, thr_cmd);
         last_thr_cmd = thr_cmd;
-        if full_thr_at.is_none() && thr_cmd >= STAGNANT_FULL_THR {
+        if full_thr_at.is_none() && lever_at_takeoff_power(thr_cmd, n1_cap) {
             full_thr_at = Some(elapsed);
         }
 
@@ -3586,6 +3668,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
                     // brake split's differenced error instead, spikes and all.
                     "r": yaw_dps, "law": if steer_law.scheduled() { "rudder" } else { "default" },
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt, "trq_ftlb": torque_ftlb,
+                    // The N1 flown to (`takeoff_thrust:`; null elsewhere):
+                    // the engines' mean, the lever the law allows, its step.
+                    "n1": n1_now, "n1_cap": n1_cap, "n1_step": n1_step.map(|s| format!("{s:?}")),
                     // The power waiting for the nose ([`RollAlign`]).
                     "align_hold": align_hold, "hold_brake": hold_brake,
                 }),
@@ -3920,7 +4005,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
         crate::blackbox::record(
             "autotakeoff",
             serde_json::json!({"event": "climb", "ias": ias, "agl": agl_ft, "cmd_vs": vs,
-                               "law_vs": law_vs, "vs": vs_flown}),
+                               "law_vs": law_vs, "vs": vs_flown, "thr": last_thr_cmd,
+                               "n1": n1_now, "n1_cap": n1_cap}),
         );
         if agl_ft >= p.handoff_agl_ft.max(AP_ENGAGE_AGL_FT + 50.0) {
             // At the height, dirty, and a few knots short of the clean-up:
@@ -4160,5 +4246,18 @@ mod stagnant_tests {
         // A lever that never got there still rejects, later.
         assert!(!roll_stagnant(39.0, None, spool, 0.0));
         assert!(roll_stagnant(40.5, None, spool, 0.0));
+    }
+
+    /// A derate's lever stops short of 0.95: its takeoff power is the lever
+    /// its N1 law allows, so the spool clock still starts there. Without
+    /// the law, 0.95 as before.
+    #[test]
+    fn a_derated_lever_at_its_n1_cap_is_takeoff_power() {
+        use super::lever_at_takeoff_power as at;
+        assert!(at(0.95, None));
+        assert!(!at(0.86, None));
+        assert!(at(0.855, Some(0.86)));
+        assert!(!at(0.80, Some(0.86)));
+        assert!(at(0.96, Some(0.86)));
     }
 }

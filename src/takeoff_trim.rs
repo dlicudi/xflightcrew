@@ -33,7 +33,7 @@ const MIN_HOLD_S: f64 = 0.2;
 const FIRST_RATE_UNITS_S: f64 = 0.09;
 
 /// Linear interpolation of `y` at `x` between `(x0, y0)` and `(x1, y1)`.
-fn lerp(x0: f64, y0: f64, x1: f64, y1: f64, x: f64) -> f64 {
+pub(crate) fn lerp(x0: f64, y0: f64, x1: f64, y1: f64, x: f64) -> f64 {
     if (x1 - x0).abs() < f64::EPSILON {
         y0
     } else {
@@ -42,7 +42,7 @@ fn lerp(x0: f64, y0: f64, x1: f64, y1: f64, x: f64) -> f64 {
 }
 
 /// The bracketing indices of `x` in an ascending axis, clamped at its ends.
-fn bracket(axis: &[f64], x: f64) -> (usize, usize) {
+pub(crate) fn bracket(axis: &[f64], x: f64) -> (usize, usize) {
     if x <= axis[0] {
         return (0, 0);
     }
@@ -169,6 +169,18 @@ mod tests {
     fn the_lemg_load_reads_about_four_point_three() {
         let u = table_units(&b738(), 18.75, 45.75).unwrap();
         assert!((u - 4.40).abs() < 0.01, "{u}");
+    }
+
+    /// A derated takeoff rotates on its own table (`by_rating`): the LEMG
+    /// load at 24K and 22K; a rating with none, or none chosen, the base.
+    #[test]
+    fn a_derate_reads_its_own_table() {
+        let t = b738();
+        let at = |r: Option<&str>| table_units(&t.for_rating(r), 18.75, 45.75).unwrap();
+        assert!((at(Some("24K")) - 4.779).abs() < 0.001, "{}", at(Some("24K")));
+        assert!((at(Some("22K")) - 5.125).abs() < 0.001, "{}", at(Some("22K")));
+        assert!((at(Some("26K")) - 4.40).abs() < 0.01);
+        assert!((at(None) - 4.40).abs() < 0.01);
     }
 
     #[test]
