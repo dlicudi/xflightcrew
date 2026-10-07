@@ -1039,6 +1039,12 @@ pub struct AircraftProfile {
     /// lever write is undone (`tools::reverse`). `None` = the lever write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reverse_hold_command: Option<String>,
+    /// The airframe's own reverse levers, written to 0 to STOW: on the Zibo
+    /// a hold released with the lever left at reverse idle (0.06) kept the
+    /// reversers deployed until the levers were written down (probed
+    /// parked, 2026-10-07). Empty = the release alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reverse_stow_levers: Vec<String>,
     /// The type's speeds BY WEIGHT, from its FCOM tables: Vref per landing
     /// flap and V1 / Vr / V2 for the takeoff flap ([`WeightSpeedsProfile`]).
     /// Declared, the approach and the takeoff fly the speeds for what the
@@ -5101,6 +5107,11 @@ pub struct TakeoffTrimProfile {
     pub table: Vec<Vec<f64>>,
 }
 
+/// The live airframe's reverse levers to write down to stow.
+pub fn reverse_stow_levers() -> Vec<String> {
+    live_profile().map(|p| p.reverse_stow_levers.clone()).unwrap_or_default()
+}
+
 /// The live airframe's reverse-hold command, when it declares one.
 pub fn reverse_hold_command() -> Option<String> {
     live_profile().and_then(|p| p.reverse_hold_command.clone())
@@ -5468,6 +5479,7 @@ fn cessna_172sp() -> AircraftProfile {
     };
     AircraftProfile {
         id: "cessna_172sp".into(),
+        reverse_stow_levers: vec![],
         reverse_hold_command: None,
         takeoff_trim: None,
         weight_speeds: None,
@@ -5846,6 +5858,7 @@ fn cirrus_sr22() -> AircraftProfile {
     };
     AircraftProfile {
         id: "cirrus_sr22".into(),
+        reverse_stow_levers: vec![],
         reverse_hold_command: None,
         takeoff_trim: None,
         weight_speeds: None,

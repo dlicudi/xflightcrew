@@ -239,6 +239,28 @@ async fn glide_levers(xp: &dyn XPlane, engines: usize, to: f64, over_ms: u64) {
     }
 }
 
+/// Write the airframe's declared reverse levers down, after the last hold has
+/// run out, and say on the tape whether they read down (`reverse` `stowed`).
+pub async fn stow_levers(xp: &dyn XPlane) -> Option<bool> {
+    let levers = crate::aircraft::reverse_stow_levers();
+    if levers.is_empty() {
+        return None;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs_f64(HOLD_CHUNK_S)).await;
+    for _ in 0..3 {
+        for l in &levers {
+            let _ = xp.set_float(l, 0.0).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+    let mut down = true;
+    for l in &levers {
+        down &= xp.get_float(l).await.is_ok_and(|v| v.abs() < 0.02);
+    }
+    crate::blackbox::record("reverse", json!({"event": "stowed", "levers_down": down}));
+    Some(down)
+}
+
 /// The rollout watcher: stow at taxi speed or on liftoff, yield to the pilot's
 /// hand, glide to idle on any exit except a pilot override.
 async fn watcher(xp: XPlaneClient, engines: usize, hold: Option<String>, run: &sim::run::Lease<'_>) {
@@ -287,9 +309,13 @@ async fn watcher(xp: XPlaneClient, engines: usize, hold: Option<String>, run: &s
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     // A watcher superseded by a newer reverse leaves the levers to it. A
-    // held command stows itself as its last hold runs out.
+    // held command stows as its last hold runs out, and the airframe's own
+    // levers are written down so it does (`reverse_stow_levers`).
     if hold.is_none() && !pilot_has_levers && run.current() {
         glide_levers(&xp, engines, 0.0, 400).await;
+    }
+    if hold.is_some() && run.current() {
+        stow_levers(&xp).await;
     }
     tracing::info!("reverse thrust stowed, watcher stopped");
 }

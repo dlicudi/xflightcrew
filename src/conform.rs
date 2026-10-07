@@ -71,6 +71,10 @@ const TOTAL_WEIGHT_KG: &str = crate::datarefs::TOTAL_WEIGHT_KG;
 const CHANNEL_CMD: f64 = 0.5;
 /// How long a channel command is held before the surface is read, s.
 const HOLD_S: f64 = 1.2;
+/// The tiller's hold, s: the Zibo's nose slews about 35 deg/s, so from +35
+/// to the other side takes two seconds; held 1.2 s the reverse read caught it
+/// crossing the centre (-0.5 deg) and failed a tiller that works.
+const TILLER_HOLD_S: f64 = 3.0;
 /// The heartbeat of a held channel, s (the plugin expires it after 1 s).
 const BEAT_S: f64 = 0.1;
 /// How long a released channel is left to expire and centre, s.
@@ -1017,7 +1021,8 @@ async fn hold_and_read(
     v: f64,
     surface: &str,
 ) -> Option<Vec<f64>> {
-    let beats = (HOLD_S / BEAT_S).round() as usize;
+    let hold = if matches!(ch, Channel::Tiller(_)) { TILLER_HOLD_S } else { HOLD_S };
+    let beats = (hold / BEAT_S).round() as usize;
     for _ in 0..beats {
         ch.write(xp, v).await;
         sleep_s(BEAT_S).await;
@@ -1039,7 +1044,8 @@ async fn swing(
     let plus = hold_and_read(xp, ch, CHANNEL_CMD, surface).await;
     let minus = hold_and_read(xp, ch, -CHANNEL_CMD, surface).await;
     ch.release(xp).await;
-    sleep_s(RELEASE_S).await;
+    // The tiller slews home as it slewed out (about 35 deg/s).
+    sleep_s(if matches!(ch, Channel::Tiller(_)) { TILLER_HOLD_S } else { RELEASE_S }).await;
     let after = read_array(xp, surface).await;
     let p = plus.as_ref().and_then(|v| largest_delta(&base, v));
     let i = p.map(|(i, _)| i);
@@ -1223,6 +1229,10 @@ pub async fn probe_reverse(
             let d = max_of(read_array(xp, REVERSER_DEPLOY).await, engines);
             let b = min_of(read_array(xp, BETA_REV).await, engines);
             sleep_s((REVERSE_HOLD_S - REVERSE_READ_S).max(0.0)).await;
+            // The reverse door's own stow: the airframe's levers written
+            // down (a released hold left the Zibo's at reverse idle,
+            // deployed, until written down).
+            let _ = crate::tools::reverse::stow_levers(xp).await;
             (d, b)
         }
         None => {

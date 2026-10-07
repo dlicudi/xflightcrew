@@ -111,6 +111,10 @@ speedbrake_lever:
 reverse_thrust: true
 rollout_reverse: true
 reverse_hold_command: sim/engines/thrust_reverse_hold
+# Released with the lever left at reverse idle (0.06, beta -1) the
+# reversers stayed deployed, engines running and 2,900 psi on both systems;
+# written down they stowed within 4 s (conform, parked, 2026-10-07).
+reverse_stow_levers: [laminar/B738/flt_ctrls/reverse_lever1, laminar/B738/flt_ctrls/reverse_lever2]
 # The Zibo owns its altimeters. Probed parked 2026-10-06: a stock dial write
 # is undone, `laminar/B738/EFIS/baro_sel_in_hg_pilot` is read-only (HTTP 400),
 # the stock `sim/instruments/barometer_up` does nothing, and ONE press of its
