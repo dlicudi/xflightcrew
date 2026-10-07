@@ -212,14 +212,14 @@ impl Tool for AutoTaxi {
         // An arrival route ends at a parking stand, not a holding point — call
         // it by the right name (the tower cleared us "to stand ...").
         let dest = if party_line::taxi_to_stand() {
-            let s = crate::station::spoken_stand(&watch.holding_point);
+            let s = crate::party_line::spoken_stand(&watch.holding_point);
             if s.is_empty() {
                 "parking".to_string()
             } else {
                 s
             }
         } else {
-            let hp = crate::station::spoken_taxiway(&watch.holding_point);
+            let hp = crate::party_line::spoken_taxiway(&watch.holding_point);
             if hp.is_empty() {
                 "the holding point".to_string()
             } else {
@@ -436,7 +436,7 @@ impl Tool for LineUp {
                 "runway": rwy.id,
             }),
         );
-        let watch = crate::station::TaxiWatch {
+        let watch = crate::party_line::TaxiWatch {
             path,
             via: String::new(),
             seg: Vec::new(),

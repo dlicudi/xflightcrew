@@ -249,7 +249,7 @@
 
     #[test]
     fn atc_payload_marks_active_and_fits_the_plugin_buffer() {
-        let f = |name: &str, dist: f64, active: bool| crate::station::RangedField {
+        let f = |name: &str, dist: f64, active: bool| crate::party_line::RangedField {
             name: name.to_string(),
             dist_nm: dist,
             active,

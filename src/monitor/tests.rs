@@ -50,7 +50,7 @@
     fn the_compliance_tick_is_not_under_the_quiet_gate() {
         let (src, watch) = runway_watch_span();
         let tick = src
-            .find("crate::station::compliance_tick_facing(")
+            .find("crate::world::compliance_tick_facing(")
             .expect("call site");
         assert!(watch.contains(&tick), "the compliance tick left the runway watch");
         let gate = src[..tick]
@@ -74,8 +74,8 @@
     fn the_landing_runway_watch_is_not_under_the_quiet_gate() {
         let (src, watch) = runway_watch_span();
         for call in [
-            "crate::station::go_around_tick(",
-            "crate::station::landing_hold_tick(",
+            "crate::world::go_around_tick(",
+            "crate::world::landing_hold_tick(",
         ] {
             let at: Vec<usize> = src.match_indices(call).map(|(i, _)| i).collect();
             assert_eq!(at.len(), 1, "{call}: one call site");

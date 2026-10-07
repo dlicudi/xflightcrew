@@ -575,7 +575,7 @@ fn real_install_page_states() {
             net.plan_to_stand(mid.0, mid.1, &stand)
         }
         .expect("a route");
-        let watch = crate::station::TaxiWatch {
+        let watch = crate::party_line::TaxiWatch {
             path: plan.path.clone(),
             via: plan.via.join(", "),
             seg: plan.seg.clone(),

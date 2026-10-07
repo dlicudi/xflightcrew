@@ -87,6 +87,7 @@ pub(super) fn vert_phrase(ft: f64) -> String {
 /// Factor traffic near the vectored arrival, spoken as a controller advisory
 /// ("traffic, two o'clock, three miles, five hundred feet above").
 /// `None` = no factor, frequency stays quiet.
+#[allow(dead_code)] // no caller: world_tick builds its advisory from the parts
 pub async fn traffic_advisory(xp: SimView<'_>) -> Option<String> {
     let f = nearest_traffic_factor(xp).await?;
     Some(advisory_line(&f))

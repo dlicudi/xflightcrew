@@ -509,7 +509,7 @@ fn rebuild(ticks: &[DriveTick], states: &[(f64, f64, f64, f64)], pace: crate::au
         pts.push((b.0 + (b.0 - a.0) / l * 20.0, b.1 + (b.1 - a.1) / l * 20.0));
     }
     let path: Vec<(f64, f64)> = pts.iter().map(|&(x, y)| geo.ll(x, y)).collect();
-    let watch = crate::station::TaxiWatch {
+    let watch = crate::party_line::TaxiWatch {
         seg: vec![(String::new(), false); path.len().saturating_sub(1)],
         path,
         via: String::new(),
@@ -644,7 +644,7 @@ fn planned(ticks: &[DriveTick], rb: &Rebuilt, pace: crate::autotaxi::Pace) -> Op
                 continue;
             }
             let pts: Vec<(f64, f64)> = plan.path.iter().map(|&(a, b)| rb.geo.xy(a, b)).collect();
-            let watch = crate::station::TaxiWatch {
+            let watch = crate::party_line::TaxiWatch {
                 seg: plan.seg.clone(),
                 path: plan.path.clone(),
                 via: String::new(),

@@ -8,10 +8,11 @@
 //! here; if a feature ever genuinely needs world-initiated audio, inject a
 //! narrow trait into that feature alone.
 //!
-//! Crew↔world state crosses ONLY through `party_line` accessors (its statics
-//! stay crate-private — the compiler now enforces what used to be
-//! convention). This crate must stay lean: no whisper, no cpal, no ort —
-//! `cargo tree -p atc` is the standalone-product health check.
+//! Crew/world state crosses ONLY through `party_line` (its statics stay
+//! crate-private) and `world` (the ticks the crew's monitor drives): the
+//! station module itself is `pub(crate)`, so the compiler enforces the seam.
+//! This crate must stay lean: no whisper, no cpal, no ort; `cargo tree -p
+//! atc` is the standalone-product health check.
 
 pub mod airspace;
 pub mod atis;
@@ -19,5 +20,6 @@ pub mod callsign;
 pub mod nav;
 pub mod party_line;
 pub mod speaker;
-pub mod station;
+pub(crate) mod station;
 pub mod tower;
+pub mod world;

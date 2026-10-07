@@ -3379,7 +3379,7 @@ pub async fn run(
             // The world's reach: a station whose field we are not at (on the
             // ground) neither hears nor answers, and an uncontrolled
             // departure plans its own taxi.
-            crate::station::note_aircraft(snap.lat, snap.lon, snap.on_ground);
+            crate::party_line::note_aircraft(snap.lat, snap.lon, snap.on_ground);
             let crashed = voice.crashed();
             let flight_events = flight.tick(&flight_sample(&snap, wall_t, crashed));
             snap.phase = coarse_phase(flight.phase(), snap.agl_ft);
@@ -3841,12 +3841,13 @@ pub async fn run(
                 // instant we tune off its frequency, and lets a stepped-on
                 // tail die with a retune instead of following us to the new
                 // frequency.
-                voice.set_com1(com1, com1.and_then(crate::station::tuned_station));
+                voice.set_com1(com1, com1.and_then(crate::party_line::tuned_station));
                 // ...and how FAR that station is: the radio's signal-quality
                 // model fades a distant tower into hiss instead of playing
                 // every transmission studio-clean at 60 nm.
-                voice
-                    .set_station_range(crate::station::active_station_range_nm(snap.lat, snap.lon));
+                voice.set_station_range(crate::party_line::active_station_range_nm(
+                    snap.lat, snap.lon,
+                ));
                 // Radio audio needs a powered receiver: with the avionics
                 // master OFF the pilot can't hear ATC/ATIS/traffic. Confident
                 // reads only — a read failure or an airframe with no avionics
@@ -5048,7 +5049,7 @@ fn feed_surface_wind() {
     // ft over Ferrara, and gave runway 12 against its own 24004KT
     // (LIPE-LIPK, 2026-09-25).
     static LAST: std::sync::Mutex<Option<(std::time::Instant, String)>> = std::sync::Mutex::new(None);
-    let Some((icao, lat, lon)) = crate::station::active_icao() else {
+    let Some((icao, lat, lon)) = crate::party_line::active_icao() else {
         return;
     };
     {
@@ -5063,7 +5064,7 @@ fn feed_surface_wind() {
     }
     tokio::task::spawn_blocking(move || {
         let wind = crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &icao);
-        crate::station::set_surface_wind(lat, lon, wind);
+        crate::party_line::set_surface_wind(lat, lon, wind);
     });
 }
 

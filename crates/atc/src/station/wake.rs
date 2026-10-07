@@ -47,6 +47,7 @@ pub const DEPARTURE_STREAM_SECS: u64 = 600;
 
 /// The end the field is departing from right now: the last ghost liftoff
 /// within [`DEPARTURE_STREAM_SECS`], else `None`.
+#[cfg_attr(not(test), allow(dead_code))] // station tests only
 pub fn departure_end(now: Instant) -> Option<String> {
     DEPARTURE_STREAM
         .lock()
@@ -72,6 +73,7 @@ pub const ARRIVAL_STREAM_SECS: u64 = 600;
 /// The end the field has been landing on: the last ghost touchdown within
 /// [`ARRIVAL_STREAM_SECS`], else `None`. The memory only: the live sighting
 /// on final ([`arrival_end`]) outranks it through [`field_streams`].
+#[cfg_attr(not(test), allow(dead_code))] // station tests only
 pub fn arrival_stream_end(now: Instant) -> Option<String> {
     ARRIVAL_STREAM
         .lock()

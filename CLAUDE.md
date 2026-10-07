@@ -205,7 +205,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 - The station returns text and can NEVER actuate (`sim::xplane::SimView`, read-only); no
   whisper/cpal/ort in its deps (`cargo tree -p atc` is the standalone health check).
 - **The crew/world seam is one page**, `crates/atc/src/party_line.rs`: statics crate-private; a
-  new crew need gets an ACCESSOR, never a `pub static`.
+  new crew need gets an ACCESSOR, never a `pub static`. `station` is `pub(crate)`: the crew's
+  inputs, reads and types are `party_line`'s, the ticks `atc::world`'s
+  (`the_station_is_reached_only_through_the_seam`).
 - Tests touching a process-wide static hold `SIDE_STATE_LOCK`; setting the mode, `mode::TEST_LOCK`.
 - `Station::install()` publishes side state, never `from_airport`; `uninstall()` retires it all.
 - **A mishear may earn "say again", never a clearance.** Only mayday/pan-pan lands without a final.

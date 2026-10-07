@@ -20,7 +20,7 @@
 
 use std::time::Instant;
 
-use crate::station::{first_designator, spoken_taxiway, TaxiWatch};
+use crate::party_line::{first_designator, spoken_taxiway, TaxiWatch};
 
 /// Route bends sharper than this (measured over the smoothing window, so
 /// gentle fillet arcs don't count) are called as turns.
@@ -249,7 +249,7 @@ impl Guide {
         // not a holding point (the tower cleared us "to stand ..."). Departure
         // (and every synthetic-route test) reads the flag as false.
         let (line, short) = if crate::party_line::taxi_to_stand() {
-            let s = crate::station::spoken_stand(&watch.holding_point);
+            let s = crate::party_line::spoken_stand(&watch.holding_point);
             let mut c = s.chars();
             let spoken = c
                 .next()

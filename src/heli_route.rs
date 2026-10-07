@@ -1462,9 +1462,15 @@ fn call_inbound(base_url: &str, khz: i64) {
             xp.get_float(crate::datarefs::ALTITUDE_FT),
         );
         if let (Ok(lat), Ok(lon), Ok(alt)) = (lat, lon, alt) {
-            crate::station::arm_station_for_freq(khz, lat, lon, alt, std::time::Instant::now());
+            crate::party_line::arm_station_for_freq(
+                khz,
+                lat,
+                lon,
+                alt,
+                std::time::Instant::now(),
+            );
         }
-        crate::station::pin_arrival_station(Some(khz));
+        crate::party_line::pin_arrival_station(Some(khz));
         let mut swapped = false;
         for _ in 0..INBOUND_SWAP_WAIT_S * 2 {
             if crate::party_line::home_tower_khz() == Some(khz) {

@@ -241,13 +241,10 @@ pub fn addressed_to_own(transcript: &str) -> bool {
         .any(|s| addressed(transcript, &s))
 }
 
-/// Register the crew's provider of the pilot's telephony setting (the raw
-/// text, [`parse_telephony`] reads it). Called once at boot.
-pub fn provide_telephony(f: fn() -> String) {
-    *crate::party_line::CALLSIGN_TELEPHONY
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(f);
-}
+// The crew registers its providers on the party line, beside their statics
+// (`party_line::provide_inputs`, `party_line::provide_telephony`); the old
+// path stays for the callers that name it.
+pub use crate::party_line::{provide_inputs, provide_telephony};
 
 /// The pilot's telephony entries right now; none without a provider.
 pub fn user_telephony() -> Vec<(String, String)> {
@@ -299,14 +296,6 @@ pub fn telephony_text(entries: &[(String, String)]) -> String {
         .map(|(c, n)| format!("{c}={n}"))
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-/// Register the crew's provider of [`Inputs`]. Called once at boot; the
-/// provider reads the live setting and the plan shelf each time it is asked.
-pub fn provide_inputs(f: fn() -> Inputs) {
-    *crate::party_line::CALLSIGN_INPUTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(f);
 }
 
 /// The crew's inputs right now; none without a provider (tests, a bare

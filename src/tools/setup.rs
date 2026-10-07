@@ -293,12 +293,12 @@ pub struct NewFlightStation {
 }
 
 /// The station for the field under the new flight's settled position: armed
-/// ([`crate::station::arm_new_flight_at`]) and waited on until the main loop
+/// ([`crate::party_line::arm_new_flight_at`]) and waited on until the main loop
 /// has installed it, at most `wait_s`.
 pub async fn new_flight_station(fix: Fix, wait_s: u64) -> NewFlightStation {
-    let was = crate::station::active_icao().map(|(icao, _, _)| icao);
+    let was = crate::party_line::active_icao().map(|(icao, _, _)| icao);
     let Some((field, khz)) =
-        crate::station::arm_new_flight_at(fix.lat, fix.lon, fix.on_ground, std::time::Instant::now())
+        crate::party_line::arm_new_flight_at(fix.lat, fix.lon, fix.on_ground, std::time::Instant::now())
     else {
         return NewFlightStation { was, ..NewFlightStation::default() };
     };
@@ -884,7 +884,7 @@ impl Tool for SetUpApproach {
             Err(line) => return Ok(line),
         };
         // The tower's runway only when its station is this field.
-        let tower = crate::station::active_icao()
+        let tower = crate::party_line::active_icao()
             .filter(|(i, _, _)| i.eq_ignore_ascii_case(&icao))
             .and_then(|_| crate::party_line::clearance_runway());
         let plan = crate::simbrief::loaded_plan()
@@ -1244,7 +1244,7 @@ async fn approach_follow_up(job: ApproachJob, loading: Loading) {
         // already retired.
         crate::flight_state::flight_begins(crate::flight_state::NewFlight::Approach);
         if !matches!(next, AfterInit::Failed { .. }) && crate::mode::atc_enabled() {
-            tower = crate::station::arm_new_flight(&job.icao, std::time::Instant::now());
+            tower = crate::party_line::arm_new_flight(&job.icao, std::time::Instant::now());
         }
     }
     // The arm first, the record and the words after: the aircraft is
@@ -1312,7 +1312,7 @@ async fn new_flight_radio(xp: &crate::xplane::XPlaneClient, job: &ApproachJob, t
     let _ = xp.set_float(crate::datarefs::COM1_FREQ_KHZ, khz as f64).await;
     if let Some((lat, lon)) = job.field {
         let wind = crate::weather::surface_wind(&super::autoland::xplane_root(), &job.icao);
-        crate::station::set_surface_wind(lat, lon, wind);
+        crate::party_line::set_surface_wind(lat, lon, wind);
     }
     // The call belongs to the NEW station: routed a pass early it reaches
     // the old one and its worksheet.

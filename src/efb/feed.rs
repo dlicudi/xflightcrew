@@ -71,7 +71,7 @@ fn tuned_now() -> (Option<i64>, Option<&'static str>) {
     let khz = com1();
     (
         khz,
-        khz.and_then(crate::station::tuned_station).map(|s| s.tag()),
+        khz.and_then(crate::party_line::tuned_station).map(|s| s.tag()),
     )
 }
 

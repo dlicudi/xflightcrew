@@ -343,10 +343,10 @@ fn gather(server: &Server) -> state::Facts {
     let profile = crate::aircraft::live_profile();
     let com1_khz = feed::com1();
     let com1_tag = com1_khz
-        .and_then(crate::station::tuned_station)
+        .and_then(crate::party_line::tuned_station)
         .map(|s| s.tag());
     let station = tick.as_ref().and_then(|t| {
-        crate::station::active_station_in_range(t.lat, t.lon, t.alt_ft)
+        crate::party_line::active_station_in_range(t.lat, t.lon, t.alt_ft)
             .map(|(field, services)| state::StationFacts { field, services })
     });
     let controller = server
@@ -429,7 +429,7 @@ fn gather(server: &Server) -> state::Facts {
             .into_iter()
             .filter(|(_, i)| !i.trim().is_empty())
             .filter_map(|(role, icao)| {
-                let at = crate::station::field_position(icao).or_else(|| {
+                let at = crate::party_line::field_position(icao).or_else(|| {
                     p.waypoints
                         .iter()
                         .find(|w| w.0.eq_ignore_ascii_case(icao))
@@ -527,7 +527,7 @@ fn airport_facts() -> airport::AirportFacts {
         })
     });
     airport::AirportFacts {
-        station: crate::station::active_icao(),
+        station: crate::party_line::active_icao(),
         diagram: None,
         unavailable: false,
         route,

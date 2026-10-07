@@ -1836,9 +1836,9 @@ pub(crate) enum DepartureWait {
 /// the main loop installs it); the wait ends Ready, or Refused at `wait`.
 pub(crate) async fn wait_departure_station<F>(mut look: F, wait: Duration, poll: Duration) -> DepartureWait
 where
-    F: FnMut(bool) -> (crate::station::DepartureStation, Option<String>),
+    F: FnMut(bool) -> (crate::party_line::DepartureStation, Option<String>),
 {
-    use crate::station::DepartureStation as D;
+    use crate::party_line::DepartureStation as D;
     let t0 = tokio::time::Instant::now();
     let mut armed = false;
     loop {
@@ -1876,10 +1876,10 @@ async fn departure_station(xp: &XPlaneClient) -> Result<(), String> {
     let (Ok(lat), Ok(lon)) = (lat, lon) else {
         return Ok(());
     };
-    let under = crate::station::field_under(lat, lon, true).map(|(icao, _)| icao);
+    let under = crate::party_line::field_under(lat, lon, true).map(|(icao, _)| icao);
     let t0 = Instant::now();
     let out = wait_departure_station(
-        |arm| crate::station::departure_station(lat, lon, arm, Instant::now()),
+        |arm| crate::party_line::departure_station(lat, lon, arm, Instant::now()),
         DEPARTURE_STATION_WAIT,
         Duration::from_millis(250),
     )
@@ -3732,7 +3732,7 @@ async fn fly_route(
     // own runway 30, and block taxi-in waiting for a clearance that could not
     // exist (EGTF-EGFH, 2026-10-01, #210).
     if dest_tower.is_none() && crate::mode::atc_enabled() {
-        crate::station::begin_uncontrolled_arrival(&route.dest_icao);
+        crate::party_line::begin_uncontrolled_arrival(&route.dest_icao);
         event(
             "uncontrolled_arrival",
             json!({ "destination": route.dest_icao, "why": "no_staffed_tower" }),
@@ -3879,11 +3879,11 @@ async fn fly_route(
         // no station held, 2026-09-15). Tuning the destination's tower arms
         // that field the way a keyed transmission on its frequency does; the
         // swap wait below then finds it on the next loop pass.
-        crate::station::arm_station_for_freq(khz, lat, lon, alt_msl_ft, Instant::now());
+        crate::party_line::arm_station_for_freq(khz, lat, lon, alt_msl_ft, Instant::now());
         // And HOLD it there for the rest of the arrival: arming only wins the
         // next swap, where the region's tick keeps running all the way to the
         // flare and will hand a nearer field the station we are talking to.
-        crate::station::pin_arrival_station(Some(khz));
+        crate::party_line::pin_arrival_station(Some(khz));
         // The call is worth nothing until the station on that frequency IS
         // the destination: at PIMOS the region swapped to Gibraltar three
         // seconds AFTER "inbound for landing" went out, the call went into
@@ -4817,10 +4817,10 @@ struct Arrival {
 /// The active station's field wind from its METAR, published now: the
 /// tower picks its runway from it, never from the air the aircraft is in.
 fn publish_field_wind() {
-    if let Some((icao, lat, lon)) = crate::station::active_icao() {
+    if let Some((icao, lat, lon)) = crate::party_line::active_icao() {
         let wind = crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &icao);
         event("field_wind", json!({ "icao": icao, "wind": wind }));
-        crate::station::set_surface_wind(lat, lon, wind);
+        crate::party_line::set_surface_wind(lat, lon, wind);
     }
 }
 
@@ -4869,7 +4869,7 @@ async fn call_inbound(
     // fly its zone (London City took the station fifteen miles out and both
     // the final report and the taxi-in request went into the void, EGLL
     // 2026-09-17). Released by `release_arrival_station`.
-    crate::station::pin_arrival_station(Some(khz));
+    crate::party_line::pin_arrival_station(Some(khz));
     event(
         "inbound_call",
         json!({ "khz": khz, "station_swapped": swapped }),
@@ -4883,12 +4883,12 @@ pub fn inbound_on_frequency(com1_khz: Option<i64>, tower_khz: i64) -> bool {
 }
 
 /// Release the arrival's hold on the station (see
-/// [`crate::station::pin_arrival_station`]). Every path that ends a mission
+/// [`crate::party_line::pin_arrival_station`]). Every path that ends a mission
 /// calls this, so a pin can never outlive the arrival that set it: the
 /// region's ordinary nearest-field handoffs resume for the next flight.
 pub fn release_arrival_station() {
-    crate::station::pin_arrival_station(None);
-    crate::station::end_arrival();
+    crate::party_line::pin_arrival_station(None);
+    crate::party_line::end_arrival();
 }
 
 /// The wind the arrival picks its runway by, and where it came from: the
@@ -6111,7 +6111,7 @@ pub(crate) fn other_runway_line(on: &str, cleared: &str) -> String {
 /// Whether `cleared` is the other end of the strip `on` ("13" and "31",
 /// "08R" and "26L"): the runway start's backtrack, not a taxi. Pure.
 pub(crate) fn is_reciprocal(on: &str, cleared: &str) -> bool {
-    crate::station::reciprocal_end(on.trim())
+    crate::party_line::reciprocal_end(on.trim())
         .is_some_and(|r| crate::autotakeoff::runway_matches(&r, cleared.trim()))
 }
 
@@ -6310,7 +6310,7 @@ async fn ensure_takeoff_cleared(
     const NUDGE_EVERY: Duration = Duration::from_secs(40);
     /// Held for traffic, ask again after this long without a word: a real
     /// hold lasts a landing or two, and the tower keeps its own promise
-    /// well inside it (`station::takeoff_hold_tick`).
+    /// well inside it (the world's `takeoff_hold_tick`).
     const HELD_REASK: Duration = Duration::from_secs(150);
 
     let deadline = Instant::now() + Duration::from_secs_f64(OVERALL_SECS);

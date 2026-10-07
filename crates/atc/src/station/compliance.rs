@@ -118,6 +118,7 @@ pub(super) const MIN_FLIGHT_SECS: f64 = 30.0;
 /// talked to. Everything is derived from the published [`CLEARANCE`] state —
 /// a tower that never saw you on its ground can't accuse you of an uncleared
 /// takeoff.
+#[cfg_attr(not(test), allow(dead_code))] // station tests only
 pub fn compliance_tick(
     lat: f64,
     lon: f64,

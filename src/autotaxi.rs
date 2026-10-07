@@ -42,7 +42,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::aircraft::throttle_dataref;
-use crate::station::TaxiWatch;
+use crate::party_line::TaxiWatch;
 use crate::taxi_guide;
 use crate::tools::speedhold;
 use crate::voice::say_opt as alert;
@@ -876,7 +876,7 @@ impl Route {
             cum,
             total,
             bends,
-            holding_point: crate::station::spoken_taxiway(&watch.holding_point),
+            holding_point: crate::party_line::spoken_taxiway(&watch.holding_point),
             done_line: None,
             pace: Pace::default(),
             runway_spans,
@@ -3046,7 +3046,7 @@ pub fn start_backtrack(
                 );
                 return;
             };
-            let watch = crate::station::TaxiWatch {
+            let watch = crate::party_line::TaxiWatch {
                 path,
                 via: String::new(),
                 seg: Vec::new(),

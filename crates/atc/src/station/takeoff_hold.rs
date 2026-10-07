@@ -192,6 +192,7 @@ pub fn void_takeoff_hold_by_roll(gs_kts: f64) -> bool {
 
 /// [`takeoff_hold_tick_from`] without our own position: every occupant of
 /// the pavement holds the departure.
+#[cfg_attr(not(test), allow(dead_code))] // station tests only
 pub fn takeoff_hold_tick(
     targets: &[TcasTarget],
     field_elev_ft: f64,

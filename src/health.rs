@@ -267,8 +267,8 @@ impl Collector {
 
         if self.atc_on {
             if let Some((lat, lon, alt_ft)) = position {
-                let (airport, services) =
-                    crate::station::active_station_in_range(lat, lon, alt_ft).unwrap_or_default();
+                let (airport, services) = crate::party_line::active_station_in_range(lat, lon, alt_ft)
+                    .unwrap_or_default();
                 live.station = airport;
                 live.services = services;
             }

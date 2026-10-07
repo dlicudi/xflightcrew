@@ -341,7 +341,7 @@ async fn vacate(
         crate::blackbox::record("taxi_in", json!({ "event": "vacate_no_plan", "rwy": rwy }));
         return VacateEnd::Carry;
     };
-    let watch = crate::station::TaxiWatch {
+    let watch = crate::party_line::TaxiWatch {
         path: plan.path.clone(),
         via: String::new(),
         seg: plan.seg.clone(),
@@ -363,7 +363,7 @@ async fn vacate(
     } else {
         format!(
             "Clear of the runway on {}.",
-            crate::station::spoken_taxiway(&plan.exit_name)
+            crate::party_line::spoken_taxiway(&plan.exit_name)
         )
     });
     crate::blackbox::record(
@@ -755,7 +755,7 @@ async fn fly(
     if let Some(collective) = crate::hover::collective_dref() {
         let route = crate::party_line::with_taxi_route(|r| {
             r.filter(|w| w.path.len() >= 2)
-                .map(|w| (w.path.clone(), crate::station::spoken_taxiway(&w.via)))
+                .map(|w| (w.path.clone(), crate::party_line::spoken_taxiway(&w.via)))
         });
         let Some((path, via)) = route else {
             announce(&voice, Priority::Caution, "No taxi route to fly. Your aircraft.");

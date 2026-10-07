@@ -746,7 +746,7 @@ pub fn arrival_brief(apt_dat: &str, cifp: &str, fixes: &str, xplane_root: &str) 
         Ok(Some(a)) => a,
         _ => return format!("I can't find {dest} in the airport data to brief it."),
     };
-    let name = crate::station::spoken_airport(&airport.name).to_string();
+    let name = crate::party_line::spoken_airport(&airport.name).to_string();
     let mut parts = vec![format!("Arrival brief for {name}.")];
     match crate::weather::briefing(xplane_root, &dest, &name) {
         Ok(w) | Err(w) => parts.push(w),

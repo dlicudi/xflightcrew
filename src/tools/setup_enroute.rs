@@ -9,7 +9,7 @@
 //! altitude (confirmed, `autoland::ApEngage`), arms the speed governor at
 //! the plan's speed there, and hands the world an IFR flight mid-route: its
 //! discrete code kept unit to unit, the nearest radar unit's station, COM1
-//! on its approach frequency (`station::arm_new_flight_enroute`). Nothing
+//! on its approach frequency (`crate::party_line::arm_new_flight_enroute`). Nothing
 //! more: "fly the flight plan" then takes it through full auto's airborne
 //! RESUME, as a pilot handing over mid-route would.
 //!
@@ -956,7 +956,7 @@ async fn enroute_follow_up(job: EnrouteJob, loading: super::setup::Loading) {
             super::setup::settled_position(&xp, super::setup::SettleTiming::LIVE).await
         {
             let callsign = crate::circuit::crew_callsign(&xp).await.unwrap_or_default();
-            station = crate::station::arm_new_flight_enroute(
+            station = crate::party_line::arm_new_flight_enroute(
                 fix.lat,
                 fix.lon,
                 &callsign,

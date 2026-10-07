@@ -64,7 +64,7 @@
     #[tokio::test(start_paused = true)]
     async fn the_arm_waits_for_the_departure_fields_station() {
         use super::{wait_departure_station, DepartureWait};
-        use crate::station::DepartureStation as D;
+        use crate::party_line::DepartureStation as D;
         let want = || "EGKK".to_string();
         let poll = std::time::Duration::from_millis(250);
         let wait = std::time::Duration::from_secs(20);
@@ -2047,7 +2047,9 @@
         // The departure controller clears the climb the check-in announced,
         // in its own words.
         assert_eq!(
-            crate::station::climb_announced(&call.replace("six thousand", "flight level one two zero")),
+            crate::party_line::climb_announced(
+                &call.replace("six thousand", "flight level one two zero")
+            ),
             Some("flight level one two zero".into())
         );
     }

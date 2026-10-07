@@ -7,16 +7,19 @@
 //! - The WORLD writes these from its reply path and watch ticks. It never
 //!   reads crew state and never actuates the aircraft — its only outputs
 //!   are spoken text and this page.
-//! - The CREW reads through the accessor functions below, never the statics,
-//!   and never writes — with two deliberate exceptions, the `take_*`
-//!   consumers, where the main loop drains a queue the world armed for it
-//!   (a station swap, a released takeoff clearance).
+//! - The CREW reads through the accessor functions below, never the statics.
+//!   It writes world state only through the named INPUTS at the foot of this
+//!   page (`note_aircraft`, `set_surface_wind`, `pin_arrival_station`,
+//!   `arm_station_for_freq`, ...) and the `take_*` consumers, where the main
+//!   loop drains a queue the world armed for it (a station swap, a released
+//!   takeoff clearance).
 //!
-//! Everything else in station.rs is private to the world side. When the
-//! crew needs a new fact, it gets a new accessor here — so "what can the
-//! copilot see of ATC?" stays answerable on one page. Until the sides live
-//! in separate crates this is convention, not compiler-checked; keep the
-//! surface small enough to audit by eye.
+//! The station is crate-private (`pub(crate) mod station`): the crew can
+//! name nothing of it but what this page and [`crate::world`] (the ticks the
+//! monitor drives) re-export, so the compiler checks the seam, and the
+//! crew's `the_station_is_reached_only_through_the_seam` scan pins it. When
+//! the crew needs a new fact, it gets a new accessor here, so "what can the
+//! copilot see of ATC?" stays answerable on one page.
 //!
 //! Every static here has a LIFETIME, classified with the station's in
 //! `station/state.rs` (`PartyLineFacts`, `FlightCarried`, `WorldOnly`,
@@ -28,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::nav;
-use crate::station::{ClearanceSnap, LandingHold, TakeoffHold, TaxiWatch, VectorPlan};
+use crate::station::{ClearanceSnap, LandingHold, TakeoffHold, VectorPlan};
 use crate::tower;
 
 // ---- published state (world-side writes live in station.rs) ----
@@ -96,18 +99,31 @@ pub(crate) static ARRIVAL_PIN: Mutex<Option<i64>> = Mutex::new(None);
 
 /// The crew's provider of what the sim cannot say about our callsign: the
 /// pilot's override and the loaded plan's ATC callsign
-/// (`callsign::provide_inputs`, registered once at boot). A function, never a
+/// ([`provide_inputs`], registered once at boot). A function, never a
 /// value: it reads the setting and the plan shelf when asked, so a replaced
 /// or cleared plan is a new or no callsign with nothing here to go stale.
 pub(crate) static CALLSIGN_INPUTS: Mutex<Option<fn() -> crate::callsign::Inputs>> =
     Mutex::new(None);
 
 /// The crew's provider of the pilot's own airline telephony
-/// (`callsign::provide_telephony`, registered once at boot): the raw setting
+/// ([`provide_telephony`], registered once at boot): the raw setting
 /// ("WAT=Walker; XYZ=Zulu Air"), read at the moment a callsign is spoken so an
 /// edit applies to the next transmission. A function for the same reason as
 /// [`CALLSIGN_INPUTS`]: nothing here can go stale.
 pub(crate) static CALLSIGN_TELEPHONY: Mutex<Option<fn() -> String>> = Mutex::new(None);
+
+/// Register the crew's provider of [`crate::callsign::Inputs`]. Called once
+/// at boot; the provider reads the live setting and the plan shelf each time
+/// it is asked (`callsign::inputs`).
+pub fn provide_inputs(f: fn() -> crate::callsign::Inputs) {
+    *lock(&CALLSIGN_INPUTS) = Some(f);
+}
+
+/// Register the crew's provider of the pilot's telephony setting (the raw
+/// text, `callsign::parse_telephony` reads it). Called once at boot.
+pub fn provide_telephony(f: fn() -> String) {
+    *lock(&CALLSIGN_TELEPHONY) = Some(f);
+}
 
 /// The crew's provider of the route it FILED (`provide_filed_route`,
 /// registered once at boot): the loaded plan's origin, destination and fix
@@ -667,3 +683,60 @@ impl GoAroundOrders {
         fresh
     }
 }
+
+// ---- the crew's door into the station ----
+//
+// `station` is crate-private: everything the crew names of it is listed
+// below, by what it is. The crew writes to the world ONLY through the
+// inputs; it reads through the accessors above and here; the world's own
+// scheduler surface (the ticks the monitor drives) is `crate::world`. A
+// source scan in the crew (`the_station_is_reached_only_through_the_seam`)
+// fails on any other path into it.
+
+/// Crew INPUTS: facts the crew tells the world, and the arms and loads it
+/// asks for. Each one is a write on world state; nothing else the crew does
+/// writes there.
+///
+/// - `note_aircraft`: where our aircraft is, per monitor tick (the landing
+///   and the out-of-reach stand-down key on it).
+/// - `set_surface_wind`: the field's own wind, from its METAR.
+/// - `pin_arrival_station` / `end_arrival` / `begin_uncontrolled_arrival`:
+///   the arrival the crew committed to, and its end.
+/// - `arm_station_for_freq`: the station COM1 was tuned to, armed for the
+///   main loop's swap.
+/// - `arm_new_flight` / `arm_new_flight_at` / `arm_new_flight_enroute`: a
+///   new flight's station, armed for the main loop.
+/// - `load_region` / `spawn_taxi_net_load` / `spawn_ils_load`: the world's
+///   data, loaded when the crew installs a station.
+pub use crate::station::{
+    arm_new_flight, arm_new_flight_at, arm_new_flight_enroute, arm_station_for_freq,
+    begin_uncontrolled_arrival, end_arrival, load_region, note_aircraft, pin_arrival_station,
+    set_surface_wind, spawn_ils_load, spawn_taxi_net_load,
+};
+
+/// World READS: what the station holds, asked by the crew. Nothing here
+/// writes.
+///
+/// - The station and the fields round us: `active_icao`, `active_field`,
+///   `active_station_in_range`, `active_station_range_nm`, `fields_in_range`,
+///   `fields_in_box`, `field_under`, `field_position`, `region_loaded`,
+///   `departure_station`.
+/// - Who COM1 reaches: `tuned_controller`, `tuned_station`.
+/// - The radio's words, for routing and the coach: `is_radio_call`,
+///   `freq_query`, `coach_query`, `coach_yes_no`, `suggest_call`,
+///   `climb_announced`, `dialect_for`.
+/// - Phraseology, pure: `spoken_airport`, `spoken_taxiway`, `spoken_stand`,
+///   `first_designator`, `reciprocal_end`.
+pub use crate::station::{
+    active_field, active_icao, active_station_in_range, active_station_range_nm, climb_announced,
+    coach_query, coach_yes_no, departure_station, dialect_for, field_position, field_under,
+    fields_in_box, fields_in_range, first_designator, freq_query, is_radio_call, reciprocal_end,
+    region_loaded, spoken_airport, spoken_stand, spoken_taxiway, suggest_call, tuned_controller,
+    tuned_station,
+};
+
+/// The station's TYPES the crew names: the `Station` the command loop owns
+/// (`load`, `from_airport`, `install`, `uninstall`), the cleared taxi route
+/// (`TaxiWatch`), the departure's station (`DepartureStation`), a field in
+/// range (`RangedField`) and a tune request's answer (`Tune`).
+pub use crate::station::{DepartureStation, RangedField, Station, TaxiWatch, Tune};

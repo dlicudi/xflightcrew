@@ -730,7 +730,7 @@ impl CardFacts {
 /// Everything the Airport page reads beyond the tick and the plan.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AirportFacts {
-    /// The active station's field: ICAO, lat, lon (`station::active_icao`).
+    /// The active station's field: ICAO, lat, lon (`crate::party_line::active_icao`).
     pub(crate) station: Option<(String, f64, f64)>,
     /// The diagram built for the field the page wants, when it is.
     pub(crate) diagram: Option<DiagramRef>,

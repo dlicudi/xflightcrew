@@ -120,9 +120,12 @@ mod weather;
 mod world_tick;
 
 // The world side (ATC) and the simulator plumbing now live in their own
-// crates; these shims keep every existing `crate::station::...` /
-// `crate::xplane::...` path in the module tree resolving unchanged.
-pub(crate) use ::atc::{airspace, atis, callsign, nav, party_line, speaker, station, tower};
+// crates; these shims keep every existing `crate::nav::...` /
+// `crate::xplane::...` path in the module tree resolving unchanged. The
+// station itself is the world's own: the crew reaches it only through
+// `party_line` (inputs, reads, types) and `world` (the ticks world_tick
+// drives), pinned by `the_station_is_reached_only_through_the_seam`.
+pub(crate) use ::atc::{airspace, atis, callsign, nav, party_line, speaker, tower, world};
 pub(crate) use sim::{angles, blackbox, datarefs, xplane};
 
 use std::time::{Duration, Instant};
@@ -621,7 +624,9 @@ async fn main() -> Result<()> {
                             .ok()
                             .map(|v| v.round() as i64);
                         if let Some((lat, lon, alt_ft)) = position(&xp).await {
-                            let row = match station::active_station_in_range(lat, lon, alt_ft) {
+                            let row = match party_line::active_station_in_range(
+                                lat, lon, alt_ft,
+                            ) {
                                 Some((airport, services)) => {
                                     radio_panel_line(&airport, &services, com1)
                                 }
@@ -630,7 +635,7 @@ async fn main() -> Result<()> {
                                 None => radio_panel_line("", &[], com1),
                             };
                             sink.radio(&row);
-                            sink.atc(&atc_panel_payload(&station::fields_in_range(
+                            sink.atc(&atc_panel_payload(&party_line::fields_in_range(
                                 lat, lon, alt_ft, 8,
                             )));
                             // The Calls tab's live "say now" line: the coach's
@@ -643,9 +648,9 @@ async fn main() -> Result<()> {
                             let callsign = crate::circuit::crew_callsign(&xp)
                                 .await
                                 .unwrap_or_else(|| "your callsign".to_string());
-                            let dist = station::active_field()
+                            let dist = party_line::active_field()
                                 .map(|(_, flat, flon, _)| nav::haversine_nm(lat, lon, flat, flon));
-                            match station::suggest_call(&callsign, on_ground, dist, com1) {
+                            match party_line::suggest_call(&callsign, on_ground, dist, com1) {
                                 Some(s) => {
                                     let text = [s.first.as_deref(), s.call.as_deref()]
                                         .into_iter()
@@ -1151,7 +1156,7 @@ async fn run_session(
                 let line = match atc_station.as_ref() {
                     Some(st) => format!(
                         "ATC is on. {} is up.",
-                        station::spoken_airport(st.airport_name())
+                        party_line::spoken_airport(st.airport_name())
                     ),
                     None => "ATC is on, no station configured.".to_string(),
                 };
@@ -1161,7 +1166,7 @@ async fn run_session(
                 atc_station = None;
                 // Retire every published fact (party line + monitor side
                 // state) and cut whatever the station was saying mid-word.
-                station::Station::uninstall();
+                party_line::Station::uninstall();
                 tts::stop_channel(tts::Channel::Radio);
                 // X-Plane gets its radio voice back through `sim_radio_sync`:
                 // the pilot may be switching to the sim's OWN ATC.
@@ -1221,7 +1226,7 @@ async fn run_session(
                 let covered = atc_station.as_ref().is_some_and(|st| st.covers_khz(com1));
                 if !covered {
                     if let Some((lat, lon, alt_ft)) = position(&xplane).await {
-                        station::arm_station_for_freq(com1, lat, lon, alt_ft, Instant::now());
+                        party_line::arm_station_for_freq(com1, lat, lon, alt_ft, Instant::now());
                     }
                 }
             }
@@ -1237,18 +1242,18 @@ async fn run_session(
             party_line::take_pending_station().filter(|_| mode::atc_enabled())
         {
             let name = apt.name.clone();
-            match station::Station::from_airport(apt) {
+            match party_line::Station::from_airport(apt) {
                 Some(mut st) => {
                     reporter.log(ui::LogKind::Info, format!("ATC region: now working {name}"));
                     st.set_enforce_readback(config.atc_readback);
-                    st.set_dialect(station::dialect_for(&icao));
+                    st.set_dialect(party_line::dialect_for(&icao));
                     // Its SIDs, for the IFR clearance.
                     st.set_procedures(&config.cifp_dir, &config.fix_data_path, &config.nav_data_path, &icao);
                     st.install();
                     // The new field's taxi network, in the background.
-                    station::spawn_taxi_net_load(config.apt_data_path.clone(), icao.clone());
+                    party_line::spawn_taxi_net_load(config.apt_data_path.clone(), icao.clone());
                     // And its ILS chart data, same deal.
-                    station::spawn_ils_load(
+                    party_line::spawn_ils_load(
                         config.nav_data_path.clone(),
                         config.cifp_dir.clone(),
                         icao.clone(),
@@ -2656,7 +2661,7 @@ async fn run_session(
                 // a COPILOT action: resolve the name against the station's
                 // apt.dat frequencies, write COM1, confirm what's actually set.
                 match st.tune_request(&tl) {
-                    Some(station::Tune::Found { label, khz }) => {
+                    Some(party_line::Tune::Found { label, khz }) => {
                         let line = match xplane.set_int(datarefs::COM1_FREQ_KHZ, khz).await {
                             Ok(()) => {
                                 let mhz = xplane
@@ -2674,7 +2679,7 @@ async fn run_session(
                         say(&voice, &reporter, ui::LogKind::Readback, &line);
                         continue;
                     }
-                    Some(station::Tune::Missing(msg)) => {
+                    Some(party_line::Tune::Missing(msg)) => {
                         say(&voice, &reporter, ui::LogKind::Readback, &msg);
                         continue;
                     }
@@ -2683,7 +2688,7 @@ async fn run_session(
                 // Frequency briefing ("what frequencies are here", "who can I
                 // talk to") — crew knowledge answered from the loaded apt.dat
                 // rows plus live COM1, after the tuning verbs so those win.
-                if station::freq_query(&tl) {
+                if party_line::freq_query(&tl) {
                     let line = st.freq_briefing(xplane.view()).await;
                     say(&voice, &reporter, ui::LogKind::Readback, &line);
                     continue;
@@ -2692,7 +2697,7 @@ async fn run_session(
                 // tower's own state machine and hands the pilot the exact
                 // next call — deterministic, and always a call the parser
                 // routes. A learning tool, not an LLM guess.
-                if station::coach_query(&tl) {
+                if party_line::coach_query(&tl) {
                     let on_ground = xplane
                         .get_float(datarefs::ON_GROUND_ANY)
                         .await
@@ -2701,7 +2706,7 @@ async fn run_session(
                     let callsign = crate::circuit::crew_callsign(&xplane)
                         .await
                         .unwrap_or_else(|| "your callsign".to_string());
-                    let dist = match (position(&xplane).await, station::active_field()) {
+                    let dist = match (position(&xplane).await, party_line::active_field()) {
                         (Some((lat, lon, _)), Some((_, flat, flon, _))) => {
                             Some(nav::haversine_nm(lat, lon, flat, flon))
                         }
@@ -2714,8 +2719,8 @@ async fn run_session(
                         .map(|v| v.round() as i64);
                     // "Should we check in with ATC?" wants a yes or a no ahead
                     // of the call, not just the phraseology.
-                    let yes_no = station::coach_yes_no(&tl);
-                    let line = match station::suggest_call(&callsign, on_ground, dist, com1) {
+                    let yes_no = party_line::coach_yes_no(&tl);
+                    let line = match party_line::suggest_call(&callsign, on_ground, dist, com1) {
                         Some(s) => match (s.first, s.call) {
                             (Some(f), Some(c)) => {
                                 let lead = if yes_no { "Yes. " } else { "" };
@@ -4321,16 +4326,16 @@ fn service_label(word: &str) -> &str {
 /// hands us to gets its own crew from the voice pool. Also spawns the
 /// background scans (taxi net, ILS, region index) — each guarded so a
 /// mid-flight re-enable doesn't pay a boot cost twice.
-fn install_home_station(config: &Config, voice: &voice::Voice) -> Option<station::Station> {
+fn install_home_station(config: &Config, voice: &voice::Voice) -> Option<party_line::Station> {
     if config.atc_airport.trim().is_empty() {
         return None;
     }
     let home_icao = config.atc_airport.trim().to_uppercase();
-    let mut st = station::Station::load(&config.apt_data_path, &home_icao)?;
+    let mut st = party_line::Station::load(&config.apt_data_path, &home_icao)?;
     st.set_enforce_readback(config.atc_readback);
     // Phraseology follows geography, like the voices: CAP 413 grammar in
     // the UK, FAA grammar at a K/P/C field.
-    st.set_dialect(station::dialect_for(&home_icao));
+    st.set_dialect(party_line::dialect_for(&home_icao));
     // The field's SIDs (CIFP), for the IFR clearance's departure.
     st.set_procedures(
         &config.cifp_dir,
@@ -4344,10 +4349,10 @@ fn install_home_station(config: &Config, voice: &voice::Voice) -> Option<station
     voice.set_station_cast(0, Vec::new());
     // Taxi network for named taxi routes — a second apt.dat scan, so a
     // background thread; clearances are route-less until it lands.
-    station::spawn_taxi_net_load(config.apt_data_path.clone(), home_icao.clone());
+    party_line::spawn_taxi_net_load(config.apt_data_path.clone(), home_icao.clone());
     // ILS + real approach platforms (earth_nav.dat + CIFP scans, also
     // backgrounded): vectors offer the ILS once this lands.
-    station::spawn_ils_load(
+    party_line::spawn_ils_load(
         config.nav_data_path.clone(),
         config.cifp_dir.clone(),
         home_icao,
@@ -4355,11 +4360,11 @@ fn install_home_station(config: &Config, voice: &voice::Voice) -> Option<station
     // Enroute region: index every towered field (a full apt.dat pass, so a
     // background thread) so the flight can outgrow its departure airport —
     // the monitor's region_tick hands off to whichever tower is nearest.
-    if config.atc_region.trim() != "off" && !station::region_loaded() {
+    if config.atc_region.trim() != "off" && !party_line::region_loaded() {
         let path = config.apt_data_path.clone();
         std::thread::Builder::new()
             .name("region-index".into())
-            .spawn(move || station::load_region(&path))
+            .spawn(move || party_line::load_region(&path))
             .ok();
     }
     Some(st)
@@ -4410,10 +4415,10 @@ pub(crate) fn pre_grammar_capture(
     if is_taxi_query(line) && grammar::try_parse(line, registry, profile).is_none() {
         return Some("taxi question");
     }
-    if station::freq_query(&tl) {
+    if party_line::freq_query(&tl) {
         return Some("frequency briefing");
     }
-    if station::coach_query(&tl) {
+    if party_line::coach_query(&tl) {
         return Some("radio coach");
     }
     if let Some(s) = shortcut {
@@ -4449,7 +4454,7 @@ pub(crate) fn state_capture_note(line: &str) -> Option<&'static str> {
     if release_intent(&tl) {
         return Some("the release guard takes it while a loop holds a control");
     }
-    if station::is_radio_call(&tl, "") && tower::parse_intent(&tl) != tower::Intent::Unknown {
+    if party_line::is_radio_call(&tl, "") && tower::parse_intent(&tl) != tower::Intent::Unknown {
         return Some("a tuned tower takes it as a radio call");
     }
     None
@@ -4459,7 +4464,7 @@ pub(crate) fn state_capture_note(line: &str) -> Option<&'static str> {
 /// radio PTT is handled earlier; this is the one fallback door for keyboard PTT
 /// and continuous mode, shared by normal crew mode and ATC-only mode.
 async fn try_route_content_atc(
-    st: &mut station::Station,
+    st: &mut party_line::Station,
     tl: &str,
     dual_ptt: bool,
     voice: &Voice,
@@ -4473,9 +4478,9 @@ async fn try_route_content_atc(
     // station by name, so the controller repeats (the bare "say again" is
     // the copilot's).
     if tower::is_say_again(tl)
-        && station::is_radio_call(
+        && party_line::is_radio_call(
             tl,
-            &station::spoken_airport(st.airport_name()).to_lowercase(),
+            &party_line::spoken_airport(st.airport_name()).to_lowercase(),
         )
         && repeat_controller(voice, reporter, tl, "unkeyed")
     {
@@ -4535,7 +4540,7 @@ fn repeat_controller(voice: &Voice, reporter: &Reporter, transcript: &str, route
     true
 }
 
-async fn void_briefing(xp: &XPlaneClient, st: &station::Station) -> String {
+async fn void_briefing(xp: &XPlaneClient, st: &party_line::Station) -> String {
     let com1 = xp
         .get_float(datarefs::COM1_FREQ_KHZ)
         .await
@@ -4549,10 +4554,10 @@ async fn void_briefing(xp: &XPlaneClient, st: &station::Station) -> String {
         // Can't place the aircraft — pointing at the station beats silence.
         return st.void_note(com1, airborne);
     };
-    if station::active_station_in_range(lat, lon, alt_ft).is_some() {
+    if party_line::active_station_in_range(lat, lon, alt_ft).is_some() {
         return st.void_note(com1, airborne);
     }
-    let near = station::fields_in_range(lat, lon, alt_ft, 1);
+    let near = party_line::fields_in_range(lat, lon, alt_ft, 1);
     match near.first().and_then(|f| {
         f.services
             .iter()
@@ -4561,14 +4566,14 @@ async fn void_briefing(xp: &XPlaneClient, st: &station::Station) -> String {
     }) {
         Some((f, khz)) => format!(
             "{} is out of radio range. Nearest station is {}, {} miles away, tower on {}.",
-            station::spoken_airport(st.airport_name()),
-            station::spoken_airport(&f.name),
+            party_line::spoken_airport(st.airport_name()),
+            party_line::spoken_airport(&f.name),
             f.dist_nm.round() as i64,
             atis::spoken_mhz(khz)
         ),
         None => format!(
             "{} is out of radio range, and nothing else is in reach from here.",
-            station::spoken_airport(st.airport_name())
+            party_line::spoken_airport(st.airport_name())
         ),
     }
 }
@@ -4612,7 +4617,7 @@ fn radio_panel_line(airport: &str, services: &[(String, i64)], com1_khz: Option<
 /// straight against COM1 for the tuned highlight and writes them back on a
 /// click-to-tune. Trailing fields drop rather than overflow the plugin's
 /// 500-byte text buffer.
-fn atc_panel_payload(fields: &[station::RangedField]) -> String {
+fn atc_panel_payload(fields: &[party_line::RangedField]) -> String {
     let mut out = String::new();
     for f in fields {
         let mut seg = String::new();

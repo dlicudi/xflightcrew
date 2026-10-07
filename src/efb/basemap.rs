@@ -463,13 +463,13 @@ pub(crate) fn answer(dir: &Path, bbox: [f64; 4], px: f64) -> Option<Arc<Answer>>
     if let Some(a) = lock(&ANSWERS).get(&key) {
         return Some(a);
     }
-    let regions_ready = crate::station::region_loaded();
+    let regions_ready = crate::party_line::region_loaded();
     let present = |a: i32, o: i32| tile_path(dir, a, o).is_file();
     let edge = |a: i32, o: i32, side: usize| edges(dir, a, o).map_or(0.0, |e| e[side]);
     let wet = water_tiles((a0, a1), (o0, o1), &present, &edge);
     let span = (a1 - a0 + 1) as f64;
     let fields: Vec<(String, f64, f64, u8)> = if span <= TOWERED_SPAN_DEG {
-        crate::station::fields_in_box(
+        crate::party_line::fields_in_box(
             a0 as f64,
             o0 as f64,
             a1 as f64 + 1.0,
@@ -688,7 +688,7 @@ mod tests {
     fn real_install_basemap_fixtures() {
         let out = std::env::var("EFB_FIXTURE_OUT").expect("EFB_FIXTURE_OUT");
         std::fs::create_dir_all(&out).unwrap();
-        crate::station::load_region(&crate::config::xplane_path(
+        crate::party_line::load_region(&crate::config::xplane_path(
             "Global Scenery/Global Airports/Earth nav data/apt.dat",
         ));
         let dir = water_dir();

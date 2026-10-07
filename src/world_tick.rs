@@ -38,7 +38,7 @@ pub(crate) struct Heard {
     pub(crate) landing_held: bool,
     pub(crate) cleared_to_land: bool,
     /// The runway watch's TCAS read, shared with the traffic watches.
-    pub(crate) targets: Option<Vec<crate::station::TcasTarget>>,
+    pub(crate) targets: Option<Vec<crate::world::TcasTarget>>,
 }
 
 /// The cadences and latches the world's ticks keep between monitor ticks.
@@ -58,7 +58,7 @@ pub(crate) struct WorldTick {
     atis_logged: Option<String>,
     /// Whether an advisory is waiting on its "clear of traffic" closure.
     traffic_open: bool,
-    traffic_called: Option<crate::station::TrafficFactor>,
+    traffic_called: Option<crate::world::TrafficFactor>,
     /// Runway-incursion shout cadence: it repeats while the conflict persists
     /// (a safety shout may nag), but not every tick.
     incursion_last: Option<Instant>,
@@ -90,7 +90,7 @@ impl WorldTick {
         // falls to the crew when None). A berate hardcoded to the
         // Tower while the pilot sat on the approach frequency put two
         // controllers on one radio (2026-07-12).
-        let tuned_speaker = com1.and_then(crate::station::tuned_controller);
+        let tuned_speaker = com1.and_then(crate::party_line::tuned_controller);
         // Compliance watch: the tower holds the pilot to the clearances
         // it actually issued (uncleared runway entry, takeoff, landing),
         // and challenges zone traffic it has never talked to. Tuned to
@@ -109,7 +109,7 @@ impl WorldTick {
         // recovery, the panel's mute or a wreck silences the world (the
         // cabin's gate). A muted call is consumed, never said late.
         if gates.compliance_ticks {
-            if let Some(call) = crate::station::compliance_tick_facing(
+            if let Some(call) = crate::world::compliance_tick_facing(
                 snap.lat,
                 snap.lon,
                 snap.alt_ft,
@@ -158,15 +158,15 @@ impl WorldTick {
         let landing_held = crate::party_line::landing_hold_armed();
         let cleared_to_land =
             crate::party_line::clearance_state() == Some(crate::tower::State::ClearedToLand);
-        let mut runway_watch_targets: Option<Vec<crate::station::TcasTarget>> = None;
+        let mut runway_watch_targets: Option<Vec<crate::world::TcasTarget>> = None;
         if gates.compliance_ticks
             && (landing_held || cleared_to_land)
-            && crate::station::active_field().is_some()
+            && crate::party_line::active_field().is_some()
         {
-            let targets = crate::station::read_tcas_targets(xp.view()).await;
+            let targets = crate::world::read_tcas_targets(xp.view()).await;
             let tower_tuned = matches!(tuned_speaker, Some(crate::voice::StationSpeaker::Tower));
             // Safety outranks flavor: the go-around order first.
-            if let Some(call) = crate::station::go_around_tick(
+            if let Some(call) = crate::world::go_around_tick(
                 &targets,
                 snap.agl_ft,
                 snap.on_ground,
@@ -196,7 +196,7 @@ impl WorldTick {
                     voice.alert_station(Priority::Warning, who, call.line);
                 }
             } else if landing_held {
-                if let Some(line) = crate::station::landing_hold_tick(&targets, snap.on_ground, now)
+                if let Some(line) = crate::world::landing_hold_tick(&targets, snap.on_ground, now)
                 {
                     crate::blackbox::record(
                         "atc",
@@ -269,7 +269,7 @@ impl WorldTick {
             // Named by the end we point down, as the compliance
             // watch names it: rolling out on 15 past midfield is
             // not "runway three three" (EGKK-EGBB, #155).
-            if let Some(rwy) = crate::station::on_active_runway_facing(
+            if let Some(rwy) = crate::world::on_active_runway_facing(
                 snap.lat,
                 snap.lon,
                 Some(snap.heading_deg).filter(|h| *h != 0.0),
@@ -279,7 +279,7 @@ impl WorldTick {
                     .is_none_or(|t| now.duration_since(t).as_secs() >= 15);
                 if due {
                     if let Some(nm) =
-                        crate::station::inbound_traffic_for_strip(xp.view(), &rwy).await
+                        crate::world::inbound_traffic_for_strip(xp.view(), &rwy).await
                     {
                         self.incursion_last = Some(now);
                         let urgent = nm < 1.5;
@@ -343,9 +343,9 @@ impl WorldTick {
             // The ATC tab tunes ANY in-range field's frequencies:
             // follow COM1 to that field's ATIS instead of staying
             // silent because it wasn't the active station's.
-            crate::station::atis_retune(com1, snap.lat, snap.lon, snap.alt_ft);
-            if crate::station::atis_due(com1, std::time::Instant::now()) {
-                let wx = crate::station::AtisWx {
+            crate::world::atis_retune(com1, snap.lat, snap.lon, snap.alt_ft);
+            if crate::world::atis_due(com1, std::time::Instant::now()) {
+                let wx = crate::world::AtisWx {
                     zulu_sec: xp
                         .get_float(crate::datarefs::ZULU_TIME_SEC)
                         .await
@@ -374,7 +374,7 @@ impl WorldTick {
                         .unwrap_or(15.0),
                 };
                 if let Some(report) =
-                    crate::station::atis_tick(com1, &wx, std::time::Instant::now())
+                    crate::world::atis_tick(com1, &wx, std::time::Instant::now())
                 {
                     // The broadcast LOOPS on the radio, but the log
                     // is a transcript: one entry per edition (field
@@ -403,7 +403,7 @@ impl WorldTick {
         // else it goes into the void — missed radio is gone, never
         // replayed on another frequency (two controllers on one
         // radio, 2026-07-12).
-        if let Some(line) = crate::station::handoff_tick(snap.alt_ft, snap.on_ground) {
+        if let Some(line) = crate::world::handoff_tick(snap.alt_ft, snap.on_ground) {
             crate::blackbox::record(
                 "atc_handoff",
                 serde_json::json!({ "alt": r1(snap.alt_ft), "msg": &line }),
@@ -434,8 +434,8 @@ impl WorldTick {
         // nagged the pilot ACROSS the tower frequency, 2026-07-12).
         // Untuned, the watch just waits; the transponder reads cost
         // nothing while nobody could speak anyway.
-        let squawk_ears = com1.and_then(crate::station::tuned_controller);
-        if !snap.on_ground && crate::station::squawk_watch_active() {
+        let squawk_ears = com1.and_then(crate::party_line::tuned_controller);
+        if !snap.on_ground && crate::world::squawk_watch_active() {
             if let Some(speaker) = squawk_ears {
                 let code = xp
                     .get_float(crate::datarefs::TRANSPONDER_CODE)
@@ -447,7 +447,7 @@ impl WorldTick {
                     .await
                     .is_ok_and(|v| v >= 2.0);
                 if let Some((line, _assigner)) =
-                    crate::station::squawk_tick(code, replying, speaker, now)
+                    crate::world::squawk_tick(code, replying, speaker, now)
                 {
                     if let Some(s) = status.as_ref() {
                         s.action(&format!("{}: {line}", speaker.tag()));
@@ -498,7 +498,7 @@ impl WorldTick {
             // tower saw the takeoff it was holding. Left armed it
             // outlived a reject and replayed "traffic clear, cleared
             // for takeoff" into the next mission (EGKK 2026-09-27).
-            if snap.on_ground && crate::station::void_takeoff_hold_by_roll(snap.groundspeed_kts) {
+            if snap.on_ground && crate::world::void_takeoff_hold_by_roll(snap.groundspeed_kts) {
                 crate::blackbox::record(
                     "atc",
                     serde_json::json!({
@@ -528,21 +528,21 @@ impl WorldTick {
             // rotating ahead of you starts a clock whether or not
             // the party line is narrating it.
             let wake_watch = tower_tuned && snap.on_ground;
-            if let Some((_, flat, flon, felev)) = crate::station::active_field() {
+            if let Some((_, flat, flon, felev)) = crate::party_line::active_field() {
                 if chatter_on || hold_armed || landing_held || cleared_to_land || wake_watch {
                     // One read per tick: the runway watch's, when it
                     // made one.
                     let targets = match heard.targets.take() {
                         Some(t) => t,
-                        None => crate::station::read_tcas_targets(xp.view()).await,
+                        None => crate::world::read_tcas_targets(xp.view()).await,
                     };
-                    crate::station::wake_note_targets(&targets, now);
+                    crate::world::wake_note_targets(&targets, now);
                     // A withheld landing clearance is the runway
                     // watch's (above, whoever flies); the flavour
                     // waits for it.
                     if landing_held {
                     } else if hold_armed {
-                        if let Some(line) = crate::station::takeoff_hold_tick_from(
+                        if let Some(line) = crate::world::takeoff_hold_tick_from(
                             &targets,
                             felev,
                             snap.on_ground,
@@ -576,19 +576,19 @@ impl WorldTick {
                             .chatter_last
                             .is_none_or(|t| now.duration_since(t).as_secs() >= 45)
                     {
-                        let fname = crate::station::active_field()
+                        let fname = crate::party_line::active_field()
                             .map(|(n, _, _, _)| n)
                             .unwrap_or_default();
                         // The strip the PLAYER holds (stands on, or
                         // landed on and not yet reported vacated): a
                         // ghost landing it gets "continue", not a
                         // narrated clearance over the player's head.
-                        let blocked = crate::station::player_blocked_strip(
+                        let blocked = crate::world::player_blocked_strip(
                             snap.on_ground,
                             snap.lat,
                             snap.lon,
                         );
-                        if let Some(exchange) = crate::station::chatter_tick(
+                        if let Some(exchange) = crate::world::chatter_tick(
                             &targets,
                             &fname,
                             flat,
@@ -640,7 +640,7 @@ impl WorldTick {
         // so this is the one world tick that would otherwise keep
         // running against a torn-down station.
         if let Some(sw) = (crate::mode::atc_enabled())
-            .then(|| crate::station::region_tick(snap.lat, snap.lon, snap.on_ground, now))
+            .then(|| crate::world::region_tick(snap.lat, snap.lon, snap.on_ground, now))
             .flatten()
         {
             let abnormal = crate::flight::published()
@@ -676,7 +676,7 @@ impl WorldTick {
                 );
             }
         }
-        if let Some(line) = crate::station::vector_tick(
+        if let Some(line) = crate::world::vector_tick(
             snap.lat,
             snap.lon,
             snap.alt_ft,
@@ -691,7 +691,7 @@ impl WorldTick {
             // mid-vector loses the service, it doesn't mute-proof it
             // ("ATC still speaking after I tuned another station",
             // 2026-07-12).
-            let on_freq = com1.and_then(crate::station::tuned_controller)
+            let on_freq = com1.and_then(crate::party_line::tuned_controller)
                 == Some(crate::voice::StationSpeaker::Approach);
             if on_freq {
                 if let Some(s) = status.as_ref() {
@@ -728,9 +728,9 @@ impl WorldTick {
                 .near_miss_last
                 .is_none_or(|t| now.duration_since(t).as_secs() >= 15);
             if due {
-                if let Some(f) = crate::station::nearest_traffic_factor(xp.view())
+                if let Some(f) = crate::world::nearest_traffic_factor(xp.view())
                     .await
-                    .filter(crate::station::is_near_miss)
+                    .filter(crate::world::is_near_miss)
                 {
                     self.near_miss_last = Some(now);
                     crate::blackbox::record(
@@ -739,19 +739,19 @@ impl WorldTick {
                             "nm": r1(f.nm), "clock": f.clock, "ft": f.ft
                         }),
                     );
-                    let speaker = com1.and_then(crate::station::tuned_controller);
+                    let speaker = com1.and_then(crate::party_line::tuned_controller);
                     if let Some(who) = speaker {
                         let callsign = crate::circuit::crew_callsign(&xp)
                             .await
                             .unwrap_or_else(|| "traffic alert".to_string());
                         let line =
-                            format!("{callsign}, {}", crate::station::near_miss_line(&f, false));
+                            format!("{callsign}, {}", crate::world::near_miss_line(&f, false));
                         if let Some(s) = status.as_ref() {
                             s.action(&format!("{}: {line}", who.tag()));
                         }
                         voice.alert_station(Priority::Warning, who, line);
                     } else {
-                        let line = crate::station::near_miss_line(&f, true);
+                        let line = crate::world::near_miss_line(&f, true);
                         voice.alert(Priority::Warning, line);
                     }
                 }
@@ -767,7 +767,7 @@ impl WorldTick {
         let controller = if vectored.is_some() {
             Some(crate::voice::StationSpeaker::Approach)
         } else if !snap.on_ground {
-            com1.and_then(crate::station::tuned_controller)
+            com1.and_then(crate::party_line::tuned_controller)
         } else {
             None
         };
@@ -784,13 +784,13 @@ impl WorldTick {
             if due {
                 // Called once, and again only when it is more of a
                 // factor (`traffic_worth_recalling`).
-                let factor = crate::station::nearest_traffic_factor(xp.view()).await;
+                let factor = crate::world::nearest_traffic_factor(xp.view()).await;
                 let fresh = factor.as_ref().filter(|f| {
                     self.traffic_called
                         .as_ref()
-                        .is_none_or(|c| crate::station::traffic_worth_recalling(c, f))
+                        .is_none_or(|c| crate::world::traffic_worth_recalling(c, f))
                 });
-                let advisory = fresh.map(crate::station::advisory_line);
+                let advisory = fresh.map(crate::world::advisory_line);
                 if let Some(f) = fresh {
                     self.traffic_called = Some(f.clone());
                 }
@@ -832,13 +832,55 @@ impl WorldTick {
 
     /// Under `quiet` on the ground the vectors still advance, unheard.
     pub(crate) fn vectors_unheard(snap: &Snapshot) {
-        let _ = crate::station::vector_tick(
+        let _ = crate::world::vector_tick(
             snap.lat,
             snap.lon,
             snap.alt_ft,
             snap.track_deg,
             snap.on_ground,
             std::time::Instant::now(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    /// The crew reaches the station ONLY through the seam: `party_line`
+    /// (inputs, reads, the types it names) and `world` (the ticks this file
+    /// drives). The station is crate-private in `atc`, so a path into it
+    /// does not compile; this scan names the rule where it would be broken
+    /// (an alias of the module, a path in a string a source scan matches).
+    /// Comments may still name the world's own items.
+    #[test]
+    fn the_station_is_reached_only_through_the_seam() {
+        let module = "station";
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        let mut files = 0;
+        for f in crate::test_support::rust_files(&src) {
+            files += 1;
+            let text = std::fs::read_to_string(&f).expect("read source");
+            for (n, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                let path_into = code.match_indices(&format!("{module}::")).any(|(i, _)| {
+                    !code[..i]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                });
+                let alias = code.contains("atc::{")
+                    && code
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .any(|w| w == module);
+                if path_into || alias {
+                    hits.push(format!("{}:{}: {}", f.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(files > 100, "the scan found only {files} files");
+        assert!(
+            hits.is_empty(),
+            "the crew names the station directly; go through party_line or world: {hits:#?}"
         );
     }
 }

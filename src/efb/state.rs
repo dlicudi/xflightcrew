@@ -196,7 +196,7 @@ pub(crate) fn station_ready_for_departure(field: &str, tag: &str) -> Option<Stri
         "TWR" => "Tower",
         _ => return None,
     };
-    let name = crate::station::spoken_airport(field).trim();
+    let name = crate::party_line::spoken_airport(field).trim();
     if name.is_empty() {
         return None;
     }
@@ -213,7 +213,7 @@ pub(crate) fn station_say_again(field: &str, tag: &str) -> Option<String> {
         "DEP" => "Departure",
         _ => return None,
     };
-    let name = crate::station::spoken_airport(field).trim();
+    let name = crate::party_line::spoken_airport(field).trim();
     if name.is_empty() {
         return None;
     }
@@ -274,7 +274,7 @@ pub(crate) struct TodFacts {
     pub(crate) held_ft: Option<f64>,
 }
 
-/// The station the radio row would show (`station::active_station_in_range`).
+/// The station the radio row would show (`crate::party_line::active_station_in_range`).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StationFacts {
     pub(crate) field: String,
@@ -747,7 +747,7 @@ pub(crate) fn station_name(f: &Facts, khz: i64) -> Option<String> {
     let (w, _) = st.services.iter().find(|(_, k)| (khz - k).abs() <= 5)?;
     Some(format!(
         "{} {}",
-        crate::station::spoken_airport(&st.field).trim(),
+        crate::party_line::spoken_airport(&st.field).trim(),
         service_label(w)
     ))
 }
@@ -2164,7 +2164,7 @@ pub(crate) mod tests {
             }
             let tl = words.to_ascii_lowercase();
             assert!(
-                crate::station::is_radio_call(&tl, "")
+                crate::party_line::is_radio_call(&tl, "")
                     && crate::tower::parse_intent(&tl) != crate::tower::Intent::Unknown,
                 "{words:?} reaches nothing"
             );
@@ -2216,9 +2216,9 @@ pub(crate) mod tests {
         ] {
             let words = station_say_again(field, tag).expect("a controller");
             let tl = words.to_ascii_lowercase();
-            let name = crate::station::spoken_airport(field).to_lowercase();
+            let name = crate::party_line::spoken_airport(field).to_lowercase();
             assert!(crate::tower::is_say_again(&tl), "{words}");
-            assert!(crate::station::is_radio_call(&tl, &name), "{words}");
+            assert!(crate::party_line::is_radio_call(&tl, &name), "{words}");
         }
         assert_eq!(station_say_again("Malaga", "ATIS"), None);
         // The taxi phase's suggested call: addressed to the tower by name,
@@ -2226,8 +2226,8 @@ pub(crate) mod tests {
         for field in ["London Gatwick", "Gibraltar", "Malaga"] {
             let words = station_ready_for_departure(field, "TWR").expect("a tower");
             let tl = words.to_ascii_lowercase();
-            let name = crate::station::spoken_airport(field).to_lowercase();
-            assert!(crate::station::is_radio_call(&tl, &name), "{words}");
+            let name = crate::party_line::spoken_airport(field).to_lowercase();
+            assert!(crate::party_line::is_radio_call(&tl, &name), "{words}");
             assert_ne!(
                 crate::tower::parse_intent(&tl),
                 crate::tower::Intent::Unknown,
