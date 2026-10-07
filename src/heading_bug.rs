@@ -20,7 +20,8 @@
 //! Before this module the circuit's door, the follower's copy and the
 //! circuit's knob lived in two files, and autoland's pattern, reversal and
 //! join legs and the helicopter route set the bug with no reversal guard.
-//! Pure.
+//! Every direct write of the bug elsewhere is allowlisted with its reason
+//! (`every_heading_bug_write_is_turn_safe`). Pure.
 
 /// Move the heading bug toward `target` by at most `max_step` degrees, the
 /// SHORT way around, returning the new dial value. A single 90-degree write
@@ -367,5 +368,165 @@ mod tests {
         assert_eq!(h.decide(1, 93.0, 10.0, db), Some(93.0), "past it, in time");
         assert_eq!(h.decide(1, 93.0 + BUG_STEER_DEG, 10.5, db), Some(98.0), "steering at once");
         assert_eq!(h.decide(2, 98.0, 11.0, db), Some(98.0), "a new key writes");
+    }
+
+    /// The heading bug writes that may bypass [`bug_toward`] and the two
+    /// holds, keyed by module (`src/<module>.rs` and everything under
+    /// `src/<module>/`), the function the write sits in, and how many it
+    /// holds, each with why it cannot reverse a turn in progress. Every
+    /// other write of the bug outside this file and `autoflight.rs` fails
+    /// [`every_heading_bug_write_is_turn_safe`]; so does an entry no write
+    /// answers any more.
+    const DIRECT_BUG_WRITES: &[(&str, &str, usize, &str)] = &[
+        ("procedure", "fly", 3, "the arm seeds the bug on the heading flown and a stalled leg puts it on the nose; the steer is HeadingHold::decide's output"),
+        ("circuit", "write_bug", 1, "the circuit's one knob writer, fed by BugHold over bug_toward, or the nose"),
+        ("hover", "cruise_modes", 1, "the hand-back's cruise modes on the heading of the moment (the nose)"),
+        ("heli_route", "fly", 3, "the departure's hand-over and the go-around on the course flown (the nose); the cruise steer is bug_toward's output"),
+        ("tools/setup_enroute", "engage", 2, "setup: the placement puts the nose on this track wings level before live flight"),
+        ("autoland", "spawn_autoland", 2, "the keyed knob is bug_toward through BugHold; the per-tick steer only on the aligned short final and flare"),
+        ("autotakeoff", "fly", 1, "setup: the runway heading preset on the brakes before the roll"),
+        ("tools/autopilot", "execute", 1, "the pilot's own heading selection"),
+        ("tools/recover", "hold_heading_and_altitude", 1, "the recovery's hold on the heading of the moment (the nose)"),
+    ];
+
+    /// "The sim's heading mode never reverses a turn in progress: every steer
+    /// goes through `heading_bug::bug_toward`" (CLAUDE.md), pinned to the
+    /// source: a direct write of the bug (`set_dial*` or `stage_dial` with
+    /// `Dial::HeadingBug`, or a `drive_heading_bug*` call) anywhere but here,
+    /// the panel owner and [`DIRECT_BUG_WRITES`] fails, and the allowlist
+    /// must match the writes exactly.
+    #[test]
+    fn every_heading_bug_write_is_turn_safe() {
+        let src = crate::test_support::root().join("src");
+        let module_of = |rel: &std::path::Path| -> String {
+            let parts: Vec<String> = rel
+                .with_extension("")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect();
+            for n in 1..=parts.len() {
+                let p = parts[..n].join("/");
+                if src.join(format!("{p}.rs")).is_file() {
+                    return p;
+                }
+            }
+            parts.join("/")
+        };
+        let mut found: std::collections::BTreeMap<(String, String), Vec<String>> = Default::default();
+        for f in crate::test_support::rust_files(&src) {
+            let rel = f.strip_prefix(&src).unwrap().to_path_buf();
+            let name = rel.to_string_lossy().to_string();
+            if crate::test_support::is_test_file(&f)
+                || name == "heading_bug.rs"
+                || name == "autoflight.rs"
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            let production = text.split("#[cfg(test)]\nmod ").next().unwrap();
+            // Code only: comments out, `#[cfg(test)]` items' first line out.
+            let mut code = String::new();
+            let mut starts = Vec::new();
+            let mut skip_next = false;
+            for (n, l) in production.lines().enumerate() {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if l.trim() == "#[cfg(test)]" {
+                    skip_next = true;
+                    continue;
+                }
+                starts.push((code.len(), n + 1));
+                code.push_str(l.split("//").next().unwrap_or(""));
+                code.push('\n');
+            }
+            let line_at = |off: usize| starts[starts.partition_point(|&(s, _)| s <= off) - 1].1;
+            let fn_at = |off: usize| -> String {
+                let before = &code[..off];
+                let mut at = before.len();
+                while let Some(i) = before[..at].rfind("fn ") {
+                    let prev = (i > 0).then(|| before.as_bytes()[i - 1]);
+                    let ok_start = prev.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_');
+                    let name: String = before[i + 3..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if ok_start && !name.is_empty() {
+                        return name;
+                    }
+                    at = i;
+                }
+                String::from("?")
+            };
+            let call_args = |from: usize| -> &str {
+                let mut depth = 0i32;
+                for (i, c) in code[from..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return &code[from..from + i];
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                &code[from..]
+            };
+            let mut hits: Vec<usize> = Vec::new();
+            for call in ["set_dial(", "set_dial_confirmed(", "set_dial_confirmed_on(", "stage_dial("] {
+                for (i, _) in code.match_indices(call) {
+                    let pre = code[..i].chars().last();
+                    if pre.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        continue;
+                    }
+                    let open = i + call.len() - 1;
+                    if call_args(open).contains("HeadingBug") && !code[..i].ends_with("fn ") {
+                        hits.push(i);
+                    }
+                }
+            }
+            for call in ["drive_heading_bug(", "drive_heading_bug_step("] {
+                for (i, _) in code.match_indices(call) {
+                    let pre = code[..i].chars().last();
+                    if pre.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') || code[..i].ends_with("fn ") {
+                        continue;
+                    }
+                    hits.push(i);
+                }
+            }
+            for i in hits {
+                found
+                    .entry((module_of(&rel), fn_at(i)))
+                    .or_default()
+                    .push(format!("{name}:{}", line_at(i)));
+            }
+        }
+        let mut bad = Vec::new();
+        for ((module, func), sites) in &found {
+            match DIRECT_BUG_WRITES.iter().find(|(m, f, _, _)| m == module && f == func) {
+                None => bad.push(format!(
+                    "{}: a direct heading bug write in {module}::{func}: steer through \
+                     heading_bug::bug_toward (or BugHold / HeadingHold), or allowlist a \
+                     setup write with its reason",
+                    sites.join(", ")
+                )),
+                Some((_, _, n, _)) if *n != sites.len() => bad.push(format!(
+                    "{module}::{func}: {} direct heading bug writes, the allowlist says {n} ({})",
+                    sites.len(),
+                    sites.join(", ")
+                )),
+                Some(_) => {}
+            }
+        }
+        for (m, f, _, why) in DIRECT_BUG_WRITES {
+            assert!(!why.is_empty());
+            if !found.contains_key(&(m.to_string(), f.to_string())) {
+                bad.push(format!("{m}::{f}: allowlisted but no direct heading bug write there any more"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 }

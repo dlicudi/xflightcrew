@@ -176,6 +176,12 @@ use undo::{
 use voice::{Priority, Voice};
 use xplane::XPlaneClient;
 
+/// The default tracing filter: every workspace crate's target AND both crew
+/// names, the package (the lib's default target) and the binary (the bin's),
+/// CLAUDE.md "Wire contracts". Pinned by
+/// `tests::the_log_filter_names_every_crate_and_both_crew_names`.
+const DEFAULT_LOG_FILTER: &str = "xvoicelayer=info,xvl=info,atc=info,sim=info";
+
 // Single-threaded runtime: the cpal stream isn't `Send`, and the loop is
 // inherently sequential (listen → think → act → speak), so there's nothing to
 // gain from a multi-threaded scheduler.
@@ -209,7 +215,7 @@ async fn main() -> Result<()> {
     // healthy (2026-07-30, found by grepping for a startup line that was
     // never there). Renaming the binary must move this default with it.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "xvoicelayer=info,xvl=info,atc=info,sim=info".into());
+        .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into());
     let stderr_layer =
         (!tui).then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     tracing_subscriber::registry()
