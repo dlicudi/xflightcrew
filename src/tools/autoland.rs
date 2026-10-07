@@ -148,10 +148,22 @@ impl Tool for Autoland {
         }
         // A mission flying the plan owns the aircraft: a second loop armed
         // under it would fight it for the autopilot.
+        // Except the nearest: that IS the diversion, and "emergency landing"
+        // is the same call. Refused here, the words this refusal suggested
+        // were refused too (LEMG, 2026-10-07: "land at the nearest" got
+        // "I'm flying the plan" three times). The mission stands down as
+        // for "my controls", and the landing arms in the same breath.
         if crate::full_auto::running() {
-            return Ok(
-                "I'm flying the plan. Say my controls first, then land, or land at the nearest."
-                    .to_string(),
+            if !a.nearest {
+                return Ok(
+                    "I'm flying the plan. Say my controls first, then land, or land at the nearest."
+                        .to_string(),
+                );
+            }
+            crate::full_auto::abort();
+            crate::blackbox::record(
+                "autoland",
+                serde_json::json!({"event": "diversion_stood_down_mission"}),
             );
         }
         // The plan's destination first, from wherever we are: the climb to
