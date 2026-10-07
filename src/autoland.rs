@@ -1400,6 +1400,11 @@ fn spawn_autoland(launch: AutolandLaunch) {
             // was 116 and touched nosewheel first (LEMG 30, 2026-10-07).
             let approach_ias = match crate::aircraft::approach_kts_now(&xp).await {
                 Some((kts, kg)) => {
+                    // The weight just read is the floor's too: on a fresh
+                    // load no monitor tick had published one yet, and the
+                    // heavy declared floor took a weighed 117 back up to 137
+                    // (LEMG 30 reposition, 2026-10-07, #232).
+                    crate::aircraft::publish_weight_now(Some(kg));
                     crate::blackbox::record(
                         "autoland",
                         serde_json::json!({"event": "approach_ias_weighed", "declared": approach_ias,

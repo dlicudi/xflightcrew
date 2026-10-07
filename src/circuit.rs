@@ -3904,6 +3904,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, mut p: Pa
     // final and the hand-down to autoland are built on it, not on a fixed
     // mid-weight figure.
     if let Some((kts, kg)) = crate::aircraft::approach_kts_now(&xp).await {
+        // The floors ride the same weight (autoland's lesson, #232).
+        crate::aircraft::publish_weight_now(Some(kg));
         crate::blackbox::record(
             "circuit",
             serde_json::json!({"event": "approach_ias_weighed", "declared": p.approach_ias,
