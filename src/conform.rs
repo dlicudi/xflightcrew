@@ -356,6 +356,9 @@ pub const WINDOWS: [(Dial, &str); 4] = [
     (Dial::Airspeed, "airspeed"),
 ];
 
+/// The MCP course windows, checked where the panel declares them.
+pub const COURSE_WINDOWS: [(Dial, &str); 2] = [(Dial::Course, "course"), (Dial::CourseFo, "course_fo")];
+
 /// The panel switches checked, with their row names.
 pub const SWITCHES: [(Switch, &str); 3] = [
     (Switch::FlightDirector, "flight_director"),
@@ -406,6 +409,13 @@ pub fn plan(p: &AircraftProfile, only: &[Area]) -> Vec<Step> {
             let panel = Panel::from_profile(p);
             for (d, name) in WINDOWS {
                 out.push(Step::Window(d, name));
+            }
+            // The course windows only where declared: the stock OBS is the
+            // radio's, not the MCP's.
+            for (d, name) in COURSE_WINDOWS {
+                if panel.window(d).is_some() {
+                    out.push(Step::Window(d, name));
+                }
             }
             out.extend(mode_probes(&panel).into_iter().map(Step::Mode));
             for (s, name) in SWITCHES {
@@ -915,7 +925,7 @@ pub fn parked(
 /// any MCP shows. Pure.
 pub fn window_test_value(d: Dial, was: f64) -> f64 {
     match d {
-        Dial::HeadingBug => (was + 20.0).rem_euclid(360.0),
+        Dial::HeadingBug | Dial::Course | Dial::CourseFo => (was + 20.0).rem_euclid(360.0),
         Dial::Altitude => {
             if was > 30_000.0 {
                 was - 1_000.0
@@ -1462,7 +1472,7 @@ pub async fn probe_window(xp: &dyn XPlane, p: &Panel, d: Dial, label: &str) -> R
         .ok()
         .filter(|v| v.is_finite());
     let tol = window_tol(w.as_ref(), d, was);
-    let wrap = d == Dial::HeadingBug;
+    let wrap = matches!(d, Dial::HeadingBug | Dial::Course | Dial::CourseFo);
     let (mut v, mut detail) = set_restore_verdict(want, got, was, back, tol, wrap);
     // A V/S window blanks with V/S off (the 737's reads 0): no measurement.
     if v == Verdict::Fail && d == Dial::Vs && got == Some(0.0) && want != 0.0 {

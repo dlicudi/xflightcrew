@@ -1678,9 +1678,17 @@
             assert_eq!(s.on_commands.len(), 1, "{:?}: one toggle per entry", s.kind);
             assert!(s.readback.is_some(), "{:?}: a toggle needs its read", s.kind);
         }
-        // The panel: its own buttons, LNAV with its lamp, never CMD B.
+        // The panel: its own buttons, LNAV with its lamp, never CMD B. CMD B
+        // is named only as the second channel of the landing the autopilot
+        // flies (`autopilot_lands`), pressed by `ap_lands` alone.
         let a = p.autoflight.as_ref().expect("its own MCP buttons");
         assert!(a.lnav_command.is_some() && a.lnav_status.is_some());
-        assert!(!refs.iter().any(|r| r.contains("cmd_b")));
+        assert!(!serde_yaml::to_string(a).unwrap().contains("cmd_b"));
+        let lands = p.autopilot_lands.as_ref().expect("the autopilot lands it");
+        let second = [lands.second_cmd.command.as_str(), lands.second_cmd.position.as_str()];
+        assert!(refs
+            .iter()
+            .filter(|r| r.contains("cmd_b"))
+            .all(|r| second.contains(&r.as_str())));
         assert!(p.seat_belt_signs.is_some() && p.transponder_mode_knob.is_some());
     }

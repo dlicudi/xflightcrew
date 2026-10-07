@@ -134,8 +134,8 @@ com2_radio: true
 nav_radio: true
 transponder: true
 ils: true              # NAV1 tune and the needles are stock
-# Not coupled: the coupling reads the stock autopilot_state bitfield, which
-# is not this MCP's truth (its lamps are laminar/B738/autopilot/*_status).
+# Not coupled on the old path (our own flare after a decouple): the Zibo
+# LANDS on its own autopilot instead (`autopilot_lands`, below).
 ils_coupled: false
 # Its own APP button, created in zibomod (B738_Commands.txt). VERIFY: the
 # setup reads the stock approach status after pressing it.
@@ -143,7 +143,8 @@ approach_command: laminar/B738/autopilot/app_press
 
 # The MCP buttons, all the aircraft's own (zibomod; B738_Commands.txt
 # "glareshield.lua" block; the same names the pilot's cockpitdecks MCP page
-# presses). CMD B is never named (stock 737 lesson, LEMG 2026-10-05).
+# presses). CMD B is never named here (stock 737 lesson, LEMG 2026-10-05):
+# only as the landing's second channel, `autopilot_lands` below.
 # Since 2026-10-07 the owner reads this MCP's own lamps and writes its own
 # windows (below, `lamps:` and `windows:`). Blackbox `autoflight` `press`,
 # `switch`, `knob` and `ap_state`.
@@ -214,6 +215,21 @@ autoflight:
       # The wheel keeps 50s: 287 read back 250, 324 read 300, every climb
       # write "unconfirmed" (LXGB 2026-10-07). Snapped to the nearest first.
       step: 50.0
+    # The MCP course windows: the glareshield Lua writes NAV1's OBS from
+    # `course_pilot` until the localiser captures (B738.glaresheild.lua:3598),
+    # so a stock OBS write is undone. Its knob commands step a whole degree
+    # (`up_dn_crs1_dial`, mode 0; held or fast repeats accelerate, mode 2).
+    # VERIFY parked (`xvl conform --only mcp`): knob, or a write.
+    course:
+      up: laminar/B738/autopilot/course_pilot_up
+      down: laminar/B738/autopilot/course_pilot_dn
+      step: 1.0
+      readback: laminar/B738/autopilot/course_pilot
+    course_fo:
+      up: laminar/B738/autopilot/course_copilot_up
+      down: laminar/B738/autopilot/course_copilot_dn
+      step: 1.0
+      readback: laminar/B738/autopilot/course_copilot
   # The switches, each a toggle read before it is fired. FD: the toggle
   # moved flight_director_pos 0 to 1 (master_capt_status and pfd_fd_cmd 1;
   # the stock flight_director_mode stayed 0; fd_ca stayed 0) and back.
@@ -236,7 +252,63 @@ autoflight:
   # C-0030: 40 % N1, stable, then TO/GA). Declared and probed; nothing
   # presses it yet.
   toga_command: laminar/B738/autopilot/left_toga_press
+  # A/T SPEED (B738_Commands.txt), read on `lamps.speed` before it is
+  # pressed. Pressed only by `autopilot_lands`. Unflown.
+  speed_command: laminar/B738/autopilot/speed_press
   # ---- end of the Zibo's own MCP ------------------------------------------
+
+# ---- The autopilot lands it (`ap_lands`), the crew monitors -------------
+# An ILS landing as a 737 crew flies it: APP armed from below the beam,
+# both captures read on the FMA, CMD B after G/S for a dual approach, its
+# own flare, retard and rollout; our crew calls, watches the gates, takes
+# reverse and brakes, disconnects at taxi speed. UNFLOWN (2026-10-07).
+# The FMA codes are the PFD's own images (b738.acf `SHOW_EQUAL`, captain's
+# element [0]): roll 1 HDG SEL, 2 VOR/LOC, 3 LNAV, 4 ROLLOUT, 5 FAC, 6 B/CRS;
+# roll armed 1 VOR/LOC, 2 ROLLOUT, 3 LNAV; pitch 1 V/S, 2 MCP SPD, 3 ALT ACQ,
+# 4 ALT HOLD, 5 G/S, 6 FLARE, 7 G/P, 8-10 VNAV, 11 TO/GA; pitch armed 1 G/S,
+# 2 V/S, 3 FLARE, 4 G/P, 5 VNAV, 6 G/S+V/S; thrust 1 ARM, 2 N1, 3 MCP SPD,
+# 4 FMC SPD, 5 GA, 6 THR HLD, 7 RETARD; pfd_land23 1 LAND 2, 2 LAND 3;
+# autoland/fail_flag 2 NO LAND 3, 3 NO AUTOLAND. The rest are zibomod's
+# names, logged raw for the probe flight (blackbox `autoland` `coupled_tick`).
+autopilot_lands:
+  second_cmd:
+    command: laminar/B738/autopilot/cmd_b_press
+    position: laminar/B738/autopilot/cmd_b_status
+  fma:
+    roll: laminar/B738/autopilot/pfd_hdg_mode[0]
+    roll_armed: laminar/B738/autopilot/pfd_hdg_mode_arm[0]
+    pitch: laminar/B738/autopilot/pfd_alt_mode[0]
+    pitch_armed: laminar/B738/autopilot/pfd_alt_mode_arm[0]
+    thrust: laminar/B738/autopilot/pfd_spd_mode[0]
+    land: laminar/B738/autopilot/pfd_land23
+    log:
+      - laminar/B738/autopilot/autoland_status
+      - laminar/B738/autopilot/no_autoland
+      - laminar/B738/autoland/fail_flag
+      - laminar/B738/autopilot/flare_status
+      - laminar/B738/autopilot/rollout_status
+      - laminar/B738/autopilot/single_ch_status
+  codes:
+    loc: [2]
+    rollout: [4]
+    gs: [5]
+    flare: [6]
+    toga: [11]
+    flare_armed: [3]
+    speed: [3]
+    retard: [7]
+    land: [1, 2]
+  # Both receivers on the ILS for the dual channel.
+  nav2: true
+  # The A/T in SPEED on the MCP window (the window's knob is a hypothesis:
+  # `windows.airspeed`); it retards at the flare (thrust 7).
+  autothrottle: true
+  # A 737 arms FLARE at 1,500 ft radio with both channels in.
+  dual_by_agl_ft: 1500.0
+  land_by_agl_ft: 1000.0
+  own_flare_below_agl_ft: 200.0
+  disconnect_kts: 30.0
+  rollout_xtk_limit_m: 10.0
 
 parking_brake: true
 # The Zibo owns its parking brake. Probed stopped 2026-10-06: a stock ratio

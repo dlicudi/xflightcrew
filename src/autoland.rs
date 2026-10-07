@@ -1092,6 +1092,8 @@ struct ArmedRunway {
     runway: Runway,
     ils: Option<crate::nav::Ils>,
     coupled_ok: bool,
+    /// The autopilot lands it on this ILS (`ap_lands`), where declared.
+    lands: Option<crate::aircraft::AutopilotLands>,
 }
 
 /// Mutable facts that describe this approach as an operation rather than a
@@ -1260,7 +1262,27 @@ async fn arm_runway(
         Priority::Warning,
     );
     let ils = crate::ils::tune(xp, &runway.icao, &runway.id, lat0, lon0).await;
-    let coupled_ok = ils.is_some() && crate::ils::coupled_allowed();
+    // The airframe that LANDS on its own autopilot (`ap_lands`): both
+    // receivers on the ILS, and the coupling is its approach mode.
+    let lands = ils.as_ref().and_then(|_| crate::ap_lands::declared());
+    if let (Some(l), Some(i)) = (lands.as_ref(), ils.as_ref()) {
+        let nav2 = crate::ap_lands::prepare(xp, l, i).await;
+        crate::blackbox::record(
+            "autoland",
+            serde_json::json!({"event": "ap_lands_armed", "rwy": format!("{} {}", runway.icao, runway.id),
+                "freq_mhz": i.freq_mhz(), "course": i.course_mag, "nav2_ok": nav2,
+                "autothrottle": l.autothrottle}),
+        );
+        announce_autoland(
+            voice,
+            format!(
+                "I.L.S. runway {} is set. The autopilot will land it, I'll monitor.",
+                crate::circuit::spell_runway(&runway.id)
+            ),
+            Priority::Advisory,
+        );
+    }
+    let coupled_ok = ils.is_some() && (crate::ils::coupled_allowed() || lands.is_some());
 
     let (aim_lat, aim_lon) = project_latlon(
         runway.thr_lat,
@@ -1332,6 +1354,7 @@ async fn arm_runway(
         runway,
         ils,
         coupled_ok,
+        lands,
     })
 }
 
@@ -1446,6 +1469,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 runway: rwy,
                 ils,
                 coupled_ok,
+                lands,
             } = match arm_runway(&xp, &apt_dat, forced_rwy.as_ref(), gp_deg, &voice).await {
                 Some(armed) => armed,
                 // The run ends with the thread (the lease drops the flag).
@@ -1721,6 +1745,14 @@ fn spawn_autoland(launch: AutolandLaunch) {
             let mut last_thr_written: Option<f64> = None;
             let mut coupling = crate::ils::Coupling::Off;
             let mut coupling_armed_s = 0.0_f64;
+            // The autopilot lands it (`ap_lands`, where declared): who flies
+            // the landing, the A/T on the speed window, the window last
+            // confirmed, the rollout still the autopilot's, on its clock.
+            let mut ap_landing = crate::ap_lands::Landing::default();
+            let mut at_speed = crate::ap_lands::AtSpeed::default();
+            let mut at_window_last: Option<f64> = None;
+            let mut ap_rollout = false;
+            let ap_t0 = std::time::Instant::now();
             // The thrust is this loop's (`autoflight::ThrustWatch`): an
             // ENGAGED autothrottle is taken out to ARM, said once. The A/T
             // in SPEED 230 from a manual recovery overrode every lever
@@ -1764,11 +1796,23 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 let mut extra_names: Vec<String> = vec![thr_name.clone()];
                 extra_names.extend(af_panel.tick_names());
                 let extra_refs: Vec<&str> = extra_names.iter().map(String::as_str).collect();
-                let (st, extra) = if ils.is_some() {
-                    sim::state::read_with(&xp, sim::state::Want(AUTOLAND_WANT_ILS), &extra_refs).await
-                } else {
-                    sim::state::read_with(&xp, sim::state::Want(AUTOLAND_WANT), &extra_refs).await
-                };
+                // ...and on a landing the autopilot flies (`ap_lands`), its
+                // FMA, second channel and speed window, in the same round.
+                let ((st, extra), lands_read) = tokio::join!(
+                    async {
+                        if ils.is_some() {
+                            sim::state::read_with(&xp, sim::state::Want(AUTOLAND_WANT_ILS), &extra_refs).await
+                        } else {
+                            sim::state::read_with(&xp, sim::state::Want(AUTOLAND_WANT), &extra_refs).await
+                        }
+                    },
+                    async {
+                        match &lands {
+                            Some(l) => Some(crate::ap_lands::read(&xp, l, &af_panel).await),
+                            None => None,
+                        }
+                    },
+                );
                 if st.frozen() {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     continue;
@@ -1778,8 +1822,30 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 let mut throttle_read = Some(extra.next().unwrap_or_else(&mut unread));
                 let panel_reads: Vec<Option<f64>> = extra.map(|r| r.ok()).collect();
                 let panel_tick = af_panel.tick_from(&panel_reads);
-                let ap_modes = panel_tick.modes;
-                let at_engaged = panel_tick.at_engaged;
+                // The FMA's captures beside the lamps (`ap_lands`): the
+                // Zibo's APP lamp is lit armed or captured alike.
+                let fma = lands
+                    .as_ref()
+                    .zip(lands_read.as_ref())
+                    .map(|(l, r)| crate::ap_lands::Fma::decode(r, &l.codes));
+                let ap_modes = match &fma {
+                    Some(f) => crate::ap_lands::modes_with_fma(panel_tick.modes, f),
+                    None => panel_tick.modes,
+                };
+                // The two channels' lamps, and whether the autopilot flies
+                // this landing (as the last tick decided it).
+                let cmd_a_lit = lands
+                    .as_ref()
+                    .and(panel_tick.status(&st, F::Servos).ok())
+                    .map(|v| v > 0.5);
+                let cmd_b_lit = lands_read.as_ref().and_then(|r| r.cmd_b).map(|v| v >= 0.5);
+                let ap_flies = ap_landing.ap_flies();
+                // An A/T this path engaged is the airframe's, not a fight.
+                let at_engaged = if at_speed.quiets_thrust_watch() {
+                    None
+                } else {
+                    panel_tick.at_engaged
+                };
                 // Before the lever is written: an engaged autothrottle fights it.
                 {
                     let step = thrust_watch.step(thrust_t0.elapsed().as_secs_f64(), at_engaged);
@@ -1996,7 +2062,20 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         if arrest_hands {
                             let _ = xp.set_float(FLARE_ROLL, 0.0).await;
                         }
-                        disconnect_autopilot(&xp).await;
+                        // A landing the autopilot flew is its rollout too
+                        // (`ap_lands`): disconnected at taxi speed, or
+                        // sooner off the line (`rollout_hand_back`).
+                        if ap_flies {
+                            ap_rollout = true;
+                            crate::blackbox::record(
+                                "autoland",
+                                serde_json::json!({"event": "ap_rollout", "taken": true, "gs": gs_kts,
+                                    "radio": radio_ft, "cmd_a": cmd_a_lit, "cmd_b": cmd_b_lit,
+                                    "rollout_fma": fma.and_then(|f| f.rollout)}),
+                            );
+                        } else {
+                            disconnect_autopilot(&xp).await;
+                        }
                         vacate_follows = VACATE_FOLLOWS.swap(false, Ordering::SeqCst);
                         // Wheels on this runway: the fact the vacate needs.
                         LANDED_RUNWAY.set_in(flight, rwy.id.clone());
@@ -2026,6 +2105,47 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     }
                     let xtk_nm = cross_track_nm(lat, lon, &rwy);
                     let xtk_m = xtk_nm * M_PER_NM;
+                    // The autopilot's rollout, handed back at taxi speed or
+                    // off the line (`ap_lands::rollout_hand_back`): from
+                    // here our steering law, begun fresh.
+                    if let (true, Some(l)) = (ap_rollout, lands.as_ref()) {
+                        let ap_in = match (cmd_a_lit, cmd_b_lit) {
+                            (Some(true), _) | (_, Some(true)) => Some(true),
+                            (Some(false), Some(false)) => Some(false),
+                            _ => None,
+                        };
+                        if let Some(why) = crate::ap_lands::rollout_hand_back(
+                            gs_kts,
+                            xtk_m,
+                            fma.and_then(|f| f.rollout),
+                            wheels_on.unwrap_or(0.0),
+                            ap_in,
+                            l,
+                        ) {
+                            ap_rollout = false;
+                            let off = disconnect_autopilot(&xp).await;
+                            roll_law = crate::autotakeoff::RollSteer::default();
+                            rollout_steer = crate::aircraft::rollout_steer().map(RolloutSteer::new);
+                            crate::blackbox::record(
+                                "autoland",
+                                serde_json::json!({"event": "ap_rollout", "taken": false, "why": why,
+                                    "gs": gs_kts, "xtk_m": xtk_m, "disconnected": off,
+                                    "wheels_on_s": wheels_on}),
+                            );
+                            if let Some(line) = crate::ap_lands::rollout_line(why) {
+                                announce(line.into(), Priority::Caution);
+                            }
+                        }
+                    }
+                    if let (Some(l), Some(r), Some(f)) = (lands.as_ref(), lands_read.as_ref(), fma.as_ref()) {
+                        crate::blackbox::record(
+                            "autoland",
+                            crate::ap_lands::tick_record(
+                                l, r, f, &ap_landing, &at_speed, coupling, cmd_a_lit, radio_ft, ias, None,
+                                on_ground > 0.5, ap_rollout,
+                            ),
+                        );
+                    }
                     // The roll's own closure rate and its own tick time. The
                     // approach path below never runs again once we are rolling
                     // out, so `prev_xtk` is ours from here; its last value is
@@ -2166,7 +2286,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                             left: 0.0,
                             right: 0.0,
                         }
-                    } else if rollout_brake_steer {
+                    } else if rollout_brake_steer && !ap_rollout {
                         rollout_brakes.step_with(
                             if psi_r.is_ok() { err } else { f64::NAN },
                             psi_r.as_ref().ok().copied(),
@@ -2228,9 +2348,13 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     if !reverse_in {
                         writes.set(&thr_name, 0.0);
                     }
-                    writes.set(TAXI_STEER, steer);
-                    if let Some(c) = rollout_tiller.command(steer, gs_kts) {
-                        writes.set(crate::tiller::TILLER, c);
+                    // The autopilot's ROLLOUT steers (`ap_lands`): ours
+                    // stands aside until it is handed back.
+                    if !ap_rollout {
+                        writes.set(TAXI_STEER, steer);
+                        if let Some(c) = rollout_tiller.command(steer, gs_kts) {
+                            writes.set(crate::tiller::TILLER, c);
+                        }
                     }
                     if let Some(e) = touch_elev {
                         // Ours, not a hand (the scorer's yoke check).
@@ -2244,6 +2368,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     // The vacate drive arms the governor from the current
                     // position, which takes a rolling aircraft like any join.
                     if vacate_follows && gs_kts <= VACATE_HANDOFF_KTS {
+                        if ap_rollout {
+                            disconnect_autopilot(&xp).await;
+                        }
                         // Stowed by now (25 kt); never handed to the drive in.
                         crate::tools::reverse::stow();
                         writes.flush(&xp).await;
@@ -2269,7 +2396,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         // rollout's ONE write round (it was two or three,
                         // 0.48 s a tick against a 300 ms sleep, 2026-09-30).
                         writes.set(TAXI_BRAKE, brakes.sym);
-                        if rollout_brake_steer {
+                        if rollout_brake_steer && !ap_rollout {
                             writes
                                 .set(crate::autotaxi::LEFT_BRAKE, brakes.left)
                                 .set(crate::autotaxi::RIGHT_BRAKE, brakes.right);
@@ -2302,6 +2429,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     // the parking brake read back. It set the parking brake
                     // at 2 kt with no tail wait (refactor audit 2026-10-04,
                     // duplicates #8). Fail closed: we are on the runway.
+                    if ap_rollout {
+                        disconnect_autopilot(&xp).await;
+                    }
                     let valve = crate::aircraft::live_profile().and_then(|p| p.park_brake_valve_set);
                     let held = crate::tools::controls::hand_back_hold(
                         &xp,
@@ -3508,14 +3638,24 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 }
                 // The final on the airframe's declared track law, where it
                 // has one (`final_track:`): the trim below learns against it.
-                g.target_heading_deg = final_track_heading(
-                    &g,
-                    rwy.course_deg,
-                    xtk_now * M_PER_NM,
-                    hpath_r.as_ref().ok().copied(),
-                    gs_kts,
-                    final_track_law,
-                );
+                // Bypassed while the airframe's own localiser has the final
+                // on a landing its autopilot flies (`ap_lands`): the law is
+                // that path's own-law fallback, never a second lateral.
+                let ap_has_loc = lands.is_some()
+                    && matches!(
+                        coupling,
+                        crate::ils::Coupling::LocCaptured | crate::ils::Coupling::Coupled
+                    );
+                if !ap_has_loc {
+                    g.target_heading_deg = final_track_heading(
+                        &g,
+                        rwy.course_deg,
+                        xtk_now * M_PER_NM,
+                        hpath_r.as_ref().ok().copied(),
+                        gs_kts,
+                        final_track_law,
+                    );
+                }
                 let g = g;
                 let outbound = hold.is_some()
                     || pattern.is_some_and(|(_, leg, _)| leg != crate::reversal::Leg::Inbound);
@@ -3690,6 +3830,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     last_flare_elev = None;
                 } else if holds_off
                     && !pitch_yielded
+                    && !ap_flies
                     && g.phase == ApproachPhase::Flare
                     && touch_hold.note(on_ground > 0.5 || radio_ft < TOUCH_RADIO_FT, last_flare_elev)
                 {
@@ -3705,7 +3846,10 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 } else {
                     None
                 };
-                let flare_elev = match (g.arresting, vvi, pitch_yielded) {
+                // A landing the autopilot flies (`ap_lands`) is its flare:
+                // our column never arrests it (the plugin releases our yoke
+                // channels while CMD is lit anyway).
+                let flare_elev = match (g.arresting && !ap_flies, vvi, pitch_yielded) {
                     // Once the pilot has taken the pitch it stays taken for
                     // this approach — the debounce the taxi and takeoff
                     // channels learned: a latch that re-arms is a fight over
@@ -3812,7 +3956,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         g.target_heading_deg
                     }
                 };
-                match arrest_hands_step(arrest_hands, g.arresting) {
+                match arrest_hands_step(arrest_hands, g.arresting && !ap_flies) {
                     ArrestHands::Take => {
                         let ok = autoflight::press(&xp, Button::Disconnect).await.is_ok();
                         arrest_hands = true;
@@ -4009,8 +4153,13 @@ fn spawn_autoland(launch: AutolandLaunch) {
                                 needles: n,
                                 modes: ap_modes,
                                 radio_ft,
-                                decouple_below_ft: crate::aircraft::live_profile()
-                                    .and_then(|p| p.ils_decouple_agl_ft),
+                                // A landing the autopilot flies keeps it to
+                                // the wheels (`ap_lands`).
+                                decouple_below_ft: if lands.is_some() {
+                                    None
+                                } else {
+                                    crate::aircraft::live_profile().and_then(|p| p.ils_decouple_agl_ft)
+                                },
                             },
                             &mut coupling_armed_s,
                             tick_dt,
@@ -4057,6 +4206,146 @@ fn spawn_autoland(launch: AutolandLaunch) {
                         own_vertical: true,
                     },
                 };
+                // THE AUTOPILOT LANDS IT (`ap_lands`), where declared: the
+                // second channel after the glideslope, the landing armed by
+                // its gate, else taken back loudly; the A/T in SPEED on our
+                // approach target. Every FMA column on the tape.
+                let mut cpl = cpl;
+                if let (Some(l), Some(r), Some(f)) = (lands.as_ref(), lands_read.as_ref(), fma.as_ref()) {
+                    let now_s = ap_t0.elapsed().as_secs_f64();
+                    let before = ap_landing;
+                    let lo = ap_landing.step(
+                        crate::ap_lands::LandIn {
+                            coupling,
+                            radio_ft,
+                            airborne: on_ground < 0.5,
+                            going_around: ga,
+                            cmd_a: cmd_a_lit,
+                            cmd_b: cmd_b_lit,
+                            fma: *f,
+                            now_s,
+                        },
+                        l,
+                    );
+                    if lo.press_second {
+                        autoflight::press_logged(&xp, Button::EngageSecond, "ap_lands").await;
+                    }
+                    if lo.press_toga {
+                        autoflight::press_logged(&xp, Button::Toga, "ap_lands").await;
+                    }
+                    if let Some(fb) = lo.fallback {
+                        announce(crate::ap_lands::fallback_line(fb, radio_ft, l), Priority::Caution);
+                        match fb {
+                            crate::ap_lands::Fallback::OwnLaw(_) => {
+                                // Our law from this tick: the bug, the wheel
+                                // and (low) the arrest are ours again.
+                                if let Some(o) = coupling.abandon_now(ap_modes) {
+                                    if o.disarm {
+                                        autoflight::press_logged(&xp, Button::Approach, "ap_lands_decouple").await;
+                                    }
+                                    cpl.own_lateral = true;
+                                    cpl.own_vertical = true;
+                                }
+                                // Our final begins fresh: the trim learnt
+                                // nothing of ours while the localiser flew.
+                                track_trim = TrackTrim::new();
+                            }
+                            crate::ap_lands::Fallback::GoAround(_) => {
+                                runtime.go_around.order(on_ground > 0.5);
+                            }
+                        }
+                    }
+                    if let Some(line) = lo.armed_line {
+                        announce(line.into(), Priority::Advisory);
+                    }
+                    if ap_landing != before {
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "ap_landing", "from": before.word(),
+                                "to": ap_landing.word(), "why": lo.fallback.map(|f| f.why()),
+                                "radio": radio_ft, "dist": g.dist_nm, "cmd_a": cmd_a_lit,
+                                "cmd_b": cmd_b_lit, "toga": lo.press_toga}),
+                        );
+                    }
+                    // The A/T holds what our governor would: the approach
+                    // target for the flap out (`approach_target_kts`).
+                    let flap_now = last_flap.unwrap_or(0.0);
+                    let at_want = approach_target_kts(
+                        g.target_ias_kts,
+                        flap_now,
+                        &crate::aircraft::flap_limits(),
+                        crate::aircraft::config_floor_kts(flap_now),
+                    );
+                    let at_before = at_speed;
+                    let ao = at_speed.step(crate::ap_lands::AtIn {
+                        wanted: l.autothrottle
+                            && ap_landing.live()
+                            && coupling != crate::ils::Coupling::Off
+                            && on_ground < 0.5
+                            && !ga,
+                        engaged: crate::ap_lands::at_engaged(f, r.speed_lamp),
+                        window_kts: r.speed_window,
+                        want_kts: at_want,
+                        now_s,
+                    });
+                    if ao.arm_switch {
+                        let armed = autoflight::ensure_switch(
+                            &xp,
+                            autoflight::Switch::AutothrottleArm,
+                            true,
+                            "ap_lands",
+                        )
+                        .await;
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "at_arm", "armed": armed}),
+                        );
+                    }
+                    if let Some(w) = ao.set_window {
+                        let _ = autoflight::set_dial_confirmed(
+                            "autoland",
+                            &xp,
+                            Dial::Airspeed,
+                            w,
+                            &mut at_window_last,
+                            1.0,
+                        )
+                        .await;
+                    }
+                    if ao.press_speed {
+                        autoflight::press_logged(&xp, Button::Speed, "ap_lands").await;
+                    }
+                    if let Some(line) = ao.say {
+                        announce(line.into(), Priority::Advisory);
+                    }
+                    if at_speed != at_before || ao.event.is_some() {
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "ap_at", "what": ao.event,
+                                "from": at_before.word(), "to": at_speed.word(), "want": at_want,
+                                "window": r.speed_window, "speed_lamp": r.speed_lamp,
+                                "thrust_fma": r.thrust, "radio": radio_ft}),
+                        );
+                    }
+                    crate::blackbox::record(
+                        "autoland",
+                        crate::ap_lands::tick_record(
+                            l,
+                            r,
+                            f,
+                            &ap_landing,
+                            &at_speed,
+                            coupling,
+                            cmd_a_lit,
+                            radio_ft,
+                            ias,
+                            Some(at_want),
+                            on_ground > 0.5,
+                            ap_rollout,
+                        ),
+                    );
+                }
+                let cpl = cpl;
                 // The knob: once per phase or pattern leg and corrected past a
                 // deadband (`bug_knob`); the short final and the flare steer
                 // it every tick, as before.
@@ -4395,6 +4684,9 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     ));
                     float_lever.or_else(|| thr_now.map(|throttle| (throttle + adj).clamp(min_thr, 1.0)))
                 };
+                // The A/T holds the speed and retards (`ap_lands`): our
+                // lever stands aside.
+                let thr = if at_speed.flies() { None } else { thr };
                 if g.phase != ApproachPhase::Flare && missed.is_none() {
                     if let Some(t) = thr {
                         approach_thr = Some(t);

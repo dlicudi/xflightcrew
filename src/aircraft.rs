@@ -219,8 +219,8 @@ pub struct AutoflightProfile {
     /// The panel's own buttons, where the airframe has them
     /// (`autoflight::Panel`): CMD A, HDG SEL, V/S and ALT HLD. `None` is the
     /// stock command. The 737's xlua buttons fire the stock modes and keep
-    /// its MCP lamps and FMA honest; CMD B is never named (it dropped CMD A
-    /// live, LEMG 2026-10-05).
+    /// its MCP lamps and FMA honest; CMD B is never named here (it dropped CMD A
+    /// live, LEMG 2026-10-05): only as `autopilot_lands.second_cmd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engage_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,10 +284,17 @@ pub struct AutoflightProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flight_director_fo: Option<PanelSwitch>,
     /// The panel's TO/GA: with the A/T armed it sets the takeoff thrust
-    /// itself. Declared and probed only; the takeoff still flies its own
-    /// levers (owed: `autoflight::Panel::toga`).
+    /// itself. The takeoff still flies its own levers (owed:
+    /// `autoflight::Panel::toga`); a go-around from a landing the autopilot
+    /// flies (`autopilot_lands`) presses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toga_command: Option<String>,
+    /// The A/T SPEED button (a toggle, read on the `lamps.speed` lamp
+    /// before it is pressed): the autothrottle holds the MCP speed window.
+    /// Pressed only by a landing the autopilot flies (`autopilot_lands`
+    /// `autothrottle`). `None` is the stock `autothrottle_on`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_command: Option<String>,
 }
 
 /// The mode lamps of a panel whose MCP is not the stock autopilot's
@@ -346,6 +353,127 @@ pub struct McpWindows {
     pub airspeed: Option<McpWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vs: Option<McpWindow>,
+    /// The MCP course windows, captain's and first officer's: the ILS course
+    /// where the MCP drives the OBS (the Zibo's `course_pilot` is the NAV1
+    /// OBS's source until the localiser captures). `None`: the stock OBS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub course: Option<McpWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub course_fo: Option<McpWindow>,
+}
+
+/// The autopilot LANDS this airframe on an ILS (`autopilot_lands`, the
+/// `ap_lands` module): APP armed, the airframe's own capture, the second
+/// channel engaged after the glideslope, its own flare, retard and rollout,
+/// the crew monitoring and taking it back loudly at the declared gates.
+/// Absent: autoland flies its own law to the ground, as it always has.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AutopilotLands {
+    /// The second channel's button and lamp (CMD B on a 737): pressed after
+    /// the glideslope captures, read lit with CMD A for a dual approach.
+    pub second_cmd: PanelSwitch,
+    /// The flight mode annunciations, read every tick on this path and
+    /// blackboxed raw (`autoland` `coupled_tick`).
+    pub fma: FmaNames,
+    /// What the FMA numbers mean ([`FmaCodes`]).
+    #[serde(default)]
+    pub codes: FmaCodes,
+    /// Tune NAV2 and set the first officer's course too: a dual-channel
+    /// approach reads both receivers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nav2: bool,
+    /// Engage the A/T in SPEED on the MCP window for the approach (the arm
+    /// switch, the window, the SPEED button, each read back): the airframe's
+    /// own retard at the flare. Off, or not taken: our thrust law flies.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub autothrottle: bool,
+    /// Radio height by which both halves are captured and both channels
+    /// engaged, else our own law flies the approach (said).
+    #[serde(default = "default_dual_by_agl_ft")]
+    pub dual_by_agl_ft: f64,
+    /// Radio height by which the landing is armed (FLARE armed, LAND 2/3),
+    /// else a go-around with height in hand (said).
+    #[serde(default = "default_land_by_agl_ft")]
+    pub land_by_agl_ft: f64,
+    /// Below this radio height a lost autoland is OUR flare's, never a
+    /// go-around from the wheels; above it, a go-around.
+    #[serde(default = "default_own_flare_below_agl_ft")]
+    pub own_flare_below_agl_ft: f64,
+    /// The rollout is the autopilot's down to this groundspeed, then it is
+    /// disconnected and our rollout steers.
+    #[serde(default = "default_ap_disconnect_kts")]
+    pub disconnect_kts: f64,
+    /// ...or sooner, past this much cross-track on the rollout.
+    #[serde(default = "default_rollout_xtk_limit_m")]
+    pub rollout_xtk_limit_m: f64,
+}
+
+fn default_dual_by_agl_ft() -> f64 {
+    1500.0
+}
+fn default_land_by_agl_ft() -> f64 {
+    1000.0
+}
+fn default_own_flare_below_agl_ft() -> f64 {
+    200.0
+}
+fn default_ap_disconnect_kts() -> f64 {
+    30.0
+}
+fn default_rollout_xtk_limit_m() -> f64 {
+    10.0
+}
+
+/// The FMA datarefs an `autopilot_lands` path reads (an element as
+/// `name[i]`). `None`: that column is not read, and nothing is decided on it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FmaNames {
+    /// The roll mode engaged (LOC, ROLLOUT).
+    pub roll: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_armed: Option<String>,
+    /// The pitch mode engaged (G/S, FLARE).
+    pub pitch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch_armed: Option<String>,
+    /// The autothrottle mode (MCP SPD, RETARD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thrust: Option<String>,
+    /// The landing annunciation (LAND 2, LAND 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land: Option<String>,
+    /// Read and blackboxed only, for the probe flight to decode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<String>,
+}
+
+/// The FMA values that mean each mode, per column ([`FmaNames`]). Empty:
+/// that mode is never read as shown.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FmaCodes {
+    /// `roll`: the localiser captured; the rollout.
+    #[serde(default)]
+    pub loc: Vec<f64>,
+    #[serde(default)]
+    pub rollout: Vec<f64>,
+    /// `pitch`: the glideslope captured; the flare; TO/GA.
+    #[serde(default)]
+    pub gs: Vec<f64>,
+    #[serde(default)]
+    pub flare: Vec<f64>,
+    #[serde(default)]
+    pub toga: Vec<f64>,
+    /// `pitch_armed`: the flare armed.
+    #[serde(default)]
+    pub flare_armed: Vec<f64>,
+    /// `thrust`: the A/T holding the MCP speed; retarding.
+    #[serde(default)]
+    pub speed: Vec<f64>,
+    #[serde(default)]
+    pub retard: Vec<f64>,
+    /// `land`: a landing annunciated (LAND 2 or LAND 3).
+    #[serde(default)]
+    pub land: Vec<f64>,
 }
 
 /// A toggle switch on the panel and the position it reads (1 on).
@@ -1339,6 +1467,10 @@ pub struct AircraftProfile {
     /// `None`: coupled to the arrest.
     #[serde(default)]
     pub ils_decouple_agl_ft: Option<f64>,
+    /// The autopilot lands this airframe on an ILS ([`AutopilotLands`]).
+    /// `None`: autoland's own law, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autopilot_lands: Option<AutopilotLands>,
     /// The autopilot's own approach button, where the add-on has its own
     /// (the Laminar 737's APP is `laminar/B738/autopilot/app_press`: its lamp
     /// lights). `None`: the stock command. The modes it arms are read on
@@ -5587,6 +5719,7 @@ fn cessna_172sp() -> AircraftProfile {
         load_sheet: LoadSheet::Stock,
         ils_coupled: false,
         ils_decouple_agl_ft: None,
+        autopilot_lands: None,
         approach_command: None,
         bus_volts_nominal: None,
         // The stock profile carries the same continuous flare laws. Keep the
@@ -5959,6 +6092,7 @@ fn cirrus_sr22() -> AircraftProfile {
         load_sheet: LoadSheet::Stock,
         ils_coupled: false,
         ils_decouple_agl_ft: None,
+        autopilot_lands: None,
         approach_command: None,
         bus_volts_nominal: None,
         flare_power: None,

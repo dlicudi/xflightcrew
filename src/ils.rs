@@ -72,16 +72,32 @@ pub async fn tune_from(
     .ok()
     .flatten()
     .filter(|i| i.airport.eq_ignore_ascii_case(&want_icao) && i.runway.eq_ignore_ascii_case(rwy))?;
-    let (freq, obs) = tokio::join!(xp.get_float(NAV1_FREQ), xp.get_float(NAV1_OBS));
+    // A declared MCP course window is the OBS's source (the Zibo's
+    // `course_pilot`: its script writes NAV1's OBS from it until the
+    // localiser captures, so a raw OBS write is undone): the course is set
+    // and read on the window, through the panel's owner, in whole degrees.
+    let course_window = autoflight::panel().window(Dial::Course).is_some();
+    let read_course = || async {
+        if course_window {
+            autoflight::read_dial(xp, Dial::Course).await
+        } else {
+            xp.get_float(NAV1_OBS).await
+        }
+    };
+    let (freq, obs) = tokio::join!(xp.get_float(NAV1_FREQ), read_course());
     let tuned = freq.is_ok_and(|f| f.round() as i64 == ils.freq_10khz);
     let on_course = obs.is_ok_and(|o| crate::angles::abs_diff_deg(o, ils.course_mag) < 1.0);
     if !tuned {
         let _ = xp.set_int(NAV1_FREQ, ils.freq_10khz).await;
     }
     if !on_course {
-        let _ = xp.set_float(NAV1_OBS, ils.course_mag).await;
+        if course_window {
+            let _ = autoflight::set_dial(xp, Dial::Course, ils.course_mag.round().rem_euclid(360.0)).await;
+        } else {
+            let _ = xp.set_float(NAV1_OBS, ils.course_mag).await;
+        }
     }
-    let (freq, obs) = tokio::join!(xp.get_float(NAV1_FREQ), xp.get_float(NAV1_OBS));
+    let (freq, obs) = tokio::join!(xp.get_float(NAV1_FREQ), read_course());
     let ok = freq.is_ok_and(|f| f.round() as i64 == ils.freq_10khz)
         && obs.is_ok_and(|o| crate::angles::abs_diff_deg(o, ils.course_mag) < 1.0);
     crate::blackbox::record(
@@ -406,6 +422,27 @@ impl Coupling {
         out.own_lateral = !matches!(self, Coupling::LocCaptured | Coupling::Coupled);
         out.own_vertical = !matches!(self, Coupling::Coupled);
         out
+    }
+}
+
+impl Coupling {
+    /// Given up from outside the step: a landing the autopilot was to fly
+    /// that did not confirm by its gate (`ap_lands::Fallback::OwnLaw`). The
+    /// lateral and vertical are handed back as any abandon hands them, APP
+    /// pressed once more when anything still reads in. `None` when it was
+    /// not engaged (nothing to hand back).
+    pub fn abandon_now(&mut self, modes: Option<crate::autoflight::Modes>) -> Option<CouplingOut> {
+        if !matches!(self, Coupling::Armed | Coupling::LocCaptured | Coupling::Coupled) {
+            return None;
+        }
+        *self = Coupling::Abandoned;
+        Some(CouplingOut {
+            press_appr: false,
+            decouple: true,
+            disarm: modes.is_some_and(|m| m.approach_any()),
+            own_lateral: true,
+            own_vertical: true,
+        })
     }
 }
 

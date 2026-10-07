@@ -447,7 +447,15 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
 - **A mountain field is a flyable approach or a hand-over** (`mountain_field`); **a MAP on the
   runway fix is a landing** (`map_short_of_runway`). **The ILS is tuned, watched and, per airframe,
   flown** (`src/ils.rs`, `ils_coupled`); **a positive `vdef` is ABOVE the beam**
-  (`ils::above_glideslope`).
+  (`ils::above_glideslope`). A declared MCP course window is the OBS's source (`windows.course`).
+- **Where the airframe declares it, its autopilot LANDS and the crew monitors**
+  (`autopilot_lands:`, `src/ap_lands.rs`, the Zibo): APP from below the beam, the captures the
+  FMA's (`modes_with_fma`: an APP lamp is lit armed or captured alike), CMD B after G/S
+  (`Landing`), its flare, retard (`AtSpeed`: the A/T in SPEED on our target) and rollout to
+  `disconnect_kts` (`rollout_hand_back`); our arrest, column, lever and track law stand aside,
+  the gates and the go-around door stay ours (TO/GA pressed). Not dual by `dual_by_agl_ft`: our
+  own law, said; not armed by `land_by_agl_ft` or lost above `own_flare_below_agl_ft`: a
+  go-around; lost below it: our flare. Every FMA column raw on `autoland` `coupled_tick`.
 - **The copilot knows the systems before reaching for one** (`src/systems.rs`): a fact, never a
   licence. **The autopilot's own modes are tools, not yet the follower's** (`tools::autoflight`
   `ap_mode`): toggles read before firing.
@@ -498,7 +506,7 @@ controls" ends the taxi-in itself** (`taxi_in::abort`), braked and parked; a sta
 go.
 
 ### Still owed
-Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (`ils_coupled` on the 737 is unflown through the owner, #81).
+Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-auto` (`ils_coupled` on the 737 is unflown through the owner, #81; the Zibo's `autopilot_lands` is unflown, its speedbrake not yet armed for it).
 Also owed from 2026-10-05: the loops' mode presses go through `autoflight::bring` (reconcile,
 then apply; `loop_mode_presses_go_through_reconcile`) except four that need a flight: the pattern
 guard's hand-back VS, autoland's arrest return, window-park and VS-watchdog presses;

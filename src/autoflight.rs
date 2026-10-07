@@ -37,7 +37,9 @@
 //! - **The panel is the airframe's** ([`Panel`], from the profile's
 //!   `autoflight:` block, else the stock commands): the 737's own CMD A,
 //!   HDG SEL, V/S, ALT HLD and APP buttons, which keep its lamps and FMA
-//!   honest. CMD B is never pressed (it dropped CMD A live, 2026-10-05).
+//!   honest. CMD B is never pressed (it dropped CMD A live, 2026-10-05)
+//!   except as the second channel of a landing the autopilot flies, where
+//!   declared (`autopilot_lands`, `ap_lands`).
 //! - **Intent, not buttons** ([`Want`], [`reconcile`]): a loop says what it
 //!   wants the autopilot to fly (its heading, its VS, the airframe's own
 //!   capture); the owner turns the modes READ into the presses needed, only on
@@ -119,6 +121,7 @@ pub(crate) mod cmd {
     pub const AT_ON: &str = "sim/autopilot/autothrottle_on";
     pub const AT_OFF: &str = "sim/autopilot/autothrottle_off";
     pub const AT_ARM: &str = "sim/autopilot/autothrottle_arm";
+    pub const TOGA: &str = "sim/autopilot/take_off_go_around";
 }
 
 /// A button on the panel. Its command is the airframe's ([`Panel`]).
@@ -157,6 +160,16 @@ pub enum Button {
     /// `lnav_press`), else the stock GPSS. A toggle: pressed only through
     /// [`LnavEngage`], never on a read that says it is in.
     Lnav,
+    /// The second channel (CMD B), declared only by `autopilot_lands` for
+    /// a dual approach: pressed by `ap_lands` after the glideslope, read on
+    /// its own lamp. Never anywhere else (on the stock 737 it dropped CMD A,
+    /// 2026-10-05).
+    EngageSecond,
+    /// A/T SPEED (`speed_command`), read on the SPEED lamp before it is
+    /// pressed.
+    Speed,
+    /// TO/GA (`toga_command`, else the stock).
+    Toga,
 }
 
 /// A dial: written only through [`set_dial`] / [`stage_dial`].
@@ -178,6 +191,10 @@ pub enum Dial {
     AirspeedKts,
     /// The hover mode's groundspeed vector (an array).
     HoverVector,
+    /// The ILS course, captain's and first officer's: the NAV1 and NAV2
+    /// OBS, or a declared MCP's course windows (`windows.course`).
+    Course,
+    CourseFo,
 }
 
 impl Dial {
@@ -190,6 +207,8 @@ impl Dial {
             Dial::Airspeed => "sim/cockpit2/autopilot/airspeed_dial_kts_mach",
             Dial::AirspeedKts => "sim/cockpit2/autopilot/airspeed_dial_kts",
             Dial::HoverVector => "sim/cockpit2/autopilot/hover_vector",
+            Dial::Course => "sim/cockpit2/radios/actuators/nav1_obs_deg_mag_pilot",
+            Dial::CourseFo => "sim/cockpit2/radios/actuators/nav2_obs_deg_mag_pilot",
         }
     }
 
@@ -211,6 +230,8 @@ pub fn dial_named(name: &str) -> Option<Dial> {
         Dial::Airspeed,
         Dial::AirspeedKts,
         Dial::HoverVector,
+        Dial::Course,
+        Dial::CourseFo,
     ]
     .into_iter()
     .find(|d| d.name() == name)
@@ -735,9 +756,14 @@ pub struct Panel {
     pub at_arm: Option<crate::aircraft::PanelSwitch>,
     pub fd: Option<crate::aircraft::PanelSwitch>,
     pub fd_fo: Option<crate::aircraft::PanelSwitch>,
-    /// TO/GA, declared and probed; nothing presses it yet (owed: the
-    /// takeoff's "A/T takes the thrust").
+    /// TO/GA, declared and probed; pressed by a go-around from a landing
+    /// the autopilot flies (owed: the takeoff's "A/T takes the thrust").
     pub toga: Option<String>,
+    /// The A/T SPEED button (`speed_command`).
+    pub speed: Option<String>,
+    /// The second channel's button and lamp (`autopilot_lands.second_cmd`).
+    pub engage_second: Option<String>,
+    pub engage_second_status: Option<String>,
 }
 
 impl Default for Panel {
@@ -762,6 +788,9 @@ impl Default for Panel {
             fd: None,
             fd_fo: None,
             toga: None,
+            speed: None,
+            engage_second: None,
+            engage_second_status: None,
         }
     }
 }
@@ -808,6 +837,9 @@ impl Panel {
             fd: a.and_then(|a| a.flight_director.clone()),
             fd_fo: a.and_then(|a| a.flight_director_fo.clone()),
             toga: a.and_then(|a| a.toga_command.clone()),
+            speed: a.and_then(|a| a.speed_command.clone()),
+            engage_second: p.autopilot_lands.as_ref().map(|l| l.second_cmd.command.clone()),
+            engage_second_status: p.autopilot_lands.as_ref().map(|l| l.second_cmd.position.clone()),
         }
     }
 
@@ -818,6 +850,8 @@ impl Panel {
             Dial::Altitude => self.windows.altitude.as_ref(),
             Dial::Airspeed | Dial::AirspeedKts => self.windows.airspeed.as_ref(),
             Dial::Vs | Dial::VviFpm => self.windows.vs.as_ref(),
+            Dial::Course => self.windows.course.as_ref(),
+            Dial::CourseFo => self.windows.course_fo.as_ref(),
             Dial::HoverVector => None,
         }?;
         Window::from_profile(w)
@@ -954,6 +988,10 @@ impl Panel {
             Button::AutothrottleOff => &self.autothrottle_off,
             Button::AutothrottleArm => cmd::AT_ARM,
             Button::Lnav => self.lnav.as_deref().unwrap_or(cmd::GPSS),
+            // Undeclared, CMD A again: `press_on` reads its lamp first.
+            Button::EngageSecond => self.engage_second.as_deref().unwrap_or(&self.engage),
+            Button::Speed => self.speed.as_deref().unwrap_or(cmd::AT_ON),
+            Button::Toga => self.toga.as_deref().unwrap_or(cmd::TOGA),
         }
     }
 }
@@ -2750,8 +2788,9 @@ mod tests {
     }
 
     /// The Zibo's panel is its own buttons, lamps, windows and switches, and
-    /// every one of them rides the swap's profile probe. CMD B is never
-    /// named; its ILS is not coupled (the APP lamp cannot tell armed from
+    /// every one of them rides the swap's profile probe. CMD B is named
+    /// only as the second channel of the landing its autopilot flies; its
+    /// ILS captures are the FMA's (the APP lamp cannot tell armed from
     /// captured).
     #[test]
     fn the_zibo_panel_is_its_own_lamps_windows_and_switches() {
@@ -2804,7 +2843,19 @@ mod tests {
         for n in &want {
             assert!(names.iter().any(|x| x == n), "{n} not probed");
         }
-        assert!(!names.iter().any(|x| x.contains("cmd_b")), "CMD B is never named");
+        // CMD B only as the landing's second channel (`autopilot_lands`).
+        assert_eq!(p.command(Button::EngageSecond), z("cmd_b_press"));
+        assert_eq!(p.engage_second_status.as_deref(), Some(z("cmd_b_status").as_str()));
+        assert_eq!(p.command(Button::Speed), z("speed_press"));
+        assert!(matches!(
+            p.window(Dial::Course),
+            Some(Window::Knob { step, ref readback, .. }) if step == 1.0 && *readback == z("course_pilot")
+        ));
+        assert!(p.window(Dial::CourseFo).is_some());
+        assert!(names
+            .iter()
+            .filter(|x| x.contains("cmd_b"))
+            .all(|x| *x == z("cmd_b_press") || *x == z("cmd_b_status")));
     }
 
     /// The probe on the ramp: HDG SEL lit read as HDG, LVL CHG and APP lit

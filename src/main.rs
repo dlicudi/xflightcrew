@@ -13,6 +13,7 @@
 mod aircraft;
 mod answers;
 mod ap_engage;
+mod ap_lands;
 mod autoflight;
 mod approach_energy;
 mod approach_guide;
