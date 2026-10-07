@@ -35,6 +35,7 @@
         let file = acf.rsplit('/').next().unwrap();
         let id = match file {
             "b738.acf" => "boeing_737_800",
+            "b738_4k.acf" => "zibo_738",
             "Cirrus SR22.acf" => "cirrus_sr22",
             "CirrusSF50.acf" => "cirrus_vision_sf50",
             "A330.acf" => "airbus_a330_300",
