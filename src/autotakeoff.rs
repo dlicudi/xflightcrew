@@ -1305,6 +1305,11 @@ pub struct RotatePitch {
     /// The vertical speed, fpm, as last read (`vh_ind_fpm`;
     /// [`RotatePitch::climb_fpm`]): with the airspeed, the flight path.
     vs_fpm: Option<f64>,
+    /// The height's own rate, fpm, low-passed over [`HEIGHT_RATE_TAU_S`],
+    /// and the height it was last taken from: the flight path of a model
+    /// that declares `path_from_height`.
+    height_fpm: Option<f64>,
+    prev_agl: Option<f64>,
     /// Tests only: see [`RotatePitch::as_flown_b2b1481`].
     #[cfg(test)]
     as_flown_b2b1481: Option<f64>,
@@ -1319,9 +1324,18 @@ pub const ROTATE_MODEL_SHARE: f64 = 0.8;
 /// The flight path the model believes, degrees: a vertical speed read in a
 /// bounce or a zoom is not a path to take the spring off by.
 const ROTATE_MODEL_PATH_MAX_DEG: f64 = 12.0;
+/// ...and taken from the height's own rate (`path_from_height`): a jet's
+/// initial climb at 17.5 degrees of attitude flies a 14 to 15 degree path
+/// (the Zibo at 4,000 fpm and 155 kt), which the 12 degree cap would read as
+/// three degrees of spring still to hold.
+const ROTATE_MODEL_HEIGHT_PATH_MAX_DEG: f64 = 20.0;
 /// The slowest airspeed the model's `(ref / ias)^2` is taken at, knots: a
 /// rotation is never below it, and a dead ASI must not ask for full column.
 const ROTATE_MODEL_MIN_KTS: f64 = 40.0;
+/// The low-pass on the height's rate, seconds: a tick's difference of a
+/// height read to the hundredth of a foot, a quarter of the 1.3 s the
+/// flight model's vertical speed trails it by.
+const HEIGHT_RATE_TAU_S: f64 = 0.25;
 
 /// The hand-flown initial climb's speed hold: from liftoff to the autopilot's
 /// engage the rotation's attitude target is walked by the airspeed TREND, so
@@ -1429,6 +1443,8 @@ impl RotatePitch {
             rest: None,
             model_out: 0.0,
             vs_fpm: None,
+            height_fpm: None,
+            prev_agl: None,
             #[cfg(test)]
             as_flown_b2b1481: None,
         }
@@ -1501,13 +1517,21 @@ impl RotatePitch {
             (0.0, 0.0)
         } else {
             let tas_fpm = ias.max(ROTATE_MODEL_MIN_KTS) * 101.269;
-            let path = self
-                .vs_fpm
+            let (climb, path_max) = if m.path_from_height {
+                (self.height_fpm, ROTATE_MODEL_HEIGHT_PATH_MAX_DEG)
+            } else {
+                (self.vs_fpm, ROTATE_MODEL_PATH_MAX_DEG)
+            };
+            let path = climb
                 .map_or(0.0, |vs| vs.atan2(tas_fpm).to_degrees())
-                .clamp(-ROTATE_MODEL_PATH_MAX_DEG, ROTATE_MODEL_PATH_MAX_DEG);
+                .clamp(-path_max, path_max);
             (path, (agl_ft / m.ground_effect_ft).clamp(0.0, 1.0))
         };
         let base = m.breakout + (m.air_base - m.breakout) * lifted;
+        let per_deg = match m.air_per_deg {
+            Some(air) => m.per_deg + (air - m.per_deg) * lifted,
+            None => m.per_deg,
+        };
         #[cfg(test)]
         if let Some(hold) = self.as_flown_b2b1481.filter(|_| !self.wheels) {
             let goal = ROTATE_MODEL_SHARE * hold / q;
@@ -1515,7 +1539,7 @@ impl RotatePitch {
             return self.model_out;
         }
         self.model_out = ROTATE_MODEL_SHARE
-            * (m.per_deg * (target - path_deg - rest).max(0.0)
+            * (per_deg * (target - path_deg - rest).max(0.0)
                 + (base + want_rate.max(0.0) / m.deg_s_per_unit) / q);
         self.model_out
     }
@@ -1683,6 +1707,23 @@ impl RotatePitch {
         // wanted from it — hold the standing pull the trim state demands, so
         // that on target and steady the elevator does not fall away.
         self.trim = (self.trim + err * PITCH_TRIM_PER_DEG_S * dt).clamp(self.pitch_min, PITCH_MAX);
+        // The height's rate, for a model that takes its path from it.
+        if self.model.is_some_and(|m| m.path_from_height) {
+            match air.filter(|(_, h)| h.is_finite()) {
+                Some((_, agl)) => {
+                    if let Some(prev) = self.prev_agl {
+                        let raw = (agl - prev) / dt * 60.0;
+                        self.height_fpm = Some(self.height_fpm.map_or(raw, |f| {
+                            f + (raw - f) * dt / (HEIGHT_RATE_TAU_S + dt)
+                        }));
+                    }
+                    self.prev_agl = Some(agl);
+                }
+                // A failed read is no measurement: the rate stands, and the
+                // next height is differenced from nothing older.
+                None => self.prev_agl = None,
+            }
+        }
         // A declared rotation model's column, fed forward (zero without one).
         let fed = self.model_step(air, target, want_rate, dt);
         let out = (err * PITCH_P_PER_DEG + self.trim + fed).clamp(self.pitch_min, PITCH_MAX);
@@ -4074,6 +4115,10 @@ pub(crate) mod climb_out_bench;
 
 #[cfg(test)]
 mod tests;
+
+/// The Zibo 737's rotation, fitted to LEMG 30 (2026-10-07) and flown.
+#[cfg(test)]
+mod zibo_rotation_tests;
 
 /// The pilot's reject at LEMG 13 (2026-09-28, sortie 1790627884-full_auto,
 /// stock 737), replayed through a plant: the stop is flown, the throttles

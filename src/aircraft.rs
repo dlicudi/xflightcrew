@@ -710,16 +710,37 @@ pub struct RotateElevatorProfile {
     /// The height ground effect is gone by, feet; `air_base` is reached
     /// linearly from the wheels to it (about half the span).
     pub ground_effect_ft: f64,
+    /// Flying clear of ground effect, the spring per degree of the wing's
+    /// angle of attack, reached from `per_deg` as `air_base` is; `None` keeps
+    /// `per_deg` flying too (the SR22). On the wheels the spring is the main
+    /// gear's as much as the tail's; flying it is the wing's own stiffness,
+    /// and on a jet the two differ threefold (the Zibo 737: 0.077 on the
+    /// wheels, 0.225 flying, LEMG 30 2026-10-07).
+    #[serde(default)]
+    pub air_per_deg: Option<f64>,
+    /// The flight path the spring is taken off by, from the height's own
+    /// rate instead of the flight model's vertical speed (`vh_ind_fpm`).
+    /// That vertical speed trails the height by about 1.3 s on the Zibo
+    /// (432 fpm read at 13 ft with the height climbing 1,145 fpm, LEMG 30
+    /// 2026-10-07): against a stiff spring flying, 3 degrees of path behind
+    /// is 0.6 of column too much pull. `false` (the default) reads the
+    /// vertical speed, as ever.
+    #[serde(default)]
+    pub path_from_height: bool,
 }
 
 impl RotateElevatorProfile {
-    /// Used only when every number is a sane one.
+    /// Used only when every number is a sane one. A stiff spring flying is
+    /// held against a large nose-up base (the Zibo's -1.5 at 0.225 per
+    /// degree), so the base may go to -2 where `air_per_deg` is declared.
     pub fn valid(self) -> Option<Self> {
+        let base_min = if self.air_per_deg.is_some() { -2.0 } else { -0.5 };
         ((30.0..=300.0).contains(&self.ref_kts)
             && (1.0..=200.0).contains(&self.deg_s_per_unit)
             && (0.0..=0.6).contains(&self.breakout)
             && (0.0..=0.1).contains(&self.per_deg)
-            && (-0.5..=0.6).contains(&self.air_base)
+            && self.air_per_deg.is_none_or(|a| (0.0..=0.4).contains(&a))
+            && (base_min..=0.6).contains(&self.air_base)
             && (3.0..=150.0).contains(&self.ground_effect_ft))
             .then_some(self)
     }

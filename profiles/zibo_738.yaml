@@ -648,6 +648,37 @@ takeoff_trim:
 
 # The attitude at which the tail touches: about 11 degrees on the -800.
 tail_strike_deg: 11.0
+# The rotation's elevator (autotakeoff::RotatePitch), fitted to THIS
+# aircraft: the two LEMG 30 rotations of 2026-10-07 the column reached
+# (1791371247 at 45.7 t, rotate 146.7; 1791374430 at 43.7 t, rotate 108.5),
+# the column read back (zibomod's joystick input as the sim holds it) driven
+# through a rate plant from the rotate to 300 ft against the attitude and the
+# height. Flown without a model the nose lagged the 2.5 deg/s ramp by 4 to 6
+# degrees the whole way, the column at 0.1 to 0.4: wheels off 144.5 and 162.6,
+# 8 ft at 153 and 173 kt, 8 to 11 m off the centreline on the long nose-up roll.
+# On the wheels the nose turns 17.0 deg/s per unit of column at 130 kt (as
+# 1/v^2) past a 0.033 breakout and 0.077 per degree it is already up, through
+# a 0.6 s lag (0.10 degree rms). Flying, the spring is the wing's: 0.225 per
+# degree of angle of attack against a -1.5 base (the trim's nose-up), reached
+# by 23.6 ft; both rotations 0.15 degree rms to 300 ft, the height 3.0 and
+# 1.2 ft rms. The spring is taken off by the TRUE path, from the height's
+# rate: the flight model's vertical speed trails it by 1.3 s (432 fpm read at
+# 13 ft climbing 1,145), three degrees of path that are 0.6 of column.
+# Through the fitted plant at a 0.25 s tick: the nose within 0.8 degree of
+# the ramp (1.5 at 0.2 to 0.3 s), wheels off 125.6 and 127.8, 8 ft at 137.8
+# and 139.5 kt (the ramp flown exactly: 135.7 and 137.5; as flown on the
+# plant 150.7 and 152.2), the tail 5 degrees clear on the wheels, the climb
+# 18.6 to 18.9 past its 18 ceiling (as flown 19.0, the ceiling guard's;
+# 18.5 in 1791374430). The rotation rate stays the airline 2.5. Offline only.
+rotate_elevator:
+  ref_kts: 130.0
+  deg_s_per_unit: 17.0
+  breakout: 0.033
+  per_deg: 0.077
+  air_per_deg: 0.225
+  air_base: -1.5
+  ground_effect_ft: 23.6
+  path_from_height: true
 # The yoke: zibomod holds override_joystick_pitch/roll and rewrites the
 # stock yoke ratios every frame, so the plugin's pitch channel reached
 # nothing (LXGB 2026-10-07: full nose-down held 3 s, the nose rose 10 to 22
