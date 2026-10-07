@@ -2028,6 +2028,17 @@ fn the_flight_is_armed_in_a_pilots_words() {
     assert!(one("take us to five thousand feet").is_none_or(|(n, _)| n != "full_auto"));
 }
 
+/// "Autoland runway 31" lands on the named runway; "land at runway 31" stays
+/// the pilot's talk-down (LEMG, 2026-10-07: the nearest was 30, not 31's ILS).
+#[test]
+fn autoland_to_a_named_runway() {
+    assert_eq!(
+        one("autoland runway 31").unwrap(),
+        ("autoland".into(), json!({ "runway": "31" }))
+    );
+    assert_eq!(one("land at runway 31").unwrap().0, "visual_approach");
+}
+
 #[test]
 fn autoland_arm_and_cancel_resolve() {
     assert_eq!(

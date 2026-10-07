@@ -56,6 +56,9 @@ struct Args {
     /// nearest", "emergency landing").
     #[serde(default)]
     nearest: bool,
+    /// A named runway at the field we are at ("autoland runway 31").
+    #[serde(default)]
+    runway: Option<String>,
 }
 
 /// The nearest suitable runway, by the self-pick's own rules and with no
@@ -109,7 +112,8 @@ impl Tool for Autoland {
             "type": "object",
             "properties": {
                 "cancel": {"type": "boolean", "description": "true = disarm/stop the autoland."},
-                "nearest": {"type": "boolean", "description": "true = the nearest suitable runway, not the plan's destination."}
+                "nearest": {"type": "boolean", "description": "true = the nearest suitable runway, not the plan's destination."},
+                "runway": {"type": "string", "description": "A named runway at the field we are at ('autoland runway 31')."}
             }
         })
     }
@@ -169,6 +173,35 @@ impl Tool for Autoland {
         // The plan's destination first, from wherever we are: the climb to
         // the way's floor, the join, its approach. The nearest runway only
         // when asked, or when the planner says why not the destination.
+        // A named runway: the field is the nearest one's, the runway the
+        // pilot's. A designator the field does not have is refused by
+        // autoland's own arm (it names what it could not find).
+        if let Some(rwy) = a.runway.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+            let rwy = if rwy.len() == 1 { format!("0{rwy}") } else { rwy.to_uppercase() };
+            let Some(here) = nearest_runway(ctx, "You asked for a runway.").await else {
+                return Ok("I can't find the field we're at, so I can't pick that runway.".into());
+            };
+            let icao = here.icao.trim().to_string();
+            crate::blackbox::record(
+                "autoland",
+                json!({"event": "named_runway", "icao": icao, "rwy": rwy}),
+            );
+            crate::autoland::run_autoland_scoped(
+                ctx.config.xplane_base_url.clone(),
+                apt_dat_path(),
+                self.cfg.clone(),
+                self.approach_ias,
+                ctx.voice.cloned(),
+                ctx.status.cloned(),
+                Some(crate::autoland::PlannedRunway::at(&icao, &rwy)),
+                ctx.xplane.cancellation(),
+                crate::autoland::HandDown::default(),
+            );
+            return Ok(format!(
+                "Landing at {icao} runway {}. Say 'my controls' to take it back.",
+                atc::atis::spoken_runway(&rwy)
+            ));
+        }
         let mut why_nearest = a.nearest.then(|| "You asked for the nearest.".to_string());
         if why_nearest.is_none() {
             if let Some(planner) = &self.planner {

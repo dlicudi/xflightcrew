@@ -2410,6 +2410,15 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("prepare_ils", json!({ "runway": runway, "couple": couple })));
     }
 
+    // "Autoland runway 31": the crew lands it on a NAMED runway at the field
+    // we are at (the plain "land at runway 31" is the pilot's talk-down
+    // below). Without it autoland could only take the plan's destination or
+    // the nearest, and the nearest at LEMG was 30, not 31's ILS (2026-10-07).
+    if (has(t, "autoland") || t.contains("auto land")) && has(t, "runway") {
+        if let Some(n) = num {
+            return Some(call("autoland", json!({ "runway": n.to_string() })));
+        }
+    }
     // Talk-down: spoken visual-approach guidance to any runway (the approach a
     // procedure-less field like LERL will never have). Cancel words first so
     // "stop the guidance" doesn't re-arm it.

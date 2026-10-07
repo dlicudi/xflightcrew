@@ -14,7 +14,7 @@ cases:
       runway_start: { field: LEMG, runway: 30, engines_running: true }
     command: fly a circuit
     steps:
-      - { say: my controls, when: { agl_above: 2500 }, tool: autopilot_off }
+      - { say: my controls, when: { agl_above: 1800 }, tool: autopilot_off }
       - { say: land at runway 31, when: { after_s: 10 }, tool: visual_approach }
     traffic: off
     deadline_min: 45
