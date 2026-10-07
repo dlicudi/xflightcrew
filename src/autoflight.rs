@@ -408,6 +408,21 @@ pub async fn drive_heading_bug_step(
         return target;
     };
     let full = crate::angles::signed_diff_deg(target, start);
+    // A declared window that takes a write is written, never knobbed: the
+    // Zibo's MCP heading took a write (probed parked), but autoland's knob
+    // presses down LEMG 30's final read back 297 every time against a bug
+    // of 294 to 295; the autopilot flew 297, drifted 28 and 34 m off the
+    // centreline and went around twice (2026-10-07). Stepped by `max_step_deg`
+    // like the knob, so a big turn is still taken a leg at a time.
+    if matches!(panel().window(Dial::HeadingBug), Some(Window::Write { .. })) {
+        if full.abs() < FINE_BUG_MIN_DEG {
+            return start;
+        }
+        let delta = full.clamp(-max_step_deg.abs(), max_step_deg.abs());
+        let leg = ((start + delta) * 10.0).round() / 10.0;
+        let _ = set_dial(xp, Dial::HeadingBug, leg.rem_euclid(360.0)).await;
+        return read_dial(xp, Dial::HeadingBug).await.unwrap_or(leg);
+    }
     // A small correction is set to a tenth of a degree, not pressed: a press
     // is a whole degree and a change under half of one is no press at all,
     // so autoland's final command hovering at 131.5 flipped the bug between
