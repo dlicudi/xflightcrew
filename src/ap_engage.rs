@@ -182,6 +182,16 @@ pub fn fd_commands() -> Vec<String> {
 /// command, never a toggle), then the servos. True when the servo command
 /// was sent, which is not the servos being in.
 pub async fn press(xp: &dyn XPlane, fd: &[String]) -> bool {
+    // A declared CMD switch is a toggle whose lamp ramps in: a retry read
+    // dark half a second after a press would turn off the autopilot that
+    // press engaged (the V/S lesson, LEMG 30, 2026-10-07). The watch keeps
+    // stepping; the press waits out the lamp.
+    let p = crate::autoflight::panel();
+    if p.engage_status.is_some()
+        && crate::autoflight::pressed_within(crate::autoflight::Button::Engage, crate::autoflight::PRESS_SETTLE_S)
+    {
+        return true;
+    }
     for c in fd {
         let _ = xp.run_command(c).await;
     }

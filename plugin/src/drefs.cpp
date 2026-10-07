@@ -470,6 +470,50 @@ static int yoke_route_now() {
     }
     return kYokeStock;
 }
+// The autopilot owns the yoke on the Zibo route. Its tablet's AP YOKE
+// NEUTRAL TOL. (REAL) and YOKE MOVEMENT (CWS) mean a yoke off neutral keeps
+// CMD A from engaging and drops an engaged one to CWS. Autoland held the
+// aircraft level on this channel until the autopilot read engaged, so twenty
+// CMD A presses met a held yoke and none took ("The autopilot will not
+// engage", LEMG 30, 2026-10-07). A crew lets go of the yoke to engage: the
+// channels let go while CMD A or B reads lit, and for kEngageReleaseS after
+// any CMD press, so the press meets a neutral yoke.
+static const float kEngageReleaseS = 1.5f;
+static float g_engage_release_until = -1.0f;
+static XPLMDataRef g_cmd_a_status = nullptr;
+static XPLMDataRef g_cmd_b_status = nullptr;
+static XPLMCommandRef g_cmd_a_press = nullptr;
+static XPLMCommandRef g_cmd_b_press = nullptr;
+static int EngagePressHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
+    if (phase == xplm_CommandBegin) {
+        g_engage_release_until = XPLMGetElapsedTime() + kEngageReleaseS;
+    }
+    return 1;
+}
+// Found and hooked once the airframe has them (zibomod registers them after
+// we load), on the Zibo route only.
+static void hook_engage_once() {
+    if (!g_cmd_a_status) g_cmd_a_status = XPLMFindDataRef("laminar/B738/autopilot/cmd_a_status");
+    if (!g_cmd_b_status) g_cmd_b_status = XPLMFindDataRef("laminar/B738/autopilot/cmd_b_status");
+    if (!g_cmd_a_press) {
+        g_cmd_a_press = XPLMFindCommand("laminar/B738/autopilot/cmd_a_press");
+        if (g_cmd_a_press) XPLMRegisterCommandHandler(g_cmd_a_press, EngagePressHandler, 1, nullptr);
+    }
+    if (!g_cmd_b_press) {
+        g_cmd_b_press = XPLMFindCommand("laminar/B738/autopilot/cmd_b_press");
+        if (g_cmd_b_press) XPLMRegisterCommandHandler(g_cmd_b_press, EngagePressHandler, 1, nullptr);
+    }
+}
+static bool ap_owns_yoke() {
+    if (g_yoke_method != kYokeZiboJoy) return false;
+    hook_engage_once();
+    if (XPLMGetElapsedTime() < g_engage_release_until) return true;
+    const auto lit = [](XPLMDataRef r) {
+        return r && XPLMIsDataRefGood(r) && XPLMGetDataf(r) > 0.5f;
+    };
+    return lit(g_cmd_a_status) || lit(g_cmd_b_status);
+}
+
 static bool joy_route_held() {
     return (g_pitch_applied && g_pitch_route == kYokeZiboJoy)
         || (g_roll_applied && g_roll_route == kYokeZiboJoy);
@@ -901,7 +945,8 @@ static float TaxiAssistLoop(float, float, int, void*) {
     // instead of the pedals.
     const bool pitch_fresh = g_pitch_stamp >= 0.0f
         && XPLMGetElapsedTime() - g_pitch_stamp <= kTaxiBrakeFreshSecs;
-    if (pitch_fresh && !g_pitch_yield) {
+    const bool ap_owns = ap_owns_yoke();
+    if (pitch_fresh && !g_pitch_yield && !ap_owns) {
         if (!g_pitch_applied) {
             g_pitch_axis = -1;
             if (g_joy_axis_assignments) {
@@ -935,7 +980,7 @@ static float TaxiAssistLoop(float, float, int, void*) {
             }
         }
     }
-    if ((!pitch_fresh || g_pitch_yield) && g_pitch_applied) {
+    if ((!pitch_fresh || g_pitch_yield || ap_owns) && g_pitch_applied) {
         g_pitch_applied = false;
         if (g_pitch_route == kYokeZiboJoy) {
             joy_release(g_joy_pitch);
@@ -951,7 +996,7 @@ static float TaxiAssistLoop(float, float, int, void*) {
     // The roll channel: identical discipline, the other yoke axis.
     const bool roll_fresh = g_roll_stamp >= 0.0f
         && XPLMGetElapsedTime() - g_roll_stamp <= kTaxiBrakeFreshSecs;
-    if (roll_fresh && !g_roll_yield) {
+    if (roll_fresh && !g_roll_yield && !ap_owns) {
         if (!g_roll_applied) {
             g_roll_axis = -1;
             if (g_joy_axis_assignments) {
@@ -985,7 +1030,7 @@ static float TaxiAssistLoop(float, float, int, void*) {
             }
         }
     }
-    if ((!roll_fresh || g_roll_yield) && g_roll_applied) {
+    if ((!roll_fresh || g_roll_yield || ap_owns) && g_roll_applied) {
         g_roll_applied = false;
         if (g_roll_route == kYokeZiboJoy) {
             joy_release(g_joy_roll);
@@ -1620,6 +1665,8 @@ void stop_first() {
             if (g_override_roll) XPLMSetDatai(g_override_roll, 0);
         }
     }
+    if (g_cmd_a_press) { XPLMUnregisterCommandHandler(g_cmd_a_press, EngagePressHandler, 1, nullptr); g_cmd_a_press = nullptr; }
+    if (g_cmd_b_press) { XPLMUnregisterCommandHandler(g_cmd_b_press, EngagePressHandler, 1, nullptr); g_cmd_b_press = nullptr; }
     // The loop is gone: no centred hold can count down, so drop it now.
     if (g_joy_drop_frames > 0) joy_drop_now();
     if (g_taxi_steer_dref) { XPLMUnregisterDataAccessor(g_taxi_steer_dref); g_taxi_steer_dref = nullptr; }
