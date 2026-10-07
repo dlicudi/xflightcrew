@@ -14,6 +14,17 @@ its one-line why and its home in the code. Each section's earlier text is in the
 "2026-09-26 trim: <section>" and "2026-10-06 trim: <section>", so any airport, date, number or
 identifier that left this file can still be grepped there.
 
+## Direction (2026-10-07, `docs/tasks/pillars-audit/REPORT.md`)
+
+Three pillars: **copilot + checklists, ATC, AI traffic** (our own, REPLACING LiveTraffic; the
+tower controls it). **The Cessna 172 is the reference airframe**; other profiles stay as they
+are. **Autonomy is FROZEN**: the flying loops (autoland, full_auto, circuit, procedure,
+autotakeoff, autotaxi, taxi_in, pushback, heli_*, recover, reversal...) take crash and safety
+fixes only, no new behaviour, no new airframe work, until it is redesigned in layers on the
+aircraft's own autopilot. "Every miss becomes a rule" is for the grammar, never a flight law.
+Order: stage A (untangle copilot from autonomy, station behind `party_line`), B (command loop),
+C (ATC per-flight strips, `crates/nav`), D (`crates/traffic`).
+
 ## Wire contracts (never rename)
 
 Named 2026-07-30. Three names survived the rename because they are wire contracts:
