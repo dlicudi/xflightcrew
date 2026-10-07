@@ -772,9 +772,7 @@ fn the_follower_never_writes_the_bug_while_lnav_owns_the_lateral() {
 /// LNAV before the bug is written.
 #[test]
 fn the_followers_lateral_writes_are_gated_on_lnav() {
-    let src =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/procedure.rs")).unwrap();
-    let prod = src.split("#[cfg(test)]\nmod ").next().unwrap();
+    let prod = crate::test_support::module_live_source("procedure");
     let lines: Vec<&str> = prod.lines().collect();
     let near = |needle: &str, guard: &str| {
         let i = lines

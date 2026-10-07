@@ -983,7 +983,9 @@ mod tests {
                             let rest = &code[from..];
                             let ident: String = rest.chars().take_while(|c| is_ident(*c)).collect();
                             if DOORS.contains(&ident.as_str()) {
-                                found.push((rel.clone(), format!("{name}::{ident}"), i + 1));
+                                // Keyed by the module: a loop's own files are its parent's.
+                                let key = format!("{}.rs", crate::test_support::namespace_of(std::path::Path::new(&rel)));
+                                found.push((key, format!("{name}::{ident}"), i + 1));
                             }
                         }
                     }

@@ -2033,6 +2033,9 @@ mod tests {
                 continue;
             }
             let rel = f.strip_prefix(&root).unwrap().to_string_lossy().to_string();
+            // The profile schema (`aircraft.rs` and its sections) names the
+            // stock autopilot to declare it, never to act.
+            let profile = rel == "aircraft.rs" || rel.starts_with("aircraft/");
             scanned.push(rel.clone());
             let text = std::fs::read_to_string(&f).unwrap();
             let production = text.split("#[cfg(test)]\nmod ").next().unwrap();
@@ -2071,7 +2074,7 @@ mod tests {
                 ]
                 .iter()
                 .any(|p| code.contains(p));
-                if lit && rel != "aircraft.rs" {
+                if lit && !profile {
                     bad.push(format!("{rel}:{}: literal: {}", i + 1, l.trim()));
                 }
                 if code.contains("autoflight::cmd::") {
@@ -2081,7 +2084,7 @@ mod tests {
                         l.trim()
                     ));
                 }
-                if rel != "aircraft.rs"
+                if !profile
                     && [
                         "TakeoffConfigProfile::CMD_",
                         "TakeoffConfigProfile::SPEED_WINDOW",
@@ -2166,11 +2169,10 @@ mod tests {
             "autoflight::press(xp, Button::VerticalSpeed)",
             1,
         )];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut bad = Vec::new();
         for rel in FILES {
-            let text = std::fs::read_to_string(root.join(rel)).unwrap();
-            let production = text.split("#[cfg(test)]\nmod ").next().unwrap();
+            // The module's live code, its loop's own files included.
+            let production = crate::test_support::module_live_source(rel.trim_end_matches(".rs"));
             let lines: Vec<&str> = production
                 .lines()
                 .map(|l| l.split("//").next().unwrap_or(""))

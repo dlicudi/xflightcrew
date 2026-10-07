@@ -1518,3 +1518,61 @@
         assert_eq!(correction_text("no"), None);
         assert_eq!(correction_text("cancel."), None);
     }
+
+    /// CLAUDE.md "Wire contracts": the default filter names every workspace
+    /// crate's target AND both crew names, the package (the lib's default
+    /// target) and every binary (the bin's). Derived from the Cargo.toml
+    /// files, so a new member or binary without a filter entry fails here,
+    /// not as half a log gone silent.
+    #[test]
+    fn the_log_filter_names_every_crate_and_both_crew_names() {
+        fn read(p: &std::path::Path) -> String {
+            std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+        }
+        // `name = "..."` lines under the given table headers, in order.
+        fn names_under(toml: &str, table: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut inside = false;
+            for l in toml.lines().map(str::trim) {
+                if l.starts_with('[') {
+                    inside = l == table;
+                    continue;
+                }
+                if inside {
+                    if let Some(v) = l.strip_prefix("name").map(str::trim).and_then(|r| r.strip_prefix('=')) {
+                        out.push(v.trim().trim_matches('"').replace('-', "_"));
+                    }
+                }
+            }
+            out
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let top = read(&root.join("Cargo.toml"));
+        let mut targets = names_under(&top, "[package]");
+        assert_eq!(targets, ["xvoicelayer"], "the crew package");
+        let bins = names_under(&top, "[[bin]]");
+        assert!(bins.iter().any(|b| b == "xvl"), "the crew binary: {bins:?}");
+        targets.extend(bins);
+        let members: Vec<String> = {
+            let i = top.find("\nmembers").expect("a workspace members list");
+            let list = &top[i..top[i..].find(']').map(|j| i + j).unwrap()];
+            list.split('"').skip(1).step_by(2).map(str::to_string).collect()
+        };
+        assert!(!members.is_empty());
+        for m in &members {
+            let names = names_under(&read(&root.join(m).join("Cargo.toml")), "[package]");
+            assert_eq!(names.len(), 1, "{m}: one package name");
+            targets.extend(names);
+        }
+        let named: Vec<&str> = super::DEFAULT_LOG_FILTER
+            .split(',')
+            .filter_map(|d| d.split('=').next())
+            .collect();
+        for t in &targets {
+            assert!(
+                named.contains(&t.as_str()),
+                "the default log filter {:?} does not name `{t}`: its default-target lines would go silent",
+                super::DEFAULT_LOG_FILTER
+            );
+        }
+    }

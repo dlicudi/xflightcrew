@@ -355,10 +355,10 @@ mod tests {
         out
     }
 
-    /// `tools/ground.rs` -> `tools::ground`.
+    /// `tools/ground.rs` -> `tools::ground`; a loop's own file its parent
+    /// re-exports whole (`autoland/flare.rs`) is its parent's, `autoland`.
     fn module_path(rel: &Path) -> String {
-        let s = rel.with_extension("").display().to_string();
-        s.replace('/', "::")
+        crate::test_support::namespace_of(rel).replace('/', "::")
     }
 
     #[test]

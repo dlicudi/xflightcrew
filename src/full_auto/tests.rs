@@ -2095,7 +2095,8 @@
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         for f in crate::test_support::rust_files(&root) {
             let rel = f.strip_prefix(&root).unwrap().display().to_string();
-            if crate::test_support::is_test_file(&f) || rel == "full_auto.rs" || rel == "aircraft.rs" {
+            let ours = |m: &str| rel == format!("{m}.rs") || rel.starts_with(&format!("{m}/"));
+            if crate::test_support::is_test_file(&f) || ours("full_auto") || ours("aircraft") {
                 continue;
             }
             let text = std::fs::read_to_string(&f).unwrap();

@@ -460,6 +460,9 @@
                 let Some(rest) = line
                     .strip_prefix("const ")
                     .or_else(|| line.strip_prefix("pub(crate) const "))
+                    // A law moved whole into its module's own file
+                    // (`autoland/flare.rs`) is `pub(super)` for its parent.
+                    .or_else(|| line.strip_prefix("pub(super) const "))
                 else {
                     continue;
                 };

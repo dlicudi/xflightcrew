@@ -34,7 +34,8 @@ Named 2026-07-30. Three names survived the rename because they are wire contract
 - the plugin binary `xcopilot.xpl` (renamed, X-Plane loads BOTH copies and double-registers).
 
 Package `xvoicelayer`, binary `xvl`. The tracing filter names every crate AND both crew names:
-`xvoicelayer=info,xvl=info,atc=info,sim=info` (`src/main.rs`). A line's default target is the BIN
+`xvoicelayer=info,xvl=info,atc=info,sim=info` (`src/main.rs` `DEFAULT_LOG_FILTER`, pinned by
+`the_log_filter_names_every_crate_and_both_crew_names`). A line's default target is the BIN
 name in the binary and the PACKAGE name in the lib: drop either and half the log goes silently while
 explicit-target lines make it look healthy.
 
@@ -373,7 +374,8 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   THE LINE (`ready_for_autoland`). **The turn onto final is sized on the bank flown** (`BankWatch`).
   The glidepath feeds forward `path_descent_fpm` (a P controller cannot track a ramp).
 - **The sim's heading mode never reverses a turn in progress**: every steer goes through
-  `heading_bug::bug_toward`. **The AP's own capture holds level legs where declared**
+  `heading_bug::bug_toward` (`every_heading_bug_write_is_turn_safe`: a direct write is allowlisted
+  with its reason). **The AP's own capture holds level legs where declared**
   (`ap_altitude_capture`).
 - LXGB's authored route joins at the nearest leg (`join_waypoint`) and is terrain-probed on its legs.
 - Full auto: engine start per class (`StartKind`); power-up INLINE (racing bring-ups shut a
