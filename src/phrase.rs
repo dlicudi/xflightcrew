@@ -440,8 +440,11 @@ fn fix_value_mishear(text: &str, garble: &str, fix: &str, leading_only: bool) ->
     }
     if leading_only {
         let trimmed = text.trim_start();
-        let leads = trimmed.len() >= garble.len()
-            && trimmed[..garble.len()].eq_ignore_ascii_case(garble)
+        // Checked slices: a transcript with a multi-byte character where the
+        // garble would end ("í") panicked on a plain byte slice.
+        let leads = trimmed
+            .get(..garble.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(garble))
             && trimmed[garble.len()..]
                 .chars()
                 .next()
@@ -520,6 +523,14 @@ fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leading-only garble ("total", five bytes) against a transcript whose
+    /// fifth byte falls inside a multi-byte character: no panic, no rewrite.
+    #[test]
+    fn a_multibyte_transcript_never_panics_the_mishear_repair() {
+        assert_eq!(fix_mishears("tootá 20 percent"), "tootá 20 percent");
+        assert_eq!(fix_mishears("Total twenty percent."), "throttle twenty percent.");
+    }
 
     #[test]
     fn echo_scores_high_real_command_low() {
