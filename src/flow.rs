@@ -1655,29 +1655,14 @@ pub fn summary_line(
             plural(failed)
         );
     }
-    let mut line = format!(
-        "{title} checklist complete, {discrepancies} item{} not as listed",
+    // The count only: the items themselves are on the checklist card
+    // (`sheet`, the EFB's), item by item. Spoken whole they ran to eleven
+    // items a list into the transcript and the speaker (pilot, 2026-10-07).
+    let _ = not_set;
+    format!(
+        "{title} checklist complete, {discrepancies} item{} not as listed, on the checklist card.",
         plural(discrepancies)
-    );
-    if not_set.is_empty() {
-        line.push('.');
-    } else {
-        let names: Vec<String> = not_set
-            .iter()
-            .map(|s| {
-                let s = s.trim_end_matches('.');
-                let mut c = s.chars();
-                match c.next() {
-                    Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
-                    None => String::new(),
-                }
-            })
-            .collect();
-        line.push_str(": ");
-        line.push_str(&names.join("; "));
-        line.push('.');
-    }
-    line
+    )
 }
 
 enum Acted {
@@ -2400,11 +2385,11 @@ mod tests {
         ];
         assert_eq!(
             summary_line("Climb", Flavour::Monitor, false, 0, 2, &names),
-            "Climb checklist complete, 2 items not as listed: flaps, up on schedule; altimeters, standard at transition."
+            "Climb checklist complete, 2 items not as listed, on the checklist card."
         );
         assert_eq!(
             summary_line("Descent", Flavour::Monitor, false, 0, 1, &names[..1]),
-            "Descent checklist complete, 1 item not as listed: flaps, up on schedule."
+            "Descent checklist complete, 1 item not as listed, on the checklist card."
         );
         // The crew flavour counts failed writes; the instructor counts what
         // the pilot never did (no names: each was said as it happened).
@@ -2414,7 +2399,7 @@ mod tests {
         );
         assert_eq!(
             summary_line("Descent", Flavour::Instruct, false, 0, 3, &[]),
-            "Descent checklist complete, 3 items not as listed."
+            "Descent checklist complete, 3 items not as listed, on the checklist card."
         );
         assert_eq!(
             summary_line("Descent", Flavour::Monitor, true, 0, 1, &names),
