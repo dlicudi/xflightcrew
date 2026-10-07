@@ -1330,7 +1330,7 @@
             let mut w = UnclearedWatch::default();
             radio
                 .iter()
-                .filter_map(|&r| w.step(working, r, false, false).map(|s| (r, s)))
+                .filter_map(|&r| w.step(working, false, r, false, false).map(|s| (r, s)))
                 .collect::<Vec<_>>()
         };
         let steps = run(true);
@@ -1345,15 +1345,22 @@
         assert!(run(false).is_empty());
         // Never on the wheels.
         let mut w = UnclearedWatch::default();
-        assert_eq!(w.step(true, 0.0, true, false), None);
+        assert_eq!(w.step(true, false, 0.0, true, false), None);
         // A missed approach resets the question for the next approach.
         let mut w = UnclearedWatch::default();
-        assert_eq!(w.step(true, 900.0, false, false), Some(UnclearedStep::Ask));
-        assert_eq!(w.step(true, 900.0, false, false), None);
-        assert_eq!(w.step(true, 250.0, false, true), None);
-        assert_eq!(w.step(true, 900.0, false, false), Some(UnclearedStep::Ask));
+        assert_eq!(w.step(true, false, 900.0, false, false), Some(UnclearedStep::Ask));
+        assert_eq!(w.step(true, false, 900.0, false, false), None);
+        assert_eq!(w.step(true, false, 250.0, false, true), None);
+        assert_eq!(w.step(true, false, 900.0, false, false), Some(UnclearedStep::Ask));
         // An unread height is no measurement.
-        assert_eq!(UnclearedWatch::default().step(true, f64::NAN, false, false), None);
+        assert_eq!(UnclearedWatch::default().step(true, false, f64::NAN, false, false), None);
+        // A book still holding our takeoff: asked once, never sent around.
+        let mut w = UnclearedWatch::default();
+        let steps: Vec<_> = radio
+            .iter()
+            .filter_map(|&r| w.step(false, true, r, false, false).map(|s| (r, s)))
+            .collect();
+        assert_eq!(steps, vec![(990.0, UnclearedStep::Ask)]);
     }
 
     #[test]

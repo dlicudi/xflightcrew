@@ -996,7 +996,11 @@ pub enum UnclearedStep {
 /// "continue approach, expect late landing clearance" answer, or a final
 /// report not yet answered); without a tower working us (an uncontrolled
 /// field, no two-way contact) there is nothing to be cleared by and the
-/// watch is silent. Pure.
+/// watch is silent. `departed` is a book still holding our takeoff (a
+/// circuit's tower keeps us): the crew ASKS, since the tower clears a final
+/// report from any state, but never goes around on it, since a tower we
+/// have left would never answer. LEMG 31, 2026-10-07: "autoland runway 31"
+/// out of a circuit landed without a call and was told so. Pure.
 #[derive(Debug, Default)]
 pub struct UnclearedWatch {
     asked: bool,
@@ -1006,6 +1010,7 @@ impl UnclearedWatch {
     pub fn step(
         &mut self,
         working: bool,
+        departed: bool,
         radio_ft: f64,
         on_ground: bool,
         missed: bool,
@@ -1015,10 +1020,10 @@ impl UnclearedWatch {
             self.asked = false;
             return None;
         }
-        if !working || on_ground || !radio_ft.is_finite() {
+        if !(working || departed) || on_ground || !radio_ft.is_finite() {
             return None;
         }
-        if radio_ft <= UNCLEARED_GO_AROUND_FT {
+        if working && radio_ft <= UNCLEARED_GO_AROUND_FT {
             return Some(UnclearedStep::GoAround);
         }
         if radio_ft <= CLEARANCE_QUERY_FT && !self.asked {
@@ -2628,8 +2633,10 @@ fn spawn_autoland(launch: AutolandLaunch) {
                 // again at 1,000 ft, go around at 300 (`UnclearedWatch`).
                 // The tower's hold is judged by the monitor on its own; this
                 // is the crew never landing uncleared (#155).
+                let book = crate::party_line::clearance_state();
                 match runtime.uncleared.step(
-                    crate::party_line::clearance_state() == Some(crate::tower::State::Inbound),
+                    book == Some(crate::tower::State::Inbound),
+                    book == Some(crate::tower::State::TakeoffCleared),
                     radio_ft,
                     on_ground > 0.5,
                     runtime.go_around.active(),

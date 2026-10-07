@@ -160,6 +160,7 @@ pub async fn select(xp: &dyn XPlane, base: String, engines: usize, by: &str) -> 
     let at_off = crate::autoflight::drop_thrust_now(xp, "reverse").await;
     let engines = engines.max(1);
     let hold = crate::aircraft::reverse_hold_command();
+    let held = hold.is_some();
     let lever = match &hold {
         // The airframe's reverse is a held command (the Zibo: its levers undo
         // a beta write; held, the reversers deploy and the lever runs to
@@ -192,8 +193,28 @@ pub async fn select(xp: &dyn XPlane, base: String, engines: usize, by: &str) -> 
             rt.block_on(watcher(XPlaneClient::new(base), engines, hold, &run));
         });
     }
-    lever.map(|l| l <= -0.9)
+    if !held {
+        return lever.map(|l| l <= -0.9);
+    }
+    // A held reverse runs its lever to full in about 3 s, the watcher keeping
+    // the hold: judged at 0.7 s it read -0.15 and "Reverse didn't take" was
+    // said over a reverse that deployed (LEMG 31, 2026-10-07).
+    let mut last = lever;
+    for _ in 0..HELD_SETTLE_POLLS {
+        if last.is_some_and(|l| l <= -0.9) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        if let Some(l) = xp.get_float_array(BETA_REV).await.ok().and_then(|v| v.first().copied()) {
+            last = Some(l);
+        }
+    }
+    last.map(|l| l <= -0.9)
 }
+
+/// Reads of a held reverse's lever, 400 ms apart, before its verdict: its
+/// run to full is about 3 s.
+const HELD_SETTLE_POLLS: usize = 8;
 
 /// Wheels on this long before autoland selects reverse: the mains touch
 /// first, and reverse with the nose still in the air pitches it up. No
