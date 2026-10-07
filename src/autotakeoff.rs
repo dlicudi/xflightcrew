@@ -1356,6 +1356,12 @@ impl ClimbHold {
     }
 }
 
+/// The initial climb speed over V2 on an airframe whose V2 is read off its
+/// card by weight (`aircraft::takeoff_speeds_now`): V2 + 20, the figure the
+/// profiles' `initial_climb_kts` already carry, so the climb hold
+/// ([`ClimbHold`]) flies V2 + 15.
+pub const V2_CLIMB_ADD_KTS: f64 = 20.0;
+
 /// The hold sits this far under the initial climb speed (V2 + 20): V2 + 15.
 pub const CLIMB_HOLD_UNDER_KTS: f64 = 5.0;
 /// The tail's arm behind the main wheels, feet, for the clearance a height
@@ -2802,7 +2808,7 @@ async fn engage_climb(
         if h.is_finite() && v.is_finite() && s.is_finite() && h > 0.5 && v > 0.5 && s > 0.5)
 }
 
-async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
+async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
     // Find the runway under the nose. A full apt.dat pass, seconds — done
     // here, off the tool's reply path.
     let (lat, lon, psi, var) = tokio::join!(
@@ -2948,6 +2954,21 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // The rotation and the climb-out are flown on the plugin's yoke
     // channels: tell it which input this airframe's yoke is.
     crate::yoke::arm(&xp, "autotakeoff").await;
+    // The takeoff speeds for what the aircraft weighs, off the type's card
+    // for the flap it set, where the airframe declares one
+    // (`weight_speeds: takeoff`): Vr, and the initial climb at V2 + 20 (the
+    // climb hold flies V2 + 15 under it). The Zibo at 45.7 t rotated on a
+    // fixed 145 where its FMC's Vr was 111 (LEMG 30, 2026-10-07).
+    if let Some((v, kg)) = crate::aircraft::takeoff_speeds_now(&xp, p.takeoff_flap_ratio).await {
+        crate::blackbox::record(
+            "autotakeoff",
+            serde_json::json!({"event": "speeds_weighed", "weight_kg": kg.round(),
+                "v1": v.v1, "vr": v.vr, "v2": v.v2,
+                "declared_vr": p.vr_kts, "declared_climb": p.initial_climb_kts}),
+        );
+        p.vr_kts = v.vr;
+        p.initial_climb_kts = v.v2 + V2_CLIMB_ADD_KTS;
+    }
     crate::tools::controls::release_park_brake_for_roll(&xp, p.park_brake_valve_set).await;
     tracing::info!(
         icao = %rwy.icao, id = %rwy.id, remaining_m, vr = p.vr_kts, "auto takeoff: rolling"

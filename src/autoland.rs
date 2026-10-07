@@ -1393,6 +1393,23 @@ fn spawn_autoland(launch: AutolandLaunch) {
             // The LANDING configuration's floor, not the clean one: the 737's
             // Vref 145 floored to the clean 167 overflew LFLL 35L twice
             // (2026-09-17; `aircraft::approach_floor_kts`).
+            // The approach speed for what the aircraft weighs NOW, on an
+            // airframe that declares its Vref table (`weight_speeds:`): Vref
+            // with the landing flap plus the additive, as a crew reads it
+            // off the card. The Zibo at 45.7 t flew a fixed 145 where Vref40
+            // was 116 and touched nosewheel first (LEMG 30, 2026-10-07).
+            let approach_ias = match crate::aircraft::approach_kts_now(&xp).await {
+                Some((kts, kg)) => {
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "approach_ias_weighed", "declared": approach_ias,
+                            "kts": kts, "weight_kg": kg.round(),
+                            "floor": crate::aircraft::approach_floor_kts()}),
+                    );
+                    kts
+                }
+                None => approach_ias,
+            };
             let approach_ias = {
                 let floored = crate::aircraft::floored_target(approach_ias, crate::aircraft::approach_floor_kts());
                 if floored > approach_ias {

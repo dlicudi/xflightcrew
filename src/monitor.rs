@@ -1029,6 +1029,11 @@ struct StallSpeed {
     /// (`aircraft::detent_stall_points`): a slatted wing is not a straight
     /// line (the A330's CONF 2 is 139, not 150; EGPF 2026-09-21).
     detent_stall: Vec<(f64, f64)>,
+    /// The weight the stalls above are quoted at
+    /// (`reference.stall_ref_weight_kg`): the band then rides the stall at
+    /// the snapshot's weight ([`crate::aircraft::weight_stall_scale`]).
+    /// `None`, or no weight read, keeps the declared stalls.
+    stall_ref_weight_kg: Option<f64>,
     /// Fires when IAS ≤ this × the flap-adjusted stall speed …
     at_or_below_factor: f64,
     /// … and (if set) still above this × it — the more urgent band owns below.
@@ -1076,7 +1081,8 @@ impl Check for StallSpeed {
             self.vs0_kts,
             &self.detent_stall,
             s.flap_ratio,
-        );
+        ) * crate::aircraft::weight_stall_scale(self.stall_ref_weight_kg, s.all_up_kg)
+            .unwrap_or(1.0);
         // Anticipate: when the speed is washing off, project it forward so the
         // band trips while there's still margin to recover. Only a *decaying*
         // trend counts (`.min(0.0)`), so this can lower the effective speed but
@@ -2561,12 +2567,14 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         // safe flaps-down approach doesn't trip it.
         let vs0 = profile.reference.as_ref().and_then(|r| r.vs0_kts);
         let detent_stall = crate::aircraft::detent_stall_points(profile.flaps.as_ref());
+        let stall_ref_weight_kg = profile.reference.as_ref().and_then(|r| r.stall_ref_weight_kg);
         checks.push(Box::new(StallSpeed {
             id: "airspeed_caution",
             severity: Severity::Caution,
             vs_clean_kts: vs,
             vs0_kts: vs0,
             detent_stall: detent_stall.clone(),
+            stall_ref_weight_kg,
             at_or_below_factor: crate::aircraft::CAUTION_HAND_RATIO,
             above_factor: Some(crate::aircraft::STALL_WARNING_RATIO),
         }));
@@ -2576,6 +2584,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             vs_clean_kts: vs,
             vs0_kts: vs0,
             detent_stall,
+            stall_ref_weight_kg,
             at_or_below_factor: crate::aircraft::STALL_WARNING_RATIO,
             above_factor: None,
         }));
@@ -3297,6 +3306,9 @@ pub async fn run(
             continue;
         }
         if let Some(mut snap) = Snapshot::read(&xp, &drefs).await {
+            // The weight the stall floors ride (`aircraft::speed_floor_kts`),
+            // every tick: a failed read publishes none.
+            crate::aircraft::publish_weight_now(snap.all_up_kg);
             if !pump_tanks.is_empty() {
                 snap.fuel_tanks = read_fuel_tanks(&xp, &pump_tanks, &mut tank_lateral).await;
             }

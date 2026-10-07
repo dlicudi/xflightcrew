@@ -1014,6 +1014,17 @@ pub struct AircraftProfile {
     /// it (`crate::takeoff_trim`). `None` = the generic neutral trim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub takeoff_trim: Option<TakeoffTrimProfile>,
+    /// Reverse selected by HOLDING this command, where the stock reverse
+    /// lever write is undone (`tools::reverse`). `None` = the lever write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse_hold_command: Option<String>,
+    /// The type's speeds BY WEIGHT, from its FCOM tables: Vref per landing
+    /// flap and V1 / Vr / V2 for the takeoff flap ([`WeightSpeedsProfile`]).
+    /// Declared, the approach and the takeoff fly the speeds for what the
+    /// aircraft weighs NOW, as a crew reads them off the card; `None` = the
+    /// fixed `reference:` figures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_speeds: Option<WeightSpeedsProfile>,
     /// Pitch attitude at which this airframe's tail touches the runway,
     /// degrees. The auto-takeoff rotation will not command within a margin of
     /// it. `None` on airframes short enough that elevator authority runs out
@@ -2858,6 +2869,15 @@ pub struct ReferenceProfile {
     pub oil_press_min_psi: Option<f64>,
     #[serde(default)]
     pub oil_press_max_psi: Option<f64>,
+    /// The all-up weight, kg, the declared stall speeds (`vs_clean_kts`,
+    /// `vs0_kts`, every detent's `vs_kts`) are quoted at. Declared, the
+    /// stalls and every floor built on them follow the LIVE weight as
+    /// sqrt(W / this) ([`weight_stall_scale`]): lift goes as V^2, so a wing
+    /// carrying less stalls slower. The Zibo at 45.7 t was floored at 137
+    /// on a 64 t Vso, over the FCOM's Vref40 of 116 (LEMG 30, 2026-10-07).
+    /// `None` = the declared stalls at every weight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_ref_weight_kg: Option<f64>,
 }
 
 /// Taxi pacing, per airframe: the pace on a straight taxiway, and the caps the
@@ -4017,7 +4037,11 @@ pub fn publish_speed_floor(vs_clean_kts: Option<f64>) {
 
 /// The live airframe's speed floor, kts, if its profile declares a clean stall.
 pub fn speed_floor_kts() -> Option<f64> {
-    airframe_facts().speed_floor_kts
+    let f = airframe_facts();
+    match weighed(&f) {
+        Some((s, p)) => speed_floor_for(p.vs_clean_kts.map(|v| v * s)),
+        None => f.speed_floor_kts,
+    }
 }
 
 // The "too slow" ratios over the clean stall, in one place so a change to
@@ -4637,12 +4661,32 @@ pub fn publish_stall_curve(
 
 /// The live airframe's stall table, when its profile declares one.
 pub fn stall_curve() -> Option<StallCurve> {
-    airframe_facts().stall_curve.clone()
+    let f = airframe_facts();
+    match weighed(&f) {
+        Some((s, p)) => {
+            let vs0 = p.reference.as_ref().and_then(|r| r.vs0_kts);
+            stall_curve_for(p.vs_clean_kts.map(|v| v * s), vs0.map(|v| v * s), p.flaps.as_ref())
+                .map(|mut c| {
+                    for k in &mut c.points {
+                        k.1 *= s;
+                    }
+                    c
+                })
+        }
+        None => f.stall_curve.clone(),
+    }
 }
 
 /// The live airframe's landing-configuration floor, kts.
 pub fn approach_floor_kts() -> Option<f64> {
-    airframe_facts().approach_floor_kts
+    let f = airframe_facts();
+    match weighed(&f) {
+        Some((s, p)) => {
+            let vs0 = p.reference.as_ref().and_then(|r| r.vs0_kts);
+            approach_floor_for(vs0.map(|v| v * s), p.vs_clean_kts.map(|v| v * s))
+        }
+        None => f.approach_floor_kts,
+    }
 }
 
 /// The floor for the configuration the aircraft is IN: the clean floor with
@@ -4673,6 +4717,218 @@ pub fn config_floor_kts(flap_ratio: f64) -> Option<f64> {
         (None, Some(landing)) => Some(landing),
         (None, None) => None,
     }
+}
+
+// ---- Speeds by weight ------------------------------------------------------
+// A crew flies the speeds for what the aircraft weighs: the stalls, the floors
+// and Vref move with it, and the takeoff speeds come off the card for the
+// weight. The Zibo at 45.7 t flew its final at a fixed 145 with flaps 40,
+// where the FCOM's Vref40 was 116: flat, nose-down, and on the nosewheel
+// first (LEMG 30, sortie 1791371247, 2026-10-07), and it rotated at 145.
+
+/// How long a published weight is believed, s: the monitor republishes it
+/// every tick, so an older one is a monitor that stopped, not a weight.
+pub const WEIGHT_FRESH_S: f64 = 30.0;
+
+/// What the aircraft weighs, kg, and when it was read: a live reading, not
+/// an airframe fact. The monitor's tick publishes it ([`publish_weight_now`]),
+/// a failed read publishes none, and a new airframe starts without one
+/// (`flight_state::publish_airframe`). Believed only while fresh.
+static WEIGHT_NOW: std::sync::Mutex<Option<(f64, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Publish what the aircraft weighs now, kg (the monitor's tick). `None`
+/// (a failed read) leaves no weight: the declared stalls fly.
+pub fn publish_weight_now(kg: Option<f64>) {
+    let w = kg
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .map(|w| (w, std::time::Instant::now()));
+    *WEIGHT_NOW.lock().unwrap_or_else(|e| e.into_inner()) = w;
+}
+
+/// The published weight, kg, while fresh ([`WEIGHT_FRESH_S`]).
+fn weight_published_kg() -> Option<f64> {
+    WEIGHT_NOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|(_, at)| at.elapsed().as_secs_f64() <= WEIGHT_FRESH_S)
+        .map(|(w, _)| w)
+}
+
+/// The stall scale at the live weight and the profile it applies to, when
+/// the profile quotes its stalls at a weight and a fresh weight is known.
+fn weighed(f: &AirframeFacts) -> Option<(f64, &AircraftProfile)> {
+    let p = f.profile.as_deref()?;
+    Some((profile_stall_scale(p, weight_published_kg())?, p))
+}
+
+/// A profile's stall scale at `weight_kg` ([`weight_stall_scale`] on its
+/// `reference.stall_ref_weight_kg`). Pure.
+pub fn profile_stall_scale(p: &AircraftProfile, weight_kg: Option<f64>) -> Option<f64> {
+    weight_stall_scale(p.reference.as_ref()?.stall_ref_weight_kg, weight_kg)
+}
+
+/// The factor a stall quoted at `ref_kg` takes at `weight_kg`: sqrt(W /
+/// W_ref), lift going as V^2. `None` when either is missing or not a
+/// weight, and for a ratio outside a quarter to four times (a read that is
+/// not an aircraft's weight): the declared stalls then fly, never a guess.
+/// Pure.
+pub fn weight_stall_scale(ref_kg: Option<f64>, weight_kg: Option<f64>) -> Option<f64> {
+    let (r, w) = (ref_kg?, weight_kg?);
+    if !(r.is_finite() && w.is_finite() && r > 0.0 && w > 0.0) {
+        return None;
+    }
+    let ratio = w / r;
+    (0.25..=4.0).contains(&ratio).then(|| ratio.sqrt())
+}
+
+/// The type's speeds by weight (`weight_speeds:`), from its FCOM tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeightSpeedsProfile {
+    /// Vref by landing flap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vref: Option<VrefTable>,
+    /// V1, Vr and V2 for the takeoff flap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeoff: Option<TakeoffSpeedTable>,
+}
+
+/// Vref, kts, by flap handle ratio (rows) and weight in tonnes (columns).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VrefTable {
+    pub weights_t: Vec<f64>,
+    /// Each row's flap handle ratio.
+    pub flaps: Vec<f64>,
+    pub table: Vec<Vec<f64>>,
+    /// The approach speed's additive over Vref, kts; `None` is
+    /// [`VREF_ADDITIVE_KTS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additive_kts: Option<f64>,
+}
+
+/// V1, Vr and V2, kts, by weight in tonnes, for ONE takeoff flap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TakeoffSpeedTable {
+    /// The takeoff flap handle ratio the table is for.
+    pub flap: f64,
+    pub weights_t: Vec<f64>,
+    pub v1: Vec<f64>,
+    pub vr: Vec<f64>,
+    pub v2: Vec<f64>,
+}
+
+/// The approach speed over Vref with the autothrottle off and calm air:
+/// Boeing's standard 5 kt.
+pub const VREF_ADDITIVE_KTS: f64 = 5.0;
+
+/// A speed read off a row by weight: straight between the columns, held at
+/// the table's first and last column outside it (as the type's FMC holds
+/// it). `None` for a malformed row (lengths differ, columns not rising, a
+/// value not a speed) or a weight that is not one. Pure.
+pub fn speed_by_weight(weights_t: &[f64], kts: &[f64], weight_kg: f64) -> Option<f64> {
+    if weights_t.is_empty()
+        || weights_t.len() != kts.len()
+        || !(weight_kg.is_finite() && weight_kg > 0.0)
+        || weights_t.iter().any(|w| !w.is_finite())
+        || weights_t.windows(2).any(|w| w[1] <= w[0])
+        || kts.iter().any(|k| !(k.is_finite() && *k > 0.0))
+    {
+        return None;
+    }
+    let t = weight_kg / 1000.0;
+    let n = weights_t.len();
+    if t <= weights_t[0] {
+        return Some(kts[0]);
+    }
+    if t >= weights_t[n - 1] {
+        return Some(kts[n - 1]);
+    }
+    let i = weights_t.iter().position(|w| *w >= t)?;
+    let (w0, w1, k0, k1) = (weights_t[i - 1], weights_t[i], kts[i - 1], kts[i]);
+    Some(k0 + (k1 - k0) * (t - w0) / (w1 - w0))
+}
+
+/// Vref with the landing flap (the fullest row: the flap every final here
+/// lands with) at `weight_kg`, kts, unrounded. Pure.
+pub fn landing_vref_kts(t: &VrefTable, weight_kg: f64) -> Option<f64> {
+    if t.flaps.len() != t.table.len() {
+        return None;
+    }
+    let row = t
+        .flaps
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.is_finite())
+        .max_by(|a, b| a.1.total_cmp(b.1))?
+        .0;
+    speed_by_weight(&t.weights_t, &t.table[row], weight_kg)
+}
+
+/// The approach speed at `weight_kg`: the landing Vref plus the additive,
+/// whole knots. Pure.
+pub fn approach_kts_at_weight(t: &VrefTable, weight_kg: f64) -> Option<f64> {
+    let add = t
+        .additive_kts
+        .filter(|a| a.is_finite() && *a >= 0.0)
+        .unwrap_or(VREF_ADDITIVE_KTS);
+    landing_vref_kts(t, weight_kg).map(|v| (v + add).round())
+}
+
+/// The takeoff speeds at a weight, whole knots.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TakeoffSpeeds {
+    pub v1: f64,
+    pub vr: f64,
+    pub v2: f64,
+}
+
+/// V1 / Vr / V2 at `weight_kg`, for `takeoff_flap` (the flap the takeoff
+/// sets): `None` when the table is for another flap, so a speed is never
+/// read off the wrong flap's card. Pure.
+pub fn takeoff_speeds_at_weight(
+    t: &TakeoffSpeedTable,
+    takeoff_flap: Option<f64>,
+    weight_kg: f64,
+) -> Option<TakeoffSpeeds> {
+    if !takeoff_flap.is_some_and(|f| (f - t.flap).abs() < 0.01) {
+        return None;
+    }
+    let at = |k: &[f64]| speed_by_weight(&t.weights_t, k, weight_kg).map(f64::round);
+    let s = TakeoffSpeeds {
+        v1: at(&t.v1)?,
+        vr: at(&t.vr)?,
+        v2: at(&t.v2)?,
+    };
+    (s.v1 <= s.vr && s.vr <= s.v2).then_some(s)
+}
+
+/// What the aircraft weighs, read now, kg; `None` on a failed read.
+pub async fn weight_now_kg(xp: &dyn sim::xplane::XPlane) -> Option<f64> {
+    xp.get_float(sim::datarefs::TOTAL_WEIGHT_KG)
+        .await
+        .ok()
+        .filter(|w| w.is_finite() && *w > 0.0)
+}
+
+/// The live airframe's approach speed at what it weighs now, with the weight
+/// it was read at, when it declares a Vref table and the weight reads;
+/// `None` keeps the caller's declared figure.
+pub async fn approach_kts_now(xp: &dyn sim::xplane::XPlane) -> Option<(f64, f64)> {
+    let t = live_profile()?.weight_speeds.as_ref()?.vref.clone()?;
+    let w = weight_now_kg(xp).await?;
+    approach_kts_at_weight(&t, w).map(|k| (k, w))
+}
+
+/// The live airframe's takeoff speeds at what it weighs now, with the
+/// weight, when it declares a takeoff table for `takeoff_flap` and the
+/// weight reads; `None` keeps the declared figures.
+pub async fn takeoff_speeds_now(
+    xp: &dyn sim::xplane::XPlane,
+    takeoff_flap: Option<f64>,
+) -> Option<(TakeoffSpeeds, f64)> {
+    let t = live_profile()?.weight_speeds.as_ref()?.takeoff.clone()?;
+    let w = weight_now_kg(xp).await?;
+    takeoff_speeds_at_weight(&t, takeoff_flap, w).map(|s| (s, w))
 }
 
 /// The least thrust the autoland holds on a stabilised final, as a lever
@@ -4822,6 +5078,11 @@ pub struct TakeoffTrimProfile {
     pub cg: Vec<f64>,
     pub weights_t: Vec<f64>,
     pub table: Vec<Vec<f64>>,
+}
+
+/// The live airframe's reverse-hold command, when it declares one.
+pub fn reverse_hold_command() -> Option<String> {
+    live_profile().and_then(|p| p.reverse_hold_command.clone())
 }
 
 /// The live airframe's takeoff trim table, when it declares one.
@@ -5186,7 +5447,9 @@ fn cessna_172sp() -> AircraftProfile {
     };
     AircraftProfile {
         id: "cessna_172sp".into(),
+        reverse_hold_command: None,
         takeoff_trim: None,
+        weight_speeds: None,
         throttle_hardware_axis: None,
         yoke_input: None,
         display_name: "Cessna 172SP Skyhawk".into(),
@@ -5450,6 +5713,7 @@ fn cessna_172sp() -> AircraftProfile {
             oil_temp_max_f: Some(245.0),
             oil_press_min_psi: Some(50.0),
             oil_press_max_psi: Some(90.0),
+            stall_ref_weight_kg: None,
         }),
         checklist: Some("checklists/cessna_172sp.txt".into()),
         checklist_map: {
@@ -5561,7 +5825,9 @@ fn cirrus_sr22() -> AircraftProfile {
     };
     AircraftProfile {
         id: "cirrus_sr22".into(),
+        reverse_hold_command: None,
         takeoff_trim: None,
+        weight_speeds: None,
         throttle_hardware_axis: None,
         yoke_input: None,
         display_name: "Cirrus SR22".into(),
@@ -5855,6 +6121,7 @@ fn cirrus_sr22() -> AircraftProfile {
             oil_temp_max_f: None,
             oil_press_min_psi: None,
             oil_press_max_psi: None,
+            stall_ref_weight_kg: None,
         }),
         checklist: Some("checklists/cirrus_sr22.txt".into()),
         // Lights — datarefs verified against the rustdecks SR22 deck; universal
@@ -5959,3 +6226,8 @@ mod vmo_tests;
 /// #12, #13): one home each, pinned here.
 #[cfg(test)]
 mod one_rule_tests;
+
+/// The speeds by weight (`weight_speeds:`, `reference.stall_ref_weight_kg`),
+/// pinned on the Zibo's card (LEMG 30, 2026-10-07).
+#[cfg(test)]
+mod weight_speeds_tests;

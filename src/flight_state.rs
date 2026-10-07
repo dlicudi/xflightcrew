@@ -44,6 +44,9 @@ use crate::aircraft::AircraftProfile;
 /// (systems, masks, the altimeter truth, anti-ice claims) and the mission.
 pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::aircraft::install_airframe_facts(airframe_facts(p));
+    // The weight the stalls ride was the last airframe's: the declared
+    // stalls fly until the monitor's next tick weighs this one.
+    crate::aircraft::publish_weight_now(None);
     // The systems survey is the detector's, from the sim; a new airframe
     // starts knowing nothing about its avionics.
     crate::systems::publish(None);

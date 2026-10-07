@@ -34,6 +34,10 @@ const MS_TO_KTS: f64 = 1.943_844;
 const FULL_REVERSE: f64 = -2.0;
 /// Stow (back to ground idle) as groundspeed decays through this.
 pub const STOW_KTS: f64 = 25.0;
+/// One hold of a declared reverse command, s; re-held every
+/// [`HOLD_REISSUE_S`] so the holds overlap and the lever never leaves full.
+const HOLD_CHUNK_S: f64 = 1.5;
+const HOLD_REISSUE_S: f64 = 1.0;
 /// Below this there's no rollout to slow — refuse to engage.
 const MIN_ENGAGE_KTS: f64 = 5.0;
 
@@ -155,12 +159,21 @@ pub async fn select(xp: &dyn XPlane, base: String, engines: usize, by: &str) -> 
     }
     let at_off = crate::autoflight::drop_thrust_now(xp, "reverse").await;
     let engines = engines.max(1);
-    glide_levers(xp, engines, FULL_REVERSE, 400).await;
-    let lever = xp
-        .get_float_array(BETA_REV)
-        .await
-        .ok()
-        .and_then(|v| v.first().copied());
+    let hold = crate::aircraft::reverse_hold_command();
+    let lever = match &hold {
+        // The airframe's reverse is a held command (the Zibo: its levers undo
+        // a beta write; held, the reversers deploy and the lever runs to
+        // full in about 3 s, stowing on release; probed parked 2026-10-07).
+        Some(cmd) => {
+            let _ = xp.run_command_for(cmd, HOLD_CHUNK_S).await;
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            xp.get_float_array(BETA_REV).await.ok().and_then(|v| v.first().copied())
+        }
+        None => {
+            glide_levers(xp, engines, FULL_REVERSE, 400).await;
+            xp.get_float_array(BETA_REV).await.ok().and_then(|v| v.first().copied())
+        }
+    };
     crate::blackbox::record(
         "reverse",
         json!({"event": "selected", "by": by, "engines": engines,
@@ -176,10 +189,10 @@ pub async fn select(xp: &dyn XPlane, base: String, engines: usize, by: &str) -> 
             else {
                 return;
             };
-            rt.block_on(watcher(XPlaneClient::new(base), engines, &run));
+            rt.block_on(watcher(XPlaneClient::new(base), engines, hold, &run));
         });
     }
-    lever.map(|l| l <= -1.0)
+    lever.map(|l| l <= -0.9)
 }
 
 /// Wheels on this long before autoland selects reverse: the mains touch
@@ -228,9 +241,10 @@ async fn glide_levers(xp: &dyn XPlane, engines: usize, to: f64, over_ms: u64) {
 
 /// The rollout watcher: stow at taxi speed or on liftoff, yield to the pilot's
 /// hand, glide to idle on any exit except a pilot override.
-async fn watcher(xp: XPlaneClient, engines: usize, run: &sim::run::Lease<'_>) {
+async fn watcher(xp: XPlaneClient, engines: usize, hold: Option<String>, run: &sim::run::Lease<'_>) {
     tracing::info!("reverse thrust in, watcher started");
     let mut pilot_has_levers = false;
+    let mut last_hold = std::time::Instant::now();
     loop {
         // Released by voice ("cancel reverse" / "my throttle") — stow and go.
         if !run.live() {
@@ -243,8 +257,10 @@ async fn watcher(xp: XPlaneClient, engines: usize, run: &sim::run::Lease<'_>) {
             .and_then(|v| v.first().copied())
             .unwrap_or(FULL_REVERSE);
         // A lever found well out of reverse is the PILOT stowing by hand —
-        // yield, and don't move what's now theirs.
-        if lever > -0.8 {
+        // yield, and don't move what's now theirs. Not on a held command:
+        // the lever reads 0 while the reversers deploy, and a hand there is
+        // the pilot's own "cancel reverse".
+        if hold.is_none() && lever > -0.8 {
             tracing::info!("reverse thrust: pilot has the levers, yielding");
             pilot_has_levers = true;
             run.lower_flag();
@@ -261,10 +277,18 @@ async fn watcher(xp: XPlaneClient, engines: usize, run: &sim::run::Lease<'_>) {
             run.lower_flag();
             break;
         }
+        // A held command is re-held before the last hold runs out.
+        if let Some(cmd) = &hold {
+            if last_hold.elapsed().as_secs_f64() >= HOLD_REISSUE_S {
+                let _ = xp.run_command_for(cmd, HOLD_CHUNK_S).await;
+                last_hold = std::time::Instant::now();
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    // A watcher superseded by a newer reverse leaves the levers to it.
-    if !pilot_has_levers && run.current() {
+    // A watcher superseded by a newer reverse leaves the levers to it. A
+    // held command stows itself as its last hold runs out.
+    if hold.is_none() && !pilot_has_levers && run.current() {
         glide_levers(&xp, engines, 0.0, 400).await;
     }
     tracing::info!("reverse thrust stowed, watcher stopped");

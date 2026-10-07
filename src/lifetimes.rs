@@ -28,6 +28,7 @@
 pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("aircraft::AIRFRAME_FACTS", 'A'),
     ("aircraft::TAKEOFF_MARGIN_WAIVED", 'M'),
+    ("aircraft::WEIGHT_NOW", 'A'),
     ("answers::NEXT", 'C'),
     ("approach_guide::GUIDE", 'L'),
     ("auto_status::AP_TARGETS", 'L'),

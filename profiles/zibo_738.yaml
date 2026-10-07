@@ -102,9 +102,15 @@ speedbrake_lever:
   flight: 0.667
   full: 1.0
 # The Zibo's reversers are its own levers (flt_ctrls/reverse_lever1/2) under
-# override_throttles: the stock beta/reverse write is not expected to reach
-# them. Off until probed.
-reverse_thrust: false
+# override_throttles. Probed parked 2026-10-07, engines idle, brake set: a
+# stock beta write of -1.5 read straight back 0 (undone), while HOLDING
+# sim/engines/thrust_reverse_hold deployed them (0.69, then 1.0), ran the
+# lever 0.09 to 0.71 and N1 19 to 70 % in about 3 s, and released stowed
+# them. So reverse is that command, held (`tools::reverse`, re-held each
+# second while due). Unflown.
+reverse_thrust: true
+rollout_reverse: true
+reverse_hold_command: sim/engines/thrust_reverse_hold
 # The Zibo owns its altimeters. Probed parked 2026-10-06: a stock dial write
 # is undone, `laminar/B738/EFIS/baro_sel_in_hg_pilot` is read-only (HTTP 400),
 # the stock `sim/instruments/barometer_up` does nothing, and ONE press of its
@@ -586,8 +592,9 @@ transponder_mode_knob:
 
 # Vmo 340 KIAS (Mmo 0.82), the placard (the acf's 400 is not).
 vne_kts: 340.0
-# The type's clean stall at mid weight (the stock profile's 139); the acf's
-# 110 is a light-weight arc, not a floor to fly.
+# The type's clean stall at mid weight (the stock profile's 139, quoted at
+# `reference.stall_ref_weight_kg`); the acf's 110 is a light-weight arc, not
+# a floor to fly.
 vs_clean_kts: 139.0
 # Gear operating limit (retract 235; the acf's Vle 270 is the extended limit).
 vlo_kts: 235.0
@@ -760,6 +767,12 @@ reference:
   enroute_descent_fpm: 2000.0
   approach_kts: 145.0
   vs0_kts: 114.0               # the type's landing-configuration stall (acf says 100)
+  # The weight the stalls above are quoted at: Vso 114 x 1.23 is the FCOM's
+  # Vref40 of 140, which the table below gives at 64 t. The stalls, the
+  # floors (1.2 Vs) and the monitor's bands ride the live weight as
+  # sqrt(W / 64 t): at 45.7 t Vso is 96, the landing floor 116 under the
+  # approach's 121 (it was 137 over a Vref of 116, LEMG 30, 2026-10-07).
+  stall_ref_weight_kg: 64000.0
   cruise_kts: 450.0
   max_gross_lb: 174700.0       # acf _m_max
   empty_weight_lb: 92670.0     # acf _m_empty
@@ -772,6 +785,32 @@ reference:
   takeoff_roll_ft: 5500.0      # CHECKED: the type's mid-weight ground roll
   landing_distance_ft: 5360.0
   landing_roll_ft: 2600.0
+
+# The speeds BY WEIGHT, the 737-800's FCOM cards as the aircraft's own FMC
+# computes them (B738.calc.lua: `vref_calc` for the -800, `vref30_40`; the
+# takeoff's `v1_dry` / `vr_dry` / `v2_dry` at 26K, flaps 5, dry, the FMC's
+# straight line between columns, held at the table's ends). The approach
+# flies Vref40 + 5 at the weight read as autoland arms (and the circuit as
+# it starts); the takeoff rotates at Vr and climbs at V2 + 20 (the hold
+# V2 + 15) at the weight read as the brakes come off. The FMC's altitude and
+# temperature corrections are not applied: at sea level and ISA they are
+# zero, at LEMG's 52 ft they are under a knot (Vr +1, V2 -1 per 2,000 ft).
+# LEMG 30, 2026-10-07, 45.7 t: the fixed 145 for both. The card: Vref40 116,
+# approach 121; V1 110, Vr 111, V2 127.
+weight_speeds:
+  vref:
+    weights_t: [40, 45, 50, 55, 60, 65, 70, 75, 80, 85]
+    flaps: [0.625, 0.875, 1.0]          # 15, 30, 40
+    table:
+      - [121, 128, 136, 143, 149, 156, 161, 167, 172, 177]
+      - [115, 122, 129, 136, 142, 148, 153, 158, 163, 168]
+      - [108, 115, 122, 128, 135, 141, 146, 151, 155, 160]
+  takeoff:
+    flap: 0.375                         # flaps 5, `flaps.takeoff_ratio`
+    weights_t: [40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90]
+    v1: [101, 109, 116, 123, 129, 135, 141, 147, 152, 157, 161]
+    vr: [102, 110, 117, 124, 131, 137, 143, 148, 154, 159, 163]
+    v2: [120, 126, 132, 137, 143, 147, 152, 156, 160, 164, 168]
 
 # Nine positions in the aircraft file (`_flap_detents` 8), the 737's
 # UP/1/2/5/10/15/25/30/40 handle gates, at eighths of the stock handle

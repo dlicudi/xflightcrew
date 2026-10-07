@@ -1840,6 +1840,7 @@
             vs_clean_kts: 175.0,
             vs0_kts: Some(125.0),
             detent_stall: Vec::new(),
+            stall_ref_weight_kg: None,
             at_or_below_factor: 1.20,
             above_factor: Some(1.10),
         };
@@ -1861,6 +1862,40 @@
         assert!(caution.eval(&s).is_some(), "160 in CONF 2 is 1.15 x 139");
     }
 
+    /// The Zibo at 45.7 t on its 121 kt final with flaps 40 (LEMG 30,
+    /// 2026-10-07): its Vso of 114 is quoted at 64 t, so the hand-flown
+    /// caution band (1.1 to 1.2 Vso, 125 to 137) called a whole range of
+    /// approach speeds slow, and 121 sat in the WARNING band. At the weight
+    /// read the stall is 96 and the caution band 106 to 116: silent at 121,
+    /// called at 112. No weight read keeps the declared stall.
+    #[test]
+    fn the_stall_band_rides_the_weight() {
+        let caution = StallSpeed {
+            id: "c",
+            severity: Severity::Caution,
+            vs_clean_kts: 139.0,
+            vs0_kts: Some(114.0),
+            detent_stall: Vec::new(),
+            stall_ref_weight_kg: Some(64_000.0),
+            at_or_below_factor: crate::aircraft::CAUTION_HAND_RATIO,
+            above_factor: Some(crate::aircraft::STALL_WARNING_RATIO),
+        };
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.agl_ft = 500.0;
+        s.flap_ratio = 1.0;
+        s.ias_trend_kts_per_s = 0.0;
+        s.ias_kts = 130.0;
+        s.all_up_kg = None;
+        assert!(caution.eval(&s).is_some(), "the declared Vso calls 130 slow");
+        s.all_up_kg = Some(45_700.0);
+        assert!(caution.eval(&s).is_none(), "at 45.7 t, 130 is fast");
+        s.ias_kts = 121.0;
+        assert!(caution.eval(&s).is_none(), "at 45.7 t, 121 is Vref + 5");
+        s.ias_kts = 112.0;
+        assert!(caution.eval(&s).is_some(), "112 is under 1.2 x 96");
+    }
+
     #[test]
     fn airspeed_bands_and_flare_and_ground_suppression() {
         // Vs=48 clean → caution ≤57.6 (and >52.8), warning ≤52.8.
@@ -1870,6 +1905,7 @@
             vs_clean_kts: 48.0,
             vs0_kts: None,
             detent_stall: Vec::new(),
+            stall_ref_weight_kg: None,
             at_or_below_factor: 1.20,
             above_factor: Some(1.10),
         };
@@ -1879,6 +1915,7 @@
             vs_clean_kts: 48.0,
             vs0_kts: None,
             detent_stall: Vec::new(),
+            stall_ref_weight_kg: None,
             at_or_below_factor: 1.10,
             above_factor: None,
         };

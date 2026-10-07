@@ -3898,7 +3898,19 @@ fn stand_down(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &'st
     alert(voice, Priority::Caution, line);
 }
 
-async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params) {
+async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, mut p: Params) {
+    // The approach speed for what the aircraft weighs now, where the
+    // airframe declares its Vref table (`aircraft::approach_kts_now`): base,
+    // final and the hand-down to autoland are built on it, not on a fixed
+    // mid-weight figure.
+    if let Some((kts, kg)) = crate::aircraft::approach_kts_now(&xp).await {
+        crate::blackbox::record(
+            "circuit",
+            serde_json::json!({"event": "approach_ias_weighed", "declared": p.approach_ias,
+                "kts": kts, "weight_kg": kg.round()}),
+        );
+        p.approach_ias = kts;
+    }
     // `base_url` is kept owned so each sub-loop gets its own client for its own
     // thread (the takeoff loop and the autoland loop each run on one).
     // The departure runway — its course drives every leg heading. Fit it from
