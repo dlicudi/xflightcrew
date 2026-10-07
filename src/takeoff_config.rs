@@ -110,6 +110,14 @@ pub fn thrust_reduction() -> Option<ThrustReduction> {
     Some(ThrustReduction { agl_ft, lever })
 }
 
+/// The declared thrust reduction height alone, for an airframe that flies
+/// its climb thrust to N1 (`takeoff_thrust:`) rather than to a lever.
+pub fn thrust_reduction_agl_ft() -> Option<f64> {
+    airframe()?
+        .thrust_reduction_agl_ft
+        .filter(|h| h.is_finite() && *h > 0.0)
+}
+
 /// What was set, and what would not go.
 #[derive(Debug, Default, PartialEq)]
 pub struct Outcome {
@@ -145,6 +153,24 @@ pub async fn set_for_takeoff(
     flap_ratio: Option<f64>,
     level_ft: Option<f64>,
     wait_flaps: bool,
+) -> Outcome {
+    // The takeoff thrust rating for the weight, for its trim table
+    // (`takeoff_thrust:`); the roll's own call names the one it flies.
+    let rating = match crate::aircraft::takeoff_thrust() {
+        Some(t) => crate::takeoff_thrust::rating_now(xp, &t).await,
+        None => None,
+    };
+    set_for_takeoff_rated(xp, flap_ratio, level_ft, wait_flaps, rating.as_deref()).await
+}
+
+/// [`set_for_takeoff`] for the takeoff thrust rating the roll will fly
+/// (`None`: the base trim table).
+pub async fn set_for_takeoff_rated(
+    xp: &dyn XPlane,
+    flap_ratio: Option<f64>,
+    level_ft: Option<f64>,
+    wait_flaps: bool,
+    rating: Option<&str>,
 ) -> Outcome {
     let mut out = Outcome::default();
     let af = airframe().unwrap_or_default();
@@ -183,7 +209,7 @@ pub async fn set_for_takeoff(
 
     // The type's table where the airframe declares it, as a crew sets the
     // stabilizer; else the generic band.
-    if let Some(t) = crate::aircraft::takeoff_trim() {
+    if let Some(t) = crate::aircraft::takeoff_trim().map(|t| t.for_rating(rating)) {
         match crate::takeoff_trim::set(xp, &t).await {
             Some(crate::takeoff_trim::Setting::Set { now, .. }) => {
                 out.set.push(format!("trim {now:.1}"));
@@ -262,7 +288,8 @@ pub async fn set_for_takeoff(
     crate::blackbox::record(
         "autotakeoff",
         serde_json::json!({"event": "takeoff_config", "set": out.set,
-                           "not_taken": out.not_taken, "waited_flaps": wait_flaps}),
+                           "not_taken": out.not_taken, "waited_flaps": wait_flaps,
+                           "rating": rating}),
     );
     out
 }

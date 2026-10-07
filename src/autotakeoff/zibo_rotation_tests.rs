@@ -118,6 +118,9 @@ struct ZiboRotation {
     /// spring (robustness).
     k_mult: f64,
     spring_mult: f64,
+    /// The thrust as a share of the levers at 1.0 (104 % N1): 1.0 is every
+    /// flown roll here.
+    thrust: f64,
 }
 
 /// The flying half of the fit. Its spring and base are found together (the
@@ -167,6 +170,13 @@ impl ZiboRotation {
     /// The write's delay past the law's tick, seconds (the fit put the
     /// whole of the lag in `TAU_S`; this is margin).
     const DELAY_S: f64 = 0.1;
+    /// Drag and friction's share of the full-thrust acceleration at 43.7 t,
+    /// kt/s: the levers at 1.0 are about 29K a side (the 27K table's 100.8
+    /// at 15 C on the field, as N1^2.3, to 104), 0.49 g at 43.7 t through
+    /// the lapse to 150 kt, against the 7.2 kt/s (0.38 g) the roll made
+    /// there. The flown climbs check it: at 168 kt and 48 t this plant
+    /// climbs 4,500 fpm gaining a knot a second, the engages 4,600 to 4,700.
+    const DRAG_KTS_S: f64 = 2.2;
 
     fn new(v: f64, weight_t: f64) -> Self {
         ZiboRotation {
@@ -182,6 +192,7 @@ impl ZiboRotation {
             air: Air::FIT,
             k_mult: 1.0,
             spring_mult: 1.0,
+            thrust: 1.0,
         }
     }
 
@@ -207,8 +218,12 @@ impl ZiboRotation {
     /// Takeoff thrust's acceleration: 8.4 kt/s at 110 kt (1791374430's roll),
     /// 7.2 at 150 (1791371247's), less the climb's share of the weight.
     /// Heavier, it gains as the weight would have it.
+    /// Less thrust (`thrust` under 1.0) gives up its share of the thrust
+    /// alone, never the drag's: [`Self::DRAG_KTS_S`] of the 8.4 is drag and
+    /// rolling friction.
     fn accel_kts_s(&self) -> f64 {
-        (8.4 - 0.03 * (self.v - 110.0)) * 43.7 / self.weight_t
+        let full = 8.4 - 0.03 * (self.v - 110.0);
+        (self.thrust * (full + Self::DRAG_KTS_S) - Self::DRAG_KTS_S) * 43.7 / self.weight_t
             - 19.06 * self.path_deg().to_radians().sin()
     }
 
@@ -348,6 +363,10 @@ struct Flown {
     /// Turns of the attitude, up to down or back, of more than 0.3 degree,
     /// from 8 ft on: one is the nose stopping at the climb attitude.
     turns: usize,
+    /// At 300 ft, the autopilot's engage: the climb the flight model reads
+    /// (what `ClimbVs` hands the autopilot), fpm, and the airspeed.
+    engage_fpm: f64,
+    engage_kts: f64,
 }
 
 /// Flies `law` against the plant from the rotate at its airspeed, at `tick`
@@ -431,6 +450,8 @@ fn fly(mut law: RotatePitch, mut plant: ZiboRotation, tick: f64, seed: u32) -> F
         max_theta_wheels: max_wheels,
         max_theta,
         turns,
+        engage_fpm: plant.vs_read,
+        engage_kts: plant.v,
     }
 }
 
@@ -564,6 +585,69 @@ fn the_zibo_rotation_survives_a_plant_not_as_fitted() {
                 }
             }
         }
+    }
+}
+
+/// The thrust's share of the levers at 1.0 for an N1, the CFM56's thrust
+/// going as N1^2.3 near the top (the 27K and 22K tables' 100.8 and 91.6 at
+/// 15 C on the field are 27/22 thrust).
+fn thrust_at_n1(n1: f64) -> f64 {
+    (n1 / 104.0).powf(2.3)
+}
+
+/// "It still felt steep": the levers at 1.0 (104 % N1) and the 18 degree
+/// climb attitude handed the light Zibo's autopilot 4,500 to 4,700 fpm at
+/// its 300 ft engage (LEMG, 2026-10-07; this plant 4,100 to 4,200 at 18).
+/// On the declared law (`takeoff_thrust:`, `climb_pitch_max_deg`) a 44 to
+/// 46 t takeoff from LEMG's 3,200 m at 15 C is 22K at an assumed 60 C, N1
+/// 86.1 (two thirds of the levers' thrust): the same rotation and V2 + 15
+/// hold hand the autopilot 2,000 to 3,000 fpm (on this plant 2,400 and
+/// 2,260) near V2 + 15, at least 900 fpm under the full levers at the same
+/// attitude. A runway with no room for the assumed temperature flies the
+/// 22K's own N1 91.6 into 3,000 fpm or less (2,790 and 2,740).
+#[test]
+fn a_derated_takeoff_hands_the_autopilot_a_sane_climb() {
+    let p: crate::aircraft::AircraftProfile =
+        serde_yaml::from_str(&std::fs::read_to_string("profiles/zibo_738.yaml").unwrap()).unwrap();
+    let law = p.takeoff_thrust.clone().expect("the Zibo declares its takeoff thrust");
+    let ceiling = p.climb_pitch_max_deg.expect("the Zibo declares its climb attitude");
+    // LEMG 13 and what the 26K needs at these weights (the profile's
+    // 5,500 ft roll at its weight, times 1.4), and a runway with room for
+    // the 22K alone.
+    let lemg = crate::takeoff_thrust::RunwayFit { needed_full_m: 1310.0, available_m: 3200.0 };
+    let short = crate::takeoff_thrust::RunwayFit { available_m: 1900.0, ..lemg };
+    for (w, vr, v2) in [(44.0, 108.0, 124.0), (45.7, 111.0, 127.0)] {
+        let fly_at = |n1: f64| {
+            let plant = ZiboRotation {
+                thrust: thrust_at_n1(n1),
+                ..ZiboRotation::new(vr, w)
+            };
+            let law = RotatePitch::with_authority(Some(11.0), -0.5)
+                .with_climb_hold(Some(ClimbHold {
+                    hold_kts: v2 + 15.0,
+                    pitch_max_deg: ceiling,
+                }))
+                .with_rotate_model(Some(zibo_model()));
+            fly(law, plant, 0.25, 1)
+        };
+        let plan = crate::takeoff_thrust::plan(&law, w, 15.0, 50.0, 1000.0, Some(lemg)).unwrap();
+        assert_eq!((plan.rating.as_str(), plan.assumed_c), ("22K", Some(60.0)), "{plan:?}");
+        let rated = crate::takeoff_thrust::plan(&law, w, 15.0, 50.0, 1000.0, Some(short)).unwrap();
+        assert_eq!((rated.rating.as_str(), rated.assumed_c), ("22K", None), "{rated:?}");
+        let full = fly_at(104.0);
+        let atm = fly_at(plan.to_n1);
+        let own = fly_at(rated.to_n1);
+        let case = format!(
+            "{w} t at {ceiling} deg: full {:.0} fpm at {:.0} kt; 22K assumed N1 {:.1}: {:.0} fpm at {:.0} kt; \
+             22K N1 {:.1}: {:.0} fpm at {:.0} kt",
+            full.engage_fpm, full.engage_kts, plan.to_n1, atm.engage_fpm, atm.engage_kts,
+            rated.to_n1, own.engage_fpm, own.engage_kts
+        );
+        assert!((2000.0..=3000.0).contains(&atm.engage_fpm), "{case}");
+        assert!(atm.engage_fpm < full.engage_fpm - 900.0, "{case}");
+        assert!((atm.engage_kts - (v2 + 15.0)).abs() < 10.0, "{case}");
+        assert!((2000.0..=3000.0).contains(&own.engage_fpm), "{case}");
+        assert!((own.engage_kts - (v2 + 15.0)).abs() < 10.0, "{case}");
     }
 }
 
