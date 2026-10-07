@@ -1264,7 +1264,6 @@ static const char* const kStateSources[] = {
     "xcopilot/steer_yield",
     "xcopilot/pitch_yield",
     "xcopilot/roll_yield",
-    "xcopilot/yoke_method",
     "xcopilot/brake_yield",
     "sim/aircraft/overflow/pushback_attached",
     "sim/flightmodel/engine/ENGN_TRQ",
