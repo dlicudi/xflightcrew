@@ -309,6 +309,10 @@ boeing_start:
   # START, START held 2 s and sprung back to ON. 21 % N1 a few seconds later,
   # 100 % in about 30 s. Its generators took only on a HELD press.
   apu_n1: sim/cockpit2/electrical/APU_N1_percent
+  # The generators did NOT take 5 s after 100 % (LEMG 2026-10-07, both
+  # NotTaken: no AC, so the yaw damper and nav lights failed after them);
+  # a minute later they did. The blue APU GEN OFF BUS lamp is the crew's cue.
+  apu_gen_ready: laminar/B738/annunciator/apu_gen_off_bus
   apu_steps:
     - { command: laminar/B738/switch/battery_dn, position: laminar/B738/electric/battery_pos, want: 1 }
     - { command: laminar/B738/toggle_switch/fuel_pump_lft1, position: laminar/B738/fuel/fuel_tank_pos_lft1, want: 1 }

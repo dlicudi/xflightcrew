@@ -2425,6 +2425,11 @@ pub struct BoeingStartProfile {
     pub apu_n1: Option<String>,
     #[serde(default = "apu_ready_n1_default")]
     pub apu_ready_n1: f64,
+    /// The lamp that says the APU will take the bus (the 737's blue APU GEN
+    /// OFF BUS), waited on, lit, before the generators are pressed. `None` =
+    /// a fixed pause after `apu_ready_n1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apu_gen_ready: Option<String>,
     /// Once the APU runs, every start: its generators and its bleed, read
     /// before fire (the Zibo's generator switches need a HELD press).
     #[serde(default)]

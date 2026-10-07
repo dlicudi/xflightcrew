@@ -1418,11 +1418,20 @@ impl BoeingStart {
                     );
                 }
             }
-            // Its generators would not take the instant it reached speed.
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Its generators would not take the instant it reached speed:
+            // 5 s after it was not enough for the Zibo's (both NotTaken, so
+            // no AC for the yaw damper and the nav lights, LEMG
+            // 2026-10-07). Where the airframe has the lamp, wait for it.
+            let lamp = match self.p.apu_gen_ready.as_deref() {
+                Some(name) => Some(wait_lamp_lit(xp, name, Duration::from_secs(60)).await),
+                None => {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    None
+                }
+            };
             crate::blackbox::record(
                 "boeing_start",
-                serde_json::json!({"event": "apu", "detail": {"ready": true}}),
+                serde_json::json!({"event": "apu", "detail": {"ready": true, "gen_lamp": lamp}}),
             );
             say("A.P.U. running.");
         }
@@ -1541,6 +1550,22 @@ impl Tool for BoeingStart {
     }
 }
 
+/// Wait for a lamp to read lit (above half bright), polled each second up
+/// to `limit`. True when it lit; false at the limit (the press then runs and
+/// reads back whatever it gets).
+async fn wait_lamp_lit(xp: &dyn crate::xplane::XPlane, name: &str, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if xp.get_float(name).await.is_ok_and(|v| v > 0.5) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 #[cfg(test)]
 mod boeing_start_tests {
     use super::*;
@@ -1581,8 +1606,24 @@ mod boeing_start_tests {
             apu_steps: vec![],
             apu_n1: None,
             apu_ready_n1: 95.0,
+            apu_gen_ready: None,
             apu_power_steps: vec![],
         }
+    }
+
+    /// The generators wait for the APU's own lamp (the Zibo's took 5 s after
+    /// 100 % too early, LEMG 2026-10-07): lit returns at once, unlit waits
+    /// out the limit and lets the press read back what it gets.
+    #[tokio::test(start_paused = true)]
+    async fn the_apu_generators_wait_for_the_gen_off_bus_lamp() {
+        let xp = FakeXPlane::new();
+        xp.set_read("gen_off_bus", 0.75);
+        assert!(wait_lamp_lit(&xp, "gen_off_bus", Duration::from_secs(60)).await);
+        let xp = FakeXPlane::new();
+        xp.set_read("gen_off_bus", 0.0);
+        let t0 = tokio::time::Instant::now();
+        assert!(!wait_lamp_lit(&xp, "gen_off_bus", Duration::from_secs(60)).await);
+        assert!(t0.elapsed() >= Duration::from_secs(60));
     }
 
     /// A parked 737 with the APU's bleed on: starters at AUTO, levers at
