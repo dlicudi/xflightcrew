@@ -292,7 +292,7 @@ impl WorldTick {
                             // controller call — an unaddressed "exit
                             // the runway" reads as talking to nobody
                             // (pilot feedback, 2026-07-10).
-                            let callsign = crate::circuit::crew_callsign(&xp)
+                            let callsign = crate::crew_radio::crew_callsign(&xp)
                                 .await
                                 .unwrap_or_else(|| "aircraft on the runway".to_string());
                             let line = if urgent {
@@ -741,7 +741,7 @@ impl WorldTick {
                     );
                     let speaker = com1.and_then(crate::station::tuned_controller);
                     if let Some(who) = speaker {
-                        let callsign = crate::circuit::crew_callsign(&xp)
+                        let callsign = crate::crew_radio::crew_callsign(&xp)
                             .await
                             .unwrap_or_else(|| "traffic alert".to_string());
                         let line =
@@ -812,7 +812,7 @@ impl WorldTick {
                     // callsign; otherwise read the tail number.
                     let callsign = match &vectored {
                         Some(c) => c.clone(),
-                        None => crate::circuit::crew_callsign(&xp)
+                        None => crate::crew_radio::crew_callsign(&xp)
                             .await
                             .unwrap_or_else(|| "traffic alert".to_string()),
                     };

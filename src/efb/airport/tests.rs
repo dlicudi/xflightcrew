@@ -472,9 +472,7 @@ fn a_card_reads_like_the_panel() {
 #[test]
 #[ignore] // needs the real X-Plane install
 fn real_install_diagrams() {
-    let apt = crate::tools::autoland::xplane_path(
-        "Global Scenery/Global Airports/Earth nav data/apt.dat",
-    );
+    let apt = crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let out = std::env::var("EFB_DIAGRAM_OUT").ok();
     for icao in ["LEMG", "EGKK"] {
         let t = Instant::now();
@@ -521,9 +519,7 @@ fn real_install_diagrams() {
 fn real_install_page_states() {
     use crate::efb::state::{build, tests::cruise};
     use crate::flight::{Control, Phase};
-    let apt = crate::tools::autoland::xplane_path(
-        "Global Scenery/Global Airports/Earth nav data/apt.dat",
-    );
+    let apt = crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let dir = std::env::var("EFB_DIAGRAM_OUT").expect("EFB_DIAGRAM_OUT");
     std::fs::create_dir_all(&dir).unwrap();
     for (icao, rwy, outbound) in [("LEMG", "13", true), ("EGKK", "26L", false)] {

@@ -223,7 +223,7 @@ impl Tool for AutoTakeoff {
                 tail_strike_deg: self.tail_strike_deg,
                 pitch_authority_down: self.pitch_authority_down,
                 vne_kts: self.vne_kts,
-                apt_dat: super::autoland::apt_dat_path(),
+                apt_dat: crate::config::apt_dat_path(),
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
                 vy_kts: self.vy_kts,

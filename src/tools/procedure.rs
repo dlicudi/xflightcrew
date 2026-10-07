@@ -184,16 +184,16 @@ fn build_plan(
 ) -> Result<(Plan, String), String> {
     // The runway in use: forced, aligned (departure), or best-for-landing.
     let rwy = if departure {
-        let cands = crate::autoland::nearby_runways(apt_dat, lat, lon, 3.0).unwrap_or_default();
-        crate::autotakeoff::runway_fit(&cands, lat, lon, track, 0.0)
+        let cands = crate::runway::nearby_runways(apt_dat, lat, lon, 3.0).unwrap_or_default();
+        crate::runway::runway_fit(&cands, lat, lon, track, 0.0)
             .map(|(r, _)| r)
             .or_else(|| {
-                crate::autoland::best_landing_runway(apt_dat, lat, lon, track, 5.0, 0.0)
+                crate::runway::best_landing_runway(apt_dat, lat, lon, track, 5.0, 0.0)
                     .ok()
                     .flatten()
             })
     } else {
-        crate::autoland::best_landing_runway(apt_dat, lat, lon, track, 40.0, 0.0)
+        crate::runway::best_landing_runway(apt_dat, lat, lon, track, 40.0, 0.0)
             .ok()
             .flatten()
     };
@@ -202,7 +202,7 @@ fn build_plan(
     };
     if let Some(force) = &forced_rwy {
         // Honour an explicit runway if it exists at this field.
-        let cands = crate::autoland::nearby_runways(apt_dat, lat, lon, 40.0).unwrap_or_default();
+        let cands = crate::runway::nearby_runways(apt_dat, lat, lon, 40.0).unwrap_or_default();
         if let Some(r) = cands.into_iter().find(|r| r.id.eq_ignore_ascii_case(force)) {
             rwy = r;
         }
@@ -215,7 +215,7 @@ fn build_plan(
         .flatten()
         .ok_or_else(|| format!("I couldn't read {icao} from the airport data."))?;
 
-    let spoken_rwy = crate::circuit::spell_runway(&rwy_id);
+    let spoken_rwy = crate::crew_radio::spell_runway(&rwy_id);
 
     if departure {
         let Some(sid) = nav::sid_for_runway(cifp, &icao, &rwy_id) else {
@@ -270,7 +270,7 @@ fn build_plan(
         apt_dat: apt_dat.to_string(),
         cfg,
         approach_ias,
-        rwy_id: Some(crate::autoland::PlannedRunway::at(&icao, &rwy_id)),
+        rwy_id: Some(crate::runway::PlannedRunway::at(&icao, &rwy_id)),
     };
     let plan = procedure::approach_plan_for(
         cifp, fix_path, nav_path, &airport, &icao, &rwy_id, lat, lon, end,
@@ -327,10 +327,11 @@ mod divert_probe {
     #[test]
     #[ignore]
     fn real_install_eddm_divert() {
-        let apt = &crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
-        let cifp = &crate::tools::autoland::xplane_path("Custom Data/CIFP");
-        let fix = &crate::tools::autoland::xplane_path("Custom Data/earth_fix.dat");
-        let nav = &crate::tools::autoland::xplane_path("Custom Data/earth_nav.dat");
+        let apt =
+            &crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let cifp = &crate::config::xplane_path("Custom Data/CIFP");
+        let fix = &crate::config::xplane_path("Custom Data/earth_fix.dat");
+        let nav = &crate::config::xplane_path("Custom Data/earth_nav.dat");
         for (label, lat, lon, trk, rwy) in [
             ("now", 47.77, 11.79, 0.0, None),
             ("20 nm S of EDDM", 48.02, 11.80, 0.0, None),

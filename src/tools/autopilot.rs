@@ -1089,7 +1089,7 @@ impl Tool for SetAltitude {
                 "Roger — {power}{} {altitude:.0} feet.{terrain}{}",
                 movement.to_lowercase(),
                 crate::interaction::route_continuation(
-                    crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                    crate::flight_state::Owner::Procedure.active()
                 )
             ))
         } else {
@@ -1368,7 +1368,7 @@ impl Tool for SetClimb {
             None => String::new(),
         };
         if engaged {
-            let following = crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+            let following = crate::flight_state::Owner::Procedure.active();
             let rate_line = if following {
                 ", with descent or climb rate managed by the route follower".to_string()
             } else {
@@ -1412,7 +1412,7 @@ impl Tool for AutopilotOff {
         // Also release an active emergency recovery or autoland — "my controls"
         // hands the aircraft fully back to the pilot. If one was actually flying,
         // acknowledge *that* rather than the AP-off wording.
-        let was_flying = crate::tools::recover::abort() | crate::autoland::abort();
+        let was_flying = crate::flight_state::release_recovery_and_landing();
         if was_flying {
             crate::monitor::note_pilot_release();
             return Ok("You have the aircraft.".to_string());

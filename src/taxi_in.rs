@@ -297,13 +297,13 @@ async fn position(xp: &XPlaneClient) -> Option<(f64, f64)> {
 /// aircraft is: `from` is where it was planned, `now` a fresh read `dt_s`
 /// later, `lateral_m` the fresh read's distance off the route. Either a jump
 /// ([`crate::autotaxi::relocation_jump_m`]) or a route further off than any
-/// join ([`crate::autotaxi::MAX_JOIN_M`], the auto taxi tool's own refusal,
+/// join ([`crate::taxi_guide::MAX_JOIN_M`], the auto taxi tool's own refusal,
 /// which the vacate's direct start used to skip) is a vacate that must not
 /// start. LEMG 31 (2026-09-28): planned at the rollout's stop, engaged 0.3 s
 /// later 1,033 m off its line after the sortie runner reloaded the aircraft.
 fn vacate_still_here(from: (f64, f64), now: (f64, f64), dt_s: f64, lateral_m: f64) -> bool {
     crate::autotaxi::relocation_jump_m(from, now, dt_s).is_none()
-        && lateral_m <= crate::autotaxi::MAX_JOIN_M
+        && lateral_m <= crate::taxi_guide::MAX_JOIN_M
 }
 
 /// Phase one: drive clear of `rwy`, then report it.
@@ -506,8 +506,8 @@ async fn vacate(
     if arrived {
         // The tower's own taxi-in reply comes next, and a controller hearing
         // "runway vacated" before the request is exactly the order.
-        let callsign = crate::circuit::crew_callsign(xp).await;
-        crate::circuit::transmit(crate::circuit::radio_call(&callsign, "runway vacated"));
+        let callsign = crate::crew_radio::crew_callsign(xp).await;
+        crate::crew_radio::transmit(crate::crew_radio::radio_call(&callsign, "runway vacated"));
         // Off the runway: landing lights off, taxi light on, by the shared
         // rule (an airframe with only a landing lamp keeps it after dusk).
         let dark = crate::tools::lights::dark_now(xp).await;
@@ -616,8 +616,11 @@ async fn fly(
         if let Some(khz) = crate::party_line::home_tower_khz() {
             // The crew radio only reaches the tuned station — tune the tower first.
             let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
-            let callsign = crate::circuit::crew_callsign(&xp).await;
-            crate::circuit::transmit(crate::circuit::radio_call(&callsign, "taxi to parking"));
+            let callsign = crate::crew_radio::crew_callsign(&xp).await;
+            crate::crew_radio::transmit(crate::crew_radio::radio_call(
+                &callsign,
+                "taxi to parking",
+            ));
             crate::blackbox::record("taxi_in", json!({ "event": "request", "khz": khz }));
             // Wait for the tower to plan and publish the stand route (~60 s, to
             // outlast a busy frequency working other traffic). Watching where we

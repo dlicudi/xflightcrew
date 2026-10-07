@@ -648,7 +648,7 @@ pub async fn gather_suitability(
     });
     let dest_icao = fp.destination.clone();
     let wind = tokio::task::spawn_blocking(move || {
-        crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &dest_icao)
+        crate::weather::surface_wind(&crate::config::xplane_root(), &dest_icao)
     })
     .await
     .ok()
@@ -761,7 +761,7 @@ pub fn choose_arrival(
         legs,
         0,
     );
-    let spoken = crate::circuit::spell_runway(&runway);
+    let spoken = crate::crew_radio::spell_runway(&runway);
     let Some(c) = chosen else {
         crate::blackbox::record(
             "plan_audit",
@@ -1053,7 +1053,7 @@ pub fn mora_grid(fix_data_path: &str) -> Option<&'static MoraGrid> {
         MoraGrid::load(&beside).or_else(|| {
             MoraGrid::load(&format!(
                 "{}/Resources/default data/earth_mora.dat",
-                crate::tools::autoland::xplane_root()
+                crate::config::xplane_root()
             ))
         })
     })

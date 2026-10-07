@@ -587,7 +587,7 @@ fn radio_out(call: String) {
         event("radio_withheld", json!({ "call": call }));
         return;
     }
-    crate::circuit::transmit(call);
+    crate::crew_radio::transmit(call);
 }
 
 /// [`radio_out`] for a readback.
@@ -596,7 +596,7 @@ fn radio_readback(call: String, owed_copy: bool) {
         event("radio_withheld", json!({ "call": call, "readback": true }));
         return;
     }
-    crate::circuit::transmit_readback(call, owed_copy);
+    crate::crew_radio::transmit_readback(call, owed_copy);
 }
 
 async fn give_up(
@@ -835,12 +835,12 @@ fn strip_end_named(id: &str, runways: &[crate::nav::Runway]) -> String {
 pub fn short_runway_line(length_m: f64, needed_m: f64, cleared: &str, ask: Option<&str>) -> String {
     let base = format!(
         "Runway {} is {:.0} metres, we need {:.0}.",
-        crate::circuit::spell_runway(cleared),
+        crate::crew_radio::spell_runway(cleared),
         length_m,
         needed_m
     );
     match ask {
-        Some(a) => format!("{base} Asking for {}.", crate::circuit::spell_runway(a)),
+        Some(a) => format!("{base} Asking for {}.", crate::crew_radio::spell_runway(a)),
         None => format!("{base} Nothing here is long enough."),
     }
 }
@@ -851,8 +851,8 @@ pub fn short_runway_line(length_m: f64, needed_m: f64, cleared: &str, ask: Optio
 pub fn runway_request_call(cleared: &str, ask: &str) -> String {
     format!(
         "unable runway {}, request runway {} for length",
-        crate::circuit::spell_runway(cleared),
-        crate::circuit::spell_runway(ask)
+        crate::crew_radio::spell_runway(cleared),
+        crate::crew_radio::spell_runway(ask)
     )
 }
 
@@ -895,7 +895,7 @@ async fn judge_cleared_runway(
         return Err(format!("{line} Your aircraft."));
     };
     announce(voice, Priority::Advisory, &line);
-    radio_out(crate::circuit::radio_call(
+    radio_out(crate::crew_radio::radio_call(
         callsign,
         &runway_request_call(&cleared, &ask),
     ));
@@ -911,7 +911,7 @@ async fn judge_cleared_runway(
     } else {
         Err(format!(
             "{line} The tower didn't give us runway {}. Your aircraft.",
-            crate::circuit::spell_runway(&ask)
+            crate::crew_radio::spell_runway(&ask)
         ))
     }
 }
@@ -992,7 +992,10 @@ pub(crate) async fn get_zone_clearance(
     // its own hands (LIPK 2026-09-26: said, queued behind the tower, and
     // dropped stale, or heard after the call it announced).
     let circuits = flying_circuits();
-    radio_out(crate::circuit::radio_call(callsign, zone_clearance_call(circuits)));
+    radio_out(crate::crew_radio::radio_call(
+        callsign,
+        zone_clearance_call(circuits),
+    ));
     event("request_clearance", json!({ "circuits": circuits }));
     // The tower answers with a discrete squawk; wait for it, then dial it
     // into the transponder and read it back — the crew's clearance copy.
@@ -1039,7 +1042,7 @@ pub(crate) fn zone_clearance_call(circuits: bool) -> &'static str {
 pub(crate) fn strip_clearance_call(runway: &str, circuits: bool) -> String {
     format!(
         "request clearance, runway {}{}",
-        crate::circuit::spell_runway(runway),
+        crate::crew_radio::spell_runway(runway),
         if circuits { ", for circuits" } else { "" }
     )
 }
@@ -1084,7 +1087,7 @@ async fn zone_clearance_from_the_strip(
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
     }
     let owed_before = crate::party_line::readback_owed();
-    radio_out(crate::circuit::radio_call(
+    radio_out(crate::crew_radio::radio_call(
         callsign,
         &strip_clearance_call(runway, flying_circuits()),
     ));
@@ -1131,7 +1134,7 @@ pub fn ifr_request_call(callsign: &Option<String>, dest_icao: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| crate::atis::nato(c.to_ascii_uppercase()))
         .collect();
-    crate::circuit::radio_call(
+    crate::crew_radio::radio_call(
         callsign,
         &format!("request IFR clearance to {}", spelled.join(" ")),
     )
@@ -1180,7 +1183,7 @@ async fn get_ifr_clearance(
         if ABORT.load(SeqCst) {
             break;
         }
-        let pending = crate::circuit::crew_radio_pending();
+        let pending = crate::crew_radio::crew_radio_pending();
         let accepted = crate::party_line::assigned_clearance().is_some();
         if wait.tick(t0.elapsed().as_secs_f64(), pending, accepted).is_some() {
             break;
@@ -1474,7 +1477,7 @@ async fn wait_enroute_working_the_radio(
                 if far {
                     wind_runway(
                         &arr.runways,
-                        crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &arr.dest_icao),
+                        crate::weather::surface_wind(&crate::config::xplane_root(), &arr.dest_icao),
                     )
                 } else {
                     None
@@ -1503,7 +1506,7 @@ pub(crate) async fn obey_departure_handoff(
     khz: i64,
     climb_to_ft: f64,
 ) {
-    radio_out(crate::circuit::radio_call(
+    radio_out(crate::crew_radio::radio_call(
         callsign,
         &format!("{to} on {}", crate::atis::spoken_mhz(khz)),
     ));
@@ -1513,7 +1516,7 @@ pub(crate) async fn obey_departure_handoff(
     // here: the queue can hold it for twenty seconds behind a busy
     // frequency, and "passing one thousand" was said at 1,207 ft.
     let alt_ft = xp.get_float(ALT_IND_FT).await.unwrap_or(0.0);
-    crate::circuit::transmit_check_in(callsign.clone(), to.clone(), climb_to_ft);
+    crate::crew_radio::transmit_check_in(callsign.clone(), to.clone(), climb_to_ft);
     // The check-in announces the climb to the plan and departure clears it
     // ("radar contact, climb ..."): the IFR clearance's altitude has done its
     // job, the follower goes on to the plan's levels.
@@ -1534,7 +1537,7 @@ pub fn region_readback(callsign: &Option<String>, h: &crate::party_line::RegionH
     } else {
         "roger"
     };
-    crate::circuit::radio_call(
+    crate::crew_radio::radio_call(
         callsign,
         &format!("{lead}, {} on {}", h.to, crate::atis::spoken_mhz(h.khz)),
     )
@@ -1972,7 +1975,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     };
 
     if let Mission::Resume(route) = &tools.mission {
-        let callsign = crate::circuit::crew_callsign(&xp).await;
+        let callsign = crate::crew_radio::crew_callsign(&xp).await;
         // The normal follower owns speed, route and arrival; no duplicate laws.
         fly_route(&xp, &config, &voice, &ctx, &tools, route, &callsign).await;
         return;
@@ -2029,7 +2032,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     }
     bail_if_abort!();
     // The callsign the tower knows us by, so our calls sound like a real pilot.
-    let callsign = crate::circuit::crew_callsign(&xp).await;
+    let callsign = crate::crew_radio::crew_callsign(&xp).await;
 
     // On a Flight mission the route goes into the GPS NOW, at the gate. The
     // write used to sit at the top of stage 4 — fly_route was where the
@@ -2627,7 +2630,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // unless the wind really favours another end): a SID exists for
             // one runway, and in calm air the pick could have been the other.
             let cleared_rwy = crate::party_line::assigned_clearance().map(|c| c.runway);
-            radio_out(crate::circuit::radio_call(
+            radio_out(crate::crew_radio::radio_call(
                 &callsign,
                 &taxi_call(&tools.mission, cleared_rwy.as_deref()),
             ));
@@ -2896,7 +2899,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                         sid_refused = true;
                         Err(format!(
                             "The tower cleared us via the {cleared_words} departure, and no departure from runway {} joins our route.",
-                            crate::circuit::spell_runway(rwy.as_deref().unwrap_or_default())
+                            crate::crew_radio::spell_runway(rwy.as_deref().unwrap_or_default())
                         ))
                     }
                 },
@@ -3225,8 +3228,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             let hopeless = matches!(
                 why,
                 Some(
-                    crate::autotakeoff::NoFit::RunwayTooShort { .. }
-                        | crate::autotakeoff::NoFit::TooLittleLeft { .. }
+                    crate::runway::NoFit::RunwayTooShort { .. }
+                        | crate::runway::NoFit::TooLittleLeft { .. }
                 )
             );
             if attempt == 1 || hopeless {
@@ -3239,7 +3242,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 // which strip it looked for: at Le Bourget that was the runway
                 // the tower had cleared, sitting 169 m away, and the vague
                 // line was all the pilot got (2026-09-22).
-                use crate::autotakeoff::NoFit;
+                use crate::runway::NoFit;
                 let named = match &why {
                     Some(NoFit::NoneNear { id, .. }) => !id.is_empty(),
                     Some(
@@ -3682,16 +3685,15 @@ async fn fly_route(
     // The destination's own position and tower, for the inbound call at the
     // zone approach: the apt.dat row, never `home_tower_khz`, which is
     // whoever the region last handed us to.
-    let dest_tower =
-        crate::nav::find_airport(&crate::tools::autoland::apt_dat_path(), &route.dest_icao)
-            .ok()
-            .flatten()
-            .and_then(|a| {
-                let (lat, lon) = a.position()?;
-                let khz = a.staffed_tower()?.khz;
-                Some((lat, lon, khz))
-            });
-    let mut arrival = ArrivalRepick::of(route, &crate::tools::autoland::apt_dat_path());
+    let dest_tower = crate::nav::find_airport(&crate::config::apt_dat_path(), &route.dest_icao)
+        .ok()
+        .flatten()
+        .and_then(|a| {
+            let (lat, lon) = a.position()?;
+            let khz = a.staffed_tower()?.khz;
+            Some((lat, lon, khz))
+        });
+    let mut arrival = ArrivalRepick::of(route, &crate::config::apt_dat_path());
     if !wait_enroute_working_the_radio(xp, ctx, voice, callsign, climb_to_ft, dest_tower, &mut arrival).await {
         if !ABORT.load(SeqCst) {
             give_up(
@@ -3792,8 +3794,7 @@ async fn fly_route(
         (Ok(dir), Ok(spd_ms)) => Some((dir, spd_ms * MS_TO_KTS)),
         _ => None,
     };
-    let metar =
-        crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &route.dest_icao);
+    let metar = crate::weather::surface_wind(&crate::config::xplane_root(), &route.dest_icao);
     let (wind, wind_source) = arrival_wind(metar, aloft);
     let wind_detail = json!({
         "source": wind_source,
@@ -3806,7 +3807,7 @@ async fn fly_route(
     let build = |forced: Option<String>| {
         let planned = planned.clone();
         let (apt_dat, cifp, fixp, navp) = (
-            crate::tools::autoland::apt_dat_path(),
+            crate::config::apt_dat_path(),
             config.cifp_dir.clone(),
             config.fix_data_path.clone(),
             config.nav_data_path.clone(),
@@ -3923,7 +3924,7 @@ async fn fly_route(
     if let Some(tower_rwy) = tower_arrival_runway(built.tower_khz).await {
         if built.rwy_id.as_deref() != Some(tower_rwy.as_str()) {
             let theirs = build(Some(tower_rwy.clone())).await;
-            let spoken = crate::circuit::spell_runway(&tower_rwy);
+            let spoken = crate::crew_radio::spell_runway(&tower_rwy);
             if theirs.plan.is_some() {
                 event(
                     "arrival_runway_from_tower",
@@ -3950,7 +3951,7 @@ async fn fly_route(
                         built
                             .rwy_id
                             .as_deref()
-                            .map(crate::circuit::spell_runway)
+                            .map(crate::crew_radio::spell_runway)
                             .unwrap_or_default()
                     ),
                 );
@@ -3967,7 +3968,7 @@ async fn fly_route(
     let landing_rwy = built
         .rwy_id
         .as_deref()
-        .map(|id| crate::autoland::PlannedRunway::at(&route.dest_icao, id));
+        .map(|id| crate::runway::PlannedRunway::at(&route.dest_icao, id));
     match built.plan {
         Some(plan)
             if route.local_runway.is_none()
@@ -4049,7 +4050,7 @@ async fn fly_route(
             );
             crate::autoland::run_autoland_scoped(
                 config.xplane_base_url.clone(),
-                crate::tools::autoland::apt_dat_path(),
+                crate::config::apt_dat_path(),
                 tools.circuit.cfg.clone(),
                 tools.circuit.approach_ias,
                 voice.clone(),
@@ -4163,10 +4164,10 @@ async fn fly_route(
     }
     if crate::autoland::established_on_final() && !ABORT.load(SeqCst) {
         let call = match &landing_rwy {
-            Some(rwy) => format!("final runway {}", crate::circuit::spell_runway(&rwy.id)),
+            Some(rwy) => format!("final runway {}", crate::crew_radio::spell_runway(&rwy.id)),
             None => "final".to_string(),
         };
-        radio_out(crate::circuit::radio_call(callsign, &call));
+        radio_out(crate::crew_radio::radio_call(callsign, &call));
         event(
             "final_call",
             json!({ "runway": landing_rwy.as_ref().map(|r| &r.id),
@@ -4640,7 +4641,7 @@ pub fn brief_arrival(
     let (alat, alon) = airport.position().unwrap_or((airport.runways[0].lat_a, airport.runways[0].lon_a));
     for r in &airport.runways {
         for id in [&r.ident_a, &r.ident_b] {
-            let spoken = crate::circuit::spell_runway(id);
+            let spoken = crate::crew_radio::spell_runway(id);
             // Built exactly as the arrival builds it: an approach the brief
             // names is one the arrival can fly (LSZS's RNAV 21 has a 5.3
             // degree visual segment, too steep, and is not named).
@@ -4717,7 +4718,7 @@ pub fn brief_arrival(
 
 /// "Planned runway one two, the ILS." Pure.
 fn planned_runway_line(runway: &str, published: &[(&str, String)], straight_in: &[String]) -> String {
-    let spoken = crate::circuit::spell_runway(runway);
+    let spoken = crate::crew_radio::spell_runway(runway);
     match published.iter().find(|(_, s)| *s == spoken) {
         Some((kind, _)) => format!("Planned runway {spoken}, the {kind}."),
         None if straight_in.contains(&spoken) => format!("Planned runway {spoken}, the straight-in."),
@@ -4818,7 +4819,7 @@ struct Arrival {
 /// tower picks its runway from it, never from the air the aircraft is in.
 fn publish_field_wind() {
     if let Some((icao, lat, lon)) = crate::station::active_icao() {
-        let wind = crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &icao);
+        let wind = crate::weather::surface_wind(&crate::config::xplane_root(), &icao);
         event("field_wind", json!({ "icao": icao, "wind": wind }));
         crate::station::set_surface_wind(lat, lon, wind);
     }
@@ -4859,10 +4860,13 @@ async fn call_inbound(
     // to a crew set up for the ILS 30).
     publish_field_wind();
     let words = match runway {
-        Some(r) => format!("inbound for landing, runway {}", crate::circuit::spell_runway(r)),
+        Some(r) => format!(
+            "inbound for landing, runway {}",
+            crate::crew_radio::spell_runway(r)
+        ),
         None => "inbound for landing".to_string(),
     };
-    radio_out(crate::circuit::radio_call(callsign, &words));
+    radio_out(crate::crew_radio::radio_call(callsign, &words));
     INBOUND_MADE.store(true, SeqCst);
     // From here the destination's tower is OURS: the region's service-weighted
     // nearest-field pick may not hand the station to a closer field while we
@@ -4946,7 +4950,7 @@ fn build_arrival(
             apt_dat: apt_dat.to_string(),
             cfg,
             approach_ias,
-            rwy_id: Some(crate::autoland::PlannedRunway::at(dest, forced)),
+            rwy_id: Some(crate::runway::PlannedRunway::at(dest, forced)),
         };
         let plan = crate::procedure::approach_plan_for(
             cifp, fixp, navp, &airport, dest, forced, lat, lon, end,
@@ -5010,7 +5014,7 @@ fn build_arrival(
             apt_dat: apt_dat.to_string(),
             cfg: cfg.clone(),
             approach_ias,
-            rwy_id: Some(crate::autoland::PlannedRunway::at(dest, id)),
+            rwy_id: Some(crate::runway::PlannedRunway::at(dest, id)),
         };
         crate::procedure::approach_plan_for(cifp, fixp, navp, &airport, dest, id, lat, lon, end)
             .ok()
@@ -5078,8 +5082,8 @@ fn planned_end_verdict(
 fn overruled_line(planned: &str, now: Option<&str>, why: &str) -> Option<String> {
     let now = now.filter(|n| !n.eq_ignore_ascii_case(planned))?;
     let (was, now) = (
-        crate::circuit::spell_runway(planned),
-        crate::circuit::spell_runway(now),
+        crate::crew_radio::spell_runway(planned),
+        crate::crew_radio::spell_runway(now),
     );
     Some(match why {
         "tailwind" => format!(
@@ -5127,8 +5131,8 @@ pub fn departure_runway_mismatch(planned: Option<&str>, cleared: Option<&str>) -
         format!(
             "The tower has given us runway {}, and the planned departure is from runway {}. \
              I can't fly that departure from here.",
-            crate::circuit::spell_runway(c),
-            crate::circuit::spell_runway(p)
+            crate::crew_radio::spell_runway(c),
+            crate::crew_radio::spell_runway(p)
         )
     })
 }
@@ -5271,7 +5275,7 @@ pub fn arrival_splice(
 
 /// The line for a re-pick. Pure.
 pub fn repick_line(dest: &str, rwy: &str, why: &str, star: Option<(&str, &str)>) -> String {
-    let spoken = crate::circuit::spell_runway(rwy);
+    let spoken = crate::crew_radio::spell_runway(rwy);
     let head = if why == "tower" {
         format!("Tower wants runway {spoken}")
     } else {
@@ -5430,7 +5434,7 @@ async fn choose_departure(
     .ok()
     .flatten()
     .ok_or_else(|| "I can't read the departure data for this field.".to_string())?;
-    let spoken = crate::circuit::spell_runway(cleared);
+    let spoken = crate::crew_radio::spell_runway(cleared);
     match found {
         Ok((choice, sid, mins, note)) => {
             let idx = route
@@ -5618,7 +5622,7 @@ pub fn sid_request_call(callsign: &Option<String>, cleared: Option<&str>, want: 
     let unable = cleared
         .map(|c| format!("unable {}, ", crate::tower::spoken_sid(c)))
         .unwrap_or_default();
-    crate::circuit::radio_call(
+    crate::crew_radio::radio_call(
         callsign,
         &format!("{unable}request the {} departure", crate::tower::spoken_sid(want)),
     )
@@ -6037,7 +6041,12 @@ fn taxi_call(mission: &Mission, cleared: Option<&str>) -> String {
         Mission::Flight(r) => cleared
             .filter(|c| !c.is_empty())
             .or(r.departure_rwy.as_deref())
-            .map(|rwy| format!("request taxi, runway {}", crate::circuit::spell_runway(rwy)))
+            .map(|rwy| {
+                format!(
+                    "request taxi, runway {}",
+                    crate::crew_radio::spell_runway(rwy)
+                )
+            })
             .unwrap_or_else(|| "request taxi".to_string()),
         Mission::Circuit { .. } => "request taxi for circuits".to_string(),
         Mission::Resume(_) => "request taxi".to_string(),
@@ -6054,7 +6063,7 @@ async fn request_departure(callsign: &Option<String>, on_runway: Option<&str>) {
     // The call itself is heard; a line announcing it first is a crew narrating
     // its own hands (LIPK 2026-09-26: said, queued behind the tower, and
     // dropped stale, or heard after the call it announced).
-    radio_out(crate::circuit::radio_call(
+    radio_out(crate::crew_radio::radio_call(
         callsign,
         ready_call(flying_circuits()),
     ));
@@ -6164,11 +6173,11 @@ async fn backtrack_from_runway_start(
         }
         let call = format!(
             "request backtrack runway {}",
-            crate::circuit::spell_runway(runway)
+            crate::crew_radio::spell_runway(runway)
         );
         let mut approved = false;
         for attempt in 0..BACKTRACK_ASKS {
-            radio_out(crate::circuit::radio_call(callsign, &call));
+            radio_out(crate::crew_radio::radio_call(callsign, &call));
             event(
                 "request_backtrack",
                 json!({ "runway": runway, "attempt": attempt }),
@@ -6248,7 +6257,7 @@ async fn backtrack_from_runway_start(
 
 /// When the crew reads back an instruction the tower is waiting on, judged
 /// against the crew radio's own record of its last readback
-/// (`circuit::last_readback`), whoever queued it: never while the same words
+/// (`crew_radio::last_readback`), whoever queued it: never while the same words
 /// are queued and not yet out, and again only if the tower still waits
 /// [`OwedReadback::AGAIN`] after they WENT OUT (a readback dropped stale on
 /// the radio). LEMG 13 (2026-09-28, sortie 1790627884-full_auto): the
@@ -6262,11 +6271,11 @@ impl OwedReadback {
     /// The readback to transmit now, if any.
     fn due(
         owed: Option<&str>,
-        last: Option<&crate::circuit::ReadbackRec>,
+        last: Option<&crate::crew_radio::ReadbackRec>,
         now: Instant,
     ) -> Option<String> {
         let owed = owed?;
-        let words = crate::circuit::readback_words(owed);
+        let words = crate::crew_radio::readback_words(owed);
         let again = match last.filter(|r| r.words == words) {
             None => true,
             Some(r) => r
@@ -6342,7 +6351,7 @@ async fn ensure_takeoff_cleared(
         // read back before anything else is said: the ready call repeated
         // over it earned "read back" three times (LEMG 13, #172).
         let owed = crate::party_line::readback_owed();
-        let last = crate::circuit::last_readback();
+        let last = crate::crew_radio::last_readback();
         if let Some(rb) = OwedReadback::due(owed.as_deref(), last.as_ref(), Instant::now()) {
             radio_readback(rb.trim_end_matches('.').to_string(), true);
             event("readback_hold", json!({ "call": rb }));
@@ -6360,7 +6369,7 @@ async fn ensure_takeoff_cleared(
                     "reask_held",
                     json!({ "why": "held", "since_call_s": last_call.elapsed().as_secs() }),
                 );
-                radio_out(crate::circuit::radio_call(
+                radio_out(crate::crew_radio::radio_call(
                     callsign,
                     ready_call(flying_circuits()),
                 ));
@@ -6380,7 +6389,7 @@ async fn ensure_takeoff_cleared(
                 announced_hold = true;
             }
         } else if last_call.elapsed() >= NUDGE_EVERY {
-            radio_out(crate::circuit::radio_call(
+            radio_out(crate::crew_radio::radio_call(
                 callsign,
                 ready_call(flying_circuits()),
             ));
@@ -6395,16 +6404,16 @@ async fn ensure_takeoff_cleared(
     // departure sequence; the line-up's is owed at the moment it's issued.
     let lined_up_only = matches!(crate::party_line::clearance_state(), Some(LinedUp));
     if let Some(rwy) = crate::party_line::clearance_runway() {
-        let spelled = crate::circuit::spell_runway(&rwy);
+        let spelled = crate::crew_radio::spell_runway(&rwy);
         let sent = if lined_up_only {
             let call =
-                crate::circuit::radio_call(callsign, &format!("lining up runway {spelled}"));
+                crate::crew_radio::radio_call(callsign, &format!("lining up runway {spelled}"));
             radio_readback(call.clone(), false);
             event("readback_line_up", json!({ "runway": rwy }));
             Some(call)
         } else if !*read_back {
             *read_back = true;
-            let call = crate::circuit::radio_call(
+            let call = crate::crew_radio::radio_call(
                 callsign,
                 &format!("cleared for takeoff runway {spelled}"),
             );
@@ -6425,7 +6434,7 @@ async fn ensure_takeoff_cleared(
             let out = readback_before_moving(
                 READBACK_OUT_S,
                 READBACK_POLL_MS,
-                || crate::circuit::readback_out(&call),
+                || crate::crew_radio::readback_out(&call),
                 || voice.as_ref().is_some_and(|v| v.radio_on_air()),
             )
             .await;
@@ -7027,12 +7036,12 @@ const RUNWAY_START_BACKTRACK_MAX_KTS: f64 = 3.0;
 
 /// Classify the arm's position from the takeoff fit. Pure.
 pub(crate) fn classify_runway_start(
-    fit: Result<String, Option<crate::autotakeoff::NoFit>>,
+    fit: Result<String, Option<crate::runway::NoFit>>,
     gs_kts: f64,
 ) -> RunwayStart {
     match fit {
         Ok(runway) => RunwayStart::Lined { runway },
-        Err(Some(crate::autotakeoff::NoFit::TooLittleLeft { id, .. }))
+        Err(Some(crate::runway::NoFit::TooLittleLeft { id, .. }))
             if gs_kts < RUNWAY_START_BACKTRACK_MAX_KTS =>
         {
             RunwayStart::Short { runway: id }
@@ -7101,7 +7110,7 @@ async fn runway_start(xp: &XPlaneClient, tools: &SubTools) -> RunwayStart {
 async fn runway_check(
     xp: &XPlaneClient,
     tools: &SubTools,
-) -> Result<(), Option<crate::autotakeoff::NoFit>> {
+) -> Result<(), Option<crate::runway::NoFit>> {
     runway_check_id(xp, tools).await.map(|_| ())
 }
 
@@ -7109,7 +7118,7 @@ async fn runway_check(
 async fn runway_check_id(
     xp: &XPlaneClient,
     tools: &SubTools,
-) -> Result<String, Option<crate::autotakeoff::NoFit>> {
+) -> Result<String, Option<crate::runway::NoFit>> {
     // Airborne is not "lined up"; and a fit needs a valid position.
     if xp.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) < 0.5 {
         return Err(None);
@@ -7128,11 +7137,11 @@ async fn runway_check_id(
         500.0,
     )
     .await;
-    let apt = crate::tools::autoland::apt_dat_path();
-    let cands = crate::autoland::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
-    match crate::autotakeoff::runway_fit(&cands, lat, lon, psi, needed_m) {
+    let apt = crate::config::apt_dat_path();
+    let cands = crate::runway::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
+    match crate::runway::runway_fit(&cands, lat, lon, psi, needed_m) {
         Some((r, _)) => Ok(r.id),
-        None => Err(Some(crate::autotakeoff::why_no_fit_cleared(
+        None => Err(Some(crate::runway::why_no_fit_cleared(
             &cands,
             lat,
             lon,
@@ -7223,7 +7232,7 @@ async fn lined_up_check(
     xp: &XPlaneClient,
     tools: &SubTools,
     drove: bool,
-) -> Result<Result<(), LineUpMiss>, Option<crate::autotakeoff::NoFit>> {
+) -> Result<Result<(), LineUpMiss>, Option<crate::runway::NoFit>> {
     let id = runway_check_id(xp, tools).await?;
     let (Ok(lat), Ok(lon), Ok(psi)) = (
         xp.get_float("sim/flightmodel/position/latitude").await,
@@ -7232,12 +7241,12 @@ async fn lined_up_check(
     ) else {
         return Err(None);
     };
-    let apt = crate::tools::autoland::apt_dat_path();
-    let cands = crate::autoland::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
+    let apt = crate::config::apt_dat_path();
+    let cands = crate::runway::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
     let Some(rwy) = cands.iter().find(|r| r.id == id) else {
         return Ok(Ok(()));
     };
-    let lateral_m = crate::autoland::cross_track_nm(lat, lon, rwy) * 1852.0;
+    let lateral_m = crate::runway::cross_track_nm(lat, lon, rwy) * 1852.0;
     let err_deg = crate::angles::abs_diff_deg(psi, rwy.course_deg);
     let arrived = crate::autotaxi::LAST_ARRIVED.load(SeqCst);
     let verdict = judge_lined_up(
@@ -7245,12 +7254,12 @@ async fn lined_up_check(
         arrived,
         lateral_m,
         err_deg,
-        crate::autoland::runway_width_m(rwy),
+        crate::runway::runway_width_m(rwy),
     );
     event(
         "line_up_check",
         json!({ "runway": id, "drove": drove, "arrived": arrived, "lateral_m": lateral_m,
-                "err_deg": err_deg, "width_m": crate::autoland::runway_width_m(rwy),
+                "err_deg": err_deg, "width_m": crate::runway::runway_width_m(rwy),
                 "verdict": format!("{verdict:?}") }),
     );
     Ok(verdict)

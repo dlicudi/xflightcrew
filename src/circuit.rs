@@ -34,9 +34,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg_attr(not(test), allow(unused_imports))]
 use std::sync::Mutex;
 
-use crate::autoland::{along_track_nm, cross_track_nm, nearby_runways, true_to_mag};
 use crate::autotakeoff;
 use crate::heading_bug::{bug_toward, slew_bug, BugDeadband, BugHold};
+use crate::runway::{along_track_nm, cross_track_nm, nearby_runways, true_to_mag};
 use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
@@ -516,8 +516,6 @@ const HANDOFF_AGL_FT: f64 = 700.0;
 /// margin to stay comfortably clean-configured, close enough that autoland has
 /// only the last few knots to take off with flaps.
 const APPROACH_LEG_MARGIN_KTS: f64 = 20.0;
-/// Ceiling on the pattern speed, as a multiple of the approach speed.
-const PATTERN_MAX_APPROACH_MULT: f64 = 1.5;
 /// Altitude-capture gain: commanded fpm per foot of error.
 const ALT_GAIN_FPM_PER_FT: f64 = 3.0;
 /// ...and how far AHEAD the capture looks, seconds. A vertical speed does not
@@ -938,36 +936,10 @@ pub fn final_high_give_up(above_path_ft: Option<f64>, along_m: f64) -> bool {
     above_path_ft.is_some_and(|h| h > HANDOFF_ABOVE_PATH_FT) && along_m.abs() <= FINAL_HIGH_LAST_M
 }
 
-/// The speed the pattern legs are flown at: the airframe's climb speed, but
-/// never more than [`PATTERN_MAX_APPROACH_MULT`] times its approach speed.
-///
-/// Vy is not a pattern speed on a jet. The Citation X's published best-rate
-/// figure is 300 KIAS — a cruise-climb number — and flown as a circuit speed it
-/// would ask for a turn radius of about ten kilometres from geometry that
-/// clamps at 2.5. The MD-82's 200 kt was the same mistake in a milder form.
-/// A pattern at 1.5x the approach speed is what these aircraft actually fly,
-/// and for every GA profile Vy already sits below that, so nothing changes.
-pub fn pattern_speed_kts(vy_kts: f64, approach_ias: f64, vs_clean_kts: Option<f64>) -> f64 {
-    let base = vy_kts
-        .max(60.0)
-        .min((approach_ias * PATTERN_MAX_APPROACH_MULT).max(60.0));
-    // ...and never near the CLEAN stall, because the pattern is flown clean.
-    // The Baron's Vy is 105 against an 84 kt clean stall — 1.25 Vs, which is
-    // four knots above the airspeed caution band (1.2 Vs = 100.8) and so every
-    // normal variation on downwind, base and final dipped into it. Six
-    // callouts in one circuit, and every one of them was correct: the aeroplane
-    // really was that close to the band. A flapped approach speed is not a
-    // clean pattern speed, and nothing here knew the difference.
-    let floor = vs_clean_kts.map_or(0.0, |v| v * PATTERN_MIN_STALL_MULT);
-    base.max(floor)
-}
-
-/// The clean pattern is flown no slower than this multiple of the CLEAN stall.
-/// 1.3 Vs is the usual approach minimum, and it is applied to the clean figure
-/// here because the circuit never lowers flap before the handoff. Only bites on
-/// an airframe whose Vy sits close to its clean stall — a 172 (Vy 74, stall 48)
-/// and an MD-82 (Vy 200, stall 100) are both untouched.
-const PATTERN_MIN_STALL_MULT: f64 = crate::aircraft::PATTERN_MIN_RATIO;
+// The pattern speed moved to `aircraft.rs` (pillars audit 2026-10-07, stage
+// A): the pattern numbers are the airframe's, read by the circuit and the
+// instructor's brief alike.
+use crate::aircraft::pattern_speed_kts;
 
 /// The speed the base and final legs are flown at. Vy is a CLIMB speed: an
 /// MD-82 arrived on base at 226 KIAS against a 140 kt approach speed and handed
@@ -1455,9 +1427,9 @@ pub fn circuit_detail(leg: Leg, rwy_id: &str, alt_ft: f64, target_alt_ft: f64, i
     s
 }
 
-// The crew radio queue moved to `crew_radio.rs` (phase 2); re-exported so
-// every `circuit::` path keeps compiling.
-pub use crate::crew_radio::*;
+// The crew radio queue moved to `crew_radio.rs` (phase 2): the circuit's
+// own calls name it unqualified, nobody else reaches it through here.
+use crate::crew_radio::*;
 
 
 /// Cancel an active circuit and stand down whichever sub-loop is flying;
@@ -2821,7 +2793,7 @@ pub fn sea_side_is_left(course_deg: f64) -> bool {
 
 /// A point in the runway frame (`a_m` along the takeoff course from the
 /// departure threshold, `x_m` right of it) → lat/lon.
-fn frame_to_latlon(rwy: &crate::autoland::Runway, a_m: f64, x_m: f64) -> (f64, f64) {
+fn frame_to_latlon(rwy: &crate::runway::Runway, a_m: f64, x_m: f64) -> (f64, f64) {
     let (lat, lon) =
         crate::nav::project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, a_m / M_PER_NM);
     crate::nav::project_latlon(
@@ -2836,7 +2808,7 @@ fn frame_to_latlon(rwy: &crate::autoland::Runway, a_m: f64, x_m: f64) -> (f64, f
 /// crosswind, downwind, base, and final, in the runway frame. ~20 points —
 /// inside the plugin probe channel's per-query cap.
 fn pattern_polyline(
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     g: &Geometry,
     runway_len_m: f64,
     left: bool,
@@ -2999,7 +2971,7 @@ fn corridor_facts(pts: &[FramePt], ground_ft: &[f64], g: &Geometry) -> SideFacts
 /// partial picture read as clear ground.
 async fn probe_side(
     xp: &XPlaneClient,
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     g: &Geometry,
     left: bool,
 ) -> SideFacts {
@@ -3120,7 +3092,7 @@ struct AuthoredWpt {
 /// over the Rock). `None` at every other field. DRAFT coordinates — the caller
 /// validates every waypoint against the live terrain probe before flying it.
 fn authored_circuit(
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     geom: &Geometry,
     field_elev_ft: f64,
     tpa_msl_ft: f64,
@@ -3294,7 +3266,7 @@ fn leg_samples(route: &[AuthoredWpt]) -> Vec<(usize, f64, f64)> {
 /// answer (no plugin): read as clear, the old fail-open behaviour.
 async fn leg_terrain_ft(
     xp: &XPlaneClient,
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     route: &[AuthoredWpt],
 ) -> Vec<Option<f64>> {
     let samples = leg_samples(route);
@@ -3403,7 +3375,7 @@ fn raise_for_terrain(
 /// air (the route is fixed to the runway, not to the aircraft).
 async fn check_authored_route(
     xp: &XPlaneClient,
-    rwy: &crate::autoland::Runway,
+    rwy: &crate::runway::Runway,
     route: &[AuthoredWpt],
     tpa_msl_ft: f64,
     field_elev_ft: f64,
@@ -3447,7 +3419,7 @@ async fn fly_authored_route(
     base_url: String,
     voice: Option<Voice>,
     route: Vec<AuthoredWpt>,
-    rwy: crate::autoland::Runway,
+    rwy: crate::runway::Runway,
     mag_var: f64,
     pattern_kts: f64,
     full_kts: f64,
@@ -3772,7 +3744,7 @@ async fn fly_authored_route(
         // been circling for minutes, a mile away. Proximity IS the right
         // answer here — unlike an arrival, which knows its destination and
         // must say so (see `PlannedRunway`).
-        Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
+        Some(crate::runway::PlannedRunway::anywhere(&rwy_id)),
         xp.cancellation(),
         // A circuit final is judged at the visual gate, 500 ft (#199).
         crate::autoland::HandDown::circuit(None),
@@ -3932,7 +3904,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, mut p: Pa
         return;
     };
     let cands = nearby_runways(&p.apt_dat, lat, lon, 3.0).unwrap_or_default();
-    let Some((rwy, _)) = autotakeoff::runway_fit(&cands, lat, lon, psi, p.takeoff.needed_m) else {
+    let Some((rwy, _)) = crate::runway::runway_fit(&cands, lat, lon, psi, p.takeoff.needed_m)
+    else {
         stand_down(
             &xp,
             &voice,
@@ -4699,7 +4672,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, mut p: Pa
             .copied()
             .filter(|v| v.is_finite() && *v > 40.0)
             .unwrap_or(p_approach_ias);
-        let rwy_width_m = crate::autoland::runway_width_m(&rwy);
+        let rwy_width_m = crate::runway::runway_width_m(&rwy);
         let landing_limit_m = crate::autoland::landing_xtk_limit_m(rwy_width_m);
         // On the path too (#188), until the one lap flown around for height
         // comes back as high: then autoland's own go-around takes it.
@@ -4783,7 +4756,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, mut p: Pa
                 p.approach_ias,
                 voice.clone(),
                 None,
-                Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
+                Some(crate::runway::PlannedRunway::anywhere(&rwy_id)),
                 xp.cancellation(),
                 hand_down,
             );
@@ -5544,7 +5517,7 @@ async fn try_published_arrival(
             apt_dat: apt_dat.clone(),
             cfg,
             approach_ias: ias,
-            rwy_id: Some(crate::autoland::PlannedRunway::at(&icao, &rwy_id)),
+            rwy_id: Some(crate::runway::PlannedRunway::at(&icao, &rwy_id)),
         };
         crate::procedure::approach_plan_for(
             &cifp, &fixp, &navp, &airport, &icao, &rwy_id, lat, lon, end,

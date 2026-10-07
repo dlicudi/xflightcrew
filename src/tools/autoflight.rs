@@ -264,8 +264,15 @@ impl Tool for ApModeTool {
         // Given to the autothrottle, the speed governor stands down: two
         // owners of one lever fight, and the governor would read the A/T's
         // lever as the pilot's hand.
-        if a.on && mode == ApMode::Autothrust && out.ends_with(" on.") && crate::tools::speedhold::release() {
-            crate::blackbox::record("autoflight", json!({"event": "governor_released", "for": "autothrottle"}));
+        if a.on
+            && mode == ApMode::Autothrust
+            && out.ends_with(" on.")
+            && crate::flight_state::release_speed_hold()
+        {
+            crate::blackbox::record(
+                "autoflight",
+                json!({"event": "governor_released", "for": "autothrottle"}),
+            );
         }
         Ok(out)
     }

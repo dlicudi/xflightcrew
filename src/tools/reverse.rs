@@ -154,7 +154,7 @@ impl Tool for ReverseThrust {
 pub async fn select(xp: &dyn XPlane, base: String, engines: usize, by: &str) -> Option<bool> {
     // Reverse owns the power levers: the speed governor lets go first, and an
     // engaged autothrottle comes out so it does not drive them back up.
-    if super::speedhold::release() {
+    if crate::flight_state::release_speed_hold() {
         tracing::info!("reverse thrust: released the speed governor");
     }
     let at_off = crate::autoflight::drop_thrust_now(xp, "reverse").await;

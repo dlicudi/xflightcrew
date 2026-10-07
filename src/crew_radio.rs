@@ -1,7 +1,8 @@
 //! The crew radio queue: every call the crew makes to the world, queued
 //! for the main loop to transmit. Moved out of `circuit.rs` verbatim
-//! (refactor audit 2026-10-04, phase 2); `circuit` re-exports it, so every
-//! `circuit::transmit` / `circuit::crew_callsign` path still compiles.
+//! (refactor audit 2026-10-04, phase 2); every caller names `crew_radio::`
+//! itself since the `circuit` re-export went (pillars audit 2026-10-07,
+//! stage A).
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

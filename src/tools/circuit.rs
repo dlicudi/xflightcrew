@@ -50,18 +50,9 @@ pub struct Circuit {
     pub park_brake_valve_set: Option<f64>,
 }
 
-/// Default pattern altitude above the field, feet (a standard light-aircraft
-/// circuit height). Not yet pilot-selectable by voice; a constant for now.
-const DEFAULT_TPA_AGL_FT: f64 = 1000.0;
-/// ...and the one a jet flies, which is the real-world figure and not
-/// decoration. The pattern feeds autoland, and the wider a pattern is the
-/// farther out it turns final: the MD-82's base leg reaches the centreline
-/// around 4 nm, where a 3° path is 1,340 ft up. Handing over from a 1,000 ft
-/// circuit there means arriving low and having to make it up, which is exactly
-/// what went wrong at Luton (2026-07-28).
-const JET_TPA_AGL_FT: f64 = 1500.0;
-/// Approach speed at or above which the pattern is a jet's, not a trainer's.
-const JET_APPROACH_KTS: f64 = 110.0;
+// The pattern altitude moved to `aircraft.rs` with the pattern speed (pillars
+// audit 2026-10-07, stage A).
+use crate::aircraft::pattern_alt_agl_ft;
 
 /// This airframe's climb-speed floor, from the profile's reference card.
 ///
@@ -74,16 +65,6 @@ pub fn climb_floor(profile: &crate::aircraft::AircraftProfile) -> f64 {
         profile.reference.as_ref().and_then(|r| r.vyse_kts),
         profile.vs_clean_kts,
     )
-}
-
-/// The pattern altitude this airframe should fly, from the only figure that
-/// distinguishes them here — how fast it flies its approach.
-pub fn pattern_alt_agl_ft(approach_ias: f64) -> f64 {
-    if approach_ias >= JET_APPROACH_KTS {
-        JET_TPA_AGL_FT
-    } else {
-        DEFAULT_TPA_AGL_FT
-    }
 }
 
 #[derive(Deserialize, Default)]
@@ -220,7 +201,7 @@ impl Tool for Circuit {
             ctx.config.xplane_base_url.clone(),
             ctx.voice.cloned(),
             circuit::Params {
-                apt_dat: super::autoland::apt_dat_path(),
+                apt_dat: crate::config::apt_dat_path(),
                 cifp_dir: ctx.config.cifp_dir.clone(),
                 fix_data_path: ctx.config.fix_data_path.clone(),
                 nav_data_path: ctx.config.nav_data_path.clone(),
@@ -230,7 +211,7 @@ impl Tool for Circuit {
                     tail_strike_deg: self.tail_strike_deg,
                     pitch_authority_down: self.pitch_authority_down,
                     vne_kts: self.vne_kts,
-                    apt_dat: super::autoland::apt_dat_path(),
+                    apt_dat: crate::config::apt_dat_path(),
                     cfg: self.cfg.clone(),
                     vr_kts: self.vr_kts,
                     vy_kts: self.vy_kts,

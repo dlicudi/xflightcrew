@@ -31,8 +31,8 @@
 //! (#182); the autoland loop runs it beside itself, owns the one `Reversal`
 //! and applies it.
 
-use crate::autoland::Runway;
 use crate::nav::{bearing_deg, project_latlon};
+use crate::runway::Runway;
 
 const M_PER_NM: f64 = 1852.0;
 /// The bank the pattern is SIZED for. Shallower than any autopilot flies
@@ -1476,7 +1476,7 @@ impl MissedWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::autoland::{along_track_nm, cross_track_nm};
+    use crate::runway::{along_track_nm, cross_track_nm};
 
     /// LEMG 12, 2026-09-28 (sortie 1790583663-approach): the inbound leg at
     /// its 2,921 ft platform, recorded. At 9.9 nm the path is still 305 ft

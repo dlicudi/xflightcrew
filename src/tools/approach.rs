@@ -539,7 +539,7 @@ impl Tool for VisualApproach {
         // finder — its first live consumer).
         let apt = ctx.config.apt_data_path.clone();
         let cands = tokio::task::spawn_blocking(move || {
-            crate::autoland::nearby_runways(&apt, lat, lon, GUIDE_MAX_NM)
+            crate::runway::nearby_runways(&apt, lat, lon, GUIDE_MAX_NM)
         })
         .await
         .map_err(|e| anyhow::anyhow!("runway scan: {e}"))?

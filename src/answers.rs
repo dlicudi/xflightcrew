@@ -496,7 +496,7 @@ pub(crate) fn remote_weather_target(
                     // Not on the plan: only if the METAR file actually lists it,
                     // so "in this" or "at that" never becomes an airport.
                     let on_file = || {
-                        weather::latest_file(&tools::autoland::xplane_root())
+                        weather::latest_file(&crate::config::xplane_root())
                             .and_then(|p| std::fs::read_to_string(p).ok())
                             .is_some_and(|text| weather::has_station(&text, &icao))
                     };
@@ -630,21 +630,21 @@ pub(crate) fn takeoff_runway_query(t: &str) -> bool {
 
 /// The answer's words, from the takeoff's own fit. Pure.
 pub(crate) fn takeoff_runway_line(
-    fit: Result<(String, f64), crate::autotakeoff::NoFit>,
+    fit: Result<(String, f64), crate::runway::NoFit>,
     needed_m: f64,
 ) -> String {
-    use crate::autotakeoff::NoFit;
+    use crate::runway::NoFit;
     let need = with_commas((needed_m / 10.0).round() * 10.0);
     let m = |v: f64| with_commas((v / 10.0).round() * 10.0);
     match fit {
         Ok((id, remaining_m)) => format!(
             "Yes. Runway {}, {} metres ahead of us, and we need {need} at this weight.",
-            crate::circuit::spell_runway(&id),
+            crate::crew_radio::spell_runway(&id),
             m(remaining_m)
         ),
         Err(NoFit::RunwayTooShort { id, length_m, .. }) => format!(
             "No. Runway {} is {} metres and we need {need} at this weight.",
-            crate::circuit::spell_runway(&id),
+            crate::crew_radio::spell_runway(&id),
             m(length_m)
         ),
         Err(NoFit::TooLittleLeft {
@@ -653,7 +653,7 @@ pub(crate) fn takeoff_runway_line(
             "Not from here. {} metres left on runway {}, and we need {need} at this weight. \
              A backtrack would do it.",
             m(remaining_m),
-            crate::circuit::spell_runway(&id)
+            crate::crew_radio::spell_runway(&id)
         ),
         Err(_) => format!(
             "We're not lined up on a runway, so I can't measure it. At this weight we need \
@@ -678,17 +678,15 @@ pub(crate) async fn takeoff_runway_answer(
     let (Ok(lat), Ok(lon), Ok(psi)) = (lat, lon, psi) else {
         return "I can't read our position.".to_string();
     };
-    let apt = crate::tools::autoland::apt_dat_path();
+    let apt = crate::config::apt_dat_path();
     let cands = tokio::task::spawn_blocking(move || {
-        crate::autoland::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default()
+        crate::runway::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default()
     })
     .await
     .unwrap_or_default();
-    let fit = match crate::autotakeoff::runway_fit(&cands, lat, lon, psi, needed_m) {
+    let fit = match crate::runway::runway_fit(&cands, lat, lon, psi, needed_m) {
         Some((rwy, remaining_m)) => Ok((rwy.id, remaining_m)),
-        None => Err(crate::autotakeoff::why_no_fit(
-            &cands, lat, lon, psi, needed_m,
-        )),
+        None => Err(crate::runway::why_no_fit(&cands, lat, lon, psi, needed_m)),
     };
     takeoff_runway_line(fit, needed_m)
 }

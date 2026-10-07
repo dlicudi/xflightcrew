@@ -604,7 +604,7 @@
         // pattern is capped against the approach speed regardless.
         let vy = r.vy_kts.expect("vy");
         assert!(vy <= 200.0, "vy is a climb-out speed, got {vy}");
-        let pat = super::circuit::pattern_speed_kts(vy, r.approach_kts.unwrap(), p.vs_clean_kts);
+        let pat = super::aircraft::pattern_speed_kts(vy, r.approach_kts.unwrap(), p.vs_clean_kts);
         assert!(pat <= 198.0, "pattern capped at 1.5x approach, got {pat}");
         // The runway it demands must fit the runways it flies from.
         let roll_m = r.takeoff_roll_ft.expect("ground roll") * 0.3048;

@@ -207,8 +207,8 @@ pub fn note_radio_call(transcript: &str) {
     if !radio_call_is_order(transcript, since) {
         return;
     }
-    let flying = crate::autoland::ACTIVE.load(Ordering::SeqCst)
-        || crate::circuit::ACTIVE.load(Ordering::SeqCst);
+    use crate::flight_state::Owner;
+    let flying = Owner::Autoland.active() || Owner::Circuit.active();
     if flying && crate::mode::crew_actuates() {
         let n = order();
         crate::blackbox::record(

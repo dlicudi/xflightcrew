@@ -569,7 +569,8 @@ fn best_rebuild(ticks: &[DriveTick], states: &[(f64, f64, f64, f64)], pace: crat
 fn lemg() -> Option<&'static (atc::nav::TaxiNet, Vec<atc::nav::Runway>)> {
     static NET: std::sync::OnceLock<Option<(atc::nav::TaxiNet, Vec<atc::nav::Runway>)>> = std::sync::OnceLock::new();
     NET.get_or_init(|| {
-        let apt = crate::tools::autoland::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let apt =
+            crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
         let net = atc::nav::find_taxi_net(&apt, "LEMG").ok()??;
         let rwys = atc::nav::find_runways(&apt, "LEMG").ok()?;
         Some((net, rwys))

@@ -434,7 +434,7 @@ impl Tool for SetUpFlight {
             Err(line) => return Ok(line),
         };
         // The first scan reads every installed .acf: off the command loop.
-        let root = super::autoland::xplane_root();
+        let root = crate::config::xplane_root();
         let lib = tokio::task::spawn_blocking(move || aircraft_library(&root)).await?;
         let Some(acf) = find_acf(lib, &fp.aircraft) else {
             return Ok(format!(
@@ -622,7 +622,7 @@ pub fn init_refusal(code: i64, icao: &str, runway: &str) -> String {
         5 => "X-Plane couldn't find that ramp".to_string(),
         6 => format!(
             "X-Plane has no runway {} at {}",
-            crate::circuit::spell_runway(runway),
+            crate::crew_radio::spell_runway(runway),
             crate::flightplan::spell_code(icao)
         ),
         _ => format!("X-Plane refused it, code {code}"),
@@ -635,9 +635,16 @@ pub fn init_refusal(code: i64, icao: &str, runway: &str) -> String {
 /// on; `Monitor` leaves the pilot flying.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AfterInit {
-    Arm { runway: crate::autoland::PlannedRunway, line: String },
-    Monitor { line: String },
-    Failed { line: String },
+    Arm {
+        runway: crate::runway::PlannedRunway,
+        line: String,
+    },
+    Monitor {
+        line: String,
+    },
+    Failed {
+        line: String,
+    },
 }
 
 /// The decision on the plugin's result (`None`: no answer in time). Pure:
@@ -650,7 +657,7 @@ pub fn after_init(
     hand_fly: bool,
     can_land: bool,
 ) -> AfterInit {
-    let spoken = crate::circuit::spell_runway(runway);
+    let spoken = crate::crew_radio::spell_runway(runway);
     match result {
         Some(0) if hand_fly => AfterInit::Monitor {
             line: format!("On a {final_nm} mile final for {spoken}. Your aircraft, I'm monitoring."),
@@ -661,7 +668,7 @@ pub fn after_init(
             ),
         },
         Some(0) => AfterInit::Arm {
-            runway: crate::autoland::PlannedRunway::at(icao, runway),
+            runway: crate::runway::PlannedRunway::at(icao, runway),
             line: format!("On a {final_nm} mile final for {spoken}, I have the aircraft."),
         },
         Some(code) => AfterInit::Failed { line: init_refusal(code, icao, runway) },
@@ -710,18 +717,20 @@ pub fn pick_runway(
     wind: Option<(f64, f64)>,
 ) -> Result<(String, &'static str), String> {
     if let Some(a) = asked {
-        return match_runway_end(runways, a).map(|e| (e, "asked")).ok_or_else(|| {
-            format!(
-                "{} has no runway {}. It has {}.",
-                crate::flightplan::spell_code(icao),
-                crate::circuit::spell_runway(a),
-                runway_ends(runways)
-                    .iter()
-                    .map(|e| crate::circuit::spell_runway(e))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        });
+        return match_runway_end(runways, a)
+            .map(|e| (e, "asked"))
+            .ok_or_else(|| {
+                format!(
+                    "{} has no runway {}. It has {}.",
+                    crate::flightplan::spell_code(icao),
+                    crate::crew_radio::spell_runway(a),
+                    runway_ends(runways)
+                        .iter()
+                        .map(|e| crate::crew_radio::spell_runway(e))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
     }
     if let Some(e) = tower.and_then(|t| match_runway_end(runways, t)) {
         return Ok((e, "tower"));
@@ -890,7 +899,7 @@ impl Tool for SetUpApproach {
         let plan = crate::simbrief::loaded_plan()
             .filter(|p| p.destination.eq_ignore_ascii_case(&icao))
             .and_then(|p| p.procedures.dest_rwy);
-        let wind = crate::weather::surface_wind(&super::autoland::xplane_root(), &icao);
+        let wind = crate::weather::surface_wind(&crate::config::xplane_root(), &icao);
         let (rwy, source) = match pick_runway(
             &icao,
             &info.runways,
@@ -934,7 +943,7 @@ impl Tool for SetUpApproach {
         spawn_off_loop(approach_follow_up(job, loading));
         Ok(format!(
             "Setting up a {final_nm} mile final for runway {} at {}.",
-            crate::circuit::spell_runway(&rwy),
+            crate::crew_radio::spell_runway(&rwy),
             crate::flightplan::spell_code(&icao)
         ))
     }
@@ -1311,20 +1320,20 @@ async fn new_flight_radio(xp: &crate::xplane::XPlaneClient, job: &ApproachJob, t
     };
     let _ = xp.set_float(crate::datarefs::COM1_FREQ_KHZ, khz as f64).await;
     if let Some((lat, lon)) = job.field {
-        let wind = crate::weather::surface_wind(&super::autoland::xplane_root(), &job.icao);
+        let wind = crate::weather::surface_wind(&crate::config::xplane_root(), &job.icao);
         crate::station::set_surface_wind(lat, lon, wind);
     }
     // The call belongs to the NEW station: routed a pass early it reaches
     // the old one and its worksheet.
     let up = await_station_up(khz, STATION_UP_S).await;
-    let callsign = crate::circuit::crew_callsign(xp).await;
+    let callsign = crate::crew_radio::crew_callsign(xp).await;
     let words = format!(
         "{} mile final runway {}",
         job.final_nm,
-        crate::circuit::spell_runway(&job.runway)
+        crate::crew_radio::spell_runway(&job.runway)
     );
     if up {
-        crate::circuit::transmit(crate::circuit::radio_call(&callsign, &words));
+        crate::crew_radio::transmit(crate::crew_radio::radio_call(&callsign, &words));
     }
     crate::blackbox::record(
         "setup",
@@ -1480,7 +1489,7 @@ mod tests {
         assert_eq!(
             after_init(Some(0), "LEMG", "13", 10, false, true),
             AfterInit::Arm {
-                runway: crate::autoland::PlannedRunway::at("LEMG", "13"),
+                runway: crate::runway::PlannedRunway::at("LEMG", "13"),
                 line: "On a 10 mile final for one three, I have the aircraft.".into(),
             }
         );

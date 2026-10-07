@@ -115,7 +115,7 @@
         let src = crate::test_support::module_source("full_auto");
         let check = src.find("if let Err(line) = departure_station(&xp).await").unwrap();
         let towered = src.find("let towered = crate::mode::atc_enabled()").unwrap();
-        let callsign = src.find("let callsign = crate::circuit::crew_callsign(&xp).await;\n\n    // On a Flight").unwrap();
+        let callsign = src.find("let callsign = crate::crew_radio::crew_callsign(&xp).await;\n\n    // On a Flight").unwrap();
         assert!(check < callsign && check < towered);
     }
 
@@ -150,15 +150,15 @@
         // it to Malaga Departure on the crosswind leg.
         let cs = Some("November eight one six November November".to_string());
         let circuit = Mission::Circuit { right: true };
-        let taxi = crate::circuit::radio_call(&cs, &taxi_call(&circuit, Some("31")));
+        let taxi = crate::crew_radio::radio_call(&cs, &taxi_call(&circuit, Some("31")));
         assert!(!taxi.contains("three one"), "a circuit asks for circuits: {taxi}");
         assert_eq!(parse_intent(&taxi), Intent::RequestTaxi, "{taxi}");
         assert!(wants_circuits(&taxi), "{taxi}");
-        let ready = crate::circuit::radio_call(&cs, ready_call(true));
+        let ready = crate::crew_radio::radio_call(&cs, ready_call(true));
         assert_eq!(parse_intent(&ready), Intent::RequestTakeoff, "{ready}");
         assert!(wants_circuits(&ready), "{ready}");
         // A departure never says it.
-        let ready = crate::circuit::radio_call(&cs, ready_call(false));
+        let ready = crate::crew_radio::radio_call(&cs, ready_call(false));
         assert_eq!(parse_intent(&ready), Intent::RequestTakeoff);
         assert!(!wants_circuits(&ready), "{ready}");
     }
@@ -171,7 +171,7 @@
     #[test]
     fn a_held_crew_reads_back_the_hold_before_asking_again() {
         use super::OwedReadback;
-        use crate::circuit::{readback_words, ReadbackRec};
+        use crate::crew_radio::{readback_words, ReadbackRec};
         use crate::tower::{parse_intent, Intent};
         use std::time::{Duration, Instant};
         let hold = "Holding position, November eight one six November November.";
@@ -212,11 +212,11 @@
         // "request clearance" on a circuit earned "cleared to leave the
         // Malaga zone".
         let cs = Some("November two five one Charlie Victor".to_string());
-        let call = crate::circuit::radio_call(&cs, zone_clearance_call(true));
+        let call = crate::crew_radio::radio_call(&cs, zone_clearance_call(true));
         assert_eq!(parse_intent(&call), Intent::RequestClearance, "{call}");
         assert!(wants_circuits(&call), "{call}");
         // A departure never says it.
-        let call = crate::circuit::radio_call(&cs, zone_clearance_call(false));
+        let call = crate::crew_radio::radio_call(&cs, zone_clearance_call(false));
         assert_eq!(parse_intent(&call), Intent::RequestClearance, "{call}");
         assert!(!wants_circuits(&call), "{call}");
     }
@@ -269,7 +269,7 @@
         use crate::tower::{parse_intent, Intent};
         let flight = Mission::Flight(egkk_egbb_route());
         let cs = Some("Whiskey Alpha Tango six two six".to_string());
-        let call = crate::circuit::radio_call(&cs, &taxi_call(&flight, Some("08R")));
+        let call = crate::crew_radio::radio_call(&cs, &taxi_call(&flight, Some("08R")));
         assert!(call.ends_with("request taxi, runway zero eight right"), "{call}");
         assert_eq!(parse_intent(&call), Intent::RequestTaxi, "{call}");
         assert_eq!(
@@ -474,7 +474,7 @@
             self.sim.run_command(name).await
         }
         async fn run_command_for(&self, name: &str, secs: f64) -> anyhow::Result<()> {
-            if name == crate::tools::BRAKES_REGULAR || name == crate::autotakeoff::BRAKES_MAX {
+            if name == crate::tools::BRAKES_REGULAR || name == crate::tools::BRAKES_MAX {
                 self.braking.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             self.sim.run_command_for(name, secs).await
@@ -530,7 +530,7 @@
         let jet = TaxiingJet::rolling_at_kts(70.0);
         let held = super::hand_back_hold(&jet, Some(1.0), super::HAND_BACK).await;
         assert_eq!(held, Some(true), "the parking brake reads set");
-        assert!(jet.sim.ran(crate::autotakeoff::BRAKES_MAX), "maximum effort while fast");
+        assert!(jet.sim.ran(crate::tools::BRAKES_MAX), "maximum effort while fast");
         assert!(jet.sim.ran(crate::tools::BRAKES_REGULAR), "the regular effort once slow");
         let at_park = jet.gs_at_park.lock().unwrap().expect("park brake set");
         assert!(
@@ -696,7 +696,7 @@
         ]);
         assert_eq!(hand_back_hold(&braking, Some(1.0), super::HAND_BACK).await, None);
         assert!(!braking.ran(SET), "the pilot is stopping it");
-        assert!(!braking.ran(crate::autotakeoff::BRAKES_MAX), "no fight on the pedals");
+        assert!(!braking.ran(crate::tools::BRAKES_MAX), "no fight on the pedals");
 
         // A tug on the bar owns the aircraft.
         let tug = FakeXPlane::with_reads(&[
@@ -748,7 +748,7 @@
         let blind = FakeXPlane::with_reads(&[(crate::datarefs::ON_GROUND_ANY, 1.0), (PARK, 0.0)]);
         blind.step_on_command(SET, PARK, 1.0);
         assert_eq!(hand_back_hold(&blind, None, taxi_in).await, Some(true));
-        assert!(blind.ran(crate::autotakeoff::BRAKES_MAX), "an unread speed is braked hard");
+        assert!(blind.ran(crate::tools::BRAKES_MAX), "an unread speed is braked hard");
         assert!(blind.ran(SET), "and parked");
 
         let no_ground =
@@ -2110,7 +2110,7 @@ fn every_mission_call_goes_through_the_abort_door() {
     let raw: Vec<&str> = src
         .lines()
         .filter(|l| {
-            (l.contains("circuit::transmit(") || l.contains("circuit::transmit_readback("))
+            (l.contains("crew_radio::transmit(") || l.contains("crew_radio::transmit_readback("))
                 && !l.trim_start().starts_with("//")
         })
         .collect();
@@ -2125,8 +2125,8 @@ fn a_withdraw_empties_the_crew_queue() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     crate::crew_radio::forget_flight_calls();
-    crate::circuit::transmit("Gibraltar Tower, request IFR clearance".into());
-    crate::circuit::transmit("Gibraltar Tower, request clearance".into());
+    crate::crew_radio::transmit("Gibraltar Tower, request IFR clearance".into());
+    crate::crew_radio::transmit("Gibraltar Tower, request clearance".into());
     assert!(crate::crew_radio::crew_radio_pending());
     let gone = crate::crew_radio::withdraw_queued();
     assert_eq!(gone.len(), 2, "{gone:?}");

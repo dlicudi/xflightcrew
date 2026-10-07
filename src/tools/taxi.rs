@@ -168,7 +168,7 @@ impl Tool for AutoTaxi {
         // refusal. Merely off it, or facing the wrong way, is a JOIN: the
         // loop turns toward the cleared pavement at bend speed and picks the
         // route up where the projection says.
-        if lateral > autotaxi::MAX_JOIN_M {
+        if lateral > crate::taxi_guide::MAX_JOIN_M {
             return Ok(format!(
                 "We're about {} meters off the cleared route. Get us near it and ask again.",
                 (lateral / 10.0).round() as i64 * 10
@@ -371,14 +371,13 @@ impl Tool for LineUp {
             );
         }
         // The apt.dat scan is seconds of file streaming — off the executor.
-        let apt = super::autoland::apt_dat_path();
-        let cands = tokio::task::spawn_blocking(move || {
-            crate::autoland::nearby_runways(&apt, lat, lon, 1.0)
-        })
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
+        let apt = crate::config::apt_dat_path();
+        let cands =
+            tokio::task::spawn_blocking(move || crate::runway::nearby_runways(&apt, lat, lon, 1.0))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
         let cleared = party_line::clearance_runway();
         let force_backtrack = args
             .get("backtrack")

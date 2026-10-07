@@ -33,9 +33,9 @@
 //! at once and a correction inside one waits as a pilot's would (#93).
 //! All pure.
 
-use crate::autoland::{along_track_nm, cross_track_nm, Runway};
 use crate::nav::ProcLeg;
 use crate::reversal::{self, Reversal};
+use crate::runway::{along_track_nm, cross_track_nm, Runway};
 
 /// The intercept angle, degrees: the standard one for an instrument final,
 /// inside autoland's 35 degree pursuit limit.
@@ -62,7 +62,7 @@ pub struct CourseLine(Runway);
 impl CourseLine {
     /// The course line of a CF leg: its fix and its course, magnetic in the
     /// CIFP, made true with the variation HERE (`mag = true + var`, the
-    /// X-Plane sense of `autoland::true_to_mag`). `None` for any other leg.
+    /// X-Plane sense of `runway::true_to_mag`). `None` for any other leg.
     pub fn of_leg(leg: &ProcLeg, mag_var: f64) -> Option<Self> {
         if leg.leg_type != "CF" {
             return None;
@@ -684,7 +684,7 @@ mod tests {
                 out.steers.push(steer.word());
             }
             was = steer;
-            let mag = |t: f64| crate::autoland::true_to_mag(t, EGKK_VAR);
+            let mag = |t: f64| crate::runway::true_to_mag(t, EGKK_VAR);
             if let Some(h) = hold.decide(steer.key(idx), mag(track), mag(p.hdg), p.bank, now) {
                 bug_true = h - EGKK_VAR;
                 out.bug_writes += 1;

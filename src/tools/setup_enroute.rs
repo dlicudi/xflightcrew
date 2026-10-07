@@ -696,7 +696,7 @@ async fn engage(xp: &crate::xplane::XPlaneClient, job: &EnrouteJob) -> Engaged {
     // A direct write, not `heading_bug::bug_toward`: the placement puts the
     // nose on this track wings level, and the heading read during the air
     // start's load is the last flight's, no measurement of this one.
-    let bug = crate::autoland::true_to_mag(p.track_true, var);
+    let bug = crate::runway::true_to_mag(p.track_true, var);
     let mut out = Engaged::default();
     let mut e = ApEngage::default();
     let t0 = std::time::Instant::now();
@@ -955,7 +955,9 @@ async fn enroute_follow_up(job: EnrouteJob, loading: super::setup::Loading) {
         if let Some(fix) =
             super::setup::settled_position(&xp, super::setup::SettleTiming::LIVE).await
         {
-            let callsign = crate::circuit::crew_callsign(&xp).await.unwrap_or_default();
+            let callsign = crate::crew_radio::crew_callsign(&xp)
+                .await
+                .unwrap_or_default();
             station = crate::station::arm_new_flight_enroute(
                 fix.lat,
                 fix.lon,

@@ -2097,7 +2097,7 @@ mod tests {
     /// file; the mapped flows must all resolve, joined parts in order.
     #[test]
     fn the_zibo_file_reads_and_its_flows_resolve() {
-        let root = crate::tools::autoland::xplane_root();
+        let root = crate::config::xplane_root();
         let Some(path) = resolve_acf_path("acf:clist.txt", "Aircraft/B737-800X/b738_4k.acf", &root)
         else {
             return;
@@ -2208,7 +2208,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_zibo_ground_lists() {
-        let root = crate::tools::autoland::xplane_root();
+        let root = crate::config::xplane_root();
         let path =
             resolve_acf_path("acf:clist.txt", "Aircraft/B737-800X/b738_4k.acf", &root).unwrap();
         let text = std::fs::read_to_string(&path).expect("the Zibo's clist.txt");

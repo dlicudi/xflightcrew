@@ -1,8 +1,8 @@
 //! Runway data and geometry: the landing options parsed from apt.dat, the
 //! pick by wind and track, the planned end, pavement widths and the
 //! along/cross-track measures. Moved out of `autoland.rs` verbatim (refactor
-//! audit 2026-10-04, phase 2); `autoland` re-exports it, so every
-//! `autoland::Runway` / `autoland::nearby_runways` path still compiles.
+//! audit 2026-10-04, phase 2); every caller names `runway::` itself since the
+//! `autoland` re-export went (pillars audit 2026-10-07, stage A).
 
 use std::io::{BufRead, BufReader};
 
@@ -405,6 +405,194 @@ pub fn cross_track_nm(lat: f64, lon: f64, rwy: &Runway) -> f64 {
     // relative to the INBOUND landing course (the direction of flight on final).
     let ang = crate::angles::signed_diff_deg(brg_from_thr, rwy.course_deg).to_radians();
     dist * ang.sin()
+}
+
+// The takeoff's runway fit, moved verbatim from `autotakeoff.rs` (pillars
+// audit 2026-10-07, stage A): pure geometry over a `Runway`, read by the
+// takeoff's gates and by the copilot's "is the runway long enough?".
+
+/// Lined up means aligned within this many degrees of a runway's course.
+pub(crate) const ALIGN_MAX_DEG: f64 = 20.0;
+/// ... and within this many meters of its centreline.
+pub(crate) const LATERAL_MAX_M: f64 = 40.0;
+/// ... and no more than this far short of the threshold (a lead-on stub
+/// aligned with the strip still counts; the far side of the airport doesn't).
+pub(crate) const BEFORE_THRESHOLD_MAX_M: f64 = 100.0;
+/// Runway remaining below this at arm time is not a takeoff, whatever the
+/// POH says: floor for airframes with no published takeoff distance.
+pub const MIN_REMAINING_M: f64 = 500.0;
+
+/// Fit the aircraft's position and heading to a runway end: which strip are
+/// we lined up on, and how much of it is left ahead of the nose. `None`
+/// when nothing fits: not on a runway, not aligned, or not enough left.
+pub fn runway_fit(
+    cands: &[Runway],
+    lat: f64,
+    lon: f64,
+    psi_true: f64,
+    needed_m: f64,
+) -> Option<(Runway, f64)> {
+    let mut best: Option<(Runway, f64, f64)> = None;
+    for r in cands {
+        let err = crate::angles::abs_diff_deg(psi_true, r.course_deg);
+        if err > ALIGN_MAX_DEG {
+            continue;
+        }
+        let lateral_m = (cross_track_nm(lat, lon, r) * M_PER_NM).abs();
+        if lateral_m > LATERAL_MAX_M {
+            continue;
+        }
+        // along_track is positive SHORT of the threshold, negative down the
+        // runway; rolled distance is how far past the numbers we sit.
+        let along_m = along_track_nm(lat, lon, r) * M_PER_NM;
+        if along_m > BEFORE_THRESHOLD_MAX_M {
+            continue;
+        }
+        let remaining_m = r.length_m - (-along_m).max(0.0);
+        if remaining_m < needed_m.max(MIN_REMAINING_M) {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(_, e, _)| err < *e) {
+            best = Some((r.clone(), err, remaining_m));
+        }
+    }
+    best.map(|(r, _, rem)| (r, rem))
+}
+
+/// Why [`runway_fit`] found nothing: the nearest near-miss, so a refusal can
+/// name the problem instead of guessing at it.
+///
+/// The four failures want four different actions from the pilot, and the
+/// caller used to collapse them into one line. At Edinburgh (2026-09-20) the
+/// aircraft sat on runway 24, aligned to within a degree and dead on the
+/// centreline, 2,408 m along a 2,549 m strip, 141 m of runway ahead. The
+/// refusal said "We're not on the runway yet. Say line us up", while the
+/// tower was simultaneously saying "you are on runway two four without
+/// clearance, traffic on short final, exit immediately". The fit was right
+/// and the words were a lie.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NoFit {
+    /// Nothing within reach on this field at all: no candidate runway, or the
+    /// best-aligned one lies further off than a line-up could ever be. `id`
+    /// and `lateral_m` name that strip when there was one, so the refusal can
+    /// say WHICH runway it looked for and how far away it is: the vague "I
+    /// couldn't get us onto the runway" is what sent the pilot to the logs
+    /// (LFPB 2026-09-22). Empty id = no pavement near us at all.
+    NoneNear { id: String, lateral_m: f64 },
+    /// On the pavement, aligned, but not enough runway ahead of the nose,
+    /// and there WOULD be from the threshold. Backtracking fixes this one.
+    TooLittleLeft {
+        id: String,
+        remaining_m: f64,
+        needed_m: f64,
+    },
+    /// The whole runway is shorter than this aircraft needs. Position is
+    /// irrelevant: no line-up and no backtrack can help.
+    ///
+    /// Edinburgh 24 is 2,549 m; the A330 asks 2,560 (a 6,000 ft roll times
+    /// the 1.4 factor). Eleven metres. The refusal said "we're not on the
+    /// runway yet", so the pilot lined up, was told the same thing, backtracked
+    /// the full length, and was told it a third time (2026-09-20).
+    RunwayTooShort {
+        id: String,
+        length_m: f64,
+        needed_m: f64,
+    },
+    /// On (or near) a strip, but lying across it.
+    NotAligned { id: String, err_deg: f64 },
+    /// Aligned with a runway but sitting beside it.
+    Offset { id: String, lateral_m: f64 },
+    /// Aligned and on the centreline, but still short of the threshold.
+    ShortOfThreshold { id: String, m: f64 },
+}
+
+/// [`why_no_fit`] told about the CLEARED runway: nowhere near any pavement,
+/// the refusal names the end the tower cleared and how far it is, never the
+/// strip that merely lay best along the nose. At ETND (2026-09-24) the SF50
+/// was cleared 26R, faced 016 at the hold, and heard "08L is 152 metres
+/// away": the reciprocal end of the runway it was cleared for, which reads
+/// as a crew that does not know its clearance. Every other gate stands as
+/// diagnosed (an aircraft aligned on another end is judged on that end).
+pub fn why_no_fit_cleared(
+    cands: &[Runway],
+    lat: f64,
+    lon: f64,
+    psi_true: f64,
+    needed_m: f64,
+    cleared: Option<&str>,
+) -> NoFit {
+    let why = why_no_fit(cands, lat, lon, psi_true, needed_m);
+    let NoFit::NoneNear { .. } = why else {
+        return why;
+    };
+    match cleared.and_then(|c| cands.iter().find(|r| r.id.eq_ignore_ascii_case(c))) {
+        Some(r) => NoFit::NoneNear {
+            id: r.id.clone(),
+            lateral_m: (cross_track_nm(lat, lon, r) * M_PER_NM).abs(),
+        },
+        None => why,
+    }
+}
+
+/// Diagnose a failed [`runway_fit`]: the best-aligned candidate, and the FIRST
+/// gate it fails, in the same order the fit applies them, so the answer is
+/// always the thing that actually stopped it.
+pub fn why_no_fit(cands: &[Runway], lat: f64, lon: f64, psi_true: f64, needed_m: f64) -> NoFit {
+    // Of the ends we are aligned with, the one we are ON (least lateral):
+    // parallels share a heading to thousandths of a degree, so the best-
+    // aligned pick was a coin toss between them. EGKK 2026-09-27 (sortie
+    // 1790527340): on 26L's centreline at 256.3 true, 26R (257.624) beat
+    // 26L (257.629) by 0.005 degrees, 200 m away, and the diagnosis was
+    // "none near" instead of "too little left". With nothing aligned, the
+    // best-aligned end, as before.
+    let lateral = |r: &Runway| (cross_track_nm(lat, lon, r) * M_PER_NM).abs();
+    let aligned = cands
+        .iter()
+        .filter(|r| crate::angles::abs_diff_deg(psi_true, r.course_deg) <= ALIGN_MAX_DEG)
+        .min_by(|a, b| lateral(a).total_cmp(&lateral(b)));
+    let best = aligned.or_else(|| {
+        cands.iter().min_by(|a, b| {
+            crate::angles::abs_diff_deg(psi_true, a.course_deg)
+                .total_cmp(&crate::angles::abs_diff_deg(psi_true, b.course_deg))
+        })
+    });
+    let Some(r) =
+        best.filter(|r| (cross_track_nm(lat, lon, r) * M_PER_NM).abs() < 2.0 * LATERAL_MAX_M)
+    else {
+        return NoFit::NoneNear {
+            id: best.map(|r| r.id.clone()).unwrap_or_default(),
+            lateral_m: best
+                .map(|r| (cross_track_nm(lat, lon, r) * M_PER_NM).abs())
+                .unwrap_or(0.0),
+        };
+    };
+    let id = r.id.clone();
+    let err = crate::angles::abs_diff_deg(psi_true, r.course_deg);
+    if err > ALIGN_MAX_DEG {
+        return NoFit::NotAligned { id, err_deg: err };
+    }
+    let lateral_m = (cross_track_nm(lat, lon, r) * M_PER_NM).abs();
+    if lateral_m > LATERAL_MAX_M {
+        return NoFit::Offset { id, lateral_m };
+    }
+    let along_m = along_track_nm(lat, lon, r) * M_PER_NM;
+    if along_m > BEFORE_THRESHOLD_MAX_M {
+        return NoFit::ShortOfThreshold { id, m: along_m };
+    }
+    let need = needed_m.max(MIN_REMAINING_M);
+    // Would the FULL strip do? If not, where we stand is beside the point.
+    if r.length_m < need {
+        return NoFit::RunwayTooShort {
+            id,
+            length_m: r.length_m,
+            needed_m: need,
+        };
+    }
+    NoFit::TooLittleLeft {
+        id,
+        remaining_m: r.length_m - (-along_m).max(0.0),
+        needed_m: need,
+    }
 }
 
 #[cfg(test)]

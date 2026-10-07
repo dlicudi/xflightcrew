@@ -1194,12 +1194,12 @@ pub fn held_by_automation(dataref: &str) -> Option<&'static str> {
     // loops and a recovery too, each by its own name (a circuit was named
     // "the follower"; refactor audit 2026-10-04, duplicates #1).
     let flying = crate::flight_state::crew_flying();
-    if dataref.contains("throttle") && crate::tools::speedhold::ACTIVE.load(Relaxed) {
+    if dataref.contains("throttle") && crate::flight_state::speed_held() {
         return Some("the speed hold");
     }
     // The circuit's own throttle law holds the pattern speed; the climb
     // list's "throttle, full" is not a discrepancy under it (LXGB 2026-09-14).
-    if dataref.contains("throttle") && crate::circuit::ACTIVE.load(Relaxed) {
+    if dataref.contains("throttle") && crate::flight_state::Owner::Circuit.active() {
         return Some("the circuit");
     }
     if dataref.contains("mixture") && crate::tools::engine::MIX_MANAGED.load(Relaxed) {
@@ -1210,7 +1210,7 @@ pub fn held_by_automation(dataref: &str) -> Option<&'static str> {
             return Some(owner.spoken());
         }
     }
-    if dataref.contains("flap") && crate::autoland::ACTIVE.load(Relaxed) {
+    if dataref.contains("flap") && crate::flight_state::Owner::Autoland.active() {
         return Some("autoland");
     }
     // Full auto works the signs by height (off through ten thousand, on
@@ -1218,7 +1218,9 @@ pub fn held_by_automation(dataref: &str) -> Option<&'static str> {
     // descent, seven thousand feet above that, and "seat belt signs, on" was
     // spoken as a discrepancy on a flight that was exactly as it should be
     // (EGPH-EGTE, 2026-09-21).
-    if crate::full_auto::ACTIVE.load(Relaxed) && crate::tools::signs::is_signs_dataref(dataref) {
+    if crate::flight_state::Owner::FullAuto.active()
+        && crate::tools::signs::is_signs_dataref(dataref)
+    {
         return Some("the signs schedule");
     }
     None

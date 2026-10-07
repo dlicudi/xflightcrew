@@ -15,26 +15,11 @@ use serde_json::{json, Value};
 use super::{Tool, ToolCtx};
 use crate::tools::autopilot::ApConfig;
 
-/// Where the Global Airports apt.dat lives — `XCOPILOT_APT_DAT` overrides the
-/// standard install path.
+/// The install paths are `config`'s (`config::apt_dat_path`,
+/// `config::xplane_root`, `config::xplane_path`); this door is kept only for
+/// `safe_hold`, untied in stage A item 2.
 pub fn apt_dat_path() -> String {
-    if let Ok(p) = std::env::var("XCOPILOT_APT_DAT") {
-        return p;
-    }
-    xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat")
-}
-
-/// The X-Plane install the sim is running from — `XCOPILOT_XPLANE_ROOT`
-/// overrides the standard location. Where an unknown airframe's `.acf` is
-/// read from (`sim/aircraft/view/acf_relative_path` is relative to it).
-pub fn xplane_root() -> String {
-    crate::config::xplane_root()
-}
-
-/// A path under the X-Plane install (`xplane_root`), e.g.
-/// `xplane_path("Custom Data/CIFP")`.
-pub fn xplane_path(rel: &str) -> String {
-    crate::config::xplane_path(rel)
+    crate::config::apt_dat_path()
 }
 
 pub struct Autoland {
@@ -64,17 +49,17 @@ struct Args {
 /// The nearest suitable runway, by the self-pick's own rules and with no
 /// destination to prefer: the airframe's minimum length, the METAR wind at
 /// each field. Blackboxed `autoland` `self_pick` with `nearest` and why.
-async fn nearest_runway(ctx: &ToolCtx<'_>, why: &str) -> Option<crate::autoland::Runway> {
+async fn nearest_runway(ctx: &ToolCtx<'_>, why: &str) -> Option<crate::runway::Runway> {
     let (lat, lon, trk) = tokio::join!(
         ctx.xplane.get_float(crate::datarefs::LATITUDE),
         ctx.xplane.get_float(crate::datarefs::LONGITUDE),
         ctx.xplane.get_float(crate::datarefs::TRACK_DEG_TRUE),
     );
     let (lat, lon, trk) = (lat.ok()?, lon.ok()?, trk.unwrap_or(0.0));
-    let apt = apt_dat_path();
+    let apt = crate::config::apt_dat_path();
     let picked = tokio::task::spawn_blocking(move || {
         let min = crate::runway::self_pick_min_length_m(crate::aircraft::landing_distance_m());
-        let root = xplane_root();
+        let root = crate::config::xplane_root();
         let wind_at = |icao: &str| crate::weather::surface_wind(&root, icao);
         let r = crate::runway::best_landing_runway_in_wind(&apt, lat, lon, trk, 40.0, min, &wind_at, None)
             .ok()
@@ -188,12 +173,12 @@ impl Tool for Autoland {
             );
             crate::autoland::run_autoland_scoped(
                 ctx.config.xplane_base_url.clone(),
-                apt_dat_path(),
+                crate::config::apt_dat_path(),
                 self.cfg.clone(),
                 self.approach_ias,
                 ctx.voice.cloned(),
                 ctx.status.cloned(),
-                Some(crate::autoland::PlannedRunway::at(&icao, &rwy)),
+                Some(crate::runway::PlannedRunway::at(&icao, &rwy)),
                 ctx.xplane.cancellation(),
                 crate::autoland::HandDown::default(),
             );
@@ -215,7 +200,7 @@ impl Tool for Autoland {
         let forced = match why_nearest.as_deref() {
             Some(why) => nearest_runway(ctx, why)
                 .await
-                .map(|r| (crate::autoland::PlannedRunway::at(r.icao.trim(), &r.id), r)),
+                .map(|r| (crate::runway::PlannedRunway::at(r.icao.trim(), &r.id), r)),
             None => None,
         };
         let line = match (&why_nearest, &forced) {
@@ -234,7 +219,7 @@ impl Tool for Autoland {
         };
         crate::autoland::run_autoland_scoped(
             ctx.config.xplane_base_url.clone(),
-            apt_dat_path(),
+            crate::config::apt_dat_path(),
             self.cfg.clone(),
             self.approach_ias,
             ctx.voice.cloned(),

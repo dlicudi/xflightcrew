@@ -5,7 +5,7 @@
     #[test]
     fn a_reject_is_reported_to_the_tower_that_cleared_it() {
         use crate::tower::{parse_intent, Intent, State};
-        let call = crate::circuit::radio_call(
+        let call = crate::crew_radio::radio_call(
             &Some("Whiskey Alpha Tango one seven three".into()),
             super::REJECT_CALL,
         );
@@ -49,7 +49,7 @@
         )
         .unwrap();
         let (lat, lon, psi) = (52.585511622928735, 8.349835096044318, 16.0);
-        let cands = crate::autoland::nearby_runways(apt.to_str().unwrap(), lat, lon, 3.0).unwrap();
+        let cands = crate::runway::nearby_runways(apt.to_str().unwrap(), lat, lon, 3.0).unwrap();
         assert!(runway_fit(&cands, lat, lon, psi, 780.0).is_none());
         let old = why_no_fit(&cands, lat, lon, psi, 780.0);
         let NoFit::NoneNear { id, lateral_m } = &old else {

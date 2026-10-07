@@ -444,6 +444,54 @@ impl Owner {
         }
     }
 
+    /// Its loop is live: its flag reads set, or, for the two loops that keep
+    /// a flag beside an unflagged run (full auto and the takeoff), its run
+    /// still runs. Every other owner is live exactly when [`Owner::active`].
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn live(self) -> bool {
+        self.active()
+            || match self {
+                Owner::FullAuto => crate::full_auto::running(),
+                Owner::Autotakeoff => crate::autotakeoff::running(),
+                _ => false,
+            }
+    }
+
+    /// Stand this one loop down through its own door, the one
+    /// [`stand_down`] calls for it: a takeoff hands over with the power set,
+    /// a taxi stops its drive, a circuit, a landing or a mission gives back a
+    /// flyable aircraft. What the door says it stopped is the caller's to
+    /// read off [`Owner::active`] first; nothing else is let go here.
+    pub(crate) fn stop(self) {
+        match self {
+            Owner::FullAuto => {
+                crate::full_auto::abort();
+            }
+            Owner::HeliRoute => crate::heli_route::abort(),
+            Owner::Circuit => {
+                crate::circuit::abort();
+            }
+            Owner::HeliCircuit => crate::heli_circuit::abort(),
+            Owner::Procedure => {
+                crate::procedure::abort();
+            }
+            Owner::Autoland => {
+                crate::autoland::abort();
+            }
+            Owner::Autotakeoff => crate::autotakeoff::cancel(),
+            Owner::Autotaxi => {
+                crate::autotaxi::halt();
+            }
+            Owner::Pushback => {
+                crate::pushback::clear();
+            }
+            Owner::Hover => crate::hover::abort(),
+            Owner::Recover => {
+                crate::tools::recover::abort();
+            }
+        }
+    }
+
     /// Its name in the blackbox, the flight model's `Control::Automation`
     /// and the duty engine (`monitor::flying_loop`'s names, kept).
     pub(crate) fn name(self) -> &'static str {
@@ -558,6 +606,205 @@ pub(crate) fn crew_taking_every_lever() -> Option<Owner> {
     innermost(Owner::active, Owner::takes_every_lever)
 }
 
+/// The speed governor (`tools::speedhold`) holds the throttle, in flight or
+/// taxiing. Not an [`Owner`]: it holds a lever, never the aircraft.
+pub(crate) fn speed_held() -> bool {
+    crate::tools::speedhold::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The speed governor is TAXIING (a ground hold, not a flight hold).
+pub(crate) fn taxi_speed_held() -> bool {
+    crate::tools::speedhold::taxi_hold_active()
+}
+
+/// The speed governor lets go of the throttle where it is; whether it was
+/// holding it.
+pub(crate) fn release_speed_hold() -> bool {
+    crate::tools::speedhold::release()
+}
+
+/// "My controls" from the autopilot tool: a recovery and a landing both let
+/// go (both doors called, never short-circuited); whether either was flying.
+pub(crate) fn release_recovery_and_landing() -> bool {
+    crate::tools::recover::abort() | crate::autoland::abort()
+}
+
+/// What the crew holds when the pilot asks for the controls back: one read
+/// of every loop and lever a release can hand over, taken BEFORE anything is
+/// let go, so the branches of [`Held::release_to_pilot`] judge the same
+/// moment. The command loop's release guard is its one reader.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Held {
+    pub(crate) speed: bool,
+    /// The continuous mixture manager OR a lean seek still hunting the peak.
+    pub(crate) mixture: bool,
+    pub(crate) reverse: bool,
+    pub(crate) taxi: bool,
+    pub(crate) takeoff: bool,
+    pub(crate) circuit: bool,
+    pub(crate) procedure: bool,
+    pub(crate) full_auto: bool,
+    /// A taxi-in between its drives (the request's wait) holds the aircraft
+    /// with no auto taxi running.
+    pub(crate) taxi_in: bool,
+    pub(crate) hover: bool,
+    /// A helicopter's route or circuit: in cruise the hover loop is not
+    /// running, and the route's speed law owns the collective until it is
+    /// told to let go.
+    pub(crate) heli: bool,
+}
+
+impl Held {
+    /// Every loop and lever read now.
+    pub(crate) fn now() -> Held {
+        use std::sync::atomic::Ordering::Relaxed;
+        Held {
+            speed: speed_held(),
+            mixture: crate::tools::engine::MIX_MANAGED.load(Relaxed)
+                || crate::tools::engine::LEAN_SEEKING.load(Relaxed),
+            reverse: crate::tools::reverse::ACTIVE.load(Relaxed),
+            taxi: Owner::Autotaxi.active(),
+            takeoff: Owner::Autotakeoff.active(),
+            circuit: Owner::Circuit.active(),
+            procedure: Owner::Procedure.active(),
+            full_auto: Owner::FullAuto.active(),
+            taxi_in: crate::taxi_in::running(),
+            hover: Owner::Hover.active(),
+            heli: Owner::HeliRoute.active() || Owner::HeliCircuit.active(),
+        }
+    }
+
+    /// The crew holds something a release can hand back.
+    pub(crate) fn any(&self) -> bool {
+        self.hover
+            || self.heli
+            || self.speed
+            || self.mixture
+            || self.reverse
+            || self.taxi
+            || self.taxi_in
+            || self.takeoff
+            || self.circuit
+            || self.procedure
+            || self.full_auto
+    }
+
+    /// Hand back what `tl` (the pilot's words, lowercased) asks for: naming
+    /// a lever releases just that one; a generic "my controls" / "let go"
+    /// releases everything held. Each loop is released by its own door, in
+    /// this order, and the spoken parts of the readback are returned (empty:
+    /// nothing named was held).
+    pub(crate) fn release_to_pilot(&self, tl: &str) -> Vec<&'static str> {
+        let names_mix = tl.contains("mixture") || tl.contains("mix");
+        let names_speed = tl.contains("throttle")
+            || tl.contains("speed")
+            || tl.contains("power")
+            || tl.contains("taxi")
+            || tl.contains("thr");
+        // The steering half of an auto taxi, releasable on its
+        // own: "my steering" keeps the speed hold, the
+        // pre-existing "you steer, I have the throttle" split.
+        let names_steer = tl.contains("steer")
+            || tl.contains("pedal")
+            || tl.contains("rudder")
+            || tl.contains("nosewheel");
+        let names_reverse = tl.contains("reverse");
+        // "Release parking brake" names a lever NOBODY here holds:
+        // it's for the brake tool, so it must not count as a
+        // generic release: that dropped the speed hold instead
+        // and left the throttle up with the brake still set
+        // (SR22, 2026-07-11).
+        let generic =
+            !names_mix && !names_speed && !names_reverse && !names_steer && !tl.contains("brake");
+        let mut released: Vec<&'static str> = Vec::new();
+        // A helicopter's hover: the collective is ours and the
+        // autopilot holds the position. "My controls" or naming
+        // the collective hands both back where they are.
+        if self.heli && (generic || tl.contains("collective")) {
+            // The route lets go of the collective where it is and
+            // leaves the autopilot in the mode it is flying.
+            Owner::HeliRoute.stop();
+            Owner::HeliCircuit.stop();
+            released.push("route off");
+        }
+        if self.hover && (generic || tl.contains("collective")) {
+            Owner::Hover.stop();
+            released.push("hover off, your controls");
+        }
+        // Full auto owns the entire chain (engine, taxi, line-up,
+        // circuit); cancelling it stands them all down and wins the
+        // release, so the per-loop branches below are skipped.
+        if self.full_auto && (names_speed || names_steer || generic) {
+            Owner::FullAuto.stop();
+            released.push("full auto off, your aircraft");
+        }
+        // A circuit in progress owns whichever sub-loop is flying
+        // (takeoff or autoland); aborting it stands them ALL down,
+        // so it wins the generic release and the per-loop branches
+        // below are skipped (they'd double up on its sub-loops).
+        if !self.full_auto && self.circuit && (names_speed || names_steer || generic) {
+            Owner::Circuit.stop();
+            released.push("circuit off, your aircraft");
+        }
+        // A published-procedure follower is airborne on the AP (it
+        // aborts its autoland handoff too); a lever-shaped or generic
+        // release hands it back.
+        if !self.full_auto && !self.circuit && self.procedure && (names_speed || generic) {
+            Owner::Procedure.stop();
+            released.push("procedure off, your aircraft");
+        }
+        // A takeoff in progress: "my controls" is a HANDOVER, not
+        // a reject: the loop stands down silently, steering
+        // expires, and the power stays set for the pilot now
+        // flying it ("abort takeoff" is the arresting path).
+        if !self.circuit
+            && !self.full_auto
+            && self.takeoff
+            && (names_speed || names_steer || generic)
+        {
+            Owner::Autotakeoff.stop();
+            released.push("your takeoff, power is set");
+        }
+        // The taxi-in ends where it is, braked to a stop and
+        // parked: a stopped drive alone was driven again to the
+        // stand 7 s later (LEMG, 2026-09-28).
+        let taxi_in_ended = self.taxi_in && (names_speed || generic);
+        if taxi_in_ended {
+            crate::taxi_in::abort(true);
+            released.push("taxi in off, your aircraft");
+        }
+        if !self.circuit
+            && !self.full_auto
+            && !taxi_in_ended
+            && self.taxi
+            && (names_speed || names_steer || generic)
+        {
+            Owner::Autotaxi.stop();
+            if names_steer && !names_speed && !generic {
+                released.push("steering's yours, I still have the speed");
+            } else {
+                release_speed_hold();
+                released.push("auto taxi off, your aircraft");
+            }
+        } else if self.speed && !taxi_in_ended && (names_speed || generic) {
+            release_speed_hold();
+            released.push("speed hold off, your throttle");
+        }
+        if self.mixture && (names_mix || generic) {
+            crate::tools::engine::release_mixture();
+            released.push("mixture's yours");
+        }
+        // Reverse rides the same levers as the speed hold: any
+        // lever-shaped release stows it (the watcher glides the
+        // levers back to idle on its way out).
+        if self.reverse && (names_reverse || names_speed || generic) {
+            crate::tools::reverse::stow();
+            released.push("stowing reverse");
+        }
+        released
+    }
+}
+
 /// The innermost owner `active` says is set among those `keep` admits. Pure
 /// over `active`, so the orders are a plain test.
 fn innermost(active: impl Fn(Owner) -> bool, keep: impl Fn(Owner) -> bool) -> Option<Owner> {
@@ -568,6 +815,201 @@ fn innermost(active: impl Fn(Owner) -> bool, keep: impl Fn(Owner) -> bool) -> Op
 
 #[cfg(test)]
 mod tests {
+    /// The copilot never reaches into a flying loop's own flags or doors:
+    /// "is it flying?" is [`super::Owner`]'s ([`super::crew_has_aircraft`]
+    /// and the rest), "let it go" is [`super::Owner::stop`],
+    /// [`super::Held::release_to_pilot`] or a named door on this page
+    /// ([`super::release_speed_hold`]). Read from the source: no COPILOT
+    /// module (the pillars audit's classification, 2026-10-07) names an
+    /// AUTONOMY module's `ACTIVE`, `ABORT`, `abort`, `release`, `cancel` or
+    /// `halt`. The knots still tied are listed by file and reference, and
+    /// each must still be there: the list only shrinks.
+    #[test]
+    fn copilot_reaches_the_loops_only_through_flight_state() {
+        const COPILOT: &[&str] = &[
+            "answers",
+            "audio",
+            "cabin",
+            "checklist",
+            "flow",
+            "conversation",
+            "dialogue",
+            "grammar",
+            "router",
+            "mic",
+            "stt",
+            "tts",
+            "tts_onnx",
+            "vad",
+            "voice",
+            "phrase",
+            "persona",
+            "tempo",
+            "rapport",
+            "readback",
+            "instructor",
+            "monitor",
+            "cockpit_auto",
+            "undo",
+            "shortcuts",
+            "interaction",
+            "handover",
+            "go_around",
+            "radiofx",
+            "crew_radio",
+            "plan",
+            "failures",
+            "approach_guide",
+            "taxi_guide",
+            "takeoff_config",
+            "crew_pace",
+            "tools/anti_ice",
+            "tools/approach",
+            "tools/autoflight",
+            "tools/autopilot",
+            "tools/cabin_air",
+            "tools/electrical",
+            "tools/engine",
+            "tools/flaps",
+            "tools/fuel_pumps",
+            "tools/gear",
+            "tools/ground",
+            "tools/instruments",
+            "tools/lever",
+            "tools/lights",
+            "tools/loading",
+            "tools/power",
+            "tools/prop",
+            "tools/radio",
+            "tools/reminder",
+            "tools/signs",
+            "tools/cycle",
+            "tools/jet_start",
+            "tools/scripted_start",
+            "tools/controls",
+            "tools/reverse",
+            "tools/go_around",
+        ];
+        const AUTONOMY: &[&str] = &[
+            "ap_engage",
+            "ap_lands",
+            "approach_energy",
+            "autoland",
+            "autotakeoff",
+            "autotaxi",
+            "circuit",
+            "climb_watch",
+            "course_leg",
+            "full_auto",
+            "ground_steer",
+            "heading_bug",
+            "heli_circuit",
+            "heli_route",
+            "hover",
+            "ils",
+            "lnav",
+            "procedure",
+            "pushback",
+            "recovery_plan",
+            "reversal",
+            "roll_steer",
+            "safe_hold",
+            "stable_approach",
+            "taxi_in",
+            "takeoff_thrust",
+            "takeoff_trim",
+            "tiller",
+            "yoke",
+            "preflight",
+            "plan_audit",
+            "control",
+            "tools/autoland",
+            "tools/circuit",
+            "tools/full_auto",
+            "tools/heli",
+            "tools/procedure",
+            "tools/recover",
+            "tools/speedhold",
+            "tools/takeoff",
+            "tools/taxi",
+            "tools/setup",
+            "tools/setup_enroute",
+        ];
+        const DOORS: &[&str] = &["ACTIVE", "ABORT", "abort", "release", "cancel", "halt"];
+        // The four copilot to autonomy knots (pillars audit), by file and the
+        // reference each still makes.
+        const KNOTS: &[(&str, &str)] = &[
+            // monitor's runway-fit judgement for full auto (knot 3): untied
+            // in stage A item 2.
+            ("monitor.rs", "full_auto::ACTIVE"),
+        ];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut names: Vec<&str> = AUTONOMY
+            .iter()
+            .map(|m| m.rsplit('/').next().unwrap())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let mut found: Vec<(String, String, usize)> = Vec::new();
+        let mut scanned = Vec::new();
+        for module in COPILOT {
+            let mut files = Vec::new();
+            let file = src.join(format!("{module}.rs"));
+            if file.is_file() {
+                files.push(file);
+            }
+            files.extend(crate::test_support::rust_files(&src.join(module)));
+            for f in files {
+                if crate::test_support::is_test_file(&f) {
+                    continue;
+                }
+                let rel = f.strip_prefix(&src).unwrap().to_string_lossy().to_string();
+                let text = std::fs::read_to_string(&f).unwrap();
+                let production = text.split("#[cfg(test)]\nmod ").next().unwrap();
+                scanned.push(rel.clone());
+                for (i, l) in production.lines().enumerate() {
+                    let code = l.split("//").next().unwrap_or("");
+                    for name in &names {
+                        let pat = format!("{name}::");
+                        let mut from = 0;
+                        while let Some(at) = code[from..].find(&pat) {
+                            let start = from + at;
+                            from = start + pat.len();
+                            if code[..start].chars().next_back().is_some_and(is_ident) {
+                                continue;
+                            }
+                            let rest = &code[from..];
+                            let ident: String = rest.chars().take_while(|c| is_ident(*c)).collect();
+                            if DOORS.contains(&ident.as_str()) {
+                                found.push((rel.clone(), format!("{name}::{ident}"), i + 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            scanned.iter().any(|f| f == "monitor.rs") && scanned.len() > 50,
+            "the scan reads the copilot: {scanned:?}"
+        );
+        let stray: Vec<String> = found
+            .iter()
+            .filter(|(f, r, _)| !KNOTS.contains(&(f.as_str(), r.as_str())))
+            .map(|(f, r, l)| format!("{f}:{l}: {r}"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "copilot names a loop's flag or door; go through flight_state: {stray:#?}"
+        );
+        for (f, r) in KNOTS {
+            assert!(
+                found.iter().any(|(ff, rr, _)| ff == f && rr == r),
+                "{f} no longer names {r}: drop it from the knots"
+            );
+        }
+    }
+
     /// Every loop run in the tree is in the registry [`super::stand_down`]
     /// cancels, read from the source like the plugin contract's: every
     /// `sim::run::Slot` declared under `src` is in [`super::LOOPS`] by its

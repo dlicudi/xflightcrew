@@ -757,7 +757,7 @@ pub fn arrival_brief(apt_dat: &str, cifp: &str, fixes: &str, xplane_root: &str) 
     if let Some(end) = crate::full_auto::wind_runway(&airport.runways, wind) {
         parts.push(format!(
             "Expect runway {}, into the wind.",
-            crate::circuit::spell_runway(&end)
+            crate::crew_radio::spell_runway(&end)
         ));
     }
     if let Ok(line) = crate::full_auto::brief_arrival(apt_dat, cifp, fixes, &dest, None) {

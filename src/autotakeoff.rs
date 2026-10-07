@@ -35,7 +35,7 @@ use crate::aircraft::throttle_dataref;
 use crate::autoflight::{self, Button, Dial};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::autoland::{along_track_nm, cross_track_nm, true_to_mag, Runway};
+use crate::runway::{along_track_nm, cross_track_nm, true_to_mag, Runway};
 use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
 use crate::xplane::{XPlane, XPlaneClient};
@@ -110,16 +110,14 @@ const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_844;
 const M_PER_NM: f64 = 1852.0;
 
-/// Lined up means aligned within this many degrees of a runway's course.
-const ALIGN_MAX_DEG: f64 = 20.0;
-/// ... and within this many meters of its centreline.
-const LATERAL_MAX_M: f64 = 40.0;
-/// ... and no more than this far short of the threshold (a lead-on stub
-/// aligned with the strip still counts; the far side of the airport doesn't).
-const BEFORE_THRESHOLD_MAX_M: f64 = 100.0;
-/// Runway remaining below this at arm time is not a takeoff, whatever the
-/// POH says — floor for airframes with no published takeoff distance.
-pub const MIN_REMAINING_M: f64 = 500.0;
+// The runway fit moved to `runway.rs` (pillars audit 2026-10-07, stage A):
+// the takeoff's gates read it here, the copilot's answers there.
+#[cfg(test)]
+use crate::runway::why_no_fit;
+use crate::runway::{
+    runway_fit, why_no_fit_cleared, NoFit, ALIGN_MAX_DEG, BEFORE_THRESHOLD_MAX_M, LATERAL_MAX_M,
+};
+
 /// Reject once the remaining runway is inside this with rotation still short:
 /// enough pavement to stop a light single from below Vr.
 const REJECT_REMAINING_M: f64 = 250.0;
@@ -596,7 +594,7 @@ pub struct Params {
     /// Rotate speed, KIAS.
     pub vr_kts: f64,
     /// Enroute climb speed, KIAS. The CIRCUIT sizes its pattern off this
-    /// (`circuit::pattern_speed_kts` reads it straight off these params);
+    /// (`aircraft::pattern_speed_kts` reads it straight off these params);
     /// the takeoff's own climb law flies `initial_climb_kts`.
     pub vy_kts: f64,
     /// Initial climb speed, KIAS — what the climb law protects between
@@ -667,90 +665,6 @@ pub struct Params {
     pub park_brake_valve_set: Option<f64>,
 }
 
-/// Fit the aircraft's position and heading to a runway end: which strip are
-/// we lined up on, and how much of it is left ahead of the nose. `None`
-/// when nothing fits — not on a runway, not aligned, or not enough left.
-pub fn runway_fit(
-    cands: &[Runway],
-    lat: f64,
-    lon: f64,
-    psi_true: f64,
-    needed_m: f64,
-) -> Option<(Runway, f64)> {
-    let mut best: Option<(Runway, f64, f64)> = None;
-    for r in cands {
-        let err = crate::angles::abs_diff_deg(psi_true, r.course_deg);
-        if err > ALIGN_MAX_DEG {
-            continue;
-        }
-        let lateral_m = (cross_track_nm(lat, lon, r) * M_PER_NM).abs();
-        if lateral_m > LATERAL_MAX_M {
-            continue;
-        }
-        // along_track is positive SHORT of the threshold, negative down the
-        // runway; rolled distance is how far past the numbers we sit.
-        let along_m = along_track_nm(lat, lon, r) * M_PER_NM;
-        if along_m > BEFORE_THRESHOLD_MAX_M {
-            continue;
-        }
-        let remaining_m = r.length_m - (-along_m).max(0.0);
-        if remaining_m < needed_m.max(MIN_REMAINING_M) {
-            continue;
-        }
-        if best.as_ref().is_none_or(|(_, e, _)| err < *e) {
-            best = Some((r.clone(), err, remaining_m));
-        }
-    }
-    best.map(|(r, _, rem)| (r, rem))
-}
-
-/// Why [`runway_fit`] found nothing — the nearest near-miss, so a refusal can
-/// name the problem instead of guessing at it.
-///
-/// The four failures want four different actions from the pilot, and the
-/// caller used to collapse them into one line. At Edinburgh (2026-09-20) the
-/// aircraft sat on runway 24, aligned to within a degree and dead on the
-/// centreline, 2,408 m along a 2,549 m strip — 141 m of runway ahead. The
-/// refusal said "We're not on the runway yet. Say line us up", while the
-/// tower was simultaneously saying "you are on runway two four without
-/// clearance, traffic on short final, exit immediately". The fit was right
-/// and the words were a lie.
-#[derive(Debug, Clone, PartialEq)]
-pub enum NoFit {
-    /// Nothing within reach on this field at all: no candidate runway, or the
-    /// best-aligned one lies further off than a line-up could ever be. `id`
-    /// and `lateral_m` name that strip when there was one, so the refusal can
-    /// say WHICH runway it looked for and how far away it is — the vague "I
-    /// couldn't get us onto the runway" is what sent the pilot to the logs
-    /// (LFPB 2026-09-22). Empty id = no pavement near us at all.
-    NoneNear { id: String, lateral_m: f64 },
-    /// On the pavement, aligned, but not enough runway ahead of the nose —
-    /// and there WOULD be from the threshold. Backtracking fixes this one.
-    TooLittleLeft {
-        id: String,
-        remaining_m: f64,
-        needed_m: f64,
-    },
-    /// The whole runway is shorter than this aircraft needs. Position is
-    /// irrelevant: no line-up and no backtrack can help.
-    ///
-    /// Edinburgh 24 is 2,549 m; the A330 asks 2,560 (a 6,000 ft roll times
-    /// the 1.4 factor). Eleven metres. The refusal said "we're not on the
-    /// runway yet", so the pilot lined up, was told the same thing, backtracked
-    /// the full length, and was told it a third time (2026-09-20).
-    RunwayTooShort {
-        id: String,
-        length_m: f64,
-        needed_m: f64,
-    },
-    /// On (or near) a strip, but lying across it.
-    NotAligned { id: String, err_deg: f64 },
-    /// Aligned with a runway but sitting beside it.
-    Offset { id: String, lateral_m: f64 },
-    /// Aligned and on the centreline, but still short of the threshold.
-    ShortOfThreshold { id: String, m: f64 },
-}
-
 /// What to SAY about a failed fit, and whether it is urgent (a Warning: we
 /// are occupying a runway we cannot depart from). One wording for the spoken
 /// takeoff and for full auto's line-up check, so neither can call an aircraft
@@ -769,7 +683,7 @@ pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
                 "Runway {} is {:.0} metres and I need {:.0} for this aircraft. It's too \
                  short — lining up or backtracking won't change that. Your takeoff if \
                  you want it.",
-                crate::circuit::spell_runway(id),
+                crate::crew_radio::spell_runway(id),
                 length_m,
                 needed_m
             ),
@@ -785,7 +699,7 @@ pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
             format!(
                 "We're lined up on {} but at the far end — {:.0} metres left and I need \
                  {:.0}. Backtrack or vacate; I can't take off from here.",
-                crate::circuit::spell_runway(id),
+                crate::crew_radio::spell_runway(id),
                 remaining_m,
                 needed_m
             ),
@@ -797,7 +711,7 @@ pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
             format!(
                 "We're on {} but {:.0} degrees off the centreline. Line us up, or vacate \
                  if there's traffic.",
-                crate::circuit::spell_runway(id),
+                crate::crew_radio::spell_runway(id),
                 err_deg
             ),
             true,
@@ -817,7 +731,7 @@ pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
         NoFit::NoneNear { id, lateral_m } if !id.is_empty() => (
             format!(
                 "Runway {} is {:.0} metres away from us, too far for me to line up on.",
-                crate::circuit::spell_runway(id),
+                crate::crew_radio::spell_runway(id),
                 lateral_m
             ),
             false,
@@ -826,94 +740,6 @@ pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
             "We're not lined up on a runway I can use. Line us up and ask me again.".to_string(),
             false,
         ),
-    }
-}
-
-/// [`why_no_fit`] told about the CLEARED runway: nowhere near any pavement,
-/// the refusal names the end the tower cleared and how far it is, never the
-/// strip that merely lay best along the nose. At ETND (2026-09-24) the SF50
-/// was cleared 26R, faced 016 at the hold, and heard "08L is 152 metres
-/// away": the reciprocal end of the runway it was cleared for, which reads
-/// as a crew that does not know its clearance. Every other gate stands as
-/// diagnosed (an aircraft aligned on another end is judged on that end).
-pub fn why_no_fit_cleared(
-    cands: &[Runway],
-    lat: f64,
-    lon: f64,
-    psi_true: f64,
-    needed_m: f64,
-    cleared: Option<&str>,
-) -> NoFit {
-    let why = why_no_fit(cands, lat, lon, psi_true, needed_m);
-    let NoFit::NoneNear { .. } = why else {
-        return why;
-    };
-    match cleared.and_then(|c| cands.iter().find(|r| r.id.eq_ignore_ascii_case(c))) {
-        Some(r) => NoFit::NoneNear {
-            id: r.id.clone(),
-            lateral_m: (cross_track_nm(lat, lon, r) * M_PER_NM).abs(),
-        },
-        None => why,
-    }
-}
-
-/// Diagnose a failed [`runway_fit`]: the best-aligned candidate, and the FIRST
-/// gate it fails — in the same order the fit applies them, so the answer is
-/// always the thing that actually stopped it.
-pub fn why_no_fit(cands: &[Runway], lat: f64, lon: f64, psi_true: f64, needed_m: f64) -> NoFit {
-    // Of the ends we are aligned with, the one we are ON (least lateral):
-    // parallels share a heading to thousandths of a degree, so the best-
-    // aligned pick was a coin toss between them. EGKK 2026-09-27 (sortie
-    // 1790527340): on 26L's centreline at 256.3 true, 26R (257.624) beat
-    // 26L (257.629) by 0.005 degrees, 200 m away, and the diagnosis was
-    // "none near" instead of "too little left". With nothing aligned, the
-    // best-aligned end, as before.
-    let lateral = |r: &Runway| (cross_track_nm(lat, lon, r) * M_PER_NM).abs();
-    let aligned = cands
-        .iter()
-        .filter(|r| crate::angles::abs_diff_deg(psi_true, r.course_deg) <= ALIGN_MAX_DEG)
-        .min_by(|a, b| lateral(a).total_cmp(&lateral(b)));
-    let best = aligned.or_else(|| {
-        cands.iter().min_by(|a, b| {
-            crate::angles::abs_diff_deg(psi_true, a.course_deg).total_cmp(&crate::angles::abs_diff_deg(psi_true, b.course_deg))
-        })
-    });
-    let Some(r) =
-        best.filter(|r| (cross_track_nm(lat, lon, r) * M_PER_NM).abs() < 2.0 * LATERAL_MAX_M)
-    else {
-        return NoFit::NoneNear {
-            id: best.map(|r| r.id.clone()).unwrap_or_default(),
-            lateral_m: best
-                .map(|r| (cross_track_nm(lat, lon, r) * M_PER_NM).abs())
-                .unwrap_or(0.0),
-        };
-    };
-    let id = r.id.clone();
-    let err = crate::angles::abs_diff_deg(psi_true, r.course_deg);
-    if err > ALIGN_MAX_DEG {
-        return NoFit::NotAligned { id, err_deg: err };
-    }
-    let lateral_m = (cross_track_nm(lat, lon, r) * M_PER_NM).abs();
-    if lateral_m > LATERAL_MAX_M {
-        return NoFit::Offset { id, lateral_m };
-    }
-    let along_m = along_track_nm(lat, lon, r) * M_PER_NM;
-    if along_m > BEFORE_THRESHOLD_MAX_M {
-        return NoFit::ShortOfThreshold { id, m: along_m };
-    }
-    let need = needed_m.max(MIN_REMAINING_M);
-    // Would the FULL strip do? If not, where we stand is beside the point.
-    if r.length_m < need {
-        return NoFit::RunwayTooShort {
-            id,
-            length_m: r.length_m,
-            needed_m: need,
-        };
-    }
-    NoFit::TooLittleLeft {
-        id,
-        remaining_m: r.length_m - (-along_m).max(0.0),
-        needed_m: need,
     }
 }
 
@@ -2449,8 +2275,9 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
     }
 }
 
-/// Maximum braking, held: a rejected takeoff is a maximum-effort stop.
-pub(crate) const BRAKES_MAX: &str = "sim/flight_controls/brakes_max";
+// Maximum braking moved beside the regular brakes (`tools::BRAKES_MAX`,
+// pillars audit 2026-10-07, stage A).
+use crate::tools::BRAKES_MAX;
 /// Under this a rejected roll has STOPPED and the parking brake goes on; the
 /// hand-back's own stopped line (`full_auto::hand_back_hold`).
 const REJECT_STOPPED_KTS: f64 = sim::ground::STOPPED_KTS;
@@ -2666,8 +2493,8 @@ async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &s
     // onto this runway; an uncontrolled field has nobody to tell.
     let call = reject_call_due(crate::party_line::clearance_state());
     if call {
-        let callsign = crate::circuit::crew_callsign(xp).await;
-        crate::circuit::transmit(crate::circuit::radio_call(&callsign, REJECT_CALL));
+        let callsign = crate::crew_radio::crew_callsign(xp).await;
+        crate::crew_radio::transmit(crate::crew_radio::radio_call(&callsign, REJECT_CALL));
     }
     crate::blackbox::record(
         "autotakeoff",
@@ -2880,7 +2707,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
         );
         return;
     };
-    let cands = match crate::autoland::nearby_runways(&p.apt_dat, lat, lon, 2.0) {
+    let cands = match crate::runway::nearby_runways(&p.apt_dat, lat, lon, 2.0) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(?e, "auto takeoff: apt.dat unreadable");
