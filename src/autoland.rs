@@ -3531,7 +3531,7 @@ fn spawn_autoland(launch: AutolandLaunch) {
                     if live_floor_probed.is_none_or(|t| t.elapsed().as_secs_f64() >= LIVE_FLOOR_EVERY_S) {
                         live_floor_probed = Some(std::time::Instant::now());
                         let mut pts = vec![(lat, lon)];
-                        pts.extend(crate::procedure::look_ahead_points(
+                        pts.extend(crate::terrain::look_ahead_points(
                             lat,
                             lon,
                             track_true,

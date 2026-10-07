@@ -418,10 +418,10 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
 
 ### The follower's vertical and the altimeter
 - **Three owners in order** (`procedure::vertical_tick`, pure): the PLAN's constraint, paced from
-  the last COMMANDED altitude (`prev_cmd_alt`); the PILOT's altitude (`procedure::take_altitude`),
+  the last COMMANDED altitude (`prev_cmd_alt`); the PILOT's altitude (`pilot_altitude::take`),
   never written to the dial; the GROUND AHEAD over both. **A descent never climbs back**
   (`descent_no_climb`), nor a climb descends (`climb_no_descent`).
-- **Terrain floor** (`terrain_floor_ahead_ft`): a climb into it RAISED and said, a descent below it
+- **Terrain floor** (`terrain::floor_ahead_ft`): a climb into it RAISED and said, a descent below it
   refused.
 - **The follower flies the ALTIMETER** (`altitude_ft_pilot`); only the floor is true feet.
 - **So the altimeter is kept right**: ONE rule (`instruments::correct_setting_inhg`) everywhere;

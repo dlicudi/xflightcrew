@@ -133,7 +133,7 @@ pub struct ClimbPerf {
     /// The speed the climb is flown at and gets its full rate at, kt: Vy.
     pub vy_kts: Option<f64>,
     /// The speed the climb fades to nothing at, kt: the circuit's climb
-    /// floor (`tools::circuit::climb_floor`: blue line, else the 1.2 Vs
+    /// floor (`aircraft::climb_floor`: blue line, else the 1.2 Vs
     /// automation floor). 0 = undeclared.
     pub floor_kts: f64,
     /// The speed a level-off hands the governor, kt: the profile's cruise.
@@ -161,7 +161,7 @@ impl ClimbPerf {
                 .filter(|f| f.is_finite() && *f > 0.0)
                 .unwrap_or(MAX_CLIMB_FPM),
             vy_kts: r.and_then(|r| r.vy_kts).filter(|v| v.is_finite() && *v > 0.0),
-            floor_kts: crate::tools::circuit::climb_floor(p),
+            floor_kts: crate::aircraft::climb_floor(p),
             cruise_ias_kts: r
                 .and_then(|r| r.cruise_ias_kts)
                 .filter(|v| v.is_finite() && *v > 0.0),
@@ -182,11 +182,11 @@ impl ClimbPerf {
 }
 
 /// The vertical speed a pilot's climb is flown at this tick: the circuit's
-/// own climb limiter (`circuit::climb_limit_fpm`, a projected airspeed
+/// own climb limiter (`aircraft::climb_limit_fpm`, a projected airspeed
 /// fading the rate from the climb speed to the floor) over the commanded
 /// rate, rounded to the 100 fpm a VS wheel steps in. The full-rate speed is
 /// Vy, capped by the governor's target when one holds the speed
-/// (`circuit::climb_full_rate_kts`); with no Vy it is the floor plus the old
+/// (`aircraft::climb_full_rate_kts`); with no Vy it is the floor plus the old
 /// 8 kt restore band. A 172 (floor 58, Vy 74) climbs at full rate down to
 /// Vy and at none at 58; it used to hold the rate to 60. Pure.
 fn protected_climb_fpm(
@@ -203,8 +203,9 @@ fn protected_climb_fpm(
     let floor = perf.floor(live_floor);
     let vy = perf.vy_kts.unwrap_or(floor + CLIMB_RESTORE_BAND_KTS);
     let full =
-        crate::circuit::climb_full_rate_kts(governor_kts.unwrap_or(f64::INFINITY), vy, floor);
-    let fpm = crate::circuit::climb_limit_fpm(commanded_fpm, ias_kts, ias_trend_kts_s, full, floor);
+        crate::aircraft::climb_full_rate_kts(governor_kts.unwrap_or(f64::INFINITY), vy, floor);
+    let fpm =
+        crate::aircraft::climb_limit_fpm(commanded_fpm, ias_kts, ias_trend_kts_s, full, floor);
     ((fpm / VS_TRIM_FPM).round() * VS_TRIM_FPM).clamp(0.0, commanded_fpm)
 }
 
@@ -223,7 +224,8 @@ enum LevelPower {
 
 /// The level-off's power: never a flat 172 lever on an airframe that
 /// declares its cruise. The cruise speed is held under 250 kt below 10,000
-/// and over the automation floor (`speedhold::arm_flight` floors it). Pure.
+/// and over the automation floor (`speedhold::hold_for_pilot` floors it).
+/// Pure.
 fn level_power(governor_kts: Option<f64>, cruise_ias_kts: Option<f64>, alt_ft: f64) -> LevelPower {
     if governor_kts.is_some() {
         return LevelPower::Governor;
@@ -373,9 +375,9 @@ async fn reject_unsafe_target(ctx: &ToolCtx<'_>, target: f64, ceiling: f64) -> O
     // under-the-wheels test alone cleared 4,000 ft over ground at 1,700 with a
     // 3,861 ft ridge five miles on the nose (2026-09-13): a target is only
     // safe against terrain it is about to fly over, not terrain already passed.
-    if let Some(floor) = crate::procedure::terrain_floor_ahead_ft() {
+    if let Some(floor) = crate::terrain::floor_ahead_ft() {
         if target < floor {
-            let ground = floor - crate::procedure::TERRAIN_CLEARANCE_FT;
+            let ground = floor - crate::terrain::CLEARANCE_FT;
             return Some(format!(
                 "Negative, {target:.0} feet is into the terrain ahead; the high ground on our \
                  track is about {ground:.0} feet. Say {floor:.0} or higher."
@@ -413,7 +415,7 @@ async fn reject_unsafe_target(ctx: &ToolCtx<'_>, target: f64, ceiling: f64) -> O
 /// terrain answer). The same standing rule as the speed floor: raise the
 /// number, say so, log it.
 async fn terrain_raised_target(ctx: &ToolCtx<'_>, target: f64) -> Option<f64> {
-    let floor = crate::procedure::terrain_floor_ahead_ft()?;
+    let floor = crate::terrain::floor_ahead_ft()?;
     if target >= floor {
         return None;
     }
@@ -441,7 +443,7 @@ async fn fly_to(
     // aircraft stay on the plan's 2,700 ft (2026-09-13). Hand the follower the
     // number instead: it stays the one writer, its VS law flies the change, and
     // the pilot's altitude outranks the plan's until they say another one.
-    if crate::procedure::take_altitude(altitude) {
+    if crate::pilot_altitude::take(altitude) {
         let current = ctx.xplane.get_float(CURRENT_ALT).await.unwrap_or(altitude);
         let diff = altitude - current;
         let movement = if diff.abs() <= ALT_CAPTURE_BAND_FT {
@@ -456,7 +458,7 @@ async fn fly_to(
         let fpm = rate
             .map(f64::abs)
             .unwrap_or_else(|| auto_vs_fpm(diff, diff > 0.0, cfg.climb.max_climb_fpm))
-            .min(crate::procedure::vs_clamp_fpm());
+            .min(crate::pilot_altitude::follower_rate_fpm());
         tracing::info!(
             target: "xvoicelayer::autopilot",
             movement,
@@ -723,7 +725,7 @@ fn capture_at_altitude(
                                     Ok(thr) if thr >= FIREWALL_HANDBACK_FLOOR => {
                                         match power {
                                             LevelPower::ArmCruise(kts) => {
-                                                crate::tools::speedhold::arm_flight(
+                                                crate::tools::speedhold::hold_for_pilot(
                                                     base.clone(),
                                                     voice.clone(),
                                                     kts,
@@ -1137,7 +1139,7 @@ impl Tool for LevelOff {
         // same way a commanded one is handed over. Wings and throttle are its
         // own (the lateral law and the governor): taking those here would put
         // two writers on each.
-        if crate::procedure::take_altitude(target) {
+        if crate::pilot_altitude::take(target) {
             return Ok(format!(
                 "Roger, holding {target:.0} feet. You have the altitude; I'm still flying the track."
             ));
@@ -1164,7 +1166,7 @@ impl Tool for LevelOff {
         ) {
             LevelPower::Governor => String::new(),
             LevelPower::ArmCruise(kts) => {
-                crate::tools::speedhold::arm_flight(
+                crate::tools::speedhold::hold_for_pilot(
                     ctx.config.xplane_base_url.clone(),
                     ctx.voice.cloned(),
                     kts,

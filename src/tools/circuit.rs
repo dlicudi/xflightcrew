@@ -41,7 +41,7 @@ pub struct Circuit {
     /// Vne/Vmo for the climb's overspeed protection.
     pub vne_kts: Option<f64>,
     /// The slowest the pattern may climb toward — blue line on a twin, else a
-    /// margin over the clean stall. See `circuit::climb_limit_fpm`.
+    /// margin over the clean stall. See `aircraft::climb_limit_fpm`.
     pub climb_floor_kts: f64,
     /// Clean stall speed, the floor under the pattern speed (flown clean).
     pub vs_clean_kts: Option<f64>,
@@ -62,19 +62,6 @@ const DEFAULT_TPA_AGL_FT: f64 = 1000.0;
 const JET_TPA_AGL_FT: f64 = 1500.0;
 /// Approach speed at or above which the pattern is a jet's, not a trainer's.
 const JET_APPROACH_KTS: f64 = 110.0;
-
-/// This airframe's climb-speed floor, from the profile's reference card.
-///
-/// Blue line where the airframe publishes one — a twin below Vyse has no
-/// single-engine climb at all — else a margin over the clean stall. Both are
-/// optional, and a profile carrying neither gets 0, which disables the
-/// protection rather than inventing a number.
-pub fn climb_floor(profile: &crate::aircraft::AircraftProfile) -> f64 {
-    crate::circuit::climb_floor_kts(
-        profile.reference.as_ref().and_then(|r| r.vyse_kts),
-        profile.vs_clean_kts,
-    )
-}
 
 /// The pattern altitude this airframe should fly, from the only figure that
 /// distinguishes them here — how fast it flies its approach.

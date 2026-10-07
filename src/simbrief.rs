@@ -56,6 +56,40 @@ pub fn local_plan() -> Option<FlightPlan> {
         .cloned()
 }
 
+/// The route the crew FILED, for the tower's IFR clearance
+/// (`party_line::provide_filed_route`, registered at boot): the loaded
+/// plan's origin, destination, navlog fixes (the fields themselves left out,
+/// as `procedure::enroute_legs` leaves them) and SID. Read at the moment of
+/// asking, so a replaced plan is a new route and a cleared one none. The
+/// plan shelf's, not an automation's (moved out of `full_auto`, pillars
+/// audit 2026-10-07, knot 4).
+pub fn filed_route() -> Option<crate::party_line::FiledRoute> {
+    filed_route_of(loaded_plan().as_ref())
+}
+
+/// [`filed_route`] of one plan. Pure.
+pub fn filed_route_of(plan: Option<&FlightPlan>) -> Option<crate::party_line::FiledRoute> {
+    let p = plan?;
+    let n = p.waypoints.len();
+    let fixes: Vec<String> = p
+        .waypoints
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| {
+            (*i != 0 || !w.ident.eq_ignore_ascii_case(&p.origin))
+                && (*i + 1 != n || !w.ident.eq_ignore_ascii_case(&p.destination))
+        })
+        .map(|(_, w)| w.ident.clone())
+        .collect();
+    Some(crate::party_line::FiledRoute {
+        origin: p.origin.clone(),
+        dest: p.destination.clone(),
+        fixes,
+        sid: p.procedures.sid.clone(),
+        cruise_ft: Some(p.cruise_alt_ft.round() as i64).filter(|c| *c > 0),
+    })
+}
+
 /// The Route tab's load sheet feed (`xcopilot/status/loadsheet`): the plan's
 /// side only, the plugin reads the aircraft's side itself every frame.
 /// "ORIGIN|DEST|block_kg|payload_kg|max_tow_kg|pax|unit", kilos throughout,

@@ -248,6 +248,15 @@ pub fn arm_flight(base_url: String, voice: Option<crate::voice::Voice>, target_k
     arm_flight_with_floor(base_url, voice, target_kts, crate::aircraft::speed_floor_kts())
 }
 
+/// The copilot's one door to the flight governor: a speed held for the
+/// pilot on an airframe with no autothrottle (the autopilot tool's level-off
+/// hands its cruise speed here). [`arm_flight`] under its own name, so a
+/// copilot tool names this and never the automations' arms; the governor,
+/// its floor and its run stay this module's.
+pub fn hold_for_pilot(base_url: String, voice: Option<crate::voice::Voice>, target_kts: f64) {
+    arm_flight(base_url, voice, target_kts)
+}
+
 /// [`arm_flight`] against a given floor: the LANDING configuration's
 /// (`aircraft::approach_floor_kts`) for a caller flying configured, the clean
 /// one otherwise. LSZS final (2026-09-24): 87 kt with the flaps out floored

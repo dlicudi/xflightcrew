@@ -72,6 +72,7 @@ mod ils;
 mod scorecard;
 mod persona;
 mod phrase;
+mod pilot_altitude;
 mod plan;
 mod plugin_status;
 mod pollers;
@@ -241,7 +242,7 @@ async fn main() -> Result<()> {
     callsign::provide_telephony(settings::airline_telephony);
     // ...and the route we filed, so an IFR clearance names the SID that
     // joins it, by the crew's own rule (#152).
-    party_line::provide_filed_route(full_auto::filed_route);
+    party_line::provide_filed_route(simbrief::filed_route);
 
     // Initial app mode: explicit env > the panel's saved pick > both. The
     // panel's Settings tab can change it live from here on (mode.rs).
