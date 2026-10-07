@@ -148,3 +148,13 @@ Redesign, for the 172, after the pillars, REPLACING the frozen code rather than 
 3. **The Cessna 172 is the reference airframe**: the three pillars are built and proven on it;
    the other profiles stay as they are (checkable with `xvl conform`), no new work.
 3. ~~Coexist or replace LiveTraffic?~~ Decided 2026-10-07: replace.
+
+## Progress
+- 2026-10-07: **Stage A done** (offline, pure refactors, `cargo test --workspace` all green:
+  2,159 crew, 86 lib, 268 atc, 54 sim). Copilot to autonomy edges 122 to 63, pinned
+  (`copilot_reaches_the_loops_only_through_flight_state`); `station` crate-private behind
+  `party_line` and `atc::world` (`the_station_is_reached_only_through_the_seam`); the four
+  knots untied (`terrain.rs`, `pilot_altitude.rs`, runway fit in `runway.rs`, filed route in
+  `simbrief.rs`); heading-bug writes and the tracing filter pinned; the eight giant files split
+  into child modules (only `autoland/run.rs`, `spawn_autoland` whole, stays over 3,000 lines).
+  Next: stage B.
