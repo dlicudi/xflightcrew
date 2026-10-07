@@ -695,7 +695,7 @@ takeoff_config:
   # Thrust reduction at 1,000 ft. Lever ratio 0.9 is the stock 737's
   # hypothesis for CLB. VERIFY: the throttle write itself first.
   thrust_reduction_agl_ft: 1000.0
-  climb_thrust_ratio: 0.9
+  climb_thrust_ratio: 0.8
 
 # Takeoff trim, set as a crew sets it (`crate::takeoff_trim`): the 737-800
 # FCOM table for flaps 1 and 5 at 26K, units by CG (% MAC, rows) and weight
@@ -773,7 +773,11 @@ rotate_elevator:
 yoke_input: zibo_joy
 # Nose-down elevator the rotation law may command: the type's.
 pitch_authority_down: 0.5
-climb_pitch_max_deg: 18.0
+# Capped low until the takeoff derate lands: at 44-48 t and full thrust
+# the V2+15 hold pitched to its 17.5 cap and the AP took 4,500-4,700 fpm
+# climbs ("too steep, 6000+", pilot, 2026-10-07). 12 degrees, the speed
+# then builds and the reduction takes the excess.
+climb_pitch_max_deg: 12.0
 
 # The approach is flown on thrust; the flare retards progressively (the
 # type, from the stock 737; VERIFY on this flight model).
