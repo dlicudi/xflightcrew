@@ -1,0 +1,16 @@
+# The Zibo's own autoland: a 12 nm final to LEMG 13's ILS (GMM 109.50).
+# Autoland arms APP, the Zibo captures LOC and G/S, CMD B joins for a
+# dual-channel approach, and the aircraft flares and rolls out itself
+# (blackbox autoland coupled_tick carries the FMA codes). Fuel by hand
+# before the run until the setup can load it (the reload keeps what is
+# aboard).
+#   xvl sortie bench/sorties/zibo-ils13.yaml
+after: stop
+
+cases:
+  - name: Zibo LEMG 13 ILS, 12 nm final, the aircraft's own autoland
+    setup:
+      aircraft: "Aircraft/B737-800X/b738_4k.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 12 }
+    traffic: off
+    deadline_min: 15

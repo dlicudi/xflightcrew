@@ -1,0 +1,20 @@
+# The Zibo's own ILS autoland, tested from a takeoff (an airborne setup
+# loads it with the IRS off, #234): a runway start on LEMG 30, full auto's
+# circuit for the cold start and the departure, then "my controls" at
+# 2,500 ft (CMD A holds it) and "land at runway 31": the ILS (GAA 109.90),
+# flown on the coupled path (blackbox autoland ap_lands_armed, ap_landing,
+# coupled_tick). Fuel by hand before the run.
+#   xvl sortie bench/sorties/zibo-lemg31-ils.yaml
+after: stop
+
+cases:
+  - name: Zibo LEMG 30 departure, land at runway 31 (ILS, its own autoland)
+    setup:
+      aircraft: "Aircraft/B737-800X/b738_4k.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    command: fly a circuit
+    steps:
+      - { say: my controls, when: { agl_above: 2500 }, tool: autopilot_off }
+      - { say: land at runway 31, when: { after_s: 10 }, tool: visual_approach }
+    traffic: off
+    deadline_min: 45

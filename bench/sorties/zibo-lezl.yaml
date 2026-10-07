@@ -1,0 +1,18 @@
+# The Zibo's own ILS autoland on a real arrival: LEMG 30 to Seville (LEZL
+# 09 ILS, ISE 111.10), planned locally and flown by full auto. An airborne
+# reposition cannot test it: the Zibo loads its systems cold in the air,
+# IRS off, and its autopilot will not engage (2026-10-07). Here the IRS is
+# aligned on the ground before the takeoff. Fuel by hand before the run.
+#   xvl sortie bench/sorties/zibo-lezl.yaml
+after: stop
+
+cases:
+  - name: Zibo LEMG 30 to LEZL ILS, the aircraft's own autoland
+    setup:
+      aircraft: "Aircraft/B737-800X/b738_4k.acf"
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
+    steps:
+      - { say: plan a flight to LEZL, when: start, tool: plan_flight }
+      - { say: fly the flight plan, when: { after_s: 15 }, tool: full_auto }
+    traffic: off
+    deadline_min: 60
