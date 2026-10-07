@@ -1,4 +1,5 @@
-# #230: the Zibo's yoke through joy_override. A runway start on LEMG 13 and
+# #230: the Zibo's yoke through joy_override. A runway start on LEMG 30 (13 has no circuit
+# clear of the ground for a jet) and
 # a full circuit. Check blackbox `yoke` armed ok, autotakeoff `roll` q near 0
 # below Vr, `climb_manual` theta tracking pitch_tgt, `ap_engaged` cmd_vs in
 # the low thousands, then the circuit's legs, the flare and the rollout.
@@ -6,10 +7,10 @@
 after: stop
 
 cases:
-  - name: Zibo 737 LEMG 13 circuit (#230)
+  - name: Zibo 737 LEMG 30 circuit (#230)
     setup:
       aircraft: "Aircraft/B737-800X/b738_4k.acf"
-      runway_start: { field: LEMG, runway: 13, engines_running: true }
+      runway_start: { field: LEMG, runway: 30, engines_running: true }
     command: fly a circuit
     traffic: off
     deadline_min: 30
