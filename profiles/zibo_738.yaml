@@ -187,6 +187,9 @@ autoflight:
     # with V/S off it read 0 (blanked, as a 737's is). VERIFY in V/S.
     vs:
       write: sim/cockpit2/autopilot/vvi_dial_fpm
+      # The wheel keeps 50s: 287 read back 250, 324 read 300, every climb
+      # write "unconfirmed" (LXGB 2026-10-07). Snapped to the nearest first.
+      step: 50.0
   # The switches, each a toggle read before it is fired. FD: the toggle
   # moved flight_director_pos 0 to 1 (master_capt_status and pfd_fd_cmd 1;
   # the stock flight_director_mode stayed 0; fd_ca stayed 0) and back.

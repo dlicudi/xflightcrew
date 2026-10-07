@@ -224,8 +224,10 @@ pub async fn set_dial(xp: &dyn XPlane, d: Dial, v: f64) -> anyhow::Result<()> {
 
 /// [`set_dial`] on a given panel.
 pub async fn set_dial_on(xp: &dyn XPlane, p: &Panel, d: Dial, v: f64) -> anyhow::Result<()> {
+    let w = p.window(d);
+    let v = w.as_ref().map_or(v, |w| w.snap(v));
     note(OurChange::Dial(d, v));
-    match p.window(d) {
+    match w {
         None => xp.set_float(d.name(), v).await,
         Some(Window::Write { name, .. }) => xp.set_float(&name, v).await,
         Some(w @ Window::Knob { .. }) => step_knob(xp, &w, v).await.map(|_| ()),
@@ -275,10 +277,12 @@ pub async fn set_dial_confirmed_on(
     last: &mut Option<f64>,
     change: f64,
 ) -> bool {
+    let window = p.window(d);
+    let want = window.as_ref().map_or(want, |w| w.snap(want));
     note(OurChange::Dial(d, want));
-    let w = match p.window(d) {
+    let w = match window {
         None => return crate::control::set_confirmed(kind, xp, d.name(), want, last, change).await,
-        Some(Window::Write { name, readback }) if name == readback => {
+        Some(Window::Write { name, readback, .. }) if name == readback => {
             return crate::control::set_confirmed(kind, xp, &name, want, last, change).await
         }
         Some(w) => w,
@@ -290,7 +294,7 @@ pub async fn set_dial_confirmed_on(
     }
     let actual = match &w {
         Window::Knob { .. } => step_knob(xp, &w, want).await.ok(),
-        Window::Write { name, readback } => match xp.set_float(name, want).await {
+        Window::Write { name, readback, .. } => match xp.set_float(name, want).await {
             Ok(()) => xp.get_float(readback).await.ok(),
             Err(_) => None,
         },
@@ -324,8 +328,10 @@ pub async fn read_dial_array(xp: &dyn XPlane, d: Dial) -> anyhow::Result<Vec<f64
 /// dial as before: no declared panel stages one (autoland stages the VS
 /// wheel and the bug).
 pub fn stage_dial(writes: &mut sim::state::Writes, d: Dial, v: f64) {
+    let w = panel().window(d);
+    let v = w.as_ref().map_or(v, |w| w.snap(v));
     note(OurChange::Dial(d, v));
-    match panel().window(d) {
+    match w {
         Some(Window::Write { name, .. }) => writes.set(&name, v),
         _ => writes.set(d.name(), v),
     };
@@ -957,7 +963,13 @@ pub fn panel() -> Panel {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Window {
     /// Written, read back from `readback` (the written name unless declared).
-    Write { name: String, readback: String },
+    /// `quantum`: the only values the window shows (the Zibo's V/S wheel
+    /// keeps 50s, 287 read back 250), so the value is snapped to it first.
+    Write {
+        name: String,
+        readback: String,
+        quantum: Option<f64>,
+    },
     /// Stepped on its knob's commands, `step` a press, read back from
     /// `readback` (a window whose writes the airframe undoes).
     Knob {
@@ -986,7 +998,17 @@ impl Window {
         Some(Window::Write {
             readback: w.readback.clone().unwrap_or_else(|| name.clone()),
             name,
+            quantum: w.step.filter(|q| q.is_finite() && *q > 0.0),
         })
+    }
+
+    /// The value as this window can show it: a write window's quantum, to
+    /// the nearest; anything else as asked. Pure.
+    pub fn snap(&self, v: f64) -> f64 {
+        match self {
+            Window::Write { quantum: Some(q), .. } if v.is_finite() => (v / q).round() * q,
+            _ => v,
+        }
     }
 
     pub fn readback(&self) -> &str {
@@ -2711,7 +2733,8 @@ mod tests {
             p.window(Dial::Altitude),
             Some(Window::Write {
                 name: z("mcp_alt_dial"),
-                readback: z("mcp_alt_dial")
+                readback: z("mcp_alt_dial"),
+                quantum: None,
             })
         );
         assert_eq!(
@@ -3020,5 +3043,27 @@ mod tests {
         );
         assert_eq!(switch_step(Some(1.0), false), Some(()));
         assert_eq!(switch_step(None, true), None);
+    }
+
+    /// A write window with a quantum shows only its multiples: the Zibo's
+    /// V/S wheel read 287 back as 250, so 287 is written as 300 and reads
+    /// back clean (LXGB 2026-10-07). No quantum: as asked.
+    #[test]
+    fn a_write_window_snaps_to_its_quantum() {
+        let w = Window::from_profile(&crate::aircraft::McpWindow {
+            write: Some("vvi".into()),
+            step: Some(50.0),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(w.snap(287.3), 300.0);
+        assert_eq!(w.snap(274.4), 250.0);
+        assert_eq!(w.snap(-512.0), -500.0);
+        let plain = Window::from_profile(&crate::aircraft::McpWindow {
+            write: Some("alt".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(plain.snap(287.3), 287.3);
     }
 }
