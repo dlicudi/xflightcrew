@@ -36,7 +36,7 @@ pub use taxi::*;
 
 /// A path under the real X-Plane install for the ignored real-install
 /// tests: `XCOPILOT_XPLANE_ROOT`, else `$HOME/X-Plane 12` (the crew's
-/// `tools::autoland::xplane_root`, which this crate cannot depend on).
+/// `config::xplane_root`, which this crate cannot depend on).
 #[cfg(test)]
 pub(crate) fn test_xplane_path(rel: &str) -> String {
     let root = std::env::var("XCOPILOT_XPLANE_ROOT").unwrap_or_else(|_| {

@@ -118,7 +118,7 @@ Rust tools; YAML is per-airframe config.
   Twenty presses in two seconds is a macro.
 
 **A profile line is a hypothesis until probed**
-- `aircraft::profile_references` walks every name, `probe_dataref` / `probe_command` ask the sim,
+- `aircraft::profile_references` walks every name, `dataref_exists` / `command_exists` ask the sim,
   `probe_summary` speaks the missing. A new field is probed the day it is added; never into a load
   (`detect::missing_with_cache`).
 - **Rust constants too**: read names come from `datarefs::*`; `cargo test -- --ignored
@@ -255,7 +255,7 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 - TWO half-duplex channels, intercom and radio. A routine intercom line is cut when the radio keys
   and resumes once quiet (`interrupt_intercom_for_radio`); a Warning talks over and is never
   stepped on. Radio-only cuts never touch the copilot.
-- **A position report dies with the position it reports** (`circuit::holds_for`, `stale_reason`;
+- **A position report dies with the position it reports** (`crew_radio::holds_for`, `stale_reason`;
   `crew_radio_stale`, `crew_radio_collapsed`).
 - **A crew call is routed on the frequency it was keyed on, before it is spoken**; a live number
   (`CrewCall::CheckIn`) is rendered as it goes out. With a radio key bound, **physical routing
@@ -404,7 +404,7 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
 - **The whole plan is dry-run first** (`src/plan_audit.rs`): REFUSED or CAUTIONED by name; the
   all-clear names what could not be checked.
 - **The crew works the radio as it flies**: **a readback goes out once**
-  (`circuit::transmit_readback`), **heard, read back, then rolled** (`readback_before_moving`);
+  (`crew_radio::transmit_readback`), **heard, read back, then rolled** (`readback_before_moving`);
   `take_departure_handoff()`, `take_region_handoff()`. **An IFR flight keeps its code** (party line
   `IFR_FLIGHT`); airborne it goes to a radar position (`radar_position`).
 - **The inbound call** goes to the destination's OWN tower (`inbound_due`) or on its challenge;
