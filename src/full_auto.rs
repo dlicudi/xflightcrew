@@ -2367,6 +2367,16 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             give_up(&xp, tools.taxi.park_brake_valve_set, &voice, &line, "irs_not_aligned").await;
             return;
         }
+        let after = tools.preflight.as_ref().map(|p| p.after_aligned.clone()).unwrap_or_default();
+        if !after.is_empty() {
+            let mut say = |s: &str| announce(&voice, Priority::Advisory, s);
+            let mut panel = |_: &str| {};
+            let not_taken = crate::tools::jet_start::run_steps(&xp, &after, &mut say, &mut panel).await;
+            event("after_aligned", json!({ "not_taken": not_taken }));
+            if !not_taken.is_empty() {
+                announce(&voice, Priority::Advisory, &format!("{} didn't take.", not_taken.join(", ")));
+            }
+        }
     }
 
     // --- Stage 2: altimeter ---------------------------------------------------

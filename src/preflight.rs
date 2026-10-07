@@ -385,6 +385,7 @@ mod tests {
         xp.set_read("sim/flightmodel/position/latitude", 51.18508594769988);
         xp.set_read("sim/flightmodel/position/longitude", -1.0408489190568715);
         let p = PreflightProfile {
+            after_aligned: vec![],
             apu_first: false,
             steps: vec![knob("irs_L_right", "irs_L_left", "irs_left", 2.0)],
             align: Some(align(true)),
@@ -411,6 +412,7 @@ mod tests {
         xp.step_on_command("irs_L_right", "irs_left", 1.0);
         xp.step_on_command("irs_L_left", "irs_left", -1.0);
         let p = PreflightProfile {
+            after_aligned: vec![],
             apu_first: false,
             steps: vec![knob("irs_L_right", "irs_L_left", "irs_left", 2.0)],
             align: None,
@@ -444,6 +446,7 @@ mod tests {
             }),
         };
         let p = PreflightProfile {
+            after_aligned: vec![],
             apu_first: false,
             steps: vec![step],
             align: None,

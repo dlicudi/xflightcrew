@@ -480,7 +480,6 @@ preflight:
     - { command: laminar/B738/toggle_switch/electric_hydro_pumps2, position: laminar/B738/toggle_switch/electric_hydro_pumps2_pos, want: 1, say: "Hydraulics on." }
     - { command: laminar/B738/autopilot/cab_util_toggle, position: laminar/B738/toggle_switch/cab_util_pos, want: 1 }
     - { command: laminar/B738/autopilot/ife_pass_seat_toggle, position: laminar/B738/toggle_switch/ife_pass_seat_pos, want: 1 }
-    - { command: laminar/B738/toggle_switch/yaw_dumper, position: laminar/B738/toggle_switch/yaw_dumper_pos, want: 1, say: "Yaw damper on." }
     - { command: laminar/B738/toggle_switch/fuel_pump_lft1, position: laminar/B738/fuel/fuel_tank_pos_lft1, want: 1 }
     - { command: laminar/B738/toggle_switch/fuel_pump_lft2, position: laminar/B738/fuel/fuel_tank_pos_lft2, want: 1 }
     - { command: laminar/B738/toggle_switch/fuel_pump_rgt1, position: laminar/B738/fuel/fuel_tank_pos_rgt1, want: 1 }
@@ -502,6 +501,11 @@ preflight:
     - { command: laminar/B738/autopilot/flight_director_toggle, position: laminar/B738/autopilot/flight_director_pos, want: 1 }
     - { command: laminar/B738/autopilot/flight_director_fo_toggle, position: laminar/B738/autopilot/flight_director_fo_pos, want: 1, say: "Flight directors on." }
     - { command: laminar/B738/knob/autobrake_up, down_command: laminar/B738/knob/autobrake_dn, position: laminar/B738/autobrake/autobrake_pos, want: 0, max_presses: 6, say: "Autobrake R.T.O." }
+  # The yaw damper holds only on an aligned platform: pressed in the
+  # preflight it dropped every time; with the IRS in NAV one press held
+  # (LEMG, 2026-10-07).
+  after_aligned:
+    - { command: laminar/B738/toggle_switch/yaw_dumper, position: laminar/B738/toggle_switch/yaw_dumper_pos, want: 1, say: "Yaw damper on." }
   align:
     modes: [laminar/B738/irs/irs_mode, laminar/B738/irs/irs2_mode]
     want: 2

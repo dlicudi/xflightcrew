@@ -1912,6 +1912,12 @@ pub struct PreflightProfile {
     /// The inertial reference alignment the steps begin ([`AlignWait`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align: Option<AlignWait>,
+    /// Switches that hold only on an ALIGNED platform, run once the wait has
+    /// it: the Zibo's yaw damper dropped every preflight while the IRS was
+    /// aligning, and one press held at once with it in NAV (LEMG,
+    /// 2026-10-07).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after_aligned: Vec<StartStep>,
 }
 
 /// An alignment begun by the preflight and waited on before the taxi: the
