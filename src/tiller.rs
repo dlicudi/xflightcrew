@@ -112,9 +112,19 @@ impl Tiller {
         }
     }
 
-    /// The tiller command for this tick, `None` when nothing is declared.
+    /// The tiller command for this tick: `None` when nothing is declared, or
+    /// at and above the hand-off where the tiller has no share. Not written
+    /// there, the plugin lets it go within the second and the pedals steer:
+    /// written as 0 it stayed applied, and on the Zibo's YAW option the
+    /// plugin put the tiller's 0 on the yaw axis in place of the pedal
+    /// command. The LEMG 30 rollout asked 0.65 right for 40 s from 135 kt,
+    /// turned 29 degrees left and ran 94 m off the centreline (2026-10-07).
     pub fn command(&self, steer: f64, gs_kts: f64) -> Option<f64> {
-        self.profile.as_ref().map(|t| command(t, steer, gs_kts))
+        let t = self.profile.as_ref()?;
+        if share(t, gs_kts) <= 0.0 {
+            return None;
+        }
+        Some(command(t, steer, gs_kts))
     }
 
     /// Write this tick's command (a no-op when nothing is declared).
@@ -219,8 +229,12 @@ mod tests {
         assert_eq!(xp.writes_to(TILLER_MAX_DEG), vec![78.0]);
         t.write(&xp, -1.0, 8.0).await;
         t.write(&xp, -1.0, 25.0).await;
+        // At and above the hand-off: nothing written, the pedals steer.
+        t.write(&xp, -1.0, 30.0).await;
+        t.write(&xp, -1.0, 120.0).await;
         t.release(&xp).await;
         assert_eq!(xp.writes_to(TILLER), vec![-1.0, -0.5, 0.0]);
+        assert_eq!(t.command(0.65, 100.0), None);
     }
 
     /// The channel's names are the plugin's, listed for the stale-plugin

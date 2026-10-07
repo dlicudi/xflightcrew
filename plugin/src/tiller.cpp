@@ -286,6 +286,10 @@ XPLMFlightLoopID make_loop(XPLMFlightLoopPhaseType phase, XPLMFlightLoop_f f) {
 
 bool yaw_override(float* v) {
     if (g_applied != kZiboYaw || g_yield) return false;
+    // A tiller at 0 (a release, or the app's last write before letting go)
+    // never blanks the pedal command on the yaw axis: at speed it is the
+    // rudder (LEMG 30 rollout, 2026-10-07: 0.65 asked, 0 sent, 94 m off).
+    if (g_value == 0.0f) return false;
     *v = g_value;
     return true;
 }
