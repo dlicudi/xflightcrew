@@ -64,6 +64,14 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::tools::anti_ice::clear_claims();
 }
 
+/// A second process's view of the live airframe (`xvl conform`): the facts
+/// the seams read, installed from the profile, and nothing else. It begins
+/// no flight, stands nothing down and records nothing: the running xvl owns
+/// all three.
+pub(crate) fn install_for_check(p: &AircraftProfile) {
+    crate::aircraft::install_airframe_facts(airframe_facts(p));
+}
+
 /// Every per-airframe fact the tools read, from the profile, as one
 /// snapshot (`aircraft::AirframeFacts`). A literal naming every field, so a
 /// fact added to the struct and forgotten here does not compile: the

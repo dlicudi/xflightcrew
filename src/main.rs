@@ -35,6 +35,7 @@ mod crew_radio;
 mod debrief;
 mod heading_bug;
 mod sortie_runner;
+mod conform;
 mod test_card;
 mod detect;
 mod dialogue;
@@ -408,6 +409,16 @@ async fn main() -> Result<()> {
         let all_passed =
             sortie_runner::main_cmd(&rest, &config.xplane_base_url, &config.apt_data_path).await?;
         std::process::exit(if all_passed { 0 } else { 1 });
+    }
+
+    // `xvl conform [--only <area>]`: every control channel the live profile
+    // declares, exercised on a PARKED aircraft through the code's own seams
+    // and put back (src/conform.rs). A second process like the runner. Exit
+    // 1 on any FAIL or a refusal.
+    if std::env::args().nth(1).as_deref() == Some("conform") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        let passed = conform::main_cmd(&rest, &config.xplane_base_url, &config.aircraft).await?;
+        std::process::exit(if passed { 0 } else { 1 });
     }
 
     // `cargo run -- analyze` mines the logs for fast-path coverage and the
