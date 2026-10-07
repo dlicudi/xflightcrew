@@ -2849,7 +2849,7 @@ mod tests {
         assert_eq!(p.command(Button::Speed), z("speed_press"));
         assert!(matches!(
             p.window(Dial::Course),
-            Some(Window::Knob { step, ref readback, .. }) if step == 1.0 && *readback == z("course_pilot")
+            Some(Window::Write { ref name, quantum: Some(q), .. }) if q == 1.0 && *name == z("course_pilot")
         ));
         assert!(p.window(Dial::CourseFo).is_some());
         assert!(names

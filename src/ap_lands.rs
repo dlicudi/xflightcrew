@@ -1102,7 +1102,7 @@ mod tests {
             "laminar/B738/autopilot/pfd_hdg_mode",
             "laminar/B738/autopilot/pfd_alt_mode",
             "laminar/B738/autopilot/pfd_spd_mode",
-            "laminar/B738/autopilot/course_pilot_up",
+            "laminar/B738/autopilot/course_pilot",
             "laminar/B738/autopilot/course_copilot",
             "laminar/B738/autopilot/speed_press",
         ] {
