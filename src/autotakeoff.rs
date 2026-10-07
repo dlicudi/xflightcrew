@@ -71,6 +71,8 @@ const ELEV_TRIM: &str = "sim/cockpit2/controls/elevator_trim";
 const ALT_IND_FT: &str = sim::datarefs::ALTITUDE_FT;
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 const TAKEOFF_PITCH: &str = "xcopilot/pitch";
+/// The yoke's pitch ratio as the sim holds it (read back, never written here).
+const YOKE_PITCH_READ: &str = "sim/cockpit2/controls/yoke_pitch_ratio";
 const TAKEOFF_ROLL: &str = "xcopilot/roll";
 /// N1 per engine, percent: recorded at the thrust reduction, the evidence
 /// for the declared climb lever.
@@ -3131,7 +3133,11 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // The panel's reads beside the frame (`autoflight::Panel::tick_names`):
         // the stock autothrottle, or a declared MCP's lamps.
         let af_panel = autoflight::panel();
-        let mut extra_names: Vec<String> = vec![thr_dref.clone()];
+        // The column as the sim holds it, beside our command: on the Zibo
+        // the pitch channel rides its own input (`crate::yoke`), and the
+        // LEMG climb-out held -0.5 while the nose rose to 23 degrees with
+        // nothing to say whether the column moved (2026-10-07).
+        let mut extra_names: Vec<String> = vec![thr_dref.clone(), YOKE_PITCH_READ.to_string()];
         extra_names.extend(af_panel.tick_names());
         let extra_refs: Vec<&str> = extra_names.iter().map(String::as_str).collect();
         let (st, extra) = sim::state::read_with(&xp, sim::state::Want(ROLL_WANT), &extra_refs).await;
@@ -3160,6 +3166,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         );
         let mut extra = extra.into_iter();
         let thr_read = extra.next().unwrap_or_else(|| Err(anyhow::anyhow!("unread")));
+        let thr_seen = thr_read.as_ref().ok().copied();
+        let yoke_read = extra.next().and_then(|r| r.ok()).filter(|v| v.is_finite());
         // The levers are the takeoff's: an ENGAGED autothrottle (armed is
         // the configuration's, never touched) is taken out and said once.
         {
@@ -3469,7 +3477,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             crate::blackbox::record(
                 "autotakeoff",
                 serde_json::json!({
-                    "event": "roll", "gs": gs_kts, "ias": ias, "err": err,
+                    "event": "roll", "gs": gs_kts, "ias": ias, "err": err, "yoke": yoke_read,
+                    "thr_read": thr_seen,
                     // Attitude and the commanded ramp: the Luton tail strike
                     // happened during the roll and the log carried no theta at
                     // all, so the peak that struck is simply not in the record.
@@ -3744,6 +3753,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                         // record carried neither: the ring was in the DAMPING
                         // path, and nothing logged what it damped on.
                         "theta": theta_deg, "pitch": pitch, "q": pitch_rate, "dt": dt,
+                        "yoke": yoke_read,
                         "pitch_tgt": pitch_law.target_deg(),
                         // The airspeed trend the climb hold walks the target
                         // on, knots per second (`ClimbHold`).
