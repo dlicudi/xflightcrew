@@ -305,6 +305,18 @@ pub fn takeoff_hold_tick_from(
     }
     // The standing clocks the stale-ghost rule reads (idempotent per tick).
     note_ground_traffic(targets, now);
+    // The book: a traffic strip cleared onto the held runway (or to land on
+    // it) holds it like an occupant, whatever the replay shows. Asked before
+    // the hold's lock (nothing to ask with no traffic strip open).
+    let traffic_strip_holds = !traffic_strips().is_empty() && {
+        let held_ident = OWN_STRIP
+            .takeoff_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|h| h.runway_ident.clone());
+        held_ident.is_some_and(|ident| strip_held_by_traffic(&active_runways(), &ident))
+    };
     let mut guard = OWN_STRIP.takeoff_hold.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_mut()?;
     // Airborne, the hold is moot: either the pilot departed through the
@@ -363,7 +375,7 @@ pub fn takeoff_hold_tick_from(
         None => targets
             .iter()
             .any(|t| t.on_ground && on_active_runway(t.lat, t.lon).is_some()),
-    };
+    } || traffic_strip_holds;
     // A CONDITIONAL line-up's condition, for the crew: the named arrival has
     // passed once it is off the final (down on the strip, or gone). Published
     // every tick, cleared with the hold. The Baron at Malaga crossed the hold

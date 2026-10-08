@@ -14,8 +14,8 @@ pub(crate) fn new_flight_pending() -> bool {
 }
 
 /// The reply path's one write of the clearance picture.
-pub(super) fn publish_clearance(snap: ClearanceSnap) {
-    *OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+pub(super) fn publish_clearance(strip: &FlightStrip, snap: ClearanceSnap) {
+    *strip.clearance.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
 }
 
 /// A NEW FLIGHT at `icao` (the crew's "put us on a ten mile final", which

@@ -18,6 +18,7 @@
 //! | flight AND field: the station's own worksheets | strip `worksheet`, [`StationFlight`] | `install`, `uninstall`, `retire_for_new_flight` |
 //! | flight, carried across a region handoff | strip `carried`, [`FlightCarried`] | `uninstall`, `retire_for_new_flight` (never `install`) |
 //! | field: the installed station's watches | strip `watch`, [`StationField`] | `install`, `uninstall` |
+//! | field: the traffic strips themselves | [`TrafficStrips`] | `install`, `uninstall` (never `retire_for_new_flight`) |
 //! | field: facts built FROM the station | [`FieldFacts`] | `install` writes `for_station`, `uninstall` writes `empty` |
 //! | world: survives install, ends with ATC | [`WorldOnly`] | `uninstall` |
 //! | transition | `NEW_FLIGHT_PENDING` | set FIRST by `retire_for_new_flight`, cleared LAST by `install` / `uninstall` |
@@ -105,6 +106,15 @@ lifetime_group! {
 }
 
 lifetime_group! {
+    /// The field's traffic strips (`STRIPS`): a new station is a new field's
+    /// traffic, and a new flight of OURS is not the traffic's, so `install`
+    /// and `uninstall` clear them and `retire_for_new_flight` never does.
+    pub(crate) struct TrafficStrips {
+        STRIPS,
+    }
+}
+
+lifetime_group! {
     /// Survives `install`, ends with ATC. `PENDING_STATION` is the swap the
     /// main loop is about to install (and `arm_new_flight` writes it AFTER
     /// `retire_for_new_flight`, so a retire must not touch it);
@@ -132,6 +142,7 @@ pub(crate) enum Group {
     StationFlight,
     FlightCarried,
     StationField,
+    TrafficStrips,
     WorldOnly,
 }
 
@@ -146,6 +157,7 @@ impl Group {
             Group::StationFlight => StationFlight::reset(),
             Group::FlightCarried => FlightCarried::reset(),
             Group::StationField => StationField::reset(),
+            Group::TrafficStrips => TrafficStrips::reset(),
             Group::WorldOnly => WorldOnly::reset(),
         }
     }
@@ -167,6 +179,7 @@ impl Group {
             Group::StationFlight => statics(StationFlight::NAMES),
             Group::FlightCarried => statics(FlightCarried::NAMES),
             Group::StationField => statics(StationField::NAMES),
+            Group::TrafficStrips => statics(TrafficStrips::NAMES),
             Group::WorldOnly => statics(WorldOnly::NAMES),
         }
     }
@@ -179,6 +192,7 @@ pub(crate) const INSTALL_RESETS: &[Group] = &[
     Group::StationFlight,
     Group::StripWatch,
     Group::StationField,
+    Group::TrafficStrips,
 ];
 
 /// What [`Station::uninstall`] resets, in order.
@@ -190,6 +204,7 @@ pub(crate) const UNINSTALL_RESETS: &[Group] = &[
     Group::FlightCarried,
     Group::StripWatch,
     Group::StationField,
+    Group::TrafficStrips,
     Group::WorldOnly,
 ];
 
@@ -463,6 +478,7 @@ mod tests {
         add(StationFlight::NAMES, "StationFlight");
         add(FlightCarried::NAMES, "FlightCarried");
         add(StationField::NAMES, "StationField");
+        add(TrafficStrips::NAMES, "TrafficStrips");
         add(WorldOnly::NAMES, "WorldOnly");
         add(FieldFacts::NAMES, "FieldFacts");
         add(TRANSITION, "TRANSITION");
@@ -596,6 +612,8 @@ mod tests {
         let mut install = names(&party_line_facts);
         install.extend(names(&station_flight));
         install.extend(names(&station_field));
+        // New with the traffic strips (increment 5): the field's traffic.
+        install.extend(names(&["STRIPS"]));
         assert_eq!(door_cells(INSTALL_RESETS), install, "install");
 
         let mut uninstall = install.clone();

@@ -234,8 +234,63 @@ flight_strip! {
     }
 }
 
-/// Our own flight's strip (the only one until traffic strips exist).
+/// Our own flight's strip.
 pub(crate) static OWN_STRIP: FlightStrip = FlightStrip::new();
+
+/// The traffic strips, by their stable number ([`FlightId::Traffic`]):
+/// empty until a traffic producer opens one (stage D). Cleared by
+/// `Station::install` and `Station::uninstall`, never by
+/// [`retire_for_new_flight`] (a new flight of OURS is not the traffic's).
+/// Lock order: the map, clone the `Arc`, drop the map, then a cell; never
+/// the map across a cell.
+pub(crate) static STRIPS: Mutex<std::collections::BTreeMap<u32, std::sync::Arc<FlightStrip>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// A traffic strip, if one is open under this number.
+pub(crate) fn traffic_strip(n: u32) -> Option<std::sync::Arc<FlightStrip>> {
+    lock(&STRIPS).get(&n).cloned()
+}
+
+/// Every open traffic strip, by number (the map's lock dropped on return).
+pub(crate) fn traffic_strips() -> Vec<(u32, std::sync::Arc<FlightStrip>)> {
+    lock(&STRIPS)
+        .iter()
+        .map(|(n, s)| (*n, s.clone()))
+        .collect()
+}
+
+/// Open (or find) the traffic strip under this number.
+#[cfg_attr(not(test), allow(dead_code))] // the traffic producer is stage D's
+pub(crate) fn open_traffic_strip(n: u32) -> std::sync::Arc<FlightStrip> {
+    lock(&STRIPS)
+        .entry(n)
+        .or_insert_with(|| std::sync::Arc::new(FlightStrip::new()))
+        .clone()
+}
+
+/// The strip a desk works: ours (the static) or a traffic strip.
+#[derive(Clone)]
+pub(crate) enum StripRef {
+    Own,
+    Traffic(std::sync::Arc<FlightStrip>),
+}
+
+impl StripRef {
+    /// A traffic strip, not ours: its writes reach no crew accessor.
+    pub(crate) fn is_traffic(&self) -> bool {
+        matches!(self, StripRef::Traffic(_))
+    }
+}
+
+impl std::ops::Deref for StripRef {
+    type Target = FlightStrip;
+    fn deref(&self) -> &FlightStrip {
+        match self {
+            StripRef::Own => &OWN_STRIP,
+            StripRef::Traffic(s) => s,
+        }
+    }
+}
 
 /// One aircraft as the world sees it at one moment: what a controller's
 /// radar and the frequency say about it. Ours is read from the sim once per
@@ -425,7 +480,7 @@ pub struct IfrFlight {
     pub airborne: bool,
 }
 
-fn lock<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 

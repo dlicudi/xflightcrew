@@ -851,10 +851,15 @@ pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) 
         *guard = None;
         return None;
     }
-    let ours = {
+    let (ours, runways) = {
         let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
-        strip(&runways, &hold.runway_ident).cloned()
+        (strip(&runways, &hold.runway_ident).cloned(), runways.clone())
     };
+    // The book first: a traffic strip cleared onto the runway (or to land
+    // on it) holds it whatever the replay shows.
+    if strip_held_by_traffic(&runways, &hold.runway_ident) {
+        return None;
+    }
     let exits = strip_exits(targets, ours.as_ref(), &hold.runway_ident, now);
     let own = ours
         .as_ref()

@@ -172,3 +172,17 @@ callsign-keyed map, single strip mutex, `Ctx` split, world_tick cadence or TCAS 
   (`conflicts_with_claim` is gone; `own_strip_claim` stays as a wrapper). The oracles and the
   matrix live in `station/book_tests.rs` (`SIDE_STATE_LOCK` is `pub(super)` for it): 78,080
   cells, each checking the four queries (and one whole-state book) against the old functions.
+- **Increment 5**: `respond_for` swaps the desk around `route_keyed` (the pure keyed path,
+  readback gate included, which ends in `respond`), not `respond` alone: a traffic flight's
+  readback must meet its own desk's gate. It returns `None` for a traffic number with no open
+  strip. The desk carries its strip (`StripDesk.strip: StripRef`, `Own` or a traffic `Arc`), so
+  the reply path writes `self.desk.strip` where it wrote `OWN_STRIP` (respond.rs, the keyed
+  readback paths, `publish_clearance`, `publish_ifr_clearance`, `radar_contact_at_check_in`).
+  `STRIPS` is classified as its own lifetime group, `TrafficStrips`, reset by `install` and
+  `uninstall` (the door test now lists it). "Traffic strips are book claimants": `RunwayBook::now`
+  reads them (by clearance; no traffic state is held), and a traffic strip holding a runway
+  WHOLE (lined up, cleared for takeoff, cleared to land) occupies it for us: `make_ctx`'s
+  `runway_occupied` (every intent, ground or air), the takeoff hold's release and the landing
+  hold's release all ask the book (`strip_held_by_traffic`, a no-op with no strip open). The
+  party line still withholds only against OUR claim. `party_line::lock` takes `&Mutex<T>`.
+  Fourth test: the strips die with the station, never with our flight.

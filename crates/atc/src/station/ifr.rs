@@ -37,6 +37,7 @@ impl SidBasis {
 /// Publish an IFR clearance whose readback the tower accepted, for the
 /// crew (`party_line::assigned_clearance`), and blackbox it item by item.
 pub(super) fn publish_ifr_clearance(
+    strip: &FlightStrip,
     c: tower::IfrClearance,
     callsign: &str,
     bearings: Option<(f64, f64)>,
@@ -56,12 +57,12 @@ pub(super) fn publish_ifr_clearance(
             "sid_join": basis.and_then(SidBasis::join),
         }),
     );
-    *OWN_STRIP.ifr_flight.lock().unwrap_or_else(|e| e.into_inner()) = Some(IfrFlight {
+    *strip.ifr_flight.lock().unwrap_or_else(|e| e.into_inner()) = Some(IfrFlight {
         code: c.squawk,
         callsign: callsign.to_string(),
         airborne: false,
     });
-    *OWN_STRIP.ifr_clearance.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
+    *strip.ifr_clearance.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
 }
 
 /// An IFR destination as heard, resolved against the region index: a code

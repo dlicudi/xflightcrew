@@ -24,12 +24,15 @@ use sim::xplane::SimView;
 // `party_line`'s accessors, never these statics.
 pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
-    AircraftState, FlightId, FlightStrip, IfrFlight, ARRIVAL_PIN, GO_AROUND_ORDERS, OWN_STRIP, PENDING_STATION,
+    AircraftState, FlightId, FlightStrip, IfrFlight, StripRef, ARRIVAL_PIN, GO_AROUND_ORDERS,
+    OWN_STRIP, PENDING_STATION, STRIPS, traffic_strip, traffic_strips,
     REGION_HANDOFF,
 };
 
 // The airline telephony and the ghost speaker live with the callsign
 // resolver, one table for our flight id and everyone else's.
+#[cfg(test)]
+pub(crate) use crate::party_line::open_traffic_strip;
 pub use crate::callsign::spoken_ghost;
 use crate::callsign::{TELEPHONY, TELEPHONY_IATA};
 
@@ -79,8 +82,13 @@ pub struct Station {
     /// takeoff.
     departure_khz: Option<i64>,
     /// The strip on frequency: our flight's desk half (the worksheet the
-    /// tower keeps for the aircraft it is talking to).
+    /// tower keeps for the aircraft it is talking to). A traffic flight's
+    /// desk is swapped in only for the synchronous answer to its call
+    /// ([`Station::respond_for`]).
     desk: StripDesk,
+    /// The desks of the traffic strips this station has answered, parked
+    /// while our own is on frequency. Never holds `FlightId::Own`.
+    desks: std::collections::BTreeMap<FlightId, StripDesk>,
     /// The runway in use, held across calls: with the wind below 5 knots the
     /// into-wind pick is a coin toss, and the 2026-07-08 flight was cleared
     /// for takeoff on two seven, then re-cleared on zero niner two minutes
@@ -110,6 +118,8 @@ pub struct Station {
 /// worksheet). Owned by the [`Station`]; the shared half is the strip's
 /// cells on the party line ([`crate::party_line::FlightStrip`]).
 struct StripDesk {
+    /// The strip this desk works: its replies write that strip's cells.
+    strip: StripRef,
     /// The tower FSM for this flight.
     twr: tower::Tower,
     /// The strip a runway start was GIVEN (`note_caller_on_strip`): held for
@@ -191,9 +201,15 @@ struct CallScratch {
 }
 
 impl StripDesk {
-    /// A fresh desk: nothing heard from the flight yet.
+    /// A fresh desk for our own flight: nothing heard from it yet.
     fn new() -> StripDesk {
+        StripDesk::for_strip(StripRef::Own)
+    }
+
+    /// A fresh desk working this strip.
+    fn for_strip(strip: StripRef) -> StripDesk {
         StripDesk {
+            strip,
             twr: tower::Tower::new(),
             start_strip: None,
             told_runway: None,
@@ -305,6 +321,7 @@ impl Station {
             departure_khz,
             apt,
             desk: StripDesk::new(),
+            desks: std::collections::BTreeMap::new(),
             runway_in_use: None,
             enforce_readback: true,
             dialect: Dialect::Icao,
@@ -415,3 +432,6 @@ mod tests;
 
 #[cfg(test)]
 mod book_tests;
+
+#[cfg(test)]
+mod strip_tests;

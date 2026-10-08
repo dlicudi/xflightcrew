@@ -3742,6 +3742,7 @@ fn lxgb() -> Station {
         approach_khz: Some(122800),
         departure_khz: None,
         desk: StripDesk::new(),
+        desks: std::collections::BTreeMap::new(),
         runway_in_use: None,
         enforce_readback: true,
         dialect: Dialect::Icao,
@@ -4660,6 +4661,7 @@ fn real_install_region_ifr_handoff_goes_to_radar() {
     // IFR on 4505, as flown.
     arm();
     publish_ifr_clearance(
+        &OWN_STRIP,
         tower::IfrClearance {
             dest: "EGKK".into(),
             sid: Some("ADME1M".into()),
@@ -4792,6 +4794,7 @@ fn region_hands_off_to_the_decisively_nearer_tower() {
     *LAST_REGION_SWITCH.lock().unwrap() = None;
     *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
     publish_ifr_clearance(
+        &OWN_STRIP,
         tower::IfrClearance {
             dest: "LEMG".into(),
             sid: None,

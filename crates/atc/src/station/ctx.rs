@@ -211,6 +211,11 @@ impl Station {
         wake_secs_left: Option<u64>,
     ) -> tower::Ctx {
         let runway = self.pick_runway(wx.wind_from_deg, wx.wind_kts);
+        // A traffic strip the tower has cleared onto (or to land on) our
+        // runway occupies it, by the book's clearance, before any ghost is
+        // seen on the pavement: our line-up, takeoff and landing wait for it.
+        let runway_occupied =
+            runway_occupied || strip_held_by_traffic(&self.apt.runways, &runway);
         // "With information X" matching the current broadcast: the clearance
         // skips the QNH — having the numbers is the whole point of an ATIS.
         // A stale or absent letter keeps them (safety over brevity).

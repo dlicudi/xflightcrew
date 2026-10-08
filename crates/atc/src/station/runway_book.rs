@@ -80,19 +80,33 @@ pub(crate) struct RunwayBook {
 
 impl RunwayBook {
     /// The book over our own strip (with our state where the caller holds
-    /// it) and the ghost memory.
+    /// it), every open traffic strip (by its clearance: no traffic state is
+    /// held yet) and the ghost memory.
     pub(crate) fn now(own: Option<AircraftState>) -> RunwayBook {
-        RunwayBook::compute(&[BookEntry {
+        // The map's lock is dropped here, before any strip's cell.
+        let traffic = traffic_strips();
+        let mut entries = vec![BookEntry {
             id: FlightId::Own,
             strip: &OWN_STRIP,
             state: own,
-        }])
+        }];
+        entries.extend(traffic.iter().map(|(n, s)| BookEntry {
+            id: FlightId::Traffic(*n),
+            strip: &**s,
+            state: None,
+        }));
+        RunwayBook::compute(&entries)
     }
 
-    /// The book over these strips and the ghost memory. Each cell is locked
-    /// alone and dropped before the next: nothing is held across another.
+    /// The book over these strips and the ghost memory, on the published
+    /// field's runways. Each cell is locked alone and dropped before the
+    /// next: nothing is held across another.
     pub(crate) fn compute(entries: &[BookEntry<'_>]) -> RunwayBook {
-        let runways = active_runways();
+        RunwayBook::compute_on(active_runways(), entries)
+    }
+
+    /// [`RunwayBook::compute`] on these runways (a station's own field).
+    pub(crate) fn compute_on(runways: Vec<nav::Runway>, entries: &[BookEntry<'_>]) -> RunwayBook {
         let mut book = RunwayBook {
             claims: Vec::new(),
             states: Vec::new(),
@@ -288,6 +302,19 @@ impl RunwayBook {
         })
     }
 
+    /// Another flight's strip holds the strip `end` is on WHOLE: lined up,
+    /// cleared for takeoff, or cleared to land and not yet reported off.
+    /// Nobody else lines up, departs or lands on it.
+    pub(crate) fn held_by_another(&self, id: FlightId, end: &str) -> Option<&Claim> {
+        let ours = strip(&self.runways, end)?;
+        self.claims.iter().find(|c| {
+            matches!(&c.who, Claimant::Strip(f) if *f != id)
+                && c.whole_strip
+                && matches!(c.kind, ClaimKind::Landing | ClaimKind::LineUp | ClaimKind::Takeoff)
+                && strip(&self.runways, &c.end).is_some_and(|r| std::ptr::eq(r, ours))
+        })
+    }
+
     /// Whether movement on `end` conflicts with this flight's strip claim:
     /// the same strip, and either the whole strip is claimed or the movement
     /// uses the other direction. One strip, one direction (LEMG 2026-09-28).
@@ -301,6 +328,28 @@ impl RunwayBook {
         );
         same && (c.whole_strip || end != c.end)
     }
+}
+
+/// A traffic strip holds the strip `end` is on whole (cleared onto it or to
+/// land on it), on these runways: our line-up, takeoff and released holds
+/// wait for it as for an occupied runway. Nothing to read (and nothing
+/// locked past the map) while no traffic strip is open.
+pub(super) fn strip_held_by_traffic(runways: &[nav::Runway], end: &str) -> bool {
+    let traffic = traffic_strips();
+    if traffic.is_empty() {
+        return false;
+    }
+    let entries: Vec<BookEntry<'_>> = traffic
+        .iter()
+        .map(|(n, s)| BookEntry {
+            id: FlightId::Traffic(*n),
+            strip: &**s,
+            state: None,
+        })
+        .collect();
+    RunwayBook::compute_on(runways.to_vec(), &entries)
+        .held_by_another(FlightId::Own, end)
+        .is_some()
 }
 
 /// The strip the PLAYER holds for the party line: the one it stands on, or,

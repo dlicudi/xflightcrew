@@ -56,8 +56,8 @@ pub(super) fn radar_unit(s: StationSpeaker) -> bool {
 
 /// The departure check-in's reply said "radar contact": the watch is
 /// satisfied, and says nothing more.
-pub(super) fn radar_contact_at_check_in() {
-    if let Some(w) = OWN_STRIP.squawk_watch
+pub(super) fn radar_contact_at_check_in(strip: &FlightStrip) {
+    if let Some(w) = strip.squawk_watch
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()

@@ -221,11 +221,11 @@ impl Station {
             if let Some(reply) = self.desk.twr.gate(transcript, intent.clone(), ctx) {
                 if reply.is_empty() {
                     // Correct readback: the debt is paid; tell the coach.
-                    if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    if let Some(c) = self.desk.strip.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                         c.pending_readback = None;
                     }
                     if let Some(ifr) = self.desk.twr.take_accepted_ifr() {
-                        publish_ifr_clearance(ifr, &ctx.callsign, self.desk.ifr_bearings, self.desk.ifr_sid_basis.as_ref());
+                        publish_ifr_clearance(&self.desk.strip, ifr, &ctx.callsign, self.desk.ifr_bearings, self.desk.ifr_sid_basis.as_ref());
                     }
                     return String::new();
                 }
@@ -235,7 +235,7 @@ impl Station {
                 if ifr_read {
                     self.desk.twr.accept_ifr_unenforced();
                     if let Some(ifr) = self.desk.twr.take_accepted_ifr() {
-                        publish_ifr_clearance(ifr, &ctx.callsign, self.desk.ifr_bearings, self.desk.ifr_sid_basis.as_ref());
+                        publish_ifr_clearance(&self.desk.strip, ifr, &ctx.callsign, self.desk.ifr_bearings, self.desk.ifr_sid_basis.as_ref());
                     }
                 }
                 // Enforcement off (XCOPILOT_ATC_READBACK=false): no
@@ -271,7 +271,7 @@ impl Station {
                 self.transfer_departure();
                 // This reply IS the radar contact: the watch has nothing
                 // left to say.
-                radar_contact_at_check_in();
+                radar_contact_at_check_in(&self.desk.strip);
                 let position = match service {
                     Service::Approach => "Approach",
                     _ => "Departure",
@@ -296,12 +296,38 @@ impl Station {
             }
             // The departure clearance's suggested readback is paid.
             self.desk.twr.clear_clearance_readback();
-            if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if let Some(c) = self.desk.strip.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 c.pending_readback = None;
             }
             return String::new();
         }
         self.respond(transcript, service, intent, ctx, wx)
+    }
+
+    /// [`Station::route_keyed`] for one flight. Ours is answered on the desk
+    /// already on frequency; a traffic flight's desk is swapped in for the
+    /// synchronous answer only and parked again on the way out, by a drop
+    /// guard, so nothing can leave a traffic desk on frequency. Its replies
+    /// write its own strip's cells. `None` for a traffic number with no open
+    /// strip.
+    #[cfg_attr(not(test), allow(dead_code))] // the traffic producer calls it (stage D)
+    pub(super) fn respond_for(
+        &mut self,
+        id: FlightId,
+        transcript: &str,
+        service: Service,
+        ctx: &tower::Ctx,
+        wx: Wx,
+    ) -> Option<String> {
+        let FlightId::Traffic(n) = id else {
+            return Some(self.route_keyed(transcript, service, ctx, wx));
+        };
+        let desk = match self.desks.remove(&id) {
+            Some(d) => d,
+            None => StripDesk::for_strip(StripRef::Traffic(traffic_strip(n)?)),
+        };
+        let swap = DeskSwap::new(self, id, desk);
+        Some(swap.st.route_keyed(transcript, service, ctx, wx))
     }
 
     /// The voice of whichever of this station's positions COM1 is tuned to.
@@ -407,4 +433,33 @@ pub fn is_radio_call(t: &str, airport_lc: &str) -> bool {
         // "Request the Lam five Papa departure" names a procedure only a
         // controller issues.
         || tower::requested_departure(t).is_some()
+}
+
+/// A traffic flight's desk on frequency for one synchronous answer: our own
+/// desk parked here, put back (and the traffic desk parked in
+/// `Station::desks`) when the guard drops, on every path out.
+struct DeskSwap<'a> {
+    st: &'a mut Station,
+    id: FlightId,
+    own: Option<StripDesk>,
+}
+
+impl<'a> DeskSwap<'a> {
+    fn new(st: &'a mut Station, id: FlightId, desk: StripDesk) -> DeskSwap<'a> {
+        let own = std::mem::replace(&mut st.desk, desk);
+        DeskSwap {
+            st,
+            id,
+            own: Some(own),
+        }
+    }
+}
+
+impl Drop for DeskSwap<'_> {
+    fn drop(&mut self) {
+        if let Some(own) = self.own.take() {
+            let traffic = std::mem::replace(&mut self.st.desk, own);
+            self.st.desks.insert(self.id, traffic);
+        }
+    }
 }
