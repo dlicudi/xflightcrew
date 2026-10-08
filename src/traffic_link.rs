@@ -1087,6 +1087,12 @@ fn record(out: &TickOut, link: &Link) {
                 "traffic",
                 serde_json::json!({ "event": "touchdown", "id": id, "along_m": along_m.round() }),
             ),
+            // Gave up waiting on the ground behind one that would not move
+            // (`past` null: our own aircraft): the gridlock guard, logged.
+            Event::SpacingWaived { id, past } => crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "spacing_waived", "id": id, "past": past }),
+            ),
             Event::Call { .. } | Event::Spawn { .. } => {}
         }
     }

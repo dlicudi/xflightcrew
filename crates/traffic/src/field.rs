@@ -254,6 +254,11 @@ impl FieldModel {
             .find_map(|(i, r)| nav::on_strip(r, p.0, p.1).map(|end| (i, end)))
     }
 
+    /// `p` is on a runway's strip (the geometry the crossings are cut by).
+    pub fn on_runway(&self, p: LatLon) -> bool {
+        self.strip_at(p).is_some()
+    }
+
     /// `path` cut at every runway it crosses ([`CutRoute`]).
     pub fn cut_at_crossings(&self, path: &[LatLon]) -> CutRoute {
         if path.len() < 2 {

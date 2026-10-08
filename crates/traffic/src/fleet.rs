@@ -6,6 +6,10 @@ use crate::clock::{SimClock, SUBSTEP_S};
 use crate::field::FieldModel;
 use crate::phase::{Despawn, Event, Order, OwnTarget, Phase};
 
+/// Our own aircraft's id in the picture the fleet's aircraft see: no
+/// traffic id (those count up from 1).
+const OWN_ID: u32 = u32::MAX;
+
 /// The traffic at one field.
 #[derive(Debug, Clone)]
 pub struct Fleet {
@@ -100,7 +104,23 @@ impl Fleet {
         let mut events = std::mem::take(&mut self.pending);
         let n = self.clock.advance(dt);
         for _ in 0..n {
-            let picture = self.picture();
+            let mut picture = self.picture();
+            // Our own aircraft on the ground takes a stand like a parked
+            // one: an arrival never picks the stand we stand on.
+            if let Some(o) = own.filter(|o| o.on_ground) {
+                picture.push(Seen {
+                    id: OWN_ID,
+                    phase: Phase::Parked,
+                    pos: o.pos,
+                });
+            }
+            crate::spacing::apply(
+                &mut self.aircraft,
+                &self.field,
+                own.as_ref(),
+                SUBSTEP_S,
+                &mut events,
+            );
             for ac in &mut self.aircraft {
                 let order = orders(ac.id);
                 ac.substep(

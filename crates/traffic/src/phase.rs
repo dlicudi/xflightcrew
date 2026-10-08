@@ -283,6 +283,13 @@ pub enum Event {
         at: LatLon,
         along_m: f64,
     },
+    /// Held [`crate::spacing::STUCK_S`] on the ground behind an aircraft
+    /// that will not move for it (`past`, or our own when `None`), it goes
+    /// on past it rather than gridlock the field.
+    SpacingWaived {
+        id: u32,
+        past: Option<u32>,
+    },
 }
 
 /// Why an aircraft left the fleet.

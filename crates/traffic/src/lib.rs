@@ -3,7 +3,8 @@
 //! Pure and deterministic: performance tables ([`perf`]), kinematics
 //! ([`kin`]), a sim-time clock ([`clock`]), a seeded generator ([`rng`]),
 //! the field ([`field`]), the phase machine ([`phase`], [`aircraft`]) and
-//! the fleet that steps it ([`fleet`]). No statics: everything here is a
+//! the fleet that steps it ([`fleet`]), keeping its distance on the
+//! ground ([`spacing`]). No statics: everything here is a
 //! value the bin owns. Depends on `nav` only; never on `atc` (the two meet
 //! in the bin) and never on whisper, cpal or ort.
 
@@ -16,6 +17,7 @@ pub mod perf;
 pub mod phase;
 pub mod rng;
 pub mod schedule;
+pub mod spacing;
 pub mod wire;
 
 pub use aircraft::{Route, Seen, TrafficAircraft};

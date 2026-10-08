@@ -45,6 +45,10 @@ fn in_own_process(test: &str) {
             "XVL_TRAFFIC_SWEEP_ONLY",
             std::env::var("XVL_TRAFFIC_SWEEP_ONLY").unwrap_or_default(),
         )
+        .env(
+            "XVL_TRAFFIC_SWEEP_S",
+            std::env::var("XVL_TRAFFIC_SWEEP_S").unwrap_or_default(),
+        )
         .output()
         .expect("run the harness");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -76,6 +80,8 @@ pub(super) struct HarnessScore {
     pub(super) unfinished: Vec<String>,
     pub(super) touchdowns: usize,
     pub(super) go_arounds: usize,
+    /// Ground waits given up behind an aircraft that would not move.
+    pub(super) spacing_waived: usize,
     pub(super) secs: f64,
     /// When each movement spawned (harness seconds) and its callsign.
     pub(super) spawned: Vec<(f64, String)>,
@@ -184,6 +190,17 @@ pub(super) fn fly_field(
                     }
                 }
                 Event::Touchdown { .. } => s.touchdowns += 1,
+                Event::SpacingWaived { id, past } => {
+                    s.spacing_waived += 1;
+                    if trace {
+                        let at = |i: u32| link.fleet().get(i).map(|a| (a.kin.pos(), a.phase));
+                        println!(
+                            "{t:7.1} [{id}] spacing waived past {past:?}: {:?} past {:?}",
+                            at(*id),
+                            past.and_then(at)
+                        );
+                    }
+                }
                 Event::Phase { id, from, to } => {
                     if trace {
                         let pos = link.fleet().get(*id).map(|a| a.kin.pos());
@@ -633,7 +650,12 @@ fn real_install_traffic_world_sweep_inner() {
         return;
     }
     let cifp = crate::nav::test_xplane_path("Custom Data/CIFP");
-    let (mut flown, mut spawned, mut calls) = (0, 0, 0);
+    // `XVL_TRAFFIC_SWEEP_S=3600` flies each field for the hour instead.
+    let window_s: f64 = std::env::var("XVL_TRAFFIC_SWEEP_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SWEEP_S);
+    let (mut flown, mut spawned, mut calls, mut completed) = (0, 0, 0, 0);
     let mut dirty: Vec<String> = Vec::new();
     for (icao, a) in fields {
         let net = crate::nav::find_taxi_net(&apt, &icao).ok().flatten();
@@ -644,15 +666,18 @@ fn real_install_traffic_world_sweep_inner() {
             continue;
         };
         let mut st = install(st, &apt, &icao, has_stands);
-        let s = fly_field(&mut st, field, schedule, SWEEP_S);
+        let s = fly_field(&mut st, field, schedule, window_s);
         println!(
-            "{icao}: {} scheduled, {} calls, {} readbacks ({} accepted), {} conflicts, {} oracle",
+            "{icao}: {} scheduled, {} completed, {} calls, {} readbacks ({} accepted), \
+             {} conflicts, {} oracle, {} spacing waived",
             s.movements,
+            s.completed,
             s.calls,
             s.readbacks,
             s.readbacks_accepted,
             s.conflicts.len(),
-            s.oracle.len()
+            s.oracle.len(),
+            s.spacing_waived
         );
         for line in s.conflicts.iter().take(1).chain(s.oracle.iter().take(1)) {
             println!("    {line}");
@@ -673,11 +698,13 @@ fn real_install_traffic_world_sweep_inner() {
         }
         flown += 1;
         spawned += s.movements;
+        completed += s.completed;
         calls += s.calls;
     }
     Station::uninstall();
     println!(
-        "swept {flown} fields: {spawned} movements, {calls} calls, no panic, {} dirty",
+        "swept {flown} fields: {spawned} movements, {completed} completed, {calls} calls, \
+         no panic, {} dirty",
         dirty.len()
     );
     assert!(flown > 0);

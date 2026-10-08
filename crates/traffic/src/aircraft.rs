@@ -8,6 +8,7 @@ use crate::kin::{bearing, dist_m, follow, project_m, Follow, FollowSpec, Kin, La
 use crate::perf::{class_for_type, Perf, Wake};
 use crate::phase::{Call, Despawn, Event, Leg, Order, Phase, Plan, RadioState, TowerState};
 use crate::rng::XorShift64;
+use crate::spacing::{GroundSpacing, SPACING_DECEL_MS2};
 
 /// Number two extends its downwind until its leader is this close to the
 /// threshold on final.
@@ -169,6 +170,9 @@ pub struct TrafficAircraft {
     vacated_at_s: Option<f64>,
     /// The altitude an arrival came in at.
     entry_alt_ft: f64,
+    /// Its distance from the ground traffic ahead, set by the fleet each
+    /// substep ([`crate::spacing::apply`]); the drive stops short of it.
+    pub spacing: GroundSpacing,
     rng: XorShift64,
 }
 
@@ -211,6 +215,7 @@ impl TrafficAircraft {
             ext_m: 0.0,
             flown: false,
             vacated_at_s: None,
+            spacing: GroundSpacing::default(),
             rng: XorShift64::new(seed),
         }
     }
@@ -374,6 +379,7 @@ impl TrafficAircraft {
             self.phase = to;
             self.radio.called = false;
             self.phase_s = 0.0;
+            self.spacing.waived.clear();
         }
     }
 
@@ -391,12 +397,18 @@ impl TrafficAircraft {
     }
 
     /// Taxi along the route at `kts`; true once stopped at its end. A
-    /// "hold position" stops it where it is.
+    /// "hold position" stops it where it is. Traffic ahead on the route
+    /// slows it to a pace it can stop from short of the spacing
+    /// ([`GroundSpacing::free_m`]), and holds it there until the way clears.
     fn drive(&mut self, kts: f64, order: &Order, dt: f64) -> bool {
         if order.hold {
             self.hold_still(dt);
             return false;
         }
+        let kts = match self.spacing.free_m {
+            Some(free) => kts.min((2.0 * SPACING_DECEL_MS2 * free.max(0.0)).sqrt() / KT_TO_MS),
+            None => kts,
+        };
         let spec = FollowSpec::taxi(kts, self.perf.turn_taxi_dps);
         follow(
             &self.route.path,
@@ -468,7 +480,17 @@ impl TrafficAircraft {
                 }
             }
             Phase::Vacate => {
-                if self.drive(self.perf.taxi_kts, o, dt) {
+                let driven = self.drive(self.perf.taxi_kts, o, dt);
+                // Stopped clear of the strip behind traffic in the exit, it
+                // HAS vacated: said and on to the stand from here. A vacate
+                // waiting to reach its drawn end never reported off, its
+                // landing held the runway whole, and the queue ahead (for a
+                // crossing of that same runway) was never cleared across:
+                // BIEG 03, 2026-10-08, the field gridlocked for two hours.
+                let queued = self.spacing.free_m.is_some_and(|f| f < 1.0)
+                    && self.kin.gs_kts < 0.5
+                    && !field.on_runway(self.kin.pos());
+                if driven || queued {
                     self.call_once(Call::Vacated, events);
                     let vacated_at = *self.vacated_at_s.get_or_insert(self.phase_s);
                     if o.state == TowerState::TaxiCleared {
