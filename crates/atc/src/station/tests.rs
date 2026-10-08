@@ -3757,7 +3757,7 @@ fn lxgb() -> Station {
 /// or asserts on the statics holds this ONE lock. Three finer locks
 /// (ATIS/REGION/HANDOFF) raced each other through `OWN_STRIP.clearance`: the coach
 /// test nulled it mid-flight under the readback test (2026-07-11).
-static SIDE_STATE_LOCK: Mutex<()> = Mutex::new(());
+pub(super) static SIDE_STATE_LOCK: Mutex<()> = Mutex::new(());
 
 fn wx(wind_deg: f64, wind_kts: f64, qnh: f64) -> AtisWx {
     AtisWx {

@@ -461,9 +461,14 @@ pub fn first_designator(name: &str) -> &str {
 /// NEAR still reads as an incursion (the route's nearest point there is the
 /// holding point, off the pavement).
 pub(super) fn on_cleared_runway_crossing(lat: f64, lon: f64) -> bool {
+    on_cleared_runway_crossing_for(&OWN_STRIP, lat, lon)
+}
+
+/// [`on_cleared_runway_crossing`] on one flight's strip (its cleared route).
+pub(super) fn on_cleared_runway_crossing_for(strip: &FlightStrip, lat: f64, lon: f64) -> bool {
     const CORRIDOR_M: f64 = 60.0;
     let nearest = {
-        let route = OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner());
+        let route = strip.taxi_route.lock().unwrap_or_else(|e| e.into_inner());
         let Some(r) = route.as_ref() else {
             return false;
         };

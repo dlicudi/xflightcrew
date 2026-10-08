@@ -72,59 +72,6 @@ pub(super) fn strip_under(lat: f64, lon: f64) -> Option<String> {
         .map(|r| r.ident_a.clone())
 }
 
-/// Does the tower's own book put us on the runway we stand on? The runway
-/// incursion watch ("traffic on final, exit the runway") asks this before it
-/// shouts: a standing takeoff clearance or line-up; a landing clearance on
-/// THIS strip not yet reported vacated (the rollout and the vacate, EGKK 26L
-/// 2026-09-27: "exit the runway immediately" from 20 s after touchdown to
-/// the vacate, eight times); a runway start; the strip we LANDED on, cleared
-/// or not, until we leave it (EGKK-EGBB 15, 2026-09-28: four "exit the
-/// runway" during the vacate of an uncleared landing); a crossing on the
-/// cleared route that keeps moving. Anything else on a strip with traffic on
-/// final is the incursion it is.
-pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bool {
-    let Some(here) = strip_under(lat, lon) else {
-        return false;
-    };
-    let clr = OWN_STRIP.clearance
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(|c| (c.state, c.runway_ident.clone(), c.holds_runway));
-    if let Some((state, ident, holds)) = &clr {
-        if matches!(state, tower::State::LinedUp | tower::State::TakeoffCleared) {
-            return true;
-        }
-        if *state == tower::State::ClearedToLand && *holds {
-            let cleared = {
-                let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
-                strip(&runways, ident).map(|r| r.ident_a.clone())
-            };
-            if ident.is_empty() || cleared.as_deref() == Some(here.as_str()) {
-                return true;
-            }
-        }
-    }
-    let (started_here, landed_here) = {
-        let w = COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            w.runway_start.as_deref() == Some(here.as_str()),
-            w.landed_strip.as_deref() == Some(here.as_str()) && gs_kts >= LANDED_VACATING_KTS,
-        )
-    };
-    // A runway start, or the strip we landed on and are still rolling off
-    // (cleared or not: an aircraft vacating is not an incursion).
-    if started_here || landed_here {
-        return true;
-    }
-    let arrival_taxi = *OWN_STRIP.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner());
-    let cleared_taxi = clr
-        .as_ref()
-        .is_some_and(|(s, _, _)| *s == tower::State::TaxiCleared)
-        || arrival_taxi;
-    cleared_taxi && gs_kts >= 3.0 && on_cleared_runway_crossing(lat, lon)
-}
-
 /// Is this position ON one strip? The shared segment test behind
 /// [`on_active_runway`] and the per-runway traffic watches. Returns the
 /// spoken-able ident of the nearer end.

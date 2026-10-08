@@ -1,0 +1,339 @@
+//! The tower's runway book: who holds which runway, COMPUTED per query from
+//! the strips' clearances and positions and the ghost memory. Nothing here is
+//! stored: no static, no lifetime. The four questions the party line and the
+//! incursion watch used to answer each from our clearance alone
+//! ([`own_strip_claim`], [`player_blocked_strip`],
+//! [`runway_occupancy_authorised`], a ghost's conflict with our claim) are
+//! queries over one book, so a traffic strip's claim is read by the same
+//! rules as ours.
+
+use super::*;
+
+/// Who holds a claim: a flight's strip, or a ghost the replay shows us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Claimant {
+    Strip(FlightId),
+    Ghost(String),
+}
+
+/// What a claim is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimKind {
+    /// Cleared to line up and wait (or a cancelled takeoff): the whole strip.
+    LineUp,
+    /// Cleared for takeoff: the whole strip.
+    Takeoff,
+    /// Cleared to land and not yet reported off: the whole strip.
+    Landing,
+    /// Taxied to the runway or told to join final: its DIRECTION.
+    Sequenced,
+    /// The tower's book holds the runway for a flight whose state claims no
+    /// movement on it (a clearance's `holds_runway` outside the above).
+    Held,
+    /// A cleared crossing on the route, moving.
+    Crossing,
+    /// Physically on the pavement, on the ground (authorised or not).
+    Occupying,
+    /// A runway start: the strip the aircraft first appeared on, stopped.
+    RunwayStart,
+    /// Rolling off the strip it landed on (cleared or not).
+    Vacating,
+    /// A ghost standing on the pavement, as the replay shows it.
+    Observed,
+}
+
+/// One claim on a runway.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Claim {
+    pub(crate) who: Claimant,
+    /// A runway END ("09R"), or a strip's `ident_a` for a claim made from a
+    /// position; empty when the clearance named no runway.
+    pub(crate) end: String,
+    /// The whole strip, either direction; else only this end's direction.
+    pub(crate) whole_strip: bool,
+    pub(crate) kind: ClaimKind,
+    /// The tower's book holds the strip for the claimant (the clearance's
+    /// `holds_runway`); false for claims made from a position.
+    pub(crate) held: bool,
+    /// Since when, where the memory knows it (a ghost's standing clock).
+    pub(crate) since: Option<Instant>,
+}
+
+/// One flight as the book reads it: its id, its strip and its state where
+/// one is known.
+pub(crate) struct BookEntry<'a> {
+    pub(crate) id: FlightId,
+    pub(crate) strip: &'a FlightStrip,
+    pub(crate) state: Option<AircraftState>,
+}
+
+/// The runway book at one moment. Computed, never stored.
+pub(crate) struct RunwayBook {
+    claims: Vec<Claim>,
+    /// Each flight's state as the book was computed with it.
+    states: Vec<(FlightId, AircraftState)>,
+    /// The strip (its `ident_a`) under each flight that stands on one.
+    under: Vec<(FlightId, String)>,
+    /// The field's runways as they were at the computation.
+    runways: Vec<nav::Runway>,
+}
+
+impl RunwayBook {
+    /// The book over our own strip (with our state where the caller holds
+    /// it) and the ghost memory.
+    pub(crate) fn now(own: Option<AircraftState>) -> RunwayBook {
+        RunwayBook::compute(&[BookEntry {
+            id: FlightId::Own,
+            strip: &OWN_STRIP,
+            state: own,
+        }])
+    }
+
+    /// The book over these strips and the ghost memory. Each cell is locked
+    /// alone and dropped before the next: nothing is held across another.
+    pub(crate) fn compute(entries: &[BookEntry<'_>]) -> RunwayBook {
+        let runways = active_runways();
+        let mut book = RunwayBook {
+            claims: Vec::new(),
+            states: Vec::new(),
+            under: Vec::new(),
+            runways,
+        };
+        for e in entries {
+            book.add_strip(e);
+        }
+        book.add_ghosts(standing_ghosts());
+        book
+    }
+
+    fn add_strip(&mut self, e: &BookEntry<'_>) {
+        let who = Claimant::Strip(e.id);
+        let clr = e
+            .strip
+            .clearance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|c| (c.state, c.runway_ident.clone(), c.holds_runway));
+        if let Some((state, ident, held)) = &clr {
+            let kind = match state {
+                tower::State::LinedUp => Some((ClaimKind::LineUp, true)),
+                tower::State::TakeoffCleared => Some((ClaimKind::Takeoff, true)),
+                // A landing reported vacated claims nothing.
+                tower::State::ClearedToLand if *held => Some((ClaimKind::Landing, true)),
+                tower::State::ClearedToLand => None,
+                tower::State::TaxiCleared | tower::State::Inbound => {
+                    Some((ClaimKind::Sequenced, false))
+                }
+                tower::State::Parked if *held => Some((ClaimKind::Held, false)),
+                tower::State::Parked => None,
+            };
+            if let Some((kind, whole_strip)) = kind {
+                self.claims.push(Claim {
+                    who: who.clone(),
+                    end: ident.clone(),
+                    whole_strip,
+                    kind,
+                    held: *held,
+                    since: None,
+                });
+            }
+        }
+        let Some(state) = e.state else {
+            return;
+        };
+        self.states.push((e.id, state));
+        let Some((lat, lon)) = state.position() else {
+            return;
+        };
+        // Standing on the pavement, by the nearer end's name.
+        if state.on_ground {
+            if let Some(end) = self.runways.iter().find_map(|r| on_runway(r, lat, lon)) {
+                self.claims.push(Claim {
+                    who: who.clone(),
+                    end,
+                    whole_strip: false,
+                    kind: ClaimKind::Occupying,
+                    held: false,
+                    since: None,
+                });
+            }
+        }
+        // The strip under it, and what the book says of its being there.
+        let Some(here) = self
+            .runways
+            .iter()
+            .find(|r| on_runway(r, lat, lon).is_some())
+            .map(|r| r.ident_a.clone())
+        else {
+            return;
+        };
+        self.under.push((e.id, here.clone()));
+        let position_claim = |kind| Claim {
+            who: who.clone(),
+            end: here.clone(),
+            whole_strip: false,
+            kind,
+            held: false,
+            since: None,
+        };
+        let (started_here, landed_here) = if e.id == FlightId::Own {
+            let w = COMPLIANCE.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                w.runway_start.as_deref() == Some(here.as_str()),
+                w.landed_strip.as_deref() == Some(here.as_str())
+                    && state.gs_kts >= LANDED_VACATING_KTS,
+            )
+        } else {
+            (false, false)
+        };
+        if started_here {
+            self.claims.push(position_claim(ClaimKind::RunwayStart));
+        }
+        if landed_here {
+            self.claims.push(position_claim(ClaimKind::Vacating));
+        }
+        let arrival_taxi = *e
+            .strip
+            .taxi_to_stand
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let cleared_taxi = clr
+            .as_ref()
+            .is_some_and(|(s, _, _)| *s == tower::State::TaxiCleared)
+            || arrival_taxi;
+        if cleared_taxi && state.gs_kts >= 3.0 && on_cleared_runway_crossing_for(e.strip, lat, lon)
+        {
+            self.claims.push(position_claim(ClaimKind::Crossing));
+        }
+    }
+
+    fn add_ghosts(&mut self, mut ghosts: Vec<(String, f64, f64, Instant)>) {
+        ghosts.sort_by(|a, b| a.0.cmp(&b.0));
+        for (cs, lat, lon, since) in ghosts {
+            if let Some(end) = self.runways.iter().find_map(|r| on_runway(r, lat, lon)) {
+                self.claims.push(Claim {
+                    who: Claimant::Ghost(cs),
+                    end,
+                    whole_strip: false,
+                    kind: ClaimKind::Observed,
+                    held: false,
+                    since: Some(since),
+                });
+            }
+        }
+    }
+
+    /// Every claim in the book.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn claims(&self) -> &[Claim] {
+        &self.claims
+    }
+
+    fn claims_of(&self, id: FlightId) -> impl Iterator<Item = &Claim> {
+        self.claims
+            .iter()
+            .filter(move |c| c.who == Claimant::Strip(id))
+    }
+
+    /// What a flight's CLEARANCE claims of a strip, for the party line, on
+    /// the ground or in the air. Cleared to land and not yet reported off,
+    /// lined up or cleared for takeoff, the WHOLE strip; sequenced for it in
+    /// any other way (taxi, the circuit's Inbound, a go-around's), its
+    /// DIRECTION. `None` without a clearance or a runway.
+    pub(crate) fn strip_claim(&self, id: FlightId) -> Option<&Claim> {
+        self.claims_of(id).find(|c| {
+            !c.end.is_empty()
+                && matches!(
+                    c.kind,
+                    ClaimKind::Landing
+                        | ClaimKind::LineUp
+                        | ClaimKind::Takeoff
+                        | ClaimKind::Sequenced
+                )
+        })
+    }
+
+    /// The strip a flight HOLDS for the party line: the one it stands on, or,
+    /// on the ground, the one the tower's book still gives it. `None`
+    /// airborne or with no state.
+    pub(crate) fn blocked_strip(&self, id: FlightId) -> Option<String> {
+        let (_, state) = self.states.iter().find(|(f, _)| *f == id)?;
+        if !state.on_ground {
+            return None;
+        }
+        self.claims_of(id)
+            .find(|c| c.kind == ClaimKind::Occupying)
+            .or_else(|| self.claims_of(id).find(|c| c.held && !c.end.is_empty()))
+            .map(|c| c.end.clone())
+    }
+
+    /// Does the book put this flight on the strip it stands on? Cleared onto
+    /// it (any runway named), cleared to land on THIS strip (or on none named)
+    /// and not reported off, a runway start, rolling off the strip it landed
+    /// on, or a moving cleared crossing.
+    pub(crate) fn occupancy_authorised(&self, id: FlightId) -> bool {
+        let Some((_, here)) = self.under.iter().find(|(f, _)| *f == id) else {
+            return false;
+        };
+        self.claims_of(id).any(|c| match c.kind {
+            ClaimKind::LineUp | ClaimKind::Takeoff => true,
+            ClaimKind::Landing => {
+                c.end.is_empty()
+                    || strip(&self.runways, &c.end).map(|r| r.ident_a.as_str())
+                        == Some(here.as_str())
+            }
+            ClaimKind::RunwayStart | ClaimKind::Vacating | ClaimKind::Crossing => true,
+            _ => false,
+        })
+    }
+
+    /// Whether movement on `end` conflicts with this flight's strip claim:
+    /// the same strip, and either the whole strip is claimed or the movement
+    /// uses the other direction. One strip, one direction (LEMG 2026-09-28).
+    pub(crate) fn conflicts(&self, id: FlightId, end: &str) -> bool {
+        let Some(c) = self.strip_claim(id) else {
+            return false;
+        };
+        let same = matches!(
+            (strip(&self.runways, end), strip(&self.runways, &c.end)),
+            (Some(x), Some(y)) if std::ptr::eq(x, y)
+        );
+        same && (c.whole_strip || end != c.end)
+    }
+}
+
+/// The strip the PLAYER holds for the party line: the one it stands on, or,
+/// on the ground, the one the tower's book still gives it (cleared onto it,
+/// or landed and not yet reported off). A ghost landing or departing that
+/// strip is not narrated a clearance over our head. The "runway vacated"
+/// report frees it, as it frees a real tower's runway, before the taxi
+/// request that used to be the only thing that did (Liege 2026-09-22).
+pub fn player_blocked_strip(on_ground: bool, lat: f64, lon: f64) -> Option<String> {
+    let own = AircraftState::at_position(lat, lon, on_ground, f64::NAN);
+    RunwayBook::now(Some(own)).blocked_strip(FlightId::Own)
+}
+
+/// What OUR clearance claims of a strip, for the party line:
+/// `(end, whole)` ([`RunwayBook::strip_claim`]).
+#[cfg_attr(not(test), allow(dead_code))] // the party line asks the book itself
+pub(super) fn own_strip_claim() -> Option<(String, bool)> {
+    RunwayBook::now(None)
+        .strip_claim(FlightId::Own)
+        .map(|c| (c.end.clone(), c.whole_strip))
+}
+
+/// Does the tower's own book put us on the runway we stand on? The runway
+/// incursion watch ("traffic on final, exit the runway") asks this before it
+/// shouts: a standing takeoff clearance or line-up; a landing clearance on
+/// THIS strip not yet reported vacated (the rollout and the vacate, EGKK 26L
+/// 2026-09-27: "exit the runway immediately" from 20 s after touchdown to
+/// the vacate, eight times); a runway start; the strip we LANDED on, cleared
+/// or not, until we leave it (EGKK-EGBB 15, 2026-09-28: four "exit the
+/// runway" during the vacate of an uncleared landing); a crossing on the
+/// cleared route that keeps moving. Anything else on a strip with traffic on
+/// final is the incursion it is.
+pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bool {
+    let own = AircraftState::at_position(lat, lon, true, gs_kts);
+    RunwayBook::now(Some(own)).occupancy_authorised(FlightId::Own)
+}

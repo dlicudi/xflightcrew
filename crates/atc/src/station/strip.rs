@@ -218,6 +218,21 @@ pub(super) fn note_ground_traffic(targets: &[TcasTarget], now: Instant) {
     standing.retain(|_, s| now.saturating_duration_since(s.seen).as_secs_f64() <= GHOST_MEMORY_S);
 }
 
+/// Every ghost standing on the ground in the memory: (callsign, lat, lon,
+/// standing since). For the runway book's `Observed` claims.
+pub(super) fn standing_ghosts() -> Vec<(String, f64, f64, Instant)> {
+    STANDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|m| {
+            m.iter()
+                .map(|(cs, s)| (cs.clone(), s.lat, s.lon, s.since))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// How long this ghost has stood where it is, seconds (0 when moving or
 /// unknown).
 pub(super) fn standing_secs(callsign: &str, now: Instant) -> f64 {

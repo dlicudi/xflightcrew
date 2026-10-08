@@ -24,7 +24,7 @@ use sim::xplane::SimView;
 // `party_line`'s accessors, never these statics.
 pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
-    AircraftState, IfrFlight, ARRIVAL_PIN, GO_AROUND_ORDERS, OWN_STRIP, PENDING_STATION,
+    AircraftState, FlightId, FlightStrip, IfrFlight, ARRIVAL_PIN, GO_AROUND_ORDERS, OWN_STRIP, PENDING_STATION,
     REGION_HANDOFF,
 };
 
@@ -378,6 +378,7 @@ mod region;
 mod respond;
 mod routing;
 mod runway_pick;
+mod runway_book;
 mod runways;
 mod self_taxi;
 mod state;
@@ -398,6 +399,7 @@ pub use party_chatter::*;
 pub use radar::*;
 pub use region::*;
 pub use routing::*;
+pub use runway_book::*;
 pub use runways::*;
 pub use self_taxi::*;
 pub use state::*;
@@ -410,3 +412,6 @@ pub use wake::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod book_tests;

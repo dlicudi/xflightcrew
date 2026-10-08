@@ -158,3 +158,17 @@ callsign-keyed map, single strip mutex, `Ctx` split, world_tick cadence or TCAS 
   helicopter flag and a 0-on-failure heading, so mapping it is a decision, not a pass-through.
   `note_aircraft` is the wrapper over `note_aircraft_state`. atc gains `tokio` as a dev-dependency
   for the no-sim ctx test (`a_ctx_is_built_from_a_handed_in_state_with_no_sim`).
+- **Increment 4**: `FlightId` arrives with the book (the claimant needs it), not with `STRIPS`.
+  `ClaimKind` names what the four queries read apart: the design's `Occupying` is split into
+  `Occupying` (on the pavement, on the ground, authorised or not: `player_blocked_strip`),
+  `RunwayStart` and `Vacating` (the two occupations the book authorises), and `Held` covers a
+  `holds_runway` in a state that claims no movement (Parked; never seen live, but the matrix
+  pins the old answer). A `Claim` carries `held` (the clearance's `holds_runway`) beside its
+  kind. The book stores the strips' states and the strip under each, and a snapshot of the
+  field's runways, so every query is pure once computed. Ghosts' `Observed` claims come from
+  the standing memory (`STANDING`, ground only); no query reads them yet. The runway start and
+  the landed strip are read from `COMPLIANCE` for `Own` only until increment 7 moves them onto
+  the strip. `chatter_tick` computes one book before the ghost memory's lock and asks it
+  (`conflicts_with_claim` is gone; `own_strip_claim` stays as a wrapper). The oracles and the
+  matrix live in `station/book_tests.rs` (`SIDE_STATE_LOCK` is `pub(super)` for it): 78,080
+  cells, each checking the four queries (and one whole-state book) against the old functions.

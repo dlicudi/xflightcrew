@@ -264,6 +264,31 @@ impl AircraftState {
     pub fn position(&self) -> Option<(f64, f64)> {
         (self.lat.is_finite() && self.lon.is_finite()).then_some((self.lat, self.lon))
     }
+
+    /// A state known only by its position and ground flag (the old
+    /// position-taking queries): every other value did not read.
+    pub(crate) fn at_position(lat: f64, lon: f64, on_ground: bool, gs_kts: f64) -> AircraftState {
+        AircraftState {
+            lat,
+            lon,
+            alt_ft: f64::NAN,
+            on_ground,
+            gs_kts,
+            psi_deg: None,
+            helicopter: false,
+            at: Instant::now(),
+        }
+    }
+}
+
+/// Which flight a strip is: OUR aircraft, or a traffic strip by its stable
+/// number. Ours is never keyed by callsign (a callsign changes with a plan
+/// or a setting; the strip does not), and a traffic strip's callsign is an
+/// attribute of the strip, never its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FlightId {
+    Own,
+    Traffic(u32),
 }
 
 /// What the controller asked of the transponder: the code it wants, and

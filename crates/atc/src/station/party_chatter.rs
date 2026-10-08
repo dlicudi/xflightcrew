@@ -37,52 +37,6 @@ pub struct PartyExchange {
     pub ghost_seed: usize,
 }
 
-/// The strip the PLAYER holds for the party line: the one it stands on, or,
-/// on the ground, the one the tower's book still gives it (cleared onto it,
-/// or landed and not yet reported off). A ghost landing or departing that
-/// strip is not narrated a clearance over our head. The "runway vacated"
-/// report frees it, as it frees a real tower's runway, before the taxi
-/// request that used to be the only thing that did (Liege 2026-09-22).
-pub fn player_blocked_strip(on_ground: bool, lat: f64, lon: f64) -> Option<String> {
-    if !on_ground {
-        return None;
-    }
-    on_active_runway(lat, lon).or_else(|| {
-        OWN_STRIP.clearance
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .filter(|c| c.holds_runway && !c.runway_ident.is_empty())
-            .map(|c| c.runway_ident.clone())
-    })
-}
-
-/// What OUR clearance claims of a strip, for the party line, on the ground
-/// or in the air: `(end, whole)`. Cleared to land and not yet reported off,
-/// the WHOLE strip is ours (nobody else is cleared onto it, either end);
-/// sequenced for it in any other way (taxi, line-up, takeoff, the circuit's
-/// Inbound, a go-around's), its DIRECTION is (nobody is cleared off or onto
-/// its reciprocal). `None` without a clearance or a runway.
-pub(super) fn own_strip_claim() -> Option<(String, bool)> {
-    let clr = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner());
-    let c = clr.as_ref().filter(|c| !c.runway_ident.is_empty())?;
-    match c.state {
-        tower::State::ClearedToLand if c.holds_runway => Some((c.runway_ident.clone(), true)),
-        // Lined up or cleared for takeoff, the runway is ours alone: one
-        // departure on it at a time, either direction (EGKK 08R, sortie
-        // 1790601822-full_auto, 2026-09-28: "Easy eight six eight zero,
-        // runway zero eight right, cleared for takeoff" 1.6 s after our own
-        // takeoff clearance, while we lined up).
-        tower::State::LinedUp | tower::State::TakeoffCleared => {
-            Some((c.runway_ident.clone(), true))
-        }
-        tower::State::TaxiCleared | tower::State::Inbound => {
-            Some((c.runway_ident.clone(), false))
-        }
-        _ => None,
-    }
-}
-
 /// Our own departure is still spacing the strip `ghost_end` is on: we lifted
 /// off it less than [`WAKE_SECS`] ago, so the tower has cleared nobody off it
 /// behind us (the wake and departure spacing a real tower gives the next
@@ -124,18 +78,6 @@ pub(super) fn same_strip_or_twin(runways: &[nav::Runway], a: &str, b: &str) -> b
 /// EGKK 2026-09-28).
 pub(super) const PARTY_LINE_FRESH_S: f64 = 5.0;
 
-/// Whether a ghost's movement on `ghost_end` conflicts with our claim: the
-/// same strip, and either the whole strip is ours or the ghost uses the
-/// other direction. One strip, one direction (LEMG 2026-09-28).
-pub(super) fn conflicts_with_claim(ghost_end: &str, claim: &(String, bool)) -> bool {
-    let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
-    let same = matches!(
-        (strip(&runways, ghost_end), strip(&runways, &claim.0)),
-        (Some(x), Some(y)) if std::ptr::eq(x, y)
-    );
-    same && (claim.1 || ghost_end != claim.0)
-}
-
 /// One pass of the party line: narrate at most ONE exchange for the ghost
 /// traffic — an arrival's final call answered with the landing clearance
 /// while the ghost is still descending (spoken BEFORE reality lands it), a
@@ -158,8 +100,12 @@ pub fn chatter_tick(
     if station_unavailable() {
         return None;
     }
-    // Read before the ghost memory's lock: our own clearance's claim.
-    let claim = own_strip_claim();
+    // Read before the ghost memory's lock: the runway book (our own
+    // clearance's claim), computed once for the pass.
+    let book = RunwayBook::now(None);
+    let claim = book
+        .strip_claim(FlightId::Own)
+        .map(|c| (c.end.clone(), c.whole_strip));
     let mut guard = GHOSTS.lock().unwrap_or_else(|e| e.into_inner());
     let mem = guard.get_or_insert_with(std::collections::HashMap::new);
     mem.retain(|_, m| now.duration_since(m.last_seen).as_secs() < 180);
@@ -244,7 +190,7 @@ pub fn chatter_tick(
             // go-around watch's, not flavour. The clearance may still come
             // once the claim is gone and the ghost is re-seen in the band.
             if let (Some(a), Some(c)) = (&aim, &claim) {
-                if conflicts_with_claim(a, c) {
+                if book.conflicts(FlightId::Own, a) {
                     sim::blackbox::record(
                         "atc",
                         serde_json::json!({"event": "party_line_withheld", "ghost": t.callsign,
@@ -326,7 +272,7 @@ pub fn chatter_tick(
             // takeoff" with our circuit on downwind for 31, "Easy two seven
             // one six" after our go-around from the 31 final).
             let claimed = match (&ident, &claim) {
-                (Some(a), Some(c)) => conflicts_with_claim(a, c),
+                (Some(a), Some(_)) => book.conflicts(FlightId::Own, a),
                 _ => false,
             } || ident.as_deref().is_some_and(|a| own_departure_spacing(a, now));
             if claimed {
