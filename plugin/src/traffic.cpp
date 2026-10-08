@@ -30,9 +30,11 @@
 // CSL: XPMP2 needs a resource folder (Doc8643.txt, related.txt, relOp.txt,
 // MapIcons.png, Obj8DataRefs.txt) and CSL packages, both user-installed and
 // read-only for us: XCOPILOT_TRAFFIC_CSL (in X-Plane's environment) names the
-// CSL folder, else <X-Plane>/Resources/plugins/LiveTraffic/Resources/CSL; the
-// resources are its parent folder (LiveTraffic's layout), else LiveTraffic's
-// Resources. Without them the status says "no CSL" and nothing draws.
+// CSL folder, else LiveTraffic's Resources/CSL, in plugins/LiveTraffic or, for a
+// LiveTraffic set aside, plugins/Disabled/LiveTraffic; the resources are its
+// parent folder (LiveTraffic's layout). Without them the status says "no CSL"
+// and nothing draws, and switching traffic on tries again (models installed
+// after the sim started need no restart).
 
 #include "traffic.h"
 
@@ -380,7 +382,11 @@ void init_xpmp2() {
     XPLMGetSystemPath(sys);
     std::string root(sys);
     if (!root.empty() && root.back() != '/') root += '/';
-    const std::string lt_res = root + "Resources/plugins/LiveTraffic/Resources";
+    std::string lt_res = root + "Resources/plugins/LiveTraffic/Resources";
+    if (!is_dir(lt_res)) {
+        const std::string aside = root + "Resources/plugins/Disabled/LiveTraffic/Resources";
+        if (is_dir(aside)) lt_res = aside;
+    }
     const char* env = std::getenv("XCOPILOT_TRAFFIC_CSL");
     const std::string csl = env && *env ? std::string(env) : lt_res + "/CSL";
     std::string res = parent_of(csl);
@@ -577,6 +583,8 @@ float TrafficLoop(float, float, int, void*) {
     const bool want_enable = g_enable_req != 0;
     if (want_enable != g_enabled) {
         g_enabled = want_enable;
+        // No CSL at start: look again now, so the models need no sim restart.
+        if (g_enabled && !g_inited) init_xpmp2();
         if (g_inited) {
             if (g_enabled) {
                 take_tcas();
