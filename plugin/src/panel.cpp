@@ -57,19 +57,37 @@ struct LogEntry {
     // exchanges) — rendered dim so calls with our name on them stay bright.
     bool ambient;
     // Who to whom, as the app labelled it ("WAT519 > TOWER"); empty from an
-    // app that sends none. The chip then names the FROM, the text the TO.
+    // app that sends none. The chip names the FROM; the TO is not drawn (the
+    // channel says it: the intercom has two ends, a radio call opens with
+    // the callsign).
     std::string route;
+    // Which channel it went out on: the radio (the frequency) or the
+    // intercom (copilot and cabin). Decided once, at append.
+    bool radio;
 };
 static std::vector<LogEntry> g_log;
 static bool g_log_scroll = false;
 static bool g_log_autoscroll = true;
-// Live view filter: PILOT rows always show (it's the pilot's own transcript),
-// the boxes toggle the other participants. copilot = the intercom, atc =
-// calls with our name on them, others = the overheard party line. All ticked
-// by default and never stored: a declutter for a busy frequency, not a mode.
-static bool g_flt_copilot = true;
-static bool g_flt_atc = true;
+// Live view: the channel tabs (ALL / INTERCOM / RADIO, the two half-duplex
+// channels the audio has) and the party-line box (the overheard frequency,
+// a declutter for a busy field). Never stored: a view, not a mode.
+enum Channel { kChanAll = 0, kChanIntercom = 1, kChanRadio = 2 };
+static int g_chan = kChanAll;
 static bool g_flt_others = true;
+
+// The channel a row went out on. The app's label names it: an intercom
+// row is FROM YOU, COPILOT, CABIN or FLIGHT DECK (efb::transcript::label);
+// a radio row is FROM a callsign or a position. A row without a label (an
+// older app, a panel-local line) goes by its tag: the crew's own lines and
+// the pilot's typed words are the intercom, a station's are the radio.
+static bool RowIsRadio(const char* tag, const std::string& route) {
+    if (!route.empty()) {
+        const std::string from = route.substr(0, route.find(" > "));
+        return !(from == "YOU" || from == "COPILOT" || from == "CABIN" || from == "FLIGHT DECK");
+    }
+    const std::string t = tag;
+    return !(t == "PILOT" || t == "COPILOT" || t == "CABIN");
+}
 // New entries arrived since the Transcript tab was last shown — drives an unread dot
 // on the tab so activity isn't missed while on Route/Settings.
 static bool g_log_unseen = false;
@@ -82,7 +100,8 @@ static void AppendLog(const char* tag, ImU32 color, const char* text,
     struct tm lt;
     localtime_r(&now, &lt);
     strftime(ts, sizeof ts, "%H:%M:%S", &lt);
-    g_log.push_back({ts, tag, color, text, ambient, route ? route : ""});
+    const std::string r = route ? route : "";
+    g_log.push_back({ts, tag, color, text, ambient, r, RowIsRadio(tag, r)});
     if (g_log.size() > 200) g_log.erase(g_log.begin());
     if (g_log_autoscroll) g_log_scroll = true;
     g_log_unseen = true;
@@ -890,13 +909,25 @@ protected:
         // the coach strip.
         // (Three rows when the controls wrap under the filters: measured the
         // same way the wrap decides, so the well shrinks only when they do.)
-        const float ctlNeed = ImGui::CalcTextSize("copilot atc others").x
-            + ImGui::GetFrameHeight() * 4.0f + ImGui::GetStyle().FramePadding.x * 8.0f
-            + ImGui::GetStyle().ItemSpacing.x * 5.0f
+        const float ctlNeed = ImGui::CalcTextSize("party line").x
+            + ImGui::GetFrameHeight() * 2.0f + ImGui::GetStyle().FramePadding.x * 6.0f
+            + ImGui::GetStyle().ItemSpacing.x * 3.0f
             + ImGui::CalcTextSize("follow Clear").x;
         const float rows = ImGui::GetContentRegionAvail().x < ctlNeed ? 3.0f : 2.0f;
         const float footer = ImGui::GetFrameHeightWithSpacing() * rows
             + ImGui::GetStyle().ItemSpacing.y + coach_h;
+        // The channel tabs, above the well: ALL keeps the two channels on
+        // one timeline (a warning between two tower calls reads in order).
+        if (ImGui::BeginTabBar("xcp_chan")) {
+            static const char* kChanName[3] = {"All", "Intercom", "Radio"};
+            for (int c = 0; c < 3; ++c) {
+                if (ImGui::BeginTabItem(kChanName[c])) {
+                    if (g_chan != c) { g_chan = c; g_log_scroll = g_log_autoscroll; }
+                    ImGui::EndTabItem();
+                }
+            }
+            ImGui::EndTabBar();
+        }
         ImGui::BeginChild("log", ImVec2(0, -footer), ImGuiChildFlags_Borders);
         if (g_log.empty()) {
             // Empty state, centred in the well — not a footer mumble.
@@ -907,34 +938,26 @@ protected:
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", hint);
         }
         for (const LogEntry& e : g_log) {
-            // The live filter. PILOT rows never filter: a row doesn't record
-            // which channel the pilot's words went out on, and their side of
-            // the transcript is the anchor either way. Ghost pilots (TRAFFIC)
-            // count as the party line even if a row arrived undimmed.
-            if (e.tag != "PILOT") {
-                const bool others = e.ambient || e.tag == "TRAFFIC";
-                const bool show = e.tag == "COPILOT" ? g_flt_copilot
-                                  : others           ? g_flt_others
-                                                     : g_flt_atc;
-                if (!show) continue;
-            }
+            // The live filter: the channel tab, then the party line. Ghost
+            // pilots (TRAFFIC) count as the party line even if a row arrived
+            // undimmed.
+            if (g_chan == kChanIntercom && e.radio) continue;
+            if (g_chan == kChanRadio && !e.radio) continue;
+            if (!g_flt_others && (e.ambient || e.tag == "TRAFFIC")) continue;
             // Ambience (overheard party-line exchanges) dims, chip and all —
             // calls with our name on them stay bright.
             const ImU32 col = e.ambient ? COL_DIM : e.color;
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", e.time.c_str());
             ImGui::SameLine(kTimeW + pad);
-            // FROM on the chip, "> TO" leading the text, dim: who said it to
-            // whom. A row without a route keeps its tag (an older app).
-            std::string chip = e.tag, to;
-            if (!e.route.empty()) {
-                const size_t gt = e.route.find(" > ");
-                chip = e.route.substr(0, gt);
-                if (gt != std::string::npos) to = "> " + e.route.substr(gt + 3);
-            }
+            // FROM on the chip: who said it. A row without a route keeps its
+            // tag (an older app). Our callsign keyed by the crew says so, dim,
+            // so the pilot's own transmissions stay told apart.
+            std::string chip = e.tag;
+            if (!e.route.empty()) chip = e.route.substr(0, e.route.find(" > "));
             TagChip(chip.c_str(), col, kTagW);
             ImGui::SameLine(kTimeW + kTagW + pad * 2);
-            if (!to.empty()) {
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", to.c_str());
+            if (e.radio && e.tag == "COPILOT") {
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "copilot");
                 ImGui::SameLine();
             }
             // Wrap long readbacks at the panel edge instead of running off it.
@@ -986,11 +1009,7 @@ protected:
 
         // Footer: the view filter on the left, log controls on the right —
         // state lives in the chips, version in Settings.
-        ImGui::Checkbox("copilot", &g_flt_copilot);
-        ImGui::SameLine();
-        ImGui::Checkbox("atc", &g_flt_atc);
-        ImGui::SameLine();
-        ImGui::Checkbox("others", &g_flt_others);
+        ImGui::Checkbox("party line", &g_flt_others);
         // Right-aligned: auto-scroll toggle + clear. On a window too narrow
         // for both groups on one row (a large UI scale) they take the next
         // row instead of overprinting the filters.
