@@ -20,8 +20,8 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use traffic::{
-    Call, Despawn, Event, FieldModel, Fleet, Movement, Order, OwnTarget, Phase, SpawnCtx,
-    TowerState, TrafficAircraft,
+    Call, Despawn, Event, FieldModel, Fleet, Movement, MovementKind, Order, OwnTarget, Phase,
+    SpawnCtx, TowerState, TrafficAircraft,
 };
 
 use crate::party_line::{
@@ -176,6 +176,9 @@ pub(crate) struct TickOut {
     pub(crate) events: Vec<Event>,
     /// Movements spawned this tick (id, callsign).
     pub(crate) spawned: Vec<(u32, String)>,
+    /// Aircraft put on their stands parked at the fleet's start (id,
+    /// callsign): the field's parked aircraft and the departures waiting.
+    pub(crate) parked: Vec<(u32, String)>,
     /// Flights that left the frequency because the station was installed
     /// again under them (the reinstall rule).
     pub(crate) left_frequency: Vec<u32>,
@@ -190,6 +193,10 @@ struct Due {
     /// Fleet seconds from which it may spawn.
     at_s: f64,
     tries: u32,
+    /// The aircraft already standing on its stand for it, parked and dark
+    /// since the fleet's start ([`Movement::parked_from_start`]): released
+    /// at its time rather than spawned.
+    held: Option<u32>,
 }
 
 /// The fleet at the installed field, its schedule and its spawn book.
@@ -211,6 +218,11 @@ pub(crate) struct Link {
     seen_orders: HashMap<u32, (TowerState, Option<String>)>,
     /// The frequency's calls waiting their turn ([`CALL_GAP_S`]).
     outbox: Outbox,
+    /// The field's parked aircraft ([`traffic::park_at_start`]), put on
+    /// their stands at the first tick, where our own position is known.
+    to_park: Vec<Movement>,
+    /// The first tick has parked them.
+    parked: bool,
 }
 
 /// An arrival spawns for the tower's runway: with none known yet (nobody
@@ -220,7 +232,10 @@ const ARRIVAL_WAIT_S: f64 = 120.0;
 /// The station's runway in use, as the command loop last saw it: traffic
 /// spawns for it before the tower has cleared anyone (the link learnt the
 /// runway only from orders, so traffic flew the plan's 13 under a tower on 12,
-/// LEMG, 2026-10-08). Overwritten every command-loop turn.
+/// LEMG, 2026-10-08). Overwritten every command-loop turn with
+/// `Station::runway_for_now`: the runway in use, else the pick the first
+/// traffic call would make, so arrivals spawn for the tower's runway from
+/// the install on instead of waiting [`ARRIVAL_WAIT_S`] for a first call.
 static STATION_RUNWAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Note the station's runway in use (the command loop, each turn).
@@ -233,14 +248,20 @@ fn station_runway() -> Option<String> {
 }
 
 impl Link {
-    /// The fleet at `field`, flying `schedule` (times from now).
+    /// The fleet at `field`, flying `schedule` (times from now). Its parked
+    /// aircraft ([`MovementKind::Parked`]) and the departures parked from
+    /// the start stand on their stands from the first tick.
     pub(crate) fn new(field: FieldModel, schedule: Vec<Movement>, tower_name: &str) -> Link {
+        let (to_park, schedule): (Vec<Movement>, Vec<Movement>) = schedule
+            .into_iter()
+            .partition(|m| m.kind == MovementKind::Parked);
         let mut due: Vec<Due> = schedule
             .into_iter()
             .map(|m| Due {
                 at_s: m.t_s,
                 m,
                 tries: 0,
+                held: None,
             })
             .collect();
         due.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
@@ -254,6 +275,8 @@ impl Link {
             noted: Vec::new(),
             seen_orders: HashMap::new(),
             outbox: Outbox::default(),
+            to_park,
+            parked: false,
         }
     }
 
@@ -264,6 +287,7 @@ impl Link {
             at_s: m.t_s + offset_s,
             m,
             tries: 0,
+            held: None,
         }));
         self.due.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
     }
@@ -272,9 +296,20 @@ impl Link {
         &self.fleet
     }
 
-    /// Movements still to spawn.
+    /// Movements still to spawn (a departure waiting parked on its stand
+    /// is one; the field's parked aircraft are none).
     pub(crate) fn pending(&self) -> usize {
         self.due.len()
+    }
+
+    /// Aircraft in the fleet that are going somewhere (not
+    /// [`TrafficAircraft::dormant`]).
+    pub(crate) fn active(&self) -> usize {
+        self.fleet
+            .aircraft()
+            .iter()
+            .filter(|a| !a.dormant())
+            .count()
     }
 
     /// The field's ICAO.
@@ -289,9 +324,16 @@ impl Link {
     }
 
     /// The picture the crew and the station see of the traffic: every
-    /// aircraft as a TCAS target (ours not in it).
+    /// aircraft going somewhere as a TCAS target (ours not in it). A
+    /// dormant one, parked on its stand, is no TCAS traffic: the plugin
+    /// draws it, the crew's picture does not carry it.
     pub(crate) fn targets(&self) -> Vec<TcasTarget> {
-        self.fleet.aircraft().iter().map(tcas_target).collect()
+        self.fleet
+            .aircraft()
+            .iter()
+            .filter(|a| !a.dormant())
+            .map(tcas_target)
+            .collect()
     }
 
     /// One tick: spawn what is due, step the fleet `dt` seconds of sim time
@@ -333,10 +375,18 @@ impl Link {
         });
         // Where everyone is first: a call's strip is open and placed before
         // the station answers it, and the book sees this tick's positions.
-        for ac in self.fleet.aircraft() {
+        // A dormant aircraft has said nothing: no strip, no state, until it
+        // is released and calls.
+        for ac in self.fleet.aircraft().iter().filter(|a| !a.dormant()) {
             crate::world::note_traffic_state(ac.id, aircraft_state(ac, now));
         }
-        self.noted = self.fleet.aircraft().iter().map(|a| a.id).collect();
+        self.noted = self
+            .fleet
+            .aircraft()
+            .iter()
+            .filter(|a| !a.dormant())
+            .map(|a| a.id)
+            .collect();
         for ev in &events {
             match ev {
                 Event::Call { id, call } => {
@@ -378,7 +428,7 @@ impl Link {
                 safety: is_safety_call(&call),
             });
         }
-        for ac in self.fleet.aircraft() {
+        for ac in self.fleet.aircraft().iter().filter(|a| !a.dormant()) {
             let picture = self.picture_for(ac.id, own);
             for line in crate::world::traffic_tick(ac.id, &picture, now) {
                 out.tower.push((ac.id, line));
@@ -406,6 +456,49 @@ impl Link {
             self.outbox.forget(*id);
         }
         ids
+    }
+
+    /// The field's parked aircraft onto their stands, and every departure
+    /// parked from the start onto its own, parked and dark
+    /// ([`Movement::park`]: never on our stand nor within 60 m of us, never
+    /// on a stand somebody stands on). A departure refused here spawns at
+    /// its time as any other; a refused parked aircraft is not drawn.
+    fn park_at_start(&mut self, own: Option<&OwnState>, out: &mut TickOut) {
+        let own = own.map(|o| (o.lat, o.lon));
+        let ctx = |fleet: &Fleet| SpawnCtx {
+            runway: None,
+            own,
+            occupied: fleet
+                .aircraft()
+                .iter()
+                .filter(|a| a.kin.on_ground)
+                .map(|a| a.kin.pos())
+                .collect(),
+        };
+        for i in 0..self.due.len() {
+            if !self.due[i].m.parked_from_start {
+                continue;
+            }
+            let c = ctx(&self.fleet);
+            if let Ok(ac) = self.due[i].m.park(self.next_id, &self.fleet.field, &c) {
+                let (id, cs) = (ac.id, ac.callsign.clone());
+                if self.fleet.spawn(ac) {
+                    self.next_id += 1;
+                    self.due[i].held = Some(id);
+                    out.parked.push((id, cs));
+                }
+            }
+        }
+        for m in std::mem::take(&mut self.to_park) {
+            let c = ctx(&self.fleet);
+            if let Ok(ac) = m.park(self.next_id, &self.fleet.field, &c) {
+                let (id, cs) = (ac.id, ac.callsign.clone());
+                if self.fleet.spawn(ac) {
+                    self.next_id += 1;
+                    out.parked.push((id, cs));
+                }
+            }
+        }
     }
 
     /// A call in words, addressed to the field's tower by name where it
@@ -444,7 +537,14 @@ impl Link {
                 next_s = self.due.first().map(|d| d.at_s), runway = ?self.tower_runway,
                 flying = self.fleet.aircraft().len(), "traffic: heartbeat");
         }
-        if self.fleet.clock.frozen || self.due.first().is_none_or(|d| d.at_s > now_s) {
+        if self.fleet.clock.frozen {
+            return;
+        }
+        if !self.parked {
+            self.parked = true;
+            self.park_at_start(own, out);
+        }
+        if self.due.first().is_none_or(|d| d.at_s > now_s) {
             return;
         }
         let ctx = SpawnCtx {
@@ -464,14 +564,22 @@ impl Link {
             let runway = self.tower_runway.clone().or_else(station_runway);
             match &runway {
                 Some(r) if self.fleet.field.end(r).is_some() => d.m.runway = r.clone(),
-                None if d.m.kind == traffic::MovementKind::Arrival
-                    && now_s < d.m.t_s + ARRIVAL_WAIT_S =>
-                {
+                None if d.m.kind == MovementKind::Arrival && now_s < d.m.t_s + ARRIVAL_WAIT_S => {
                     d.at_s = now_s + 5.0;
                     later.push(d);
                     continue;
                 }
                 _ => {}
+            }
+            // A departure waiting on its stand starts up there.
+            if let Some(id) = d.held {
+                let plan = d.m.plan(&self.fleet.field);
+                if let Ok(plan) = plan {
+                    if self.fleet.release(id, plan) {
+                        out.spawned.push((id, d.m.callsign.clone()));
+                        continue;
+                    }
+                }
             }
             let spawned = d.m.spawn(self.next_id, &self.fleet.field, &ctx);
             if let Err(why) = &spawned {
@@ -863,7 +971,10 @@ fn build_link(
     let ctx = SpawnCtx::default();
     let (schedule, source) = if file.is_empty() {
         let d = traffic::Density::parse(density).unwrap_or(traffic::Density::Normal);
-        (traffic::generate(&field, d, seed, &ctx), "generated")
+        let mut schedule = traffic::generate(&field, d, seed, &ctx);
+        let parked = traffic::park_at_start(&field, d, seed, &ctx, &mut schedule);
+        schedule.extend(parked);
+        (schedule, "generated")
     } else {
         let text = match std::fs::read_to_string(file) {
             Ok(t) => t,
@@ -891,11 +1002,20 @@ fn build_link(
             }
         }
     };
-    tracing::info!(%icao, movements = schedule.len(), source, "traffic: the fleet is up");
+    let parked = schedule
+        .iter()
+        .filter(|m| m.kind == MovementKind::Parked || m.parked_from_start)
+        .count();
+    let movements = schedule
+        .iter()
+        .filter(|m| m.kind != MovementKind::Parked)
+        .count();
+    tracing::info!(%icao, movements, parked, source, "traffic: the fleet is up");
     crate::blackbox::record(
         "traffic",
         serde_json::json!({
-            "event": "up", "field": icao, "movements": schedule.len(), "source": source,
+            "event": "up", "field": icao, "movements": movements, "parked": parked,
+            "source": source,
         }),
     );
     Some(Link::new(field, schedule, name))
@@ -930,6 +1050,17 @@ fn record(out: &TickOut, link: &Link) {
                 "type": ac.map(|a| a.icao_type.clone()),
                 "plan": ac.map(|a| plan_word(&a.plan)),
                 "runway": ac.and_then(|a| a.plan.runway().map(str::to_string)),
+            }),
+        );
+    }
+    for (id, callsign) in &out.parked {
+        let ac = link.fleet().get(*id);
+        crate::blackbox::record(
+            "traffic",
+            serde_json::json!({
+                "event": "parked", "id": id, "callsign": callsign,
+                "type": ac.map(|a| a.icao_type.clone()),
+                "stand": ac.and_then(|a| a.stand.clone()),
             }),
         );
     }

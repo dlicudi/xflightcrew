@@ -77,6 +77,12 @@ pub(super) struct HarnessScore {
     pub(super) touchdowns: usize,
     pub(super) go_arounds: usize,
     pub(super) secs: f64,
+    /// When each movement spawned (harness seconds) and its callsign.
+    pub(super) spawned: Vec<(f64, String)>,
+    /// Put on their stands parked at the start (parked aircraft and the
+    /// departures waiting), and still parked at the end (never moved).
+    pub(super) parked_at_start: usize,
+    pub(super) parked: usize,
 }
 
 /// A station for `icao` from `apt` with its taxi network loaded, installed.
@@ -110,14 +116,25 @@ fn install_apt() -> String {
 }
 
 /// Fly `schedule` at `field` against the installed `station` on a fake
-/// clock in `dt` ticks until every movement is done or `max_s` passes.
+/// clock in `dt` ticks until every movement is done or `max_s` passes. The
+/// field's stands are parked at the start as the live link parks them
+/// (`traffic::park_at_start`, normal density): the departures waiting on
+/// their stands are movements, the parked aircraft are not, and they stay.
 pub(super) fn fly_field(
     station: &mut Station,
     field: FieldModel,
-    schedule: Vec<Movement>,
+    mut schedule: Vec<Movement>,
     max_s: f64,
 ) -> HarnessScore {
     let name = crate::party_line::spoken_airport(station.airport_name()).to_string();
+    let parked = traffic::park_at_start(
+        &field,
+        Density::Normal,
+        3,
+        &SpawnCtx::default(),
+        &mut schedule,
+    );
+    schedule.extend(parked);
     let mut link = Link::new(field, schedule, &name);
     let mut s = HarnessScore {
         movements: link.pending(),
@@ -130,6 +147,9 @@ pub(super) fn fly_field(
     let mut readbacks: HashMap<u32, Vec<String>> = HashMap::new();
     let mut seen_ids: HashSet<u32> = HashSet::new();
     let trace = std::env::var("XVL_TRAFFIC_TRACE").is_ok_and(|v| !v.is_empty());
+    // The command loop notes the station's runway each turn, from the
+    // install on (`station_work::drain_traffic_calls`).
+    note_station_runway(station.runway_for_now().as_deref());
     while t < max_s {
         t += dt;
         let now = epoch + Duration::from_secs_f64(t);
@@ -138,6 +158,9 @@ pub(super) fn fly_field(
         s.keyed
             .extend(out.transmissions.iter().map(|tx| (t, tx.safety)));
         s.said.extend(out.tower.iter().map(|(_, l)| l.clone()));
+        s.spawned
+            .extend(out.spawned.iter().map(|(_, cs)| (t, cs.clone())));
+        s.parked_at_start += out.parked.len();
         for ev in &out.events {
             match ev {
                 Event::Spawn { id } => {
@@ -170,6 +193,7 @@ pub(super) fn fly_field(
             }
         }
         // The command loop's half, as often as the monitor ticks.
+        note_station_runway(station.runway_for_now().as_deref());
         station.sync_traffic_desks();
         for line in out.tower.iter().filter(|_| trace) {
             println!("{t:7.1} TWR(tick) [{}] {}", line.0, line.1);
@@ -229,12 +253,18 @@ pub(super) fn fly_field(
                 }
             }
         }
-        if link.pending() == 0 && link.fleet().aircraft().is_empty() {
+        if link.pending() == 0 && link.active() == 0 {
             break;
         }
     }
     s.secs = t;
-    for ac in link.fleet().aircraft() {
+    s.parked = link
+        .fleet()
+        .aircraft()
+        .iter()
+        .filter(|a| a.dormant())
+        .count();
+    for ac in link.fleet().aircraft().iter().filter(|a| !a.dormant()) {
         s.unfinished.push(format!(
             "{} {} still {:?} at {t:.0} s",
             ac.id, ac.callsign, ac.phase
@@ -289,27 +319,6 @@ fn crowded(s: &HarnessScore) -> Option<(f64, f64)> {
 
 /// The world sweep's window at each field: ten minutes of fleet time.
 const SWEEP_S: f64 = 600.0;
-
-/// What the sweep asserts of a field's window (completion is not asked of
-/// ten minutes): the runway book never held two incompatible claims, the
-/// compliance oracle stayed silent, every traffic readback was accepted.
-fn assert_sweep_clean(s: &HarnessScore, what: &str) {
-    assert_paced(s, what);
-    assert!(
-        s.conflicts.is_empty(),
-        "{what}: runway conflicts {:?}",
-        s.conflicts
-    );
-    assert!(
-        s.oracle.is_empty(),
-        "{what}: the oracle spoke {:?}",
-        s.oracle
-    );
-    assert_eq!(
-        s.readbacks, s.readbacks_accepted,
-        "{what}: every readback accepted"
-    );
-}
 
 /// The orders map one to one.
 #[test]
@@ -417,8 +426,22 @@ fn a_field_hour_inner() {
         .with_cifp(&format!("{}/cifp", fixtures()));
     let schedule = traffic::generate(&field, Density::Normal, 7, &SpawnCtx::default());
     let mut st = installed_station(&apt, "XTST");
+    // The field has a runway for the traffic from the install on: the first
+    // arrival spawns at its time, not ARRIVAL_WAIT_S later for a first call.
+    assert!(st.runway_in_use().is_none() && st.runway_for_now().is_some());
+    let first_in = schedule
+        .iter()
+        .find(|m| m.kind == traffic::MovementKind::Arrival)
+        .map(|m| (m.t_s, m.callsign.clone()))
+        .expect("an arrival");
     let s = fly_field(&mut st, field, schedule, 2.5 * 3600.0);
     assert_clean(&s, "XTST field hour");
+    let spawned = s.spawned.iter().find(|(_, cs)| *cs == first_in.1);
+    assert!(
+        spawned.is_some_and(|(t, _)| *t < first_in.0 + 1.0),
+        "the first arrival spawned at {spawned:?}, scheduled {:.0} s",
+        first_in.0
+    );
     Station::uninstall();
 }
 
@@ -494,7 +517,11 @@ fn ulmm_traffic_holds_short_inner() {
 /// side and its taxi in crossed the strip again ("taxi to parking one,
 /// cross runway zero three") while a departure released by the takeoff
 /// hold rolled on 03: 20 conflicts. Now the taxi in holds short of 21,
-/// asks, and waits for the departure.
+/// asks, and waits for the departure. Flown to the END of its schedule
+/// (three hours): a 172 landing short rolled 1.2 km to the far exit at taxi
+/// pace and despawned `NoStand` the moment the vacate ended, its "runway
+/// vacated" never said and the strip held behind it, until the wait for a
+/// stand ran from the vacate's end (#242).
 #[test]
 fn bieg_taxi_in_holds_short_of_the_runway_it_landed_on() {
     in_own_process("traffic_link::tests::bieg_taxi_in_holds_short_inner");
@@ -514,13 +541,13 @@ fn bieg_taxi_in_holds_short_inner() {
         &["I03", "Q03", "Q21", "R03", "R21"],
     );
     let schedule = traffic::generate(&field, Density::Normal, 3, &SpawnCtx::default());
-    let s = fly_field(&mut st, field, schedule, SWEEP_S);
+    let s = fly_field(&mut st, field, schedule, 3.0 * 3600.0);
     assert!(
         s.said.iter().any(|l| l.contains("hold short runway")),
         "the taxi in held short: {:?}",
         s.said
     );
-    assert_sweep_clean(&s, "BIEG crossings");
+    assert_clean(&s, "BIEG crossings");
     Station::uninstall();
 }
 
@@ -546,7 +573,19 @@ fn real_install_lemg_traffic_hour_inner() {
     let field = field.with_cifp(&crate::nav::test_xplane_path("Custom Data/CIFP"));
     let schedule = traffic::generate(&field, Density::Normal, 7, &SpawnCtx::default());
     let mut st = installed_station(&apt, "LEMG");
+    println!(
+        "LEMG at install: runway in use {:?}, for the traffic {:?}",
+        st.runway_in_use(),
+        st.runway_for_now()
+    );
     let s = fly_field(&mut st, field, schedule, 3.0 * 3600.0);
+    println!(
+        "LEMG first spawns: {:?}, {} parked at the start, {} never moved",
+        &s.spawned[..s.spawned.len().min(4)],
+        s.parked_at_start,
+        s.parked
+    );
+    assert!(s.parked > 0, "LEMG's stands are not empty");
     assert_clean(&s, "LEMG field hour");
     Station::uninstall();
 }
@@ -557,7 +596,7 @@ fn real_install_lemg_traffic_hour_inner() {
 /// minutes against its real station: nothing panics, and at every field the
 /// runway book never holds two incompatible claims, the compliance oracle
 /// stays silent, every traffic readback is accepted and the frequency is
-/// paced ([`assert_sweep_clean`]). Completion is not asked (minutes, not the
+/// paced (`assert_clean` less completion). Completion is not asked (minutes, not the
 /// hour); the numbers print. Seconds in release.
 #[test]
 #[ignore = "needs X-Plane's Global Airports apt.dat; run with -- --ignored"]

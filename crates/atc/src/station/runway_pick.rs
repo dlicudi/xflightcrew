@@ -427,6 +427,44 @@ impl Station {
         self.runway_in_use.clone().unwrap_or_default()
     }
 
+    /// The runway the field works NOW: the runway in use, else the pick the
+    /// first ground call of a traffic flight would make on this field (its
+    /// wind as [`Station::traffic_ctx`] takes it, the remembered streams,
+    /// a departure's wind pick, the close-parallel rule: the same steps
+    /// [`Station::pick_runway_with`] takes with nothing in use, nothing
+    /// stated and nothing committed). PURE: it writes nothing, so our own
+    /// flight's first call picks exactly as before. The traffic link spawns
+    /// its arrivals for it from the install on (LEMG, 2026-10-08: arrivals
+    /// waited two minutes for a first call to give the field a runway).
+    pub fn runway_for_now(&self) -> Option<String> {
+        if let Some(r) = &self.runway_in_use {
+            return Some(r.clone());
+        }
+        let (wind_from, wind_kts) = TOWER_WIND
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .or_else(|| surface_wind_at(self.apt.position()))
+            .unwrap_or((0.0, 0.0));
+        let (arrival_end, departure_end) = field_streams(&self.apt.runways, None, Instant::now());
+        let on_field = |e: &String| strip(&self.apt.runways, e).is_some();
+        let stream_end = arrival_end
+            .filter(on_field)
+            .or(departure_end.filter(on_field));
+        if wind_kts < CALM_WIND_KTS {
+            if let Some(end) = stream_end {
+                return Some(end);
+            }
+        }
+        let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts);
+        let (id, _, _) = self.departure_wind_pick(best, wind_from, wind_kts)?;
+        let main = nav::close_parallel_main(&self.apt.runways, &id);
+        Some(if main != id && self.departs_from(&main) {
+            main
+        } else {
+            id
+        })
+    }
+
     /// A traffic flight may write the runway in use only while the field has
     /// none ([`Station::pick_runway_with`]): every other write of it is
     /// ours. Logged when it does.

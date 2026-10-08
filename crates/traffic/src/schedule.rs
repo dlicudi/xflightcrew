@@ -7,6 +7,7 @@
 //! is gone [`DEPART_GONE_NM`] out, an arrival [`PARKED_LINGER_S`] after it
 //! parks, a circuit aircraft once its laps are flown and it has parked.
 
+use nav::Stand;
 use serde::Deserialize;
 
 use crate::aircraft::TrafficAircraft;
@@ -55,6 +56,11 @@ pub const OWN_CLEAR_NM: f64 = 3.0;
 /// An arrival starts this far out.
 pub const ENTRY_NM: f64 = 10.0;
 
+/// The schedule's first movement comes this soon after the fleet starts,
+/// seconds (a draw between the two): the first live hour at LEMG
+/// (2026-10-08) showed an empty field for four to six minutes.
+pub const FIRST_MOVE_S: (f64, f64) = (30.0, 60.0);
+
 /// The shortest runway a jet is scheduled on, and a turboprop.
 pub const JET_MIN_RUNWAY_M: f64 = 1800.0;
 pub const TURBOPROP_MIN_RUNWAY_M: f64 = 1100.0;
@@ -66,7 +72,27 @@ pub enum MovementKind {
     Circuit,
     Departure,
     Arrival,
+    /// Stands on its stand from the fleet's start and never moves (drawn
+    /// only, [`Plan::Parked`]): the field's parked aircraft
+    /// ([`park_at_start`]).
+    Parked,
 }
+
+/// The share of a field's suitable stands filled at the fleet's start, by
+/// density ([`park_at_start`]).
+pub const PARKED_SHARE_LIGHT: f64 = 0.15;
+pub const PARKED_SHARE_NORMAL: f64 = 0.30;
+
+/// Stands left free at the start for the arrivals, whatever the share.
+pub const STANDS_KEPT_FREE: usize = 3;
+
+/// Nothing is parked this close to our own aircraft, metres.
+pub const PARK_CLEAR_OWN_M: f64 = 60.0;
+
+/// The most aircraft parked at the start, however big the field: each is an
+/// XPMP2 aircraft the plugin draws every frame (frame cost unmeasured past
+/// 60 aircraft, see the risks).
+pub const PARKED_MAX: usize = 40;
 
 /// One scheduled flight.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +115,10 @@ pub struct Movement {
     /// A departure's way out, degrees true.
     pub exit_bearing: f64,
     pub seed: u64,
+    /// A departure that stands on its stand, parked and dark, from the
+    /// fleet's start until its time, and starts up there
+    /// ([`park_at_start`]); else it appears on its stand at its time.
+    pub parked_from_start: bool,
 }
 
 /// What the world looks like at generation or spawn time.
@@ -123,32 +153,18 @@ pub enum Refusal {
 impl Movement {
     /// The aircraft, as traffic id `id`, or why not now. A circuit or a
     /// departure takes its stand only when free, else the nearest free
-    /// one; an arrival never starts within [`OWN_CLEAR_NM`] of us.
+    /// one; an arrival never starts within [`OWN_CLEAR_NM`] of us; a parked
+    /// aircraft is [`Movement::park`]ed.
     pub fn spawn(
         &self,
         id: u32,
         field: &FieldModel,
         ctx: &SpawnCtx,
     ) -> Result<TrafficAircraft, Refusal> {
-        let end = field.end(&self.runway).ok_or(Refusal::NoRunway)?;
-        let plan = match self.kind {
-            MovementKind::Circuit => Plan::Circuit {
-                runway: end.ident.clone(),
-                laps: self.laps.max(1),
-                left: end.left,
-            },
-            MovementKind::Departure => Plan::Departure {
-                runway: end.ident.clone(),
-                sid: self.sid.clone(),
-                exit_bearing: self.exit_bearing,
-            },
-            MovementKind::Arrival => Plan::Arrival {
-                entry: self.entry.unwrap_or_else(|| default_entry(&end)),
-                star: self.star.clone(),
-                runway: end.ident.clone(),
-                straight_in: self.straight_in,
-            },
-        };
+        if self.kind == MovementKind::Parked {
+            return self.park(id, field, ctx);
+        }
+        let plan = self.plan(field)?;
         if let Plan::Arrival { entry, .. } = &plan {
             if ctx
                 .own
@@ -189,6 +205,70 @@ impl Movement {
             plan,
             field,
             &stand,
+            self.seed,
+        )
+        .ok_or(Refusal::NoStand)
+    }
+
+    /// What the movement flies, at its runway (`NoRunway` when the field
+    /// has none such; a parked aircraft needs none).
+    pub fn plan(&self, field: &FieldModel) -> Result<Plan, Refusal> {
+        if self.kind == MovementKind::Parked {
+            return Ok(Plan::Parked);
+        }
+        let end = field.end(&self.runway).ok_or(Refusal::NoRunway)?;
+        Ok(match self.kind {
+            MovementKind::Circuit => Plan::Circuit {
+                runway: end.ident.clone(),
+                laps: self.laps.max(1),
+                left: end.left,
+            },
+            MovementKind::Departure => Plan::Departure {
+                runway: end.ident.clone(),
+                sid: self.sid.clone(),
+                exit_bearing: self.exit_bearing,
+            },
+            MovementKind::Arrival => Plan::Arrival {
+                entry: self.entry.unwrap_or_else(|| default_entry(&end)),
+                star: self.star.clone(),
+                runway: end.ident.clone(),
+                straight_in: self.straight_in,
+            },
+            MovementKind::Parked => Plan::Parked,
+        })
+    }
+
+    /// The aircraft standing on its own stand, parked and dark
+    /// ([`Plan::Parked`]), as traffic id `id`: a parked aircraft, or a
+    /// departure waiting for its time ([`Movement::parked_from_start`],
+    /// released then by [`crate::Fleet::release`]). Only on its NAMED
+    /// stand, free, and never within [`PARK_CLEAR_OWN_M`] of our aircraft.
+    pub fn park(
+        &self,
+        id: u32,
+        field: &FieldModel,
+        ctx: &SpawnCtx,
+    ) -> Result<TrafficAircraft, Refusal> {
+        let stand = self
+            .stand
+            .as_deref()
+            .and_then(|n| field.stand(n))
+            .filter(|s| !stand_taken(s, &ctx.taken()))
+            .ok_or(Refusal::NoStand)?;
+        if ctx
+            .own
+            .is_some_and(|o| dist_m(o, (stand.lat, stand.lon)) < PARK_CLEAR_OWN_M)
+        {
+            return Err(Refusal::NearOwn);
+        }
+        TrafficAircraft::at_stand(
+            id,
+            &self.callsign,
+            &self.spoken,
+            &self.icao_type,
+            Plan::Parked,
+            field,
+            &stand.name,
             self.seed,
         )
         .ok_or(Refusal::NoStand)
@@ -258,6 +338,10 @@ fn field_seed(icao: &str, seed: u64) -> u64 {
 ///   arrivals (straight in where the runway has an approach, else to the
 ///   downwind) where it publishes approaches or STARs, every 20 (light) or
 ///   10 (normal) minutes, on a runway long enough for the type;
+/// - the first movement within [`FIRST_MOVE_S`] of the start: the stream
+///   it belongs to (a ground start's, circuits or departures, before the
+///   arrivals') is brought forward whole, so its spacing and the hour's
+///   count are unchanged;
 /// - never on an occupied stand (ours, anyone's in `ctx`, or one already
 ///   handed out), never an entry within [`OWN_CLEAR_NM`] of us.
 pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx) -> Vec<Movement> {
@@ -310,6 +394,7 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
                 star: None,
                 exit_bearing: 0.0,
                 seed: rng.next_u64(),
+                parked_from_start: false,
             });
             t += rng.range_f64(120.0, 420.0);
         }
@@ -354,6 +439,7 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
                 star: None,
                 exit_bearing: rng.range_f64(0.0, 360.0),
                 seed: rng.next_u64(),
+                parked_from_start: false,
             });
             t += every * rng.range_f64(0.8, 1.2);
         }
@@ -390,12 +476,169 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
                 star,
                 exit_bearing: 0.0,
                 seed: rng.next_u64(),
+                parked_from_start: false,
             });
             t += every * rng.range_f64(0.8, 1.2);
         }
     }
+    bring_first_forward(&mut out, &mut rng);
     out.sort_by(|a, b| a.t_s.total_cmp(&b.t_s));
     out
+}
+
+/// The first movement within [`FIRST_MOVE_S`]: the earliest ground start
+/// (a circuit or a departure: something seen moving on the field), else the
+/// earliest arrival, and every movement of its kind with it, by the same
+/// shift. Already that soon, nothing moves. One draw of `rng`, always.
+fn bring_first_forward(out: &mut [Movement], rng: &mut XorShift64) {
+    let first_s = rng.range_f64(FIRST_MOVE_S.0, FIRST_MOVE_S.1);
+    let earliest = |ground: bool| {
+        out.iter()
+            .filter(|m| {
+                let start = matches!(m.kind, MovementKind::Circuit | MovementKind::Departure);
+                start == ground && m.kind != MovementKind::Parked
+            })
+            .min_by(|a, b| a.t_s.total_cmp(&b.t_s))
+            .map(|m| (m.kind, m.t_s))
+    };
+    let Some((kind, t)) = earliest(true).or_else(|| earliest(false)) else {
+        return;
+    };
+    let shift = t - first_s;
+    if shift > 0.0 {
+        for m in out.iter_mut().filter(|m| m.kind == kind) {
+            m.t_s -= shift;
+        }
+    }
+}
+
+/// THE FIELD IS NOT EMPTY AT THE START (LEMG, 2026-10-08: no parked
+/// aircraft at all): a share of the field's suitable stands
+/// ([`PARKED_SHARE_LIGHT`], [`PARKED_SHARE_NORMAL`]; at most
+/// [`PARKED_MAX`]) stands occupied from the fleet's start. The `schedule`'s departures fill it first, earliest
+/// first: each is marked [`Movement::parked_from_start`], waits on its own
+/// stand parked and dark, and starts up there at its time. The rest of the
+/// share is returned as [`MovementKind::Parked`] aircraft at `t_s` 0, each
+/// of the class its stand takes (an airliner of a carrier that flies the
+/// type at a gate or a jet stand, the regional turboprop at a turboprop
+/// stand, a light aircraft on a GA stand or a tie-down), never on a stand
+/// the schedule or `ctx` holds, and never so many that fewer than
+/// [`STANDS_KEPT_FREE`] stands are left for the arrivals. Our own stand and
+/// [`PARK_CLEAR_OWN_M`] round us are refused at spawn ([`Movement::park`]).
+/// Deterministic per field and seed; nothing at `Off`.
+pub fn park_at_start(
+    field: &FieldModel,
+    density: Density,
+    seed: u64,
+    ctx: &SpawnCtx,
+    schedule: &mut [Movement],
+) -> Vec<Movement> {
+    let share = match density {
+        Density::Off => return Vec::new(),
+        Density::Light => PARKED_SHARE_LIGHT,
+        Density::Normal => PARKED_SHARE_NORMAL,
+    };
+    let suitable: Vec<&Stand> = field
+        .net
+        .stands
+        .iter()
+        .filter(|s| s.is_suitable())
+        .collect();
+    let mut budget = ((share * suitable.len() as f64).floor() as usize).min(PARKED_MAX);
+    let mut order: Vec<&mut Movement> = schedule
+        .iter_mut()
+        .filter(|m| m.kind == MovementKind::Departure && m.stand.is_some())
+        .collect();
+    order.sort_by(|a, b| a.t_s.total_cmp(&b.t_s));
+    for m in order {
+        if budget == 0 {
+            break;
+        }
+        m.parked_from_start = true;
+        budget -= 1;
+    }
+    let mut taken = ctx.taken();
+    taken.extend(
+        schedule
+            .iter()
+            .filter_map(|m| m.stand.as_deref().and_then(|n| field.stand(n)))
+            .map(|s| (s.lat, s.lon)),
+    );
+    let mut free: Vec<&Stand> = suitable
+        .into_iter()
+        .filter(|s| !stand_taken(s, &taken))
+        .collect();
+    let n = budget.min(free.len().saturating_sub(STANDS_KEPT_FREE));
+    let mut rng = XorShift64::new(field_seed(&field.icao, seed) ^ 0x5041_524B_4544);
+    let longest = field
+        .airport
+        .runways
+        .iter()
+        .map(|r| r.length_m())
+        .fold(0.0, f64::max);
+    let prefix = registration_prefix(&field.icao);
+    let mut out = Vec::new();
+    while out.len() < n && !free.is_empty() {
+        let stand = free.swap_remove(rng.below(free.len() as u64) as usize);
+        let Some(icao_type) = parked_type(stand, longest, &mut rng) else {
+            continue;
+        };
+        let (callsign, spoken, icao_type) =
+            if class_for_type(icao_type).0.name == PISTON_SINGLE.name {
+                let (c, s) = registration(prefix, icao_type, &mut rng);
+                (c, s, icao_type)
+            } else {
+                airline(&field.icao, icao_type, &mut rng)
+            };
+        out.push(Movement {
+            t_s: 0.0,
+            callsign,
+            spoken,
+            icao_type: icao_type.into(),
+            kind: MovementKind::Parked,
+            runway: String::new(),
+            stand: Some(stand.name.clone()),
+            entry: None,
+            straight_in: false,
+            laps: 0,
+            sid: None,
+            star: None,
+            exit_bearing: 0.0,
+            seed: rng.next_u64(),
+            parked_from_start: false,
+        });
+    }
+    out
+}
+
+/// What stands parked on `stand`: the biggest class it takes that the
+/// field's longest runway (`longest_m`) is scheduled for (one stand in five
+/// that also takes turboprops gets the regional turboprop). A stand naming
+/// no class is judged by its kind (a gate takes an airliner, anything else
+/// a light aircraft). `None` when it takes nothing this field flies.
+fn parked_type(stand: &Stand, longest_m: f64, rng: &mut XorShift64) -> Option<&'static str> {
+    let takes = |c: &str| stand.accepts.iter().any(|a| a == c);
+    let (jets, turboprops, props) = if stand.accepts.is_empty() {
+        let gate = stand.kind.eq_ignore_ascii_case("gate");
+        (gate, gate, !gate)
+    } else {
+        (
+            takes("jets") || takes("heavy"),
+            takes("turboprops"),
+            takes("props"),
+        )
+    };
+    // A stand that takes both is a turboprop's one time in five.
+    let regional = turboprops && rng.below(5) == 0;
+    if jets && !regional && longest_m >= JET_MIN_RUNWAY_M {
+        Some(["A320", "B738", "A319"][rng.below(3) as usize])
+    } else if (jets || turboprops) && longest_m >= TURBOPROP_MIN_RUNWAY_M {
+        Some("AT76")
+    } else if props || stand.accepts.is_empty() {
+        Some(["C172", "C152", "PA28", "SR22"][rng.below(4) as usize])
+    } else {
+        None
+    }
 }
 
 /// An entry [`ENTRY_NM`] out, within 50 degrees of the extended
@@ -559,7 +802,7 @@ fn phonetic(c: char) -> &'static str {
 /// - t_s: 0
 ///   callsign: N345SP
 ///   type: C172
-///   kind: circuit        # circuit | departure | arrival
+///   kind: circuit        # circuit | departure | arrival | parked
 ///   runway: "13"         # optional: the tower's runway in use
 ///   stand: W4            # optional: a free stand
 ///   laps: 3              # optional, circuits (default 3)
@@ -637,6 +880,7 @@ pub fn from_file(
                 star: None,
                 exit_bearing: rng.range_f64(0.0, 360.0),
                 seed: rng.next_u64(),
+                parked_from_start: false,
             })
         })
         .collect();

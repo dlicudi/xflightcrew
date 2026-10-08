@@ -712,6 +712,7 @@ fn assert_despawned_by_the_rules(done: &[Finished]) {
     for (kind, reason, parked) in done {
         match kind {
             MovementKind::Departure => assert_eq!(*reason, Despawn::LeftTheArea),
+            MovementKind::Parked => panic!("a parked aircraft never leaves"),
             MovementKind::Arrival | MovementKind::Circuit => {
                 assert_eq!(*reason, Despawn::Parked, "{kind:?}");
                 let p = parked.expect("parked first");
@@ -824,5 +825,74 @@ fn a_readback_not_taken_twice_says_again_once_then_leaves() {
     assert_eq!(
         Call::SayAgain.text("Cessna one", None),
         "Tower, Cessna one, say again"
+    );
+}
+
+/// #242 (BIEG 03): a landing short rolled 1.2 km to the far exit at taxi
+/// pace, and the wait for a stand, timed from the START of the vacate, ran
+/// out the moment the drive ended: gone `NoStand` with "runway vacated"
+/// never said. The wait runs from the vacate's END: the call is made as it
+/// stops clear, and only `2 * PARKED_LINGER_S` later, still with nowhere to
+/// park, does it leave.
+#[test]
+fn a_long_vacate_calls_vacated_before_its_wait_for_a_stand_begins() {
+    use crate::aircraft::{Route, PARKED_LINGER_S};
+    use crate::kin::{project_m, Kin};
+    use crate::phase::Despawn;
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    // 1.4 km along the strip and off it: about 270 s at the 172's 10 kt.
+    let start = end.at(100.0, 0.0);
+    let exit = project_m(start, end.course_deg, 1400.0);
+    let off = project_m(exit, end.course_deg + 90.0, 60.0);
+    let mut kin = Kin::parked(start, end.elev_ft, end.course_deg);
+    kin.gs_kts = 10.0;
+    let mut ac = TrafficAircraft::new(
+        1,
+        "N1SP",
+        "Cessna one",
+        "C172",
+        Plan::Arrival {
+            entry: start,
+            star: None,
+            runway: "09".into(),
+            straight_in: true,
+        },
+        kin,
+        Phase::Vacate,
+        1,
+    );
+    ac.route = Route::taxi(vec![start, exit, off]);
+    // The tower never clears it to a stand.
+    let none = Order::default();
+    let mut events = Vec::new();
+    let (mut t, mut vacated_at, mut gone_at) = (0.0, None, None);
+    while t < 900.0 && gone_at.is_none() {
+        ac.substep(0.1, Some(&none), &field, &[], &mut events);
+        t += 0.1;
+        for e in events.drain(..) {
+            match e {
+                Event::Call {
+                    call: Call::Vacated,
+                    ..
+                } => vacated_at = Some(t),
+                Event::Despawn {
+                    reason: Despawn::NoStand,
+                    ..
+                } => gone_at = Some(t),
+                _ => {}
+            }
+        }
+    }
+    let vacated_at = vacated_at.expect("runway vacated was called");
+    let gone_at = gone_at.expect("it left with nowhere to park");
+    assert!(
+        vacated_at > 2.0 * PARKED_LINGER_S,
+        "the drive itself outlasts the old wait: called at {vacated_at:.0} s"
+    );
+    let waited = gone_at - vacated_at;
+    assert!(
+        (waited - 2.0 * PARKED_LINGER_S).abs() < 0.5,
+        "waited {waited:.1} s after the call"
     );
 }

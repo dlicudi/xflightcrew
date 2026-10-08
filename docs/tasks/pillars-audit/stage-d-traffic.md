@@ -736,3 +736,95 @@ finding; BIEG's test flies the sweep's ten minutes until it is fixed.
 Measured after A to D: the sweep 150 fields, 985 movements, 1,256 calls, zero conflicts, a
 silent oracle, every readback accepted, never two calls inside 3 s; XTST's field hour and the
 real LEMG hour clean; ULMM flown to the end (every movement completes).
+
+### Startup fixes
+
+The first live hour at LEMG (2026-10-08) showed the field EMPTY for the first four to six
+minutes and no parked aircraft at all.
+
+**1. The first movement within a minute.** `schedule::generate` ends in
+`bring_first_forward`: one draw in `FIRST_MOVE_S` (30 to 60 s), and the stream of the earliest
+GROUND start (circuits, else departures; arrivals only at a field with neither) is brought
+forward WHOLE by the same shift, so its spacing and the hour's count are unchanged and the other
+streams untouched. Before: circuits from 30 to 180 s, the first departure from 60 s to one
+interval (LEMG seed 1: 227 s); after, LEMG seed 1's first departure is at 44 s. The pilot's
+file is not touched. Test: `the_first_movement_comes_within_a_minute` (two fixtures, both
+densities, 30 seeds: the first is a ground start inside the window, the departures keep their
+0.8 to 1.2 interval spacing).
+
+**3. The tower's runway for the traffic from the install on.** Writing `runway_in_use` at
+install would have changed OUR first call (in calm a runway in use skips the wind pick and the
+stream rule's "none yet" branch), so the station gained a PURE `Station::runway_for_now()`
+instead (`runway_pick.rs`): the runway in use, else the pick the first traffic GROUND call would
+make on the field (its wind as `traffic_ctx` takes it, `TOWER_WIND` else the field's surface
+wind else calm; the remembered streams; a departure's wind pick; the close-parallel rule). It
+writes nothing. The command loop notes it for the link each turn (`note_station_runway`, which
+read `runway_in_use()`), so arrivals spawn for the tower's runway at their time instead of
+waiting `ARRIVAL_WAIT_S` (kept as the fallback with no station). The harness notes it too, at
+its start and every command-loop half. LEMG at install, calm: `runway_for_now` is 12 (the
+runway in use stays `None` until a call). Tests:
+`the_runway_for_now_is_the_first_traffic_calls_pick_and_writes_nothing` (three winds: the
+answer is the first traffic call's pick, nothing written), XTST's field hour asserts the first
+arrival spawns at its scheduled time. Sweep after: 150 fields, 985 movements, 1,356 calls (the
+arrivals no longer wait), clean.
+
+**4. #242: the wait for a stand runs from the vacate's END.** `Phase::Vacate`'s "nowhere to
+park" wait (`2 * PARKED_LINGER_S`) counted from the start of the vacate, so BIEG's 172 rolling
+1.2 km to the far exit at taxi pace (about 270 s) despawned `NoStand` the substep its drive
+ended, its "runway vacated" never keyed and its taxi in never asked. The aircraft now notes
+`vacated_at_s` when the drive ends and the call is made, and the wait runs from there. BIEG's
+test flies the sweep's schedule to its END (three hours, `assert_clean`): 10 movements, all
+complete. Tried and NOT kept: a 25 kt vacate down the strip to a far exit; BIEG's go-arounds
+are the single runway's sequencing (one Ryanair arrival sent round five times by "traffic on
+the runway" behind circuits and departures), not the slow vacate, and they went from 24 to 34
+with it. Test: `a_long_vacate_calls_vacated_before_its_wait_for_a_stand_begins` (pure: a
+1.4 km vacate outlasting the old wait calls vacated, then waits the full 240 s). BIEG's was
+the last caller of `assert_sweep_clean`, removed; the sweep checks the same inline.
+
+**2. Parked aircraft from the start.** `traffic::park_at_start(field, density, seed, ctx,
+&mut schedule)` (the bin's `build_link`, generated schedules only; a pilot's file may name
+`kind: parked` rows, a new `MovementKind::Parked`): a share of the field's suitable stands,
+`PARKED_SHARE_LIGHT` 15% / `PARKED_SHARE_NORMAL` 30%, at most `PARKED_MAX` (40: each is an
+XPMP2 aircraft drawn every frame), stands occupied from the start.
+- The schedule's departures fill it first, earliest first: `Movement::parked_from_start`. The
+  link parks each on its own stand at the first tick (`Movement::park`, `Plan::Parked`: engines
+  off, lights off) and at its time RELEASES it there (`Fleet::release`,
+  `TrafficAircraft::release`: the plan given, the phase clock reset), so the first departure
+  starts up where it stood instead of appearing. A departure refused at the start spawns at its
+  time as before.
+- The rest are `MovementKind::Parked` aircraft at `t_s` 0 of the stand's class
+  (`parked_type`: an airliner of a carrier that flies the type (`airline`, `fleet_of`) at a jet
+  stand or a gate naming no class, the regional turboprop one stand in five that takes them, a
+  light aircraft with a registration on a props stand or a tie-down), never on a stand the
+  schedule or `ctx` holds, never so many that fewer than `STANDS_KEPT_FREE` (3) stands are left
+  for the arrivals. They never move and never leave.
+- Parked at the FIRST TICK, where our position is known: never on our stand nor within
+  `PARK_CLEAR_OWN_M` (60 m) of us (`Refusal::NearOwn`), never on a stand somebody stands on.
+  Counted as occupied by every later spawn (`SpawnCtx.occupied` is the fleet on the ground).
+- A DORMANT aircraft (`TrafficAircraft::dormant`, `Plan::Parked`) has said nothing, so it has
+  no strip: the link neither notes its state (`note_traffic_state` would open one) nor ticks
+  its runway watch, it is not in the reinstall rule's `noted`, and it is NOT in the crew's TCAS
+  picture (`Link::targets`): no TCAS noise from a full apron. It is in each traffic call's
+  picture, so the tower can see the stand is taken, and the plugin draws it (the sink sends
+  the whole fleet). It is never in the runway book (no strip, never on a runway).
+- The tower routes a TRAFFIC arrival to the nearest stand nobody in its picture stands on
+  (`stand_route_avoiding`, `plan_taxi_route_to_stand(.., occupied)`, 20 m as the traffic's
+  `STAND_TAKEN_M`); ours passes no one and is routed as before (`stand_route_on`).
+- The harness parks the stands as the link does (normal density) in every run, the sweep
+  included: the departures waiting are movements that must complete, the parked aircraft are
+  not; the run ends when nothing is pending and nothing ACTIVE is left (`Link::active`).
+- LEMG at normal density, the live seed (1): 125 suitable stands, 31 parked aircraft and the
+  6 departures of the hour waiting on their stands (37, the 30% share), the first departure
+  starting up at 44 s; the harness's LEMG hour (seed 7, parked with 3): 37 parked at the start,
+  31 never moved, 12 movements all complete. Sweep: 150 fields clean.
+- Tests: `a_share_of_the_stands_is_parked_at_the_start` (ULMM's real 12 stands: the share,
+  departures first, the stand's class, never a held stand or ours, stands kept free,
+  deterministic, nothing at `Off`), `a_parked_departure_starts_up_on_its_stand_when_released`
+  (refused 40 m from us; parked says nothing; released once, it calls for taxi with its beacon on
+  from its stand), `a_stand_route_avoiding_the_parked_goes_to_the_next_free_stand` (atc), and
+  the LEMG hour asserts parked aircraft stay.
+- Not done: hours after the first generate departures that appear on their stands at their
+  time (only the first hour's wait parked), and an arrival that parks still leaves after
+  `PARKED_LINGER_S`, so the parked share does not grow or refill. OUR taxi in is still routed
+  to the nearest stand whoever stands on it (the crew's TCAS picture does not carry the parked
+  aircraft): a parked aircraft may stand on the stand the tower sends us to.

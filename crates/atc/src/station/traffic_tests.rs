@@ -215,6 +215,36 @@ fn a_traffic_call_initialises_the_runway_in_use_only_when_none() {
     Station::uninstall();
 }
 
+/// THE FIELD HAS A RUNWAY FROM THE INSTALL ON, FOR THE TRAFFIC: with none
+/// in use, [`Station::runway_for_now`] is the pick the first traffic ground
+/// call then makes (into a wind, and in calm), and it writes nothing (the
+/// runway in use stays `None` for our own first call to pick as before).
+/// With one in use it is that one.
+#[test]
+fn the_runway_for_now_is_the_first_traffic_calls_pick_and_writes_nothing() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    for wind in [(250.0, 12.0), (70.0, 15.0), (250.0, 2.0)] {
+        let mut st = gatwick_live();
+        st.runway_in_use = None;
+        *TOWER_WIND.lock().unwrap() = Some(wind);
+        let before = field_facts(&st);
+        let now = st.runway_for_now();
+        assert!(now.is_some(), "{wind:?}: a runway for the traffic");
+        assert_eq!(field_facts(&st), before, "{wind:?}: nothing written");
+        assert_eq!(st.runway_for_now(), now, "{wind:?}: the same answer twice");
+        st.answer_traffic(&call(
+            1,
+            "Gatwick Tower, Cessna three four five, request taxi",
+            at_the_hold(),
+            Vec::new(),
+        ));
+        assert_eq!(st.runway_in_use, now, "{wind:?}: the first call's pick");
+        assert_eq!(st.runway_for_now(), now, "{wind:?}: in use now");
+        Station::uninstall();
+    }
+}
+
 /// A TRAFFIC READBACK MEETS ITS OWN DESK'S GATE: a wrong runway is
 /// challenged and the readback stays owed on its strip (the fleet sees it
 /// and answers again); the right one is silence and pays it.
