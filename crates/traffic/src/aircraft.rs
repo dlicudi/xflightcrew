@@ -163,6 +163,10 @@ pub struct TrafficAircraft {
     ext_m: f64,
     /// The flight is flown: parked again, lingering.
     flown: bool,
+    /// Phase seconds at which the vacate drive ended clear of the runway
+    /// and "runway vacated" was called: the wait for a stand runs from
+    /// here, never from the end of the rollout (#242).
+    vacated_at_s: Option<f64>,
     /// The altitude an arrival came in at.
     entry_alt_ft: f64,
     rng: XorShift64,
@@ -206,6 +210,7 @@ impl TrafficAircraft {
             phase_s: 0.0,
             ext_m: 0.0,
             flown: false,
+            vacated_at_s: None,
             rng: XorShift64::new(seed),
         }
     }
@@ -445,12 +450,19 @@ impl TrafficAircraft {
             Phase::Vacate => {
                 if self.drive(self.perf.taxi_kts, o, dt) {
                     self.call_once(Call::Vacated, events);
+                    let vacated_at = *self.vacated_at_s.get_or_insert(self.phase_s);
                     if o.state == TowerState::TaxiCleared {
                         self.start_taxi_in(o, field, others, events);
                     }
                     // Nowhere to park (no stands, all taken, no route):
-                    // clear of the runway it waits, then leaves.
-                    if self.phase == Phase::Vacate && self.phase_s >= 2.0 * PARKED_LINGER_S {
+                    // clear of the runway and called vacated, it waits,
+                    // then leaves. Timed from the vacate's END: a long
+                    // rollout to a far exit (BIEG 03, 1.2 km at taxi pace)
+                    // spent the whole wait on the strip and left unheard,
+                    // the strip held behind it (#242).
+                    if self.phase == Phase::Vacate
+                        && self.phase_s - vacated_at >= 2.0 * PARKED_LINGER_S
+                    {
                         self.set_phase(Phase::Gone, events);
                         events.push(Event::Despawn {
                             id: self.id,
@@ -1054,6 +1066,7 @@ impl TrafficAircraft {
         self.kin.lights.strobe = false;
         self.kin.lights.taxi = true;
         self.route = Route::taxi(path);
+        self.vacated_at_s = None;
         self.set_phase(Phase::Vacate, events);
     }
 

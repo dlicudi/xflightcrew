@@ -767,3 +767,15 @@ runway in use stays `None` until a call). Tests:
 answer is the first traffic call's pick, nothing written), XTST's field hour asserts the first
 arrival spawns at its scheduled time. Sweep after: 150 fields, 985 movements, 1,356 calls (the
 arrivals no longer wait), clean.
+
+**4. #242: the wait for a stand runs from the vacate's END.** `Phase::Vacate`'s "nowhere to
+park" wait (`2 * PARKED_LINGER_S`) counted from the start of the vacate, so BIEG's 172 rolling
+1.2 km to the far exit at taxi pace (about 270 s) despawned `NoStand` the substep its drive
+ended, its "runway vacated" never keyed and its taxi in never asked. The aircraft now notes
+`vacated_at_s` when the drive ends and the call is made, and the wait runs from there. BIEG's
+test flies the sweep's schedule to its END (three hours, `assert_clean`): 10 movements, all
+complete. Tried and NOT kept: a 25 kt vacate down the strip to a far exit; BIEG's go-arounds
+are the single runway's sequencing (one Ryanair arrival sent round five times by "traffic on
+the runway" behind circuits and departures), not the slow vacate, and they went from 24 to 34
+with it. Test: `a_long_vacate_calls_vacated_before_its_wait_for_a_stand_begins` (pure: a
+1.4 km vacate outlasting the old wait calls vacated, then waits the full 240 s).

@@ -298,27 +298,6 @@ fn crowded(s: &HarnessScore) -> Option<(f64, f64)> {
 /// The world sweep's window at each field: ten minutes of fleet time.
 const SWEEP_S: f64 = 600.0;
 
-/// What the sweep asserts of a field's window (completion is not asked of
-/// ten minutes): the runway book never held two incompatible claims, the
-/// compliance oracle stayed silent, every traffic readback was accepted.
-fn assert_sweep_clean(s: &HarnessScore, what: &str) {
-    assert_paced(s, what);
-    assert!(
-        s.conflicts.is_empty(),
-        "{what}: runway conflicts {:?}",
-        s.conflicts
-    );
-    assert!(
-        s.oracle.is_empty(),
-        "{what}: the oracle spoke {:?}",
-        s.oracle
-    );
-    assert_eq!(
-        s.readbacks, s.readbacks_accepted,
-        "{what}: every readback accepted"
-    );
-}
-
 /// The orders map one to one.
 #[test]
 fn an_order_maps_onto_the_fleet() {
@@ -516,7 +495,11 @@ fn ulmm_traffic_holds_short_inner() {
 /// side and its taxi in crossed the strip again ("taxi to parking one,
 /// cross runway zero three") while a departure released by the takeoff
 /// hold rolled on 03: 20 conflicts. Now the taxi in holds short of 21,
-/// asks, and waits for the departure.
+/// asks, and waits for the departure. Flown to the END of its schedule
+/// (three hours): a 172 landing short rolled 1.2 km to the far exit at taxi
+/// pace and despawned `NoStand` the moment the vacate ended, its "runway
+/// vacated" never said and the strip held behind it, until the wait for a
+/// stand ran from the vacate's end (#242).
 #[test]
 fn bieg_taxi_in_holds_short_of_the_runway_it_landed_on() {
     in_own_process("traffic_link::tests::bieg_taxi_in_holds_short_inner");
@@ -536,13 +519,13 @@ fn bieg_taxi_in_holds_short_inner() {
         &["I03", "Q03", "Q21", "R03", "R21"],
     );
     let schedule = traffic::generate(&field, Density::Normal, 3, &SpawnCtx::default());
-    let s = fly_field(&mut st, field, schedule, SWEEP_S);
+    let s = fly_field(&mut st, field, schedule, 3.0 * 3600.0);
     assert!(
         s.said.iter().any(|l| l.contains("hold short runway")),
         "the taxi in held short: {:?}",
         s.said
     );
-    assert_sweep_clean(&s, "BIEG crossings");
+    assert_clean(&s, "BIEG crossings");
     Station::uninstall();
 }
 
@@ -588,7 +571,7 @@ fn real_install_lemg_traffic_hour_inner() {
 /// minutes against its real station: nothing panics, and at every field the
 /// runway book never holds two incompatible claims, the compliance oracle
 /// stays silent, every traffic readback is accepted and the frequency is
-/// paced ([`assert_sweep_clean`]). Completion is not asked (minutes, not the
+/// paced (`assert_clean` less completion). Completion is not asked (minutes, not the
 /// hour); the numbers print. Seconds in release.
 #[test]
 #[ignore = "needs X-Plane's Global Airports apt.dat; run with -- --ignored"]
