@@ -338,7 +338,7 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
                 break;
             };
             let sid = field.procs.sids[rng.below(field.procs.sids.len() as u64) as usize].clone();
-            let (callsign, spoken) = airline(&field.icao, &mut rng);
+            let (callsign, spoken, icao_type) = airline(&field.icao, icao_type, &mut rng);
             out.push(Movement {
                 t_s: t,
                 callsign,
@@ -374,7 +374,7 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
             let star = (!field.procs.stars.is_empty()).then(|| {
                 field.procs.stars[rng.below(field.procs.stars.len() as u64) as usize].clone()
             });
-            let (callsign, spoken) = airline(&field.icao, &mut rng);
+            let (callsign, spoken, icao_type) = airline(&field.icao, icao_type, &mut rng);
             out.push(Movement {
                 t_s: t,
                 callsign,
@@ -473,8 +473,29 @@ fn registration(prefix: &str, icao_type: &str, rng: &mut XorShift64) -> (String,
     }
 }
 
-/// An airline callsign for the region, and its telephony.
-fn airline(icao: &str, rng: &mut XorShift64) -> (String, String) {
+/// What each carrier flies: a type the airline does not fly is swapped for its
+/// own (a Ryanair A320 at LEMG drew a Wizz Air livery, 2026-10-08).
+fn fleet_of(code: &str) -> &'static [&'static str] {
+    match code {
+        "RYR" | "TVF" => &["B738"],
+        "EZY" | "BAW" => &["A320", "A319"],
+        "ANE" | "LOG" | "HOP" => &["AT76"],
+        _ => &["A320"],
+    }
+}
+
+/// The regional turboprop carrier for the region.
+fn regional(icao: &str) -> (&'static str, &'static str) {
+    match icao.get(..2).unwrap_or("") {
+        "EG" => ("LOG", "Logan"),
+        "LF" => ("HOP", "Air Hop"),
+        _ => ("ANE", "Air Nostrum"),
+    }
+}
+
+/// An airline callsign for the region, its telephony, and the type it flies
+/// (`icao_type` kept when the carrier flies it, else the carrier's own).
+fn airline(icao: &str, icao_type: &'static str, rng: &mut XorShift64) -> (String, String, &'static str) {
     let carriers: &[(&str, &str)] = match icao.get(..2).unwrap_or("") {
         "EG" => &[("BAW", "Speedbird"), ("EZY", "Easy"), ("RYR", "Ryanair")],
         "LE" | "GC" => &[("IBE", "Iberia"), ("VLG", "Vueling"), ("RYR", "Ryanair")],
@@ -491,7 +512,12 @@ fn airline(icao: &str, rng: &mut XorShift64) -> (String, String) {
         "LI" => &[("ITY", "Itarrow"), ("RYR", "Ryanair"), ("EZY", "Easy")],
         _ => &[("RYR", "Ryanair"), ("EZY", "Easy"), ("DLH", "Lufthansa")],
     };
-    let (code, telephony) = carriers[rng.below(carriers.len() as u64) as usize];
+    let (mut code, mut telephony) = carriers[rng.below(carriers.len() as u64) as usize];
+    if icao_type == "AT76" {
+        (code, telephony) = regional(icao);
+    }
+    let fleet = fleet_of(code);
+    let icao_type = if fleet.contains(&icao_type) { icao_type } else { fleet[0] };
     let number = 100 + rng.below(9800);
     let words = number
         .to_string()
@@ -499,7 +525,7 @@ fn airline(icao: &str, rng: &mut XorShift64) -> (String, String) {
         .map(digit_word)
         .collect::<Vec<_>>()
         .join(" ");
-    (format!("{code}{number}"), format!("{telephony} {words}"))
+    (format!("{code}{number}"), format!("{telephony} {words}"), icao_type)
 }
 
 fn digit_word(c: char) -> &'static str {

@@ -239,11 +239,27 @@ fn callsigns_are_spoken_the_way_the_region_writes_them() {
     let (cs, spoken) = registration("N", "PA28", &mut r);
     assert!(cs.starts_with('N') && cs.len() == 6, "{cs}");
     assert!(spoken.starts_with("Piper "), "{spoken}");
-    let (cs, spoken) = airline("LEMG", &mut r);
+    let (cs, spoken, _) = airline("LEMG", "A320", &mut r);
     assert!(
         cs.len() >= 6 && spoken.split(' ').count() >= 4,
         "{cs}: {spoken}"
     );
+}
+
+/// The type is the airline's: a Ryanair is a 737, a turboprop a regional
+/// carrier's (a Ryanair A320 drew a Wizz Air livery at LEMG, 2026-10-08).
+#[test]
+fn every_airline_flies_its_own_type() {
+    let mut r = XorShift64::new(7);
+    for _ in 0..200 {
+        for t in ["A320", "B738", "A319", "AT76"] {
+            let (cs, _, ty) = airline("LEMG", t, &mut r);
+            assert!(fleet_of(&cs[..3]).contains(&ty), "{cs} flies {ty}");
+            if t == "AT76" {
+                assert_eq!(ty, "AT76", "{cs}");
+            }
+        }
+    }
 }
 
 /// The real Malaga with its CIFP: no circuits (it says 0), IFR both ways.
