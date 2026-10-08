@@ -1,0 +1,276 @@
+use super::*;
+use crate::field::fixtures;
+
+fn kinds(ms: &[Movement]) -> (usize, usize, usize) {
+    let n = |k| ms.iter().filter(|m| m.kind == k).count();
+    (
+        n(MovementKind::Circuit),
+        n(MovementKind::Departure),
+        n(MovementKind::Arrival),
+    )
+}
+
+#[test]
+fn a_circuit_field_with_procedures_gets_all_three_kinds() {
+    let f = fixtures::xtst_ifr();
+    let ms = generate(&f, Density::Light, 1, &SpawnCtx::default());
+    let (c, d, a) = kinds(&ms);
+    assert_eq!(c, 1, "light: one circuit aircraft");
+    assert!(
+        d >= 2 && a >= 2,
+        "every 20 minutes for an hour: {d} out, {a} in"
+    );
+    assert!(ms.windows(2).all(|w| w[0].t_s <= w[1].t_s), "in time order");
+    assert!(ms.iter().all(|m| m.t_s < HORIZON_S));
+    // 1,500 m: turboprops, never a jet.
+    assert!(ms
+        .iter()
+        .filter(|m| m.kind != MovementKind::Circuit)
+        .all(|m| m.icao_type == "AT76"));
+    // 27 has the approach, so it is the runway and arrivals come straight in.
+    assert!(ms.iter().all(|m| m.runway == "27"));
+    assert!(ms
+        .iter()
+        .filter(|m| m.kind == MovementKind::Arrival)
+        .all(|m| m.straight_in));
+    let normal = generate(&f, Density::Normal, 1, &SpawnCtx::default());
+    let (c, d, a) = kinds(&normal);
+    assert!((1..=3).contains(&c), "normal: one to three circuits, {c}");
+    // Four stands: the circuits and the departures share them.
+    assert!(c + d <= 4, "never more ground starts than stands");
+    assert!(a >= 4, "every 10 minutes: {a} in");
+}
+
+#[test]
+fn a_field_that_says_no_circuits_gets_none() {
+    let f = fixtures::xnoc();
+    assert_eq!(f.airport.allows_circuits, Some(false));
+    let ms = generate(&f, Density::Normal, 7, &SpawnCtx::default());
+    let (c, d, a) = kinds(&ms);
+    assert_eq!(c, 0);
+    assert!(d > 0 && a > 0, "{d} out, {a} in");
+    assert!(ms.iter().all(|m| m.runway == "12"), "the end with the ILS");
+    assert!(ms
+        .iter()
+        .filter(|m| m.kind == MovementKind::Departure)
+        .all(|m| m.sid.as_deref().is_some_and(|s| s.starts_with("NOC"))));
+    assert!(ms
+        .iter()
+        .filter(|m| m.kind == MovementKind::Arrival)
+        .all(|m| m.star.as_deref() == Some("NOC1S") && m.straight_in));
+    // A departure only on a stand that takes its class.
+    for m in ms.iter().filter(|m| m.kind == MovementKind::Departure) {
+        let s = f.stand(m.stand.as_deref().unwrap()).unwrap();
+        let cat = if m.icao_type == "AT76" {
+            "turboprops"
+        } else {
+            "jets"
+        };
+        assert!(
+            s.accepts.iter().any(|a| a == cat),
+            "{} on {}",
+            m.icao_type,
+            s.name
+        );
+    }
+}
+
+#[test]
+fn a_bare_strip_gets_nothing_to_fly() {
+    let f = fixtures::xbar();
+    assert!(f.net.stands.is_empty() && f.procs == Default::default());
+    assert!(generate(&f, Density::Normal, 3, &SpawnCtx::default()).is_empty());
+}
+
+#[test]
+fn off_is_nothing_and_the_words_parse() {
+    let f = fixtures::xtst_ifr();
+    assert!(generate(&f, Density::Off, 1, &SpawnCtx::default()).is_empty());
+    assert_eq!(Density::parse(" Normal "), Some(Density::Normal));
+    assert_eq!(Density::parse("light"), Some(Density::Light));
+    assert_eq!(Density::parse("off"), Some(Density::Off));
+    assert_eq!(Density::parse("busy"), None);
+}
+
+#[test]
+fn the_same_seed_is_the_same_schedule() {
+    let f = fixtures::xtst_ifr();
+    let a = generate(&f, Density::Normal, 42, &SpawnCtx::default());
+    assert_eq!(a, generate(&f, Density::Normal, 42, &SpawnCtx::default()));
+    assert_ne!(a, generate(&f, Density::Normal, 43, &SpawnCtx::default()));
+}
+
+#[test]
+fn nothing_is_put_on_an_occupied_stand() {
+    let f = fixtures::xtst_ifr();
+    let stand = |n: &str| {
+        let s = f.stand(n).unwrap();
+        (s.lat, s.lon)
+    };
+    // We are on GA1, somebody is on GA2 and GA3: only GA4 is free.
+    let ctx = SpawnCtx {
+        own: Some(stand("GA1")),
+        occupied: vec![stand("GA2"), stand("GA3")],
+        ..Default::default()
+    };
+    for seed in 0..20 {
+        let ms = generate(&f, Density::Normal, seed, &ctx);
+        let used: Vec<&str> = ms.iter().filter_map(|m| m.stand.as_deref()).collect();
+        assert!(used.iter().all(|s| *s == "GA4"), "seed {seed}: {used:?}");
+        assert!(used.len() <= 1, "GA4 handed out once: {used:?}");
+    }
+    // At spawn: a named stand taken now moves to a free one, and none free
+    // is a refusal.
+    let m = generate(&f, Density::Light, 5, &SpawnCtx::default())
+        .into_iter()
+        .find(|m| m.kind == MovementKind::Circuit)
+        .unwrap();
+    let mut named = m.clone();
+    named.stand = Some("GA2".into());
+    let ac = named.spawn(1, &f, &ctx).unwrap();
+    assert_eq!(ac.stand.as_deref(), Some("GA4"));
+    let full = SpawnCtx {
+        occupied: vec![stand("GA2"), stand("GA3"), stand("GA4")],
+        ..ctx.clone()
+    };
+    assert_eq!(named.spawn(1, &f, &full).unwrap_err(), Refusal::NoStand);
+}
+
+#[test]
+fn nothing_spawns_in_the_air_near_us() {
+    let f = fixtures::xtst_ifr();
+    let end = f.end("27").unwrap();
+    // Sitting on the default entry, ten miles out on the centreline.
+    let own = default_entry(&end);
+    let ctx = SpawnCtx {
+        own: Some(own),
+        ..Default::default()
+    };
+    for seed in 0..20 {
+        for m in generate(&f, Density::Normal, seed, &ctx)
+            .iter()
+            .filter(|m| m.kind == MovementKind::Arrival)
+        {
+            let d = dist_m(own, m.entry.unwrap()) / 1852.0;
+            assert!(d >= OWN_CLEAR_NM, "seed {seed}: entry {d:.1} nm from us");
+        }
+    }
+    let m = generate(&f, Density::Light, 1, &SpawnCtx::default())
+        .into_iter()
+        .find(|m| m.kind == MovementKind::Arrival)
+        .unwrap();
+    let on_it = SpawnCtx {
+        own: m.entry,
+        ..Default::default()
+    };
+    assert_eq!(m.spawn(9, &f, &on_it).unwrap_err(), Refusal::NearOwn);
+    assert!(m.spawn(9, &f, &SpawnCtx::default()).is_ok());
+}
+
+const FILE: &str = "
+- t_s: 0
+  callsign: N345SP
+  type: C172
+  kind: circuit
+  stand: GA2
+  laps: 2
+  spoken: Cessna three four five
+- t_s: 300
+  callsign: RYR12
+  type: b738
+  kind: arrival
+- t_s: 120
+  callsign: EZY7
+  type: A320
+  kind: departure
+  runway: \"09\"
+";
+
+#[test]
+fn the_traffic_file_parses_and_resolves_at_the_field() {
+    let rows = parse_file(FILE).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].kind, MovementKind::Circuit);
+    assert_eq!(rows[0].laps, Some(2));
+    assert_eq!(rows[1].runway, None);
+    let f = fixtures::xtst_ifr();
+    let ms = from_file(&rows, &f, 1, &SpawnCtx::default());
+    assert_eq!(ms.len(), 3);
+    assert_eq!(
+        ms.iter().map(|m| m.callsign.as_str()).collect::<Vec<_>>(),
+        ["N345SP", "EZY7", "RYR12"],
+        "time order"
+    );
+    assert_eq!(ms[0].spoken, "Cessna three four five");
+    assert_eq!(
+        ms[0].runway, "27",
+        "the field's runway when the row names none"
+    );
+    assert_eq!(ms[1].runway, "09");
+    assert_eq!(ms[2].icao_type, "B738");
+    assert!(ms[2].entry.is_some() && ms[2].straight_in);
+    let ac = ms[0].spawn(1, &f, &SpawnCtx::default()).unwrap();
+    assert_eq!(ac.stand.as_deref(), Some("GA2"));
+}
+
+#[test]
+fn a_bad_traffic_file_is_refused_whole() {
+    assert!(parse_file("- t_s: 0\n  callsign: X\n  type: C172\n  kind: hover\n").is_err());
+    assert!(parse_file("- t_s: -5\n  callsign: X\n  type: C172\n  kind: circuit\n").is_err());
+    assert!(
+        parse_file("- t_s: 0\n  callsign: X\n  type: C172\n  kind: circuit\n  colour: red\n")
+            .is_err()
+    );
+    assert!(parse_file("- t_s: 0\n  callsign: ' '\n  type: C172\n  kind: circuit\n").is_err());
+    assert!(parse_file("[]").unwrap().is_empty());
+    // A runway the field lacks drops the row, not the file.
+    let rows =
+        parse_file("- t_s: 0\n  callsign: X\n  type: C172\n  kind: circuit\n  runway: '18'\n")
+            .unwrap();
+    assert!(from_file(&rows, &fixtures::xtst(), 1, &SpawnCtx::default()).is_empty());
+}
+
+#[test]
+fn callsigns_are_spoken_the_way_the_region_writes_them() {
+    let mut r = XorShift64::new(3);
+    let (cs, spoken) = registration("G", "C172", &mut r);
+    assert!(cs.starts_with('G') && cs.len() == 5, "{cs}");
+    assert!(spoken.starts_with("Cessna Golf "), "{spoken}");
+    let (cs, spoken) = registration("N", "PA28", &mut r);
+    assert!(cs.starts_with('N') && cs.len() == 6, "{cs}");
+    assert!(spoken.starts_with("Piper "), "{spoken}");
+    let (cs, spoken) = airline("LEMG", &mut r);
+    assert!(
+        cs.len() >= 6 && spoken.split(' ').count() >= 4,
+        "{cs}: {spoken}"
+    );
+}
+
+/// The real Malaga with its CIFP: no circuits (it says 0), IFR both ways.
+/// `cargo test -p traffic -- --ignored real_install_schedule --nocapture`
+#[test]
+#[ignore] // needs the real X-Plane install
+fn real_install_schedule_lemg() {
+    let apt = nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    let Ok(Some(f)) = FieldModel::load(&apt, "LEMG") else {
+        return;
+    };
+    let f = f.with_cifp(&nav::test_xplane_path("Custom Data/CIFP"));
+    let ms = generate(&f, Density::Normal, 1, &SpawnCtx::default());
+    for m in &ms {
+        println!(
+            "{:>5.0} s {:?} {} {} rwy {} stand {:?} sid {:?} star {:?}",
+            m.t_s, m.kind, m.callsign, m.icao_type, m.runway, m.stand, m.sid, m.star
+        );
+    }
+    let (c, d, a) = kinds(&ms);
+    assert_eq!(c, 0, "LEMG publishes no circuits");
+    assert!(d > 0 && a > 0, "{d} out, {a} in");
+    for (i, m) in ms.iter().enumerate() {
+        assert!(
+            m.spawn(i as u32 + 1, &f, &SpawnCtx::default()).is_ok(),
+            "{} spawns",
+            m.callsign
+        );
+    }
+}

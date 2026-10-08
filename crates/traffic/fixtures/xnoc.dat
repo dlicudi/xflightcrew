@@ -1,0 +1,39 @@
+I
+1200 Synthetic traffic test fields (crates/traffic fixtures, not real airports)
+
+1 2000 0 0 XNOC No Circuits International
+1302 allows_circuits 0
+100 45.00 2 0 0.25 1 2 1 12 40.00000000 3.00000000 0.00 0.00 3 0 0 0 30 39.98742400 3.02843700 0.00 0.00 3 0 0 0
+1054 119100 XNOC Tower
+1201 40.00092500 3.00259500 both 1 A_west
+1201 39.99526600 3.01539200 both 2 A_mid
+1201 39.98960700 3.02818800 both 3 A_east
+1201 40.00007100 3.00195000 both 4 A1_hold
+1201 39.99441200 3.01474700 both 5 A2_hold
+1201 39.98875300 3.02754300 both 6 A3_hold
+1201 39.99937100 3.00142200 both 7 rwy_west
+1201 39.99371200 3.01421900 both 8 rwy_mid
+1201 39.98805300 3.02701500 both 9 rwy_east
+1201 39.99646600 3.01629200 both 10 apron
+1202 1 2 twoway taxiway A
+1202 2 3 twoway taxiway A
+1202 1 4 twoway taxiway A1
+1202 4 7 twoway taxiway A1
+1204 departure 12,30
+1204 arrival 12,30
+1202 2 5 twoway taxiway A2
+1202 5 8 twoway taxiway A2
+1204 departure 12,30
+1204 arrival 12,30
+1202 3 6 twoway taxiway A3
+1202 6 9 twoway taxiway A3
+1204 departure 12,30
+1204 arrival 12,30
+1202 7 8 twoway runway 12/30
+1202 8 9 twoway runway 12/30
+1202 2 10 twoway taxiway B
+1300 39.99686600 3.01629200 210.0 gate jets|turboprops S1
+1300 39.99646600 3.01679200 210.0 gate jets|turboprops S2
+1300 39.99646600 3.01579200 210.0 tie_down props S3
+
+99

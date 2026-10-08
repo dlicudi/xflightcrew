@@ -13,3 +13,6 @@ publish = false
 [dependencies]
 nav = { path = "../nav" }
 anyhow = { workspace = true }
+# The pilot's traffic file (`XCOPILOT_TRAFFIC_FILE`, YAML): parsing only.
+serde = { workspace = true }
+serde_yaml = { workspace = true }

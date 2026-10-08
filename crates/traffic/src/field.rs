@@ -12,6 +12,37 @@ pub struct FieldModel {
     pub airport: AirportInfo,
     /// Empty (default) where the field has no network: nothing taxis.
     pub net: TaxiNet,
+    /// The field's published procedures by name (empty without CIFP).
+    pub procs: Procedures,
+}
+
+/// The terminal procedures a field publishes, by ident: what the
+/// schedule needs to know IFR traffic can come and go.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Procedures {
+    pub sids: Vec<String>,
+    pub stars: Vec<String>,
+    pub approaches: Vec<String>,
+}
+
+impl Procedures {
+    /// Read from the CIFP folder (`<cifp_dir>/<ICAO>.dat`); empty when the
+    /// field has none.
+    pub fn load(cifp_dir: &str, icao: &str) -> Procedures {
+        Procedures {
+            sids: nav::list_procedures(cifp_dir, icao, nav::ProcKind::Sid),
+            stars: nav::list_procedures(cifp_dir, icao, nav::ProcKind::Star),
+            approaches: nav::list_procedures(cifp_dir, icao, nav::ProcKind::Appch),
+        }
+    }
+
+    /// An approach that serves runway `ident`.
+    pub fn approach_for(&self, ident: &str) -> Option<&str> {
+        self.approaches
+            .iter()
+            .find(|a| nav::approach_runway(a).is_some_and(|r| nav::same_runway_end(&r, ident)))
+            .map(String::as_str)
+    }
 }
 
 /// One runway END, ready to fly: its threshold, the far end, the course,
@@ -69,7 +100,14 @@ impl FieldModel {
             icao: icao.to_string(),
             airport,
             net: net.unwrap_or_default(),
+            procs: Procedures::default(),
         }
+    }
+
+    /// With the procedures from the CIFP folder.
+    pub fn with_cifp(mut self, cifp_dir: &str) -> FieldModel {
+        self.procs = Procedures::load(cifp_dir, &self.icao);
+        self
     }
 
     /// Read `icao` from an apt.dat. `None` when the file has no such field.
@@ -211,6 +249,29 @@ pub(crate) mod fixtures {
         FieldModel::load(&path("xtst.dat"), "XTST")
             .unwrap()
             .expect("XTST in the fixture")
+    }
+
+    /// XTST with its procedures (a SID and an approach for 27).
+    pub fn xtst_ifr() -> FieldModel {
+        xtst().with_cifp(&path("cifp"))
+    }
+
+    /// XNOC: no circuits (`allows_circuits 0`), a 2,800 m runway 12/30,
+    /// three stands (two for jets), SIDs, a STAR and an ILS 12.
+    pub fn xnoc() -> FieldModel {
+        FieldModel::load(&path("xnoc.dat"), "XNOC")
+            .unwrap()
+            .expect("XNOC in the fixture")
+            .with_cifp(&path("cifp"))
+    }
+
+    /// XBAR: an 800 m grass strip with no network, no stands, no
+    /// procedures.
+    pub fn xbar() -> FieldModel {
+        FieldModel::load(&path("xbar.dat"), "XBAR")
+            .unwrap()
+            .expect("XBAR in the fixture")
+            .with_cifp(&path("cifp"))
     }
 }
 

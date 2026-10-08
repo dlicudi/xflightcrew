@@ -2649,6 +2649,8 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "nav",
+ "serde",
+ "serde_yaml",
 ]
 
 [[package]]

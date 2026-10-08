@@ -526,3 +526,136 @@ fn real_install_lemg_172_circuit_stand_to_stand() {
     assert_flown(&s, &format!("LEMG 13 from {stand}"));
     assert_eq!(s.phases, CIRCUIT_PHASES, "every phase, none skipped");
 }
+
+/// How one scheduled aircraft finished: its kind, why it went, and how
+/// long it stood parked first.
+type Finished = (
+    crate::schedule::MovementKind,
+    crate::phase::Despawn,
+    Option<f64>,
+);
+
+/// A generated hour at `field`: every movement spawned at its time, flown
+/// against the scripted tower to the end. Returns (kind, despawn reason,
+/// seconds parked before going) per aircraft, and every touchdown.
+fn fly_schedule(
+    field: FieldModel,
+    density: crate::schedule::Density,
+    seed: u64,
+) -> (Vec<Finished>, Vec<f64>) {
+    use crate::schedule::{generate, SpawnCtx};
+    let plan = generate(&field, density, seed, &SpawnCtx::default());
+    assert!(!plan.is_empty());
+    let mut fleet = Fleet::new(field);
+    let tower = RefCell::new(ScriptedTower::default());
+    let mut waiting: Vec<(u32, crate::schedule::Movement)> = plan
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| (i as u32 + 1, m))
+        .collect();
+    let mut kinds = HashMap::new();
+    let mut parked_at: HashMap<u32, f64> = HashMap::new();
+    let mut done = Vec::new();
+    let mut touchdowns = Vec::new();
+    let mut t = 0.0;
+    while t < 3.0 * 3600.0 && (!waiting.is_empty() || !fleet.aircraft().is_empty()) {
+        let ctx = SpawnCtx {
+            occupied: fleet
+                .aircraft()
+                .iter()
+                .filter(|a| a.kin.on_ground)
+                .map(|a| a.kin.pos())
+                .collect(),
+            ..Default::default()
+        };
+        waiting.retain(|(id, m)| {
+            if m.t_s > t {
+                return true;
+            }
+            match m.spawn(*id, &fleet.field, &ctx) {
+                Ok(ac) => {
+                    kinds.insert(*id, m.kind);
+                    fleet.spawn(ac);
+                    false
+                }
+                Err(_) => true,
+            }
+        });
+        let events = fleet.step(0.1, None, &|id| tower.borrow().orders.get(&id).cloned());
+        t += 0.1;
+        for e in &events {
+            tower.borrow_mut().hear(e);
+            match e {
+                Event::Phase {
+                    id,
+                    to: Phase::Parked,
+                    ..
+                } => {
+                    parked_at.insert(*id, t);
+                }
+                Event::Touchdown { along_m, .. } => touchdowns.push(*along_m),
+                Event::Despawn { id, reason } => {
+                    done.push((kinds[id], *reason, parked_at.get(id).map(|p| t - p)));
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        waiting.is_empty(),
+        "never spawned: {:?}",
+        waiting.iter().map(|w| &w.1.callsign).collect::<Vec<_>>()
+    );
+    assert!(
+        fleet.aircraft().is_empty(),
+        "still flying: {:?}",
+        fleet
+            .aircraft()
+            .iter()
+            .map(|a| (a.id, a.phase))
+            .collect::<Vec<_>>()
+    );
+    (done, touchdowns)
+}
+
+fn assert_despawned_by_the_rules(done: &[Finished]) {
+    use crate::phase::Despawn;
+    use crate::schedule::MovementKind;
+    for (kind, reason, parked) in done {
+        match kind {
+            MovementKind::Departure => assert_eq!(*reason, Despawn::LeftTheArea),
+            MovementKind::Arrival | MovementKind::Circuit => {
+                assert_eq!(*reason, Despawn::Parked, "{kind:?}");
+                let p = parked.expect("parked first");
+                assert!(
+                    (p - crate::aircraft::PARKED_LINGER_S).abs() < 0.5,
+                    "{kind:?} gone {p:.1} s after parking"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_generated_hour_at_a_circuit_field_flies_to_the_end() {
+    let (done, tds) = fly_schedule(fixtures::xtst_ifr(), crate::schedule::Density::Normal, 11);
+    assert_despawned_by_the_rules(&done);
+    assert!(done.len() >= 6, "{} movements", done.len());
+    assert!(
+        tds.iter().all(|d| *d > 0.0 && *d < 500.0),
+        "touchdowns {tds:?}"
+    );
+}
+
+#[test]
+fn a_generated_hour_of_jets_flies_to_the_end() {
+    let f = fixtures::xnoc();
+    let len = f.end("12").unwrap().length_m;
+    let (done, tds) = fly_schedule(f, crate::schedule::Density::Normal, 5);
+    assert_despawned_by_the_rules(&done);
+    println!("XNOC touchdowns {tds:.0?} m into {len:.0} m");
+    assert!(
+        tds.iter().all(|d| *d > 0.0 && *d < len / 3.0),
+        "touchdowns {tds:?}"
+    );
+}

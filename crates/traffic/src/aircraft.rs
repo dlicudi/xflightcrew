@@ -25,7 +25,8 @@ pub const NO_CLEARANCE_AGL_FT: f64 = 300.0;
 /// The flare begins below this height.
 pub const FLARE_AGL_FT: f64 = 30.0;
 
-/// The sink held through the flare, feet a minute.
+/// The least sink held through the flare, feet a minute (half the
+/// approach's sink for anything faster than a light aircraft).
 pub const FLARE_SINK_FPM: f64 = 200.0;
 
 /// The final approach path, degrees.
@@ -428,6 +429,15 @@ impl TrafficAircraft {
                     self.call_once(Call::Vacated, events);
                     if o.state == TowerState::TaxiCleared {
                         self.start_taxi_in(o, field, others, events);
+                    }
+                    // Nowhere to park (no stands, all taken, no route):
+                    // clear of the runway it waits, then leaves.
+                    if self.phase == Phase::Vacate && self.phase_s >= 2.0 * PARKED_LINGER_S {
+                        self.set_phase(Phase::Gone, events);
+                        events.push(Event::Despawn {
+                            id: self.id,
+                            reason: Despawn::NoStand,
+                        });
                     }
                 }
             }
@@ -840,7 +850,11 @@ impl TrafficAircraft {
                 self.go_around(end, events);
                 return;
             }
-            self.kin.vs_toward(-FLARE_SINK_FPM, dt);
+            // Half the approach's sink, never less than the light
+            // aircraft's: a fast aircraft floating at 200 fpm lands long.
+            let approach_sink = p.vref_kts * KT_TO_MS * 196.85 * GLIDE_DEG.to_radians().tan();
+            self.kin
+                .vs_toward(-FLARE_SINK_FPM.max(0.5 * approach_sink), dt);
             let spec = FollowSpec {
                 accel_kts_s: 0.0,
                 decel_kts_s: 1.0,

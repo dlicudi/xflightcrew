@@ -273,6 +273,8 @@ pub enum Despawn {
     Parked,
     /// Taken out by the caller (a reinstall, a schedule change).
     Removed,
+    /// Landed with nowhere to park, after waiting clear of the runway.
+    NoStand,
 }
 
 /// Our own aircraft, as the fleet needs it: where not to spawn.

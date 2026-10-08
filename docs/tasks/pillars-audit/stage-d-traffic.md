@@ -235,3 +235,37 @@ Increment 2 (the phase machine, `aircraft.rs`, `fleet.rs`, `field.rs`, `phase.rs
 - Measured (the sortie tests print them): XTST 09 stand to stand in 810 s, taxi cross-track at
   most 3.2 m (corner cuts), final below 300 ft at most 0.6 m, touchdown 381 m into 1,500 m;
   LEMG 13 from stand W4 in 1,321 s, taxi 3.3 m, final 0.5 m, touchdown 381 m into 3,206 m.
+
+Increment 3 (`schedule.rs`):
+- **`generate(field, density, seed, &SpawnCtx)`**: a fourth argument carries the tower's
+  runway (else `default_runway`: the longest assignable strip, the end with an approach first),
+  our own position and the others on the ground. "Never within 3 nm of us" is read as AIRBORNE
+  spawns (an entry is turned round the field until clear, else skipped); on the ground the rule
+  is the stand: ours and everyone's are occupied (`STAND_TAKEN_M`, 20 m), and a stand is handed
+  out once per schedule. `Movement::spawn(id, field, ctx)` applies both again at spawn time
+  (`Refusal::{NoRunway, NoStand, NearOwn}`: the bin retries later); a named stand that is taken
+  moves to a free one of the class (a stand that names categories must name the class's).
+- **Procedures are data on the field** (`FieldModel.procs`, `Procedures::load(cifp_dir, icao)`
+  over `nav::list_procedures`): departures only where SIDs exist, arrivals where approaches or
+  STARs exist (straight in where the runway has an approach, else to the downwind, 10 nm out
+  within 50 degrees of the centreline). The SID and STAR are names only in v1: departures leave
+  on a seeded bearing.
+- **Types by runway**: jets (A319, A320, B738) and the ATR 72 on 1,800 m or more, the ATR alone
+  from 1,100 m, nothing IFR below; circuits are C172, C152, PA28, SR22 with 2 to 4 laps.
+  Callsigns by region (`G`, `EC`, `F`, `D`, `I`... registrations, regional carriers), spoken in
+  full.
+- **The file** (`parse_file`, `from_file`): a YAML list of `t_s, callsign, type, kind`
+  (`circuit|departure|arrival`), `runway?, stand?, laps?, spoken?`; unknown fields, a bad kind,
+  a negative time or an empty callsign refuse the WHOLE file; a runway the field lacks drops its
+  row. The crate reads no environment: the bin passes the text.
+- **Despawn** stays in the phase machine (12 nm, 120 s parked, circuits after their laps); an
+  arrival with nowhere to park waits clear of the runway for 240 s and goes (`Despawn::NoStand`).
+- The flare holds half the approach's sink (never under 200 fpm): at 200 the ATR landed 560 m
+  into 1,500 m. Generated hours, flown to the end against the scripted tower: XTST (circuits,
+  ATRs) every touchdown under 500 m; XNOC (jets on 2,800 m) 427 to 440 m.
+- Fixtures: `xtst.dat` (+ `cifp/XTST.dat`: a SID, an approach for 27), `xnoc.dat` (allows
+  circuits 0, 2,800 m, jet gates, `cifp/XNOC.dat`: two SIDs, a STAR, ILS 12), `xbar.dat` (an
+  800 m grass strip with no network: nothing generated). `real_install_schedule_lemg` is the
+  ignored one over the install (LEMG says no circuits; IFR both ways, every movement spawns).
+- Known: a turboprop's vacate at 16 kt cuts its 90 degree turn-off by up to 7 m (the 172's
+  taxi stays under 3.3 m); not asserted for the ATR yet.
