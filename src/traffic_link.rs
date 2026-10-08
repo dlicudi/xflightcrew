@@ -378,12 +378,24 @@ impl Link {
 /// The command loop's half: the traffic desks synced with what the ticks
 /// said, then every posted traffic call answered on its own desk, in
 /// order. A reply with an empty line is an accepted readback.
-pub(crate) fn drain_calls(station: &mut Station) -> Vec<TrafficReply> {
+/// Each reply comes with the moment its call was keyed.
+pub(crate) fn drain_calls(station: &mut Station) -> Vec<(Instant, TrafficReply)> {
     station.sync_traffic_desks();
     crate::world::take_traffic_calls()
         .iter()
-        .map(|c| station.answer_traffic(c))
+        .map(|c| (c.state.at, station.answer_traffic(c)))
         .collect()
+}
+
+/// The tower's answers to our traffic, onto the frequency in its own voice,
+/// each just after the call it answers (an accepted readback says nothing).
+pub(crate) fn overhear_replies(voice: &crate::voice::Voice, replies: Vec<(Instant, TrafficReply)>) {
+    for (keyed, reply) in replies {
+        if !reply.line.is_empty() {
+            let made = keyed + std::time::Duration::from_millis(1);
+            voice.overhear(reply.speaker, reply.line, made);
+        }
+    }
 }
 
 /// The tower's order view mapped onto the fleet's. A leader that is ours
@@ -519,6 +531,7 @@ impl TrafficWorld {
     pub(crate) async fn tick(
         &mut self,
         xp: &crate::xplane::XPlaneClient,
+        voice: &crate::voice::Voice,
         snap: &crate::monitor::Snapshot,
         sim_speed: Option<f64>,
         now: Instant,
@@ -554,6 +567,12 @@ impl TrafficWorld {
                 "traffic",
                 serde_json::json!({ "event": "frozen", "fast": fast, "sim_speed": sim_speed }),
             );
+            if fast {
+                voice.alert(
+                    crate::voice::Priority::Advisory,
+                    "The traffic holds while the sim runs fast.",
+                );
+            }
         }
         link.set_frozen(fast);
         // The fleet's clock is the sim's (a failed read is no time), and our
@@ -597,6 +616,15 @@ impl TrafficWorld {
         }
         crate::party_line::publish_traffic_picture(Some(link.targets()));
         record(&out, link);
+        // The frequency: each call in its flight's own ghost voice, the
+        // tower's runway-watch lines in the tower's.
+        for t in &out.transmissions {
+            let seed = crate::voice::station_voice_seed(&t.callsign);
+            voice.overhear(crate::voice::StationSpeaker::Ghost { seed }, &t.text, now);
+        }
+        for (_, line) in &out.tower {
+            voice.overhear(crate::voice::StationSpeaker::Tower, line, now);
+        }
         Some(out)
     }
 

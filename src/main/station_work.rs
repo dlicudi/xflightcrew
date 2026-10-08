@@ -23,7 +23,8 @@ impl Session {
             return;
         }
         if let Some(st) = self.atc_station.as_mut() {
-            let _ = crate::traffic_link::drain_calls(st);
+            let replies = crate::traffic_link::drain_calls(st);
+            crate::traffic_link::overhear_replies(&self.voice, replies);
         }
     }
 

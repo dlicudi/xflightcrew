@@ -452,3 +452,28 @@ Increment 8 (monitor wiring, `world::targets`, the reinstall rule, settings):
   `touchdown`, `call` (id, callsign, text), `order` (a change of the tower state or runway on
   the order view), `tower` (a line from a traffic flight's runway watch). The station's answers
   are its own `atc` `route: traffic` records.
+
+Increment 9 (speech):
+- **The frequency is a queue in the voice** (`Voice::overhear(speaker, text, made)`, an
+  `Inner` field, never a static): the fleet's calls in their flight's ghost voice
+  (`StationSpeaker::Ghost { seed: station_voice_seed(callsign) }`, the party line's hash), the
+  tower's runway-watch lines and its answers to traffic calls in the tower's voice. Both threads
+  feed it (the monitor its tick's lines, the command loop the answers via
+  `traffic_link::overhear_replies`) and it keeps the order the lines were MADE: an answer is
+  stamped 1 ms after the call it answers (`TrafficCall.state.at`), so it never airs first
+  whichever thread got there first. An accepted readback says nothing.
+- **`Voice::pump_overheard(now, pilot_line_pending)`**, per monitor tick (in
+  `WorldTick::traffic_link`, with `pollers::command_waiting()`): tuned elsewhere than the TOWER
+  the lines are the void (dropped, never saved; unknown tuning fails open, as the arbiter);
+  under our PTT (`Voice::held`) or a pilot's line waiting they go back 3 to 5 s (by the line's
+  hash); older than 8 s (`OVERHEARD_STALE_S`) they are dropped; the rest air as an OVERHEARD
+  exchange (never the controller's last word to us, so "say again" never repeats it) with a
+  `stale_by` of made + 8 s (the radio's dequeue drops one that waited past it), mirrored to the
+  panel dimmed (`~GHOST:`, `~TWR:`), each one blackboxed `said` by the voice. The fleet never
+  waits on any of it: its calls went to the station when they were made.
+- The fast-forward freeze is SAID once per spell by the copilot ("The traffic holds while the
+  sim runs fast.").
+- Tests are on a voice with no speaker threads (`threadless`): the order made, the overheard
+  flag and the 8 s perish, the PTT and pilot-line retry then the stale drop, the tower-only rule.
+- Not done: a per-field call rate cap (the spec's "speech flood" risk); the stale drop and the
+  one frequency are the only limits so far.
