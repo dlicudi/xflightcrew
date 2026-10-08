@@ -26,6 +26,13 @@ pub(crate) const WRITE_EVERY: Duration = Duration::from_millis(250);
 /// the writer waits this long before it tries again.
 const BACKOFF: Duration = Duration::from_secs(10);
 
+/// The enable flag and the roster are written again this often even when
+/// nothing changed: the plugin can lose them behind the writer's back (a
+/// plugin reload starts at enable 0; a field change withdrew while the next
+/// link loaded and the plugin sat disabled with frames still arriving, LEMG
+/// 2026-10-08). Two small writes per period.
+const REASSERT_EVERY: Duration = Duration::from_secs(5);
+
 /// What the writer is to make true, the latest only.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Packet {
@@ -118,11 +125,18 @@ async fn write_loop(base_url: String, mut rx: tokio::sync::watch::Receiver<Packe
 struct Written {
     enabled: Option<bool>,
     roster_seq: Option<u32>,
+    /// When enable and the roster were last written whatever the cache said.
+    reasserted: Option<std::time::Instant>,
 }
 
 impl Written {
     /// The writes `packet` still needs, in order. False on a failed write.
     async fn apply(&mut self, packet: &Packet, xp: &crate::xplane::XPlaneClient) -> bool {
+        if self.reasserted.is_none_or(|t| t.elapsed() >= REASSERT_EVERY) {
+            self.enabled = None;
+            self.roster_seq = None;
+            self.reasserted = Some(std::time::Instant::now());
+        }
         if self.enabled != Some(packet.enabled) {
             if xp.set_int(ENABLE, i64::from(packet.enabled)).await.is_err() {
                 return false;
