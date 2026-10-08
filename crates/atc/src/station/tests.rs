@@ -864,6 +864,49 @@ fn unnamed_runway_edges_still_name_the_crossing() {
     assert!(clear.crossings.is_empty());
 }
 
+/// A traffic arrival's stand route passes over a stand somebody stands on
+/// (the parked aircraft its picture shows) for the next nearest; with
+/// nobody given (ours) the nearest stand, as always.
+#[test]
+fn a_stand_route_avoiding_the_parked_goes_to_the_next_free_stand() {
+    let mut nodes = std::collections::HashMap::new();
+    nodes.insert(1, (36.0000, -5.0000));
+    nodes.insert(2, (36.0000, -4.9980));
+    let stand = |name: &str, lon: f64| nav::Stand {
+        lat: 36.0003,
+        lon,
+        heading: 180.0,
+        name: name.into(),
+        kind: "gate".into(),
+        accepts: vec![],
+    };
+    let net = nav::TaxiNet {
+        nodes,
+        edges: vec![nav::TaxiEdge {
+            a: 1,
+            b: 2,
+            oneway: false,
+            runway: false,
+            name: "A".into(),
+            zone_of: Vec::new(),
+        }],
+        stands: vec![stand("S1", -5.0000), stand("S2", -4.9980)],
+        paint: vec![],
+        pavement: vec![],
+        stand_lines: vec![],
+    };
+    let (lat, lon) = (36.0000, -5.0004);
+    let ours = stand_route_on(&net, &[], lat, lon, None).expect("a route");
+    assert_eq!(ours.holding_point, "S1", "the nearest");
+    let none = stand_route_avoiding(&net, &[], lat, lon, None, &[]).expect("a route");
+    assert_eq!(none.holding_point, "S1");
+    let parked = [(36.0003, -5.0000)];
+    let traffic = stand_route_avoiding(&net, &[], lat, lon, None, &parked).expect("a route");
+    assert_eq!(traffic.holding_point, "S2", "past the parked aircraft");
+    let full = [(36.0003, -5.0000), (36.0003, -4.9980)];
+    assert!(stand_route_avoiding(&net, &[], lat, lon, None, &full).is_none());
+}
+
 #[test]
 fn off_route_stray_gets_a_fresh_route_from_present_position() {
     let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

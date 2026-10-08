@@ -133,6 +133,150 @@ fn the_first_movement_comes_within_a_minute() {
     }
 }
 
+/// ULMM's real layout (12 stands) with SIDs and approaches named, so it
+/// schedules departures and arrivals.
+fn ulmm() -> FieldModel {
+    let mut f = FieldModel::load(&fixtures::path("ulmm.dat"), "ULMM")
+        .unwrap()
+        .unwrap();
+    f.procs.sids = vec!["ASGO2E".into(), "EKLE2G".into()];
+    f.procs.approaches = vec!["I13-Y".into(), "I31-Y".into()];
+    f
+}
+
+/// THE FIELD IS NOT EMPTY AT THE START (LEMG, 2026-10-08: no parked
+/// aircraft at all): a share of the suitable stands is taken from the
+/// start, the departures first (each waits parked on its own stand), the
+/// rest parked aircraft of the class the stand takes, never on a stand the
+/// schedule or we hold, with stands kept free for the arrivals; the same
+/// seed, the same field; nothing at `Off`.
+#[test]
+fn a_share_of_the_stands_is_parked_at_the_start() {
+    let f = ulmm();
+    let suitable = f.net.stands.iter().filter(|s| s.is_suitable()).count();
+    let own = f.stand("Stand 9").map(|s| (s.lat, s.lon)).unwrap();
+    let ctx = SpawnCtx {
+        own: Some(own),
+        ..Default::default()
+    };
+    for (density, share) in [
+        (Density::Light, PARKED_SHARE_LIGHT),
+        (Density::Normal, PARKED_SHARE_NORMAL),
+    ] {
+        for seed in 0..10 {
+            let mut ms = generate(&f, density, seed, &ctx);
+            let parked = park_at_start(&f, density, seed, &ctx, &mut ms);
+            let waiting = ms.iter().filter(|m| m.parked_from_start).count();
+            let budget = (share * suitable as f64).floor() as usize;
+            assert!(waiting + parked.len() <= budget, "{density:?} {seed}");
+            assert!(
+                ms.iter()
+                    .filter(|m| m.parked_from_start)
+                    .all(|m| m.kind == MovementKind::Departure),
+                "only departures wait on their stands"
+            );
+            // The earliest departures wait.
+            let deps: Vec<&Movement> = ms
+                .iter()
+                .filter(|m| m.kind == MovementKind::Departure)
+                .collect();
+            assert!(deps
+                .windows(2)
+                .all(|w| w[0].parked_from_start || !w[1].parked_from_start));
+            let held: Vec<&str> = ms.iter().filter_map(|m| m.stand.as_deref()).collect();
+            let mut names: Vec<&str> = parked.iter().filter_map(|m| m.stand.as_deref()).collect();
+            for p in &parked {
+                assert_eq!(p.kind, MovementKind::Parked);
+                assert_eq!(p.t_s, 0.0);
+                let name = p.stand.as_deref().unwrap();
+                assert!(!held.contains(&name), "{name}: the schedule's stand");
+                assert_ne!(name, "Stand 9", "our stand");
+                let s = f.stand(name).unwrap();
+                // The stand's class: ULMM's stands take jets.
+                let cat = match p.icao_type.as_str() {
+                    "AT76" => "turboprops",
+                    "C172" | "C152" | "PA28" | "SR22" => "props",
+                    _ => "jets",
+                };
+                assert!(
+                    s.accepts.is_empty() || s.accepts.iter().any(|a| a == cat),
+                    "{} on {name} {:?}",
+                    p.icao_type,
+                    s.accepts
+                );
+                if cat != "props" {
+                    assert!(fleet_of(&p.callsign[..3]).contains(&p.icao_type.as_str()));
+                }
+                assert!(p.spawn(1, &f, &ctx).is_ok_and(|a| a.dormant()));
+            }
+            names.sort();
+            names.dedup();
+            assert_eq!(names.len(), parked.len(), "one aircraft a stand");
+            let free = suitable - held.len() - parked.len() - 1;
+            assert!(free + 1 >= STANDS_KEPT_FREE, "stands left for the arrivals");
+            let mut again = generate(&f, density, seed, &ctx);
+            assert_eq!(park_at_start(&f, density, seed, &ctx, &mut again), parked);
+            assert_eq!(again, ms);
+        }
+    }
+    let mut ms = generate(&f, Density::Normal, 1, &ctx);
+    let parked = park_at_start(&f, Density::Normal, 1, &ctx, &mut ms);
+    assert!(
+        !parked.is_empty() || ms.iter().any(|m| m.parked_from_start),
+        "normal parks something at ULMM"
+    );
+    assert!(park_at_start(&f, Density::Off, 1, &ctx, &mut ms).is_empty());
+}
+
+/// A parked aircraft is never put on our stand or within 60 m of us, and a
+/// departure waiting on its stand starts up there when it is released.
+#[test]
+fn a_parked_departure_starts_up_on_its_stand_when_released() {
+    let f = ulmm();
+    let mut ms = generate(&f, Density::Normal, 1, &SpawnCtx::default());
+    park_at_start(&f, Density::Normal, 1, &SpawnCtx::default(), &mut ms);
+    let m = ms
+        .iter()
+        .find(|m| m.parked_from_start)
+        .expect("a departure waits")
+        .clone();
+    let stand = f.stand(m.stand.as_deref().unwrap()).unwrap();
+    let near = SpawnCtx {
+        own: Some(project_m((stand.lat, stand.lon), 90.0, 40.0)),
+        ..Default::default()
+    };
+    assert_eq!(m.park(1, &f, &near).unwrap_err(), Refusal::NearOwn);
+    let ac = m.park(1, &f, &SpawnCtx::default()).unwrap();
+    assert!(ac.dormant() && ac.phase == crate::phase::Phase::Parked);
+    assert_eq!(ac.stand.as_deref(), Some(stand.name.as_str()));
+    assert!(!ac.kin.lights.beacon, "dark");
+    let mut fleet = crate::Fleet::new(f.clone());
+    fleet.spawn(ac);
+    let events = fleet.step(30.0, None, &|_| None);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, crate::phase::Event::Call { .. })),
+        "a parked aircraft says nothing"
+    );
+    assert!(fleet.release(1, m.plan(&f).unwrap()));
+    assert!(!fleet.release(1, m.plan(&f).unwrap()), "once");
+    let events = fleet.step(1.0, None, &|_| None);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        crate::phase::Event::Call {
+            call: crate::phase::Call::Taxi,
+            ..
+        }
+    )));
+    let ac = fleet.get(1).unwrap();
+    assert!(
+        !ac.dormant() && ac.kin.lights.beacon,
+        "started up where it stood"
+    );
+    assert_eq!(ac.kin.pos(), (stand.lat, stand.lon));
+}
+
 #[test]
 fn the_same_seed_is_the_same_schedule() {
     let f = fixtures::xtst_ifr();
@@ -323,6 +467,18 @@ fn real_install_schedule_lemg() {
     let (c, d, a) = kinds(&ms);
     assert_eq!(c, 0, "LEMG publishes no circuits");
     assert!(d > 0 && a > 0, "{d} out, {a} in");
+    let mut parked_ms = ms.clone();
+    let parked = park_at_start(&f, Density::Normal, 1, &SpawnCtx::default(), &mut parked_ms);
+    let waiting = parked_ms.iter().filter(|m| m.parked_from_start).count();
+    let suitable = f.net.stands.iter().filter(|s| s.is_suitable()).count();
+    println!(
+        "parked at the start: {} aircraft and {waiting} departures waiting, of {suitable} stands",
+        parked.len()
+    );
+    for m in &parked {
+        println!("  {} {} on {:?}", m.callsign, m.icao_type, m.stand);
+    }
+    assert!(!parked.is_empty() && waiting > 0);
     for (i, m) in ms.iter().enumerate() {
         assert!(
             m.spawn(i as u32 + 1, &f, &SpawnCtx::default()).is_ok(),

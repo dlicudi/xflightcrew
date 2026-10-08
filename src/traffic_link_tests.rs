@@ -79,6 +79,10 @@ pub(super) struct HarnessScore {
     pub(super) secs: f64,
     /// When each movement spawned (harness seconds) and its callsign.
     pub(super) spawned: Vec<(f64, String)>,
+    /// Put on their stands parked at the start (parked aircraft and the
+    /// departures waiting), and still parked at the end (never moved).
+    pub(super) parked_at_start: usize,
+    pub(super) parked: usize,
 }
 
 /// A station for `icao` from `apt` with its taxi network loaded, installed.
@@ -112,14 +116,25 @@ fn install_apt() -> String {
 }
 
 /// Fly `schedule` at `field` against the installed `station` on a fake
-/// clock in `dt` ticks until every movement is done or `max_s` passes.
+/// clock in `dt` ticks until every movement is done or `max_s` passes. The
+/// field's stands are parked at the start as the live link parks them
+/// (`traffic::park_at_start`, normal density): the departures waiting on
+/// their stands are movements, the parked aircraft are not, and they stay.
 pub(super) fn fly_field(
     station: &mut Station,
     field: FieldModel,
-    schedule: Vec<Movement>,
+    mut schedule: Vec<Movement>,
     max_s: f64,
 ) -> HarnessScore {
     let name = crate::party_line::spoken_airport(station.airport_name()).to_string();
+    let parked = traffic::park_at_start(
+        &field,
+        Density::Normal,
+        3,
+        &SpawnCtx::default(),
+        &mut schedule,
+    );
+    schedule.extend(parked);
     let mut link = Link::new(field, schedule, &name);
     let mut s = HarnessScore {
         movements: link.pending(),
@@ -145,6 +160,7 @@ pub(super) fn fly_field(
         s.said.extend(out.tower.iter().map(|(_, l)| l.clone()));
         s.spawned
             .extend(out.spawned.iter().map(|(_, cs)| (t, cs.clone())));
+        s.parked_at_start += out.parked.len();
         for ev in &out.events {
             match ev {
                 Event::Spawn { id } => {
@@ -237,12 +253,18 @@ pub(super) fn fly_field(
                 }
             }
         }
-        if link.pending() == 0 && link.fleet().aircraft().is_empty() {
+        if link.pending() == 0 && link.active() == 0 {
             break;
         }
     }
     s.secs = t;
-    for ac in link.fleet().aircraft() {
+    s.parked = link
+        .fleet()
+        .aircraft()
+        .iter()
+        .filter(|a| a.dormant())
+        .count();
+    for ac in link.fleet().aircraft().iter().filter(|a| !a.dormant()) {
         s.unfinished.push(format!(
             "{} {} still {:?} at {t:.0} s",
             ac.id, ac.callsign, ac.phase
@@ -558,9 +580,12 @@ fn real_install_lemg_traffic_hour_inner() {
     );
     let s = fly_field(&mut st, field, schedule, 3.0 * 3600.0);
     println!(
-        "LEMG first spawns: {:?}",
-        &s.spawned[..s.spawned.len().min(4)]
+        "LEMG first spawns: {:?}, {} parked at the start, {} never moved",
+        &s.spawned[..s.spawned.len().min(4)],
+        s.parked_at_start,
+        s.parked
     );
+    assert!(s.parked > 0, "LEMG's stands are not empty");
     assert_clean(&s, "LEMG field hour");
     Station::uninstall();
 }

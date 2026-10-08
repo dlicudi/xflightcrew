@@ -329,6 +329,26 @@ impl TrafficAircraft {
         Some(ac)
     }
 
+    /// Parked and going nowhere yet ([`Plan::Parked`]): a parked aircraft,
+    /// or a departure waiting on its stand for its time. It has said
+    /// nothing, so the tower holds no strip for it.
+    pub fn dormant(&self) -> bool {
+        matches!(self.plan, Plan::Parked)
+    }
+
+    /// A [`dormant`](Self::dormant) aircraft given its flight: it starts up
+    /// on its stand and calls for taxi from there. False (nothing changes)
+    /// for one not dormant, or a `plan` that is itself [`Plan::Parked`].
+    pub fn release(&mut self, plan: Plan) -> bool {
+        if !self.dormant() || matches!(plan, Plan::Parked) || self.phase != Phase::Parked {
+            return false;
+        }
+        self.plan = plan;
+        self.phase_s = 0.0;
+        self.radio.called = false;
+        true
+    }
+
     /// Height above the field, feet.
     pub fn agl_ft(&self, field: &FieldModel) -> f64 {
         self.kin.alt_ft - field.elev_ft()

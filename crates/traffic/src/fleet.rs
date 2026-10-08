@@ -51,6 +51,17 @@ impl Fleet {
         Some(self.aircraft.remove(i))
     }
 
+    /// Give a dormant aircraft (parked, [`crate::Plan::Parked`]) its
+    /// flight: it starts up where it stands
+    /// ([`TrafficAircraft::release`]). False when `id` is not here or not
+    /// dormant.
+    pub fn release(&mut self, id: u32, plan: crate::phase::Plan) -> bool {
+        self.aircraft
+            .iter_mut()
+            .find(|a| a.id == id)
+            .is_some_and(|a| a.release(plan))
+    }
+
     pub fn aircraft(&self) -> &[TrafficAircraft] {
         &self.aircraft
     }

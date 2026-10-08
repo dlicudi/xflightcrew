@@ -712,6 +712,7 @@ fn assert_despawned_by_the_rules(done: &[Finished]) {
     for (kind, reason, parked) in done {
         match kind {
             MovementKind::Departure => assert_eq!(*reason, Despawn::LeftTheArea),
+            MovementKind::Parked => panic!("a parked aircraft never leaves"),
             MovementKind::Arrival | MovementKind::Circuit => {
                 assert_eq!(*reason, Despawn::Parked, "{kind:?}");
                 let p = parked.expect("parked first");

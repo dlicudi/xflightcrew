@@ -26,7 +26,9 @@ pub use kin::{follow, Follow, FollowSpec, Kin, LatLon, Lights};
 pub use perf::{class_for_type, Perf, Wake, JET_HEAVY, JET_MED, PISTON_SINGLE, TURBOPROP};
 pub use phase::{Call, Despawn, Event, Leg, Order, OwnTarget, Phase, Plan, RadioState, TowerState};
 pub use rng::XorShift64;
-pub use schedule::{generate, Density, FileEntry, Movement, MovementKind, Refusal, SpawnCtx};
+pub use schedule::{
+    generate, park_at_start, Density, FileEntry, Movement, MovementKind, Refusal, SpawnCtx,
+};
 
 #[cfg(test)]
 mod sortie_tests;

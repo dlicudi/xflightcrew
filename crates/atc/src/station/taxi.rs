@@ -111,15 +111,23 @@ pub fn spawn_taxi_net_load(apt_path: String, icao: String) {
 /// stand name so the reply and the crew call it by name. Runway crossings on
 /// the way in are still named. `None` when the field has no stands or neither
 /// end snaps to the network.
+/// `occupied`: where aircraft stand on the ground (a traffic desk's
+/// picture); a stand one of them is on is passed over for the next nearest.
+/// Empty for ours: our route is planned as it always was.
 pub(super) fn plan_taxi_route_to_stand(
     runways: &[nav::Runway],
     lat: f64,
     lon: f64,
     psi_true: Option<f64>,
+    occupied: &[(f64, f64)],
 ) -> Option<nav::TaxiRoutePlan> {
     let net = TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-    stand_route_on(&net, runways, lat, lon, psi_true)
+    stand_route_avoiding(&net, runways, lat, lon, psi_true, occupied)
 }
+
+/// A stand is taken when an aircraft stands this close to it, metres
+/// (the traffic crate's own `STAND_TAKEN_M`).
+const STAND_TAKEN_M: f64 = 20.0;
 
 /// True heading, for which way is forward off a runway.
 pub(super) const TRUE_PSI: &str = sim::datarefs::TRUE_HEADING_DEG;
@@ -138,6 +146,20 @@ pub(super) fn stand_route_on(
     lon: f64,
     psi_true: Option<f64>,
 ) -> Option<nav::TaxiRoutePlan> {
+    stand_route_avoiding(net, runways, lat, lon, psi_true, &[])
+}
+
+/// [`stand_route_on`] to the nearest stand nobody in `occupied` stands on
+/// (within [`STAND_TAKEN_M`]). A traffic arrival is not sent onto a stand
+/// a parked aircraft stands on (stage D's parked aircraft, 2026-10-08).
+pub(super) fn stand_route_avoiding(
+    net: &nav::TaxiNet,
+    runways: &[nav::Runway],
+    lat: f64,
+    lon: f64,
+    psi_true: Option<f64>,
+    occupied: &[(f64, f64)],
+) -> Option<nav::TaxiRoutePlan> {
     let on = runways.iter().find(|r| on_runway(r, lat, lon).is_some());
     let vacate = match (on, psi_true.filter(|p| p.is_finite())) {
         (Some(r), Some(psi)) => {
@@ -152,7 +174,21 @@ pub(super) fn stand_route_on(
         .as_ref()
         .and_then(|(v, _)| v.path.last().copied())
         .unwrap_or((lat, lon));
-    let stand = net.nearest_stand(slat, slon)?.clone();
+    let stand = if occupied.is_empty() {
+        net.nearest_stand(slat, slon)?.clone()
+    } else {
+        let taken = |s: &nav::Stand| {
+            occupied
+                .iter()
+                .any(|(a, b)| nav::haversine_nm(s.lat, s.lon, *a, *b) * 1852.0 < STAND_TAKEN_M)
+        };
+        let d = |s: &nav::Stand| nav::haversine_nm(slat, slon, s.lat, s.lon);
+        net.stands
+            .iter()
+            .filter(|s| s.is_suitable() && !taken(s))
+            .min_by(|a, b| d(a).total_cmp(&d(b)))?
+            .clone()
+    };
     // To the STAND, not to the taxiway node nearest it — see `plan_to_stand`.
     let mut plan = net.plan_to_stand(slat, slon, &stand)?;
     plan.holding_point = stand.name.clone();

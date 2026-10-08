@@ -205,7 +205,19 @@ impl Station {
                 self.desk.planned_route = if arrival {
                     // The heading says which way is forward off a runway we
                     // may still be on; a failed read plans as before.
-                    plan_taxi_route_to_stand(&self.apt.runways, lat, lon, state.psi_deg)
+                    // A traffic arrival passes over the stands its picture
+                    // shows somebody on (the parked aircraft); ours plans
+                    // as it always did.
+                    let occupied: Vec<(f64, f64)> = if self.desk.strip.is_traffic() {
+                        targets
+                            .iter()
+                            .filter(|t| t.on_ground)
+                            .map(|t| (t.lat, t.lon))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    plan_taxi_route_to_stand(&self.apt.runways, lat, lon, state.psi_deg, &occupied)
                 } else {
                     plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
                 };

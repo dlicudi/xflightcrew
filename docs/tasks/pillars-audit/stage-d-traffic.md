@@ -778,4 +778,53 @@ complete. Tried and NOT kept: a 25 kt vacate down the strip to a far exit; BIEG'
 are the single runway's sequencing (one Ryanair arrival sent round five times by "traffic on
 the runway" behind circuits and departures), not the slow vacate, and they went from 24 to 34
 with it. Test: `a_long_vacate_calls_vacated_before_its_wait_for_a_stand_begins` (pure: a
-1.4 km vacate outlasting the old wait calls vacated, then waits the full 240 s).
+1.4 km vacate outlasting the old wait calls vacated, then waits the full 240 s). BIEG's was
+the last caller of `assert_sweep_clean`, removed; the sweep checks the same inline.
+
+**2. Parked aircraft from the start.** `traffic::park_at_start(field, density, seed, ctx,
+&mut schedule)` (the bin's `build_link`, generated schedules only; a pilot's file may name
+`kind: parked` rows, a new `MovementKind::Parked`): a share of the field's suitable stands,
+`PARKED_SHARE_LIGHT` 15% / `PARKED_SHARE_NORMAL` 30%, at most `PARKED_MAX` (40: each is an
+XPMP2 aircraft drawn every frame), stands occupied from the start.
+- The schedule's departures fill it first, earliest first: `Movement::parked_from_start`. The
+  link parks each on its own stand at the first tick (`Movement::park`, `Plan::Parked`: engines
+  off, lights off) and at its time RELEASES it there (`Fleet::release`,
+  `TrafficAircraft::release`: the plan given, the phase clock reset), so the first departure
+  starts up where it stood instead of appearing. A departure refused at the start spawns at its
+  time as before.
+- The rest are `MovementKind::Parked` aircraft at `t_s` 0 of the stand's class
+  (`parked_type`: an airliner of a carrier that flies the type (`airline`, `fleet_of`) at a jet
+  stand or a gate naming no class, the regional turboprop one stand in five that takes them, a
+  light aircraft with a registration on a props stand or a tie-down), never on a stand the
+  schedule or `ctx` holds, never so many that fewer than `STANDS_KEPT_FREE` (3) stands are left
+  for the arrivals. They never move and never leave.
+- Parked at the FIRST TICK, where our position is known: never on our stand nor within
+  `PARK_CLEAR_OWN_M` (60 m) of us (`Refusal::NearOwn`), never on a stand somebody stands on.
+  Counted as occupied by every later spawn (`SpawnCtx.occupied` is the fleet on the ground).
+- A DORMANT aircraft (`TrafficAircraft::dormant`, `Plan::Parked`) has said nothing, so it has
+  no strip: the link neither notes its state (`note_traffic_state` would open one) nor ticks
+  its runway watch, it is not in the reinstall rule's `noted`, and it is NOT in the crew's TCAS
+  picture (`Link::targets`): no TCAS noise from a full apron. It is in each traffic call's
+  picture, so the tower can see the stand is taken, and the plugin draws it (the sink sends
+  the whole fleet). It is never in the runway book (no strip, never on a runway).
+- The tower routes a TRAFFIC arrival to the nearest stand nobody in its picture stands on
+  (`stand_route_avoiding`, `plan_taxi_route_to_stand(.., occupied)`, 20 m as the traffic's
+  `STAND_TAKEN_M`); ours passes no one and is routed as before (`stand_route_on`).
+- The harness parks the stands as the link does (normal density) in every run, the sweep
+  included: the departures waiting are movements that must complete, the parked aircraft are
+  not; the run ends when nothing is pending and nothing ACTIVE is left (`Link::active`).
+- LEMG at normal density, the live seed (1): 125 suitable stands, 31 parked aircraft and the
+  6 departures of the hour waiting on their stands (37, the 30% share), the first departure
+  starting up at 44 s; the harness's LEMG hour (seed 7, parked with 3): 37 parked at the start,
+  31 never moved, 12 movements all complete. Sweep: 150 fields clean.
+- Tests: `a_share_of_the_stands_is_parked_at_the_start` (ULMM's real 12 stands: the share,
+  departures first, the stand's class, never a held stand or ours, stands kept free,
+  deterministic, nothing at `Off`), `a_parked_departure_starts_up_on_its_stand_when_released`
+  (refused 40 m from us; parked says nothing; released once, it calls for taxi with its beacon on
+  from its stand), `a_stand_route_avoiding_the_parked_goes_to_the_next_free_stand` (atc), and
+  the LEMG hour asserts parked aircraft stay.
+- Not done: hours after the first generate departures that appear on their stands at their
+  time (only the first hour's wait parked), and an arrival that parks still leaves after
+  `PARKED_LINGER_S`, so the parked share does not grow or refill. OUR taxi in is still routed
+  to the nearest stand whoever stands on it (the crew's TCAS picture does not carry the parked
+  aircraft): a parked aircraft may stand on the stand the tower sends us to.
