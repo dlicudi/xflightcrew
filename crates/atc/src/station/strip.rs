@@ -17,8 +17,14 @@ pub(super) const TRACK_MIN_DT_S: f64 = 1.0;
 
 /// Record our own position for the go-around judgement. Airborne only: on
 /// the ground there is no threshold to reach.
+#[cfg_attr(not(test), allow(dead_code))] // the monitor notes through note_aircraft_state
 pub(crate) fn note_own_fix(lat: f64, lon: f64, on_ground: bool, now: Instant) {
-    let mut f = OWN_STRIP.own_fixes.lock().unwrap_or_else(|e| e.into_inner());
+    note_fix_for(&OWN_STRIP, lat, lon, on_ground, now);
+}
+
+/// [`note_own_fix`] on one flight's strip.
+pub(super) fn note_fix_for(flight: &FlightStrip, lat: f64, lon: f64, on_ground: bool, now: Instant) {
+    let mut f = flight.own_fixes.lock().unwrap_or_else(|e| e.into_inner());
     if on_ground {
         f.clear();
         return;
@@ -407,9 +413,20 @@ pub(crate) fn strip_exit(
 
 /// Our distance (nm) and time (s) to the landing threshold from the fixes the
 /// monitor noted. `None` without a fresh fix (a test, the first tick).
+#[cfg_attr(not(test), allow(dead_code))] // the ticks read their strip's fixes
 pub(super) fn own_time_to_threshold(r: &nav::Runway, landing_end: &str, now: Instant) -> Option<(f64, f64)> {
+    time_to_threshold_for(&OWN_STRIP, r, landing_end, now)
+}
+
+/// [`own_time_to_threshold`] from one flight's strip's fixes.
+pub(super) fn time_to_threshold_for(
+    flight: &FlightStrip,
+    r: &nav::Runway,
+    landing_end: &str,
+    now: Instant,
+) -> Option<(f64, f64)> {
     let f = LandingFrame::new(r, landing_end)?;
-    let fixes = OWN_STRIP.own_fixes.lock().unwrap_or_else(|e| e.into_inner());
+    let fixes = flight.own_fixes.lock().unwrap_or_else(|e| e.into_inner());
     let &(lat, lon, at) = fixes.back()?;
     if now.saturating_duration_since(at).as_secs_f64() > 3.0 {
         return None;
@@ -569,20 +586,36 @@ pub fn go_around_tick(
     tuned: bool,
     now: Instant,
 ) -> Option<ComplianceCall> {
+    let state = AircraftState::at_position(f64::NAN, f64::NAN, on_ground, f64::NAN);
+    go_around_tick_for(&OWN_STRIP, &state, targets, own_agl_ft, tuned, now)
+}
+
+/// [`go_around_tick`] for one flight's strip: its clearance or held
+/// landing, its fixes, its pacing. The order's count
+/// ([`GO_AROUND_ORDERS`], the crew's loops) moves only for OUR strip.
+pub(super) fn go_around_tick_for(
+    flight: &FlightStrip,
+    state: &AircraftState,
+    targets: &[TcasTarget],
+    own_agl_ft: f64,
+    tuned: bool,
+    now: Instant,
+) -> Option<ComplianceCall> {
     // The standing clocks run through the whole final, not only its last
     // 800 ft ([`GHOST_STALE_S`]).
     note_ground_traffic(targets, now);
-    if on_ground || own_agl_ft > 800.0 {
+    if state.on_ground || own_agl_ft > 800.0 {
         return None;
     }
-    let cleared = OWN_STRIP.clearance
+    let cleared = flight
+        .clearance
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .filter(|c| c.state == tower::State::ClearedToLand)
         .map(|c| (c.callsign.clone(), c.runway_ident.clone()));
     let held = || {
-        OWN_STRIP.landing_hold
+        flight.landing_hold
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -601,7 +634,7 @@ pub fn go_around_tick(
     }
     let own = ours
         .as_ref()
-        .and_then(|r| own_time_to_threshold(r, &runway_ident, now));
+        .and_then(|r| time_to_threshold_for(flight, r, &runway_ident, now));
     let plain: Vec<StripExit> = exits.iter().map(|e| e.exit).collect();
     let (own_nm, own_s) = own_json(own);
     if !go_around_due(own.map(|o| o.1), &plain) {
@@ -618,7 +651,7 @@ pub fn go_around_tick(
         }
         return None;
     }
-    let mut last = OWN_STRIP.go_around_last.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last = flight.go_around_last.lock().unwrap_or_else(|e| e.into_inner());
     if last.is_some_and(|t| now.duration_since(t).as_secs_f64() < 30.0) {
         return None;
     }
@@ -629,31 +662,34 @@ pub fn go_around_tick(
             "own_nm": own_nm, "own_s": own_s, "occupants": exits_json(&exits)}),
     );
     // A withheld landing is over: the order is the answer it was waiting for.
-    *OWN_STRIP.landing_hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *flight.landing_hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // The order voids the clearance in the FSM too, or the coach keeps
     // suggesting "cleared to land ..." as the readback owed while the tower
     // is shouting go around (seen live, 2026-07-14). The sync is handed to
     // the main loop, which owns the `Station`, same as the hold release.
-    *OWN_STRIP.pending_go_around.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    *flight.pending_go_around.lock().unwrap_or_else(|e| e.into_inner()) = true;
     // An occupant that will not leave on its own clock (standing, or using
     // the other direction) would send the next approach round the same way:
     // the tower re-sequences now (issue #162). Only a flight on the
     // frequency can be told.
     let expect = if tuned {
-        resequence_after_go_around(targets, &runway_ident, &exits, now)
+        resequence_after_go_around(flight, targets, &runway_ident, &exits, now)
     } else {
         None
     };
     // The runway the order names rides with it, published BEFORE its count
     // moves, so a crew watch that sees the order sees its runway (#182).
-    *OWN_STRIP.resequenced_order.lock().unwrap_or_else(|e| e.into_inner()) = expect.clone().map(|to| {
+    *flight.resequenced_order.lock().unwrap_or_else(|e| e.into_inner()) = expect.clone().map(|to| {
         (
             GO_AROUND_ORDERS.load(std::sync::atomic::Ordering::SeqCst) + 1,
             to,
         )
     });
-    // ...and the order itself, for every crew loop that flies it.
-    GO_AROUND_ORDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // ...and the order itself, for every crew loop that flies it: ours
+    // only, the crew flies no traffic strip's go-around.
+    if flight.is_own() {
+        GO_AROUND_ORDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     Some(if tuned {
         let expect = expect
             .map(|to| format!("expect runway {}, ", atis::spoken_runway(&to)))
@@ -774,6 +810,7 @@ pub(crate) fn resequence_runway(
 /// held on its runway (the next final report is withheld while the strip is
 /// occupied and released when it clears). Recorded `resequenced` either way.
 pub(super) fn resequence_after_go_around(
+    flight: &FlightStrip,
     targets: &[TcasTarget],
     runway_ident: &str,
     exits: &[Occupant],
@@ -819,7 +856,7 @@ pub(super) fn resequence_after_go_around(
             "occupants": exits_json(exits)}),
     );
     let to = pick.ok()?;
-    *OWN_STRIP.pending_resequence.lock().unwrap_or_else(|e| e.into_inner()) =
+    *flight.pending_resequence.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((runway_ident.to_string(), to.clone()));
     Some(to)
 }
@@ -845,9 +882,21 @@ pub struct LandingHold {
 /// ([`Station::sync_landing_release`]). Landed, the hold is moot: dropped.
 /// The go-around order, when the traffic stays, is [`go_around_tick`]'s.
 pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) -> Option<String> {
-    let mut guard = OWN_STRIP.landing_hold.lock().unwrap_or_else(|e| e.into_inner());
+    let state = AircraftState::at_position(f64::NAN, f64::NAN, on_ground, f64::NAN);
+    landing_hold_tick_for(&OWN_STRIP, &state, targets, now)
+}
+
+/// [`landing_hold_tick`] for one flight's strip: its held landing, its
+/// fixes, its clearance; every other strip a claimant in the book.
+pub(super) fn landing_hold_tick_for(
+    flight: &FlightStrip,
+    state: &AircraftState,
+    targets: &[TcasTarget],
+    now: Instant,
+) -> Option<String> {
+    let mut guard = flight.landing_hold.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_ref()?;
-    if on_ground || station_unavailable() {
+    if state.on_ground || station_unavailable() {
         *guard = None;
         return None;
     }
@@ -857,13 +906,13 @@ pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) 
     };
     // The book first: a traffic strip cleared onto the runway (or to land
     // on it) holds it whatever the replay shows.
-    if strip_held_by_traffic(&runways, &hold.runway_ident) {
+    if strip_held_by_others(&runways, &hold.runway_ident, flight) {
         return None;
     }
     let exits = strip_exits(targets, ours.as_ref(), &hold.runway_ident, now);
     let own = ours
         .as_ref()
-        .and_then(|r| own_time_to_threshold(r, &hold.runway_ident, now));
+        .and_then(|r| time_to_threshold_for(flight, r, &hold.runway_ident, now));
     let plain: Vec<StripExit> = exits.iter().map(|e| e.exit).collect();
     if !landing_release_due(own.map(|o| o.1), &plain) {
         return None;
@@ -875,7 +924,7 @@ pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) 
         serde_json::json!({"event": "landing_released", "runway": hold.runway_ident,
             "own_nm": own_nm, "own_s": own_s, "occupants": exits_json(&exits)}),
     );
-    if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(c) = flight.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         c.state = tower::State::ClearedToLand;
         c.holds_runway = true;
         c.runway_ident = hold.runway_ident.clone();
@@ -884,8 +933,8 @@ pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) 
             hold.runway, hold.callsign
         ));
     }
-    *OWN_STRIP.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *OWN_STRIP.pending_landing_release
+    *flight.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *flight.pending_landing_release
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some((hold.runway.clone(), hold.line.clone()));
     Some(hold.line)

@@ -237,6 +237,14 @@ flight_strip! {
 /// Our own flight's strip.
 pub(crate) static OWN_STRIP: FlightStrip = FlightStrip::new();
 
+impl FlightStrip {
+    /// This is OUR strip: a crew projection (the go-around count, the
+    /// station's reach) follows it and no traffic strip.
+    pub(crate) fn is_own(&self) -> bool {
+        std::ptr::eq(self, &OWN_STRIP)
+    }
+}
+
 /// The traffic strips, by their stable number ([`FlightId::Traffic`]):
 /// empty until a traffic producer opens one (stage D). Cleared by
 /// `Station::install` and `Station::uninstall`, never by

@@ -186,3 +186,18 @@ callsign-keyed map, single strip mutex, `Ctx` split, world_tick cadence or TCAS 
   hold's release all ask the book (`strip_held_by_traffic`, a no-op with no strip open). The
   party line still withholds only against OUR claim. `party_line::lock` takes `&Mutex<T>`.
   Fourth test: the strips die with the station, never with our flight.
+- **Increment 6**: the cores are `go_around_tick_for`, `landing_hold_tick_for`,
+  `takeoff_hold_tick_for`, `handoff_tick_for`, `vector_tick_for`, `compliance_tick_for` and
+  `note_aircraft_state_for`, each `(flight: &FlightStrip, state: &AircraftState, ...)` with the
+  inputs the state does not carry kept as arguments (the go-around's AGL, COM1 tuned, the
+  vectors' ground track, the field elevation); `squawk_tick_for(flight, ...)` takes no state
+  (the transponder is not in it). The strip parameter is named `flight` where the station's
+  `strip(runways, ident)` lookup is in scope. A core reads its position as
+  `state.position().unwrap_or((NaN, NaN))` where the old body did geometry on raw lat/lon, so
+  a failed read is no position exactly as before. `GO_AROUND_ORDERS` moves only for our strip
+  (`FlightStrip::is_own`); `OUT_OF_REACH` and its stand-down stay in `note_aircraft_state`,
+  ours alone. The holds' book question is now "held by any OTHER strip"
+  (`strip_held_by_others`): ours is a claimant for a traffic strip's holds. The compliance core
+  still keeps its flight memory in `COMPLIANCE` until increment 7, so its per-strip test lands
+  there. Tests: one per tick (station/tick_tests.rs), each checking the traffic strip's cells
+  moved and every cell of ours stayed at rest.

@@ -84,7 +84,19 @@ pub fn squawk_tick(
     tuned: StationSpeaker,
     now: Instant,
 ) -> Option<(String, StationSpeaker)> {
-    let mut guard = OWN_STRIP.squawk_watch.lock().unwrap_or_else(|e| e.into_inner());
+    squawk_tick_for(&OWN_STRIP, actual, mode_on, tuned, now)
+}
+
+/// [`squawk_tick`] for one flight's strip: its watch, its nudge. No
+/// aircraft state is read (the transponder is not in it).
+pub(super) fn squawk_tick_for(
+    flight: &FlightStrip,
+    actual: Option<i64>,
+    mode_on: bool,
+    tuned: StationSpeaker,
+    now: Instant,
+) -> Option<(String, StationSpeaker)> {
+    let mut guard = flight.squawk_watch.lock().unwrap_or_else(|e| e.into_inner());
     let w = guard.as_mut()?;
     let first = *w.first_seen.get_or_insert(now);
     if actual == Some(w.code) && mode_on {
@@ -114,7 +126,7 @@ pub fn squawk_tick(
     // 2026-07-13) — a nag that reads as "your digits are wrong" when the
     // digits are the one thing that's right.
     let recycle = actual == Some(w.code);
-    *OWN_STRIP.squawk_nudge.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::party_line::SquawkNudge {
+    *flight.squawk_nudge.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::party_line::SquawkNudge {
         code: w.code,
         recycle,
     });
@@ -150,9 +162,19 @@ pub struct Handoff {
 /// flight is airborne and through the arming altitude, then the handoff
 /// exactly once.
 pub fn handoff_tick(alt_ft: f64, on_ground: bool) -> Option<String> {
-    let mut guard = OWN_STRIP.handoff.lock().unwrap_or_else(|e| e.into_inner());
+    let state = AircraftState {
+        alt_ft,
+        ..AircraftState::at_position(f64::NAN, f64::NAN, on_ground, f64::NAN)
+    };
+    handoff_tick_for(&OWN_STRIP, &state)
+}
+
+/// [`handoff_tick`] for one flight's strip: its armed handoff, published on
+/// its strip as it goes out.
+pub(super) fn handoff_tick_for(flight: &FlightStrip, state: &AircraftState) -> Option<String> {
+    let mut guard = flight.handoff.lock().unwrap_or_else(|e| e.into_inner());
     let plan = guard.as_ref()?;
-    if on_ground || alt_ft < plan.min_alt_ft {
+    if state.on_ground || state.alt_ft < plan.min_alt_ft {
         return None;
     }
     let line = plan.line.clone();
@@ -160,7 +182,7 @@ pub fn handoff_tick(alt_ft: f64, on_ground: bool) -> Option<String> {
     // as audio: a readback, a retune and a check-in are owed, and until this
     // was published nothing on the crew side could do them — the Malaga
     // departure stayed on tower for thirteen minutes (12:23Z, 2026-09-11).
-    *OWN_STRIP.departure_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
+    *flight.departure_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((plan.to.clone(), plan.khz));
     *guard = None;
     Some(line)
@@ -236,9 +258,27 @@ pub fn vector_tick(
     on_ground: bool,
     now: Instant,
 ) -> Option<String> {
-    let mut guard = OWN_STRIP.vectors.lock().unwrap_or_else(|e| e.into_inner());
+    let state = AircraftState {
+        alt_ft,
+        ..AircraftState::at_position(lat, lon, on_ground, f64::NAN)
+    };
+    vector_tick_for(&OWN_STRIP, &state, track_deg, now)
+}
+
+/// [`vector_tick`] for one flight's strip: its vectors plan and its
+/// approach handoff. A position that did not read is no position, as before
+/// (every distance and bearing from it is NaN).
+pub(super) fn vector_tick_for(
+    flight: &FlightStrip,
+    state: &AircraftState,
+    track_deg: Option<f64>,
+    now: Instant,
+) -> Option<String> {
+    let (lat, lon) = state.position().unwrap_or((f64::NAN, f64::NAN));
+    let alt_ft = state.alt_ft;
+    let mut guard = flight.vectors.lock().unwrap_or_else(|e| e.into_inner());
     let plan = guard.as_mut()?;
-    if on_ground {
+    if state.on_ground {
         *guard = None; // landed (or armed on the ramp by mistake): vectors over
         return None;
     }
@@ -300,7 +340,7 @@ pub fn vector_tick(
         // (the compliance watch clears this on the landing clearance and on
         // touchdown). Only when there's a tower to report to.
         if plan.tower_spoken.is_some() {
-            *OWN_STRIP.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
+            *flight.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(plan.runway_spoken.clone());
         }
         *guard = None; // approach's job is done

@@ -296,34 +296,11 @@ pub fn note_aircraft(lat: f64, lon: f64, on_ground: bool) {
 /// position, the ground flag and the time are read.
 pub fn note_aircraft_state(state: &AircraftState) {
     use std::sync::atomic::Ordering::Relaxed;
-    let (lat, lon, on_ground) = (state.lat, state.lon, state.on_ground);
-    // Where we are, for the go-around judgement's time to the threshold.
-    note_own_fix(lat, lon, on_ground, state.at);
-    // The crew's own route and runway end at the liftoff: a departure's
-    // runway must never read as a cleared one at the destination (autoland
-    // takes the cleared runway).
-    if !on_ground {
-        let mut own = OWN_STRIP.self_taxi.lock().unwrap_or_else(|e| e.into_inner());
-        if own.take().is_some() {
-            *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        }
-    }
-    // An IFR flight ends at its landing: airborne since the clearance, the
-    // next ground contact retires it (never a region switch).
-    {
-        let mut ifr = OWN_STRIP.ifr_flight.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(f) = ifr.as_mut() {
-            if !on_ground {
-                f.airborne = true;
-            } else if f.airborne {
-                sim::blackbox::record(
-                    "atc",
-                    serde_json::json!({ "event": "ifr_flight_ended", "code": f.code, "why": "landed" }),
-                );
-                *ifr = None;
-            }
-        }
-    }
+    note_aircraft_state_for(&OWN_STRIP, state);
+    // The station's reach is OURS (`OUT_OF_REACH`, own-only): it follows
+    // our aircraft, never a traffic strip's.
+    let (lat, lon) = state.position().unwrap_or((f64::NAN, f64::NAN));
+    let on_ground = state.on_ground;
     let far = on_ground
         && active_station_range_nm(lat, lon).is_some_and(|d| d > GROUND_REACH_NM);
     let was = OUT_OF_REACH.swap(far, Relaxed);
@@ -347,5 +324,40 @@ pub fn note_aircraft_state(state: &AircraftState) {
         }
     } else if was && !far {
         sim::blackbox::record("atc", serde_json::json!({ "route": "reach", "out": false }));
+    }
+}
+
+/// [`note_aircraft_state`]'s strip half, for one flight: its fixes, the
+/// crew's own route at the liftoff, the IFR flight's end at the landing.
+/// A position that did not read is no position, as before.
+pub(super) fn note_aircraft_state_for(flight: &FlightStrip, state: &AircraftState) {
+    let (lat, lon) = state.position().unwrap_or((f64::NAN, f64::NAN));
+    let on_ground = state.on_ground;
+    // Where we are, for the go-around judgement's time to the threshold.
+    note_fix_for(flight, lat, lon, on_ground, state.at);
+    // The crew's own route and runway end at the liftoff: a departure's
+    // runway must never read as a cleared one at the destination (autoland
+    // takes the cleared runway).
+    if !on_ground {
+        let mut own = flight.self_taxi.lock().unwrap_or_else(|e| e.into_inner());
+        if own.take().is_some() {
+            *flight.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+    // An IFR flight ends at its landing: airborne since the clearance, the
+    // next ground contact retires it (never a region switch).
+    {
+        let mut ifr = flight.ifr_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = ifr.as_mut() {
+            if !on_ground {
+                f.airborne = true;
+            } else if f.airborne {
+                sim::blackbox::record(
+                    "atc",
+                    serde_json::json!({ "event": "ifr_flight_ended", "code": f.code, "why": "landed" }),
+                );
+                *ifr = None;
+            }
+        }
     }
 }

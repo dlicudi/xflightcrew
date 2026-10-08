@@ -435,3 +435,6 @@ mod book_tests;
 
 #[cfg(test)]
 mod strip_tests;
+
+#[cfg(test)]
+mod tick_tests;

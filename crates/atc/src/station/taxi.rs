@@ -460,6 +460,7 @@ pub fn first_designator(name: &str) -> &str {
 /// so nosing past a hold-short point onto a runway the route only ends
 /// NEAR still reads as an incursion (the route's nearest point there is the
 /// holding point, off the pavement).
+#[cfg_attr(not(test), allow(dead_code))] // the callers hold a strip (`_for`)
 pub(super) fn on_cleared_runway_crossing(lat: f64, lon: f64) -> bool {
     on_cleared_runway_crossing_for(&OWN_STRIP, lat, lon)
 }

@@ -305,10 +305,16 @@ impl RunwayBook {
     /// Another flight's strip holds the strip `end` is on WHOLE: lined up,
     /// cleared for takeoff, or cleared to land and not yet reported off.
     /// Nobody else lines up, departs or lands on it.
+    #[cfg_attr(not(test), allow(dead_code))] // the holds ask through strip_held_by_others
     pub(crate) fn held_by_another(&self, id: FlightId, end: &str) -> Option<&Claim> {
+        self.held_whole(end, Some(id))
+    }
+
+    /// A strip (other than `except`) holds the strip `end` is on WHOLE.
+    fn held_whole(&self, end: &str, except: Option<FlightId>) -> Option<&Claim> {
         let ours = strip(&self.runways, end)?;
         self.claims.iter().find(|c| {
-            matches!(&c.who, Claimant::Strip(f) if *f != id)
+            matches!(&c.who, Claimant::Strip(f) if Some(*f) != except)
                 && c.whole_strip
                 && matches!(c.kind, ClaimKind::Landing | ClaimKind::LineUp | ClaimKind::Takeoff)
                 && strip(&self.runways, &c.end).is_some_and(|r| std::ptr::eq(r, ours))
@@ -335,20 +341,37 @@ impl RunwayBook {
 /// wait for it as for an occupied runway. Nothing to read (and nothing
 /// locked past the map) while no traffic strip is open.
 pub(super) fn strip_held_by_traffic(runways: &[nav::Runway], end: &str) -> bool {
+    strip_held_by_others(runways, end, &OWN_STRIP)
+}
+
+/// [`strip_held_by_traffic`] for any flight's strip `me`: every OTHER strip
+/// is a claimant (ours too, for a traffic strip). For our strip, nothing is
+/// read past the map while no traffic strip is open.
+pub(super) fn strip_held_by_others(runways: &[nav::Runway], end: &str, me: &FlightStrip) -> bool {
     let traffic = traffic_strips();
-    if traffic.is_empty() {
+    if me.is_own() && traffic.is_empty() {
         return false;
     }
-    let entries: Vec<BookEntry<'_>> = traffic
-        .iter()
-        .map(|(n, s)| BookEntry {
-            id: FlightId::Traffic(*n),
-            strip: &**s,
+    let mut entries: Vec<BookEntry<'_>> = Vec::new();
+    if !me.is_own() {
+        entries.push(BookEntry {
+            id: FlightId::Own,
+            strip: &OWN_STRIP,
             state: None,
-        })
-        .collect();
+        });
+    }
+    entries.extend(
+        traffic
+            .iter()
+            .filter(|(_, s)| !std::ptr::eq(&**s, me))
+            .map(|(n, s)| BookEntry {
+                id: FlightId::Traffic(*n),
+                strip: &**s,
+                state: None,
+            }),
+    );
     RunwayBook::compute_on(runways.to_vec(), &entries)
-        .held_by_another(FlightId::Own, end)
+        .held_whole(end, None)
         .is_some()
 }
 

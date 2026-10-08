@@ -144,6 +144,26 @@ pub fn compliance_tick_facing(
     now: Instant,
     heading_true: Option<f64>,
 ) -> Option<ComplianceCall> {
+    let state = AircraftState {
+        alt_ft,
+        psi_deg: heading_true,
+        ..AircraftState::at_position(lat, lon, on_ground, gs_kts)
+    };
+    compliance_tick_for(&OWN_STRIP, &state, tuned, now)
+}
+
+/// [`compliance_tick_facing`] for one flight's strip: its clearance, its
+/// route, its coach and challenge cells. A position that did not read is no
+/// position, as before (no strip under it, no distance).
+pub(super) fn compliance_tick_for(
+    flight: &FlightStrip,
+    state: &AircraftState,
+    tuned: bool,
+    now: Instant,
+) -> Option<ComplianceCall> {
+    let (lat, lon) = state.position().unwrap_or((f64::NAN, f64::NAN));
+    let (alt_ft, on_ground, gs_kts, heading_true) =
+        (state.alt_ft, state.on_ground, state.gs_kts, state.psi_deg);
     if station_unavailable() {
         return None;
     }
@@ -153,7 +173,7 @@ pub fn compliance_tick_facing(
         (*la, *lo)
     };
     let dist_nm = crate::nav::haversine_nm(lat, lon, field_lat, field_lon);
-    let clr: Option<(tower::State, String)> = OWN_STRIP.clearance
+    let clr: Option<(tower::State, String)> = flight.clearance
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
@@ -170,7 +190,7 @@ pub fn compliance_tick_facing(
         w.airborne_since = None;
         // Down: the landing-clearance coach is moot, and a stale handoff must
         // not nag on the next takeoff.
-        *OWN_STRIP.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *flight.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
     } else if w.airborne_since.is_none() {
         w.airborne_since = Some(now);
     }
@@ -209,7 +229,7 @@ pub fn compliance_tick_facing(
     {
         w.cleared_to_land_seen = Some(now);
         // Cleared to land — the coach got what it was waiting for.
-        *OWN_STRIP.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *flight.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     let vacating = w
         .cleared_to_land_seen
@@ -286,7 +306,7 @@ pub fn compliance_tick_facing(
                 .is_some_and(|t| now.duration_since(t).as_secs_f64() < 45.0)
             && on_active_runway(lat, lon).is_none()
         {
-            let stray = OWN_STRIP.taxi_route
+            let stray = flight.taxi_route
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
@@ -319,7 +339,7 @@ pub fn compliance_tick_facing(
                 let line = if let Some(r) = fresh {
                     let via = spoken_via(&r.via).join(", ");
                     let hp = spoken_taxiway(&r.holding_point);
-                    *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaxiWatch {
+                    *flight.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaxiWatch {
                         path: r.path.clone(),
                         via: via.clone(),
                         seg: r.seg.clone(),
@@ -357,8 +377,8 @@ pub fn compliance_tick_facing(
         // incursion berate outright, and a bare flag that survived a swap or
         // a route-less clearance would switch that safety net off with
         // nothing to show the occupancy is part of a cleared drive.
-        let arrival_taxi = *OWN_STRIP.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner())
-            && OWN_STRIP.taxi_route
+        let arrival_taxi = *flight.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner())
+            && flight.taxi_route
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some();
@@ -390,7 +410,7 @@ pub fn compliance_tick_facing(
                 // a pilot following its own route, 2026-07-14). Holds for a
                 // DEPARTURE (state TaxiCleared) and an ARRIVAL taxi-in alike.
                 let cleared_taxi = *state == tower::State::TaxiCleared || arrival_taxi;
-                if cleared_taxi && on_cleared_runway_crossing(lat, lon) {
+                if cleared_taxi && on_cleared_runway_crossing_for(flight, lat, lon) {
                     if gs_kts < 3.0 {
                         w.last_call = Some(now);
                         // Crossing, the heading is square to the strip and
@@ -460,7 +480,7 @@ pub fn compliance_tick_facing(
             return Some(if tuned {
                 // The crew hears the question as data too: an inbound call is
                 // the answer when this is the destination's tower.
-                *OWN_STRIP.zone_challenge.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                *flight.zone_challenge.lock().unwrap_or_else(|e| e.into_inner()) = true;
                 ComplianceCall {
                     line: format!(
                         "Aircraft in the {zone_name} control zone, you are inside \
