@@ -450,7 +450,24 @@ impl TrafficAircraft {
             }
             Phase::Gone => {}
         }
+        self.gear_for_phase(field);
         self.phase_s += dt;
+    }
+
+    /// The gear, whatever flew this substep: down on the ground and on any
+    /// final, landing or go-around below 1,500 ft. The circuit lowered it on
+    /// its own legs only, so a straight-in arrival landed, rolled out and
+    /// taxied in with it up (LEMG, 2026-10-08, the pilot watching).
+    fn gear_for_phase(&mut self, field: &FieldModel) {
+        if !self.perf.retractable_gear {
+            self.kin.gear = 1.0;
+            return;
+        }
+        let low_approach = matches!(self.phase, Phase::Final | Phase::Landing)
+            || (self.phase == Phase::GoAround && self.agl_ft(field) < 1500.0);
+        if self.kin.on_ground || low_approach {
+            self.kin.gear = 1.0;
+        }
     }
 
     fn parked(

@@ -65,6 +65,8 @@ struct Score {
     trace: Vec<u64>,
     gone: bool,
     secs: f64,
+    /// Substeps flown on the ground or on a final or landing with the gear up.
+    gear_up_low: u32,
 }
 
 /// Fly `ac` at `field` until it is gone or `max_s` passes. `tower` may
@@ -110,6 +112,9 @@ fn fly(
             break;
         };
         let k = &ac.kin;
+        if (k.on_ground || matches!(ac.phase, Phase::Final | Phase::Landing)) && k.gear < 1.0 {
+            s.gear_up_low += 1;
+        }
         s.trace.extend([
             k.lat.to_bits(),
             k.lon.to_bits(),
@@ -486,6 +491,17 @@ fn a_straight_in_arrival_lands_and_parks() {
         "{:?}",
         s.calls
     );
+}
+
+/// A retractable straight-in arrival has its gear down from the final to
+/// the stand (LEMG, 2026-10-08: it landed and taxied in with it up).
+#[test]
+fn a_straight_in_arrival_lands_with_its_gear_down() {
+    let field = fixtures::xtst();
+    let ac = arrival(&field, 31, "AT72", true);
+    let s = fly(field, vec![ac], ScriptedTower::default(), 3600.0, 31);
+    assert!(s.phases.contains(&Phase::Parked), "{:?}", s.phases);
+    assert_eq!(s.gear_up_low, 0, "substeps with the gear up low or on the ground");
 }
 
 #[test]
