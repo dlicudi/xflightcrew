@@ -32,6 +32,10 @@ pub(crate) enum ClaimKind {
     Held,
     /// A cleared crossing on the route, moving.
     Crossing,
+    /// Cleared to cross the strip ("cross runway one three", the strip's
+    /// `crossing` cell): the whole strip, from the clearance until the flight
+    /// is seen off it again. Nobody lines up, departs or lands meanwhile.
+    CrossingCleared,
     /// Physically on the pavement, on the ground (authorised or not).
     Occupying,
     /// A runway start: the strip the aircraft first appeared on, stopped.
@@ -159,6 +163,27 @@ impl RunwayBook {
                     since: None,
                 });
             }
+        }
+        // A crossing the tower cleared holds the strip crossed, whole, from
+        // the clearance (the flight is still 20 m short of the pavement)
+        // until it is seen off it: the 2026-10-08 world sweep's ULMM, a
+        // takeoff released 6 s after two crossings were cleared of 13.
+        let crossing = e
+            .strip
+            .crossing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|c| c.0.clone());
+        if let Some(end) = crossing {
+            self.claims.push(Claim {
+                who: who.clone(),
+                end,
+                whole_strip: true,
+                kind: ClaimKind::CrossingCleared,
+                held: false,
+                since: None,
+            });
         }
         let Some(state) = e.state else {
             return;
@@ -306,13 +331,16 @@ impl RunwayBook {
                         == Some(here.as_str())
             }
             ClaimKind::RunwayStart | ClaimKind::Vacating | ClaimKind::Crossing => true,
+            ClaimKind::CrossingCleared => {
+                strip(&self.runways, &c.end).map(|r| r.ident_a.as_str()) == Some(here.as_str())
+            }
             _ => false,
         })
     }
 
     /// Another flight's strip holds the strip `end` is on WHOLE: lined up,
-    /// cleared for takeoff, or cleared to land and not yet reported off.
-    /// Nobody else lines up, departs or lands on it.
+    /// cleared for takeoff, cleared to land and not yet reported off, or
+    /// cleared to cross it. Nobody else lines up, departs or lands on it.
     #[cfg_attr(not(test), allow(dead_code))] // the holds ask through strip_held_by_others
     pub(crate) fn held_by_another(&self, id: FlightId, end: &str) -> Option<&Claim> {
         self.held_whole(end, Some(id))
@@ -333,13 +361,20 @@ impl RunwayBook {
         })
     }
 
-    /// A strip (other than `except`) holds the strip `end` is on WHOLE.
+    /// A strip (other than `except`) holds the strip `end` is on WHOLE:
+    /// lined up, cleared for takeoff, cleared to land, or cleared to cross.
     fn held_whole(&self, end: &str, except: Option<FlightId>) -> Option<&Claim> {
         let ours = strip(&self.runways, end)?;
         self.claims.iter().find(|c| {
             matches!(&c.who, Claimant::Strip(f) if Some(*f) != except)
                 && c.whole_strip
-                && matches!(c.kind, ClaimKind::Landing | ClaimKind::LineUp | ClaimKind::Takeoff)
+                && matches!(
+                    c.kind,
+                    ClaimKind::Landing
+                        | ClaimKind::LineUp
+                        | ClaimKind::Takeoff
+                        | ClaimKind::CrossingCleared
+                )
                 && strip(&self.runways, &c.end).is_some_and(|r| std::ptr::eq(r, ours))
         })
     }
@@ -446,8 +481,8 @@ pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bo
 /// cannot stand together now, described ("Traffic(1) Takeoff 09 / Traffic(2)
 /// Occupying 09"), with our state where the caller holds it. Two flights
 /// each holding the whole strip (lined up, cleared for takeoff, cleared to
-/// land and not reported off), or one cleared for takeoff on a strip
-/// another stands on. Empty is a clean book. A read for tests and the
+/// land and not reported off, cleared to cross), or one cleared for takeoff
+/// on a strip another stands on. Empty is a clean book. A read for tests and the
 /// traffic harness (a field hour has zero), never a decision.
 pub fn runway_conflicts(own: Option<AircraftState>) -> Vec<String> {
     let book = RunwayBook::now(own);
@@ -455,7 +490,10 @@ pub fn runway_conflicts(own: Option<AircraftState>) -> Vec<String> {
         c.whole_strip
             && matches!(
                 c.kind,
-                ClaimKind::Landing | ClaimKind::LineUp | ClaimKind::Takeoff
+                ClaimKind::Landing
+                    | ClaimKind::LineUp
+                    | ClaimKind::Takeoff
+                    | ClaimKind::CrossingCleared
             )
     };
     let same_strip = |a: &Claim, b: &Claim| {

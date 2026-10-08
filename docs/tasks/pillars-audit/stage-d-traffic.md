@@ -664,3 +664,30 @@ all 150 (985 movements, 1,256 calls: the crossing requests).
   process: `ulmm_traffic_holds_short_of_the_runway_it_crosses`,
   `bieg_taxi_in_holds_short_of_the_runway_it_landed_on` (both failed with the crossing cut
   disabled).
+
+**B. A takeoff cleared on a strip another flight stands on** (ULMM 13, BIEG 03 with a
+flight on 21).
+- Root cause, in the sweep's ten minutes: the same crossings as A. ULMM's departures crossed
+  13 to reach its holds under a takeoff clearance on 13; BIEG's 737 vacated 03 on the far side
+  and its taxi in ("taxi to parking one, cross runway zero three") crossed the strip while the
+  takeoff hold released a departure ("traffic clear, cleared for takeoff") that had been held
+  for it: nobody was on the pavement YET. Fixed by A's crossing request.
+- Root cause left behind A, found by flying ULMM's schedule to the end (three hours): the
+  tower cleared two crossings of 13 and the takeoff hold released a departure on 13 six
+  seconds later, the crossers still 20 m short of the pavement. A cleared crossing claimed
+  nothing in the runway book until the flight was ON the strip.
+- Fix (tower side): the strip's `crossing` cell is a book claim, `ClaimKind::CrossingCleared`,
+  the WHOLE strip, from the clearance until the flight is seen off it again. It is one of the
+  whole-strip kinds (`held_whole`, so `blocked`, `strip_held_by_others`, the reply's
+  `runway_occupied`, the takeoff hold's and the landing hold's releases, the crossing judgement
+  itself: one crossing of a strip at a time), and of the audit's (`runway_conflicts`: a takeoff,
+  a line-up, a landing or another crossing beside it is a conflict). `occupancy_authorised` takes
+  it for the strip it names. Ours never holds the cell unless our pilot asks to cross, so the
+  stage C pins (`the_runway_book_answers_as_the_functions_it_replaced`, 78,080 cells) and our
+  flight are unchanged.
+- Tests: `a_cleared_crossing_holds_the_strip_against_a_takeoff` (cleared 80 m short of 26L,
+  ready for departure is held, three release ticks hold, across and off the far side the
+  departure goes), `the_book_audits_a_takeoff_over_a_cleared_crossing` (either end, not the
+  twin, the audit names it), and `ulmm_traffic_holds_short_of_the_runway_it_crosses` now flies
+  the schedule to its end (every movement completes, zero conflicts, a silent oracle); it
+  failed at 2,551 s without the claim.

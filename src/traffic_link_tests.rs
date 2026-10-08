@@ -377,7 +377,11 @@ const ULMM_APPROACHES: [&str; 14] = [
 /// 13 with a flight crossing it) and the oracle's "you are on runway three
 /// one without clearance" at the pavement's edge. Now each flight holds
 /// short, asks, and is held while the strip is busy. The sweep's own
-/// schedule (seed 3) on the real layout, flown to the end.
+/// schedule (seed 3) on the real layout, flown to the END (three hours):
+/// past the sweep's ten minutes the takeoff hold released a departure onto
+/// 13 six seconds after two crossings of it were cleared, the crossers
+/// still short of the pavement, until a cleared crossing held the strip in
+/// the book.
 #[test]
 fn ulmm_traffic_holds_short_of_the_runway_it_crosses() {
     in_own_process("traffic_link::tests::ulmm_traffic_holds_short_inner");
@@ -391,7 +395,7 @@ fn ulmm_traffic_holds_short_inner() {
     }
     let (field, mut st, _) = fixture_field("ULMM", &ULMM_SIDS, &ULMM_APPROACHES);
     let schedule = traffic::generate(&field, Density::Normal, 3, &SpawnCtx::default());
-    let s = fly_field(&mut st, field, schedule, SWEEP_S);
+    let s = fly_field(&mut st, field, schedule, 3.0 * 3600.0);
     assert!(
         s.said
             .iter()
@@ -405,7 +409,7 @@ fn ulmm_traffic_holds_short_inner() {
             .any(|l| l.ends_with("cross runway one three.")),
         "and cleared once it was free"
     );
-    assert_sweep_clean(&s, "ULMM crossings");
+    assert_clean(&s, "ULMM crossings");
     Station::uninstall();
 }
 
