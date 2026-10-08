@@ -305,7 +305,15 @@ public:
             eng_rpm = on_ground ? 1000.0f + 15.0f * p.gs_kts : 2300.0f;
             if (eng_rpm > 2300.0f) eng_rpm = 2300.0f;
         }
-        SetThrustRatio(on_ground ? std::fmin(1.0f, p.gs_kts / 140.0f) : 0.7f);
+        // XPMP2 scales the engine sound by the thrust ratio: idle is audible
+        // (0.3), the roll builds to full at 140 kt, the air holds 0.8; engines
+        // off are silent. gs/140 alone left a taxiing jet near silent (0.07 at
+        // 10 kt; the pilot heard it "very low", 2026-10-08).
+        float thrust = 0.0f;
+        if (p.flags & traffic_wire::kFlagEngines) {
+            thrust = on_ground ? std::fmin(1.0f, 0.3f + 0.7f * p.gs_kts / 140.0f) : 0.8f;
+        }
+        SetThrustRatio(thrust);
         SetTireRotRpm(tyre_rpm);
         SetEngineRotRpm(eng_rpm);
         SetPropRotRpm(eng_rpm);
