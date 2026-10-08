@@ -91,7 +91,7 @@ impl Station {
         // taxi (or the join) it bought freezes the pick on it from here.
         if service == Service::Tower && intent == tower::Intent::RequestRunway {
             if let Some(ident) = self.desk.call.requested_ident.take() {
-                if ctx.runway_refusal.is_none() {
+                if ctx.runway_refusal.is_none() && self.traffic_may_set_runway() {
                     tracing::info!(runway = %ident, "runway request granted");
                     self.runway_in_use = Some(ident);
                 }
@@ -361,7 +361,9 @@ impl Station {
             .take();
         if let Some((from, to)) = &reseq {
             tracing::info!(%from, %to, "arrival re-sequenced after a go-around");
-            self.runway_in_use = Some(to.clone());
+            if self.traffic_may_set_runway() {
+                self.runway_in_use = Some(to.clone());
+            }
             self.desk.call.stated_runway = None;
         }
         self.desk.resequenced = reseq.clone();

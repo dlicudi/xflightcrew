@@ -111,6 +111,11 @@ pub struct Station {
     /// files): the IFR clearance picks the SID that leaves toward the
     /// destination (`nav::sid_toward`), else the first in the file.
     sid_exits: std::sync::Arc<Mutex<Option<Vec<nav::SidExit>>>>,
+    /// The pressure phrase our last call's context was given
+    /// ([`Station::build_ctx`] reads the sim), for a traffic call's context,
+    /// which reads nothing ([`Station::traffic_ctx`]). `None` until ours has
+    /// been answered once with a pressure that read.
+    last_qnh: Option<String>,
 }
 
 /// The desk half of a flight's strip: what the station keeps, between calls,
@@ -327,6 +332,7 @@ impl Station {
             dialect: Dialect::Icao,
             procedures: None,
             sid_exits: Default::default(),
+            last_qnh: None,
         })
     }
 
@@ -440,3 +446,6 @@ mod strip_tests;
 
 #[cfg(test)]
 mod tick_tests;
+
+#[cfg(test)]
+mod traffic_tests;

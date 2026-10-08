@@ -187,6 +187,32 @@ impl Station {
         arrival_end: Option<&str>,
         departure_end: Option<&str>,
     ) -> String {
+        // THE RUNWAY IN USE IS THE FIELD'S, OURS TO MOVE: a traffic flight
+        // is given it, whatever it stated, and none of the writes below run
+        // for it ([`Station::traffic_may_set_runway`]); the one exception is
+        // a field with no runway in use yet, which its pick initialises.
+        if self.desk.strip.is_traffic() {
+            if let Some(in_use) = self.runway_in_use.clone() {
+                self.desk.call.stated_on_strip = false;
+                self.desk.call.stated_runway = None;
+                return in_use;
+            }
+            let ident = self.pick_runway_for_field(wind_from, wind_kts, arrival_end, departure_end);
+            self.note_traffic_initialised_runway(&ident);
+            return ident;
+        }
+        self.pick_runway_for_field(wind_from, wind_kts, arrival_end, departure_end)
+    }
+
+    /// The pick itself ([`Station::pick_runway_with`]), free to write the
+    /// runway in use.
+    fn pick_runway_for_field(
+        &mut self,
+        wind_from: f64,
+        wind_kts: f64,
+        arrival_end: Option<&str>,
+        departure_end: Option<&str>,
+    ) -> String {
         // The stream the field is working: arrivals first (where the traffic
         // is landing is what the field IS), else the last departures.
         let stream_end = arrival_end
@@ -394,6 +420,26 @@ impl Station {
             }
         }
         self.runway_in_use.clone().unwrap_or_default()
+    }
+
+    /// A traffic flight may write the runway in use only while the field has
+    /// none ([`Station::pick_runway_with`]): every other write of it is
+    /// ours. Logged when it does.
+    pub(super) fn traffic_may_set_runway(&self) -> bool {
+        !self.desk.strip.is_traffic() || self.runway_in_use.is_none()
+    }
+
+    /// A traffic call's pick gave the field its first runway in use.
+    fn note_traffic_initialised_runway(&self, ident: &str) {
+        if ident.is_empty() {
+            return;
+        }
+        tracing::info!(runway = %ident, "runway in use initialised by a traffic call");
+        sim::blackbox::record(
+            "atc",
+            serde_json::json!({"event": "runway_in_use_initialised", "by": "traffic",
+                "runway": ident}),
+        );
     }
 
     /// A departure from `ident` gets onto the strip on its threshold's half

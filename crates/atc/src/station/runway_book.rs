@@ -363,6 +363,7 @@ pub(super) fn seen(strip: &FlightStrip) -> Option<AircraftState> {
 /// takeoff and released holds wait for it as for an occupied runway.
 /// Nothing to read (and nothing locked past the map) while no traffic strip
 /// is open.
+#[cfg_attr(not(test), allow(dead_code))] // the reply path asks per strip
 pub(super) fn strip_held_by_traffic(runways: &[nav::Runway], end: &str) -> bool {
     strip_held_by_others(runways, end, &OWN_STRIP)
 }

@@ -109,8 +109,10 @@ lifetime_group! {
     /// The field's traffic strips (`STRIPS`): a new station is a new field's
     /// traffic, and a new flight of OURS is not the traffic's, so `install`
     /// and `uninstall` clear them and `retire_for_new_flight` never does.
+    /// The calls they posted and the station has not answered die with them.
     pub(crate) struct TrafficStrips {
         STRIPS,
+        TRAFFIC_CALLS,
     }
 }
 
@@ -620,6 +622,8 @@ mod tests {
         // New with our own traffic (stage D, increment 4): where a traffic
         // flight was last seen, a strip `watch` cell (never written on ours).
         install.extend(names(&["SEEN"]));
+        // ...and the traffic's calls not yet answered (increment 5).
+        install.extend(names(&["TRAFFIC_CALLS"]));
         assert_eq!(door_cells(INSTALL_RESETS), install, "install");
 
         let mut uninstall = install.clone();

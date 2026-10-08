@@ -310,7 +310,6 @@ impl Station {
     /// guard, so nothing can leave a traffic desk on frequency. Its replies
     /// write its own strip's cells. `None` for a traffic number with no open
     /// strip.
-    #[cfg_attr(not(test), allow(dead_code))] // the traffic producer calls it (stage D)
     pub(super) fn respond_for(
         &mut self,
         id: FlightId,
@@ -319,15 +318,30 @@ impl Station {
         ctx: &tower::Ctx,
         wx: Wx,
     ) -> Option<String> {
+        self.with_desk(id, |st| st.route_keyed(transcript, service, ctx, wx))
+    }
+
+    /// Run `f` with this flight's desk on frequency: ours is already there;
+    /// a traffic flight's is swapped in (a fresh one for a strip it has not
+    /// worked, or for a strip reopened since its desk was parked) and parked
+    /// again on the way out by the drop guard, on every path. Synchronous by
+    /// construction: nothing can await inside `f`. `None` for a traffic
+    /// number with no open strip.
+    pub(super) fn with_desk<R>(
+        &mut self,
+        id: FlightId,
+        f: impl FnOnce(&mut Station) -> R,
+    ) -> Option<R> {
         let FlightId::Traffic(n) = id else {
-            return Some(self.route_keyed(transcript, service, ctx, wx));
+            return Some(f(self));
         };
+        let open = traffic_strip(n)?;
         let desk = match self.desks.remove(&id) {
-            Some(d) => d,
-            None => StripDesk::for_strip(StripRef::Traffic(traffic_strip(n)?)),
+            Some(d) if matches!(&d.strip, StripRef::Traffic(s) if std::sync::Arc::ptr_eq(s, &open)) => d,
+            _ => StripDesk::for_strip(StripRef::Traffic(open)),
         };
         let swap = DeskSwap::new(self, id, desk);
-        Some(swap.st.route_keyed(transcript, service, ctx, wx))
+        Some(f(&mut *swap.st))
     }
 
     /// The voice of whichever of this station's positions COM1 is tuned to.

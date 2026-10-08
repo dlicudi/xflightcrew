@@ -205,3 +205,27 @@ with ATC off (parked aircraft drawn only); any `pub static` for traffic.
   clearance only (no position of ours is held in a cell): our position reaches a traffic tick
   through the picture it is handed. `seen` never goes stale by itself: the producer retires a
   strip it despawns (increment 6).
+- **Increment 5**: the picture travels WITH the call: `TrafficCall { id, spoken, text, state,
+  picture: Vec<TrafficTarget> }`, a `TrafficTarget { who: FlightId, target: TcasTarget }` per
+  other aircraft (ours `FlightId::Own`), posted by the producer with what it saw when it keyed;
+  `TrafficReply { id, line, speaker }`, `line` empty for an accepted readback. The types are in
+  `atc::world` and on the party line's type list; `answer_traffic` is a `pub` method of the
+  `Station` the party line names (no free accessor: the command loop owns the `Station`).
+  `traffic_ctx(state, spoken, intent, picture)` takes the picture as its fourth argument.
+  `build_ctx` is split: the sim reads and the field's writes (ghost memory, `TOWER_WIND`, the new
+  `Station.last_qnh`) stay in it, everything after goes to `ctx_for_call`, which both contexts
+  end in (it ends in `make_ctx`); the order of the desk's own writes is unchanged.
+  `answer_traffic` builds the context with the traffic desk on frequency (`with_desk`, the
+  `DeskSwap` door `respond_for` now goes through) and then calls `respond_for`: two swaps, the
+  call's scratch carried in the parked desk between them. A parked desk whose strip was closed
+  and reopened is replaced by a fresh one. The runway-in-use guard is ONE early return at the
+  top of `pick_runway_with` (a traffic desk is given the runway in use and its stated runway is
+  dropped; with none in use the pick runs and is logged, `runway_in_use_initialised` `by:
+  traffic`), plus `traffic_may_set_runway` on the two writes in `respond.rs`. `TOWER_WIND`,
+  `note_ground_traffic` and `last_qnh` are written only in `build_ctx`, which a traffic call
+  never runs; the ATIS letter has no writer on any reply path (only `atis_tick`), so its guard
+  is the test. `make_ctx`'s `runway_occupied` asks the book for the desk's own strip
+  (`strip_held_by_others(.., &self.desk.strip)`, identical for ours) and the reply's
+  `departure_strip_occupied` became `departure_strip_occupied_for(strip, ..)` (the hold read is
+  the desk's strip's). The inbox is `TRAFFIC_CALLS` in the `TrafficStrips` group (the door test
+  lists it).

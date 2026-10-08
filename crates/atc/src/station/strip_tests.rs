@@ -40,6 +40,7 @@ pub(super) fn gatwick() -> Station {
         dialect: Dialect::Icao,
         procedures: None,
         sid_exits: Default::default(),
+        last_qnh: None,
     }
 }
 

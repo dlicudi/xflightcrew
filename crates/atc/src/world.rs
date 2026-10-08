@@ -30,8 +30,12 @@ pub use crate::station::{
 };
 
 /// Our own AI traffic (stage D): where each traffic flight is, by its
-/// stable number.
-pub use crate::station::note_traffic_state;
+/// stable number; the calls it keys, as text, through an inbox the command
+/// loop drains (`party_line::Station::answer_traffic` answers each).
+pub use crate::station::{
+    note_traffic_state, post_traffic_call, take_traffic_calls, TrafficCall, TrafficReply,
+    TrafficTarget,
+};
 
 /// Traffic: the TCAS read, the near-miss and the traffic advisory.
 pub use crate::station::{

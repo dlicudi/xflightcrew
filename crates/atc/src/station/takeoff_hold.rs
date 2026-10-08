@@ -275,14 +275,17 @@ pub(super) fn departure_strip_picture(
 
 /// [`departure_strip_picture`]'s verdict for the tower's reply: the hold
 /// standing on this runway (if any) says who it was held for.
-pub(super) fn departure_strip_occupied(
+/// Asked for the flight whose strip `flight` is (ours, or a traffic flight's
+/// answered on its own desk).
+pub(super) fn departure_strip_occupied_for(
+    flight: &FlightStrip,
     r: &nav::Runway,
     departure_end: &str,
     targets: &[TcasTarget],
     own: Option<(f64, f64)>,
     now: Instant,
 ) -> bool {
-    let held_for = OWN_STRIP.takeoff_hold
+    let held_for = flight.takeoff_hold
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
@@ -292,7 +295,7 @@ pub(super) fn departure_strip_occupied(
 }
 
 /// One pass of the held-clearance watch with our own position (`own`, for
-/// the occupant behind our tail; see [`departure_strip_occupied`]).
+/// the occupant behind our tail; see [`departure_strip_occupied_for`]).
 pub fn takeoff_hold_tick_from(
     targets: &[TcasTarget],
     field_elev_ft: f64,

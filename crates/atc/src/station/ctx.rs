@@ -75,20 +75,12 @@ impl Station {
             .await
             .map(|r| r.spoken)
             .unwrap_or_else(|| "aircraft calling".to_string());
-        let on_ground = state.on_ground;
-        // An IFR clearance's runway is held for its departure only: airborne
-        // it has been flown (or abandoned), and the pick is free again.
-        // So is a runway start's strip (`start_strip`).
-        if !on_ground {
-            self.desk.ifr_runway = None;
-            self.desk.start_strip = None;
-        }
         // The wind a tower reads out and picks its runway by is the wind ON
         // THE FIELD. The sim's wind datarefs are the air the aircraft is in:
         // for a caller on the ground the same thing, for an arrival at
         // 2,700 ft the winds aloft (350 at 8 against the field's 190 at 3,
         // EGTE 2026-09-21: crew and tower picked opposite ends).
-        if !on_ground {
+        if !state.on_ground {
             if let Some((from, kts)) = surface_wind_at(self.apt.position()) {
                 wx.wind_from_deg = from;
                 wx.wind_kts = kts;
@@ -97,18 +89,51 @@ impl Station {
         // The controller's own traffic picture, read once per call: an
         // arrival in OUR runway's corridor gates takeoff clearances and
         // sequences downwind joins; a ghost ON the strip blocks line-ups.
-        // Restricted to the strip in use — the runway-blind version held a
+        // Restricted to the strip in use: the runway-blind version held a
         // Heathrow 09R departure for the 09L stream, indefinitely
         // (2026-07-10).
         let targets = read_tcas_targets(xp).await;
         let now = Instant::now();
+        // The FIELD's facts, ours to write: the ghost memory, the wind the
+        // tower worked with and the pressure it gave (a traffic call's ctx
+        // reads the last two, `Station::traffic_ctx`).
         note_ground_traffic(&targets, now);
         *TOWER_WIND.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((wx.wind_from_deg, wx.wind_kts));
+        if !qnh.is_empty() {
+            self.last_qnh = Some(qnh.clone());
+        }
+        self.ctx_for_call(&state, wx, qnh, callsign, intent, &targets, now)
+    }
+
+    /// The desk half of a call's context, after the field's reads (ours in
+    /// [`Station::build_ctx`], a traffic flight's in
+    /// [`Station::traffic_ctx`]): the runway pick, the traffic on it, the
+    /// taxi route from where the caller is, ending in [`Station::make_ctx`].
+    /// Writes nothing of the field's but through the pick.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ctx_for_call(
+        &mut self,
+        state: &AircraftState,
+        wx: Wx,
+        qnh: String,
+        callsign: String,
+        intent: tower::Intent,
+        targets: &[TcasTarget],
+        now: Instant,
+    ) -> (tower::Ctx, Wx) {
+        let on_ground = state.on_ground;
+        // An IFR clearance's runway is held for its departure only: airborne
+        // it has been flown (or abandoned), and the pick is free again.
+        // So is a runway start's strip (`start_strip`).
+        if !on_ground {
+            self.desk.ifr_runway = None;
+            self.desk.start_strip = None;
+        }
         // The live lander on final, else the remembered touchdowns (#164).
         let (arrival_end, departure_end) = field_streams(
             &self.apt.runways,
-            arrival_end(&targets, &self.apt.runways, self.apt.elev_ft),
+            arrival_end(targets, &self.apt.runways, self.apt.elev_ft),
             now,
         );
         if on_ground && self.desk.call.stated_runway.is_some() {
@@ -138,8 +163,8 @@ impl Station {
                 // The landing judgement's own test: on the pavement and not
                 // stale data (`occupies`, issue #162); a departure standing
                 // on the strip is not held by a ghost behind its tail (#172).
-                let occupied = departure_strip_occupied(&r, &ident, &targets, own, now);
-                (final_traffic_for(&targets, &r, &self.apt.runways, self.apt.elev_ft), occupied)
+                let occupied = departure_strip_occupied_for(&self.desk.strip, &r, &ident, targets, own, now);
+                (final_traffic_for(targets, &r, &self.apt.runways, self.apt.elev_ft), occupied)
             }
             None => (None, false),
         };
@@ -211,11 +236,12 @@ impl Station {
         wake_secs_left: Option<u64>,
     ) -> tower::Ctx {
         let runway = self.pick_runway(wx.wind_from_deg, wx.wind_kts);
-        // A traffic strip the tower has cleared onto (or to land on) our
-        // runway occupies it, by the book's clearance, before any ghost is
-        // seen on the pavement: our line-up, takeoff and landing wait for it.
+        // Another strip the tower has cleared onto (or to land on) the
+        // runway, or one standing on it, occupies it, by the book, before
+        // any ghost is seen on the pavement: the caller's line-up, takeoff
+        // and landing wait for it (ours for a traffic strip, theirs for us).
         let runway_occupied =
-            runway_occupied || strip_held_by_traffic(&self.apt.runways, &runway);
+            runway_occupied || strip_held_by_others(&self.apt.runways, &runway, &self.desk.strip);
         // "With information X" matching the current broadcast: the clearance
         // skips the QNH — having the numbers is the whole point of an ATIS.
         // A stale or absent letter keeps them (safety over brevity).

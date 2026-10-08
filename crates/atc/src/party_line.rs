@@ -947,7 +947,12 @@ pub use crate::station::{
 };
 
 /// The station's TYPES the crew names: the `Station` the command loop owns
-/// (`load`, `from_airport`, `install`, `uninstall`), the cleared taxi route
-/// (`TaxiWatch`), the departure's station (`DepartureStation`), a field in
-/// range (`RangedField`) and a tune request's answer (`Tune`).
-pub use crate::station::{DepartureStation, RangedField, Station, TaxiWatch, Tune};
+/// (`load`, `from_airport`, `install`, `uninstall`, and `answer_traffic`
+/// for our own AI traffic's calls), the cleared taxi route (`TaxiWatch`),
+/// the departure's station (`DepartureStation`), a field in range
+/// (`RangedField`), a tune request's answer (`Tune`), and a traffic call and
+/// its answer (`TrafficCall`, `TrafficReply`, `TrafficTarget`).
+pub use crate::station::{
+    DepartureStation, RangedField, Station, TaxiWatch, TrafficCall, TrafficReply, TrafficTarget,
+    Tune,
+};
