@@ -342,8 +342,9 @@ private:
 
 // The CSL folders are the pilot's and read-only for us: XPMP2 writes no
 // .xpmp2.obj copies (replace_texture and replace_datarefs off), so a CSL that
-// names a livery texture shows its base texture. No network (remote off), no
-// sound in v1.
+// names a livery texture shows its base texture. No network (remote off).
+// Sound on, through X-Plane 12's own sound API (no FMOD is compiled in): the
+// pilot heard LiveTraffic's engines and heard ours silent (2026-10-08).
 int Prefs(const char* section, const char* key, int dflt) {
     (void)section;
     if (!std::strcmp(key, XPMP_CFG_ITM_REPLDATAREFS)) return 0;
@@ -351,7 +352,7 @@ int Prefs(const char* section, const char* key, int dflt) {
     if (!std::strcmp(key, XPMP_CFG_ITM_CLAMPALL)) return 1;
     if (!std::strcmp(key, XPMP_CFG_ITM_HANDLE_DUP_ID)) return 1;
     if (!std::strcmp(key, XPMP_CFG_ITM_SUPPORT_REMOTE)) return -1;
-    if (!std::strcmp(key, XPMP_CFG_ITM_ACTIVATE_SOUND)) return 0;
+    if (!std::strcmp(key, XPMP_CFG_ITM_ACTIVATE_SOUND)) return 1;
     if (!std::strcmp(key, XPMP_CFG_ITM_LOGLEVEL)) return 2;
     if (!std::strcmp(key, XPMP_CFG_ITM_MODELMATCHING)) return 0;
     return dflt;

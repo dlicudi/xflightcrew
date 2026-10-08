@@ -132,6 +132,21 @@ pub(crate) struct Link {
 /// has been cleared) it waits this long, then takes the field's default.
 const ARRIVAL_WAIT_S: f64 = 120.0;
 
+/// The station's runway in use, as the command loop last saw it: traffic
+/// spawns for it before the tower has cleared anyone (the link learnt the
+/// runway only from orders, so traffic flew the plan's 13 under a tower on 12,
+/// LEMG, 2026-10-08). Overwritten every command-loop turn.
+static STATION_RUNWAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Note the station's runway in use (the command loop, each turn).
+pub(crate) fn note_station_runway(r: Option<&str>) {
+    *STATION_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()) = r.map(str::to_string);
+}
+
+fn station_runway() -> Option<String> {
+    STATION_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 impl Link {
     /// The fleet at `field`, flying `schedule` (times from now).
     pub(crate) fn new(field: FieldModel, schedule: Vec<Movement>, tower_name: &str) -> Link {
@@ -349,7 +364,8 @@ impl Link {
         let mut later = Vec::new();
         while self.due.first().is_some_and(|d| d.at_s <= now_s) {
             let mut d = self.due.remove(0);
-            match &self.tower_runway {
+            let runway = self.tower_runway.clone().or_else(station_runway);
+            match &runway {
                 Some(r) if self.fleet.field.end(r).is_some() => d.m.runway = r.clone(),
                 None if d.m.kind == traffic::MovementKind::Arrival
                     && now_s < d.m.t_s + ARRIVAL_WAIT_S =>

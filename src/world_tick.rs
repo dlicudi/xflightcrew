@@ -524,8 +524,14 @@ impl WorldTick {
             // taxi, most of it stationary (same day). Stopped, no cue
             // is imminent; chatter is welcome. Calls addressed to US
             // (compliance, hold releases) are unaffected either way.
-            let chatter_on =
-                atc_chatter && tower_tuned && (taxi_guide_idle || snap.groundspeed_kts < 3.0);
+            // Our own traffic speaks for itself: under `ours` the TCAS slots
+            // hold OUR aircraft, and narrating them as ghosts said every
+            // arrival twice, on the station's runway 12 while it flew 13
+            // (LEMG, 2026-10-08). The ghost party line is `real` traffic's.
+            let chatter_on = atc_chatter
+                && tower_tuned
+                && (taxi_guide_idle || snap.groundspeed_kts < 3.0)
+                && crate::traffic_link::TrafficMode::now() != crate::traffic_link::TrafficMode::Ours;
             // The wake watch needs the TCAS picture while the pilot
             // is on the tower frequency on the ground — a heavy
             // rotating ahead of you starts a clock whether or not

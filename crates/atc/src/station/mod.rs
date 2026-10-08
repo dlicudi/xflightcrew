@@ -283,6 +283,12 @@ pub fn spoken_pressure(pascals: f64, dialect: Dialect) -> String {
 }
 
 impl Station {
+    /// The runway the tower is using (None until something picks one): read
+    /// by the crew's traffic link so traffic spawns for the tower's runway.
+    pub fn runway_in_use(&self) -> Option<&str> {
+        self.runway_in_use.as_deref()
+    }
+
     /// Load the station for `icao` from apt.dat. `None` (with a log line) when
     /// the field is missing or has no tower frequency — the copilot then runs
     /// exactly as before the merge.
