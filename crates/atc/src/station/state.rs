@@ -589,6 +589,9 @@ mod tests {
             "LANDING_HANDOFF",
             "ASSIGNED_SQUAWK",
             "IFR_CLEARANCE",
+            // New with our own traffic (stage D, increment 6): the flight's
+            // place in the landing sequence, a strip `facts` cell.
+            "SEQUENCE",
         ];
         let station_flight = [
             "SQUAWK_WATCH",

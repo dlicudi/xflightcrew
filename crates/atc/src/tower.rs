@@ -199,6 +199,11 @@ pub struct Ctx {
     /// legal with ONE intervening aircraft ("behind the landing traffic" is
     /// ambiguous against a stream).
     pub final_traffic_count: usize,
+    /// Which flight that nearest arrival is, when the picture names it
+    /// (our own AI traffic, stage D: a traffic flight's picture names ours
+    /// and the other traffic). `None` for a ghost or with no traffic: the
+    /// "number two, follow the traffic" leader a traffic flight follows.
+    pub final_traffic_id: Option<crate::party_line::FlightId>,
     /// A ghost is ON our strip (on the ground): nobody lines up onto an
     /// occupied runway.
     pub runway_occupied: bool,

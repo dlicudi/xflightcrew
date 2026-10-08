@@ -103,14 +103,16 @@ impl Station {
         if !qnh.is_empty() {
             self.last_qnh = Some(qnh.clone());
         }
-        self.ctx_for_call(&state, wx, qnh, callsign, intent, &targets, now)
+        self.ctx_for_call(&state, wx, qnh, callsign, intent, &targets, &[], now)
     }
 
     /// The desk half of a call's context, after the field's reads (ours in
     /// [`Station::build_ctx`], a traffic flight's in
     /// [`Station::traffic_ctx`]): the runway pick, the traffic on it, the
     /// taxi route from where the caller is, ending in [`Station::make_ctx`].
-    /// Writes nothing of the field's but through the pick.
+    /// Writes nothing of the field's but through the pick. `ids` names the
+    /// flights in `targets` that the picture knows (by raw callsign): the
+    /// nearest arrival's becomes `final_traffic_id`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn ctx_for_call(
         &mut self,
@@ -120,6 +122,7 @@ impl Station {
         callsign: String,
         intent: tower::Intent,
         targets: &[TcasTarget],
+        ids: &[(&str, FlightId)],
         now: Instant,
     ) -> (tower::Ctx, Wx) {
         let on_ground = state.on_ground;
@@ -168,6 +171,11 @@ impl Station {
             }
             None => (None, false),
         };
+        let final_traffic_id = final_traffic
+            .as_ref()
+            .and_then(|f| f.ghosts.first())
+            .and_then(|nearest| ids.iter().find(|(cs, _)| cs == nearest))
+            .map(|(_, who)| *who);
         let wake_secs_left = if on_ground {
             wake_remaining(&ident, Instant::now())
         } else {
@@ -214,6 +222,7 @@ impl Station {
             wake_secs_left,
         );
         ctx.own_on_runway = own_on_runway;
+        ctx.final_traffic_id = final_traffic_id;
         if intent == tower::Intent::RequestRunway {
             self.apply_runway_request(&mut ctx, pos);
         }
@@ -278,6 +287,8 @@ impl Station {
             final_traffic_nm: final_traffic.as_ref().map(|f| f.nm),
             final_traffic_callsign: final_traffic.as_ref().and_then(|f| f.callsign.clone()),
             final_traffic_count: final_traffic.as_ref().map(|f| f.count).unwrap_or(0),
+            // Named by the caller's picture where it can (`ctx_for_call`).
+            final_traffic_id: None,
             runway_occupied,
             wake_secs_left,
             taxi_via: route.map(|r| spoken_via(&r.via)).unwrap_or_default(),

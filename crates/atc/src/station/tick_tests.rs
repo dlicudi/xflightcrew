@@ -39,7 +39,9 @@ pub(super) fn own_strip_moved() -> Vec<&'static str> {
         pending_resequence,
         self_taxi,
         ifr_flight,
-        go_around_last
+        go_around_last,
+        sequence,
+        seen
     );
     set!(
         taxi_to_stand,

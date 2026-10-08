@@ -229,3 +229,44 @@ with ATC off (parked aircraft drawn only); any `pub static` for traffic.
   `departure_strip_occupied` became `departure_strip_occupied_for(strip, ..)` (the hold read is
   the desk's strip's). The inbox is `TRAFFIC_CALLS` in the `TrafficStrips` group (the door test
   lists it).
+- **Increment 6**: `TrafficOrder { state, runway, taxi_path, holding_point, to_stand, sequence,
+  follow, hold, line_up_condition, go_around, readback_owed }`; `follow` is an
+  `Option<FlightId>` (the leader may be ours), not a `u32`, and `hold` is "a takeoff or landing
+  clearance withheld". `go_around` is level-triggered through the desk sync: the tick's
+  `pending_go_around`, then the "Going around, ..." acknowledgement the sync owes
+  (`GO_AROUND_READBACK`), until the flight says it. `traffic_tick(id, picture, now)` takes
+  `now` (the hold clocks) and the same `TrafficTarget` picture as a call, reads the flight's
+  state from `seen` (nothing without one), runs `note_aircraft_state_for`, then go-around,
+  landing hold, takeoff hold in our tick's order, `tuned` always true, and returns the tower's
+  lines. In the `_for` cores the ghost memory (`note_ground_traffic`, and through
+  `strip_exits_unnoted` the occupant scan) is noted only for OUR strip, and a traffic go-around
+  is never re-sequenced to another runway (its order names none). `Ctx.final_traffic_id` is an
+  `Option<FlightId>` set by `ctx_for_call` from the picture's ids (`None` for ours: the TCAS
+  picture names nobody until step 8). The `sequence` cell is a strip `facts` cell (all three
+  doors, the door test lists it), set from the reply to a downwind report ("number two" with
+  the leader unless the runway is occupied, "number one"), cleared once the flight is no longer
+  Inbound; nothing of ours reads it. The sync cores are `sync_takeoff_release(runway, callsign)`
+  and `sync_line_up(runway, callsign)`, which `apply_monitor_takeoff_clearance` and
+  `apply_monitor_line_up` now call; a traffic desk is synced with its clearance's runway
+  (spoken) and callsign and arms no departure handoff. Added: `world::retire_traffic(id)` (a
+  despawn closes the strip; `sync_traffic_desks` drops a desk whose strip closed or was
+  reopened).
+
+### What step 7 calls (the bin's `traffic_link`)
+
+- Per monitor tick, per traffic flight: `world::note_traffic_state(id, state)`, then
+  `world::traffic_tick(id, &picture_without_it_plus_us, now)` (speak the lines as the tower);
+  read `world::traffic_order(id)` as the fleet's `orders` closure (map `tower::State`,
+  `runway`, `taxi_path`, `holding_point`, `follow`, `hold`, `go_around`, `readback_owed`
+  onto `traffic::Order`); a call goes out as `world::post_traffic_call(TrafficCall { id,
+  spoken, text, state, picture })`; a despawn is `world::retire_traffic(id)`.
+- In the command loop (`drain_traffic_calls`): `station.sync_traffic_desks()`, then for each
+  `world::take_traffic_calls()` call `station.answer_traffic(&call)`; a `TrafficReply` with an
+  empty `line` is an accepted readback (nothing said).
+- The picture: ours is `TrafficTarget { who: FlightId::Own, target: TcasTarget { .. } }` from
+  the monitor's snapshot (feet MSL in `ele_ft`, `vs_fpm`), each other traffic flight
+  `FlightId::Traffic(n)` with a unique raw callsign (the `final_traffic_id` lookup is by it).
+- A headless harness needs `Station::from_airport(..)` then `install()` (it publishes the
+  runways the book reads and clears `STRIPS`), our `TOWER_WIND` comes from our own calls (set
+  it through one `handle_transmission_with` or accept calm), and `SIDE_STATE_LOCK` plus a
+  `STRIPS` drop guard in tests.

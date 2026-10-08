@@ -114,6 +114,24 @@ impl Station {
                 holds_runway: self.desk.twr.holds_runway(),
             });
         }
+        // The landing sequence as the tower just said it: a downwind report
+        // is told its number (and, behind a named arrival, whom it follows);
+        // a flight no longer Inbound has no place in it.
+        if service == Service::Tower {
+            let mut seq = self.desk.strip.sequence.lock().unwrap_or_else(|e| e.into_inner());
+            if intent == tower::Intent::ReportDownwind && reply.contains("number two") {
+                let leader = if ctx.runway_occupied {
+                    None
+                } else {
+                    ctx.final_traffic_id
+                };
+                *seq = Some((2, leader));
+            } else if intent == tower::Intent::ReportDownwind && reply.contains("number one") {
+                *seq = Some((1, None));
+            } else if self.desk.twr.state != tower::State::Inbound {
+                *seq = None;
+            }
+        }
         // A withheld landing clearance lives only while the flight is still
         // Inbound for it: cleared (a new final report), gone around, landed
         // or elsewhere retires it. A final report onto an occupied runway
@@ -299,17 +317,24 @@ impl Station {
     pub async fn apply_monitor_takeoff_clearance(&mut self, xp: SimView<'_>) {
         // A departure context (the monitor's release watch) — never an arrival.
         let (ctx, _wx) = self.build_ctx(xp, None, tower::Intent::RequestTakeoff).await;
+        self.sync_takeoff_release(&ctx.runway, &ctx.callsign);
+        self.arm_departure_handoff(&ctx);
+    }
+
+    /// The FSM half of [`Station::apply_monitor_takeoff_clearance`], on the
+    /// desk on frequency: TakeoffCleared, its readback owed (`runway`
+    /// spoken).
+    pub(super) fn sync_takeoff_release(&mut self, runway: &str, callsign: &str) {
         self.desk.twr.state = tower::State::TakeoffCleared;
         // The released clearance owes its readback exactly like one issued
         // on the reply path.
         self.desk.twr.arm_takeoff_readback(
-            ctx.runway.clone(),
-            format!("runway {}, cleared for takeoff.", ctx.runway),
+            runway.to_string(),
+            format!("runway {runway}, cleared for takeoff."),
         );
         if let Some(c) = self.desk.strip.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            c.pending_readback = self.desk.twr.suggested_readback(&ctx.callsign);
+            c.pending_readback = self.desk.twr.suggested_readback(callsign);
         }
-        self.arm_departure_handoff(&ctx);
     }
 
     /// Sync the tower FSM with the line-up-and-wait the MONITOR spoke when it
@@ -319,13 +344,19 @@ impl Station {
     /// armed — the release is still to come.
     pub async fn apply_monitor_line_up(&mut self, xp: SimView<'_>) {
         let (ctx, _wx) = self.build_ctx(xp, None, tower::Intent::RequestTakeoff).await;
+        self.sync_line_up(&ctx.runway, &ctx.callsign);
+    }
+
+    /// The FSM half of [`Station::apply_monitor_line_up`], on the desk on
+    /// frequency: LinedUp, the line-up readback owed (`runway` spoken).
+    pub(super) fn sync_line_up(&mut self, runway: &str, callsign: &str) {
         self.desk.twr.state = tower::State::LinedUp;
         self.desk.twr.arm_line_up_readback(
-            ctx.runway.clone(),
-            format!("line up and wait runway {}.", ctx.runway),
+            runway.to_string(),
+            format!("line up and wait runway {runway}."),
         );
         if let Some(c) = self.desk.strip.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            c.pending_readback = self.desk.twr.suggested_readback(&ctx.callsign);
+            c.pending_readback = self.desk.twr.suggested_readback(callsign);
         }
     }
 
@@ -369,7 +400,7 @@ impl Station {
         self.desk.resequenced = reseq.clone();
         if let Some(c) = self.desk.strip.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             c.state = tower::State::Inbound;
-            c.pending_readback = Some(format!("Going around, {}.", c.callsign));
+            c.pending_readback = Some(format!("{GO_AROUND_READBACK}{}.", c.callsign));
             if let Some((_, to)) = &reseq {
                 c.runway_ident = to.clone();
             }

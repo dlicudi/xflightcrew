@@ -179,6 +179,13 @@ flight_strip! {
             /// one the crew may fly), retired with the squawk: by `Station::install`
             /// (a new field), `Station::uninstall` and the out-of-reach stand-down.
             ifr_clearance: Mutex<Option<tower::IfrClearance>> = Mutex::new(None),
+            /// Where the tower put this flight in the landing sequence when it
+            /// said so ("number two, follow the traffic on ..."): its number
+            /// and the flight it follows, when the picture named one
+            /// (`tower::Ctx::final_traffic_id`). Set by the reply to a downwind
+            /// report, cleared once the flight is no longer Inbound. Read only
+            /// by a traffic flight's order view (`world::traffic_order`).
+            sequence: Mutex<Option<(u8, Option<FlightId>)>> = Mutex::new(None),
         },
         /// The station's own worksheets for this flight at this field: reset by
         /// `install`, `uninstall` and `retire_for_new_flight`. `self_taxi` is the
@@ -953,6 +960,6 @@ pub use crate::station::{
 /// (`RangedField`), a tune request's answer (`Tune`), and a traffic call and
 /// its answer (`TrafficCall`, `TrafficReply`, `TrafficTarget`).
 pub use crate::station::{
-    DepartureStation, RangedField, Station, TaxiWatch, TrafficCall, TrafficReply, TrafficTarget,
-    Tune,
+    DepartureStation, RangedField, Station, TaxiWatch, TrafficCall, TrafficOrder, TrafficReply,
+    TrafficTarget, Tune,
 };

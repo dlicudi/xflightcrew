@@ -32,9 +32,12 @@ pub use crate::station::{
 /// Our own AI traffic (stage D): where each traffic flight is, by its
 /// stable number; the calls it keys, as text, through an inbox the command
 /// loop drains (`party_line::Station::answer_traffic` answers each).
+/// What the tower told each one comes back as data, level-triggered
+/// (`traffic_order`), its runway watch is `traffic_tick`, and a despawn
+/// closes its strip (`retire_traffic`).
 pub use crate::station::{
-    note_traffic_state, post_traffic_call, take_traffic_calls, TrafficCall, TrafficReply,
-    TrafficTarget,
+    note_traffic_state, post_traffic_call, retire_traffic, take_traffic_calls, traffic_order,
+    traffic_tick, TrafficCall, TrafficOrder, TrafficReply, TrafficTarget,
 };
 
 /// Traffic: the TCAS read, the near-miss and the traffic advisory.

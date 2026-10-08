@@ -500,6 +500,18 @@ pub(super) fn strip_exits(
     now: Instant,
 ) -> Vec<Occupant> {
     note_ground_traffic(targets, now);
+    strip_exits_unnoted(targets, ours, landing_end, now)
+}
+
+/// [`strip_exits`] without noting the picture into the ghost memory: a
+/// traffic flight's tick reads the field's memory and writes none of it
+/// (its picture holds us and the other traffic, never ghosts).
+pub(super) fn strip_exits_unnoted(
+    targets: &[TcasTarget],
+    ours: Option<&nav::Runway>,
+    landing_end: &str,
+    now: Instant,
+) -> Vec<Occupant> {
     let runways: Vec<nav::Runway> = match ours {
         Some(r) => vec![r.clone()],
         None => ACTIVE_RUNWAYS
@@ -602,8 +614,11 @@ pub(super) fn go_around_tick_for(
     now: Instant,
 ) -> Option<ComplianceCall> {
     // The standing clocks run through the whole final, not only its last
-    // 800 ft ([`GHOST_STALE_S`]).
-    note_ground_traffic(targets, now);
+    // 800 ft ([`GHOST_STALE_S`]). The ghost memory is the FIELD's: only our
+    // tick notes it.
+    if flight.is_own() {
+        note_ground_traffic(targets, now);
+    }
     if state.on_ground || own_agl_ft > 800.0 {
         return None;
     }
@@ -628,7 +643,11 @@ pub(super) fn go_around_tick_for(
         let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
         strip(&runways, &runway_ident).cloned()
     };
-    let exits = strip_exits(targets, ours.as_ref(), &runway_ident, now);
+    let exits = if flight.is_own() {
+        strip_exits(targets, ours.as_ref(), &runway_ident, now)
+    } else {
+        strip_exits_unnoted(targets, ours.as_ref(), &runway_ident, now)
+    };
     if exits.is_empty() {
         return None;
     }
@@ -672,7 +691,9 @@ pub(super) fn go_around_tick_for(
     // the other direction) would send the next approach round the same way:
     // the tower re-sequences now (issue #162). Only a flight on the
     // frequency can be told.
-    let expect = if tuned {
+    // A traffic flight is never re-sequenced to another runway: the runway in
+    // use is the field's, and it rejoins for the one it was sent round from.
+    let expect = if tuned && flight.is_own() {
         resequence_after_go_around(flight, targets, &runway_ident, &exits, now)
     } else {
         None
@@ -909,7 +930,11 @@ pub(super) fn landing_hold_tick_for(
     if strip_held_by_others(&runways, &hold.runway_ident, flight) {
         return None;
     }
-    let exits = strip_exits(targets, ours.as_ref(), &hold.runway_ident, now);
+    let exits = if flight.is_own() {
+        strip_exits(targets, ours.as_ref(), &hold.runway_ident, now)
+    } else {
+        strip_exits_unnoted(targets, ours.as_ref(), &hold.runway_ident, now)
+    };
     let own = ours
         .as_ref()
         .and_then(|r| time_to_threshold_for(flight, r, &hold.runway_ident, now));

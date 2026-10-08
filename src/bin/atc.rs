@@ -322,6 +322,7 @@ fn main() -> Result<()> {
                     final_traffic_nm: None,
                     final_traffic_callsign: None,
                     final_traffic_count: 0,
+                    final_traffic_id: None,
                     runway_occupied: false,
                     wake_secs_left: None,
                     taxi_via: Vec::new(),

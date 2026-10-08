@@ -102,6 +102,10 @@ impl Station {
         };
         let qnh = self.last_qnh.clone().unwrap_or_default();
         let targets: Vec<TcasTarget> = picture.iter().map(|t| t.target.clone()).collect();
+        let ids: Vec<(&str, FlightId)> = picture
+            .iter()
+            .map(|t| (t.target.callsign.as_str(), t.who))
+            .collect();
         self.ctx_for_call(
             state,
             wx,
@@ -109,6 +113,7 @@ impl Station {
             spoken.to_string(),
             intent,
             &targets,
+            &ids,
             Instant::now(),
         )
     }
@@ -154,4 +159,207 @@ impl Station {
             speaker: StationSpeaker::Tower,
         }
     }
+
+    /// Keep every traffic desk's tower FSM in step with what the ticks said
+    /// on frequency, as our `sync_tower` does for ours: a released takeoff,
+    /// a sequenced line-up, a go-around order, a released landing. Each desk
+    /// is swapped in for its sync (`with_desk`, never across an await); a
+    /// desk whose strip closed (or was reopened) is dropped. Run before the
+    /// traffic calls are answered.
+    pub fn sync_traffic_desks(&mut self) {
+        let ids: Vec<FlightId> = self.desks.keys().copied().collect();
+        for id in ids {
+            let FlightId::Traffic(n) = id else {
+                continue;
+            };
+            let alive = match (self.desks.get(&id), traffic_strip(n)) {
+                (Some(d), Some(open)) => {
+                    matches!(&d.strip, StripRef::Traffic(s) if std::sync::Arc::ptr_eq(s, &open))
+                }
+                _ => false,
+            };
+            if !alive {
+                self.desks.remove(&id);
+                continue;
+            }
+            self.with_desk(id, |st| st.sync_traffic_desk());
+        }
+    }
+
+    /// One traffic desk's sync, on frequency.
+    fn sync_traffic_desk(&mut self) {
+        let take =
+            |m: &Mutex<bool>| std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner()));
+        if take(&self.desk.strip.pending_takeoff_clearance) {
+            let (runway, callsign) = self.cleared_runway_spoken();
+            self.sync_takeoff_release(&runway, &callsign);
+        }
+        if take(&self.desk.strip.pending_line_up) {
+            let (runway, callsign) = self.cleared_runway_spoken();
+            self.sync_line_up(&runway, &callsign);
+        }
+        if take(&self.desk.strip.pending_go_around) {
+            self.apply_monitor_go_around();
+        }
+        self.sync_landing_release();
+    }
+
+    /// The runway the desk's standing clearance names (else the runway in
+    /// use), spoken, and the callsign it was issued to: what a released
+    /// clearance is synced with when no context is built for it.
+    fn cleared_runway_spoken(&self) -> (String, String) {
+        let (ident, callsign) = self
+            .desk
+            .strip
+            .clearance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|c| (c.runway_ident.clone(), c.callsign.clone()))
+            .unwrap_or_default();
+        let ident = Some(ident)
+            .filter(|r| !r.is_empty())
+            .or_else(|| self.runway_in_use.clone())
+            .unwrap_or_default();
+        (atis::spoken_runway(&ident), callsign)
+    }
+}
+
+/// What the tower has told a traffic flight, as it stands now: a
+/// LEVEL-TRIGGERED view over its strip's cells (nothing here is consumed,
+/// so an order a tick did not act on is still there at the next).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrafficOrder {
+    /// The tower FSM state of its standing clearance (`Parked` with none).
+    pub state: tower::State,
+    /// The runway END the clearance names ("26L"); empty when none.
+    pub runway: String,
+    /// The taxi route it is cleared on, (lat, lon) in order; empty when none.
+    pub taxi_path: Vec<(f64, f64)>,
+    /// The route's end: a holding point, or a stand for an arrival.
+    pub holding_point: String,
+    /// The route ends at a stand (an arrival's taxi-in).
+    pub to_stand: bool,
+    /// Its number in the landing sequence, when the tower gave one.
+    pub sequence: Option<u8>,
+    /// The flight it follows ("number two, follow the traffic"), when the
+    /// tower's picture named it.
+    pub follow: Option<FlightId>,
+    /// A takeoff or landing clearance is being WITHHELD: hold short, or
+    /// continue the approach without one.
+    pub hold: bool,
+    /// A conditional line-up's condition: `Some(false)` while the named
+    /// arrival is still on final.
+    pub line_up_condition: Option<bool>,
+    /// The tower ordered a go-around and it has not been acknowledged.
+    pub go_around: bool,
+    /// The readback the tower is waiting for, phrased; `None` once heard.
+    pub readback_owed: Option<String>,
+}
+
+/// How the acknowledgement a go-around order owes begins
+/// (`Station::apply_monitor_go_around`).
+pub(super) const GO_AROUND_READBACK: &str = "Going around, ";
+
+/// The order view for traffic flight `id`; `None` with no strip open. Each
+/// cell is locked alone and dropped before the next.
+pub fn traffic_order(id: u32) -> Option<TrafficOrder> {
+    let strip = traffic_strip(id)?;
+    let clr = strip
+        .clearance
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|c| (c.state, c.runway_ident.clone(), c.pending_readback.clone()));
+    let route = strip
+        .taxi_route
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|r| (r.path.clone(), r.holding_point.clone()));
+    let to_stand = *strip
+        .taxi_to_stand
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let sequence = *strip.sequence.lock().unwrap_or_else(|e| e.into_inner());
+    let takeoff_held = strip
+        .takeoff_hold
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    let landing_held = strip
+        .landing_hold
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    let line_up_condition = *strip
+        .line_up_condition
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let ordered = *strip
+        .pending_go_around
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let readback_owed = clr
+        .as_ref()
+        .and_then(|c| c.2.clone())
+        .filter(|r| !r.is_empty());
+    // The order stands from the tick that gave it (`pending_go_around`)
+    // through the desk's sync (which owes "Going around, ...") until the
+    // flight has said it.
+    let go_around = ordered
+        || readback_owed
+            .as_deref()
+            .is_some_and(|r| r.starts_with(GO_AROUND_READBACK));
+    let (taxi_path, holding_point) = route.unwrap_or_default();
+    Some(TrafficOrder {
+        state: clr.as_ref().map_or(tower::State::Parked, |c| c.0),
+        runway: clr.map(|c| c.1).unwrap_or_default(),
+        taxi_path,
+        holding_point,
+        to_stand,
+        sequence: sequence.map(|s| s.0),
+        follow: sequence.and_then(|s| s.1),
+        hold: takeoff_held || landing_held,
+        line_up_condition,
+        go_around,
+        readback_owed,
+    })
+}
+
+/// The producer despawned traffic flight `id`: its strip closes (its claims
+/// leave the book) and its desk is dropped at the next desk sync.
+pub fn retire_traffic(id: u32) {
+    STRIPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+}
+
+/// One pass of the runway watch for traffic flight `id`, with the picture
+/// round it (every OTHER aircraft, ours included): its position noted on
+/// its strip, then the go-around judgement, the withheld landing's release
+/// and the held takeoff's release, the same `_for` cores ours runs, in our
+/// order. Returns what the tower says, in order (the tower's voice, on its
+/// frequency). Nothing without an open strip or a reported position. Reads
+/// the field's ghost memory, writes none of it.
+pub fn traffic_tick(id: u32, picture: &[TrafficTarget], now: Instant) -> Vec<String> {
+    let Some(strip) = traffic_strip(id) else {
+        return Vec::new();
+    };
+    let Some(state) = seen(&strip) else {
+        return Vec::new();
+    };
+    let targets: Vec<TcasTarget> = picture.iter().map(|t| t.target.clone()).collect();
+    note_aircraft_state_for(&strip, &state);
+    let elev = active_field().map_or(0.0, |f| f.3);
+    // No height reported is no go-around judgement (never a made-up one).
+    let agl = if state.alt_ft.is_finite() {
+        state.alt_ft - elev
+    } else {
+        f64::INFINITY
+    };
+    let mut lines = Vec::new();
+    // Always on frequency: a traffic flight is called by name.
+    lines.extend(go_around_tick_for(&strip, &state, &targets, agl, true, now).map(|c| c.line));
+    lines.extend(landing_hold_tick_for(&strip, &state, &targets, now));
+    lines.extend(takeoff_hold_tick_for(&strip, &state, &targets, elev, now));
+    lines
 }

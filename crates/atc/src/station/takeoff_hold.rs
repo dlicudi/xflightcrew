@@ -322,8 +322,11 @@ pub(super) fn takeoff_hold_tick_for(
         return None;
     }
     let own = state.position();
-    // The standing clocks the stale-ghost rule reads (idempotent per tick).
-    note_ground_traffic(targets, now);
+    // The standing clocks the stale-ghost rule reads (idempotent per tick):
+    // the field's memory, noted by our tick only.
+    if flight.is_own() {
+        note_ground_traffic(targets, now);
+    }
     // The book: another strip cleared onto the held runway (or to land on
     // it) holds it like an occupant, whatever the replay shows. Asked before
     // the hold's lock (for ours, nothing to ask with no traffic strip open).
