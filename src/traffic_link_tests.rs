@@ -42,6 +42,10 @@ fn in_own_process(test: &str) {
             std::env::var("XVL_TRAFFIC_TRACE").unwrap_or_default(),
         )
         .env(
+            "XVL_TRAFFIC_SWEEP_S",
+            std::env::var("XVL_TRAFFIC_SWEEP_S").unwrap_or_default(),
+        )
+        .env(
             "XVL_TRAFFIC_SWEEP_ONLY",
             std::env::var("XVL_TRAFFIC_SWEEP_ONLY").unwrap_or_default(),
         )
@@ -521,7 +525,10 @@ fn ulmm_traffic_holds_short_inner() {
 /// (three hours): a 172 landing short rolled 1.2 km to the far exit at taxi
 /// pace and despawned `NoStand` the moment the vacate ended, its "runway
 /// vacated" never said and the strip held behind it, until the wait for a
-/// stand ran from the vacate's end (#242).
+/// stand ran from the vacate's end (#242). Then the far-side vacate itself
+/// went: the apron's one exit is behind a landing on 03, so the rollout
+/// turns round and backtracks to it (`FieldModel::vacate`), and the taxi in
+/// crosses nothing at all.
 #[test]
 fn bieg_taxi_in_holds_short_of_the_runway_it_landed_on() {
     in_own_process("traffic_link::tests::bieg_taxi_in_holds_short_inner");
@@ -542,10 +549,17 @@ fn bieg_taxi_in_holds_short_inner() {
     );
     let schedule = traffic::generate(&field, Density::Normal, 3, &SpawnCtx::default());
     let s = fly_field(&mut st, field, schedule, 3.0 * 3600.0);
+    let taxi_in: Vec<&String> = s
+        .said
+        .iter()
+        .filter(|l| l.contains("taxi to parking"))
+        .collect();
+    assert!(taxi_in.len() >= 3, "arrivals taxied in: {taxi_in:?}");
     assert!(
-        s.said.iter().any(|l| l.contains("hold short runway")),
-        "the taxi in held short: {:?}",
-        s.said
+        taxi_in
+            .iter()
+            .all(|l| !l.contains("runway zero three") && !l.contains("runway two one")),
+        "backtracked to the apron's exit, nothing to cross: {taxi_in:?}"
     );
     assert_clean(&s, "BIEG crossings");
     Station::uninstall();
@@ -632,6 +646,11 @@ fn real_install_traffic_world_sweep_inner() {
         println!("no install, no verdict");
         return;
     }
+    // `XVL_TRAFFIC_SWEEP_S=3600` flies the hour.
+    let sweep_s: f64 = std::env::var("XVL_TRAFFIC_SWEEP_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SWEEP_S);
     let cifp = crate::nav::test_xplane_path("Custom Data/CIFP");
     let (mut flown, mut spawned, mut calls) = (0, 0, 0);
     let mut dirty: Vec<String> = Vec::new();
@@ -644,7 +663,7 @@ fn real_install_traffic_world_sweep_inner() {
             continue;
         };
         let mut st = install(st, &apt, &icao, has_stands);
-        let s = fly_field(&mut st, field, schedule, SWEEP_S);
+        let s = fly_field(&mut st, field, schedule, sweep_s);
         println!(
             "{icao}: {} scheduled, {} calls, {} readbacks ({} accepted), {} conflicts, {} oracle",
             s.movements,

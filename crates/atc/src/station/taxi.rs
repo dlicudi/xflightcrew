@@ -139,6 +139,7 @@ pub(super) const TRUE_PSI: &str = sim::datarefs::TRUE_HEADING_DEG;
 /// to the nearest node whatever the heading and backtracked (EDLP 24,
 /// 2026-09-24, see [`nav::after_vacate`]). Off a runway, no heading, or no
 /// way off ahead: the plain route from here, as before.
+#[cfg(test)]
 pub(super) fn stand_route_on(
     net: &nav::TaxiNet,
     runways: &[nav::Runway],

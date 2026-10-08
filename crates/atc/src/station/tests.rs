@@ -907,6 +907,50 @@ fn a_stand_route_avoiding_the_parked_goes_to_the_next_free_stand() {
     assert!(stand_route_avoiding(&net, &[], lat, lon, None, &full).is_none());
 }
 
+/// Our own arrival passes over a stand our own fleet's parked aircraft
+/// stands on (#243): the link publishes where they stand, our stand route
+/// (the arrival desk's and the self taxi's) reads it; with no fleet the
+/// nearest stand, as always.
+#[test]
+fn our_stand_route_passes_over_a_stand_our_parked_traffic_stands_on() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut nodes = std::collections::HashMap::new();
+    nodes.insert(1, (36.0000, -5.0000));
+    nodes.insert(2, (36.0000, -4.9980));
+    let stand = |name: &str, lon: f64| nav::Stand {
+        lat: 36.0003,
+        lon,
+        heading: 180.0,
+        name: name.into(),
+        kind: "gate".into(),
+        accepts: vec![],
+    };
+    *TAXI_NET.lock().unwrap() = Some(std::sync::Arc::new(nav::TaxiNet {
+        nodes,
+        edges: vec![nav::TaxiEdge {
+            a: 1,
+            b: 2,
+            oneway: false,
+            runway: false,
+            name: "A".into(),
+            zone_of: Vec::new(),
+        }],
+        stands: vec![stand("S1", -5.0000), stand("S2", -4.9980)],
+        paint: vec![],
+        pavement: vec![],
+        stand_lines: vec![],
+    }));
+    let (lat, lon) = (36.0000, -5.0004);
+    publish_stands_taken(Vec::new());
+    let free = plan_taxi_route_to_stand(&[], lat, lon, None, &stands_taken()).expect("a route");
+    assert_eq!(free.holding_point, "S1", "no fleet: the nearest");
+    publish_stands_taken(vec![(36.0003, -5.0000)]);
+    let ours = plan_taxi_route_to_stand(&[], lat, lon, None, &stands_taken()).expect("a route");
+    assert_eq!(ours.holding_point, "S2", "past our parked traffic");
+    publish_stands_taken(Vec::new());
+    *TAXI_NET.lock().unwrap() = None;
+}
+
 #[test]
 fn off_route_stray_gets_a_fresh_route_from_present_position() {
     let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -9974,4 +10018,55 @@ fn a_ctx_is_built_from_a_handed_in_state_with_no_sim() {
     assert!(!ctx.own_on_runway);
     assert!(!ctx.helicopter);
     Station::uninstall();
+}
+
+/// A crossing route along the strip is a backtrack and is judged on the
+/// time it holds the strip (BIEG 03, 2026-10-08): the legs still to drive
+/// on the pavement count, the ones behind do not; a 45 m crossing keeps
+/// the crossing's 3 nm, a 1,850 m backtrack wants an arrival over 13 nm
+/// out, and circuit traffic level at 1,000 ft blocks it.
+#[test]
+fn a_backtrack_is_judged_on_the_time_it_holds_the_strip() {
+    use super::ctx::{arrival_within, backtrack_clear_nm, route_on_strip_m, BACKTRACK_M, CROSSING_FINAL_NM};
+    let rwy = nav::Runway {
+        ident_a: "03".into(),
+        ident_b: "21".into(),
+        lat_a: 65.27595,
+        lon_a: -14.40972,
+        lat_b: 65.29098,
+        lon_b: -14.39287,
+        width_m: 45.0,
+        surface: 1,
+    };
+    let n = 12_u32;
+    let along: Vec<(f64, f64)> = (0..=n)
+        .rev()
+        .map(|i| {
+            let f = f64::from(i) / f64::from(n);
+            (rwy.lat_a + f * (rwy.lat_b - rwy.lat_a), rwy.lon_a + f * (rwy.lon_b - rwy.lon_a))
+        })
+        .collect();
+    let whole = route_on_strip_m(&along, None, &rwy);
+    assert!(whole > 1500.0, "the backtrack is on the strip: {whole:.0}");
+    let half = route_on_strip_m(&along, Some(along[6]), &rwy);
+    assert!((half - whole / 2.0).abs() < 100.0, "only what is still owed: {half:.0}");
+    let mid = (65.2835, -14.4013);
+    let across = [(mid.0 + 0.0004, mid.1 - 0.0010), (mid.0 - 0.0004, mid.1 + 0.0010)];
+    assert!(route_on_strip_m(&across, None, &rwy) < BACKTRACK_M, "a crossing");
+    assert_eq!(backtrack_clear_nm(40.0), CROSSING_FINAL_NM);
+    assert!(backtrack_clear_nm(whole) > 12.0);
+    let target = |lat: f64, lon: f64, ele_ft: f64, vs_fpm: f64| TcasTarget {
+        callsign: "TEST1".into(),
+        lat,
+        lon,
+        ele_ft,
+        on_ground: false,
+        vs_fpm,
+    };
+    let downwind = [target(65.31, -14.3965, 1100.0, 0.0)];
+    assert!(arrival_within(&downwind, &rwy, &[rwy.clone()], 75.0, backtrack_clear_nm(whole)));
+    let climbing = [target(65.31, -14.3965, 1100.0, 900.0)];
+    assert!(!arrival_within(&climbing, &rwy, &[rwy.clone()], 75.0, backtrack_clear_nm(whole)));
+    let far = [target(65.0, -15.2, 3000.0, -700.0)];
+    assert!(!arrival_within(&far, &rwy, &[rwy.clone()], 75.0, backtrack_clear_nm(whole)));
 }

@@ -284,6 +284,13 @@ public:
         if (!IsVisible()) SetVisible(true);
 
         const bool on_ground = (p.flags & traffic_wire::kFlagOnGround) != 0;
+        // A parked aircraft, engines off on its stand, has its transponder
+        // in standby as a real one does, which keeps it out of the sim's
+        // TCAS slots: 37 parked at LEMG would crowd the pilot's TCAS and
+        // take the slots from the traffic that moves (#243). It comes on
+        // with the engines.
+        const bool parked = on_ground && !(p.flags & traffic_wire::kFlagEngines);
+        acRadar.mode = parked ? xpmpTransponderMode_Standby : xpmpTransponderMode_ModeC;
         SetLocation(p.lat, p.lon, p.alt_ft, on_ground);
         if (on_ground) sit_on_mesh();
         SetHeading(p.hdg);

@@ -934,11 +934,12 @@ impl GoAroundOrders {
 /// - `load_region` / `spawn_taxi_net_load` / `spawn_ils_load`: the world's
 ///   data, loaded when the crew installs a station.
 /// - `publish_traffic_picture`: our own fleet as the TCAS picture, per
-///   monitor tick while it flies (`None` when it does not).
+///   monitor tick while it flies (`None` when it does not), and
+///   `publish_stands_taken`: where its parked aircraft stand.
 pub use crate::station::{
     arm_new_flight, arm_new_flight_at, arm_new_flight_enroute, arm_station_for_freq,
     begin_uncontrolled_arrival, end_arrival, load_region, note_aircraft, note_aircraft_state,
-    pin_arrival_station, publish_traffic_picture, set_surface_wind, spawn_ils_load,
+    pin_arrival_station, publish_stands_taken, publish_traffic_picture, set_surface_wind, spawn_ils_load,
     spawn_taxi_net_load,
 };
 

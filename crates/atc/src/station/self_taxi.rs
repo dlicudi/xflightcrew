@@ -72,7 +72,7 @@ pub fn plan_self_taxi_to_stand(
         .ok()
         .flatten()
         .ok_or_else(|| format!("{icao} has no taxiways drawn, so the taxi is yours."))?;
-    let mut plan = stand_route_on(&net, &apt.runways, lat, lon, psi_true)
+    let mut plan = stand_route_avoiding(&net, &apt.runways, lat, lon, psi_true, &stands_taken())
         .filter(|p| p.path.len() >= 2)
         .ok_or_else(|| format!("I can't find a taxi route to parking at {icao}."))?;
     let stand = plan.holding_point.clone();

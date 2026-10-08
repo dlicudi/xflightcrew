@@ -336,6 +336,17 @@ impl Link {
             .collect()
     }
 
+    /// Where the fleet's parked aircraft stand (dormant, out of
+    /// [`Self::targets`]): our own stand route passes over them (#243).
+    pub(crate) fn stands_taken(&self) -> Vec<(f64, f64)> {
+        self.fleet
+            .aircraft()
+            .iter()
+            .filter(|a| a.dormant())
+            .map(|a| a.kin.pos())
+            .collect()
+    }
+
     /// One tick: spawn what is due, step the fleet `dt` seconds of sim time
     /// (clamped and substepped by its clock; nothing while frozen), and
     /// trade with the station. `now` is the station's clock for this tick.
@@ -859,6 +870,7 @@ impl TrafficWorld {
             }
         }
         crate::party_line::publish_traffic_picture(Some(link.targets()));
+        crate::party_line::publish_stands_taken(link.stands_taken());
         if self.sink.is_none() {
             self.sink = crate::traffic_sink::TrafficSink::start(
                 crate::settings::live().xplane_base_url.clone(),
@@ -894,6 +906,7 @@ impl TrafficWorld {
         }
         if self.field.is_some() {
             crate::party_line::publish_traffic_picture(None);
+            crate::party_line::publish_stands_taken(Vec::new());
         }
         if let Some(sink) = self.sink.as_mut() {
             sink.withdraw();

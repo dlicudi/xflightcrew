@@ -36,6 +36,26 @@ pub fn publish_traffic_picture(picture: Option<Vec<TcasTarget>>) {
     *TRAFFIC_PICTURE.lock().unwrap_or_else(|e| e.into_inner()) = picture;
 }
 
+/// Where our own fleet's parked aircraft stand (dormant on their stands,
+/// out of the TCAS picture), published with the picture by the crew's
+/// traffic link; empty while the fleet does not fly. The field's, cleared
+/// with the picture ([`TrafficStrips`]). Our own stand route passes over a
+/// stand one of them is on (#243).
+pub(crate) static STANDS_TAKEN: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());
+
+/// The crew's traffic link publishes where its parked aircraft stand.
+pub fn publish_stands_taken(at: Vec<(f64, f64)>) {
+    *STANDS_TAKEN.lock().unwrap_or_else(|e| e.into_inner()) = at;
+}
+
+/// Where our own fleet's parked aircraft stand (empty with no fleet).
+pub(crate) fn stands_taken() -> Vec<(f64, f64)> {
+    STANDS_TAKEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Our own traffic, as the crew may see it: every aircraft of the fleet as
 /// a TCAS target (ours not in it); `None` while the fleet does not fly.
 pub fn traffic_picture() -> Option<Vec<TcasTarget>> {

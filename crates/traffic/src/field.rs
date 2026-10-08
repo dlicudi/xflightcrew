@@ -190,11 +190,41 @@ impl FieldModel {
         )
     }
 
-    /// The drive off `end`'s strip from a rollout at `pos` heading `hdg`.
+    /// The drive off `end`'s strip from a rollout at `pos` heading `hdg`:
+    /// forward to an exit, or, where the parking is behind, turned round
+    /// and BACKTRACKED to the exit nearest it. BIEG 03 (world sweep,
+    /// 2026-10-08): the one exit to the apron is behind a landing, so the
+    /// forward vacate rolled 1.2 km to the far end, waited there for a
+    /// crossing and was cleared 1,850 m back down the whole runway: the
+    /// strip held for minutes, 22 go-arounds in the hour. A real crew turns
+    /// round and backtracks as it slows. The backtrack is taken when its
+    /// drive to the stand is under [`BACKTRACK_SAVES`] of the forward one,
+    /// or when there is no exit ahead at all.
     pub fn vacate(&self, pos: LatLon, hdg: f64, end: &RunwayEnd) -> Option<VacatePlan> {
         let zone = [end.ident.clone(), end.reciprocal.clone()];
-        self.net
-            .plan_vacate(pos.0, pos.1, hdg, &zone, nav::VACATE_CLEAR_M)
+        let plan = |h: f64| {
+            self.net
+                .plan_vacate(pos.0, pos.1, h, &zone, nav::VACATE_CLEAR_M)
+                .filter(|v| v.path.len() >= 2)
+        };
+        let ahead = plan(hdg);
+        let Some(stand) = self.net.nearest_stand(pos.0, pos.1) else {
+            return ahead;
+        };
+        let behind = plan((hdg + 180.0).rem_euclid(360.0));
+        // The whole drive to the parking: the vacate, then the stand route.
+        let drive_m = |v: &VacatePlan| -> Option<f64> {
+            let off = *v.path.last()?;
+            let route = self.net.plan_to_stand(off.0, off.1, stand)?;
+            Some(path_m(&v.path) + path_m(&route.path))
+        };
+        match (ahead, behind) {
+            (Some(a), Some(b)) => match (drive_m(&a), drive_m(&b)) {
+                (Some(da), Some(db)) if db < BACKTRACK_SAVES * da => Some(b),
+                _ => Some(a),
+            },
+            (a, b) => a.or(b),
+        }
     }
 
     /// The taxi route from `from` onto `stand`.
@@ -352,6 +382,16 @@ fn slice_m(path: &[LatLon], a_m: f64, b_m: f64) -> Vec<LatLon> {
 pub const STAND_TAKEN_M: f64 = 20.0;
 
 /// Somebody in `occupied` is on `stand`.
+/// A backtrack vacate is taken when its drive to the parking is under this
+/// share of the forward one's ([`FieldModel::vacate`]): a turn round on the
+/// runway is paid for only by a real saving.
+pub const BACKTRACK_SAVES: f64 = 0.6;
+
+/// The length of a polyline, metres.
+fn path_m(path: &[LatLon]) -> f64 {
+    path.windows(2).map(|w| dist_m(w[0], w[1])).sum()
+}
+
 pub fn stand_taken(stand: &Stand, occupied: &[LatLon]) -> bool {
     occupied
         .iter()
@@ -402,6 +442,44 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BIEG 03 (2026-10-08): the apron's one exit is near the 03
+    /// threshold, behind a landing. A rollout 1.2 km down 03 turns round
+    /// and backtracks to it, never on to the far end and the whole runway
+    /// back; on XTST, a parallel taxiway with exits ahead, the vacate is
+    /// forward as before.
+    #[test]
+    fn a_rollout_past_the_only_exit_to_the_apron_backtracks_to_it() {
+        let f = FieldModel::load(&fixtures::path("bieg.dat"), "BIEG")
+            .unwrap()
+            .expect("BIEG in the fixture");
+        let e03 = f.end("03").unwrap();
+        let here = (65.28663668654765, -14.397736800949273);
+        let v = f.vacate(here, e03.course_deg, &e03).expect("a vacate");
+        let off = *v.path.last().unwrap();
+        assert!(
+            e03.frame(off).0 < e03.frame(here).0,
+            "turned round: off at {:.0} m, rollout at {:.0} m",
+            e03.frame(off).0,
+            e03.frame(here).0
+        );
+        let stand = f.net.nearest_stand(here.0, here.1).unwrap();
+        let route = f.net.plan_to_stand(off.0, off.1, stand).unwrap();
+        assert!(
+            path_m(&route.path) < 600.0,
+            "then a short way in: {:.0} m",
+            path_m(&route.path)
+        );
+
+        let x = fixtures::xtst();
+        let e09 = x.end("09").unwrap();
+        let roll = e09.at(500.0, 0.0);
+        let v = x.vacate(roll, e09.course_deg, &e09).expect("a vacate");
+        assert!(
+            e09.frame(*v.path.last().unwrap()).0 > 500.0,
+            "forward to the next exit"
+        );
+    }
 
     #[test]
     fn the_fixture_field_reads_with_its_geometry() {

@@ -114,6 +114,7 @@ lifetime_group! {
         STRIPS,
         TRAFFIC_CALLS,
         TRAFFIC_PICTURE,
+        STANDS_TAKEN,
     }
 }
 
@@ -640,6 +641,8 @@ mod tests {
         // ...and the picture of our own traffic every TCAS read takes while
         // the fleet flies (stage D, increment 8): republished every tick.
         install.extend(names(&["TRAFFIC_PICTURE"]));
+        // ...and where its parked aircraft stand (#243), published with it.
+        install.extend(names(&["STANDS_TAKEN"]));
         assert_eq!(door_cells(INSTALL_RESETS), install, "install");
 
         let mut uninstall = install.clone();

@@ -206,8 +206,9 @@ impl Station {
                     // The heading says which way is forward off a runway we
                     // may still be on; a failed read plans as before.
                     // A traffic arrival passes over the stands its picture
-                    // shows somebody on (the parked aircraft); ours plans
-                    // as it always did.
+                    // shows somebody on (the parked aircraft); ours over
+                    // the stands our own fleet's parked aircraft stand on
+                    // (#243), else it plans as it always did.
                     let occupied: Vec<(f64, f64)> = if self.desk.strip.is_traffic() {
                         targets
                             .iter()
@@ -215,7 +216,7 @@ impl Station {
                             .map(|t| (t.lat, t.lon))
                             .collect()
                     } else {
-                        Vec::new()
+                        stands_taken()
                     };
                     plan_taxi_route_to_stand(&self.apt.runways, lat, lon, state.psi_deg, &occupied)
                 } else {
@@ -239,7 +240,7 @@ impl Station {
             self.apply_runway_request(&mut ctx, pos);
         }
         if intent == tower::Intent::RequestCrossing && on_ground {
-            ctx.crossing = self.judge_crossing(targets, now);
+            ctx.crossing = self.judge_crossing(targets, pos, now);
         }
         ctx.helicopter = state.helicopter;
         (ctx, wx)
@@ -341,6 +342,7 @@ impl Station {
     fn judge_crossing(
         &mut self,
         targets: &[TcasTarget],
+        pos: Option<(f64, f64)>,
         now: Instant,
     ) -> Option<(String, Option<String>)> {
         let heard = self.desk.call.crossing_request.clone()?;
@@ -353,12 +355,36 @@ impl Station {
         let r = strip(&self.apt.runways, &ident)?.clone();
         let occupied = strip_held_by_others(&self.apt.runways, &ident, &self.desk.strip)
             || departure_strip_picture(&r, &ident, targets, None, None, now).blocked;
+        // A "crossing" whose route runs ALONG the strip is a backtrack: BIEG
+        // 03 (world sweep, 2026-10-08) rolled to the far end, then taxied
+        // 1,850 m back down the runway to the apron, four minutes on it,
+        // cleared as a 45 m crossing with a Cessna on base; 22 go-arounds
+        // in the hour. The time it holds the strip is judged against
+        // everything that could be landing in it.
+        let on_strip_m = self
+            .desk
+            .strip
+            .taxi_route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0.0, |w| route_on_strip_m(&w.path, pos, &r));
         let why = if occupied {
             Some("traffic on the runway")
         } else if final_traffic_for(targets, &r, &self.apt.runways, self.apt.elev_ft)
             .is_some_and(|f| f.nm < CROSSING_FINAL_NM)
         {
             Some("traffic on final")
+        } else if on_strip_m > BACKTRACK_M
+            && arrival_within(
+                targets,
+                &r,
+                &self.apt.runways,
+                self.apt.elev_ft,
+                backtrack_clear_nm(on_strip_m),
+            )
+        {
+            Some("traffic inbound")
         } else {
             None
         };
@@ -372,3 +398,72 @@ impl Station {
 /// An arrival this close on a strip's final keeps a crossing flight short of
 /// it: a light aircraft crossing a 45 m runway is a minute on it.
 pub(super) const CROSSING_FINAL_NM: f64 = 3.0;
+
+/// A crossing route this long on the strip's pavement is a backtrack,
+/// metres: a crossing of the widest runway is under 100 m of it.
+pub(super) const BACKTRACK_M: f64 = 150.0;
+
+/// A backtrack's pace, m/s (12 kt: a brisk taxi down a runway).
+const BACKTRACK_MPS: f64 = 6.2;
+
+/// The approach speed an arrival is judged at, knots: the fastest of the
+/// fleet's finals, so a jet is never under-judged.
+const ARRIVAL_KTS: f64 = 150.0;
+
+/// How far out an arrival must be for a backtrack of `on_strip_m` to be
+/// off the strip before it lands, nm: the drive at [`BACKTRACK_MPS`] plus
+/// half a minute, flown at [`ARRIVAL_KTS`]; never less than a crossing's.
+pub(super) fn backtrack_clear_nm(on_strip_m: f64) -> f64 {
+    let secs = on_strip_m / BACKTRACK_MPS + 30.0;
+    (secs * ARRIVAL_KTS / 3600.0).max(CROSSING_FINAL_NM)
+}
+
+/// Metres of `path` still to drive on `rwy`'s pavement, from the point of
+/// the path nearest `pos` on (the whole path with no position): the legs
+/// already driven, a vacate's rollout among them, are not owed.
+pub(super) fn route_on_strip_m(
+    path: &[(f64, f64)],
+    pos: Option<(f64, f64)>,
+    rwy: &nav::Runway,
+) -> f64 {
+    let from = pos.map_or(0, |(lat, lon)| {
+        path.iter()
+            .enumerate()
+            .min_by(|a, b| {
+                let d = |p: &(f64, f64)| nav::haversine_nm(lat, lon, p.0, p.1);
+                d(a.1).total_cmp(&d(b.1))
+            })
+            .map_or(0, |(i, _)| i)
+    });
+    path.get(from..)
+        .unwrap_or(&[])
+        .windows(2)
+        .filter(|w| on_runway(rwy, (w[0].0 + w[1].0) / 2.0, (w[0].1 + w[1].1) / 2.0).is_some())
+        .map(|w| nav::haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1) * 1852.0)
+        .sum()
+}
+
+/// Anything that may land on `rwy` within `nm` of it: airborne, low (the
+/// circuit and an arrival's descent, under 4,000 ft above the field), not
+/// climbing away, not on an independent parallel's final. Straight-line
+/// distance, so circuit traffic flying a longer way round is judged
+/// early, never late.
+pub(super) fn arrival_within(
+    targets: &[TcasTarget],
+    rwy: &nav::Runway,
+    runways: &[nav::Runway],
+    field_elev_ft: f64,
+    nm: f64,
+) -> bool {
+    targets
+        .iter()
+        .filter(|t| !t.on_ground)
+        .filter(|t| t.ele_ft - field_elev_ft < 4000.0)
+        .filter(|t| t.vs_fpm <= CLIMBOUT_FPM)
+        .filter(|t| !on_independent_final(t, rwy, runways))
+        .any(|t| {
+            nav::haversine_nm(t.lat, t.lon, rwy.lat_a, rwy.lon_a)
+                .min(nav::haversine_nm(t.lat, t.lon, rwy.lat_b, rwy.lon_b))
+                < nm
+        })
+}
