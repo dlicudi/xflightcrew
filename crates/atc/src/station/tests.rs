@@ -90,7 +90,7 @@ fn squawk_watch_calls_radar_contact_only_when_the_code_shows() {
         "November one seven two Sierra Papa",
         StationSpeaker::Approach,
     );
-    let code = st.assigned_squawk.expect("code issued");
+    let code = st.desk.assigned_squawk.expect("code issued");
     assert_eq!(spoken, atis::spoken_digits(&code.to_string()));
     // Same flight asks again: same code, watch not reset.
     assert_eq!(
@@ -185,7 +185,7 @@ fn departure_clearance_assigns_a_discrete_code_at_radar_fields() {
         &ctx,
         wx,
     );
-    let code = st.assigned_squawk.expect("discrete code issued");
+    let code = st.desk.assigned_squawk.expect("discrete code issued");
     let spoken = atis::spoken_digits(&code.to_string());
     assert!(r.contains(&spoken), "{r}");
     assert!(!r.contains("seven zero zero zero"), "{r}");
@@ -220,7 +220,7 @@ fn departure_clearance_assigns_a_discrete_code_at_radar_fields() {
         wx,
     );
     assert!(r.contains("seven zero zero zero"), "{r}");
-    assert!(st.assigned_squawk.is_none());
+    assert!(st.desk.assigned_squawk.is_none());
     assert!(OWN_STRIP.squawk_watch.lock().unwrap().is_none());
     assert!(
         OWN_STRIP.assigned_squawk.lock().unwrap().is_none(),
@@ -281,11 +281,11 @@ fn squawk_check_repeats_the_assigned_code() {
         false,
         None,
     );
-    let r = st.twr.handle(tower::Intent::SquawkCheck, &ctx);
+    let r = st.desk.twr.handle(tower::Intent::SquawkCheck, &ctx);
     assert!(r.contains("seven zero zero zero"), "{r}");
     // Flight following assigns the discrete code...
     let r = st.respond_approach(tower::Intent::RequestFlightFollowing, &ctx, wx);
-    let code = st.assigned_squawk.expect("code issued");
+    let code = st.desk.assigned_squawk.expect("code issued");
     let spoken = atis::spoken_digits(&code.to_string());
     assert!(r.contains(&spoken), "{r}");
     assert!(
@@ -303,7 +303,7 @@ fn squawk_check_repeats_the_assigned_code() {
         false,
         None,
     );
-    let r = st.twr.handle(tower::Intent::SquawkCheck, &ctx);
+    let r = st.desk.twr.handle(tower::Intent::SquawkCheck, &ctx);
     assert!(r.contains(&spoken), "{r}");
     assert!(!r.contains("seven zero zero zero"), "{r}");
     *OWN_STRIP.squawk_watch.lock().unwrap() = None;
@@ -1817,13 +1817,13 @@ fn a_runway_request_is_granted_or_refused_by_the_field() {
     // The grass strip is refused: a tower does not hand it out.
     let r = ask(&mut st, "request runway two six right");
     assert!(r.contains("unable runway two six right, that runway is not available"), "{r}");
-    assert_eq!(st.twr.state, tower::State::Parked);
+    assert_eq!(st.desk.twr.state, tower::State::Parked);
     // A runway the field lacks.
     let r = ask(&mut st, "request runway three three");
     assert!(r.contains("unable runway three three, no such runway here"), "{r}");
     let r = ask(&mut st, "request runway zero niner");
     assert!(r.contains("unable runway zero niner"), "{r}");
-    assert_eq!(st.twr.state, tower::State::Parked);
+    assert_eq!(st.desk.twr.state, tower::State::Parked);
 
     // The paved runway, asked for by length: granted, and it is the
     // runway in use from here, on the party line too.
@@ -1833,7 +1833,7 @@ fn a_runway_request_is_granted_or_refused_by_the_field() {
         "{r}"
     );
     assert!(r.contains("runway zero eight"), "{r}");
-    assert_eq!(st.twr.state, tower::State::TaxiCleared);
+    assert_eq!(st.desk.twr.state, tower::State::TaxiCleared);
     assert_eq!(st.runway_in_use.as_deref(), Some("08"));
     assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("08"));
     // The pick holds it through the taxi, whatever the calm air says.
@@ -1866,8 +1866,8 @@ fn the_vacated_report_frees_the_strip_before_the_taxi_request() {
     // Landed on 27, rolled off onto the apron south of the strip.
     let r = st.route_keyed("final runway two seven", Service::Tower, &ctx, wx);
     assert!(r.contains("cleared to land"), "{r}");
-    st.twr.gate("cleared to land runway two seven", tower::Intent::Unknown, &ctx);
-    assert_eq!(st.twr.state, tower::State::ClearedToLand);
+    st.desk.twr.gate("cleared to land runway two seven", tower::Intent::Unknown, &ctx);
+    assert_eq!(st.desk.twr.state, tower::State::ClearedToLand);
     let (off_lat, off_lon) = (36.1440, -5.3500);
     assert!(on_active_runway(off_lat, off_lon).is_none(), "the apron is off the strip");
     let held = player_blocked_strip(true, off_lat, off_lon);
@@ -1897,8 +1897,8 @@ fn the_vacated_report_frees_the_strip_before_the_taxi_request() {
     // The report: acknowledged, the state stands, the strip is free.
     let r = st.route_keyed("runway vacated", Service::Tower, &ctx, wx);
     assert!(r.contains("roger, thank you"), "{r}");
-    assert_eq!(st.twr.state, tower::State::ClearedToLand);
-    assert!(st.twr.runway_vacated());
+    assert_eq!(st.desk.twr.state, tower::State::ClearedToLand);
+    assert!(st.desk.twr.runway_vacated());
     let snap_holds = OWN_STRIP.clearance.lock().unwrap().as_ref().map(|c| c.holds_runway);
     assert_eq!(snap_holds, Some(false), "published for the watches");
     let held = player_blocked_strip(true, off_lat, off_lon);
@@ -1913,7 +1913,7 @@ fn the_vacated_report_frees_the_strip_before_the_taxi_request() {
     // Still the taxi IN, never a departure clearance.
     let r = st.route_keyed("request taxi", Service::Tower, &ctx, wx);
     assert!(!r.contains("holding point"), "{r}");
-    assert_eq!(st.twr.state, tower::State::Parked);
+    assert_eq!(st.desk.twr.state, tower::State::Parked);
 
     *GHOSTS.lock().unwrap() = None;
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
@@ -2267,8 +2267,8 @@ fn lemg13_the_tower_continues_the_final_and_clears_it_when_the_runway_clears() {
     st.apt.elev_ft = 52.0;
     st.apt.runways = lemg_runways();
     st.runway_in_use = Some("13".into());
-    st.circuits = true;
-    st.twr.state = tower::State::Inbound;
+    st.desk.circuits = true;
+    st.desk.twr.state = tower::State::Inbound;
     let wx = Wx {
         wind_from_deg: 130.0,
         wind_kts: 5.0,
@@ -2359,7 +2359,7 @@ fn lemg13_the_tower_continues_the_final_and_clears_it_when_the_runway_clears() {
     ctx.runway_occupied = false;
     let r = st.route_keyed(owed.trim_end_matches('.'), Service::Tower, &ctx, wx);
     assert_eq!(r, "", "the readback is accepted");
-    assert_eq!(st.twr.state, tower::State::ClearedToLand);
+    assert_eq!(st.desk.twr.state, tower::State::ClearedToLand);
     assert_eq!(crate::party_line::readback_owed(), None);
 
     // Case B: it never rolls. Cleared, a lined-up aircraft is given its
@@ -2599,7 +2599,7 @@ fn lemg30_a_head_on_lander_sends_us_round_and_we_are_resequenced_to_twelve() {
     st.apt.elev_ft = 52.0;
     st.apt.runways = lemg_runways();
     st.runway_in_use = Some("30".into());
-    st.twr.state = tower::State::ClearedToLand;
+    st.desk.twr.state = tower::State::ClearedToLand;
     st.apply_monitor_go_around();
     assert_eq!(st.runway_in_use.as_deref(), Some("12"));
     assert_eq!(
@@ -2643,7 +2643,7 @@ fn lemg30_a_head_on_lander_sends_us_round_and_we_are_resequenced_to_twelve() {
         )
     );
     // Said once: the next go-around call is the plain answer.
-    assert!(st.resequenced.is_none());
+    assert!(st.desk.resequenced.is_none());
     reset_runway_watch();
 }
 
@@ -2756,7 +2756,7 @@ fn a_standing_occupant_resequences_to_another_strip_or_holds() {
     st.apt.name = "Malaga".into();
     st.apt.runways = vec![lemg_runways()[0].clone()];
     st.runway_in_use = Some("30".into());
-    st.twr.state = tower::State::ClearedToLand;
+    st.desk.twr.state = tower::State::ClearedToLand;
     st.apply_monitor_go_around();
     assert_eq!(st.runway_in_use.as_deref(), Some("30"));
     let wx = Wx {
@@ -2929,7 +2929,7 @@ fn a_monitor_go_around_voids_the_clearance_and_flips_the_coach() {
         holds_runway: false,
     });
     let mut st = lxgb();
-    st.twr.state = tower::State::ClearedToLand;
+    st.desk.twr.state = tower::State::ClearedToLand;
     // Before the sync: the coach suggests the landing readback — the
     // exact contradiction from the 2026-07-14 tape.
     let s = suggest_call(cs, false, Some(1.0), None).unwrap();
@@ -2942,11 +2942,11 @@ fn a_monitor_go_around_voids_the_clearance_and_flips_the_coach() {
     st.apply_monitor_go_around();
 
     assert_eq!(
-        st.twr.state,
+        st.desk.twr.state,
         tower::State::Inbound,
         "clearance void in the FSM"
     );
-    assert!(st.twr.pending().is_none(), "the owed readback dies with it");
+    assert!(st.desk.twr.pending().is_none(), "the owed readback dies with it");
     assert_eq!(
         OWN_STRIP.clearance.lock().unwrap().as_ref().unwrap().state,
         tower::State::Inbound
@@ -3741,29 +3741,12 @@ fn lxgb() -> Station {
         tower_khz: 131200,
         approach_khz: Some(122800),
         departure_khz: None,
-        twr: tower::Tower::new(),
+        desk: StripDesk::new(),
         runway_in_use: None,
-        stated_runway: None,
-        stated_on_strip: false,
-        start_strip: None,
-        departing: false,
-        told_runway: None,
-        runway_request: None,
-        requested_ident: None,
-        dep_checked_in: false,
-        handed_to: None,
-        circuits: false,
-        pilot_info: None,
-        assigned_squawk: None,
-        planned_route: None,
         enforce_readback: true,
         dialect: Dialect::Icao,
         procedures: None,
         sid_exits: Default::default(),
-        ifr_bearings: None,
-        ifr_sid_basis: None,
-        ifr_runway: None,
-        resequenced: None,
     }
 }
 
@@ -4556,7 +4539,7 @@ fn real_install_short_cleared_runway_is_granted_the_longer_one() {
     let r = st.route_keyed(words, Service::Tower, &ctx, wx);
     println!("{r}");
     assert!(r.contains("runway two five approved, taxi to holding point"), "{r}");
-    assert_eq!(st.twr.state, tower::State::TaxiCleared);
+    assert_eq!(st.desk.twr.state, tower::State::TaxiCleared);
     assert_eq!(st.runway_in_use.as_deref(), Some("25"));
     assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("25"));
     let route = OWN_STRIP.taxi_route.lock().unwrap().clone().expect("the taxi route published");
@@ -5010,7 +4993,7 @@ fn having_the_current_information_skips_the_qnh() {
             None,
         )
     };
-    let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
+    let reply = st.desk.twr.handle(tower::parse_intent("request taxi"), &ctx);
     assert!(!reply.contains("QNH"), "{reply}");
     // A STALE letter keeps the numbers — safety over brevity.
     let mut st = lxgb();
@@ -5025,7 +5008,7 @@ fn having_the_current_information_skips_the_qnh() {
         false,
         None,
     );
-    let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
+    let reply = st.desk.twr.handle(tower::parse_intent("request taxi"), &ctx);
     assert!(reply.contains("QNH one zero one eight"), "{reply}");
     // No letter at all: numbers as always.
     let mut st = lxgb();
@@ -5039,7 +5022,7 @@ fn having_the_current_information_skips_the_qnh() {
         false,
         None,
     );
-    let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
+    let reply = st.desk.twr.handle(tower::parse_intent("request taxi"), &ctx);
     assert!(reply.contains("QNH one zero one eight"), "{reply}");
     *ATIS.lock().unwrap() = None;
 }
@@ -5081,11 +5064,11 @@ fn calm_wind_follows_the_arrival_stream() {
     let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
     assert_eq!(st.pick_runway_with(70.0, 1.0, Some("09"), None), "09");
     // Held once we are sequenced: a taxi clearance owns its runway.
-    st.twr.state = tower::State::TaxiCleared;
+    st.desk.twr.state = tower::State::TaxiCleared;
     assert_eq!(st.pick_runway_with(70.0, 1.0, Some("27"), None), "09");
     // Uncommitted, a stream that turned round turns the calm pick with
     // it: one strip, one direction (LEMG 2026-09-28, issue #140).
-    st.twr.state = tower::State::Parked;
+    st.desk.twr.state = tower::State::Parked;
     assert_eq!(st.pick_runway_with(70.0, 1.0, Some("27"), None), "27");
     // A real wind is not overruled by traffic.
     let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
@@ -5217,7 +5200,7 @@ fn an_arrival_keeps_its_runway_on_a_wind_that_favours_neither_end() {
     // A departure ready to go does not choose its runway...
     let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
     st.note_stated_runway("ready for departure runway two seven", tower::Intent::RequestTakeoff);
-    assert_eq!(st.stated_runway, None);
+    assert_eq!(st.desk.call.stated_runway, None);
     // ...but asks for one at the taxi request, honoured when the wind
     // does not argue (LOWI, calm, MOGT3H only from 26).
     assert_eq!(
@@ -5243,7 +5226,7 @@ fn an_arrival_keeps_its_runway_on_a_wind_that_favours_neither_end() {
     let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
     st.runway_in_use = Some("09".into());
     for state in [tower::State::ClearedToLand, tower::State::Inbound] {
-        st.twr.state = state;
+        st.desk.twr.state = state;
         assert_eq!(st.pick_runway(270.0, 15.0), "09", "{state:?}");
     }
 }
@@ -5308,7 +5291,7 @@ fn the_calm_runway_in_use_turns_to_the_live_stream() {
     // Committed: the circuit's Inbound and a taxi clearance hold 31.
     for state in [tower::State::Inbound, tower::State::TaxiCleared] {
         let mut st = fresh("31");
-        st.twr.state = state;
+        st.desk.twr.state = state;
         assert_eq!(st.pick_runway_with(350.0, 3.0, None, Some("13")), "31", "{state:?}");
     }
     // "Downwind runway three one" into the 13 departures, uncommitted:
@@ -5762,7 +5745,7 @@ fn a_runway_start_is_given_the_runway_it_is_lined_up_on() {
     // A flight the tower is sequencing keeps its runway.
     let mut st = station();
     st.runway_in_use = Some("31".into());
-    st.twr.state = tower::State::TaxiCleared;
+    st.desk.twr.state = tower::State::TaxiCleared;
     st.note_stated_runway(words, intent.clone());
     st.note_caller_on_strip(true, lat, lon);
     assert_eq!(st.pick_runway_with(342.6, 2.9, Some("12"), None), "31");
@@ -5864,7 +5847,7 @@ fn a_runway_start_keeps_its_strip_in_a_light_tailwind() {
     assert_eq!(st.pick_runway_with(from, kts, None, None), "30");
     // Not on the strip: the arrival's 5 kt rule, refused as before.
     let mut st = station();
-    st.stated_on_strip = false;
+    st.desk.call.stated_on_strip = false;
     assert_eq!(st.pick_runway_with(from, kts, None, None), "30");
     // A real tailwind still wins: 310 at 12 down 13.
     let mut st = station();
@@ -5873,7 +5856,7 @@ fn a_runway_start_keeps_its_strip_in_a_light_tailwind() {
     let mut st = station();
     assert_eq!(st.pick_runway_with(from, kts, None, None), "13");
     assert_ne!(st.pick_runway_with(from, kts, Some("31"), None), "13");
-    assert_eq!(st.start_strip, None);
+    assert_eq!(st.desk.start_strip, None);
     // The clearance the crew reads names 13.
     let mut st = station();
     assert_eq!(st.pick_runway_with(from, kts, None, None), "13");
@@ -5928,7 +5911,7 @@ fn a_runway_turned_under_a_cleared_start_is_said() {
     let mut ctx = scripted_ctx(&mut st, wx);
     ctx.on_ground = true;
     ctx.holding_point = "Hotel November one".into();
-    st.planned_route = Some(nav::TaxiRoutePlan {
+    st.desk.planned_route = Some(nav::TaxiRoutePlan {
         via: Vec::new(),
         crossings: Vec::new(),
         holding_point: "HN1".into(),
@@ -5944,7 +5927,7 @@ fn a_runway_turned_under_a_cleared_start_is_said() {
         ),
         "{r}"
     );
-    assert_eq!(st.twr.state, tower::State::TaxiCleared);
+    assert_eq!(st.desk.twr.state, tower::State::TaxiCleared);
     assert_eq!(crate::party_line::clearance_runway().as_deref(), Some("13"));
     // The route rides the party line like a "request taxi" answer.
     assert!(OWN_STRIP.taxi_route.lock().unwrap().is_some());
@@ -6023,21 +6006,21 @@ fn parallel_runways_never_trade_places_under_a_departure() {
     ];
     // The tower is working 27L — the taxi clearance named it.
     st.runway_in_use = Some("27L".into());
-    st.twr.state = tower::State::TaxiCleared;
+    st.desk.twr.state = tower::State::TaxiCleared;
     // Every subsequent transmission, in any wind, keeps 27L: the departure
     // is committed and a controller does not move it to the other
     // parallel mid-sequence.
     for (from, kts) in [(250.0, 12.0), (270.0, 25.0), (269.0, 8.0), (271.0, 30.0)] {
         assert_eq!(st.pick_runway(from, kts), "27L", "wind {from}/{kts}");
     }
-    st.twr.state = tower::State::LinedUp;
+    st.desk.twr.state = tower::State::LinedUp;
     assert_eq!(st.pick_runway(280.0, 18.0), "27L");
-    st.twr.state = tower::State::TakeoffCleared;
+    st.desk.twr.state = tower::State::TakeoffCleared;
     assert_eq!(st.pick_runway(260.0, 18.0), "27L");
 
     // Uncommitted, the hysteresis still holds the pick against a parallel
     // that is "better" by rounding error...
-    st.twr.state = tower::State::Parked;
+    st.desk.twr.state = tower::State::Parked;
     for (from, kts) in [(250.0, 12.0), (270.0, 20.0), (271.0, 9.0)] {
         assert_eq!(st.pick_runway(from, kts), "27L", "wind {from}/{kts}");
     }
@@ -6208,7 +6191,7 @@ fn approach_takes_the_departure_check_in_when_it_is_the_handoff() {
     let r = st.route_keyed("descending two thousand", Service::Approach, &ctx, wx);
     assert_eq!(r, "", "{r}");
 
-    st.twr.state = tower::State::TaxiCleared;
+    st.desk.twr.state = tower::State::TaxiCleared;
     let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
     assert!(r.contains("cleared for takeoff"), "{r}");
     let _ = crate::party_line::take_departure_handoff();
@@ -6225,7 +6208,7 @@ fn approach_takes_the_departure_check_in_when_it_is_the_handoff() {
         wx,
     );
     assert_eq!(r, "", "{r}");
-    assert_eq!(st.twr.state, tower::State::TakeoffCleared);
+    assert_eq!(st.desk.twr.state, tower::State::TakeoffCleared);
 
     // The check-in on approach, as the crew said it.
     let checkin = "birmingham approach, whiskey alpha tango four two three six, passing three thousand one hundred climbing one five thousand";
@@ -6236,10 +6219,10 @@ fn approach_takes_the_departure_check_in_when_it_is_the_handoff() {
         r,
         "November one seven two Sierra Papa, Gibraltar Approach, radar contact, climb one five thousand."
     );
-    assert_eq!(st.twr.state, tower::State::Parked, "the tower's book is closed");
+    assert_eq!(st.desk.twr.state, tower::State::Parked, "the tower's book is closed");
     let snap = crate::party_line::clearance_state();
     assert_eq!(snap, Some(tower::State::Parked));
-    assert!(!st.twr.holds_runway());
+    assert!(!st.desk.twr.holds_runway());
     // Later readbacks on approach stay quiet.
     let r = st.route_keyed("maintaining one five thousand", Service::Approach, &ctx, wx);
     assert_eq!(r, "", "{r}");
@@ -6272,15 +6255,15 @@ fn a_landing_readback_is_a_readback_not_a_landing_request() {
     let ctx = scripted_ctx(&mut st, wx);
     let r = st.route_keyed("november one seven two, final", Service::Tower, &ctx, wx);
     assert!(r.contains("cleared to land"), "{r}");
-    assert!(st.twr.pending().is_some(), "the landing readback is owed");
+    assert!(st.desk.twr.pending().is_some(), "the landing readback is owed");
     let r = st.route_keyed(readback, Service::Tower, &ctx, wx);
     assert_eq!(r, "", "{r}");
-    assert_eq!(st.twr.state, tower::State::ClearedToLand);
-    assert!(st.twr.pending().is_none(), "paid");
+    assert_eq!(st.desk.twr.state, tower::State::ClearedToLand);
+    assert!(st.desk.twr.pending().is_none(), "paid");
     // Said again with nothing owed: still silence, still cleared.
     let r = st.route_keyed(readback, Service::Tower, &ctx, wx);
     assert_eq!(r, "", "{r}");
-    assert_eq!(st.twr.state, tower::State::ClearedToLand);
+    assert_eq!(st.desk.twr.state, tower::State::ClearedToLand);
 
     // Unkeyed, addressed by our callsign: not the tower's business as a
     // request any more; it falls through and the landing stands.
@@ -6288,9 +6271,9 @@ fn a_landing_readback_is_a_readback_not_a_landing_request() {
     let mut ctx = scripted_ctx(&mut st, wx);
     ctx.callsign = "Whiskey Alpha Tango four two three six".into();
     st.route_keyed("whiskey alpha tango four two three six, final", Service::Tower, &ctx, wx);
-    assert_eq!(st.twr.state, tower::State::ClearedToLand);
+    assert_eq!(st.desk.twr.state, tower::State::ClearedToLand);
     assert_eq!(st.route_unkeyed(readback, Service::Tower, &ctx, wx), None);
-    assert_eq!(st.twr.state, tower::State::ClearedToLand, "never walked back to Inbound");
+    assert_eq!(st.desk.twr.state, tower::State::ClearedToLand, "never walked back to Inbound");
     *OWN_STRIP.clearance.lock().unwrap() = None;
 }
 
@@ -6315,7 +6298,7 @@ fn sortie_dialogues_battle_test_the_routing() {
     let r = st.route_keyed("gibraltar tower, radio check", Service::Tower, &ctx, wx);
     assert!(r.contains("reading you five"), "{r}");
     assert_eq!(
-        st.twr.state,
+        st.desk.twr.state,
         tower::State::Parked,
         "a radio check moves nothing"
     );
@@ -6324,19 +6307,19 @@ fn sortie_dialogues_battle_test_the_routing() {
     // enforces nothing; the crew's echo pays it and earns silence.
     let r = st.route_keyed("request clearance", Service::Tower, &ctx, wx);
     assert!(r.contains("cleared to leave the Gibraltar zone"), "{r}");
-    let owed = st.twr.suggested_readback(&ctx.callsign).expect("a suggested readback");
+    let owed = st.desk.twr.suggested_readback(&ctx.callsign).expect("a suggested readback");
     assert!(owed.starts_with("Not above two thousand feet, QNH one zero one seven, squawk"), "{owed}");
     assert!(owed.ends_with(&format!("{}.", ctx.callsign)), "{owed}");
     let r = st.route_keyed(&owed.to_lowercase(), Service::Tower, &ctx, wx);
     assert_eq!(r, "", "a clearance readback keeps the frequency quiet: {r}");
-    assert!(st.twr.suggested_readback(&ctx.callsign).is_none(), "paid");
+    assert!(st.desk.twr.suggested_readback(&ctx.callsign).is_none(), "paid");
 
     let r = st.route_keyed("request clearance for taxi", Service::Tower, &ctx, wx);
     assert!(
         r.contains("taxi to holding point Alpha runway two seven"),
         "{r}"
     );
-    assert_eq!(st.twr.state, tower::State::TaxiCleared);
+    assert_eq!(st.desk.twr.state, tower::State::TaxiCleared);
 
     // A readback earns silence; garble earns "say again"; neither moves
     // the sequence.
@@ -6349,7 +6332,7 @@ fn sortie_dialogues_battle_test_the_routing() {
         wx,
     );
     assert!(r.contains("say again"), "{r}");
-    assert_eq!(st.twr.state, tower::State::TaxiCleared);
+    assert_eq!(st.desk.twr.state, tower::State::TaxiCleared);
 
     // A question keyed by mistake gets "say again", never a clearance —
     // the 2026-07-08 regression, now at the routing layer.
@@ -6363,14 +6346,14 @@ fn sortie_dialogues_battle_test_the_routing() {
     let r = st.route_keyed("takeoff checklist", Service::Tower, &ctx, wx);
     assert!(r.contains("say again"), "{r}");
     assert_eq!(
-        st.twr.state,
+        st.desk.twr.state,
         tower::State::TaxiCleared,
         "questions moved the sequence"
     );
 
     let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
     assert!(r.contains("cleared for takeoff"), "{r}");
-    assert_eq!(st.twr.state, tower::State::TakeoffCleared);
+    assert_eq!(st.desk.twr.state, tower::State::TakeoffCleared);
 
     // The takeoff clearance armed the handoff; airborne through 700 ft it
     // fires exactly once, to the departure frequency.
@@ -6407,7 +6390,7 @@ fn sortie_dialogues_battle_test_the_routing() {
 
     // Runway-shaped business on the wrong frequency redirects to the
     // tower and must not advance the tower's sequence.
-    let was = st.twr.state;
+    let was = st.desk.twr.state;
     let r = st.route_keyed("request taxi", Service::Approach, &ctx, wx);
     assert!(
         r.contains("contact Gibraltar Tower on one three one decimal two"),
@@ -6415,7 +6398,7 @@ fn sortie_dialogues_battle_test_the_routing() {
     );
     let r = st.route_keyed("ready for departure", Service::Departure, &ctx, wx);
     assert!(r.contains("contact Gibraltar Tower"), "{r}");
-    assert_eq!(st.twr.state, was, "a redirect must not move the sequence");
+    assert_eq!(st.desk.twr.state, was, "a redirect must not move the sequence");
 
     // Coming back in: departure sends arrivals to approach when the field
     // has one, and the touch-and-go option survives the redirect.
@@ -6456,13 +6439,13 @@ fn sortie_dialogues_battle_test_the_routing() {
     );
     assert_eq!(r, "", "a clearance echo keeps the frequency quiet: {r}");
     assert_eq!(
-        st.twr.state,
+        st.desk.twr.state,
         tower::State::ClearedToLand,
         "echo moved the sequence"
     );
     let r = st.route_keyed("request taxi", Service::Tower, &calm_ctx, calm());
     assert!(r.contains("taxi to parking"), "{r}");
-    assert_eq!(st.twr.state, tower::State::Parked);
+    assert_eq!(st.desk.twr.state, tower::State::Parked);
     let r = st.route_keyed("i've just landed", Service::Tower, &calm_ctx, calm());
     assert!(r.contains("taxi to parking"), "{r}");
 
@@ -6489,7 +6472,7 @@ fn sortie_dialogues_battle_test_the_routing() {
         .expect("a hail addressed to the tower is answered");
     assert!(r.contains("pass your message"), "{r}");
     assert_eq!(
-        st.twr.state,
+        st.desk.twr.state,
         tower::State::Parked,
         "crew talk moved the sequence"
     );
@@ -6547,7 +6530,7 @@ fn an_airline_callsign_is_addressed_and_answered() {
         .expect("our callsign addresses the tower");
     assert!(r.starts_with("Speedbird three zero six"), "{r}");
     assert!(r.contains("holding point"), "{r}");
-    assert_eq!(st.twr.state, tower::State::TaxiCleared);
+    assert_eq!(st.desk.twr.state, tower::State::TaxiCleared);
 
     // Keyed, the whisper spelling of the same callsign.
     let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
@@ -6663,7 +6646,7 @@ fn readback_discipline_runs_through_the_keyed_route() {
     assert!(r.contains("read back"), "{r}");
     assert!(r.contains("cleared for takeoff"), "{r}");
     assert_eq!(
-        st.twr.state,
+        st.desk.twr.state,
         tower::State::TakeoffCleared,
         "challenge moves nothing"
     );
@@ -6782,11 +6765,11 @@ fn a_rejected_takeoff_cancels_the_clearance_and_the_held_release() {
     assert!(r.contains("roger") && r.contains("Hold position"), "{r}");
     assert!(!r.contains("read back"), "{r}");
     assert_eq!(
-        st.twr.state,
+        st.desk.twr.state,
         tower::State::LinedUp,
         "on the runway, no clearance"
     );
-    assert!(st.twr.pending().is_none(), "nothing owed");
+    assert!(st.desk.twr.pending().is_none(), "nothing owed");
     assert!(
         OWN_STRIP.takeoff_hold.lock().unwrap().is_none(),
         "the held release is void"
@@ -6822,7 +6805,7 @@ fn a_rejected_takeoff_cancels_the_clearance_and_the_held_release() {
     );
     assert!(r.contains("holding point"), "{r}");
     assert!(!r.contains("read back"), "{r}");
-    assert_eq!(st.twr.state, tower::State::TaxiCleared);
+    assert_eq!(st.desk.twr.state, tower::State::TaxiCleared);
 
     // From the start of the runway instead, it asks for takeoff again.
     let mut st = Station::load(path.to_str().unwrap(), "LXGB").unwrap();
@@ -6834,7 +6817,7 @@ fn a_rejected_takeoff_cancels_the_clearance_and_the_held_release() {
         wx,
     );
     st.route_keyed(&format!("{cs}, stopping"), Service::Tower, &ctx, wx);
-    assert_eq!(st.twr.state, tower::State::LinedUp);
+    assert_eq!(st.desk.twr.state, tower::State::LinedUp);
     let r = st.route_keyed(
         &format!("{cs}, ready for departure"),
         Service::Tower,
@@ -6898,13 +6881,13 @@ fn a_taxi_request_cancels_a_takeoff_clearance() {
     st.route_keyed("request taxi", Service::Tower, &ctx, wx);
     let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
     assert!(r.contains("cleared for takeoff"), "{r}");
-    assert!(st.twr.pending().is_some(), "the takeoff readback is owed");
+    assert!(st.desk.twr.pending().is_some(), "the takeoff readback is owed");
     let r = st.route_keyed("gibraltar tower, request taxi", Service::Tower, &ctx, wx);
     assert!(r.contains("takeoff clearance cancelled"), "{r}");
     assert!(r.contains("holding point"), "{r}");
     assert!(!r.contains("read back"), "{r}");
-    assert_eq!(st.twr.state, tower::State::TaxiCleared);
-    assert!(st.twr.pending().is_none());
+    assert_eq!(st.desk.twr.state, tower::State::TaxiCleared);
+    assert!(st.desk.twr.pending().is_none());
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *OWN_STRIP.handoff.lock().unwrap() = None;
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
@@ -6934,7 +6917,7 @@ fn conditional_line_up_arms_the_release_watch() {
         "{r}"
     );
     assert!(r.contains("line up runway zero niner behind"), "{r}");
-    assert_eq!(st.twr.state, tower::State::LinedUp);
+    assert_eq!(st.desk.twr.state, tower::State::LinedUp);
     assert!(
         OWN_STRIP.takeoff_hold.lock().unwrap().is_some(),
         "a conditional line-up owes the clearance: release watch armed"
@@ -7601,7 +7584,7 @@ fn radar_contact_is_the_radar_units_never_the_towers() {
 
     let r = st.route_keyed("request clearance", Service::Tower, &ctx, wx);
     assert!(r.contains("squawk"), "{r}");
-    let code = st.assigned_squawk.expect("code issued");
+    let code = st.desk.assigned_squawk.expect("code issued");
     let t0 = Instant::now();
     // Airborne on the tower, the code squawking: the tower says nothing,
     // and the watch still waits for the radar unit.
@@ -7638,9 +7621,9 @@ fn radar_contact_is_the_radar_units_never_the_towers() {
     // A code issued by the radar unit on its own frequency (flight
     // following, no handoff): the watch says it there.
     *OWN_STRIP.squawk_watch.lock().unwrap() = None;
-    st.assigned_squawk = None;
+    st.desk.assigned_squawk = None;
     st.assign_squawk("November one two three", StationSpeaker::Departure);
-    let code = st.assigned_squawk.expect("code issued");
+    let code = st.desk.assigned_squawk.expect("code issued");
     let (line, who) = squawk_tick(Some(code), true, StationSpeaker::Departure, t0)
         .expect("radar contact on Departure");
     assert!(line.contains("radar contact"), "{line}");
@@ -7722,7 +7705,7 @@ fn a_circuit_zone_request_is_cleared_for_the_circuit() {
             &ctx,
             wx,
         );
-        assert!(st.circuits, "circuits noted from the zone request");
+        assert!(st.desk.circuits, "circuits noted from the zone request");
         assert!(!r.contains("leave the"), "{r}");
         assert!(r.contains("runway two seven"), "{r}");
         assert!(r.contains("squawk"), "{r}");
@@ -7742,10 +7725,10 @@ fn a_circuit_zone_request_is_cleared_for_the_circuit() {
         let r = st.route_keyed(owed.trim_end_matches('.'), Service::Tower, &ctx, wx);
         assert_eq!(r, "", "the readback is accepted");
         assert_eq!(crate::party_line::readback_owed(), None);
-        assert_eq!(st.twr.state, tower::State::Parked);
+        assert_eq!(st.desk.twr.state, tower::State::Parked);
         // A plain zone request states the intent afresh: a departure.
         let r = st.route_keyed("request clearance", Service::Tower, &ctx, wx);
-        assert!(!st.circuits);
+        assert!(!st.desk.circuits);
         assert!(r.contains("cleared to leave the Gibraltar zone"), "{r}");
     }
     // From the ramp no runway is named (full auto's zone_clearance_call,
@@ -7760,7 +7743,7 @@ fn a_circuit_zone_request_is_cleared_for_the_circuit() {
         &ctx,
         wx,
     );
-    assert!(st.circuits, "circuits noted from the ramp's zone request");
+    assert!(st.desk.circuits, "circuits noted from the ramp's zone request");
     assert!(!r.contains("leave the"), "{r}");
     assert!(r.contains("circuit height"), "{r}");
     assert!(r.ends_with("report ready for departure."), "{r}");
@@ -7797,7 +7780,7 @@ fn circuit_traffic_stays_with_the_tower() {
         wx,
     );
     assert!(r.contains("taxi to holding point"), "{r}");
-    assert!(st.circuits, "circuits noted");
+    assert!(st.desk.circuits, "circuits noted");
     assert!(!squawk_watch_active(), "no radar watch for pattern traffic");
     // A plain "ready" does not undo it.
     let r = st.route_keyed(
@@ -7807,7 +7790,7 @@ fn circuit_traffic_stays_with_the_tower() {
         wx,
     );
     assert!(r.contains("cleared for takeoff"), "{r}");
-    assert_eq!(st.twr.state, tower::State::TakeoffCleared);
+    assert_eq!(st.desk.twr.state, tower::State::TakeoffCleared);
     assert!(
         handoff_tick(900.0, false).is_none(),
         "the tower keeps a circuit"
@@ -7837,9 +7820,9 @@ fn circuit_traffic_stays_with_the_tower() {
     let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
     let ctx = scripted_ctx(&mut st, wx);
     st.route_keyed("request taxi for circuits", Service::Tower, &ctx, wx);
-    assert!(st.circuits);
+    assert!(st.desk.circuits);
     st.route_keyed("request taxi", Service::Tower, &ctx, wx);
-    assert!(!st.circuits, "a taxi request states the intent afresh");
+    assert!(!st.desk.circuits, "a taxi request states the intent afresh");
     let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
     assert!(r.contains("cleared for takeoff"), "{r}");
     let line = handoff_tick(900.0, false).expect("a departure is handed off");
@@ -7885,11 +7868,11 @@ fn takeoff_clearance_arms_the_departure_handoff() {
     };
     // Walk the tower to a takeoff clearance and arm, exactly as respond()
     // does around twr.handle().
-    st.twr.handle(tower::parse_intent("request taxi"), &ctx);
-    let was = st.twr.state;
-    st.twr
+    st.desk.twr.handle(tower::parse_intent("request taxi"), &ctx);
+    let was = st.desk.twr.state;
+    st.desk.twr
         .handle(tower::parse_intent("ready for departure"), &ctx);
-    assert_ne!(was, st.twr.state);
+    assert_ne!(was, st.desk.twr.state);
     st.arm_departure_handoff(&ctx);
 
     // On the roll: silence. Climbing through field + 700: the handoff,
@@ -8198,7 +8181,7 @@ fn the_ifr_clearance_and_the_taxi_name_one_runway_at_egkk() {
     assert!(r.contains("Mike departure"), "LAM6M off 26L: {r}");
     assert!(!r.contains("Victor"), "{r}");
     let r = st.route_keyed(
-        &format!("cleared to birmingham via the lam six mike departure, runway two six left, climb five thousand feet, squawk {}, {cs}", atis::spoken_digits(&format!("{:04}", st.assigned_squawk.unwrap()))),
+        &format!("cleared to birmingham via the lam six mike departure, runway two six left, climb five thousand feet, squawk {}, {cs}", atis::spoken_digits(&format!("{:04}", st.desk.assigned_squawk.unwrap()))),
         Service::Tower,
         &ctx,
         wx,
@@ -8215,7 +8198,7 @@ fn the_ifr_clearance_and_the_taxi_name_one_runway_at_egkk() {
     assert!(r.contains("runway two six left"), "{r}");
 
     // Airborne, the freeze is spent.
-    st.ifr_runway = None;
+    st.desk.ifr_runway = None;
     *REGION.lock().unwrap() = Vec::new();
     *OWN_STRIP.ifr_clearance.lock().unwrap() = None;
     *OWN_STRIP.ifr_flight.lock().unwrap() = None;
@@ -8322,7 +8305,7 @@ fn an_ifr_clearance_is_published_only_after_its_readback() {
     // A destination the index does not know: asked again, nothing issued.
     let r = st.route_keyed("gibraltar tower, request ifr clearance to atlantis", Service::Tower, &ctx, wx);
     assert_eq!(r, "November one seven two Sierra Papa, say again destination.");
-    assert!(st.assigned_squawk.is_none(), "no clearance, no code");
+    assert!(st.desk.assigned_squawk.is_none(), "no clearance, no code");
     // Issued: the SID from the CIFP for the runway in use, 5,000 ft, the
     // radar field's discrete code. Not yet published.
     let r = st.route_keyed(
@@ -8331,7 +8314,7 @@ fn an_ifr_clearance_is_published_only_after_its_readback() {
         &ctx,
         wx,
     );
-    let code = st.assigned_squawk.expect("a discrete code at a radar field");
+    let code = st.desk.assigned_squawk.expect("a discrete code at a radar field");
     let spoken = atis::spoken_digits(&format!("{code:04}"));
     assert_eq!(
         r,
@@ -8444,7 +8427,7 @@ fn an_ifr_clearance_reaches_any_field_and_cancel_ifr_ends_it() {
         Some("EGHM")
     );
     assert!(crate::party_line::ifr_flight_code().is_some());
-    assert!(st.ifr_runway.is_some(), "the SID's runway is frozen");
+    assert!(st.desk.ifr_runway.is_some(), "the SID's runway is frozen");
     // Cancelled: the clearance, the flight's IFR code and the frozen
     // runway all go.
     let r = st.route_keyed(
@@ -8456,7 +8439,7 @@ fn an_ifr_clearance_reaches_any_field_and_cancel_ifr_ends_it() {
     assert_eq!(r, format!("{cs}, IFR flight cancelled."));
     assert_eq!(crate::party_line::assigned_clearance(), None);
     assert_eq!(crate::party_line::ifr_flight_code(), None);
-    assert!(st.ifr_runway.is_none());
+    assert!(st.desk.ifr_runway.is_none());
     // An owed readback is cancelled too, with nothing published after.
     st.route_keyed(
         "gibraltar tower, november one seven two sierra papa, request ifr clearance to edinburgh",
@@ -8579,7 +8562,7 @@ fn the_ifr_sid_is_the_one_that_leaves_toward_the_destination() {
     );
     let r = st.route_keyed("request ifr clearance to lemd", Service::Tower, &ctx, wx);
     assert!(r.contains("via the North one Alpha departure, runway zero niner"), "{r}");
-    let (exit, dest) = st.ifr_bearings.expect("bearings kept");
+    let (exit, dest) = st.desk.ifr_bearings.expect("bearings kept");
     assert!(exit < 10.0 || exit > 350.0, "north exit: {exit}");
     assert!((dest - 22.0).abs() < 10.0, "Madrid bearing: {dest}");
     // Another flight (a fresh station: this one is owed a readback).
@@ -8602,7 +8585,7 @@ fn the_ifr_sid_is_the_one_that_leaves_toward_the_destination() {
     );
     let r = st.route_keyed("request ifr clearance to gmmx", Service::Tower, &ctx, wx);
     assert!(r.contains("via the South one Alpha departure"), "{r}");
-    let (exit, dest) = st.ifr_bearings.expect("bearings kept");
+    let (exit, dest) = st.desk.ifr_bearings.expect("bearings kept");
     assert!((exit - 190.0).abs() < 15.0, "south exit: {exit}");
     assert!((dest - 212.0).abs() < 10.0, "Marrakech bearing: {dest}");
     // No positioned fixes: the first in the file, as before.
@@ -8620,7 +8603,7 @@ fn the_ifr_sid_is_the_one_that_leaves_toward_the_destination() {
     );
     let r = st.route_keyed("request ifr clearance to lemd", Service::Tower, &ctx, wx);
     assert!(r.contains("via the South one Alpha departure"), "{r}");
-    assert_eq!(st.ifr_bearings, None);
+    assert_eq!(st.desk.ifr_bearings, None);
     Station::uninstall();
     *REGION.lock().unwrap() = Vec::new();
     *OWN_STRIP.squawk_watch.lock().unwrap() = None;
@@ -8705,7 +8688,7 @@ fn the_ifr_sid_is_the_one_that_joins_the_filed_route() {
             None,
         );
         let r = st.route_keyed(&format!("request ifr clearance to {dest}"), Service::Tower, &ctx, wx);
-        (r, st.ifr_sid_basis.clone())
+        (r, st.desk.ifr_sid_basis.clone())
     };
     *crate::party_line::FILED_ROUTE.lock().unwrap() = Some(filed_lxgb_lemd_via_south);
     let (r, basis) = ask("lemd");
@@ -8958,7 +8941,7 @@ fn lxgb_vectored_arrival_flies_to_a_landing_clearance() {
     );
 
     // The handoff lands on the tower: "final" alone earns the clearance.
-    let clear = st.twr.handle(
+    let clear = st.desk.twr.handle(
         tower::parse_intent("november one seven two sierra papa, final"),
         &tower::Ctx {
             callsign: "November one seven two Sierra Papa".into(),
@@ -9728,7 +9711,7 @@ fn a_held_runway_start_arms_the_release_and_takes_the_hold_readback() {
     ctx.own_on_runway = true;
     ctx.runway_occupied = true;
     let cs = "november one seven two sierra papa";
-    assert_eq!(st.twr.state, tower::State::Parked);
+    assert_eq!(st.desk.twr.state, tower::State::Parked);
     let r = st.route_keyed(
         &format!("{cs}, ready for departure, for circuits"),
         Service::Tower,
@@ -9736,7 +9719,7 @@ fn a_held_runway_start_arms_the_release_and_takes_the_hold_readback() {
         wx,
     );
     assert!(r.contains("hold position, traffic on the runway"), "{r}");
-    assert_eq!(st.twr.state, tower::State::LinedUp);
+    assert_eq!(st.desk.twr.state, tower::State::LinedUp);
     assert!(
         OWN_STRIP.takeoff_hold.lock().unwrap().as_ref().is_some_and(|h| h.lined_up),
         "the release watch is armed for the runway start"
@@ -9793,12 +9776,12 @@ fn real_install_lemd_departure_pick_skips_an_exit_only_end() {
     let mut arr = Station::load(&apt, "LEMD").expect("LEMD has a tower");
     assert_eq!(arr.pick_runway(240.0, 5.0), "18R", "an arrival keeps the wind's pick");
     let mut dep = Station::load(&apt, "LEMD").expect("LEMD has a tower");
-    dep.departing = true;
+    dep.desk.call.departing = true;
     let id = dep.pick_runway(240.0, 5.0);
     println!("departure runway {id}");
     assert!(!["18R", "32L", "32R"].contains(&id.as_str()), "{id}");
     // A departure already given 18R is moved off it too.
-    arr.departing = true;
+    arr.desk.call.departing = true;
     let id = arr.pick_runway(240.0, 5.0);
     assert!(!["18R", "32L", "32R"].contains(&id.as_str()), "{id}");
     *TAXI_NET.lock().unwrap() = None;

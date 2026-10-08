@@ -11,7 +11,7 @@ impl Station {
     /// been 08, and the planned MOGT3H exists only from 26. The wind still
     /// wins when it really favours the other end.
     pub(super) fn note_stated_runway(&mut self, transcript: &str, intent: tower::Intent) {
-        self.stated_runway = match intent {
+        self.desk.call.stated_runway = match intent {
             tower::Intent::ReportFinal
             | tower::Intent::ReportDownwind
             | tower::Intent::ReportBase
@@ -23,12 +23,12 @@ impl Station {
             | tower::Intent::RequestClearance => tower::stated_runway(transcript),
             _ => None,
         };
-        self.stated_on_strip = false;
-        self.runway_request = match intent {
+        self.desk.call.stated_on_strip = false;
+        self.desk.call.runway_request = match intent {
             tower::Intent::RequestRunway => tower::requested_runway(transcript),
             _ => None,
         };
-        self.requested_ident = None;
+        self.desk.call.requested_ident = None;
     }
 
     /// The caller of the stated runway stands ON that strip, on the ground:
@@ -36,7 +36,7 @@ impl Station {
     /// against the calm-wind arrival stream as long as the wind does not
     /// argue (`pick_runway_with`). Pure but for the flag.
     pub(super) fn note_caller_on_strip(&mut self, on_ground: bool, lat: f64, lon: f64) {
-        self.stated_on_strip = on_ground
+        self.desk.call.stated_on_strip = on_ground
             && self.stated_ident().is_some_and(|ident| {
                 strip(&self.apt.runways, &ident).is_some_and(|r| on_runway(r, lat, lon).is_some())
             });
@@ -58,8 +58,8 @@ impl Station {
         reply: String,
     ) -> String {
         if !ctx.on_ground {
-            self.told_runway = None;
-            self.start_strip = None;
+            self.desk.told_runway = None;
+            self.desk.start_strip = None;
             return reply;
         }
         if reply.is_empty() {
@@ -70,13 +70,13 @@ impl Station {
             tower::Intent::RequestClearance
             | tower::Intent::RequestIfrClearance { .. }
             | tower::Intent::RequestRunway => {
-                self.told_runway = now;
+                self.desk.told_runway = now;
                 reply
             }
             tower::Intent::RequestTakeoff
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestBacktrack => {
-                let from = std::mem::replace(&mut self.told_runway, now.clone());
+                let from = std::mem::replace(&mut self.desk.told_runway, now.clone());
                 match (from, now) {
                     (Some(from), Some(to)) if from != to => {
                         sim::blackbox::record(
@@ -95,7 +95,7 @@ impl Station {
 
     /// The strip end the held stated runway names at this field.
     fn stated_ident(&self) -> Option<String> {
-        let stated = self.stated_runway.as_deref()?;
+        let stated = self.desk.call.stated_runway.as_deref()?;
         self.apt
             .runways
             .iter()
@@ -107,13 +107,13 @@ impl Station {
     /// `pick_runway_with`).
     fn runway_committed(&self) -> bool {
         matches!(
-            self.twr.state,
+            self.desk.twr.state,
             tower::State::TaxiCleared
                 | tower::State::LinedUp
                 | tower::State::TakeoffCleared
                 | tower::State::Inbound
-        ) || (self.twr.state == tower::State::ClearedToLand && !self.twr.runway_vacated())
-            || (self.ifr_runway.is_some() && self.ifr_runway == self.runway_in_use)
+        ) || (self.desk.twr.state == tower::State::ClearedToLand && !self.desk.twr.runway_vacated())
+            || (self.desk.ifr_runway.is_some() && self.desk.ifr_runway == self.runway_in_use)
     }
 
     /// Answer a "request runway ..." call's context: the runway it named,
@@ -122,19 +122,19 @@ impl Station {
     /// to it from `pos` (as `RequestTaxi` plans one to the runway in use);
     /// refused, the ctx carries the reason. Pure but for the route planner.
     pub(super) fn apply_runway_request(&mut self, ctx: &mut tower::Ctx, pos: Option<(f64, f64)>) {
-        match resolve_runway_request(&self.apt.runways, self.runway_request.as_deref()) {
+        match resolve_runway_request(&self.apt.runways, self.desk.call.runway_request.as_deref()) {
             Err(refusal) => {
-                self.requested_ident = None;
+                self.desk.call.requested_ident = None;
                 ctx.runway_refusal = Some(refusal);
             }
             Ok(ident) => {
                 ctx.runway = atis::spoken_runway(&ident);
                 ctx.runway_refusal = None;
                 if ctx.on_ground {
-                    self.planned_route = pos.and_then(|(lat, lon)| {
+                    self.desk.planned_route = pos.and_then(|(lat, lon)| {
                         plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
                     });
-                    let route = self.planned_route.as_ref();
+                    let route = self.desk.planned_route.as_ref();
                     ctx.holding_point = route
                         .map(|r| spoken_taxiway(&r.holding_point))
                         .filter(|h| !h.is_empty())
@@ -149,7 +149,7 @@ impl Station {
                         })
                         .unwrap_or_default();
                 }
-                self.requested_ident = Some(ident);
+                self.desk.call.requested_ident = Some(ident);
             }
         }
     }
@@ -226,27 +226,27 @@ impl Station {
                     ON_STRIP_TAILWIND_KTS,
                 )
         };
-        if std::mem::take(&mut self.stated_on_strip) && !self.runway_committed() {
+        if std::mem::take(&mut self.desk.call.stated_on_strip) && !self.runway_committed() {
             if let Some(ident) = self.stated_ident() {
                 if start_ok(self, &ident) {
-                    self.stated_runway = None;
+                    self.desk.call.stated_runway = None;
                     self.runway_in_use = Some(ident.clone());
-                    self.start_strip = Some(ident.clone());
+                    self.desk.start_strip = Some(ident.clone());
                     return ident;
                 }
             }
         }
-        if let Some(held) = self.start_strip.take() {
+        if let Some(held) = self.desk.start_strip.take() {
             let restated = self
-                .stated_runway
+                .desk.call.stated_runway
                 .as_deref()
                 .is_some_and(|s| !tower::runway_matches(&held, s));
             if !restated
                 && self.runway_in_use.as_deref() == Some(held.as_str())
                 && start_ok(self, &held)
             {
-                self.stated_runway = None;
-                self.start_strip = Some(held.clone());
+                self.desk.call.stated_runway = None;
+                self.desk.start_strip = Some(held.clone());
                 return held;
             }
         }
@@ -288,7 +288,7 @@ impl Station {
         // mile final runway one three" into 350 at 3 earned "negative, runway
         // three one" because 13's -2.3 kt trailed 31's +2.3 kt by 4.7, over
         // the 3 kt margin, in a wind the same function calls calm.
-        if let Some(stated) = self.stated_runway.take() {
+        if let Some(stated) = self.desk.call.stated_runway.take() {
             let ident = self
                 .apt
                 .runways
@@ -352,7 +352,7 @@ impl Station {
         }
         if wind_kts >= CALM_WIND_KTS || self.runway_in_use.is_none() {
             let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts);
-            let best = if self.departing {
+            let best = if self.desk.call.departing {
                 self.departure_wind_pick(best, wind_from, wind_kts)
             } else {
                 best
@@ -375,7 +375,7 @@ impl Station {
                 let current = self
                     .runway_in_use
                     .as_deref()
-                    .filter(|cur| !self.departing || self.departs_from(cur))
+                    .filter(|cur| !self.desk.call.departing || self.departs_from(cur))
                     .and_then(|cur| nav::headwind_for(&self.apt.runways, cur, wind_from, wind_kts));
                 if current.is_none_or(|cur_hw| hw > cur_hw + RUNWAY_SWAP_MARGIN_KTS) {
                     self.runway_in_use = Some(id);
@@ -388,7 +388,7 @@ impl Station {
         // before the fix, or by a calm-wind stream, would stand for good.
         if let Some(cur) = self.runway_in_use.as_deref() {
             let main = nav::close_parallel_main(&self.apt.runways, cur);
-            if main != cur && (!self.departing || self.departs_from(&main)) {
+            if main != cur && (!self.desk.call.departing || self.departs_from(&main)) {
                 tracing::info!(from = %cur, to = %main, "runway in use moved to the main runway");
                 self.runway_in_use = Some(main);
             }

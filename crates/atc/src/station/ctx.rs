@@ -30,8 +30,8 @@ impl Station {
         // it has been flown (or abandoned), and the pick is free again.
         // So is a runway start's strip (`start_strip`).
         if !on_ground {
-            self.ifr_runway = None;
-            self.start_strip = None;
+            self.desk.ifr_runway = None;
+            self.desk.start_strip = None;
         }
         // The wind a tower reads out and picks its runway by is the wind ON
         // THE FIELD. The sim's wind datarefs are the air the aircraft is in:
@@ -61,7 +61,7 @@ impl Station {
             arrival_end(&targets, &self.apt.runways, self.apt.elev_ft),
             now,
         );
-        if on_ground && self.stated_runway.is_some() {
+        if on_ground && self.desk.call.stated_runway.is_some() {
             if let (Ok(lat), Ok(lon)) = (
                 xp.get_float(datarefs::LATITUDE).await,
                 xp.get_float(datarefs::LONGITUDE).await,
@@ -69,9 +69,9 @@ impl Station {
                 self.note_caller_on_strip(on_ground, lat, lon);
             }
         }
-        self.departing = on_ground
+        self.desk.call.departing = on_ground
             && !matches!(intent, tower::Intent::RequestTaxiIn)
-            && self.twr.state != tower::State::ClearedToLand;
+            && self.desk.twr.state != tower::State::ClearedToLand;
         let ident = self.pick_runway_with(
             wx.wind_from_deg,
             wx.wind_kts,
@@ -119,8 +119,8 @@ impl Station {
         // (2026-07-26).
         let arrival = matches!(intent, tower::Intent::RequestTaxiIn)
             || (matches!(intent, tower::Intent::RequestTaxi)
-                && self.twr.state == tower::State::ClearedToLand);
-        self.planned_route = None;
+                && self.desk.twr.state == tower::State::ClearedToLand);
+        self.desk.planned_route = None;
         let mut own_on_runway = false;
         let mut pos = None;
         if on_ground {
@@ -131,7 +131,7 @@ impl Station {
                 pos = Some((lat, lon));
                 own_on_runway = strip(&self.apt.runways, &ident)
                     .is_some_and(|r| on_runway(r, lat, lon).is_some());
-                self.planned_route = if arrival {
+                self.desk.planned_route = if arrival {
                     // The heading says which way is forward off a runway we
                     // may still be on; a failed read plans as before.
                     let psi = xp.get_float(TRUE_PSI).await.ok();
@@ -180,12 +180,12 @@ impl Station {
         // "With information X" matching the current broadcast: the clearance
         // skips the QNH — having the numbers is the whole point of an ATIS.
         // A stale or absent letter keeps them (safety over brevity).
-        let qnh = if self.pilot_info.is_some() && self.pilot_info == atis_current_letter() {
+        let qnh = if self.desk.pilot_info.is_some() && self.desk.pilot_info == atis_current_letter() {
             String::new()
         } else {
             qnh
         };
-        let route = self.planned_route.as_ref();
+        let route = self.desk.planned_route.as_ref();
         tower::Ctx {
             callsign,
             airport: spoken_airport(&self.apt.name).to_string(),
@@ -207,7 +207,7 @@ impl Station {
             },
             approach: self.approach_khz.map(atis::spoken_mhz),
             squawk: self
-                .assigned_squawk
+                .desk.assigned_squawk
                 .map(|c| atis::spoken_digits(&c.to_string()))
                 .unwrap_or_else(|| "seven zero zero zero".to_string()),
             final_traffic_nm: final_traffic.as_ref().map(|f| f.nm),

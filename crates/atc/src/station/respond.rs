@@ -14,7 +14,7 @@ impl Station {
         wx: Wx,
     ) -> String {
         self.sync_landing_release();
-        let was = self.twr.state;
+        let was = self.desk.twr.state;
         if service == Service::Tower {
             self.note_departure_intent(&intent, transcript);
         }
@@ -25,7 +25,7 @@ impl Station {
         let circuit_ctx;
         let ctx = if service == Service::Tower
             && intent == tower::Intent::RequestClearance
-            && self.circuits
+            && self.desk.circuits
         {
             circuit_ctx = tower::Ctx {
                 circuit: Some(self.circuit_offer(&ctx.runway)),
@@ -43,7 +43,7 @@ impl Station {
         let assigned_ctx;
         let ctx = if service == Service::Tower
             && intent == tower::Intent::RequestClearance
-            && self.assigned_squawk.is_none()
+            && self.desk.assigned_squawk.is_none()
             && (self.approach_khz.is_some() || self.departure_khz.is_some())
         {
             let scope = if self.departure_khz.is_some() {
@@ -90,7 +90,7 @@ impl Station {
         // A granted runway request makes that runway the one in use; the
         // taxi (or the join) it bought freezes the pick on it from here.
         if service == Service::Tower && intent == tower::Intent::RequestRunway {
-            if let Some(ident) = self.requested_ident.take() {
+            if let Some(ident) = self.desk.call.requested_ident.take() {
                 if ctx.runway_refusal.is_none() {
                     tracing::info!(runway = %ident, "runway request granted");
                     self.runway_in_use = Some(ident);
@@ -106,11 +106,11 @@ impl Station {
         // (`retire_for_new_flight`): its worksheet is the ended flight's.
         if !new_flight_pending() {
             publish_clearance(ClearanceSnap {
-                state: self.twr.state,
+                state: self.desk.twr.state,
                 callsign: ctx.callsign.clone(),
                 runway_ident: self.runway_in_use.clone().unwrap_or_default(),
-                pending_readback: self.twr.suggested_readback(&ctx.callsign),
-                holds_runway: self.twr.holds_runway(),
+                pending_readback: self.desk.twr.suggested_readback(&ctx.callsign),
+                holds_runway: self.desk.twr.holds_runway(),
             });
         }
         // A withheld landing clearance lives only while the flight is still
@@ -119,11 +119,11 @@ impl Station {
         // ("continue approach", tower.rs) arms it, for the monitor's watch
         // to release once the strip clears (`landing_hold_tick`).
         if service == Service::Tower {
-            if self.twr.state != tower::State::Inbound || intent == tower::Intent::GoAround {
+            if self.desk.twr.state != tower::State::Inbound || intent == tower::Intent::GoAround {
                 *OWN_STRIP.landing_hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
             if intent == tower::Intent::ReportFinal
-                && self.twr.state == tower::State::Inbound
+                && self.desk.twr.state == tower::State::Inbound
                 && !ctx.on_ground
                 && ctx.runway_occupied
             {
@@ -137,7 +137,7 @@ impl Station {
                     callsign: ctx.callsign.clone(),
                     runway: ctx.runway.clone(),
                     runway_ident: ident,
-                    line: self.twr.landing_clearance_line(ctx),
+                    line: self.desk.twr.landing_clearance_line(ctx),
                 });
             }
         }
@@ -150,10 +150,10 @@ impl Station {
         if service == Service::Tower
             && (matches!(intent, tower::Intent::RequestTaxi | tower::Intent::RequestRunway)
                 || taxi_first)
-            && self.twr.state == tower::State::TaxiCleared
+            && self.desk.twr.state == tower::State::TaxiCleared
         {
             *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = self
-                .planned_route
+                .desk.planned_route
                 .as_ref()
                 .filter(|r| r.path.len() >= 2)
                 .map(|r| TaxiWatch {
@@ -174,7 +174,7 @@ impl Station {
                 || (intent == tower::Intent::RequestTaxi && was == tower::State::ClearedToLand))
         {
             *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = self
-                .planned_route
+                .desk.planned_route
                 .as_ref()
                 .filter(|r| r.path.len() >= 2)
                 .map(|r| TaxiWatch {
@@ -195,14 +195,14 @@ impl Station {
         // 13, sortie 1790623420-full_auto, 2026-09-28, issue #172: "hold
         // position, traffic on the runway" at +50 with nothing to release it).
         let runway_start_held =
-            was == tower::State::Parked && self.twr.state == tower::State::LinedUp;
+            was == tower::State::Parked && self.desk.twr.state == tower::State::LinedUp;
         if service == Service::Tower
             && intent == tower::Intent::RequestTakeoff
             && (matches!(
                 was,
                 tower::State::TaxiCleared | tower::State::LinedUp | tower::State::TakeoffCleared
             ) || runway_start_held)
-            && self.twr.state != tower::State::TakeoffCleared
+            && self.desk.twr.state != tower::State::TakeoffCleared
             && (ctx.final_traffic_nm.is_some()
                 || ctx.runway_occupied
                 || ctx.wake_secs_left.is_some())
@@ -238,8 +238,8 @@ impl Station {
                 // A hold issued FROM the runway is already sequenced: the
                 // conditional/plain line-up put us there, so the watch owes a
                 // release, not another line-up.
-                lined_up: self.twr.state == tower::State::LinedUp,
-                behind: self.twr.pending().is_some_and(|p| {
+                lined_up: self.desk.twr.state == tower::State::LinedUp,
+                behind: self.desk.twr.pending().is_some_and(|p| {
                     matches!(p.awaited, tower::Awaited::LineUp { behind: true, .. })
                 }),
                 held_for,
@@ -281,7 +281,7 @@ impl Station {
         if service == Service::Tower
             && (intent == tower::Intent::RejectingTakeoff
                 || !matches!(
-                    self.twr.state,
+                    self.desk.twr.state,
                     tower::State::TaxiCleared | tower::State::LinedUp
                 ))
         {
@@ -298,15 +298,15 @@ impl Station {
     pub async fn apply_monitor_takeoff_clearance(&mut self, xp: SimView<'_>) {
         // A departure context (the monitor's release watch) — never an arrival.
         let (ctx, _wx) = self.build_ctx(xp, tower::Intent::RequestTakeoff).await;
-        self.twr.state = tower::State::TakeoffCleared;
+        self.desk.twr.state = tower::State::TakeoffCleared;
         // The released clearance owes its readback exactly like one issued
         // on the reply path.
-        self.twr.arm_takeoff_readback(
+        self.desk.twr.arm_takeoff_readback(
             ctx.runway.clone(),
             format!("runway {}, cleared for takeoff.", ctx.runway),
         );
         if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            c.pending_readback = self.twr.suggested_readback(&ctx.callsign);
+            c.pending_readback = self.desk.twr.suggested_readback(&ctx.callsign);
         }
         self.arm_departure_handoff(&ctx);
     }
@@ -318,13 +318,13 @@ impl Station {
     /// armed — the release is still to come.
     pub async fn apply_monitor_line_up(&mut self, xp: SimView<'_>) {
         let (ctx, _wx) = self.build_ctx(xp, tower::Intent::RequestTakeoff).await;
-        self.twr.state = tower::State::LinedUp;
-        self.twr.arm_line_up_readback(
+        self.desk.twr.state = tower::State::LinedUp;
+        self.desk.twr.arm_line_up_readback(
             ctx.runway.clone(),
             format!("line up and wait runway {}.", ctx.runway),
         );
         if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            c.pending_readback = self.twr.suggested_readback(&ctx.callsign);
+            c.pending_readback = self.desk.twr.suggested_readback(&ctx.callsign);
         }
     }
 
@@ -344,12 +344,12 @@ impl Station {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some((runway, line)) = released {
-            self.twr.release_landing(runway, line);
+            self.desk.twr.release_landing(runway, line);
         }
     }
 
     pub fn apply_monitor_go_around(&mut self) {
-        self.twr.apply_go_around();
+        self.desk.twr.apply_go_around();
         // The re-sequence the order announced ("expect runway one two"):
         // the runway in use moves with it, and the published clearance
         // names it, so the crew's approach follows once its missed approach
@@ -361,9 +361,9 @@ impl Station {
         if let Some((from, to)) = &reseq {
             tracing::info!(%from, %to, "arrival re-sequenced after a go-around");
             self.runway_in_use = Some(to.clone());
-            self.stated_runway = None;
+            self.desk.call.stated_runway = None;
         }
-        self.resequenced = reseq.clone();
+        self.desk.resequenced = reseq.clone();
         if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             c.state = tower::State::Inbound;
             c.pending_readback = Some(format!("Going around, {}.", c.callsign));
@@ -391,12 +391,12 @@ impl Station {
         }
         match service {
             Service::Tower => {
-                let was = self.twr.state;
+                let was = self.desk.twr.state;
                 let going_around = intent == tower::Intent::GoAround;
-                let reply = self.twr.handle(intent.clone(), ctx);
+                let reply = self.desk.twr.handle(intent.clone(), ctx);
                 // The crew's "going around" after a re-sequenced order is
                 // answered with the runway it is re-sequenced to, once.
-                let reply = match (going_around, self.resequenced.take()) {
+                let reply = match (going_around, self.desk.resequenced.take()) {
                     (true, Some((from, to))) => tower::go_around_resequenced_line(
                         &ctx.callsign,
                         &atis::spoken_runway(&from),
@@ -411,7 +411,7 @@ impl Station {
                 // once airborne and climbing, the tower sends the flight to
                 // departure (or approach) — the frequency chain, not a tower
                 // that owns you forever.
-                if self.twr.state == tower::State::TakeoffCleared
+                if self.desk.twr.state == tower::State::TakeoffCleared
                     && was != tower::State::TakeoffCleared
                 {
                     self.arm_departure_handoff(ctx);
@@ -456,14 +456,14 @@ impl Station {
             },
             tower::Intent::RequestLanding { touch_and_go } => match &ctx.approach {
                 Some(freq) => {
-                    self.twr.expect_touch_and_go(touch_and_go);
+                    self.desk.twr.expect_touch_and_go(touch_and_go);
                     format!(
                         "{}, contact {} Approach on {} for vectors.",
                         ctx.callsign, ctx.airport, freq
                     )
                 }
                 None => {
-                    self.twr.expect_touch_and_go(touch_and_go);
+                    self.desk.twr.expect_touch_and_go(touch_and_go);
                     self.arm_vectors(ctx, wx)
                 }
             },
@@ -475,7 +475,7 @@ impl Station {
                 ctx.callsign
             ),
             tower::Intent::Mayday => {
-                self.twr.expect_touch_and_go(false);
+                self.desk.twr.expect_touch_and_go(false);
                 let vectors = self.arm_vectors(ctx, wx);
                 format!("Roger mayday. {vectors}")
             }
@@ -535,7 +535,7 @@ impl Station {
     /// and a later request is a fresh clearance. A flight with nothing to
     /// cancel is told so rather than acknowledged.
     fn cancel_ifr(&mut self, ctx: &tower::Ctx) -> String {
-        let owed = self.twr.cancel_ifr();
+        let owed = self.desk.twr.cancel_ifr();
         let published = OWN_STRIP.ifr_clearance
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -550,9 +550,9 @@ impl Station {
             tracing::info!("cancel IFR with no IFR flight");
             return format!("{}, roger, you are not on an IFR clearance.", ctx.callsign);
         }
-        self.ifr_runway = None;
-        self.ifr_bearings = None;
-        self.ifr_sid_basis = None;
+        self.desk.ifr_runway = None;
+        self.desk.ifr_bearings = None;
+        self.desk.ifr_sid_basis = None;
         tracing::info!(owed, published, flight, "IFR cancelled");
         match self.dialect {
             Dialect::Faa => format!("{}, IFR cancellation received.", ctx.callsign),
@@ -641,7 +641,7 @@ impl Station {
     fn ifr_offer(&mut self, dest: &str, ctx: &tower::Ctx) -> Option<tower::IfrOffer> {
         let (icao, name, dest_pos) = resolve_destination(dest)?;
         let runway = self.runway_in_use.clone().unwrap_or_default();
-        self.ifr_runway = Some(runway.clone()).filter(|r| !r.is_empty());
+        self.desk.ifr_runway = Some(runway.clone()).filter(|r| !r.is_empty());
         // The flight's FILED route, when the crew has one to this
         // destination from this field: the SID is the one that serves the
         // runway and joins it, by the crew's own rule
@@ -658,12 +658,12 @@ impl Station {
         });
         let (sid, basis) = match filed {
             Some((Some(choice), _)) => {
-                self.ifr_bearings = None;
+                self.desk.ifr_bearings = None;
                 (Some(choice.ident), SidBasis::Route { join: choice.join })
             }
             // The runway has SIDs and none meets the route.
             Some((None, true)) => {
-                self.ifr_bearings = None;
+                self.desk.ifr_bearings = None;
                 (None, SidBasis::NoneJoins)
             }
             _ => {
@@ -679,7 +679,7 @@ impl Station {
                         .and_then(|x| nav::sid_toward(x, &runway, field, dest_pos)),
                     _ => None,
                 };
-                self.ifr_bearings = toward.as_ref().map(|t| (t.1, t.2));
+                self.desk.ifr_bearings = toward.as_ref().map(|t| (t.1, t.2));
                 match toward {
                     Some((ident, _, _)) => (Some(ident), SidBasis::Bearing),
                     None => (
@@ -692,7 +692,7 @@ impl Station {
                 }
             }
         };
-        self.ifr_sid_basis = Some(basis);
+        self.desk.ifr_sid_basis = Some(basis);
         let radar = self.approach_khz.is_some() || self.departure_khz.is_some();
         let squawk = if radar {
             let scope = if self.departure_khz.is_some() {
@@ -701,9 +701,9 @@ impl Station {
                 StationSpeaker::Approach
             };
             self.assign_squawk(&ctx.callsign, scope);
-            self.assigned_squawk.unwrap_or(7000)
+            self.desk.assigned_squawk.unwrap_or(7000)
         } else {
-            self.assigned_squawk.unwrap_or(7000)
+            self.desk.assigned_squawk.unwrap_or(7000)
         };
         *OWN_STRIP.ifr_clearance.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *OWN_STRIP.ifr_flight.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -755,13 +755,13 @@ impl Station {
     /// `OWN_STRIP.handoff` write: reply paths own their monitor-tick state.
     pub(super) fn assign_squawk(&mut self, callsign: &str, speaker: StationSpeaker) -> String {
         let code = *self
-            .assigned_squawk
+            .desk.assigned_squawk
             .get_or_insert_with(|| discrete_squawk(callsign));
         // Publish it for the crew (the transponder gets dialled to this).
         *OWN_STRIP.assigned_squawk.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
         // Circuit traffic gets no radar service: the code, but no watch
         // (no "radar contact" from a tower working the pattern by eye).
-        if self.circuits {
+        if self.desk.circuits {
             return atis::spoken_digits(&code.to_string());
         }
         let mut w = OWN_STRIP.squawk_watch.lock().unwrap_or_else(|e| e.into_inner());
@@ -800,13 +800,13 @@ impl Station {
         let now = match intent {
             tower::Intent::RequestTaxi | tower::Intent::RequestClearance => said,
             tower::Intent::RequestIfrClearance { .. } => false,
-            tower::Intent::RequestTakeoff => self.circuits || said,
+            tower::Intent::RequestTakeoff => self.desk.circuits || said,
             _ => return,
         };
-        if now == self.circuits {
+        if now == self.desk.circuits {
             return;
         }
-        self.circuits = now;
+        self.desk.circuits = now;
         sim::blackbox::record(
             "atc",
             serde_json::json!({"event": "circuit_traffic", "circuits": now,
@@ -828,7 +828,7 @@ impl Station {
         // Circuit traffic is the tower's own: the pattern comes back to this
         // runway, and "contact Departure" on the crosswind leg sends it to a
         // controller who does not work it (LEMG 31, 2026-09-28).
-        if self.circuits {
+        if self.desk.circuits {
             sim::blackbox::record(
                 "atc",
                 serde_json::json!({"event": "departure_handoff_withheld", "why": "circuits"}),
@@ -843,7 +843,7 @@ impl Station {
             (None, Some(k)) => ("Approach", k),
             (None, None) => return,
         };
-        self.dep_checked_in = false;
+        self.desk.dep_checked_in = false;
         // "Radar contact" is now the check-in's answer on the new frequency.
         if let Some(w) = OWN_STRIP.squawk_watch
             .lock()
@@ -852,7 +852,7 @@ impl Station {
         {
             w.check_in_owed = true;
         }
-        self.handed_to = Some(if name == "Departure" {
+        self.desk.handed_to = Some(if name == "Departure" {
             Service::Departure
         } else {
             Service::Approach
@@ -878,13 +878,13 @@ impl Station {
     /// to Parked, the state every arrival starts from, and the published
     /// picture says so: nothing held, nothing owed.
     pub(super) fn transfer_departure(&mut self) {
-        if self.twr.state == tower::State::TakeoffCleared {
-            self.twr.state = tower::State::Parked;
+        if self.desk.twr.state == tower::State::TakeoffCleared {
+            self.desk.twr.state = tower::State::Parked;
         }
-        self.twr.clear_clearance_readback();
+        self.desk.twr.clear_clearance_readback();
         if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            c.state = self.twr.state;
-            c.holds_runway = self.twr.holds_runway();
+            c.state = self.desk.twr.state;
+            c.holds_runway = self.desk.twr.holds_runway();
             c.pending_readback = None;
         }
     }
@@ -914,7 +914,7 @@ impl Station {
             tower::Intent::RequestLanding { touch_and_go } => {
                 // The option request rides through the vectors: the tower's
                 // eventual clearance must say "touch and go", not "land".
-                self.twr.expect_touch_and_go(touch_and_go);
+                self.desk.twr.expect_touch_and_go(touch_and_go);
                 self.arm_vectors(ctx, wx)
             }
             // A mayday to approach: keep the flight, vector it home with
@@ -925,7 +925,7 @@ impl Station {
                 ctx.callsign
             ),
             tower::Intent::Mayday => {
-                self.twr.expect_touch_and_go(false);
+                self.desk.twr.expect_touch_and_go(false);
                 let vectors = self.arm_vectors(ctx, wx);
                 format!("Roger mayday. {vectors}")
             }

@@ -55,14 +55,14 @@ impl Station {
         };
         self.note_stated_runway(transcript, intent.clone());
         let (ctx, wx) = self.build_ctx(xp, intent.clone()).await;
-        let before = self.twr.state;
+        let before = self.desk.twr.state;
         let reply = self.route_unkeyed(transcript, service, &ctx, wx)?;
         sim::blackbox::record(
             "atc",
             serde_json::json!({
                 "route": "unkeyed", "outcome": "reply", "service": service.name(),
                 "transcript": transcript, "intent": format!("{intent:?}"),
-                "state": format!("{before:?}>{:?}", self.twr.state), "reply": reply,
+                "state": format!("{before:?}>{:?}", self.desk.twr.state), "reply": reply,
             }),
         );
         Some((reply, service.speaker()))
@@ -103,7 +103,7 @@ impl Station {
     pub(super) fn note_information(&mut self, transcript: &str) {
         if let Some(l) = heard_information(&transcript.to_lowercase()) {
             tracing::info!(letter = %l, "pilot reports having the information");
-            self.pilot_info = Some(l);
+            self.desk.pilot_info = Some(l);
         }
     }
 
@@ -129,7 +129,7 @@ impl Station {
         };
         self.note_stated_runway(transcript, tower::parse_intent(transcript));
         let (ctx, wx) = self.build_ctx(xp, tower::parse_intent(transcript)).await;
-        let before = self.twr.state;
+        let before = self.desk.twr.state;
         let reply = self.route_keyed(transcript, service, &ctx, wx);
         sim::blackbox::record(
             "atc",
@@ -141,7 +141,7 @@ impl Station {
                 "readback": reply.is_empty() && tower::is_readback(transcript),
                 "service": service.name(), "transcript": transcript,
                 "intent": format!("{:?}", tower::parse_intent(transcript)),
-                "state": format!("{before:?}>{:?}", self.twr.state), "reply": reply,
+                "state": format!("{before:?}>{:?}", self.desk.twr.state), "reply": reply,
             }),
         );
         Some((reply, service.speaker()))
@@ -168,19 +168,19 @@ impl Station {
         if service == Service::Tower {
             // Judged BEFORE the gate spends it: with enforcement off, an IFR
             // readback that said any of the clearance stands as read.
-            let ifr_read = self.twr.pending().is_some_and(|p| {
+            let ifr_read = self.desk.twr.pending().is_some_and(|p| {
                 matches!(p.awaited, tower::Awaited::IfrClearance { .. })
                     && tower::check_readback(transcript, &p.awaited)
                         != tower::ReadbackCheck::NotAReadback
             });
-            if let Some(reply) = self.twr.gate(transcript, intent.clone(), ctx) {
+            if let Some(reply) = self.desk.twr.gate(transcript, intent.clone(), ctx) {
                 if reply.is_empty() {
                     // Correct readback: the debt is paid; tell the coach.
                     if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                         c.pending_readback = None;
                     }
-                    if let Some(ifr) = self.twr.take_accepted_ifr() {
-                        publish_ifr_clearance(ifr, &ctx.callsign, self.ifr_bearings, self.ifr_sid_basis.as_ref());
+                    if let Some(ifr) = self.desk.twr.take_accepted_ifr() {
+                        publish_ifr_clearance(ifr, &ctx.callsign, self.desk.ifr_bearings, self.desk.ifr_sid_basis.as_ref());
                     }
                     return String::new();
                 }
@@ -188,9 +188,9 @@ impl Station {
                     return reply;
                 }
                 if ifr_read {
-                    self.twr.accept_ifr_unenforced();
-                    if let Some(ifr) = self.twr.take_accepted_ifr() {
-                        publish_ifr_clearance(ifr, &ctx.callsign, self.ifr_bearings, self.ifr_sid_basis.as_ref());
+                    self.desk.twr.accept_ifr_unenforced();
+                    if let Some(ifr) = self.desk.twr.take_accepted_ifr() {
+                        publish_ifr_clearance(ifr, &ctx.callsign, self.desk.ifr_bearings, self.desk.ifr_sid_basis.as_ref());
                     }
                 }
                 // Enforcement off (XCOPILOT_ATC_READBACK=false): no
@@ -220,9 +220,9 @@ impl Station {
             // three thousand one hundred climbing one five thousand" as a
             // readback and said nothing, the tower still holding the flight
             // cleared for takeoff.
-            let checks_in = service == Service::Departure || self.handed_to == Some(service);
-            if checks_in && !self.dep_checked_in {
-                self.dep_checked_in = true;
+            let checks_in = service == Service::Departure || self.desk.handed_to == Some(service);
+            if checks_in && !self.desk.dep_checked_in {
+                self.desk.dep_checked_in = true;
                 self.transfer_departure();
                 // This reply IS the radar contact: the watch has nothing
                 // left to say.
@@ -250,7 +250,7 @@ impl Station {
                 };
             }
             // The departure clearance's suggested readback is paid.
-            self.twr.clear_clearance_readback();
+            self.desk.twr.clear_clearance_readback();
             if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 c.pending_readback = None;
             }

@@ -77,38 +77,49 @@ pub struct Station {
     /// The departure frequency (row 1056) — where the tower sends you after
     /// takeoff.
     departure_khz: Option<i64>,
-    twr: tower::Tower,
+    /// The strip on frequency: our flight's desk half (the worksheet the
+    /// tower keeps for the aircraft it is talking to).
+    desk: StripDesk,
     /// The runway in use, held across calls: with the wind below 5 knots the
     /// into-wind pick is a coin toss, and the 2026-07-08 flight was cleared
     /// for takeoff on two seven, then re-cleared on zero niner two minutes
     /// later in the same calm. A runway change needs actual wind.
     runway_in_use: Option<String>,
-    /// The runway the arrival now calling named for itself, consumed by the
-    /// pick that answers the call (`note_stated_runway`).
-    stated_runway: Option<String>,
-    /// The caller stating [`Station::stated_runway`] stands ON that strip,
-    /// on the ground: a runway start asking for the runway it is lined up on
-    /// (`note_caller_on_strip`), consumed by the same pick.
-    stated_on_strip: bool,
+    /// Challenge missing/wrong readbacks of runway-critical clearances
+    /// (`XCOPILOT_ATC_READBACK`). The pending state still arms when this is
+    /// off: the coach teaches the readback either way; only the challenges
+    /// are gated.
+    enforce_readback: bool,
+    /// Phraseology dialect for this field's controllers (set by the owner
+    /// from the ICAO prefix, like the voice casting). Defaults to ICAO.
+    dialect: Dialect,
+    /// The CIFP directory and this field's ICAO, for the SID an IFR
+    /// clearance names (set by the owner, like the dialect). `None` = no
+    /// procedure data: IFR clearances say "fly runway heading".
+    procedures: Option<(String, String)>,
+    /// Every SID's exit fix, positioned, loaded off the reply path by
+    /// [`Station::set_procedures`] (`None` until it lands, or with no nav
+    /// files): the IFR clearance picks the SID that leaves toward the
+    /// destination (`nav::sid_toward`), else the first in the file.
+    sid_exits: std::sync::Arc<Mutex<Option<Vec<nav::SidExit>>>>,
+}
+
+/// The desk half of a flight's strip: what the station keeps, between calls,
+/// about the ONE aircraft it is working (its tower FSM and its
+/// worksheet). Owned by the [`Station`]; the shared half is the strip's
+/// cells on the party line ([`crate::party_line::FlightStrip`]).
+struct StripDesk {
+    /// The tower FSM for this flight.
+    twr: tower::Tower,
     /// The strip a runway start was GIVEN (`note_caller_on_strip`): held for
     /// its later calls on the ground while no stream opposes it and its
     /// tailwind stays within [`ON_STRIP_TAILWIND_KTS`], where the wind pick's
     /// hysteresis would otherwise turn it round on the next call (#178).
     start_strip: Option<String>,
-    /// The caller being answered is a DEPARTURE on the ground (`build_ctx`):
-    /// the wind pick then skips an end with no way on at its threshold's
-    /// half when another end fits the wind (LEMD 18R, 2026-10-05).
-    departing: bool,
     /// The runway the tower last named to this flight on the ground (its
     /// zone, circuit or IFR clearance, a taxi, a line-up): a later reply on
     /// another runway states the change (`state_runway_change`, #178).
     told_runway: Option<String>,
-    /// The runway a "request runway ..." call named, canonical ("8L"), for
-    /// the ctx that answers it (`note_stated_runway`, `apply_runway_request`).
-    runway_request: Option<String>,
-    /// That request resolved to a strip end the tower can hand out ("08L"),
-    /// committed as the runway in use when the tower grants it.
-    requested_ident: Option<String>,
     /// The departure controller has said "radar contact" to this flight.
     dep_checked_in: bool,
     /// The position the after-takeoff handoff sends the flight to
@@ -133,23 +144,6 @@ pub struct Station {
     /// The taxi route planned when the ctx was last built on the ground —
     /// published to `OWN_STRIP.taxi_route` iff the taxi clearance is actually issued.
     planned_route: Option<nav::TaxiRoutePlan>,
-    /// Challenge missing/wrong readbacks of runway-critical clearances
-    /// (`XCOPILOT_ATC_READBACK`). The pending state still arms when this is
-    /// off — the coach teaches the readback either way; only the challenges
-    /// are gated.
-    enforce_readback: bool,
-    /// Phraseology dialect for this field's controllers (set by the owner
-    /// from the ICAO prefix, like the voice casting). Defaults to ICAO.
-    dialect: Dialect,
-    /// The CIFP directory and this field's ICAO, for the SID an IFR
-    /// clearance names (set by the owner, like the dialect). `None` = no
-    /// procedure data: IFR clearances say "fly runway heading".
-    procedures: Option<(String, String)>,
-    /// Every SID's exit fix, positioned, loaded off the reply path by
-    /// [`Station::set_procedures`] (`None` until it lands, or with no nav
-    /// files): the IFR clearance picks the SID that leaves toward the
-    /// destination (`nav::sid_toward`), else the first in the file.
-    sid_exits: std::sync::Arc<Mutex<Option<Vec<nav::SidExit>>>>,
     /// The (exit, destination) bearings behind the last IFR clearance's SID,
     /// for its blackbox record when the readback is accepted.
     ifr_bearings: Option<(f64, f64)>,
@@ -167,6 +161,54 @@ pub struct Station {
     /// offered), said once in the answer to the crew's "going around" call
     /// (issue #162).
     resequenced: Option<(String, String)>,
+    /// What the transmission being answered said, consumed by the pick that
+    /// answers it.
+    call: CallScratch,
+}
+
+/// Per transmission: what the call being answered stated, consumed by the
+/// pick that answers it.
+#[derive(Default)]
+struct CallScratch {
+    /// The runway the arrival now calling named for itself, consumed by the
+    /// pick that answers the call (`note_stated_runway`).
+    stated_runway: Option<String>,
+    /// The caller stating [`CallScratch::stated_runway`] stands ON that strip,
+    /// on the ground: a runway start asking for the runway it is lined up on
+    /// (`note_caller_on_strip`), consumed by the same pick.
+    stated_on_strip: bool,
+    /// The caller being answered is a DEPARTURE on the ground (`build_ctx`):
+    /// the wind pick then skips an end with no way on at its threshold's
+    /// half when another end fits the wind (LEMD 18R, 2026-10-05).
+    departing: bool,
+    /// The runway a "request runway ..." call named, canonical ("8L"), for
+    /// the ctx that answers it (`note_stated_runway`, `apply_runway_request`).
+    runway_request: Option<String>,
+    /// That request resolved to a strip end the tower can hand out ("08L"),
+    /// committed as the runway in use when the tower grants it.
+    requested_ident: Option<String>,
+}
+
+impl StripDesk {
+    /// A fresh desk: nothing heard from the flight yet.
+    fn new() -> StripDesk {
+        StripDesk {
+            twr: tower::Tower::new(),
+            start_strip: None,
+            told_runway: None,
+            dep_checked_in: false,
+            handed_to: None,
+            circuits: false,
+            pilot_info: None,
+            assigned_squawk: None,
+            planned_route: None,
+            ifr_bearings: None,
+            ifr_sid_basis: None,
+            ifr_runway: None,
+            resequenced: None,
+            call: CallScratch::default(),
+        }
+    }
 }
 
 /// Radio phraseology dialect. ICAO/CAP 413 style ("descend to altitude two
@@ -261,29 +303,12 @@ impl Station {
             approach_khz,
             departure_khz,
             apt,
-            twr: tower::Tower::new(),
+            desk: StripDesk::new(),
             runway_in_use: None,
-            stated_runway: None,
-            stated_on_strip: false,
-            start_strip: None,
-            departing: false,
-            told_runway: None,
-            runway_request: None,
-            requested_ident: None,
-            dep_checked_in: false,
-            handed_to: None,
-            circuits: false,
-            pilot_info: None,
-            assigned_squawk: None,
-            planned_route: None,
             enforce_readback: true,
             dialect: Dialect::Icao,
             procedures: None,
             sid_exits: Default::default(),
-            ifr_bearings: None,
-            ifr_sid_basis: None,
-            ifr_runway: None,
-            resequenced: None,
         })
     }
 
