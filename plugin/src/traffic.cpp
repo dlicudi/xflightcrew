@@ -562,9 +562,10 @@ void publish_status(double wall) {
     const int n = std::snprintf(
         s, sizeof s,
         "models=%d|tcas=%s|drawn=%d|roster_seq=%u|frame_seq=%u|errors=%d|last_error=%s|"
-        "create_errors=%d|csl=%s|enabled=%d",
+        "create_errors=%d|csl=%s|enabled=%d|sound=%d",
         g_models, g_enabled ? g_tcas_owner.c_str() : "off", drawn, g_roster_seq, g_frame_seq,
-        g_decode_errors, g_last_error, g_create_errors, g_csl_state.c_str(), g_enabled ? 1 : 0);
+        g_decode_errors, g_last_error, g_create_errors, g_csl_state.c_str(), g_enabled ? 1 : 0,
+        g_inited && XPMPSoundIsEnabled() ? 1 : 0);
     const int len = n < 0 ? 0 : (n < static_cast<int>(sizeof s) ? n : static_cast<int>(sizeof s) - 1);
     std::memset(g_status.buf, 0, sizeof g_status.buf);
     std::memcpy(g_status.buf, s, static_cast<size_t>(len));
@@ -586,6 +587,7 @@ float TrafficLoop(float, float, int, void*) {
         g_enabled = want_enable;
         // No CSL at start: look again now, so the models need no sim restart.
         if (g_enabled && !g_inited) init_xpmp2();
+        if (g_enabled && g_inited) XPMPSoundEnable(true);
         if (g_inited) {
             if (g_enabled) {
                 take_tcas();
@@ -703,6 +705,9 @@ void start() {
 // takes them again when the plugin is enabled and traffic is still wanted.
 void disable() {
     g_tracks.clear();
+    // Sound too: its play callbacks fired after the unload, and X-Plane called
+    // the plugin buggy again on a reload (FMOD error 65, 2026-10-08).
+    if (g_inited) XPMPSoundEnable(false);
     if (g_inited && g_enabled) {
         XPMPMultiplayerDisable();
         g_tcas_owner = "off";
