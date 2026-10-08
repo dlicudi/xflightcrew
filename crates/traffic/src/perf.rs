@@ -44,6 +44,14 @@ pub struct Perf {
     pub pattern_kts: f64,
     /// The gear comes up after takeoff (a 172 has none to raise).
     pub retractable_gear: bool,
+    /// Wingspan, metres: the corridor a taxi keeps clear
+    /// ([`crate::spacing`]).
+    pub span_m: f64,
+    /// Overall length, metres.
+    pub length_m: f64,
+    /// The gap kept behind the aircraft ahead on a taxiway, tail to nose,
+    /// metres (a jet's is its blast).
+    pub taxi_gap_m: f64,
 }
 
 /// A wake turbulence category (ICAO: L, M, H, J).
@@ -89,6 +97,9 @@ pub const PISTON_SINGLE: Perf = Perf {
     turn_air_dps: 5.0,
     pattern_kts: 85.0,
     retractable_gear: false,
+    span_m: 11.0,
+    length_m: 8.3,
+    taxi_gap_m: 30.0,
 };
 
 /// A King Air or ATR class turboprop.
@@ -112,6 +123,9 @@ pub const TURBOPROP: Perf = Perf {
     turn_air_dps: 4.0,
     pattern_kts: 160.0,
     retractable_gear: true,
+    span_m: 27.0,
+    length_m: 27.0,
+    taxi_gap_m: 35.0,
 };
 
 /// An A320 or 737 class jet.
@@ -135,6 +149,9 @@ pub const JET_MED: Perf = Perf {
     turn_air_dps: 3.0,
     pattern_kts: 210.0,
     retractable_gear: true,
+    span_m: 36.0,
+    length_m: 38.0,
+    taxi_gap_m: 40.0,
 };
 
 /// A 777 or A330 class jet.
@@ -158,6 +175,9 @@ pub const JET_HEAVY: Perf = Perf {
     turn_air_dps: 3.0,
     pattern_kts: 220.0,
     retractable_gear: true,
+    span_m: 65.0,
+    length_m: 70.0,
+    taxi_gap_m: 50.0,
 };
 
 /// The class table and wake category for an ICAO type designator. An
