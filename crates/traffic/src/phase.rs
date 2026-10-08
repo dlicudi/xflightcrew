@@ -30,7 +30,7 @@ pub struct Order {
     pub taxi_path: Option<Vec<LatLon>>,
     pub holding_point: Option<String>,
     /// Number two to this traffic id: the downwind is extended until the
-    /// leader is [`crate::aircraft::FOLLOW_FINAL_NM`] on final.
+    /// leader will be off the runway before we reach it.
     pub follow: Option<u32>,
     /// "Hold position": stop where you are, and no "ready" call yet.
     pub hold: bool,

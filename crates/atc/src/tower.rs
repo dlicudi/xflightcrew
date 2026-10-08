@@ -214,6 +214,10 @@ pub struct Ctx {
     /// and the other traffic). `None` for a ghost or with no traffic: the
     /// "number two, follow the traffic" leader a traffic flight follows.
     pub final_traffic_id: Option<crate::party_line::FlightId>,
+    /// A downwind report's place in the landing sequence the tower has
+    /// already given out: its number and where the flight it follows is
+    /// ("on downwind", "on final"). `None` with nobody sequenced ahead.
+    pub sequence_ahead: Option<(u8, String)>,
     /// A ghost is ON our strip (on the ground): nobody lines up onto an
     /// occupied runway.
     pub runway_occupied: bool,
@@ -435,6 +439,19 @@ fn title_case(w: &str) -> String {
 
 /// Spoken position of traffic on final: "short final" inside 1.5 nm, else
 /// "N mile final".
+/// A landing sequence number as the tower says it.
+fn sequence_number(n: u8) -> String {
+    match n {
+        1 => "one".into(),
+        2 => "two".into(),
+        3 => "three".into(),
+        4 => "four".into(),
+        5 => "five".into(),
+        6 => "six".into(),
+        n => n.to_string(),
+    }
+}
+
 fn spoken_final(nm: f64) -> String {
     if nm < 1.5 {
         "short final".to_string()
@@ -2591,9 +2608,13 @@ impl Tower {
                 // enough out: a CONDITIONAL line-up puts the departure on the
                 // pavement the moment the lander is past — real towers fill
                 // this gap instead of parking you. Closer, more than one, or
-                // already lined up: hold, honestly.
+                // already lined up: hold, honestly. Never onto a strip somebody
+                // holds (EFLP 06, world sweep 2026-10-08: "behind the landing
+                // traffic, line up" in front of a departure cleared for
+                // takeoff further down the runway).
                 State::TaxiCleared
                     if ctx.final_traffic_nm.is_some()
+                        && !ctx.runway_occupied
                         && ctx.final_traffic_count <= 1
                         && ctx.final_traffic_nm.unwrap_or(0.0) >= CONDITIONAL_MIN_NM =>
                 {
@@ -2773,6 +2794,19 @@ impl Tower {
             // Traffic standing on the runway: the downwind is number two
             // behind it, and the final report's clearance is withheld until
             // the strip clears (issue #162: the hold, not a second order).
+            // Behind the sequence already given out: number three follows
+            // number two, never both number two behind one leader (BIEG 03,
+            // 2026-10-08: two downwinds sent number two behind the same
+            // occupant turned final together and one went around).
+            Intent::ReportDownwind if ctx.sequence_ahead.is_some() && !ctx.on_ground => {
+                self.state = State::Inbound;
+                let (n, at) = ctx.sequence_ahead.clone().unwrap_or_default();
+                format!(
+                    "{}, number {}, follow the traffic {at}, report base.",
+                    ctx.callsign,
+                    sequence_number(n)
+                )
+            }
             Intent::ReportDownwind if ctx.runway_occupied && !ctx.on_ground => {
                 self.state = State::Inbound;
                 format!(

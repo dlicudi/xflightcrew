@@ -216,7 +216,7 @@ pub(super) struct StripPicture {
     /// Something on the pavement holds the departure.
     pub(super) blocked: bool,
     /// The occupants ahead of our tail, raw callsigns (the watch's seed).
-    occupants: Vec<String>,
+    pub(super) occupants: Vec<String>,
     /// Ghosts standing on the strip that the hold was not held for: a
     /// replay's departure queue lining up in front of an aircraft the tower
     /// gave the runway to. The party line withholds their clearance

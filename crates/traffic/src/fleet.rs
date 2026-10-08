@@ -83,6 +83,7 @@ impl Fleet {
                 id: a.id,
                 phase: a.phase,
                 pos: a.kin.pos(),
+                gs_kts: a.kin.gs_kts,
             })
             .collect()
     }

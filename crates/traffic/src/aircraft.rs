@@ -9,10 +9,6 @@ use crate::perf::{class_for_type, Perf, Wake};
 use crate::phase::{Call, Despawn, Event, Leg, Order, Phase, Plan, RadioState, TowerState};
 use crate::rng::XorShift64;
 
-/// Number two extends its downwind until its leader is this close to the
-/// threshold on final.
-pub const FOLLOW_FINAL_NM: f64 = 1.5;
-
 /// A departure is gone this far from the field.
 pub const DEPART_GONE_NM: f64 = 12.0;
 
@@ -34,6 +30,13 @@ pub const GLIDE_DEG: f64 = 3.0;
 
 /// The path crosses the threshold this high.
 pub const TCH_FT: f64 = 50.0;
+
+/// How long a leader holds the runway once it reaches the threshold,
+/// seconds: a touch and go's roll, or a full stop's rollout to an exit.
+const LEADER_RUNWAY_S: f64 = 45.0;
+
+/// The gap number two keeps behind that, seconds.
+const FOLLOW_GAP_S: f64 = 20.0;
 
 /// The longest a downwind is extended for a leader.
 pub const MAX_DOWNWIND_EXT_NM: f64 = 4.0;
@@ -122,6 +125,8 @@ pub struct Seen {
     pub id: u32,
     pub phase: Phase,
     pub pos: LatLon,
+    /// Groundspeed, knots: number two times its base against it.
+    pub gs_kts: f64,
 }
 
 /// One traffic aircraft.
@@ -876,9 +881,18 @@ impl TrafficAircraft {
                 let seg = self.route.follow.seg;
                 let left = dist_m(here, self.route.path[seg + 1]);
                 let radius = self.kin.gs_kts * KT_TO_MS / p.turn_air_dps.to_radians();
+                // Our own time to the threshold from here: the rest of the
+                // downwind, the base, the final, at the pattern's pace.
+                let own_s = (left
+                    + self
+                        .route
+                        .path
+                        .get(seg + 2)
+                        .map_or(0.0, |b| dist_m(self.route.path[seg + 1], *b) + dist_m(*b, end.thr)))
+                    / (self.kin.gs_kts.max(40.0) * KT_TO_MS);
                 if left < radius + 200.0
                     && self.ext_m < MAX_DOWNWIND_EXT_NM * NM
-                    && !leader_ready(lid, others, end)
+                    && !leader_ready(lid, others, end, own_s)
                 {
                     let step = self.kin.gs_kts * KT_TO_MS * dt;
                     for k in [seg + 1, seg + 2] {
@@ -1168,15 +1182,26 @@ pub fn pattern_points(end: &RunwayEnd, p: &Perf) -> PatternPoints {
     }
 }
 
-/// The leader is far enough ahead for number two to turn base: on short
-/// final, down, or not in the circuit at all.
-fn leader_ready(lid: u32, others: &[Seen], end: &RunwayEnd) -> bool {
+/// The leader is far enough ahead for number two to turn base: on final
+/// and off the runway again before we reach it (`own_s`, our time to the
+/// threshold from here), off the runway, or not in the circuit at all. A
+/// leader still ON the runway (rolling out, vacating, lining up, rolling)
+/// is the occupant the tower sequenced the downwind behind: the base waits
+/// for it to be off (BIEG 03, 2026-10-08: a backtracking jet held the strip
+/// for minutes and the base turned on time went around). Timed, never a
+/// fixed distance: a 737 that turned base with a 172 at 1.5 nm on final
+/// caught it up and went around behind it, five times running.
+pub(crate) fn leader_ready(lid: u32, others: &[Seen], end: &RunwayEnd, own_s: f64) -> bool {
     let Some(l) = others.iter().find(|s| s.id == lid) else {
         return true;
     };
     match l.phase {
-        Phase::Final => dist_m(l.pos, end.thr) <= FOLLOW_FINAL_NM * NM,
+        Phase::Final => {
+            let to_thr_s = dist_m(l.pos, end.thr) / (l.gs_kts.max(40.0) * KT_TO_MS);
+            to_thr_s + LEADER_RUNWAY_S + FOLLOW_GAP_S <= own_s
+        }
         Phase::Climb | Phase::Arrive | Phase::Pattern { .. } | Phase::GoAround => false,
+        Phase::Landing | Phase::Vacate | Phase::LineUp | Phase::Roll => false,
         _ => true,
     }
 }

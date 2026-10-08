@@ -896,3 +896,28 @@ fn a_long_vacate_calls_vacated_before_its_wait_for_a_stand_begins() {
         "waited {waited:.1} s after the call"
     );
 }
+
+/// Number two turns base on TIME (BIEG 03, 2026-10-08): only once its
+/// leader on final will have reached the runway and left it before we get
+/// there; a 737 that turned with a 172 at 1.5 nm caught it and went around.
+/// A leader still on the runway holds the base; one off it releases it.
+#[test]
+fn number_two_turns_base_once_its_leader_will_be_off_the_runway() {
+    use crate::aircraft::{leader_ready, Seen};
+    use crate::kin::project_m;
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    let seen = |phase: Phase, nm: f64, gs_kts: f64| Seen {
+        id: 1,
+        phase,
+        pos: project_m(end.thr, end.course_deg + 180.0, nm * 1852.0),
+        gs_kts,
+    };
+    // A 172 at 1.5 nm, 70 kt: 79 s to the threshold, plus its runway and the gap.
+    let slow = [seen(Phase::Final, 1.5, 70.0)];
+    assert!(!leader_ready(1, &slow, &end, 100.0), "a jet 100 s out would catch it");
+    assert!(leader_ready(1, &slow, &end, 160.0), "a 172 160 s out follows it");
+    assert!(!leader_ready(1, &[seen(Phase::Vacate, 0.0, 10.0)], &end, 300.0), "still on the runway");
+    assert!(leader_ready(1, &[seen(Phase::TaxiIn, 0.0, 10.0)], &end, 30.0), "off it");
+    assert!(leader_ready(1, &[], &end, 30.0), "a leader gone is no leader");
+}

@@ -245,6 +245,48 @@ pub fn final_traffic_for(
     runways: &[nav::Runway],
     field_elev_ft: f64,
 ) -> Option<FinalTraffic> {
+    final_traffic_within(targets, rwy, runways, field_elev_ft, FINAL_NM, FINAL_CEILING_FT)
+}
+
+/// The traffic on final the downwind is sequenced behind: further out than
+/// the holds look ([`FINAL_NM`]), and as high as a 3 degree path is there.
+/// BIEG 03 (world sweep, 2026-10-08): circuit traffic was told "number one"
+/// with a jet on a 6 nm final it could not see and turned base in front of
+/// it; whichever landed second went around, one arrival six times running.
+pub(super) fn sequence_traffic_for(
+    targets: &[TcasTarget],
+    rwy: &nav::Runway,
+    runways: &[nav::Runway],
+    field_elev_ft: f64,
+) -> Option<FinalTraffic> {
+    final_traffic_within(
+        targets,
+        rwy,
+        runways,
+        field_elev_ft,
+        SEQUENCE_FINAL_NM,
+        SEQUENCE_CEILING_FT,
+    )
+}
+
+/// How far out a straight-in arrival is sequenced ahead of the circuit, nm.
+pub(super) const SEQUENCE_FINAL_NM: f64 = 8.0;
+/// ...and how high it may be there, ft above the field (a 3 degree path at
+/// 8 nm is 2,500 ft).
+const SEQUENCE_CEILING_FT: f64 = 3000.0;
+/// The holds' final traffic is under this, ft above the field.
+const FINAL_CEILING_FT: f64 = 1500.0;
+
+/// [`final_traffic_for`] out to `final_nm`, below `ceiling_ft` above the
+/// field.
+fn final_traffic_within(
+    targets: &[TcasTarget],
+    rwy: &nav::Runway,
+    runways: &[nav::Runway],
+    field_elev_ft: f64,
+    final_nm: f64,
+    ceiling_ft: f64,
+) -> Option<FinalTraffic> {
     let m_per_deg_lat = 111_320.0;
     let m_per_deg_lon = 111_320.0 * rwy.lat_a.to_radians().cos();
     let (bx, by) = (
@@ -259,7 +301,7 @@ pub fn final_traffic_for(
     let mut hits: Vec<(f64, &TcasTarget)> = targets
         .iter()
         .filter(|t| !t.on_ground)
-        .filter(|t| (30.0..1500.0).contains(&(t.ele_ft - field_elev_ft)))
+        .filter(|t| (30.0..ceiling_ft).contains(&(t.ele_ft - field_elev_ft)))
         .filter(|t| t.vs_fpm <= CLIMBOUT_FPM)
         .filter(|t| !on_independent_final(t, rwy, runways))
         .filter_map(|t| {
@@ -269,7 +311,7 @@ pub fn final_traffic_for(
             );
             let along = (px * bx + py * by) / len2;
             let cross_m = (px * by - py * bx).abs() / len_m;
-            let beyond = FINAL_NM * 1852.0 / len_m;
+            let beyond = final_nm * 1852.0 / len_m;
             if cross_m > CORRIDOR_HALF_M || along < -beyond || along > 1.0 + beyond {
                 return None;
             }

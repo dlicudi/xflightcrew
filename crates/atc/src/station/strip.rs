@@ -959,6 +959,9 @@ pub(super) fn landing_hold_tick_for(
         ));
     }
     *flight.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // Cleared to land, it has left the landing sequence (as a final
+    // report's clearance takes it out in `respond`).
+    *flight.sequence.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *flight.pending_landing_release
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some((hold.runway.clone(), hold.line.clone()));

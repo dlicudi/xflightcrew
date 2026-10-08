@@ -129,13 +129,13 @@ impl Station {
         // a flight no longer Inbound has no place in it.
         if service == Service::Tower {
             let mut seq = self.desk.strip.sequence.lock().unwrap_or_else(|e| e.into_inner());
-            if intent == tower::Intent::ReportDownwind && reply.contains("number two") {
-                let leader = if ctx.runway_occupied {
-                    None
-                } else {
-                    ctx.final_traffic_id
-                };
-                *seq = Some((2, leader));
+            if intent == tower::Intent::ReportDownwind && ctx.sequence_ahead.is_some() {
+                let n = ctx.sequence_ahead.as_ref().map_or(2, |(n, _)| *n);
+                *seq = Some((n, ctx.final_traffic_id));
+            } else if intent == tower::Intent::ReportDownwind && reply.contains("number two") {
+                // Behind the arrival on final, or the occupant of the strip
+                // (`ctx_for_call` names either).
+                *seq = Some((2, ctx.final_traffic_id));
             } else if intent == tower::Intent::ReportDownwind && reply.contains("number one") {
                 *seq = Some((1, None));
             } else if self.desk.twr.state != tower::State::Inbound {

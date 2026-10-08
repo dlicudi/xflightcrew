@@ -15,6 +15,7 @@ fn ctx() -> Ctx {
         final_traffic_callsign: None,
         final_traffic_count: 0,
         final_traffic_id: None,
+        sequence_ahead: None,
         runway_occupied: false,
         own_on_runway: false,
         helicopter: false,
@@ -1480,6 +1481,40 @@ fn final_traffic_gates_takeoff_and_sequences_downwind() {
     // Empty final: number one, as before.
     let r = twr.handle(Intent::ReportDownwind, &ctx());
     assert!(r.contains("number one"), "{r}");
+}
+
+/// EFLP 06 (world sweep, 2026-10-08): one arrival far out would earn a
+/// conditional line-up, but a departure cleared for takeoff holds the strip:
+/// hold position, never "line up behind" in front of it.
+#[test]
+fn no_conditional_line_up_onto_a_held_strip() {
+    let mut twr = Tower::new();
+    twr.state = State::TaxiCleared;
+    let mut c = busy(2.4);
+    c.runway_occupied = true;
+    let r = twr.handle(Intent::RequestTakeoff, &c);
+    assert!(!r.contains("line up"), "{r}");
+    assert!(r.contains("hold position"), "{r}");
+    assert_eq!(twr.state, State::TaxiCleared);
+}
+
+/// BIEG 03 (2026-10-08): a downwind behind the sequence already given out
+/// is told its own number and whom it follows, even with the strip held,
+/// never number two behind a leader somebody else follows.
+#[test]
+fn a_downwind_behind_the_sequence_is_its_next_number() {
+    let mut twr = Tower::new();
+    twr.state = State::Inbound;
+    let mut c = ctx();
+    c.sequence_ahead = Some((3, "on downwind".into()));
+    c.runway_occupied = true;
+    let r = twr.handle(Intent::ReportDownwind, &c);
+    assert_eq!(
+        r,
+        "November one seven two Sierra Papa, number three, follow the traffic on downwind, \
+         report base."
+    );
+    assert_eq!(twr.state, State::Inbound);
 }
 
 #[test]

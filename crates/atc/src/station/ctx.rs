@@ -171,11 +171,47 @@ impl Station {
             }
             None => (None, false),
         };
-        let final_traffic_id = final_traffic
+        // A downwind report is sequenced further out: behind a straight-in
+        // on a longer final ([`sequence_traffic_for`]), or, with the strip
+        // held, behind its occupant, whom the downwind follows (extended)
+        // until it is off (BIEG 03, 2026-10-08: "number two, traffic on the
+        // runway" named no leader, the base was turned on time and the
+        // final went around behind a backtracking jet).
+        let downwind = intent == tower::Intent::ReportDownwind && !on_ground;
+        let final_traffic = match (&final_traffic, strip(&self.apt.runways, &ident)) {
+            (None, Some(r)) if downwind && !runway_occupied => {
+                sequence_traffic_for(targets, r, &self.apt.runways, self.apt.elev_ft)
+            }
+            _ => final_traffic,
+        };
+        let occupant = match strip(&self.apt.runways, &ident) {
+            Some(r) if downwind && runway_occupied => {
+                departure_strip_picture(r, &ident, targets, None, None, now)
+                    .occupants
+                    .first()
+                    .cloned()
+            }
+            _ => None,
+        };
+        let mut final_traffic_id = occupant
             .as_ref()
-            .and_then(|f| f.ghosts.first())
+            .or_else(|| final_traffic.as_ref().and_then(|f| f.ghosts.first()))
             .and_then(|nearest| ids.iter().find(|(cs, _)| cs == nearest))
             .map(|(_, who)| *who);
+        // ...and behind the LAST flight the tower has already sequenced,
+        // when there is one: that flight is the one to follow.
+        let mut sequence_ahead = None;
+        if downwind {
+            if let Some((n, who)) = landing_sequence_tail(&self.desk.strip) {
+                let on_final = final_traffic.as_ref().is_some_and(|f| {
+                    ids.iter()
+                        .any(|(cs, id)| *id == who && f.ghosts.iter().any(|g| g == cs))
+                });
+                let at = if on_final { "on final" } else { "on downwind" };
+                sequence_ahead = Some((n.saturating_add(1), at.to_string()));
+                final_traffic_id = Some(who);
+            }
+        }
         let wake_secs_left = if on_ground {
             wake_remaining(&ident, now)
         } else {
@@ -236,6 +272,7 @@ impl Station {
         );
         ctx.own_on_runway = own_on_runway;
         ctx.final_traffic_id = final_traffic_id;
+        ctx.sequence_ahead = sequence_ahead;
         if intent == tower::Intent::RequestRunway {
             self.apply_runway_request(&mut ctx, pos);
         }
@@ -305,6 +342,7 @@ impl Station {
             final_traffic_count: final_traffic.as_ref().map(|f| f.count).unwrap_or(0),
             // Named by the caller's picture where it can (`ctx_for_call`).
             final_traffic_id: None,
+            sequence_ahead: None,
             runway_occupied,
             wake_secs_left,
             taxi_via: route.map(|r| spoken_via(&r.via)).unwrap_or_default(),
@@ -393,6 +431,36 @@ impl Station {
         }
         Some((atis::spoken_runway(&ident), why.map(str::to_string)))
     }
+}
+
+/// The landing sequence the tower has given out, not counting `me`: how
+/// many flights hold a place in it and the last of them (the one a new
+/// downwind follows). A place counts while its flight is still Inbound
+/// for it: every strip, ours and the traffic's, holding one ("number two,
+/// ..."), the highest number last. `None` with nobody sequenced.
+pub(super) fn landing_sequence_tail(me: &FlightStrip) -> Option<(u8, FlightId)> {
+    let place = |s: &FlightStrip| {
+        let inbound = s
+            .clearance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|c| c.state == tower::State::Inbound);
+        inbound
+            .then(|| *s.sequence.lock().unwrap_or_else(|e| e.into_inner()))
+            .flatten()
+    };
+    let own = (!std::ptr::eq(me, &OWN_STRIP))
+        .then(|| place(&OWN_STRIP).map(|(n, _)| (n, FlightId::Own)))
+        .flatten();
+    let placed: Vec<(u8, FlightId)> = traffic_strips()
+        .into_iter()
+        .filter(|(_, s)| !std::ptr::eq(me, s.as_ref()))
+        .filter_map(|(id, s)| place(&s).map(|(n, _)| (n, FlightId::Traffic(id))))
+        .chain(own)
+        .collect();
+    let last = placed.iter().max_by_key(|(n, _)| *n)?.1;
+    Some((u8::try_from(placed.len()).unwrap_or(u8::MAX), last))
 }
 
 /// An arrival this close on a strip's final keeps a crossing flight short of

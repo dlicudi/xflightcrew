@@ -2,6 +2,7 @@
 //! its own strip, and an empty map changes nothing for ours.
 
 use super::book_tests::{along, book_runways};
+use super::ctx::landing_sequence_tail;
 use super::tests::SIDE_STATE_LOCK;
 use super::*;
 
@@ -384,4 +385,37 @@ fn traffic_strips_die_with_the_station_not_with_our_flight() {
     open_traffic_strip(5);
     Station::uninstall();
     assert!(traffic_strips().is_empty(), "the end of ATC");
+}
+
+/// The landing sequence is every strip's place while its flight is still
+/// Inbound for it (BIEG 03, 2026-10-08): counted, the last of them the
+/// leader, the asking flight itself left out; a flight cleared to land is
+/// out of it.
+#[test]
+fn the_landing_sequence_counts_the_inbound_places_and_names_the_last() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    *OWN_STRIP.sequence.lock().unwrap() = None;
+    *OWN_STRIP.clearance.lock().unwrap() = None;
+    let place = |s: &FlightStrip, n: u8, state: tower::State| {
+        *s.sequence.lock().unwrap() = Some((n, None));
+        *s.clearance.lock().unwrap() = Some(ClearanceSnap {
+            state,
+            callsign: "x".into(),
+            runway_ident: "03".into(),
+            pending_readback: None,
+            holds_runway: false,
+        });
+    };
+    let me = open_traffic_strip(9);
+    assert_eq!(landing_sequence_tail(&me), None, "nobody sequenced");
+    place(&open_traffic_strip(1), 1, tower::State::Inbound);
+    place(&open_traffic_strip(2), 2, tower::State::Inbound);
+    place(&open_traffic_strip(3), 7, tower::State::ClearedToLand);
+    place(&me, 4, tower::State::Inbound);
+    assert_eq!(
+        landing_sequence_tail(&me),
+        Some((2, FlightId::Traffic(2))),
+        "two inbound ahead, the cleared one and the asker left out"
+    );
 }
