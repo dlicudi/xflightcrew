@@ -696,6 +696,20 @@ void start() {
     XPLMScheduleFlightLoop(g_loop, -1.0f, 1);
 }
 
+// X-Plane takes the AI planes from a plugin as it disables it, before its
+// stop: release them here while they are still ours, or XPMP2's cleanup (which
+// trusts its own flag) writes TCAS and the map layer without owning them and
+// X-Plane calls the plugin buggy (seen on a reload, 2026-10-08). The loop
+// takes them again when the plugin is enabled and traffic is still wanted.
+void disable() {
+    g_tracks.clear();
+    if (g_inited && g_enabled) {
+        XPMPMultiplayerDisable();
+        g_tcas_owner = "off";
+    }
+    g_enabled = false;
+}
+
 void stop() {
     if (g_loop) {
         XPLMDestroyFlightLoop(g_loop);

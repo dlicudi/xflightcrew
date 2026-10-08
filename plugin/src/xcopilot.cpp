@@ -81,5 +81,5 @@ PLUGIN_API void XPluginStop(void) {
 }
 
 PLUGIN_API int XPluginEnable(void) { return 1; }
-PLUGIN_API void XPluginDisable(void) {}
+PLUGIN_API void XPluginDisable(void) { traffic::disable(); }
 PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int, void*) {}

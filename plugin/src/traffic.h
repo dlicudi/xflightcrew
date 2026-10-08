@@ -13,6 +13,7 @@ namespace traffic {
 void start();
 // Destroy every aircraft, XPMPMultiplayerCleanup, unregister. Call first in
 // XPluginStop, before the rest of the teardown.
+void disable();  // XPluginDisable: give back the AI planes while still ours
 void stop();
 
 } // namespace traffic
