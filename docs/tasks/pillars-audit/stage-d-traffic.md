@@ -270,3 +270,84 @@ with ATC off (parked aircraft drawn only); any `pub static` for traffic.
   runways the book reads and clears `STRIPS`), our `TOWER_WIND` comes from our own calls (set
   it through one `handle_transmission_with` or accept calm), and `SIDE_STATE_LOCK` plus a
   `STRIPS` drop guard in tests.
+
+### Traffic crate (steps 1 to 3)
+
+Increment 1 (`crates/traffic` skeleton):
+- **`sim` is in `cargo tree -p traffic`**, transitively: `nav` depends on `sim` for
+  `sim::angles`. "As lean as nav" holds; "free of sim" cannot without moving the angle helpers
+  out of `sim`, which this stage does not do. No whisper, cpal, ort or atc.
+- **`follow` keeps its progress in a `Follow { seg, done }`** passed alongside the path, and
+  takes a `FollowSpec` (speed, turn rate, accel, decel, stop at end, slow for corners, minimum
+  lookahead) instead of loose arguments: `follow(path, &mut Follow, &mut Kin, &FollowSpec, dt)`.
+- **The pursuit gain is twice the classic arc's** (`4 sin(alpha) / L`, critically damped with
+  heading as the only state; the classic gain rang on a saturated intercept), the lookahead is
+  never shorter than the turn radius, and in the air a corner is FLOWN BY (the turn begins
+  `R tan(turn / 2)` before it). Measured: a 300 m offset intercept at 85 kt settles with no
+  overshoot; a 90 degree corner overshoots its new leg by about 25 m and settles within a mile;
+  a 90 degree taxi corner is cut by under 4 m (slowed to 35% of the taxi pace).
+- `Perf` gained `roll_accel_kts_s`, `turn_air_dps` and `pattern_kts`; `class_for_type(icao)`
+  picks the table and the `Wake`. `SimClock` also takes the sim's running time (`observe`).
+
+Increment 2 (the phase machine, `aircraft.rs`, `fleet.rs`, `field.rs`, `phase.rs`):
+- **A `Phase` carries no path.** The aircraft holds ONE `Route` (path, a `Leg` per segment,
+  its `Follow`, the threshold's index), and the airborne phases follow from the leg reached:
+  the roll's route runs on through upwind, crosswind, downwind, base and final, so a corner is
+  flown by and never re-planned. `Phase::Arrive` and `Phase::Pattern { leg: Leg }` take a
+  `Leg`, not an index.
+- **`Order.state` is `TowerState`**, a copy of `tower::State`'s six names (the crate never
+  sees atc); `Order::default()` (no strip) clears nothing, so an aircraft with no order waits on
+  the stand and goes around at 300 ft.
+- **`Event` gained `Phase { id, from, to }` and `Touchdown { id, at, along_m }`**; `Despawn`
+  carries a reason (`LeftTheArea`, `Parked`, `Removed`). `Call::text(spoken, runway)` renders
+  plain English ("Tower, Cessna three four five, ready for departure runway one three");
+  `Call::Inbound` is `{ miles, from }` (a compass point), not a position.
+- **The final is flown on a ramp** (fed forward on groundspeed, trimmed on the error), and so
+  are the downwind and base once the 3 degree path along the rest of the circuit is below
+  circuit height: the final is joined ON the path. In the air the follow adds a LEAD TURN (full
+  rate when the arc to roll out on the leg needs all the room left) and halves its lookahead:
+  without them the turn onto a short 172 final ended 10 to 25 m off and took a mile to settle.
+- The 172's circuit is 0.8 nm out with a 1.0 nm base extension and 5 degrees a second in the
+  turns (about 20 degrees of bank); the flare holds 200 fpm below 30 ft.
+- `FieldModel` is `AirportInfo` plus `TaxiNet` with `RunwayEnd` geometry (`at`, `frame`,
+  `side`), `taxi_to_runway` / `vacate` / `taxi_to_stand` over nav's planners, `free_stand`.
+  LEMG exists only in the install, so its sortie is `#[ignore]`
+  (`real_install_lemg_172_circuit_stand_to_stand`) and a synthetic `fixtures/xtst.dat`
+  (09/27, 1,500 m, a parallel taxiway, four stands, 27 published right) covers the rest.
+- Measured (the sortie tests print them): XTST 09 stand to stand in 810 s, taxi cross-track at
+  most 3.2 m (corner cuts), final below 300 ft at most 0.6 m, touchdown 381 m into 1,500 m;
+  LEMG 13 from stand W4 in 1,321 s, taxi 3.3 m, final 0.5 m, touchdown 381 m into 3,206 m.
+
+Increment 3 (`schedule.rs`):
+- **`generate(field, density, seed, &SpawnCtx)`**: a fourth argument carries the tower's
+  runway (else `default_runway`: the longest assignable strip, the end with an approach first),
+  our own position and the others on the ground. "Never within 3 nm of us" is read as AIRBORNE
+  spawns (an entry is turned round the field until clear, else skipped); on the ground the rule
+  is the stand: ours and everyone's are occupied (`STAND_TAKEN_M`, 20 m), and a stand is handed
+  out once per schedule. `Movement::spawn(id, field, ctx)` applies both again at spawn time
+  (`Refusal::{NoRunway, NoStand, NearOwn}`: the bin retries later); a named stand that is taken
+  moves to a free one of the class (a stand that names categories must name the class's).
+- **Procedures are data on the field** (`FieldModel.procs`, `Procedures::load(cifp_dir, icao)`
+  over `nav::list_procedures`): departures only where SIDs exist, arrivals where approaches or
+  STARs exist (straight in where the runway has an approach, else to the downwind, 10 nm out
+  within 50 degrees of the centreline). The SID and STAR are names only in v1: departures leave
+  on a seeded bearing.
+- **Types by runway**: jets (A319, A320, B738) and the ATR 72 on 1,800 m or more, the ATR alone
+  from 1,100 m, nothing IFR below; circuits are C172, C152, PA28, SR22 with 2 to 4 laps.
+  Callsigns by region (`G`, `EC`, `F`, `D`, `I`... registrations, regional carriers), spoken in
+  full.
+- **The file** (`parse_file`, `from_file`): a YAML list of `t_s, callsign, type, kind`
+  (`circuit|departure|arrival`), `runway?, stand?, laps?, spoken?`; unknown fields, a bad kind,
+  a negative time or an empty callsign refuse the WHOLE file; a runway the field lacks drops its
+  row. The crate reads no environment: the bin passes the text.
+- **Despawn** stays in the phase machine (12 nm, 120 s parked, circuits after their laps); an
+  arrival with nowhere to park waits clear of the runway for 240 s and goes (`Despawn::NoStand`).
+- The flare holds half the approach's sink (never under 200 fpm): at 200 the ATR landed 560 m
+  into 1,500 m. Generated hours, flown to the end against the scripted tower: XTST (circuits,
+  ATRs) every touchdown under 500 m; XNOC (jets on 2,800 m) 427 to 440 m.
+- Fixtures: `xtst.dat` (+ `cifp/XTST.dat`: a SID, an approach for 27), `xnoc.dat` (allows
+  circuits 0, 2,800 m, jet gates, `cifp/XNOC.dat`: two SIDs, a STAR, ILS 12), `xbar.dat` (an
+  800 m grass strip with no network: nothing generated). `real_install_schedule_lemg` is the
+  ignored one over the install (LEMG says no circuits; IFR both ways, every movement spawns).
+- Known: a turboprop's vacate at 16 kt cuts its 90 degree turn-off by up to 7 m (the 172's
+  taxi stays under 3.3 m); not asserted for the ATR yet.

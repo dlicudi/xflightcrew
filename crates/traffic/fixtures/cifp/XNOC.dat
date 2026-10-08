@@ -1,0 +1,4 @@
+SID:010,5,NOC1A,RW12,NOCEX,XN,P,C,E   , ,   ,IF, , , , , , , , , , , , , , , , , , , , , ,;
+SID:010,5,NOC2B,RW30,NOCWX,XN,P,C,E   , ,   ,IF, , , , , , , , , , , , , , , , , , , , , ,;
+STAR:010,5,NOC1S,ALL,NOCIN,XN,P,C,E   , ,   ,IF, , , , , , , , , , , , , , , , , , , , , ,;
+APPCH:010,A,I12,IXNC,NOCFA,XN,P,C,E  M, ,   ,IF, , , , , , , , , , , , , , , , , , , , , ,;

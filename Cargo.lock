@@ -2644,6 +2644,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "traffic"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "nav",
+ "serde",
+ "serde_yaml",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

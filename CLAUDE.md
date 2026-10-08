@@ -34,7 +34,7 @@ Named 2026-07-30. Three names survived the rename because they are wire contract
 - the plugin binary `xcopilot.xpl` (renamed, X-Plane loads BOTH copies and double-registers).
 
 Package `xvoicelayer`, binary `xvl`. The tracing filter names every crate (`atc`, `nav`, `sim`)
-AND both crew names: `xvoicelayer=info,xvl=info,atc=info,nav=info,sim=info` (`src/main.rs`
+AND both crew names: `xvoicelayer=info,xvl=info,atc=info,nav=info,sim=info,traffic=info` (`src/main.rs`
 `DEFAULT_LOG_FILTER`, pinned by
 `the_log_filter_names_every_crate_and_both_crew_names`). A line's default target is the BIN
 name in the binary and the PACKAGE name in the lib: drop either and half the log goes silently while
