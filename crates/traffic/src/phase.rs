@@ -38,6 +38,9 @@ pub struct Order {
     pub go_around: bool,
     /// A readback the tower is owed, answered verbatim once.
     pub readback_owed: Option<String>,
+    /// The runway the tower has cleared this aircraft to cross ("cross
+    /// runway one three"): the taxi goes on past the stop short of it.
+    pub cross_cleared: Option<String>,
 }
 
 /// What a traffic aircraft is doing.
@@ -157,8 +160,15 @@ pub enum Call {
     Final,
     Vacated,
     GoingAround,
+    /// Holding short of a runway the taxi route crosses, asking to cross.
+    RequestCrossing {
+        runway: String,
+    },
     /// The owed readback, verbatim.
     Readback(String),
+    /// "Say again": the readback was not taken twice, the tower is asked to
+    /// repeat once before the flight gives up.
+    SayAgain,
 }
 
 impl Call {
@@ -185,6 +195,11 @@ impl Call {
             // tower's own suggested wording.
             Call::Vacated => format!("{spoken}, runway vacated, request taxi to parking"),
             Call::GoingAround => format!("{spoken}, going around"),
+            Call::SayAgain => format!("Tower, {spoken}, say again"),
+            Call::RequestCrossing { runway } => format!(
+                "Tower, {spoken}, holding short runway {}, request crossing",
+                runway_words(runway)
+            ),
             // The tower's phrasing already names the flight: said as it is.
             Call::Readback(text) if text.contains(spoken) => text.trim_end_matches('.').to_string(),
             Call::Readback(text) => format!("{text}, {spoken}"),
@@ -281,6 +296,9 @@ pub enum Despawn {
     Removed,
     /// Landed with nowhere to park, after waiting clear of the runway.
     NoStand,
+    /// Its readback was not taken twice and the tower's repeat did not
+    /// help: it leaves the frequency rather than be challenged forever.
+    ReadbackFailed,
 }
 
 /// Our own aircraft, as the fleet needs it: where not to spawn.
@@ -295,8 +313,17 @@ pub struct OwnTarget {
 /// made once.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RadioState {
-    /// The last readback given, so the same owed text is answered once.
+    /// The readback owed now and last given, so an owed text is answered
+    /// once per owing (forgotten once nothing is owed: the next lap's
+    /// identical clearance is read back again).
     pub last_readback: Option<String>,
+    /// Times the owed readback has been given.
+    pub readback_tries: u32,
+    /// "Say again" has been asked for the owed readback.
+    pub said_again: bool,
+    /// When the owed readback (or the "say again") last went out, the
+    /// aircraft's own seconds.
+    pub readback_at_s: f64,
     /// The phase's call has gone out (reset on every phase change).
     pub called: bool,
 }
@@ -329,6 +356,13 @@ mod tests {
                 .text("Cessna one", None),
             "Cleared to land runway two seven, Cessna one",
             "a readback already naming the flight is said as it is"
+        );
+        assert_eq!(
+            Call::RequestCrossing {
+                runway: "13".into()
+            }
+            .text("Cessna one", None),
+            "Tower, Cessna one, holding short runway one three, request crossing"
         );
         assert_eq!(
             Call::Base.text("Cessna one", Some("27")),

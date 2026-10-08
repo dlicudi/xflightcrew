@@ -48,6 +48,18 @@ const LINE_UP_ALIGN_M: f64 = 60.0;
 /// How long a failed taxi plan waits before trying again.
 const REPLAN_S: f64 = 10.0;
 
+/// Held short of a crossing, the request is made again this often.
+pub const CROSS_ASK_RETRY_S: f64 = 30.0;
+
+/// An owed readback still owed this long after it went out was not taken:
+/// it is given again (the link may hold a call a few seconds before it
+/// keys, `CALL_GAP_S` in the bin, so this is several of those).
+pub const READBACK_RETRY_S: f64 = 12.0;
+
+/// A readback is given this many times before the flight asks "say
+/// again", once, and then leaves the frequency (the spec's readback cap).
+pub const READBACK_TRIES: u32 = 2;
+
 /// A departure climbs to this above the field before it is gone.
 const DEPART_CLIMB_AGL_FT: f64 = 6000.0;
 
@@ -137,6 +149,14 @@ pub struct TrafficAircraft {
     pub touchdown: Option<LatLon>,
     /// The drawn lead-on from the hold onto the strip.
     lead_on: Vec<LatLon>,
+    /// The taxi route past each runway it crosses: the runway the stop at
+    /// the end of the piece now driven is short of, and the piece beyond
+    /// it, in order ([`FieldModel::cut_at_crossings`]).
+    taxi_rest: Vec<(String, Vec<LatLon>)>,
+    /// When the crossing held short of was last asked for (phase seconds).
+    cross_asked_at: Option<f64>,
+    /// Seconds since it spawned (the readback's clock: phases reset theirs).
+    age_s: f64,
     /// Seconds in the current phase.
     phase_s: f64,
     /// Metres the downwind has been extended.
@@ -180,6 +200,9 @@ impl TrafficAircraft {
             laps_done: 0,
             touchdown: None,
             lead_on: Vec::new(),
+            taxi_rest: Vec::new(),
+            cross_asked_at: None,
+            age_s: 0.0,
             phase_s: 0.0,
             ext_m: 0.0,
             flown: false,
@@ -370,20 +393,15 @@ impl TrafficAircraft {
     ) {
         let none = Order::default();
         let o = order.unwrap_or(&none);
-        if let Some(rb) = &o.readback_owed {
-            if self.radio.last_readback.as_ref() != Some(rb) {
-                self.radio.last_readback = Some(rb.clone());
-                events.push(Event::Call {
-                    id: self.id,
-                    call: Call::Readback(rb.clone()),
-                });
-            }
+        self.age_s += dt;
+        if self.answer_readback(o, events) {
+            return;
         }
         let end = self.runway_end(field, o);
         match self.phase {
             Phase::Parked => self.parked(dt, o, field, end.as_ref(), events),
             Phase::TaxiOut => {
-                if self.drive(self.perf.taxi_kts, o, dt) {
+                if self.drive(self.perf.taxi_kts, o, dt) && self.past_crossings(o, field, events) {
                     self.set_phase(Phase::HoldShort, events);
                 }
             }
@@ -442,7 +460,7 @@ impl TrafficAircraft {
                 }
             }
             Phase::TaxiIn => {
-                if self.drive(self.perf.taxi_kts, o, dt) {
+                if self.drive(self.perf.taxi_kts, o, dt) && self.past_crossings(o, field, events) {
                     self.kin.lights = Default::default();
                     self.flown = true;
                     self.set_phase(Phase::Parked, events);
@@ -521,9 +539,103 @@ impl TrafficAircraft {
         let mut full = vec![here];
         full.extend(path.into_iter().skip_while(|p| dist_m(*p, here) < 1.0));
         self.lead_on = lead_on;
-        self.route = Route::taxi(full);
+        self.set_taxi_route(&full, field);
         self.kin.lights.taxi = true;
         self.set_phase(Phase::TaxiOut, events);
+    }
+
+    /// The owed readback ([`Order::readback_owed`]), once per owing: given
+    /// when it comes owed, given again if it is still owed
+    /// [`READBACK_RETRY_S`] later (not taken), [`READBACK_TRIES`] times in
+    /// all, then "say again" once, then the flight leaves the frequency
+    /// ([`Despawn::ReadbackFailed`], true: the substep stops). Nothing owed
+    /// forgets it, so the next identical clearance is read back afresh.
+    fn answer_readback(&mut self, o: &Order, events: &mut Vec<Event>) -> bool {
+        let r = &mut self.radio;
+        let Some(rb) = &o.readback_owed else {
+            r.last_readback = None;
+            r.readback_tries = 0;
+            r.said_again = false;
+            return false;
+        };
+        let call = if r.last_readback.as_ref() != Some(rb) {
+            r.last_readback = Some(rb.clone());
+            r.readback_tries = 1;
+            r.said_again = false;
+            Some(Call::Readback(rb.clone()))
+        } else if self.age_s - r.readback_at_s < READBACK_RETRY_S {
+            None
+        } else if r.readback_tries < READBACK_TRIES {
+            r.readback_tries += 1;
+            Some(Call::Readback(rb.clone()))
+        } else if !r.said_again {
+            r.said_again = true;
+            Some(Call::SayAgain)
+        } else {
+            self.set_phase(Phase::Gone, events);
+            events.push(Event::Despawn {
+                id: self.id,
+                reason: Despawn::ReadbackFailed,
+            });
+            return true;
+        };
+        if let Some(call) = call {
+            self.radio.readback_at_s = self.age_s;
+            events.push(Event::Call { id: self.id, call });
+        }
+        false
+    }
+
+    /// Taxi `full`, stopping short of every runway it crosses (by the
+    /// strips' geometry) until the tower clears the crossing.
+    fn set_taxi_route(&mut self, full: &[LatLon], field: &FieldModel) {
+        let cut = field.cut_at_crossings(full);
+        let mut pieces = cut.pieces.into_iter();
+        self.route = Route::taxi(pieces.next().unwrap_or_default());
+        self.taxi_rest = cut.crossings.into_iter().zip(pieces).collect();
+        self.cross_asked_at = None;
+    }
+
+    /// Stopped at the end of the piece of taxi route being driven: true
+    /// when it is the route's end. Short of a crossing it asks to cross
+    /// (again every [`CROSS_ASK_RETRY_S`]) and holds until the tower has
+    /// cleared it across THAT strip and heard the readback; then it drives
+    /// the next piece.
+    fn past_crossings(&mut self, o: &Order, field: &FieldModel, events: &mut Vec<Event>) -> bool {
+        let Some((runway, _)) = self.taxi_rest.first() else {
+            return true;
+        };
+        let same_strip = |a: &str, b: &str| match (field.strip(a), field.strip(b)) {
+            (Some(x), Some(y)) => std::ptr::eq(x, y),
+            _ => false,
+        };
+        let cleared = o
+            .cross_cleared
+            .as_deref()
+            .is_some_and(|c| same_strip(c, runway))
+            && o.readback_owed.is_none();
+        if cleared {
+            let (_, piece) = self.taxi_rest.remove(0);
+            let here = self.kin.pos();
+            let mut path = vec![here];
+            path.extend(piece.into_iter().skip_while(|p| dist_m(*p, here) < 1.0));
+            self.route = Route::taxi(path);
+            self.cross_asked_at = None;
+            return false;
+        }
+        let due = self
+            .cross_asked_at
+            .is_none_or(|t| self.phase_s - t >= CROSS_ASK_RETRY_S);
+        if !o.hold && due {
+            self.cross_asked_at = Some(self.phase_s);
+            events.push(Event::Call {
+                id: self.id,
+                call: Call::RequestCrossing {
+                    runway: runway.clone(),
+                },
+            });
+        }
+        false
     }
 
     /// From the hold onto the centreline: the drawn lead-on, then along
@@ -977,7 +1089,7 @@ impl TrafficAircraft {
         let mut full = vec![here];
         full.extend(path.into_iter().skip_while(|p| dist_m(*p, here) < 1.0));
         self.stand = Some(name);
-        self.route = Route::taxi(full);
+        self.set_taxi_route(&full, field);
         self.set_phase(Phase::TaxiIn, events);
     }
 

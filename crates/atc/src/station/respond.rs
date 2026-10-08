@@ -97,6 +97,16 @@ impl Station {
                 }
             }
         }
+        // A crossing the tower cleared is noted on the strip: the flight's
+        // order view reads it, and it stands until the flight is seen off
+        // the strip it crossed.
+        if service == Service::Tower && intent == tower::Intent::RequestCrossing {
+            let cleared = ctx.on_ground && ctx.crossing.as_ref().is_some_and(|c| c.1.is_none());
+            if let Some(end) = self.desk.call.crossing_ident.take().filter(|_| cleared) {
+                let cell = &self.desk.strip.crossing;
+                *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some((end, false));
+            }
+        }
         // Publish the clearance picture for the monitor's compliance watch:
         // two-way contact has happened, and this is what the pilot is (and
         // isn't) cleared to do. Same reply-path-owns-its-static pattern as
@@ -526,6 +536,7 @@ impl Station {
             | tower::Intent::RunwayVacated
             | tower::Intent::RequestRunway
             | tower::Intent::RequestBacktrack
+            | tower::Intent::RequestCrossing
             | tower::Intent::CancelIfr
             | tower::Intent::RequestSid
             | tower::Intent::RequestStartup
@@ -991,6 +1002,7 @@ impl Station {
             | tower::Intent::RunwayVacated
             | tower::Intent::RequestRunway
             | tower::Intent::RequestBacktrack
+            | tower::Intent::RequestCrossing
             | tower::Intent::CancelIfr
             | tower::Intent::RequestSid
             | tower::Intent::RequestStartup

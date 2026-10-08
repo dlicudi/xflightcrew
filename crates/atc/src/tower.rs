@@ -117,6 +117,16 @@ pub enum Intent {
     /// 2026-09-27: a 737 started 1,340 m from the end of 26L, needing 1,897,
     /// had no words for it and was taxied off the runway to its far hold.
     RequestBacktrack,
+    /// "holding short runway one three, request crossing" / "request to cross
+    /// runway one three": an aircraft at a runway its taxi route crosses,
+    /// asking to cross it now. The runway is read from the words
+    /// ([`stated_runway`]); the station judges the strip (the runway book, the
+    /// final) and hands the answer down in [`Ctx::crossing`]: "cross runway
+    /// one three" (read back) or "hold short runway one three". Our own AI
+    /// traffic holds short of every crossing and asks (the 2026-10-08 world
+    /// sweep: traffic taxied across ULMM 13 under a takeoff clearance, the
+    /// crossing given minutes before in the taxi clearance).
+    RequestCrossing,
     /// "cancel IFR" / "cancelling IFR": an IFR flight going VFR. The station
     /// retires the IFR clearance and the flight's IFR standing, so the next
     /// region handoff terminates the service like any VFR flight's.
@@ -217,6 +227,17 @@ pub struct Ctx {
     pub taxi_via: Vec<String>,
     /// Runways the taxi route crosses, spoken ("zero niner left").
     pub taxi_crossings: Vec<String>,
+    /// The taxi clearance says "hold short runway ..." at each of
+    /// [`Ctx::taxi_crossings`] instead of "cross runway ...": the crossing
+    /// is asked for at the runway ([`Intent::RequestCrossing`]). Our own AI
+    /// traffic's desk only; ours is cleared across in the taxi clearance, as
+    /// before.
+    pub hold_short_crossings: bool,
+    /// The answer to a crossing request, judged by the station: the runway
+    /// asked about, spoken, and `Some(reason)` when the flight must hold
+    /// short ("traffic on final"). `None` on every other call, and when the
+    /// words named no runway of the field (the tower asks again).
+    pub crossing: Option<(String, Option<String>)>,
     /// The aircraft is on the ground — shapes the mayday answer (a parked
     /// emergency gets the trucks, not a landing clearance; seen live
     /// 2026-07-09: mayday from the stand was "cleared to land").
@@ -448,11 +469,18 @@ fn taxi_in_reply(ctx: &Ctx) -> String {
     )
 }
 
-/// The ", cross runway ..." clause when the taxi route crosses one.
+/// The ", cross runway ..." clause when the taxi route crosses one (", hold
+/// short runway ..." where the crossing is asked for at the runway,
+/// [`Ctx::hold_short_crossings`]).
 fn crossing_clause(ctx: &Ctx) -> String {
+    let verb = if ctx.hold_short_crossings {
+        "hold short"
+    } else {
+        "cross"
+    };
     ctx.taxi_crossings
         .iter()
-        .map(|r| format!(", cross runway {r}"))
+        .map(|r| format!(", {verb} runway {r}"))
         .collect()
 }
 
@@ -671,6 +699,15 @@ pub fn parse_intent(transcript: &str) -> Intent {
         && (word("request") || word("requesting") || word("requests"))
     {
         return Intent::RequestBacktrack;
+    }
+    // A runway crossing asked for, before the runway request can read
+    // "request to cross runway one three" as a request for runway one three.
+    // Request-shaped only: "crossing runway one three" is the readback.
+    if (word("cross") || word("crossing"))
+        && word("runway")
+        && (word("request") || word("requesting") || word("requests"))
+    {
+        return Intent::RequestCrossing;
     }
     if requested_runway(&t).is_some() {
         return Intent::RequestRunway;
@@ -1058,6 +1095,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "runway_vacated" => Intent::RunwayVacated,
         "request_runway" => Intent::RequestRunway,
         "request_backtrack" => Intent::RequestBacktrack,
+        "request_crossing" => Intent::RequestCrossing,
         "cancel_ifr" => Intent::CancelIfr,
         "request_sid" => Intent::RequestSid,
         "request_vectors" => Intent::RequestVectors,
@@ -1172,6 +1210,11 @@ pub enum Awaited {
     Landing {
         runway: String,
         touch_and_go: bool,
+    },
+    /// "cross runway ..." ([`Intent::RequestCrossing`]): crossing words and,
+    /// when one is named, the runway.
+    Crossing {
+        runway: String,
     },
     /// The IFR clearance: the SID (when one was given), the altitude and the
     /// squawk must all come back, and a runway named must be ours. The
@@ -1731,6 +1774,7 @@ pub fn check_readback(transcript: &str, awaited: &Awaited) -> ReadbackCheck {
                 word("land") || word("landing") || word("cleared")
             }
         }
+        Awaited::Crossing { .. } => word("cross") || word("crossing"),
         Awaited::IfrClearance { .. } => unreachable!("judged above"),
     };
     if !verb_ok {
@@ -1741,6 +1785,7 @@ pub fn check_readback(transcript: &str, awaited: &Awaited) -> ReadbackCheck {
     let expect = match awaited {
         Awaited::LineUp { runway, .. }
         | Awaited::Takeoff { runway }
+        | Awaited::Crossing { runway }
         | Awaited::Landing { runway, .. } => canon_runway(runway),
         Awaited::HoldPosition | Awaited::IfrClearance { .. } => None,
     };
@@ -2138,6 +2183,7 @@ impl Tower {
             Awaited::Takeoff { runway } => {
                 format!("Cleared for takeoff runway {runway}, {callsign}.")
             }
+            Awaited::Crossing { runway } => format!("Crossing runway {runway}, {callsign}."),
             Awaited::Landing {
                 runway,
                 touch_and_go: false,
@@ -2456,6 +2502,26 @@ impl Tower {
                     qnh_clause(ctx)
                 )
             }
+            // A crossing: on the ground only, on the station's judgement of
+            // the strip. Cleared, it is read back; held, the flight asks
+            // again. The FSM state stands: the flight is still on its taxi.
+            Intent::RequestCrossing => match &ctx.crossing {
+                _ if !ctx.on_ground => format!("{}, say again.", ctx.callsign),
+                None => format!("{}, say again the runway to cross.", ctx.callsign),
+                Some((rwy, Some(why))) => {
+                    format!("{}, hold short runway {rwy}, {why}.", ctx.callsign)
+                }
+                Some((rwy, None)) => {
+                    let line = format!("{}, cross runway {rwy}.", ctx.callsign);
+                    self.arm(
+                        Awaited::Crossing {
+                            runway: rwy.clone(),
+                        },
+                        &format!("cross runway {rwy}."),
+                    );
+                    line
+                }
+            },
             // A backtrack: the strip and its final must be clear, as for a
             // line-up; then onto (or down) the runway to the threshold,
             // turned round and lined up. From the runway itself (a runway

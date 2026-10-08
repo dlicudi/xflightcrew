@@ -3529,3 +3529,70 @@ fn real_install_lemd_18r_departure() {
         assert!(enterable || !p.crossings.contains(&own), "{id}: crosses its own strip");
     }
 }
+
+/// UEMH (the traffic world sweep, 2026-10-08), its real rows: stand 13
+/// snaps to the node ONE taxiway edge from the runway junction. The
+/// two-node route could be trimmed by neither rule (the zone trim kept two
+/// nodes, the geometric one wants a longer route), so it ended ON the
+/// centreline and a taxi clearance drove onto runway zero niner. The
+/// aircraft's own position fronts the route, so the zone trim may cut the
+/// network part to its one node: the route ends at the authored hold, the
+/// lead-on runs from it onto the strip.
+#[test]
+fn a_one_edge_route_from_the_stand_still_holds_short() {
+    let path = std::env::temp_dir().join("xc-uemh-test.dat");
+    let mut f = std::fs::File::create(&path).unwrap();
+    for row in [
+        "1    938 0 0 UEMH Tyoply Kluch",
+        "100 70.00 5 0 0.25 0 1 1  09 62.7864289 136.8383557 0 0 0 10 0 0 \
+         27 62.7922325 136.8714037 0 0 0 0 0 0",
+        "1300 62.787771 136.849157 250.0 tie_down turboprops|props|helos 13",
+        "1201 62.786451 136.838480 both 0",
+        "1201 62.792206 136.871253 both 1",
+        "1201 62.787721 136.850605 both 2",
+        "1201 62.788090 136.850299 both 3",
+        "1201 62.788474 136.849993 both 4",
+        "1202 0 4 twoway runway 09/27",
+        "1204 departure 09,27",
+        "1204 arrival 09,27",
+        "1202 4 1 twoway runway 09/27",
+        "1204 departure 09,27",
+        "1204 arrival 09,27",
+        "1202 4 3 twoway taxiway_C A",
+        "1204 departure 09,27",
+        "1204 arrival 09,27",
+        "1202 3 2 twoway taxiway_C A",
+        "1204 departure 09,27",
+        "1204 arrival 09,27",
+    ] {
+        writeln!(f, "{row}").unwrap();
+    }
+    f.flush().unwrap();
+    let apt = path.to_str().unwrap();
+    let field = find_airport(apt, "UEMH").unwrap().expect("UEMH");
+    let rwy = &field.runways[0];
+    let net = find_taxi_net(apt, "UEMH").unwrap().expect("its network");
+    let zone = ["09".to_string(), "27".to_string()];
+    let plan = net
+        .plan_to_runway(
+            62.787771,
+            136.849157,
+            rwy.lat_a,
+            rwy.lon_a,
+            100.0,
+            &zone,
+            Some(rwy),
+        )
+        .expect("a route to 09");
+    let end = *plan.path.last().unwrap();
+    assert_eq!(
+        on_strip(rwy, end.0, end.1),
+        None,
+        "the route ends short of the runway: {plan:?}"
+    );
+    let onto = *plan.lead_on.last().expect("a lead-on");
+    assert!(
+        on_strip(rwy, onto.0, onto.1).is_some(),
+        "and the lead-on runs onto it: {plan:?}"
+    );
+}

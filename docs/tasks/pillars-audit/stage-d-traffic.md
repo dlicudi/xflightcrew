@@ -590,14 +590,149 @@ engines).
   `api_load` for the added requests (one roster on change, one frames write per tick, plus
   the two reads of the link: running time and elevation).
 - The frequency: our traffic only on the TOWER, ghost voices per callsign, the tower's
-  answers after the calls, nothing over a PTT, nothing older than 8 s; listen for a crowd at
-  a busy hour (there is no rate cap yet).
+  answers after the calls, nothing over a PTT, nothing older than 8 s; at a busy hour one
+  traffic call keyed per `CALL_GAP_S` (3 s), a go-around at once (see "Sweep fixes").
 - Our own aircraft in the tower's picture (`OWNSHIP`, true MSL): a traffic departure held
   for us on final, a traffic arrival sent round for us on the runway. OUR departure, once
   airborne, still holds the strip by its `TakeoffCleared` until our next call (only traffic
   strips lapse when airborne): watch traffic holding behind our own climb-out.
-- The world sweep's findings: traffic taxiing onto a runway without a crossing clearance and
-  a takeoff cleared on a strip another flight stands on (ULMM, BIEG, EFKU, UEMH); fields with
-  runway crossings on the taxi routes are where to look.
+- The world sweep's findings (fixed, see "Sweep fixes"): at fields with runway crossings on
+  the taxi routes, traffic holds short and asks ("holding short runway ..., request
+  crossing"); watch the `atc` `route: traffic` records for `RequestCrossing` and the hold
+  shorts, and that nothing departs or lands across a cleared crossing.
 - Time acceleration freezes the fleet (said once); a reinstall (region switch, ATC toggle)
   sends every moving aircraft off the frequency (`despawn` `reinstalled`).
+
+### Sweep fixes
+
+The world sweep (`real_install_traffic_world_sweep`, 150 towered fields, ten minutes each)
+now ASSERTS a clean book at every field: no runway conflict, a silent compliance oracle, every
+traffic readback accepted (`assert_sweep_clean`). It defaults to 150 fields and runs in seconds
+in release; `XVL_TRAFFIC_SWEEP_ONLY=ULMM,BIEG` sweeps named ones, `XVL_TRAFFIC_TRACE=1` prints
+the frequency, the phases and the oracle's position. Before: ULMM 20 conflicts and 1 oracle,
+BIEG 20 conflicts, EFKU 1 oracle, UEMH 1 oracle (985 movements, 1,223 calls). After: zero at
+all 150 (985 movements, 1,256 calls: the crossing requests).
+
+**A. Traffic onto a runway without a crossing clearance** (ULMM 31, EFKU 15, UEMH 09).
+- Root cause, ULMM and EFKU: the tower cleared every runway crossing INSIDE the taxi
+  clearance ("taxi to holding point Foxtrot runway one three via Foxtrot, cross runway one
+  three": at ULMM the route from the north apron reaches the 13 holds across 13/31 itself),
+  and the traffic drove the route straight over, whatever was on the strip by then. The oracle
+  caught it at the pavement's EDGE: the pure pursuit cut the corner onto the crossing by 3.5 m,
+  inside the strip's 26 + 10 m capture, while the route's nearest point was just outside it, so
+  the "cleared crossing" exemption (route's nearest point ON a runway) missed.
+- Root cause, UEMH: a TOWER taxi planner bug that would have driven ours too. Stand 13 snaps
+  to the node one taxiway edge from the runway junction; the zone trim kept at least two
+  network nodes and the geometric trim wants a route longer than the standoff plus 30 m, so
+  the two-node route was trimmed by neither and ended ON the centreline. `plan_inner` now lets
+  the zone trim cut the network part down to one node when the aircraft's own position will
+  front the route (`keep_nodes`); the route ends at the authored hold, the lead-on runs onto
+  the strip (`a_one_edge_route_from_the_stand_still_holds_short`, the real rows).
+- Traffic side (`crates/traffic`): `FieldModel::cut_at_crossings` cuts a taxi route at every
+  runway it comes onto, by the strips' GEOMETRY (`nav::on_strip`, the tower's own pavement test,
+  moved to nav as the one home; atc's `on_runway` calls it), sampled every 2 m:
+  `CROSSING_STOP_M` (20 m) of route short of the pavement. A route that starts on a strip (a
+  vacate's end) is not stopped for it; one that ends on a strip stops short and goes no further.
+  The taxi out and the taxi in drive piece by piece: at each stop the aircraft holds and calls
+  `Call::RequestCrossing` ("Tower, <callsign>, holding short runway one three, request
+  crossing"), again every `CROSS_ASK_RETRY_S` (30 s) while held, and goes on only when its
+  order's `cross_cleared` names THAT strip (either end) and no readback is owed. The vacate is
+  not cut (it starts on the landing runway).
+- Tower side (`crates/atc`): a new `Intent::RequestCrossing` ("request crossing" / "request to
+  cross runway ..."; "crossing runway ..." without a request word is the readback), before the
+  runway request in the parser, corpus label `request_crossing`. The station judges it in
+  `ctx_for_call` (`judge_crossing`, into `Ctx.crossing`): the runway the words named at this
+  field; hold short when another strip holds or stands on the strip (the runway book, ours
+  included for a traffic flight), when the picture shows somebody on its pavement, or when an
+  arrival is on its final inside `CROSSING_FINAL_NM` (3 nm). Cleared, the tower says "cross
+  runway one three", arms `Awaited::Crossing` (readback "Crossing runway one three, <callsign>",
+  gated like the others) and notes the end on the strip's new `crossing` cell (`facts` group, the
+  door test lists `CROSSING`); `note_aircraft_state_for` spends it once the flight has been on
+  that strip and is seen off it again (or airborne). Held: "hold short runway one three, traffic
+  on the runway / on final", no state change, no readback. `world::traffic_order` carries
+  `crossing`, the link maps it to `Order.cross_cleared`.
+- A traffic desk's taxi clearance says "hold short runway ..." where ours says "cross runway
+  ..." (`Ctx.hold_short_crossings`, set from `desk.strip.is_traffic()`); OUR clearance and
+  our flight are unchanged. Our pilot may now ask "request crossing runway ..." and be answered
+  the same way (before, those words fell to whatever else they parsed as).
+- Tests: `a_route_is_cut_short_of_every_runway_it_crosses`,
+  `a_taxi_holds_short_of_a_runway_it_crosses_until_cleared` (traffic),
+  `a_runway_crossing_is_asked_answered_and_read_back` (tower),
+  `a_traffic_crossing_is_asked_for_and_judged_on_the_book` (station), and the sweep's own two
+  fields on their REAL layouts (`crates/traffic/fixtures/ulmm.dat`, `bieg.dat`: runways,
+  frequencies, network and stands cut from the install's apt.dat; the CIFP procedure NAMES
+  written in the test), the sweep's schedule (seed 3) over its ten minutes, in their own
+  process: `ulmm_traffic_holds_short_of_the_runway_it_crosses`,
+  `bieg_taxi_in_holds_short_of_the_runway_it_landed_on` (both failed with the crossing cut
+  disabled).
+
+**B. A takeoff cleared on a strip another flight stands on** (ULMM 13, BIEG 03 with a
+flight on 21).
+- Root cause, in the sweep's ten minutes: the same crossings as A. ULMM's departures crossed
+  13 to reach its holds under a takeoff clearance on 13; BIEG's 737 vacated 03 on the far side
+  and its taxi in ("taxi to parking one, cross runway zero three") crossed the strip while the
+  takeoff hold released a departure ("traffic clear, cleared for takeoff") that had been held
+  for it: nobody was on the pavement YET. Fixed by A's crossing request.
+- Root cause left behind A, found by flying ULMM's schedule to the end (three hours): the
+  tower cleared two crossings of 13 and the takeoff hold released a departure on 13 six
+  seconds later, the crossers still 20 m short of the pavement. A cleared crossing claimed
+  nothing in the runway book until the flight was ON the strip.
+- Fix (tower side): the strip's `crossing` cell is a book claim, `ClaimKind::CrossingCleared`,
+  the WHOLE strip, from the clearance until the flight is seen off it again. It is one of the
+  whole-strip kinds (`held_whole`, so `blocked`, `strip_held_by_others`, the reply's
+  `runway_occupied`, the takeoff hold's and the landing hold's releases, the crossing judgement
+  itself: one crossing of a strip at a time), and of the audit's (`runway_conflicts`: a takeoff,
+  a line-up, a landing or another crossing beside it is a conflict). `occupancy_authorised` takes
+  it for the strip it names. Ours never holds the cell unless our pilot asks to cross, so the
+  stage C pins (`the_runway_book_answers_as_the_functions_it_replaced`, 78,080 cells) and our
+  flight are unchanged.
+- Tests: `a_cleared_crossing_holds_the_strip_against_a_takeoff` (cleared 80 m short of 26L,
+  ready for departure is held, three release ticks hold, across and off the far side the
+  departure goes), `the_book_audits_a_takeoff_over_a_cleared_crossing` (either end, not the
+  twin, the audit names it), and `ulmm_traffic_holds_short_of_the_runway_it_crosses` now flies
+  the schedule to its end (every movement completes, zero conflicts, a silent oracle); it
+  failed at 2,551 s without the claim.
+
+**C. The readback cap** (the risk "a traffic readback failing the gate forever").
+- `TrafficAircraft::answer_readback`: an owed readback is given once per OWING; still owed
+  `READBACK_RETRY_S` (12 s, several `CALL_GAP_S`: the link may hold a call a few seconds) after
+  it went out, it was not taken and is given again, `READBACK_TRIES` (2) in all; then
+  `Call::SayAgain` ("Tower, <callsign>, say again") once; still owed after that the flight leaves
+  the frequency, `Despawn::ReadbackFailed` (blackbox `readback_failed`), its strip retired.
+- Found on the way, and fixed with it: the old dedupe answered an owed text once EVER
+  (`last_readback` never forgotten), so the next lap's IDENTICAL landing clearance ("cleared
+  to land runway zero three, ...") was never read back and stood owed for good, which A's
+  crossing gate (no move while a readback is owed) would have turned into a flight frozen at
+  its first crossing. Nothing owed now forgets it.
+- Test: `a_readback_not_taken_twice_says_again_once_then_leaves` (traffic).
+
+**D. One traffic call per `CALL_GAP_S` on the frequency** (the risk "a speech flood at busy
+fields").
+- `traffic_link::Outbox`, the link's one queue for the one frequency (the tower's): the fleet's
+  calls are queued as made (the same call from the same flight not twice; a despawned flight's
+  calls dropped), and `Outbox::due(fleet_s)` keys at most ONE per `CALL_GAP_S` (3 s of fleet
+  time), a readback before the older requests (it completes a clearance a flight waits on), else
+  the oldest. A safety call (`is_safety_call`: the fleet's own "going around", or the
+  acknowledgement of a go-around order, "Going around, ...") is keyed at once, inside the gap,
+  and the gap runs from it; nothing is ever dropped for the pace. A call keys from where the
+  flight IS when it keys (its state and the picture then), so the tower answers the position it
+  hears. `Transmission.safety` says which went out unpaced.
+- The harness checks the pace (`assert_paced`, `crowded`): no transmission but a safety call
+  within `CALL_GAP_S` of the one before, in both asserts and the sweep. A readback is counted
+  as it KEYS (one still waiting when a window closes was never heard).
+- The pace shifted a crossing at EFKU 15 by 3 s and the oracle spoke again ("on runway one five
+  without clearance") with the flight CLEARED to cross, at the pavement's edge: the compliance
+  watch now takes the strip's `crossing` cell as legal occupancy of that strip
+  (`cleared_to_cross`, beside the cleared taxi route's crossings; "expedite" when stopped on
+  it). Our flight holds no crossing unless our pilot asked, so its watch is unchanged.
+- Test: `the_traffic_frequency_keys_one_call_per_gap_and_never_holds_a_go_around` (pure), and
+  every harness run (XTST's field hour, ULMM, BIEG, the sweep) paced.
+
+Left, filed: #242 (BIEG 03, flown to the end: a 172 landing short rolls 1.2 km to the far exit
+at taxi pace and despawns `NoStand` the moment its vacate ends, the linger timed from the start
+of `Vacate`; the strip held four and a half minutes, 23 go-arounds in three hours). Not a sweep
+finding; BIEG's test flies the sweep's ten minutes until it is fixed.
+
+Measured after A to D: the sweep 150 fields, 985 movements, 1,256 calls, zero conflicts, a
+silent oracle, every readback accepted, never two calls inside 3 s; XTST's field hour and the
+real LEMG hour clean; ULMM flown to the end (every movement completes).

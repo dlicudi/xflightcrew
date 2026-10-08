@@ -15,14 +15,11 @@ pub(crate) fn active_runways() -> Vec<nav::Runway> {
 }
 
 /// Lateral capture around a runway centerline when the 100-row carried no
-/// width: 40 m covers everything up to a wide-body runway (60 m ÷ 2 + slack)
-/// without capturing a parallel taxiway.
-pub(super) const RUNWAY_HALF_WIDTH_M: f64 = 40.0;
-/// Slack past the real pavement edge: edge lines, a mainwheel over the
-/// threshold stripe — not the holding point. Jerez's E1 sits 40 m off the
-/// 45 m runway's centerline; the blanket 40 m capture accused a pilot
-/// holding SHORT of runway 20 of being ON it (2026-07-11).
-pub(super) const RUNWAY_EDGE_SLACK_M: f64 = 10.0;
+/// width (the one home is nav's: [`nav::RUNWAY_HALF_WIDTH_M`]).
+pub(super) const RUNWAY_HALF_WIDTH_M: f64 = nav::RUNWAY_HALF_WIDTH_M;
+/// Slack past the real pavement edge ([`nav::RUNWAY_EDGE_SLACK_M`]).
+#[cfg_attr(not(test), allow(dead_code))] // strip.rs's tests read it
+pub(super) const RUNWAY_EDGE_SLACK_M: f64 = nav::RUNWAY_EDGE_SLACK_M;
 
 /// Is this position ON one of the active field's runways? Point-to-segment in
 /// a local flat-earth projection (exact enough over a 3 km runway). Returns
@@ -76,21 +73,8 @@ pub(super) fn strip_under(lat: f64, lon: f64) -> Option<String> {
 /// [`on_active_runway`] and the per-runway traffic watches. Returns the
 /// spoken-able ident of the nearer end.
 pub(super) fn on_runway(r: &nav::Runway, lat: f64, lon: f64) -> Option<String> {
-    // Scaled at the position's latitude; a degenerate row is nowhere.
-    let f = nav::strip_frame(r, lat, lon, lat)?;
-    let t = f.t();
-    let cross_m = f.cross_m();
-    let half_width = if r.width_m > 1.0 {
-        r.width_m / 2.0 + RUNWAY_EDGE_SLACK_M
-    } else {
-        RUNWAY_HALF_WIDTH_M
-    };
-    // Slightly past the thresholds still counts (displaced/overrun).
-    if (-0.02..=1.02).contains(&t) && cross_m <= half_width {
-        let ident = if t < 0.5 { &r.ident_a } else { &r.ident_b };
-        return Some(ident.clone());
-    }
-    None
+    // nav's test, shared with our traffic's runway crossings.
+    nav::on_strip(r, lat, lon)
 }
 
 /// The strip a runway END belongs to: landing 27L and departing 09R share

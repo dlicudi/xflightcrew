@@ -7907,6 +7907,8 @@ fn takeoff_clearance_arms_the_departure_handoff() {
         wake_secs_left: None,
         taxi_via: Vec::new(),
         taxi_crossings: Vec::new(),
+        hold_short_crossings: false,
+        crossing: None,
         on_ground: false,
     };
     // Walk the tower to a takeoff clearance and arm, exactly as respond()
@@ -9010,6 +9012,8 @@ fn lxgb_vectored_arrival_flies_to_a_landing_clearance() {
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
+            hold_short_crossings: false,
+            crossing: None,
             on_ground: false,
         },
     );
@@ -9276,6 +9280,8 @@ fn lxgb_vectored_arrival_flies_to_a_landing_clearance() {
         wake_secs_left: None,
         taxi_via: Vec::new(),
         taxi_crossings: Vec::new(),
+        hold_short_crossings: false,
+        crossing: None,
         on_ground: false,
     };
     let wx2 = Wx {

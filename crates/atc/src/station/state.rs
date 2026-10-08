@@ -599,6 +599,9 @@ mod tests {
             // New with our own traffic (stage D, increment 6): the flight's
             // place in the landing sequence, a strip `facts` cell.
             "SEQUENCE",
+            // ...and a runway crossing the tower cleared (the 2026-10-08
+            // traffic sweep), a strip `facts` cell.
+            "CROSSING",
         ];
         let station_flight = [
             "SQUAWK_WATCH",

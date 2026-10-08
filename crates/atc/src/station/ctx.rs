@@ -226,6 +226,9 @@ impl Station {
         if intent == tower::Intent::RequestRunway {
             self.apply_runway_request(&mut ctx, pos);
         }
+        if intent == tower::Intent::RequestCrossing && on_ground {
+            ctx.crossing = self.judge_crossing(targets, now);
+        }
         ctx.helicopter = state.helicopter;
         (ctx, wx)
     }
@@ -300,6 +303,11 @@ impl Station {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // Our own AI traffic holds short of each crossing and asks for
+            // it at the runway; ours is cleared across here, as before.
+            hold_short_crossings: self.desk.strip.is_traffic(),
+            // Judged by `ctx_for_call` for a crossing request.
+            crossing: None,
             on_ground,
             // The sim read is `build_ctx`'s; scripted contexts are off it.
             own_on_runway: false,
@@ -310,4 +318,45 @@ impl Station {
             transition_level_ft: self.apt.transition_level_ft,
         }
     }
+
+    /// A crossing request judged: the runway its words named at this field,
+    /// spoken, and why the flight must hold short when it must. Another
+    /// flight's strip holds the strip or stands on it (the runway book, ours
+    /// included for a traffic flight), the picture shows somebody on its
+    /// pavement, or an arrival is on its final inside [`CROSSING_FINAL_NM`].
+    /// A clear strip notes the end for the reply that clears it
+    /// (`crossing_ident`). `None` when the words named no runway here.
+    fn judge_crossing(
+        &mut self,
+        targets: &[TcasTarget],
+        now: Instant,
+    ) -> Option<(String, Option<String>)> {
+        let heard = self.desk.call.crossing_request.clone()?;
+        let ident = self
+            .apt
+            .runways
+            .iter()
+            .flat_map(|r| [r.ident_a.clone(), r.ident_b.clone()])
+            .find(|id| tower::runway_matches(id, &heard))?;
+        let r = strip(&self.apt.runways, &ident)?.clone();
+        let occupied = strip_held_by_others(&self.apt.runways, &ident, &self.desk.strip)
+            || departure_strip_picture(&r, &ident, targets, None, None, now).blocked;
+        let why = if occupied {
+            Some("traffic on the runway")
+        } else if final_traffic_for(targets, &r, &self.apt.runways, self.apt.elev_ft)
+            .is_some_and(|f| f.nm < CROSSING_FINAL_NM)
+        {
+            Some("traffic on final")
+        } else {
+            None
+        };
+        if why.is_none() {
+            self.desk.call.crossing_ident = Some(ident.clone());
+        }
+        Some((atis::spoken_runway(&ident), why.map(str::to_string)))
+    }
 }
+
+/// An arrival this close on a strip's final keeps a crossing flight short of
+/// it: a light aircraft crossing a 45 m runway is a minute on it.
+pub(super) const CROSSING_FINAL_NM: f64 = 3.0;

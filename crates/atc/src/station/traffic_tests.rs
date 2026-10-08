@@ -613,3 +613,186 @@ fn the_fleet_picture_is_the_one_traffic_picture() {
     st.install();
     assert!(traffic_picture().is_none(), "an install clears the picture");
 }
+
+/// A point `off_m` north of the twin strip (08L/26R), halfway along it.
+fn by_the_twin(off_m: f64) -> AircraftState {
+    let (lat, lon) = along(&book_runways()[1], 0.5);
+    AircraftState::at_position(lat + off_m / 111_320.0, lon, true, 0.0)
+}
+
+/// A TRAFFIC CROSSING IS ASKED FOR AND JUDGED ON THE BOOK: through the same
+/// keyed path as any call, held short while somebody stands on the strip,
+/// cleared once it is free (the readback owed, the crossing on its strip
+/// and its order), and spent once the flight has been on the strip and is
+/// off it again. The world sweep's ULMM, EFKU, UEMH (2026-10-08): the
+/// crossing was given in the taxi clearance and flown at once.
+#[test]
+fn a_traffic_crossing_is_asked_for_and_judged_on_the_book() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let mut st = gatwick_live();
+    let ask = "Gatwick Tower, Cessna three four five, holding short runway two six right, \
+               request crossing";
+    let short = by_the_twin(-80.0);
+    note_traffic_state(12, short);
+    let held = st.answer_traffic(&call(12, ask, short, vec![ghost_on_the_twin()]));
+    assert_eq!(
+        held.line,
+        format!("{CS}, hold short runway two six right, traffic on the runway.")
+    );
+    let order = || traffic_order(12).expect("its strip");
+    assert_eq!(order().crossing, None, "nothing cleared");
+    let cleared = st.answer_traffic(&call(12, ask, short, Vec::new()));
+    assert_eq!(cleared.line, format!("{CS}, cross runway two six right."));
+    assert_eq!(order().crossing.as_deref(), Some("26R"));
+    assert_eq!(
+        order().readback_owed.as_deref(),
+        Some("Crossing runway two six right, Cessna three four five.")
+    );
+    let rb = st.answer_traffic(&call(
+        12,
+        "Crossing runway two six right, Cessna three four five",
+        short,
+        Vec::new(),
+    ));
+    assert!(rb.line.is_empty(), "the readback is accepted: {}", rb.line);
+    assert_eq!(order().readback_owed, None);
+    // On the strip, then off the far side: the crossing is spent. On the
+    // pavement under its crossing the compliance watch is silent, at the
+    // edge too (EFKU 15: a corner cut there read as an incursion).
+    for (off, still) in [(-80.0, true), (-30.0, true), (0.0, true), (80.0, false)] {
+        let moving = AircraftState {
+            gs_kts: 8.0,
+            ..by_the_twin(off)
+        };
+        note_traffic_state(12, moving);
+        assert_eq!(
+            traffic_compliance_oracle(12, Instant::now()),
+            None,
+            "{off} m"
+        );
+        traffic_tick(12, &[], Instant::now());
+        assert_eq!(order().crossing.is_some(), still, "{off} m");
+    }
+    assert!(own_strip_moved().is_empty(), "{:?}", own_strip_moved());
+    Station::uninstall();
+}
+
+/// A CLEARED CROSSING HOLDS THE STRIP, WHOLE, FROM THE CLEARANCE: the
+/// flight is still short of the pavement, and no takeoff is cleared or
+/// released onto the strip until it is seen off the far side. The world
+/// sweep's ULMM (2026-10-08, a field's three hours): two crossings of 13
+/// were cleared, and 6 s later the takeoff hold released a departure on 13
+/// ("traffic clear"), because nobody was on the pavement YET.
+#[test]
+fn a_cleared_crossing_holds_the_strip_against_a_takeoff() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let mut st = gatwick_live();
+    let by_26l = |off_m: f64| {
+        let (lat, lon) = along(&book_runways()[0], 0.5);
+        AircraftState::at_position(lat + off_m / 111_320.0, lon, true, 0.0)
+    };
+    let hold = at_the_hold();
+    note_traffic_state(13, hold);
+    st.answer_traffic(&call(
+        13,
+        "Gatwick Tower, Cessna three four five, request taxi",
+        hold,
+        Vec::new(),
+    ));
+    // The crossing is cleared first, 80 m short of 26L's pavement.
+    note_traffic_state(12, by_26l(-80.0));
+    let c = st.answer_traffic(&call(
+        12,
+        "Gatwick Tower, Cessna three four five, holding short runway two six left, \
+         request crossing",
+        by_26l(-80.0),
+        Vec::new(),
+    ));
+    assert_eq!(c.line, format!("{CS}, cross runway two six left."));
+    assert!(
+        strip_held_by_traffic(&book_runways(), "26L"),
+        "held for the crossing, nobody on the pavement yet"
+    );
+    // Ready for departure: held, never cleared onto the crossing.
+    let ready = st.answer_traffic(&call(
+        13,
+        "Gatwick Tower, Cessna three four five, ready for departure",
+        hold,
+        Vec::new(),
+    ));
+    assert!(
+        !ready.line.contains("cleared for takeoff"),
+        "{}",
+        ready.line
+    );
+    assert!(traffic_order(13).unwrap().hold, "its release is held");
+    let t0 = Instant::now();
+    let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+    for s in [0, 20, 40] {
+        let lines = traffic_tick(13, &[], at(s));
+        assert!(
+            !lines.iter().any(|l| l.contains("cleared for takeoff")),
+            "released over a cleared crossing at {s} s: {lines:?}"
+        );
+        assert!(
+            runway_conflicts(None).is_empty(),
+            "{:?}",
+            runway_conflicts(None)
+        );
+    }
+    // Across and off the far side: the strip is free, the departure goes.
+    for off in [0.0, 80.0] {
+        note_traffic_state(12, by_26l(off));
+        traffic_tick(12, &[], at(45));
+    }
+    assert!(!strip_held_by_traffic(&book_runways(), "26L"));
+    let mut released = Vec::new();
+    for s in [50, 70, 90] {
+        released.extend(traffic_tick(13, &[], at(s)));
+    }
+    assert!(
+        released.iter().any(|l| l.contains("cleared for takeoff")),
+        "{released:?}"
+    );
+    assert!(own_strip_moved().is_empty(), "{:?}", own_strip_moved());
+    Station::uninstall();
+}
+
+/// The book's audit names a takeoff over a cleared crossing (and the
+/// crossing's own claim reads by the rules ours would: the whole strip).
+#[test]
+fn the_book_audits_a_takeoff_over_a_cleared_crossing() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let st = gatwick_live();
+    let crossing = open_traffic_strip(20);
+    *crossing.crossing.lock().unwrap() = Some(("26L".into(), false));
+    assert!(strip_held_by_traffic(&book_runways(), "08R"), "either end");
+    assert!(
+        !strip_held_by_traffic(&book_runways(), "26R"),
+        "not the twin"
+    );
+    assert!(
+        runway_conflicts(None).is_empty(),
+        "a crossing alone is clean"
+    );
+    let departure = open_traffic_strip(21);
+    *departure.clearance.lock().unwrap() = Some(ClearanceSnap {
+        state: tower::State::TakeoffCleared,
+        callsign: "N21".into(),
+        runway_ident: "26L".into(),
+        pending_readback: None,
+        holds_runway: true,
+    });
+    let found = runway_conflicts(None);
+    assert!(
+        found
+            .iter()
+            .any(|c| c.contains("CrossingCleared") && c.contains("Takeoff")),
+        "{found:?}"
+    );
+    drop(st);
+    Station::uninstall();
+}
