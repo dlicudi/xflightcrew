@@ -81,8 +81,9 @@ impl Station {
     /// desk on frequency and no sim read: the wind the tower last worked
     /// with ([`TOWER_WIND`], else the field's surface wind, else calm), the
     /// pressure our last context was given, the picture handed in (ours
-    /// included), and the same pick, traffic and taxi route planners ours
-    /// uses ([`Station::ctx_for_call`]), ending in [`Station::make_ctx`].
+    /// included), the moment the call was keyed (`state.at`) as its clock,
+    /// and the same pick, traffic and taxi route planners ours uses
+    /// ([`Station::ctx_for_call`]), ending in [`Station::make_ctx`].
     /// Writes no field fact: no ghost memory, no tower wind, no pressure.
     pub(super) fn traffic_ctx(
         &mut self,
@@ -114,8 +115,14 @@ impl Station {
             intent,
             &targets,
             &ids,
-            Instant::now(),
+            state.at,
         )
+    }
+
+    /// The reply path's clock: the moment the traffic call being answered
+    /// was keyed ([`Station::reply_at`]), else the wall clock (ours).
+    pub(super) fn reply_now(&self) -> Instant {
+        self.reply_at.unwrap_or_else(Instant::now)
     }
 
     /// Answer a traffic flight's call on its own desk: its strip opened if
@@ -125,6 +132,14 @@ impl Station {
     /// Its answer writes its own strip; a challenged readback leaves the
     /// readback owed on it ([`crate::world`]'s order view reads it).
     pub fn answer_traffic(&mut self, call: &TrafficCall) -> TrafficReply {
+        self.reply_at = Some(call.state.at);
+        let reply = self.answer_traffic_at(call);
+        self.reply_at = None;
+        reply
+    }
+
+    /// [`Station::answer_traffic`] on the call's clock.
+    fn answer_traffic_at(&mut self, call: &TrafficCall) -> TrafficReply {
         open_traffic_strip(call.id);
         let id = FlightId::Traffic(call.id);
         let intent = tower::parse_intent(&call.text);
@@ -362,4 +377,16 @@ pub fn traffic_tick(id: u32, picture: &[TrafficTarget], now: Instant) -> Vec<Str
     lines.extend(landing_hold_tick_for(&strip, &state, &targets, now));
     lines.extend(takeoff_hold_tick_for(&strip, &state, &targets, elev, now));
     lines
+}
+
+/// The compliance watch over traffic flight `id`, as an ORACLE: the same
+/// core ours ticks (`compliance_tick_for`), on its strip and its last seen
+/// state, tuned. A traffic flight that obeys its orders is never berated,
+/// so tests and the traffic harness assert this stays `None`. Never ticked
+/// in flight: it writes the strip's compliance memory, which the book
+/// reads, and the field's radio cooldowns, which are ours.
+pub fn traffic_compliance_oracle(id: u32, now: Instant) -> Option<String> {
+    let strip = traffic_strip(id)?;
+    let state = seen(&strip)?;
+    compliance_tick_for(&strip, &state, true, now).map(|c| c.line)
 }

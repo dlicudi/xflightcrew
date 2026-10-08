@@ -116,6 +116,13 @@ pub struct Station {
     /// which reads nothing ([`Station::traffic_ctx`]). `None` until ours has
     /// been answered once with a pressure that read.
     last_qnh: Option<String>,
+    /// The moment the call being answered was keyed, while a TRAFFIC call is
+    /// answered ([`Station::answer_traffic`] sets it from the call's state
+    /// and clears it after): the reply path's clocks (a takeoff hold's
+    /// `armed_at`, the wake gate) read the producer's time, so a fleet on a
+    /// test's clock is held and released on that clock. `None` (ours, always)
+    /// is the wall clock, as before ([`Station::reply_now`]).
+    reply_at: Option<Instant>,
 }
 
 /// The desk half of a flight's strip: what the station keeps, between calls,
@@ -333,6 +340,7 @@ impl Station {
             procedures: None,
             sid_exits: Default::default(),
             last_qnh: None,
+            reply_at: None,
         })
     }
 

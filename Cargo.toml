@@ -57,6 +57,9 @@ path = "src/bin/atc.rs"
 atc = { path = "crates/atc" }
 # shared simulator plumbing (Web API client, dataref names, blackbox)
 sim = { path = "crates/sim" }
+# our own AI traffic (the fleet, its phase machine, schedules, the wire):
+# joined to the station in src/traffic_link.rs, never inside atc
+traffic = { path = "crates/traffic" }
 
 # async runtime + HTTP
 tokio = { workspace = true }

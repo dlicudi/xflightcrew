@@ -351,3 +351,57 @@ Increment 3 (`schedule.rs`):
   ignored one over the install (LEMG says no circuits; IFR both ways, every movement spawns).
 - Known: a turboprop's vacate at 16 kt cuts its 90 degree turn-off by up to 7 m (the 172's
   taxi stays under 3.3 m); not asserted for the ATR yet.
+
+### Bin side (steps 7 to 10)
+
+Increment 7 (`src/traffic_link.rs`, the headless harness):
+- **`Link { fleet, due, next_id, tower_name, tower_runway }`**, `Link::tick(own: Option<&OwnState>,
+  dt, now) -> TickOut { tower, transmissions, events, spawned }` in the spec's order: spawn
+  what is due, read every flight's `traffic_order` ONCE per tick (level-triggered, so the
+  substeps of one tick share it), step, note every state, post the calls, tick every runway
+  watch. `drain_calls(&mut Station)` is the command loop's half. `OwnState` is ours from the
+  snapshot (raw callsign, position, feet MSL, vs).
+- **The order map** (`map_order`): `follow` that is ours is `None` (no traffic id); a
+  CONDITIONAL line-up (`line_up_condition == Some(false)`) is held short as `TaxiCleared`
+  until the arrival is past; the taxi-in clearance (the FSM goes `Parked` with a route to a
+  stand, `to_stand`) is `TaxiCleared`.
+- **Calls name the TOWER's runway** (the order's, else the plan's) and the field ("Malaga
+  Tower, ..."), and every movement spawns for the runway the tower last cleared anyone for:
+  an airborne route is planned once for one runway, so an arrival with none known yet waits
+  up to 120 s (`ARRIVAL_WAIT_S`) for one, then takes the field's default. An ordered go-around
+  is acknowledged by its readback only (the fleet's own "going around" would say it twice).
+  A refused spawn retries every 30 s, ten times.
+- **Traffic crate words** (`Call::text`): "base leg" (the parser needs pattern context for
+  "base"), "runway vacated, request taxi to parking" (one call off the runway; the tower answers
+  with the stand), and a readback that already names the flight is said as it is (the tower's
+  phrasing ends with the callsign).
+- **atc, three changes the harness found**: (1) the reply path's clock is the CALL's
+  (`TrafficCall.state.at`; `Station.reply_at` set only inside `answer_traffic`,
+  `reply_now()`): the takeoff hold's `armed_at`, its log stamp and the context's wake gate
+  (`ctx_for_call` now uses its `now`) read the producer's time, so a fleet on a fake clock is
+  held and released on that clock; ours is unchanged (`None` is the wall clock). (2) A TRAFFIC
+  strip known airborne claims nothing with `TakeoffCleared` (it keeps the clearance until 12 nm
+  out and closed the field behind it); ours is unchanged, pinned by
+  `the_runway_book_answers_as_the_functions_it_replaced`. (3) Two audits for tests and the
+  harness, never decisions: `world::runway_conflicts(own)` (two flights holding one strip
+  whole, or a takeoff on a strip another stands on; a conditional line-up beside the landing it
+  waits for is NOT a conflict unless it stands on the strip while that landing is airborne) and
+  `world::traffic_compliance_oracle(id, now)`.
+- **The harness runs in its own process**: a station installs process-wide statics the crew's
+  2,000 tests read, so `a_field_hour_against_the_real_station` re-runs the test binary on the
+  ignored `a_field_hour_inner` with `XVL_TRAFFIC_HARNESS=1` (the inner tests return at once
+  without it; `XVL_TRAFFIC_TRACE=1` prints the frequency). The station's taxi network is loaded
+  with `spawn_taxi_net_load` and waited for. Our aircraft is not in the harness picture.
+- **Measured**: XTST (generated, `Normal`, seed 7) 9 movements (2 departures, 1 circuit
+  aircraft of 2 laps, 6 arrivals), all completed in 3,955 s (2 left the area, 7 parked), 47
+  calls, 12 readbacks all accepted (accepted = the strip no longer owes it), 0 conflicts, the
+  oracle silent, 1 go-around (the tower's: a departure on the runway). The real LEMG
+  (`real_install_lemg_traffic_hour`, ignored) 12 movements (6 each way), all completed in
+  4,161 s, 14 readbacks accepted, 0 conflicts, oracle silent, no go-around.
+- **World sweep** (`real_install_traffic_world_sweep`, ignored, `XVL_TRAFFIC_SWEEP_N`,
+  default 20): 150 towered fields, ten minutes each, 985 movements, 1,223 calls, no panic.
+  Found and NOT fixed (step 11 watches): traffic taxiing onto a runway without a crossing
+  clearance (ULMM 31, EFKU 15, UEMH 09: the oracle's "you are on runway ... without clearance"
+  in `TaxiOut`), and a takeoff cleared on a strip another flight stands on (ULMM 13, BIEG 03
+  with a flight on 21): the taxi route and the vacate cross or ride a runway the book then
+  reads as occupied.

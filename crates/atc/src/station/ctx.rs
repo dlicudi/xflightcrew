@@ -177,7 +177,7 @@ impl Station {
             .and_then(|nearest| ids.iter().find(|(cs, _)| cs == nearest))
             .map(|(_, who)| *who);
         let wake_secs_left = if on_ground {
-            wake_remaining(&ident, Instant::now())
+            wake_remaining(&ident, now)
         } else {
             None
         };

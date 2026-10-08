@@ -177,10 +177,16 @@ impl Call {
                 number_words(*miles)
             ),
             Call::Downwind => format!("{spoken}, downwind{rwy}"),
-            Call::Base => format!("{spoken}, base{rwy}"),
+            // "base" alone is too common a word for the tower's parser: the
+            // pattern report is "base leg".
+            Call::Base => format!("{spoken}, base leg{rwy}"),
             Call::Final => format!("{spoken}, final{rwy}"),
-            Call::Vacated => format!("{spoken}, runway vacated"),
+            // Off the runway and asking for the stand in one call, in the
+            // tower's own suggested wording.
+            Call::Vacated => format!("{spoken}, runway vacated, request taxi to parking"),
             Call::GoingAround => format!("{spoken}, going around"),
+            // The tower's phrasing already names the flight: said as it is.
+            Call::Readback(text) if text.contains(spoken) => text.trim_end_matches('.').to_string(),
             Call::Readback(text) => format!("{text}, {spoken}"),
         }
     }
@@ -317,6 +323,16 @@ mod tests {
         assert_eq!(
             Call::Readback("Cleared to land runway two seven".into()).text("Cessna one", None),
             "Cleared to land runway two seven, Cessna one"
+        );
+        assert_eq!(
+            Call::Readback("Cleared to land runway two seven, Cessna one.".into())
+                .text("Cessna one", None),
+            "Cleared to land runway two seven, Cessna one",
+            "a readback already naming the flight is said as it is"
+        );
+        assert_eq!(
+            Call::Base.text("Cessna one", Some("27")),
+            "Cessna one, base leg runway two seven"
         );
     }
 }
