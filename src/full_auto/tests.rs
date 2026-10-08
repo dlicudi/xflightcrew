@@ -1089,7 +1089,7 @@
         let filed = crate::simbrief::filed_route_of(Some(&p)).unwrap();
         assert_eq!(filed.fixes.first().map(String::as_str), Some("D257B"));
         assert_eq!(filed.fixes.last().map(String::as_str), Some("GROVE"), "the fields left out");
-        let cifp = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/crates/atc/bench/cifp/EGKK_sids.dat"));
+        let cifp = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/crates/nav/bench/cifp/EGKK_sids.dat"));
         let tower = crate::nav::sid_for_filed_route_in(cifp.lines(), "08R", &filed.fixes, filed.sid.as_deref())
             .unwrap();
         assert_eq!(tower.ident, "LAM5P");
@@ -1145,7 +1145,7 @@
             })
             .collect();
         let plan = crate::procedure::enroute_legs(&wps, "EGKK", "EGBB", 18_000.0);
-        let cifp = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/crates/atc/bench/cifp/EGKK_sids.dat"));
+        let cifp = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/crates/nav/bench/cifp/EGKK_sids.dat"));
         let mut chart = crate::nav::parse_proc_legs(
             cifp.lines(),
             crate::nav::ProcKind::Sid,

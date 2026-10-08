@@ -1498,7 +1498,7 @@ impl TaxiNet {
     ///
     /// "Entrance" is decided by CONNECTIVITY, never by edge names: apt.dat
     /// authors leave runway edges unnamed often enough that
-    /// [`mark_runway_crossings`](crate::station) already refuses to trust the
+    /// the station's `mark_runway_crossings` already refuses to trust the
     /// flags for the same reason. A node qualifies if it sits on a runway edge,
     /// or one hop from a node that does — which is exactly how a network draws
     /// the stub from a holding point out to the centreline.
@@ -1513,7 +1513,7 @@ impl TaxiNet {
     /// tower cleared "holding point Alpha runway zero seven", the route was
     /// planned to 09's hold, the active-zone trim cut its last three edges,
     /// and the drive stopped 169 m from runway 07's centreline — 19 m outside
-    /// [`LINE_UP_MAX_LATERAL_M`](crate::nav) as the line-up sees it. The
+    /// the crew's `LINE_UP_MAX_LATERAL_M` as the line-up sees it. The
     /// lead-on ended 34 m off the 07 centreline too, so the authored entry
     /// was refused as well, and full auto said "I couldn't get us onto the
     /// runway" with the aircraft correctly parked where it had been sent

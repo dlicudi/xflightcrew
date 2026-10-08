@@ -1628,7 +1628,7 @@ mod tests {
                 }
             }
         }
-        for dir in ["src", "crates/atc/src", "crates/sim/src"] {
+        for dir in ["src", "crates/atc/src", "crates/nav/src", "crates/sim/src"] {
             walk(&manifest.join(dir), &mut files);
         }
         let literal = concat!("\"sim/flightmodel/failures/", "onground_any\"");

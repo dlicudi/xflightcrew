@@ -110,7 +110,7 @@ fn egkk_egbb_route() -> Vec<String> {
 /// the filed LAM6M stands.
 #[test]
 fn the_sid_for_the_filed_route_at_egkk_is_the_one_that_reaches_lam() {
-    let text = include_str!("../../bench/cifp/EGKK_sids.dat");
+    let text = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/cifp/EGKK_sids.dat"));
     let route = egkk_egbb_route();
     let serving: Vec<String> =
         sid_transitions_in(text.lines(), "08R").into_iter().map(|(i, _)| i).collect();
@@ -1338,7 +1338,7 @@ fn drawn_centrelines_parse_out_of_a_linear_feature() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn real_install_transition_levels() {
     let apt =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     if !std::path::Path::new(apt).exists() {
         return;
     }
@@ -1408,7 +1408,7 @@ fn circuits_flag_and_pattern_sides_are_read_from_the_flows() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn real_install_circuits_flags() {
     let apt =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     if !std::path::Path::new(apt).exists() {
         return;
     }
@@ -1425,7 +1425,7 @@ fn real_install_circuits_flags() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn real_install_egkk_one_runway() {
     let apt =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let (Ok(Some(egkk)), Ok(Some(egbb))) =
         (find_airport(apt, "EGKK"), find_airport(apt, "EGBB"))
     else {
@@ -1442,16 +1442,16 @@ fn real_install_egkk_one_runway() {
         }
     };
     let cifp = first(
-        &crate::nav::test_xplane_path("Custom Data/CIFP"),
-        &crate::nav::test_xplane_path("Resources/default data/CIFP"),
+        &crate::test_xplane_path("Custom Data/CIFP"),
+        &crate::test_xplane_path("Resources/default data/CIFP"),
     );
     let fix = first(
-        &crate::nav::test_xplane_path("Custom Data/earth_fix.dat"),
-        &crate::nav::test_xplane_path("Resources/default data/earth_fix.dat"),
+        &crate::test_xplane_path("Custom Data/earth_fix.dat"),
+        &crate::test_xplane_path("Resources/default data/earth_fix.dat"),
     );
     let navd = first(
-        &crate::nav::test_xplane_path("Custom Data/earth_nav.dat"),
-        &crate::nav::test_xplane_path("Resources/default data/earth_nav.dat"),
+        &crate::test_xplane_path("Custom Data/earth_nav.dat"),
+        &crate::test_xplane_path("Resources/default data/earth_nav.dat"),
     );
     let exits = sid_exits(&cifp, &fix, &navd, &egkk, "EGKK");
     let sid = sid_toward(
@@ -1497,7 +1497,7 @@ fn real_install_egkk_one_runway() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn real_install_egkk_08r_filed_route() {
     let apt =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let (Ok(Some(egkk)), Ok(Some(egbb))) =
         (find_airport(apt, "EGKK"), find_airport(apt, "EGBB"))
     else {
@@ -1511,16 +1511,16 @@ fn real_install_egkk_08r_filed_route() {
         }
     };
     let cifp = first(
-        &crate::nav::test_xplane_path("Custom Data/CIFP"),
-        &crate::nav::test_xplane_path("Resources/default data/CIFP"),
+        &crate::test_xplane_path("Custom Data/CIFP"),
+        &crate::test_xplane_path("Resources/default data/CIFP"),
     );
     let fix = first(
-        &crate::nav::test_xplane_path("Custom Data/earth_fix.dat"),
-        &crate::nav::test_xplane_path("Resources/default data/earth_fix.dat"),
+        &crate::test_xplane_path("Custom Data/earth_fix.dat"),
+        &crate::test_xplane_path("Resources/default data/earth_fix.dat"),
     );
     let navd = first(
-        &crate::nav::test_xplane_path("Custom Data/earth_nav.dat"),
-        &crate::nav::test_xplane_path("Resources/default data/earth_nav.dat"),
+        &crate::test_xplane_path("Custom Data/earth_nav.dat"),
+        &crate::test_xplane_path("Resources/default data/earth_nav.dat"),
     );
     let exits = sid_exits(&cifp, &fix, &navd, &egkk, "EGKK");
     let toward = sid_toward(&exits, "08R", egkk.position().unwrap(), egbb.position().unwrap());
@@ -1539,7 +1539,7 @@ fn real_install_egkk_08r_filed_route() {
 #[test]
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_lipr_route_has_no_zero_length_legs() {
-    let p = &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    let p = &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let (Ok(Some(net)), Ok(Some(apt))) = (find_taxi_net(p, "LIPR"), find_airport(p, "LIPR")) else {
         return;
     };
@@ -1562,7 +1562,7 @@ fn live_lipr_route_has_no_zero_length_legs() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_lipk_pavement_knows_the_grass() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = find_taxi_net(path, "LIPK") else {
         return;
     };
@@ -1577,7 +1577,7 @@ fn live_lipk_pavement_knows_the_grass() {
 #[ignore]
 fn live_push_lane_survey() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     for icao in ["LIBP", "LIPK", "LEMG", "EGLL", "EGPH", "EGSS", "EDLP", "LFPB"] {
         let Ok(Some(net)) = find_taxi_net(path, icao) else { continue };
         let (mut found, mut lens, mut turns) = (0, Vec::new(), Vec::new());
@@ -1605,7 +1605,7 @@ fn live_push_lane_survey() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_libp_stand_has_a_push_lane() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = find_taxi_net(path, "LIBP") else {
         return;
     };
@@ -1639,7 +1639,7 @@ fn live_libp_stand_has_a_push_lane() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_libp_stand_has_no_pavement_behind_it() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = find_taxi_net(path, "LIBP") else {
         return;
     };
@@ -1678,7 +1678,7 @@ fn pavement_holes_are_not_pavement_and_no_data_is_no_verdict() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_lemg_route_rides_the_paint() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = find_taxi_net(path, "LEMG") else {
         return; // no install, no verdict
     };
@@ -1764,7 +1764,7 @@ fn live_lemg_route_rides_the_paint() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_eghi_runway_20_holds_at_an_entrance() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = find_taxi_net(path, "EGHI") else {
         return; // no install, no verdict
     };
@@ -1806,7 +1806,7 @@ fn live_eghi_runway_20_holds_at_an_entrance() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_eblg_vacate_04r_turns_toward_the_apron() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = find_taxi_net(path, "EBLG") else {
         return; // no install, no verdict
     };
@@ -1848,7 +1848,7 @@ fn live_eblg_vacate_04r_turns_toward_the_apron() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_lfpb_runway_07_holds_on_its_own_strip() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = find_taxi_net(path, "LFPB") else {
         return; // no install, no verdict
     };
@@ -1946,7 +1946,7 @@ fn a_runway_entrance_one_hop_off_the_strip_leads_on_to_the_centreline() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_libp_runway_04_lead_on_ends_on_the_centreline() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = find_taxi_net(path, "LIBP") else {
         return;
     };
@@ -1982,7 +1982,7 @@ fn live_libp_runway_04_lead_on_ends_on_the_centreline() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_heathrow_taxi_route_plans() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let t = std::time::Instant::now();
     let net = find_taxi_net(path, "EGLL")
         .unwrap()
@@ -2025,7 +2025,7 @@ fn live_heathrow_taxi_route_plans() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn live_apt_dat_scan_is_fast_enough_to_speak() {
     let path =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let t = std::time::Instant::now();
     let rw = find_runways(path, "LEAL").unwrap();
     let elapsed = t.elapsed();
@@ -2120,13 +2120,13 @@ fn real_install_ils_chart_data_reads() {
     }
     let nav_data_path = env_or_first_existing(
         "XPLANE_NAV_DATA",
-        &crate::nav::test_xplane_path("Custom Data/earth_nav.dat"),
-        &crate::nav::test_xplane_path("Resources/default data/earth_nav.dat"),
+        &crate::test_xplane_path("Custom Data/earth_nav.dat"),
+        &crate::test_xplane_path("Resources/default data/earth_nav.dat"),
     );
     let cifp_dir = env_or_first_existing(
         "XPLANE_CIFP_DIR",
-        &crate::nav::test_xplane_path("Custom Data/CIFP"),
-        &crate::nav::test_xplane_path("Resources/default data/CIFP"),
+        &crate::test_xplane_path("Custom Data/CIFP"),
+        &crate::test_xplane_path("Resources/default data/CIFP"),
     );
     let ils = airport_ils(&nav_data_path, "EGLL").expect("nav scan");
     for rwy in ["09L", "09R", "27L", "27R"] {
@@ -2420,19 +2420,19 @@ fn real_install_procedures() {
         .to_string()
     }
     let cifp = first_existing(
-        &crate::nav::test_xplane_path("Custom Data/CIFP"),
-        &crate::nav::test_xplane_path("Resources/default data/CIFP"),
+        &crate::test_xplane_path("Custom Data/CIFP"),
+        &crate::test_xplane_path("Resources/default data/CIFP"),
     );
     let fix_path = first_existing(
-        &crate::nav::test_xplane_path("Custom Data/earth_fix.dat"),
-        &crate::nav::test_xplane_path("Resources/default data/earth_fix.dat"),
+        &crate::test_xplane_path("Custom Data/earth_fix.dat"),
+        &crate::test_xplane_path("Resources/default data/earth_fix.dat"),
     );
     let nav_path = first_existing(
-        &crate::nav::test_xplane_path("Custom Data/earth_nav.dat"),
-        &crate::nav::test_xplane_path("Resources/default data/earth_nav.dat"),
+        &crate::test_xplane_path("Custom Data/earth_nav.dat"),
+        &crate::test_xplane_path("Resources/default data/earth_nav.dat"),
     );
     let apt =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let airport = find_airport(apt, "LEMG").unwrap().expect("LEMG in apt.dat");
     let (near_lat, near_lon) = airport.position().unwrap();
 
@@ -2474,7 +2474,7 @@ fn real_install_procedures() {
     // straight-in (the whole reason this exists). Runway 27's fixes must
     // chain farthest-first to the threshold, over the water.
     let apt =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     if let Ok(Some(lxgb)) = find_airport(apt, "LXGB") {
         assert!(
             list_procedures(&cifp, "LXGB", ProcKind::Appch).is_empty(),
@@ -2994,7 +2994,7 @@ fn the_walk_prefers_our_exit_stub_over_a_crossing_runways_zone() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn real_install_converging_thresholds_taxi_to_their_own_strip() {
     let apt =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     if !std::path::Path::new(apt).exists() {
         return;
     }
@@ -3184,7 +3184,7 @@ fn real_install_converging_thresholds_taxi_to_their_own_strip() {
 #[test]
 #[ignore] // needs the real X-Plane install
 fn live_lemg_190_route_from_the_gate_starts_down_the_lane() {
-    let apt = &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    let apt = &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = find_taxi_net(apt, "LEMG") else {
         return;
     };
@@ -3329,7 +3329,7 @@ fn lemg_quebec_onto_delta_rides_the_left_fillet() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn real_install_fillet_sweep() {
     let apt =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     if !std::path::Path::new(apt).exists() {
         return;
     }
@@ -3493,7 +3493,7 @@ fn an_exit_only_threshold_is_a_backtrack_never_a_runway_ride() {
 #[ignore] // needs the real X-Plane install; run with --ignored
 fn real_install_lemd_18r_departure() {
     let apt =
-        &crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     if !std::path::Path::new(apt).exists() {
         return;
     }

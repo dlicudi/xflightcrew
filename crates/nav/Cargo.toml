@@ -1,0 +1,13 @@
+[package]
+name = "nav"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Navigation data and geometry only: apt.dat, earth_nav/earth_fix, CIFP, the
+# taxi graph. No station state, and no whisper, cpal or ort (`cargo tree -p nav`).
+[dependencies]
+sim = { path = "../sim" }
+anyhow = { workspace = true }
+tracing = { workspace = true }

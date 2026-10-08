@@ -33,8 +33,9 @@ Named 2026-07-30. Three names survived the rename because they are wire contract
 - the `XCOPILOT_*` env vars (the pilot's own `.env` and `prefs.json`),
 - the plugin binary `xcopilot.xpl` (renamed, X-Plane loads BOTH copies and double-registers).
 
-Package `xvoicelayer`, binary `xvl`. The tracing filter names every crate AND both crew names:
-`xvoicelayer=info,xvl=info,atc=info,sim=info` (`src/main.rs` `DEFAULT_LOG_FILTER`, pinned by
+Package `xvoicelayer`, binary `xvl`. The tracing filter names every crate (`atc`, `nav`, `sim`)
+AND both crew names: `xvoicelayer=info,xvl=info,atc=info,nav=info,sim=info` (`src/main.rs`
+`DEFAULT_LOG_FILTER`, pinned by
 `the_log_filter_names_every_crate_and_both_crew_names`). A line's default target is the BIN
 name in the binary and the PACKAGE name in the lib: drop either and half the log goes silently while
 explicit-target lines make it look healthy.
@@ -205,6 +206,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 **Hard boundaries**
 - The station returns text and can NEVER actuate (`sim::xplane::SimView`, read-only); no
   whisper/cpal/ort in its deps (`cargo tree -p atc` is the standalone health check).
+- **Nav data is its own crate** (`crates/nav`: apt.dat, earth_nav/earth_fix, CIFP, `TaxiNet`,
+  paint, geometry), pure data, never station state, re-exported as `atc::nav` so every path
+  stands; a traffic crate takes `nav` without the station (`cargo tree -p nav` lean too).
 - **The crew/world seam is one page**, `crates/atc/src/party_line.rs`: statics crate-private; a
   new crew need gets an ACCESSOR, never a `pub static`. `station` is `pub(crate)`: the crew's
   inputs, reads and types are `party_line`'s, the ticks `atc::world`'s

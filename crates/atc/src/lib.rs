@@ -17,7 +17,9 @@
 pub mod airspace;
 pub mod atis;
 pub mod callsign;
-pub mod nav;
+/// Navigation data lives in its own crate (`crates/nav`); re-exported so
+/// every `atc::nav::...` and `crate::nav::...` path keeps working.
+pub use ::nav;
 pub mod party_line;
 pub mod speaker;
 pub(crate) mod station;

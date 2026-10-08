@@ -1,4 +1,14 @@
-//! Navigation-data lookup from X-Plane's `earth_nav.dat`.
+//! Navigation data: X-Plane's `apt.dat`, `earth_nav.dat`, `earth_fix.dat`
+//! and CIFP, parsed into airports, runways, ILS, SIDs/STARs, approaches and
+//! the taxi graph (`TaxiNet`), plus the geometry they share.
+//!
+//! Its own crate (moved out of `atc` 2026-10-08) so a consumer of nav data
+//! (the crew, a future traffic crate) need not depend on the station. Pure
+//! data and geometry: it never reads station, tower or party-line state.
+//! `atc` re-exports it as `atc::nav`, so every existing path keeps working.
+//! Like `atc`, it must stay lean: no whisper, no cpal, no ort.
+//!
+//! ILS lookup from `earth_nav.dat`:
 //!
 //! Parses ILS localizer records (row code 4) to resolve "the ILS for runway N"
 //! into a frequency + magnetic course, choosing the one nearest the aircraft.
@@ -36,9 +46,10 @@ pub use taxi::*;
 
 /// A path under the real X-Plane install for the ignored real-install
 /// tests: `XCOPILOT_XPLANE_ROOT`, else `$HOME/X-Plane 12` (the crew's
-/// `config::xplane_root`, which this crate cannot depend on).
-#[cfg(test)]
-pub(crate) fn test_xplane_path(rel: &str) -> String {
+/// `config::xplane_root`, which this crate cannot depend on). Public (and
+/// hidden) because `atc`'s station tests use it too; nothing at runtime does.
+#[doc(hidden)]
+pub fn test_xplane_path(rel: &str) -> String {
     let root = std::env::var("XCOPILOT_XPLANE_ROOT").unwrap_or_else(|_| {
         format!("{}/X-Plane 12", std::env::var("HOME").unwrap_or_default())
     });

@@ -61,6 +61,7 @@ name = "atc"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "nav",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1362,6 +1363,15 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "tempfile",
+]
+
+[[package]]
+name = "nav"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "sim",
+ "tracing",
 ]
 
 [[package]]
