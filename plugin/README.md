@@ -25,7 +25,13 @@ size and open state across sessions in `Output/preferences/xvoicelayer_panel.txt
 ## Vendored libraries
 
 `third_party/` holds Dear ImGui (MIT, 1.92) and the B612 typeface (OFL) —
-committed so the build is self-contained.
+committed so the build is self-contained. `third_party/XPMP2` is XPMP2
+(github.com/TwinFan/XPMP2, MIT, tag v3.7.0; `src`, `inc` and `LICENSE` only,
+`SoundFMOD.*` left out), the library that draws our AI traffic
+(`src/traffic.cpp`). It is built without `INCLUDE_FMOD_SOUND`. It needs CSL
+models the pilot installs: `XCOPILOT_TRAFFIC_CSL` in X-Plane's environment
+names the CSL folder, else LiveTraffic's `Resources/CSL` is used read-only.
+`make test` runs the host-side test of the traffic wire decoder (no SDK).
 
 ## Build (macOS)
 

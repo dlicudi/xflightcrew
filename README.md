@@ -232,5 +232,7 @@ phrasings the deterministic grammar missed.
 X-Plane only. Contributions and derivative works are governed by the license.
 
 Third-party components keep their own, all permissive and all GPL-compatible:
-the X-Plane SDK is MIT/BSD, Dear ImGui is MIT, ImgWindow is BSD-3-Clause, and
-the B612 font is under the SIL Open Font License.
+the X-Plane SDK is MIT/BSD, Dear ImGui is MIT, ImgWindow is BSD-3-Clause,
+XPMP2 (B. Hoppe, `plugin/third_party/XPMP2/LICENSE`) is MIT, and the B612
+font is under the SIL Open Font License. XPMP2 is built without FMOD; CSL
+aircraft models are never bundled (the pilot installs them).

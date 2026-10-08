@@ -24,7 +24,7 @@ CXXFLAGS := -std=c++17 -fPIC -fvisibility=hidden -O2 -mmacosx-version-min=12.0 \
             -DAPL=1 -DIBM=0 -DLIN=0 -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 \
             -DXPLM400=1 -DXPLM410=1 -DXPLM420=1 -DXPLM430=1 -DXPLM440=1 \
             -DXCOPILOT_VERSION='"$(VERSION)"' -DXCOPILOT_BUILD='"$(BUILD)"' \
-            -I$(SDK)/CHeaders/XPLM -Ithird_party/imgui
+            -I$(SDK)/CHeaders/XPLM -Ithird_party/imgui -Ithird_party/XPMP2/inc
 LDFLAGS  := -dynamiclib -mmacosx-version-min=12.0 -F$(SDK)/Libraries/Mac \
             -framework XPLM -framework ApplicationServices \
             -framework CoreFoundation -lobjc
@@ -34,12 +34,31 @@ SRCS := src/$(PLUGIN).cpp src/drefs.cpp src/panel.cpp src/fms.cpp src/flightinit
         third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
 HDRS := $(wildcard src/*.h)
 
+# XPMP2 (github.com/TwinFan/XPMP2, MIT, tag v3.7.0), the traffic drawing
+# library, vendored under third_party/XPMP2 (src + inc + LICENSE). Built WITHOUT
+# INCLUDE_FMOD_SOUND (never define it: FMOD has its own licence). Its objects
+# are compiled once with its own defines and warnings silenced (third party
+# only), then linked into the one plugin binary.
+XPMP2_DIR   := third_party/XPMP2
+XPMP2_SRCS  := $(wildcard $(XPMP2_DIR)/src/*.cpp)
+XPMP2_HDRS  := $(wildcard $(XPMP2_DIR)/src/*.h $(XPMP2_DIR)/inc/*.h)
+XPMP2_OBJS  := $(patsubst $(XPMP2_DIR)/src/%.cpp,build/xpmp2/%.o,$(XPMP2_SRCS))
+XPMP2_FLAGS := -std=c++17 -fPIC -fvisibility=hidden -O2 -mmacosx-version-min=12.0 -w \
+               -DAPL=1 -DIBM=0 -DLIN=0 -DNDEBUG=1 \
+               -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 -DXPLM303=1 -DXPLM400=1 \
+               -DXPMP2_VERSION='"3.7.0"' -DXPMP2_VER_MAJOR=3 -DXPMP2_VER_MINOR=7 -DXPMP2_VER_PATCH=0 \
+               -I$(SDK)/CHeaders/XPLM -I$(XPMP2_DIR)/inc -I$(XPMP2_DIR)/src
+
 OUT := build/mac_x64/$(PLUGIN).xpl
 
-$(OUT): $(SRCS) $(HDRS)
+$(OUT): $(SRCS) $(HDRS) $(XPMP2_OBJS)
 	@mkdir -p build/mac_x64
-	$(CXX) $(ARCHS) $(CXXFLAGS) $(LDFLAGS) -o $@ $(SRCS)
+	$(CXX) $(ARCHS) $(CXXFLAGS) $(LDFLAGS) -o $@ $(SRCS) $(XPMP2_OBJS)
 	@echo "built $@"
+
+build/xpmp2/%.o: $(XPMP2_DIR)/src/%.cpp $(XPMP2_HDRS)
+	@mkdir -p build/xpmp2
+	$(CXX) $(ARCHS) $(XPMP2_FLAGS) -c -o $@ $<
 
 .PHONY: install clean
 install: $(OUT)
