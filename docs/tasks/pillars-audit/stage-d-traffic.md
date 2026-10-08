@@ -351,3 +351,48 @@ Increment 3 (`schedule.rs`):
   ignored one over the install (LEMG says no circuits; IFR both ways, every movement spawns).
 - Known: a turboprop's vacate at 16 kt cuts its 90 degree turn-off by up to 7 m (the 172's
   taxi stays under 3.3 m); not asserted for the ATR yet.
+
+### Plugin side (increments 10 and 11, the plugin half)
+
+- **XPMP2 v3.7.0** vendored at `plugin/third_party/XPMP2` (`src`, `inc`, `LICENSE`; no
+  `SoundFMOD.*`, no examples or docs), compiled by the Makefile into `build/xpmp2/*.o` with its
+  own defines and warnings silenced, then linked into the one `xcopilot.xpl` (universal).
+- **The wire as the plugin decodes it** (`plugin/src/traffic_wire.h`, the one reference):
+  little-endian, version `1` in both buffers, 16 KB each. Roster: header 8 bytes (`u16
+  version`, `u16 count`, `u32 seq`), then 48 bytes per aircraft: `u32 id` @0, `u32 mode_s`
+  @4 (24 bit, 0 = XPMP2 picks), `u16 squawk` @8 (the four octal figures read as a decimal
+  number, 7000 = 7000), `u16` reserved @10, `char[4] type` @12, `char[4] airline` @16,
+  `char[16] livery` @20, `char[12] callsign` @36 (NUL-padded, not terminated when full).
+  Frames: header 16 bytes (`u16 version`, `u16 count`, `u32 seq`, `f64 sim time` @8, from
+  `sim/time/total_running_time_sec`), then 40 bytes per aircraft: `u32 id` @0, `f32 alt ft
+  MSL` @4, `f64 lat` @8, `f64 lon` @16, `u16 true heading` @24, `i16 pitch` @26 and `i16 roll`
+  @28 in centidegrees, `u16 gs` @30 in tenths of a knot, `i16 vs` @32 in ft/min, `u8` gear
+  @34, flaps @35, spoiler @36, reverser @37 (0..255), `u8 lights` @38 (bit 0 nav, 1 beacon,
+  2 strobe, 3 landing, 4 taxi), `u8 flags` @39 (bit 0 on the ground, 1 engines running, 2
+  hidden). A wrong version, a buffer shorter than its header plus `count` entries, a
+  non-finite or out-of-range position, a write at a non-zero offset or over 16 KB is refused
+  whole and counted; trailing bytes are ignored.
+- **Golden bytes owed**: `plugin/test/traffic_wire_test.cpp` (`make -C plugin test`) decodes
+  hand-laid fixtures; the app's packed sink must decode the same bytes, so the app's golden
+  hex goes into that test at merge.
+- **Status** (`xcopilot/traffic/status`, read-only, refreshed every 0.25 s):
+  `models=N|tcas=OWNER|drawn=N|roster_seq=N|frame_seq=N|errors=N|last_error=KIND|
+  create_errors=N|csl=STATE|enabled=0/1`, OWNER `ours`, another plugin's name, `none` or
+  `off`; STATE `ok`, `no CSL` or `init failed: ...`. `/enable` and `/labels` start at 0: the
+  app turns them on.
+- **CSL location**: `XCOPILOT_TRAFFIC_CSL` is read from X-Plane's own environment (the plugin
+  cannot see the app's `.env`), else `<X-Plane>/Resources/plugins/LiveTraffic/Resources/CSL`;
+  the resource files are the CSL folder's parent, else LiveTraffic's `Resources`.
+- **Read-only CSL means base liveries**: XPMP2's `replace_texture` is OFF, so it writes no
+  `.xpmp2.obj` copies and a livery that needs a texture swap shows the base texture.
+  Turning it on (one line in `Prefs`) lets XPMP2 write those copies into the pilot's CSL
+  folder, as LiveTraffic does (1,287 exist there today and would be reused).
+- **No sound, no network** in v1: `activate_sound` 0, `support_remote` -1.
+- **Rendering**: the render clock is local sim time minus the smoothed transport offset
+  (snapped on a jump of more than 2 s) minus the smoothed frame interval. Hermite tangents
+  are groundspeed along the HEADING (no track on the wire), reversed when the chord runs
+  against the heading (a push); a chord the speeds cannot explain is interpolated linearly.
+  On the ground the aircraft is put ON the mesh by its own probe; engines turn at 1,000 rpm
+  plus 15 per knot on the ground (capped 2,300), 2,300 in the air, only with the engines flag.
+- **TCAS**: `XPMPMultiplayerEnable` on enable; when another plugin holds the slots, its name
+  is in the status and the callback retries in the flight loop when they are freed.

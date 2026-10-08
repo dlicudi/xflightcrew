@@ -30,6 +30,7 @@ LDFLAGS  := -dynamiclib -mmacosx-version-min=12.0 -F$(SDK)/Libraries/Mac \
             -framework CoreFoundation -lobjc
 
 SRCS := src/$(PLUGIN).cpp src/drefs.cpp src/panel.cpp src/fms.cpp src/flightinit.cpp src/audio.cpp src/imgui_xp.cpp src/cursor.cpp src/tiller.cpp \
+        src/traffic.cpp src/traffic_wire.cpp \
         third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp \
         third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
 HDRS := $(wildcard src/*.h)
@@ -60,7 +61,16 @@ build/xpmp2/%.o: $(XPMP2_DIR)/src/%.cpp $(XPMP2_HDRS)
 	@mkdir -p build/xpmp2
 	$(CXX) $(ARCHS) $(XPMP2_FLAGS) -c -o $@ $<
 
-.PHONY: install clean
+# Host-side unit test of the traffic wire decoder: no SDK, no XPMP2.
+TEST_BIN := build/test/traffic_wire_test
+$(TEST_BIN): test/traffic_wire_test.cpp src/traffic_wire.cpp src/traffic_wire.h
+	@mkdir -p build/test
+	$(CXX) -std=c++17 -O1 -Wall -Wextra -Isrc -o $@ test/traffic_wire_test.cpp src/traffic_wire.cpp
+
+.PHONY: install clean test
+test: $(TEST_BIN)
+	./$(TEST_BIN)
+
 install: $(OUT)
 	@mkdir -p "$(XPLANE)/Resources/plugins/$(PLUGIN)/mac_x64"
 	cp $(OUT) "$(XPLANE)/Resources/plugins/$(PLUGIN)/mac_x64/$(PLUGIN).xpl"

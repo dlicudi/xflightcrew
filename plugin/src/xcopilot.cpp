@@ -35,6 +35,7 @@
 #include "drefs.h"
 #include "fms.h"
 #include "panel.h"
+#include "traffic.h"
 
 // ---- lifecycle --------------------------------------------------------------
 
@@ -52,6 +53,7 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     XPLMEnableFeature("XPLM_USE_NATIVE_PATHS", 1);
 
     drefs::start();
+    traffic::start();
     panel::create();
     cursor::start();
 
@@ -68,7 +70,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 
 PLUGIN_API void XPluginStop(void) {
     // Teardown mirrors the original single-file order: the flight loop and the
-    // panel-feed datarefs first, then the panel itself, then the rest.
+    // panel-feed datarefs first, then the panel itself, then the rest. The
+    // traffic goes before all of it: every XPMP2 aircraft destroyed, then
+    // XPMPMultiplayerCleanup.
+    traffic::stop();
     cursor::stop();
     drefs::stop_first();
     panel::destroy();
