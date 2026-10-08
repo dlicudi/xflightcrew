@@ -156,6 +156,19 @@ pub struct Config {
     /// default; `XCOPILOT_ATC_CHATTER=false` silences the flavor calls
     /// (the go-around/held-clearance safety watches stay on regardless).
     pub atc_chatter: bool,
+    /// Who flies the traffic round us (stage D, `traffic_link::TrafficMode`):
+    /// `off` (the default until the plugin draws our own) and `real` keep
+    /// today's read-only narration of the sim's TCAS traffic; `ours` flies
+    /// our own fleet at the installed field, controlled by its tower.
+    /// `XCOPILOT_TRAFFIC`.
+    pub traffic: String,
+    /// How busy our generated traffic is: `off`, `light` or `normal`.
+    /// `XCOPILOT_TRAFFIC_DENSITY`.
+    pub traffic_density: String,
+    /// The pilot's own traffic schedule (YAML: `t_s, callsign, type, kind`,
+    /// `runway?, stand?, laps?, spoken?`), flown instead of a generated one;
+    /// empty = generated. `XCOPILOT_TRAFFIC_FILE`.
+    pub traffic_file: String,
     /// How much the copilot volunteers (`persona::Chatter`): `quiet` answers
     /// and calls what matters, `normal` adds the landing word, the offers
     /// and the flight's memory, `chatty` a little more. Answers and safety
@@ -362,6 +375,9 @@ impl Config {
             atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
             atc_region: env_or("XCOPILOT_ATC_REGION", "auto"),
             atc_chatter: env_or("XCOPILOT_ATC_CHATTER", "true") != "false",
+            traffic: env_or("XCOPILOT_TRAFFIC", "off"),
+            traffic_density: env_or("XCOPILOT_TRAFFIC_DENSITY", "normal"),
+            traffic_file: env_or("XCOPILOT_TRAFFIC_FILE", "").trim().to_string(),
             crew_chatter: env_or("XCOPILOT_CREW_CHATTER", "normal"),
             start_calls: env_or("XCOPILOT_START_CALLS", "milestones"),
             crew_dialect: env_or("XCOPILOT_CREW_DIALECT", "auto"),

@@ -91,8 +91,13 @@ pub(crate) struct TickOut {
     pub(crate) transmissions: Vec<Transmission>,
     /// The fleet's events, for the blackbox.
     pub(crate) events: Vec<Event>,
-    /// Movements spawned this tick (id, callsign, kind) and refusals.
+    /// Movements spawned this tick (id, callsign).
     pub(crate) spawned: Vec<(u32, String)>,
+    /// Flights that left the frequency because the station was installed
+    /// again under them (the reinstall rule).
+    pub(crate) left_frequency: Vec<u32>,
+    /// Orders that changed this tick: (id, state, runway), for the blackbox.
+    pub(crate) orders: Vec<(u32, TowerState, Option<String>)>,
 }
 
 /// A scheduled movement not yet spawned.
@@ -115,6 +120,10 @@ pub(crate) struct Link {
     /// for it (an airborne aircraft's route is planned once, for one
     /// runway), and an arrival waits for it ([`ARRIVAL_WAIT_S`]).
     tower_runway: Option<String>,
+    /// The flights noted on their strips last tick (the reinstall rule).
+    noted: Vec<u32>,
+    /// Each flight's order as last seen (state, runway): a change is logged.
+    seen_orders: HashMap<u32, (TowerState, Option<String>)>,
 }
 
 /// An arrival spawns for the tower's runway: with none known yet (nobody
@@ -139,7 +148,20 @@ impl Link {
             next_id: 1,
             tower_name: tower_name.to_string(),
             tower_runway: None,
+            noted: Vec::new(),
+            seen_orders: HashMap::new(),
         }
+    }
+
+    /// More movements, `offset_s` fleet seconds from the clock's start (the
+    /// next hour of a generated schedule).
+    pub(crate) fn add_schedule(&mut self, schedule: Vec<Movement>, offset_s: f64) {
+        self.due.extend(schedule.into_iter().map(|m| Due {
+            at_s: m.t_s + offset_s,
+            m,
+            tries: 0,
+        }));
+        self.due.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
     }
 
     pub(crate) fn fleet(&self) -> &Fleet {
@@ -173,6 +195,17 @@ impl Link {
     /// trade with the station. `now` is the station's clock for this tick.
     pub(crate) fn tick(&mut self, own: Option<&OwnState>, dt: f64, now: Instant) -> TickOut {
         let mut out = TickOut::default();
+        // THE REINSTALL RULE: an install clears the strips. A flight noted
+        // last tick whose strip is gone (we retire only what we despawn)
+        // means the station was installed again under us: everyone not
+        // parked leaves the frequency.
+        let reinstalled = self
+            .noted
+            .iter()
+            .any(|id| self.fleet.get(*id).is_some() && crate::world::traffic_order(*id).is_none());
+        if reinstalled {
+            out.left_frequency = self.despawn_moving();
+        }
         self.spawn_due(own, &mut out);
         let orders: HashMap<u32, Order> = self
             .fleet
@@ -183,6 +216,14 @@ impl Link {
         if let Some(r) = orders.values().find_map(|o| o.runway.clone()) {
             self.tower_runway = Some(r);
         }
+        for (id, o) in &orders {
+            let now_seen = (o.state, o.runway.clone());
+            if self.seen_orders.get(id) != Some(&now_seen) {
+                out.orders.push((*id, o.state, o.runway.clone()));
+                self.seen_orders.insert(*id, now_seen);
+            }
+        }
+        self.seen_orders.retain(|id, _| orders.contains_key(id));
         let events = self.fleet.step(dt, own.map(OwnState::own_target), &|id| {
             orders.get(&id).cloned()
         });
@@ -191,6 +232,7 @@ impl Link {
         for ac in self.fleet.aircraft() {
             crate::world::note_traffic_state(ac.id, aircraft_state(ac, now));
         }
+        self.noted = self.fleet.aircraft().iter().map(|a| a.id).collect();
         for ev in &events {
             match ev {
                 Event::Call { id, call } => {
@@ -403,8 +445,378 @@ fn tcas_target(ac: &TrafficAircraft) -> TcasTarget {
     }
 }
 
+/// Who flies the traffic round us (`XCOPILOT_TRAFFIC`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrafficMode {
+    /// Today's behaviour: the sim's TCAS traffic, narrated read-only. The
+    /// default until the plugin draws our own (stage D step 11).
+    Off,
+    /// The sim's traffic (LiveTraffic, X-Plane's AI), narrated read-only.
+    Real,
+    /// Our own fleet at the installed field, controlled by its tower.
+    Ours,
+}
+
+impl TrafficMode {
+    /// `ours` or `real` (any case); anything else is `off`.
+    pub(crate) fn parse(s: &str) -> TrafficMode {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ours" => TrafficMode::Ours,
+            "real" => TrafficMode::Real,
+            _ => TrafficMode::Off,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            TrafficMode::Off => "off",
+            TrafficMode::Real => "real",
+            TrafficMode::Ours => "ours",
+        }
+    }
+
+    /// The mode in force now (the live settings).
+    pub(crate) fn now() -> TrafficMode {
+        TrafficMode::parse(&crate::settings::live().traffic)
+    }
+}
+
+/// Above this time acceleration the fleet freezes: the station's timers are
+/// wall `Instant`s, so at 4x a hold would be judged on a quarter of the
+/// flight it waited for.
+const FAST_OVER: f64 = 1.2;
+
+/// The callsign our aircraft is keyed by in the traffic's picture (the
+/// tower names us by `FlightId::Own`, never by this).
+const OWN_KEY: &str = "OWNSHIP";
+
+/// The monitor's side of the traffic: the link for the installed field
+/// (built off the tick: two apt.dat scans), its clock, the fast-forward
+/// latch. Owned by `WorldTick`, never a static.
+#[derive(Default)]
+pub(crate) struct TrafficWorld {
+    link: Option<Link>,
+    /// The field the link is for, or is being built for.
+    field: Option<String>,
+    /// A link being built, off the tick.
+    loading: Option<std::sync::mpsc::Receiver<Option<Link>>>,
+    /// The sim's running time at the last tick.
+    last_sim_s: Option<f64>,
+    /// Frozen for time acceleration (said once per spell).
+    fast: bool,
+    /// Generated schedules flown so far at this field (the next hour's seed
+    /// and offset); `None` for the pilot's file.
+    hours: Option<u32>,
+    /// Links built this session: each new field's seed.
+    built: u64,
+}
+
+impl TrafficWorld {
+    /// One monitor tick. Nothing at all unless `XCOPILOT_TRAFFIC=ours`, ATC
+    /// is on and a station is installed: the link is dropped (every strip
+    /// it opened retired, the picture withdrawn) the moment any of those
+    /// stops being true. `sim_speed` is the monitor's latest read.
+    pub(crate) async fn tick(
+        &mut self,
+        xp: &crate::xplane::XPlaneClient,
+        snap: &crate::monitor::Snapshot,
+        sim_speed: Option<f64>,
+        now: Instant,
+    ) -> Option<TickOut> {
+        let field = wanted_field(
+            TrafficMode::now(),
+            crate::mode::atc_enabled(),
+            crate::party_line::installed_icao(),
+        );
+        if field != self.field {
+            self.stand_down();
+            self.field = field.clone();
+            if let Some(icao) = field {
+                self.loading = Some(self.build(&icao));
+            }
+        }
+        if let Some(rx) = &self.loading {
+            match rx.try_recv() {
+                Ok(link) => {
+                    self.loading = None;
+                    self.link = link;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.loading = None,
+            }
+        }
+        let link = self.link.as_mut()?;
+        // Time acceleration freezes the fleet (v1), said once per spell.
+        let fast = sim_speed.is_some_and(|v| v > FAST_OVER);
+        if fast != self.fast {
+            self.fast = fast;
+            crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "frozen", "fast": fast, "sim_speed": sim_speed }),
+            );
+        }
+        link.set_frozen(fast);
+        // The fleet's clock is the sim's (a failed read is no time), and our
+        // height in the tower's picture is true feet MSL (the snapshot's is
+        // the altimeter's): one batched read, only while the fleet flies.
+        let (sim_s, ele_m) = tokio::join!(
+            xp.get_float(crate::datarefs::TOTAL_RUNNING_TIME_SEC),
+            xp.get_float(crate::datarefs::ELEVATION_M),
+        );
+        let sim_s = sim_s.ok().filter(|t| t.is_finite());
+        let alt_ft = ele_m
+            .ok()
+            .filter(|m| m.is_finite())
+            .map_or(snap.alt_ft, |m| m * 3.28084);
+        let dt = match (self.last_sim_s, sim_s) {
+            (Some(prev), Some(t)) if t >= prev => t - prev,
+            _ => 0.0,
+        };
+        if sim_s.is_some() {
+            self.last_sim_s = sim_s;
+        }
+        let own = OwnState {
+            callsign: OWN_KEY.to_string(),
+            lat: snap.lat,
+            lon: snap.lon,
+            alt_ft,
+            on_ground: snap.on_ground,
+            vs_fpm: snap.vs_fpm.unwrap_or(0.0),
+        };
+        let out = link.tick(Some(&own), dt, now);
+        // The next hour of a generated schedule, once this one is spent.
+        if link.pending() == 0 {
+            if let Some(h) = self.hours.as_mut() {
+                let start = link.fleet().clock.now_s();
+                if start >= f64::from(*h) * traffic::schedule::HORIZON_S {
+                    *h += 1;
+                    let ms = generate_for(link.fleet(), u64::from(*h), &own);
+                    link.add_schedule(ms, start);
+                }
+            }
+        }
+        crate::party_line::publish_traffic_picture(Some(link.targets()));
+        record(&out, link);
+        Some(out)
+    }
+
+    /// Drop the link: every strip it opened retired, the picture withdrawn.
+    fn stand_down(&mut self) {
+        if let Some(link) = self.link.take() {
+            let ids: Vec<u32> = link.fleet().aircraft().iter().map(|a| a.id).collect();
+            for id in &ids {
+                crate::world::retire_traffic(*id);
+            }
+            crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "stand_down", "field": link.icao(), "aircraft": ids.len() }),
+            );
+        }
+        if self.field.is_some() {
+            crate::party_line::publish_traffic_picture(None);
+        }
+        self.loading = None;
+        self.last_sim_s = None;
+        self.hours = None;
+    }
+
+    /// Build the link for `icao` off the tick: the field (apt.dat, its
+    /// taxi network and CIFP) and its schedule, the pilot's file or a
+    /// generated hour.
+    fn build(&mut self, icao: &str) -> std::sync::mpsc::Receiver<Option<Link>> {
+        let cfg = crate::settings::live();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (icao, apt, cifp) = (
+            icao.to_string(),
+            cfg.apt_data_path.clone(),
+            cfg.cifp_dir.clone(),
+        );
+        let (file, density) = (cfg.traffic_file.clone(), cfg.traffic_density.clone());
+        self.built += 1;
+        let seed = self.built;
+        self.hours = file.is_empty().then_some(1);
+        let name = crate::party_line::active_field()
+            .map(|(n, ..)| crate::party_line::spoken_airport(&n).to_string())
+            .unwrap_or_default();
+        let spawned = std::thread::Builder::new()
+            .name("traffic-field".into())
+            .spawn(move || {
+                let link = build_link(&icao, &apt, &cifp, &file, &density, seed, &name);
+                let _ = tx.send(link);
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("traffic: the field loader did not start: {e}");
+        }
+        rx
+    }
+}
+
+/// The field the fleet flies at: the installed station's, and only with
+/// `XCOPILOT_TRAFFIC=ours` and ATC on.
+pub(crate) fn wanted_field(
+    mode: TrafficMode,
+    atc_on: bool,
+    installed: Option<String>,
+) -> Option<String> {
+    (mode == TrafficMode::Ours && atc_on)
+        .then_some(installed)
+        .flatten()
+}
+
+/// The link for one field, built off the tick; `None` (said in the log and
+/// the blackbox) when the field or the file cannot be read.
+fn build_link(
+    icao: &str,
+    apt: &str,
+    cifp: &str,
+    file: &str,
+    density: &str,
+    seed: u64,
+    name: &str,
+) -> Option<Link> {
+    let field = match FieldModel::load(apt, icao) {
+        Ok(Some(f)) => f.with_cifp(cifp),
+        Ok(None) => {
+            tracing::warn!(%icao, "traffic: the field is not in apt.dat; no traffic");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(%icao, "traffic: apt.dat scan failed ({e:#}); no traffic");
+            return None;
+        }
+    };
+    let ctx = SpawnCtx::default();
+    let (schedule, source) = if file.is_empty() {
+        let d = traffic::Density::parse(density).unwrap_or(traffic::Density::Normal);
+        (traffic::generate(&field, d, seed, &ctx), "generated")
+    } else {
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(%file, "traffic: the schedule file did not read ({e}); no traffic");
+                crate::blackbox::record(
+                    "traffic",
+                    serde_json::json!({ "event": "file_refused", "file": file, "why": e.to_string() }),
+                );
+                return None;
+            }
+        };
+        match traffic::schedule::parse_file(&text) {
+            Ok(rows) => (
+                traffic::schedule::from_file(&rows, &field, seed, &ctx),
+                "file",
+            ),
+            Err(e) => {
+                tracing::warn!(%file, "traffic: the schedule file was refused ({e:#}); no traffic");
+                crate::blackbox::record(
+                    "traffic",
+                    serde_json::json!({ "event": "file_refused", "file": file, "why": format!("{e:#}") }),
+                );
+                return None;
+            }
+        }
+    };
+    tracing::info!(%icao, movements = schedule.len(), source, "traffic: the fleet is up");
+    crate::blackbox::record(
+        "traffic",
+        serde_json::json!({
+            "event": "up", "field": icao, "movements": schedule.len(), "source": source,
+        }),
+    );
+    Some(Link::new(field, schedule, name))
+}
+
+/// The next generated hour at the fleet's field, round us.
+fn generate_for(fleet: &Fleet, hour: u64, own: &OwnState) -> Vec<Movement> {
+    let density = traffic::Density::parse(&crate::settings::live().traffic_density)
+        .unwrap_or(traffic::Density::Normal);
+    let ctx = SpawnCtx {
+        runway: None,
+        own: Some((own.lat, own.lon)),
+        occupied: fleet
+            .aircraft()
+            .iter()
+            .filter(|a| a.kin.on_ground)
+            .map(|a| a.kin.pos())
+            .collect(),
+    };
+    traffic::generate(&fleet.field, density, hour, &ctx)
+}
+
+/// The blackbox's `traffic` records for one tick: one record per event, each
+/// one write.
+fn record(out: &TickOut, link: &Link) {
+    for (id, callsign) in &out.spawned {
+        let ac = link.fleet().get(*id);
+        crate::blackbox::record(
+            "traffic",
+            serde_json::json!({
+                "event": "spawn", "id": id, "callsign": callsign,
+                "type": ac.map(|a| a.icao_type.clone()),
+                "plan": ac.map(|a| plan_word(&a.plan)),
+                "runway": ac.and_then(|a| a.plan.runway().map(str::to_string)),
+            }),
+        );
+    }
+    for id in &out.left_frequency {
+        crate::blackbox::record(
+            "traffic",
+            serde_json::json!({ "event": "despawn", "id": id, "reason": "reinstalled" }),
+        );
+    }
+    for ev in &out.events {
+        match ev {
+            Event::Despawn { id, reason } => crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "despawn", "id": id, "reason": despawn_word(*reason) }),
+            ),
+            Event::Phase { id, from, to } => crate::blackbox::record(
+                "traffic",
+                serde_json::json!({
+                    "event": "phase", "id": id,
+                    "from": format!("{from:?}"), "to": format!("{to:?}"),
+                }),
+            ),
+            Event::Touchdown { id, along_m, .. } => crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "touchdown", "id": id, "along_m": along_m.round() }),
+            ),
+            Event::Call { .. } | Event::Spawn { .. } => {}
+        }
+    }
+    for t in &out.transmissions {
+        crate::blackbox::record(
+            "traffic",
+            serde_json::json!({ "event": "call", "id": t.id, "callsign": t.callsign, "text": t.text }),
+        );
+    }
+    for (id, state, runway) in &out.orders {
+        crate::blackbox::record(
+            "traffic",
+            serde_json::json!({
+                "event": "order", "id": id, "state": format!("{state:?}"), "runway": runway,
+            }),
+        );
+    }
+    for (id, line) in &out.tower {
+        crate::blackbox::record(
+            "traffic",
+            serde_json::json!({ "event": "tower", "id": id, "line": line }),
+        );
+    }
+}
+
+/// A plan in a word, for the blackbox.
+fn plan_word(p: &traffic::Plan) -> &'static str {
+    match p {
+        traffic::Plan::Circuit { .. } => "circuit",
+        traffic::Plan::Departure { .. } => "departure",
+        traffic::Plan::Arrival { .. } => "arrival",
+        traffic::Plan::Parked => "parked",
+    }
+}
+
 /// Why an aircraft left, in a word, for the blackbox.
-#[allow(dead_code)]
 pub(crate) fn despawn_word(d: Despawn) -> &'static str {
     match d {
         Despawn::LeftTheArea => "left_the_area",

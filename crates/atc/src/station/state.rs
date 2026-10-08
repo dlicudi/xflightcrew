@@ -113,6 +113,7 @@ lifetime_group! {
     pub(crate) struct TrafficStrips {
         STRIPS,
         TRAFFIC_CALLS,
+        TRAFFIC_PICTURE,
     }
 }
 
@@ -271,6 +272,7 @@ pub(crate) const TRANSITION: &[&str] = &["NEW_FLIGHT_PENDING"];
 /// constructors and in [`FieldFacts::publish`] until it is handled.
 pub(super) struct FieldFacts {
     active_field: Option<(String, f64, f64)>,
+    active_icao: Option<String>,
     controller_freqs: Vec<(i64, StationSpeaker)>,
     active_panel: Option<ActivePanel>,
     active_runways: Vec<nav::Runway>,
@@ -283,6 +285,7 @@ impl FieldFacts {
     #[allow(dead_code)]
     pub(crate) const NAMES: &'static [&'static str] = &[
         "ACTIVE_FIELD",
+        "ACTIVE_ICAO",
         "CONTROLLER_FREQS",
         "ACTIVE_PANEL",
         "ACTIVE_RUNWAYS",
@@ -294,6 +297,7 @@ impl FieldFacts {
     pub(super) fn empty() -> FieldFacts {
         FieldFacts {
             active_field: None,
+            active_icao: None,
             controller_freqs: Vec::new(),
             active_panel: None,
             active_runways: Vec::new(),
@@ -333,6 +337,7 @@ impl FieldFacts {
                 .apt
                 .position()
                 .map(|(lat, lon)| (st.apt.name.clone(), lat, lon)),
+            active_icao: st.procedures.as_ref().map(|(_, icao)| icao.clone()),
             controller_freqs,
             active_panel: Some((st.apt.name.clone(), st.apt.elev_ft, services(&st.apt))),
             active_runways: st.apt.runways.clone(),
@@ -353,6 +358,7 @@ impl FieldFacts {
     pub(super) fn publish(self) {
         let FieldFacts {
             active_field,
+            active_icao,
             controller_freqs,
             active_panel,
             active_runways,
@@ -360,6 +366,7 @@ impl FieldFacts {
             compliance,
         } = self;
         *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = active_field;
+        *ACTIVE_ICAO.lock().unwrap_or_else(|e| e.into_inner()) = active_icao;
         *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = controller_freqs;
         *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) = active_panel;
         *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = active_runways;
@@ -627,6 +634,9 @@ mod tests {
         install.extend(names(&["SEEN"]));
         // ...and the traffic's calls not yet answered (increment 5).
         install.extend(names(&["TRAFFIC_CALLS"]));
+        // ...and the picture of our own traffic every TCAS read takes while
+        // the fleet flies (stage D, increment 8): republished every tick.
+        install.extend(names(&["TRAFFIC_PICTURE"]));
         assert_eq!(door_cells(INSTALL_RESETS), install, "install");
 
         let mut uninstall = install.clone();

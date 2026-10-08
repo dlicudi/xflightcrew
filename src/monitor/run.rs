@@ -767,6 +767,8 @@ pub async fn run(
                 now,
             };
             let mut heard = world.runway_watch(&tick, gates).await;
+            // Our own traffic (stage D): nothing unless XCOPILOT_TRAFFIC=ours.
+            world.traffic_link(&tick, &heard).await;
             let com1 = heard.com1;
             crate::efb::feed::note_com1(com1);
             if !quiet {

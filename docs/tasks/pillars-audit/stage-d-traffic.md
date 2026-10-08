@@ -405,3 +405,50 @@ Increment 7 (`src/traffic_link.rs`, the headless harness):
   in `TaxiOut`), and a takeoff cleared on a strip another flight stands on (ULMM 13, BIEG 03
   with a flight on 21): the taxi route and the vacate cross or ride a runway the book then
   reads as occupied.
+
+Increment 8 (monitor wiring, `world::targets`, the reinstall rule, settings):
+- **`XCOPILOT_TRAFFIC=off|real|ours`, DEFAULT `off`** until the plugin draws ours (step 11;
+  the spec's "ours, the default" waits for it). `off` and `real` are both today's behaviour
+  until step 12 retires the ghost ticks under `ours` and silences them under `off`.
+  `XCOPILOT_TRAFFIC_DENSITY=off|light|normal` (default `normal`) and `XCOPILOT_TRAFFIC_FILE`
+  (empty = generated) are registry settings (`settings::ALL`: `traffic`, `traffic_density`,
+  `traffic_file`, env-pinned, persisted), so the terminal, the panel and the EFB see them; a
+  change of density or file is taken by the next field's link.
+- **`TrafficWorld` in `WorldTick`** (`world_tick::WorldTick::traffic_link`, called from the
+  monitor right after the runway watch, ahead of `quiet`): nothing at all unless
+  `XCOPILOT_TRAFFIC=ours`, ATC is on and a station is installed (`wanted_field`); the moment
+  any stops being true the link is dropped (every strip it opened retired, the picture
+  withdrawn, blackboxed `stand_down`). The field is built OFF the tick on a `traffic-field`
+  thread (`FieldModel::load` is two apt.dat scans, then CIFP and the schedule), the tick polls
+  it. The field is the INSTALLED station's ICAO: a new `party_line::installed_icao()`
+  (`ACTIVE_ICAO`, a `FieldFacts` static from the owner's `set_procedures`; `active_icao`
+  needs the region index, which `XCOPILOT_ATC_REGION=off` never loads).
+- **Frozen**: the monitor already skips the whole tick in replay and pause (its own
+  `IS_IN_REPLAY` / `PAUSED` gate, the same as `sim_frozen`), so the fleet is not ticked then;
+  the clock is `sim/time/total_running_time_sec` (`datarefs::TOTAL_RUNNING_TIME_SEC`, read with
+  `ELEVATION_M` in one join only while the fleet flies; a failed read is no time), clamped by
+  the `SimClock`. Above 1.2x (`climb_watch::sim_speed_now()`, the monitor's own read) the fleet
+  freezes, blackboxed `traffic` `frozen` once per spell (it is SAID in step 9).
+- **Our aircraft in the picture** is keyed `OWNSHIP` (the tower names us by `FlightId::Own`,
+  never by it), true feet MSL from `ELEVATION_M` (the snapshot's `alt_ft` is the altimeter's).
+- **The next hour**: a generated schedule is extended by another `HORIZON_S` (seed = the hour)
+  once the last one is spent; the pilot's file is flown once.
+- **The reinstall rule** is in `Link::tick`: a flight noted last tick whose strip is gone (we
+  retire only what we despawn) means an install under us; every aircraft not parked leaves
+  (`TickOut.left_frequency`, blackboxed `despawn` `reinstalled`), the parked stay and their
+  strips reopen at the next note. A new field (`installed_icao` changes) is a new link.
+- **One traffic picture**: `world::targets(xp)` (atc `tcas.rs`) returns
+  `party_line::traffic_picture()` while the fleet flies, else the sim's TCAS; the raw read is
+  private to `tcas.rs` and the station's own reads (`build_ctx`, `inbound_traffic_for_strip`)
+  go through it too. `nearest_traffic_factor` under the picture computes the factor from our
+  position and heading (`factor_from_picture`, the same selection). The picture is a
+  `TrafficStrips` static (`TRAFFIC_PICTURE`), so an install clears it and the link republishes
+  it every tick. Pinned by `every_tcas_read_goes_through_world_targets` (no
+  `read_tcas_targets` or `TCAS_FLIGHT_ID` outside `tcas.rs`).
+- **`drain_traffic_calls`** (`src/main/station_work.rs`, after `sync_tower`): only under
+  `ours`; the replies are spoken in step 9.
+- **Blackbox kind `traffic`**, one record per fact: `up`, `stand_down`, `file_refused`,
+  `frozen`, `spawn` (id, callsign, type, plan, runway), `despawn` (id, reason), `phase`,
+  `touchdown`, `call` (id, callsign, text), `order` (a change of the tower state or runway on
+  the order view), `tower` (a line from a traffic flight's runway watch). The station's answers
+  are its own `atc` `route: traffic` records.

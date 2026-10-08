@@ -607,8 +607,15 @@ pub fn publish_sim_speed(v: Option<f64>) {
 const FAST_FORWARD_OVER: f64 = 1.2;
 
 fn fast_forward() -> bool {
+    sim_speed_now().is_some_and(|v| v > FAST_FORWARD_OVER)
+}
+
+/// The sim's time acceleration as the monitor last read it, if fresh
+/// (our traffic freezes above 1x: `traffic_link`).
+pub fn sim_speed_now() -> Option<f64> {
     let g = SIM_SPEED.lock().unwrap_or_else(|e| e.into_inner());
-    g.is_some_and(|(t, v)| now_s() - t <= TELEMETRY_FRESH_S && v > FAST_FORWARD_OVER)
+    g.filter(|(t, _)| now_s() - t <= TELEMETRY_FRESH_S)
+        .map(|(_, v)| v)
 }
 
 struct Armed {

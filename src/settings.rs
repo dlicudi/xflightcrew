@@ -246,6 +246,15 @@ impl Kind {
     }
 }
 
+/// A traffic density as the registry shows it.
+fn density_word(d: traffic::Density) -> &'static str {
+    match d {
+        traffic::Density::Off => "off",
+        traffic::Density::Light => "light",
+        traffic::Density::Normal => "normal",
+    }
+}
+
 fn round_to(v: f64, decimals: usize) -> f64 {
     let f = 10f64.powi(decimals as i32);
     (v * f).round() / f
@@ -573,6 +582,67 @@ pub const ALL: &[Setting] = &[
         apply: |v| {
             let Some(b) = v.as_bool() else { return false };
             update(|c| c.atc_chatter = b);
+            true
+        },
+    },
+    Setting {
+        key: "traffic",
+        env: "XCOPILOT_TRAFFIC",
+        label: "traffic",
+        help: "ours: our own traffic flies the field, controlled by the tower; real or off: the sim's traffic, narrated",
+        kind: Kind::Choice(&["off", "real", "ours"]),
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || {
+            Value::Choice(
+                crate::traffic_link::TrafficMode::parse(&live().traffic)
+                    .as_str()
+                    .to_string(),
+            )
+        },
+        apply: |v| {
+            let Some(m) = v.as_choice() else { return false };
+            let m = crate::traffic_link::TrafficMode::parse(m).as_str().to_string();
+            update(|c| c.traffic = m);
+            true
+        },
+    },
+    Setting {
+        key: "traffic_density",
+        env: "XCOPILOT_TRAFFIC_DENSITY",
+        label: "traffic density",
+        help: "how busy our own generated traffic is; a new field's schedule takes it",
+        kind: Kind::Choice(&["off", "light", "normal"]),
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || {
+            Value::Choice(
+                traffic::Density::parse(&live().traffic_density)
+                    .map_or("normal", density_word)
+                    .to_string(),
+            )
+        },
+        apply: |v| {
+            let Some(d) = v.as_choice().and_then(traffic::Density::parse) else {
+                return false;
+            };
+            update(|c| c.traffic_density = density_word(d).to_string());
+            true
+        },
+    },
+    Setting {
+        key: "traffic_file",
+        env: "XCOPILOT_TRAFFIC_FILE",
+        label: "traffic file",
+        help: "blank = generated; a YAML schedule of your own (t_s, callsign, type, kind), read when a field's traffic starts",
+        kind: Kind::Text { max_len: 400 },
+        tier: Tier::Live,
+        persist: Persist::Map,
+        get: || Value::Text(live().traffic_file.clone()),
+        apply: |v| {
+            let Some(t) = v.as_text() else { return false };
+            let t = t.trim().to_string();
+            update(|c| c.traffic_file = t);
             true
         },
     },

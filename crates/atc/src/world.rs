@@ -46,8 +46,10 @@ pub use crate::station::{
 /// silent (`traffic_compliance_oracle`).
 pub use crate::station::{runway_conflicts, traffic_compliance_oracle};
 
-/// Traffic: the TCAS read, the near-miss and the traffic advisory.
+/// Traffic: THE traffic picture (`targets`: our own fleet while it flies,
+/// else the sim's TCAS; every read goes through it), the near-miss and the
+/// traffic advisory.
 pub use crate::station::{
-    advisory_line, is_near_miss, near_miss_line, nearest_traffic_factor, read_tcas_targets,
+    advisory_line, is_near_miss, near_miss_line, nearest_traffic_factor, targets,
     traffic_worth_recalling, TcasTarget, TrafficFactor,
 };

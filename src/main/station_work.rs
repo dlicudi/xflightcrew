@@ -11,7 +11,20 @@ impl Session {
         self.arm_keyed_station(input).await;
         self.take_pending_station(config);
         self.sync_tower(config).await;
+        self.drain_traffic_calls();
         self.drain_crew_radio(input).await;
+    }
+
+    /// Our own traffic's calls (stage D), answered on each flight's own
+    /// desk after the desks are synced with what the ticks said
+    /// (`traffic_link::drain_calls`). Nothing unless `XCOPILOT_TRAFFIC=ours`.
+    pub(crate) fn drain_traffic_calls(&mut self) {
+        if crate::traffic_link::TrafficMode::now() != crate::traffic_link::TrafficMode::Ours {
+            return;
+        }
+        if let Some(st) = self.atc_station.as_mut() {
+            let _ = crate::traffic_link::drain_calls(st);
+        }
     }
 
     /// A mode change (panel toggle or the poller's pick) reconciled: the world

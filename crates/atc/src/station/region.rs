@@ -31,6 +31,20 @@ pub(super) static FIELD_DIR: Mutex<Vec<FieldDirectoryEntry>> = Mutex::new(Vec::n
 /// [`Station::from_airport`].
 pub(super) static ACTIVE_FIELD: Mutex<Option<(String, f64, f64)>> = Mutex::new(None);
 
+/// The installed station's ICAO, as its owner told it
+/// ([`Station::set_procedures`]): what our own traffic loads its field by.
+/// `None` with no station, or one whose owner never named it.
+pub(super) static ACTIVE_ICAO: Mutex<Option<String>> = Mutex::new(None);
+
+/// The installed station's ICAO ([`ACTIVE_ICAO`]); unlike `active_icao`
+/// it needs no region index.
+pub fn installed_icao() -> Option<String> {
+    ACTIVE_ICAO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 pub(super) static LAST_REGION_SWITCH: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// The new field must be this much nearer than the active one before a

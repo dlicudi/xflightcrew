@@ -388,3 +388,147 @@ fn real_install_traffic_world_sweep_inner() {
     println!("swept {flown} fields: {spawned} movements, {calls} calls, no panic");
     assert!(flown > 0);
 }
+
+/// `XCOPILOT_TRAFFIC` unset is `off`, and `off` (or `real`, or ATC off, or
+/// no station) flies nothing: the link only ever runs under `ours`.
+#[test]
+fn traffic_unset_is_off_and_only_ours_flies() {
+    assert_eq!(TrafficMode::parse(""), TrafficMode::Off);
+    assert_eq!(
+        TrafficMode::parse(&crate::config::Config::default().traffic),
+        TrafficMode::Off
+    );
+    assert_eq!(TrafficMode::parse(" Ours "), TrafficMode::Ours);
+    assert_eq!(TrafficMode::parse("real"), TrafficMode::Real);
+    assert_eq!(TrafficMode::parse("livetraffic"), TrafficMode::Off);
+    let lemg = || Some("LEMG".to_string());
+    assert_eq!(wanted_field(TrafficMode::Off, true, lemg()), None);
+    assert_eq!(wanted_field(TrafficMode::Real, true, lemg()), None);
+    assert_eq!(
+        wanted_field(TrafficMode::Ours, false, lemg()),
+        None,
+        "ATC off"
+    );
+    assert_eq!(
+        wanted_field(TrafficMode::Ours, true, None),
+        None,
+        "no station"
+    );
+    assert_eq!(wanted_field(TrafficMode::Ours, true, lemg()), lemg());
+}
+
+/// The three traffic knobs are in the settings registry, each pinned by its
+/// environment variable, so the panel, the terminal and the EFB see them.
+#[test]
+fn the_traffic_knobs_are_registry_settings() {
+    for (key, env) in [
+        ("traffic", "XCOPILOT_TRAFFIC"),
+        ("traffic_density", "XCOPILOT_TRAFFIC_DENSITY"),
+        ("traffic_file", "XCOPILOT_TRAFFIC_FILE"),
+    ] {
+        let s = crate::settings::ALL
+            .iter()
+            .find(|s| s.key == key)
+            .unwrap_or_else(|| panic!("{key} is not a setting"));
+        assert_eq!(s.env, env, "{key}");
+    }
+    let mode = crate::settings::ALL
+        .iter()
+        .find(|s| s.key == "traffic")
+        .unwrap();
+    assert!(
+        mode.kind.parse("ours").is_some() && mode.kind.parse("sometimes").is_none(),
+        "a closed choice"
+    );
+}
+
+/// EVERY TCAS READ GOES THROUGH `world::targets`: it returns our own fleet
+/// while it flies (the plugin puts the same aircraft in the sim's TCAS, so
+/// a read beside it would count each twice). The raw sim read is private to
+/// the station's `tcas.rs`; nothing else names it.
+#[test]
+fn every_tcas_read_goes_through_world_targets() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut hits = Vec::new();
+    for dir in ["src", "crates/atc/src"] {
+        for f in crate::test_support::rust_files(&root.join(dir)) {
+            let rel = f.strip_prefix(root).unwrap_or(&f).display().to_string();
+            if rel.ends_with("station/tcas.rs") || rel.ends_with("traffic_link_tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).expect("read source");
+            for (n, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("read_tcas_targets") || code.contains("TCAS_FLIGHT_ID") {
+                    hits.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "a TCAS read beside world::targets: {hits:#?}"
+    );
+}
+
+/// THE REINSTALL RULE: an install clears the strips under the fleet, and
+/// every aircraft not parked leaves the frequency; the parked stay. In its
+/// own process (module docs).
+#[test]
+fn a_reinstall_sends_the_moving_traffic_off_the_frequency() {
+    in_own_process("traffic_link::tests::a_reinstall_inner");
+}
+
+#[test]
+#[ignore = "run in its own process by a_reinstall_sends_the_moving_traffic_off_the_frequency"]
+fn a_reinstall_inner() {
+    if std::env::var(HARNESS_ENV).is_err() {
+        return;
+    }
+    let apt = format!("{}/xtst.dat", fixtures());
+    let field = FieldModel::load(&apt, "XTST")
+        .unwrap()
+        .unwrap()
+        .with_cifp(&format!("{}/cifp", fixtures()));
+    let schedule = traffic::generate(&field, Density::Normal, 7, &SpawnCtx::default());
+    let st = installed_station(&apt, "XTST");
+    let mut link = Link::new(field, schedule, "Test");
+    let epoch = Instant::now();
+    let mut t = 0.0;
+    let mut st = st;
+    // Fly until someone is moving and someone is still parked.
+    let mixed = |l: &Link| {
+        let a = l.fleet().aircraft();
+        a.iter().any(|x| x.phase != traffic::Phase::Parked)
+            && a.iter().any(|x| x.phase == traffic::Phase::Parked)
+    };
+    while t < 1800.0 && !mixed(&link) {
+        t += 0.25;
+        let _ = link.tick(None, 0.25, epoch + Duration::from_secs_f64(t));
+        let _ = drain_calls(&mut st);
+    }
+    assert!(mixed(&link), "a moving and a parked aircraft by {t:.0} s");
+    let moving: Vec<u32> = link
+        .fleet()
+        .aircraft()
+        .iter()
+        .filter(|a| a.phase != traffic::Phase::Parked)
+        .map(|a| a.id)
+        .collect();
+    let parked = link.fleet().aircraft().len() - moving.len();
+    st.install();
+    t += 0.25;
+    let out = link.tick(None, 0.25, epoch + Duration::from_secs_f64(t));
+    assert_eq!(out.left_frequency, moving, "the moving left the frequency");
+    assert_eq!(link.fleet().aircraft().len(), parked, "the parked stayed");
+    for ac in link.fleet().aircraft() {
+        assert!(
+            crate::world::traffic_order(ac.id).is_some(),
+            "a parked aircraft's strip is open again"
+        );
+    }
+    t += 0.25;
+    let out = link.tick(None, 0.25, epoch + Duration::from_secs_f64(t));
+    assert!(out.left_frequency.is_empty(), "said once");
+    Station::uninstall();
+}

@@ -110,8 +110,6 @@ mod yoke;
 // Test-only (the file's own `#![cfg(test)]`), as `free_nose_replay` above.
 mod test_support;
 mod tools;
-// Ticked by the monitor from stage D step 8; tests only until then.
-#[allow(dead_code)]
 mod traffic_link;
 mod tts;
 #[cfg(feature = "onnx-tts")]
