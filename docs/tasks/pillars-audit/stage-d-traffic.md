@@ -188,3 +188,21 @@ Crew flight laws for traffic; online schedules; wind triangle; per-category wake
 or "number two cleared to land" conditionals; strips re-adopted across a reinstall; departure
 or approach handoff for traffic (it leaves at 12 nm); traffic at uncontrolled fields; traffic
 with ATC off (parked aircraft drawn only); any `pub static` for traffic.
+
+## Deviations (as built)
+
+Increment 1 (`crates/traffic` skeleton):
+- **`sim` is in `cargo tree -p traffic`**, transitively: `nav` depends on `sim` for
+  `sim::angles`. "As lean as nav" holds; "free of sim" cannot without moving the angle helpers
+  out of `sim`, which this stage does not do. No whisper, cpal, ort or atc.
+- **`follow` keeps its progress in a `Follow { seg, done }`** passed alongside the path, and
+  takes a `FollowSpec` (speed, turn rate, accel, decel, stop at end, slow for corners, minimum
+  lookahead) instead of loose arguments: `follow(path, &mut Follow, &mut Kin, &FollowSpec, dt)`.
+- **The pursuit gain is twice the classic arc's** (`4 sin(alpha) / L`, critically damped with
+  heading as the only state; the classic gain rang on a saturated intercept), the lookahead is
+  never shorter than the turn radius, and in the air a corner is FLOWN BY (the turn begins
+  `R tan(turn / 2)` before it). Measured: a 300 m offset intercept at 85 kt settles with no
+  overshoot; a 90 degree corner overshoots its new leg by about 25 m and settles within a mile;
+  a 90 degree taxi corner is cut by under 4 m (slowed to 35% of the taxi pace).
+- `Perf` gained `roll_accel_kts_s`, `turn_air_dps` and `pattern_kts`; `class_for_type(icao)`
+  picks the table and the `Wake`. `SimClock` also takes the sim's running time (`observe`).

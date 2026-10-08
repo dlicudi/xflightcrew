@@ -2,7 +2,7 @@
 # library; both stand on crates/sim. One process at runtime — the split is a
 # compile-time boundary, not the failed second-terminal experiment.
 [workspace]
-members = ["crates/atc", "crates/nav", "crates/sim"]
+members = ["crates/atc", "crates/nav", "crates/sim", "crates/traffic"]
 
 # One license across the workspace, inherited by every member, for the same
 # reason the deps are pinned here: the crates must never drift apart. GPL-3.0

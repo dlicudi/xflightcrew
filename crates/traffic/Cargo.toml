@@ -1,0 +1,14 @@
+[package]
+name = "traffic"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Our own AI traffic (stage D, docs/tasks/pillars-audit/stage-d-traffic.md):
+# performance tables, kinematics, the phase machine and the schedules. Pure:
+# no statics, no I/O but the file parsers it is handed, and it depends on
+# nav only. Neither atc nor traffic depends on the other; they meet in the
+# bin (`cargo tree -p traffic` stays as lean as nav).
+[dependencies]
+nav = { path = "../nav" }
