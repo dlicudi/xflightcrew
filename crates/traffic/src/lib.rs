@@ -16,6 +16,7 @@ pub mod perf;
 pub mod phase;
 pub mod rng;
 pub mod schedule;
+pub mod wire;
 
 pub use aircraft::{Route, Seen, TrafficAircraft};
 pub use clock::{SimClock, SUBSTEP_S};

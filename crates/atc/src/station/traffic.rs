@@ -15,7 +15,23 @@ pub struct TrafficFactor {
 /// The nearest TCAS target inside 6 nm and ±1,500 ft; `None` = no factor.
 /// Reads the sim's TCAS arrays, which any traffic source (LiveTraffic,
 /// default AI aircraft) populates — ATC narrates traffic, never controls it.
+///
+/// While our own fleet flies ([`traffic_picture`]) the factor is ITS
+/// nearest aircraft, from our position and heading (the reads the monitor's
+/// snapshot already made this tick): the sim's TCAS holds the same aircraft
+/// once the plugin draws them, and every traffic read is the one picture.
 pub async fn nearest_traffic_factor(xp: SimView<'_>) -> Option<TrafficFactor> {
+    if let Some(picture) = traffic_picture() {
+        let (Ok(lat), Ok(lon), Ok(ele_m), Ok(hdg)) = (
+            xp.get_float(datarefs::LATITUDE).await,
+            xp.get_float(datarefs::LONGITUDE).await,
+            xp.get_float(datarefs::ELEVATION_M).await,
+            xp.get_float(datarefs::TRUE_HEADING_DEG).await,
+        ) else {
+            return None;
+        };
+        return factor_from_picture(lat, lon, ele_m * 3.28084, hdg, &picture);
+    }
     let bear = xp
         .get_float_array("sim/cockpit2/tcas/indicators/relative_bearing_degs")
         .await
@@ -35,6 +51,26 @@ pub async fn nearest_traffic_factor(xp: SimView<'_>) -> Option<TrafficFactor> {
         .get_float_array(datarefs::TCAS_WOW)
         .await
         .unwrap_or_default();
+    select_traffic_factor(&dist, &bear, &alt, &wow)
+}
+
+/// [`nearest_traffic_factor`] over a picture of targets, from our position
+/// (feet MSL) and true heading: the same selection as the sim's indicator
+/// arrays ([`select_traffic_factor`]), slot 0 standing for us.
+pub(super) fn factor_from_picture(
+    lat: f64,
+    lon: f64,
+    alt_ft: f64,
+    hdg_deg: f64,
+    picture: &[TcasTarget],
+) -> Option<TrafficFactor> {
+    let (mut dist, mut bear, mut alt, mut wow) = (vec![0.0], vec![0.0], vec![0.0], vec![0.0]);
+    for t in picture {
+        dist.push(crate::nav::haversine_nm(lat, lon, t.lat, t.lon) * 1852.0);
+        bear.push((crate::nav::bearing_deg(lat, lon, t.lat, t.lon) - hdg_deg).rem_euclid(360.0));
+        alt.push((t.ele_ft - alt_ft) / 3.28084);
+        wow.push(if t.on_ground { 1.0 } else { 0.0 });
+    }
     select_traffic_factor(&dist, &bear, &alt, &wow)
 }
 

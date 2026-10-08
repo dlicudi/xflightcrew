@@ -24,10 +24,43 @@ pub struct TcasTarget {
     pub vs_fpm: f64,
 }
 
+/// Our own AI traffic as the TCAS picture, while the fleet flies
+/// (`XCOPILOT_TRAFFIC=ours`): published by the crew's traffic link every
+/// monitor tick, `None` otherwise. The field's: `install` and `uninstall`
+/// clear it ([`TrafficStrips`]), and the link publishes it again.
+pub(crate) static TRAFFIC_PICTURE: Mutex<Option<Vec<TcasTarget>>> = Mutex::new(None);
+
+/// The crew's traffic link publishes its fleet as the TCAS picture
+/// (`None`: the fleet does not fly, the sim's TCAS is the picture).
+pub fn publish_traffic_picture(picture: Option<Vec<TcasTarget>>) {
+    *TRAFFIC_PICTURE.lock().unwrap_or_else(|e| e.into_inner()) = picture;
+}
+
+/// Our own traffic, as the crew may see it: every aircraft of the fleet as
+/// a TCAS target (ours not in it); `None` while the fleet does not fly.
+pub fn traffic_picture() -> Option<Vec<TcasTarget>> {
+    TRAFFIC_PICTURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// THE traffic picture, for every reader in the crew and the station: our
+/// own fleet while it flies ([`traffic_picture`]: the plugin puts the same
+/// aircraft in the sim's TCAS slots, so reading both would count each
+/// twice), else the sim's TCAS table. The only caller of the sim read.
+pub async fn targets(xp: SimView<'_>) -> Vec<TcasTarget> {
+    match traffic_picture() {
+        Some(picture) => picture,
+        None => read_tcas_targets(xp).await,
+    }
+}
+
 /// Read the TCAS target table (slot 0 = own ship, skipped). Targets without
 /// a flight id are dropped — a tower can't address an aircraft it can't
-/// name. Any missing array (older sim, no traffic feed) = empty.
-pub async fn read_tcas_targets(xp: SimView<'_>) -> Vec<TcasTarget> {
+/// name. Any missing array (older sim, no traffic feed) = empty. Read only
+/// through [`targets`].
+async fn read_tcas_targets(xp: SimView<'_>) -> Vec<TcasTarget> {
     let (Ok(lat), Ok(lon), Ok(ele), Ok(wow), Ok(ids)) = (
         xp.get_float_array(datarefs::TCAS_LAT).await,
         xp.get_float_array(datarefs::TCAS_LON).await,

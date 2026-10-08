@@ -110,6 +110,8 @@ mod yoke;
 // Test-only (the file's own `#![cfg(test)]`), as `free_nose_replay` above.
 mod test_support;
 mod tools;
+mod traffic_link;
+mod traffic_sink;
 mod tts;
 #[cfg(feature = "onnx-tts")]
 mod tts_onnx;

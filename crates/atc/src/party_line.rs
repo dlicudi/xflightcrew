@@ -926,10 +926,13 @@ impl GoAroundOrders {
 ///   new flight's station, armed for the main loop.
 /// - `load_region` / `spawn_taxi_net_load` / `spawn_ils_load`: the world's
 ///   data, loaded when the crew installs a station.
+/// - `publish_traffic_picture`: our own fleet as the TCAS picture, per
+///   monitor tick while it flies (`None` when it does not).
 pub use crate::station::{
     arm_new_flight, arm_new_flight_at, arm_new_flight_enroute, arm_station_for_freq,
     begin_uncontrolled_arrival, end_arrival, load_region, note_aircraft, note_aircraft_state,
-    pin_arrival_station, set_surface_wind, spawn_ils_load, spawn_taxi_net_load,
+    pin_arrival_station, publish_traffic_picture, set_surface_wind, spawn_ils_load,
+    spawn_taxi_net_load,
 };
 
 /// World READS: what the station holds, asked by the crew. Nothing here
@@ -945,12 +948,14 @@ pub use crate::station::{
 ///   `climb_announced`, `dialect_for`.
 /// - Phraseology, pure: `spoken_airport`, `spoken_taxiway`, `spoken_stand`,
 ///   `first_designator`, `reciprocal_end`.
+/// - Our own traffic, the ONE way the crew sees it: `traffic_picture`; the
+///   installed field it flies at: `installed_icao`.
 pub use crate::station::{
     active_field, active_icao, active_station_in_range, active_station_range_nm, climb_announced,
     coach_query, coach_yes_no, departure_station, dialect_for, field_position, field_under,
-    fields_in_box, fields_in_range, first_designator, freq_query, is_radio_call, reciprocal_end,
-    region_loaded, spoken_airport, spoken_stand, spoken_taxiway, suggest_call, tuned_controller,
-    tuned_station,
+    fields_in_box, fields_in_range, first_designator, freq_query, installed_icao, is_radio_call,
+    reciprocal_end, region_loaded, spoken_airport, spoken_stand, spoken_taxiway, suggest_call,
+    traffic_picture, tuned_controller, tuned_station,
 };
 
 /// The station's TYPES the crew names: the `Station` the command loop owns

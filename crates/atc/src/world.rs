@@ -40,8 +40,16 @@ pub use crate::station::{
     traffic_tick, TrafficCall, TrafficOrder, TrafficReply, TrafficTarget,
 };
 
-/// Traffic: the TCAS read, the near-miss and the traffic advisory.
+/// Audits for tests and the traffic harness, never decisions: the book's
+/// incompatible claims (`runway_conflicts`, empty on a clean field) and the
+/// compliance watch run over a traffic strip as an oracle that must stay
+/// silent (`traffic_compliance_oracle`).
+pub use crate::station::{runway_conflicts, traffic_compliance_oracle};
+
+/// Traffic: THE traffic picture (`targets`: our own fleet while it flies,
+/// else the sim's TCAS; every read goes through it), the near-miss and the
+/// traffic advisory.
 pub use crate::station::{
-    advisory_line, is_near_miss, near_miss_line, nearest_traffic_factor, read_tcas_targets,
+    advisory_line, is_near_miss, near_miss_line, nearest_traffic_factor, targets,
     traffic_worth_recalling, TcasTarget, TrafficFactor,
 };

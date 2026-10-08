@@ -165,6 +165,11 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/tiller_max_deg",
     "xcopilot/tiller_method",
     "xcopilot/tiller_phases",
+    // Our own traffic (stage D): listed so a plugin without them is SAID at
+    // boot ("out of date"), never fatal; written only under XCOPILOT_TRAFFIC=ours.
+    "xcopilot/traffic/enable",
+    "xcopilot/traffic/frames",
+    "xcopilot/traffic/roster",
     "xcopilot/typed",
     "xcopilot/typed_age",
     "xcopilot/yoke_method",

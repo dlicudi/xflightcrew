@@ -240,7 +240,7 @@ impl Station {
             let armed_at = hold_armed_at(
                 held.as_ref(),
                 &self.runway_in_use.clone().unwrap_or_default(),
-                Instant::now(),
+                self.reply_now(),
             );
             // So is the traffic it was held for: asking again names nobody new.
             let held_for = held
@@ -253,7 +253,7 @@ impl Station {
                 runway_ident: self.runway_in_use.clone().unwrap_or_default(),
                 clear_since: None,
                 armed_at,
-                logged_at: Instant::now(),
+                logged_at: self.reply_now(),
                 // A hold issued FROM the runway is already sequenced: the
                 // conditional/plain line-up put us there, so the watch owes a
                 // release, not another line-up.

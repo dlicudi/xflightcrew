@@ -386,7 +386,7 @@ pub(super) fn on_independent_final(t: &TcasTarget, rwy: &nav::Runway, runways: &
 /// A parallel runway's stream is not your traffic — the same Heathrow lesson
 /// `final_traffic_for` already encodes for the release watch.
 pub async fn inbound_traffic_for_strip(xp: SimView<'_>, ident: &str) -> Option<f64> {
-    let targets = read_tcas_targets(xp).await;
+    let targets = targets(xp).await;
     inbound_final_for_strip(&targets, ident)
 }
 

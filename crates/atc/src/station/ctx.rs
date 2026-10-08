@@ -92,7 +92,7 @@ impl Station {
         // Restricted to the strip in use: the runway-blind version held a
         // Heathrow 09R departure for the 09L stream, indefinitely
         // (2026-07-10).
-        let targets = read_tcas_targets(xp).await;
+        let targets = targets(xp).await;
         let now = Instant::now();
         // The FIELD's facts, ours to write: the ghost memory, the wind the
         // tower worked with and the pressure it gave (a traffic call's ctx
@@ -177,7 +177,7 @@ impl Station {
             .and_then(|nearest| ids.iter().find(|(cs, _)| cs == nearest))
             .map(|(_, who)| *who);
         let wake_secs_left = if on_ground {
-            wake_remaining(&ident, Instant::now())
+            wake_remaining(&ident, now)
         } else {
             None
         };

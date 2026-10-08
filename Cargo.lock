@@ -3326,6 +3326,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "traffic",
  "tungstenite",
  "whisper-rs",
 ]

@@ -396,3 +396,208 @@ Increment 3 (`schedule.rs`):
   plus 15 per knot on the ground (capped 2,300), 2,300 in the air, only with the engines flag.
 - **TCAS**: `XPMPMultiplayerEnable` on enable; when another plugin holds the slots, its name
   is in the status and the callback retries in the flight loop when they are freed.
+
+### Bin side (steps 7 to 10)
+
+Increment 7 (`src/traffic_link.rs`, the headless harness):
+- **`Link { fleet, due, next_id, tower_name, tower_runway }`**, `Link::tick(own: Option<&OwnState>,
+  dt, now) -> TickOut { tower, transmissions, events, spawned }` in the spec's order: spawn
+  what is due, read every flight's `traffic_order` ONCE per tick (level-triggered, so the
+  substeps of one tick share it), step, note every state, post the calls, tick every runway
+  watch. `drain_calls(&mut Station)` is the command loop's half. `OwnState` is ours from the
+  snapshot (raw callsign, position, feet MSL, vs).
+- **The order map** (`map_order`): `follow` that is ours is `None` (no traffic id); a
+  CONDITIONAL line-up (`line_up_condition == Some(false)`) is held short as `TaxiCleared`
+  until the arrival is past; the taxi-in clearance (the FSM goes `Parked` with a route to a
+  stand, `to_stand`) is `TaxiCleared`.
+- **Calls name the TOWER's runway** (the order's, else the plan's) and the field ("Malaga
+  Tower, ..."), and every movement spawns for the runway the tower last cleared anyone for:
+  an airborne route is planned once for one runway, so an arrival with none known yet waits
+  up to 120 s (`ARRIVAL_WAIT_S`) for one, then takes the field's default. An ordered go-around
+  is acknowledged by its readback only (the fleet's own "going around" would say it twice).
+  A refused spawn retries every 30 s, ten times.
+- **Traffic crate words** (`Call::text`): "base leg" (the parser needs pattern context for
+  "base"), "runway vacated, request taxi to parking" (one call off the runway; the tower answers
+  with the stand), and a readback that already names the flight is said as it is (the tower's
+  phrasing ends with the callsign).
+- **atc, three changes the harness found**: (1) the reply path's clock is the CALL's
+  (`TrafficCall.state.at`; `Station.reply_at` set only inside `answer_traffic`,
+  `reply_now()`): the takeoff hold's `armed_at`, its log stamp and the context's wake gate
+  (`ctx_for_call` now uses its `now`) read the producer's time, so a fleet on a fake clock is
+  held and released on that clock; ours is unchanged (`None` is the wall clock). (2) A TRAFFIC
+  strip known airborne claims nothing with `TakeoffCleared` (it keeps the clearance until 12 nm
+  out and closed the field behind it); ours is unchanged, pinned by
+  `the_runway_book_answers_as_the_functions_it_replaced`. (3) Two audits for tests and the
+  harness, never decisions: `world::runway_conflicts(own)` (two flights holding one strip
+  whole, or a takeoff on a strip another stands on; a conditional line-up beside the landing it
+  waits for is NOT a conflict unless it stands on the strip while that landing is airborne) and
+  `world::traffic_compliance_oracle(id, now)`.
+- **The harness runs in its own process**: a station installs process-wide statics the crew's
+  2,000 tests read, so `a_field_hour_against_the_real_station` re-runs the test binary on the
+  ignored `a_field_hour_inner` with `XVL_TRAFFIC_HARNESS=1` (the inner tests return at once
+  without it; `XVL_TRAFFIC_TRACE=1` prints the frequency). The station's taxi network is loaded
+  with `spawn_taxi_net_load` and waited for. Our aircraft is not in the harness picture.
+- **Measured**: XTST (generated, `Normal`, seed 7) 9 movements (2 departures, 1 circuit
+  aircraft of 2 laps, 6 arrivals), all completed in 3,955 s (2 left the area, 7 parked), 47
+  calls, 12 readbacks all accepted (accepted = the strip no longer owes it), 0 conflicts, the
+  oracle silent, 1 go-around (the tower's: a departure on the runway). The real LEMG
+  (`real_install_lemg_traffic_hour`, ignored) 12 movements (6 each way), all completed in
+  4,161 s, 14 readbacks accepted, 0 conflicts, oracle silent, no go-around.
+- **World sweep** (`real_install_traffic_world_sweep`, ignored, `XVL_TRAFFIC_SWEEP_N`,
+  default 20): 150 towered fields, ten minutes each, 985 movements, 1,223 calls, no panic.
+  Found and NOT fixed (step 11 watches): traffic taxiing onto a runway without a crossing
+  clearance (ULMM 31, EFKU 15, UEMH 09: the oracle's "you are on runway ... without clearance"
+  in `TaxiOut`), and a takeoff cleared on a strip another flight stands on (ULMM 13, BIEG 03
+  with a flight on 21): the taxi route and the vacate cross or ride a runway the book then
+  reads as occupied.
+
+Increment 8 (monitor wiring, `world::targets`, the reinstall rule, settings):
+- **`XCOPILOT_TRAFFIC=off|real|ours`, DEFAULT `off`** until the plugin draws ours (step 11;
+  the spec's "ours, the default" waits for it). `off` and `real` are both today's behaviour
+  until step 12 retires the ghost ticks under `ours` and silences them under `off`.
+  `XCOPILOT_TRAFFIC_DENSITY=off|light|normal` (default `normal`) and `XCOPILOT_TRAFFIC_FILE`
+  (empty = generated) are registry settings (`settings::ALL`: `traffic`, `traffic_density`,
+  `traffic_file`, env-pinned, persisted), so the terminal, the panel and the EFB see them; a
+  change of density or file is taken by the next field's link.
+- **`TrafficWorld` in `WorldTick`** (`world_tick::WorldTick::traffic_link`, called from the
+  monitor right after the runway watch, ahead of `quiet`): nothing at all unless
+  `XCOPILOT_TRAFFIC=ours`, ATC is on and a station is installed (`wanted_field`); the moment
+  any stops being true the link is dropped (every strip it opened retired, the picture
+  withdrawn, blackboxed `stand_down`). The field is built OFF the tick on a `traffic-field`
+  thread (`FieldModel::load` is two apt.dat scans, then CIFP and the schedule), the tick polls
+  it. The field is the INSTALLED station's ICAO: a new `party_line::installed_icao()`
+  (`ACTIVE_ICAO`, a `FieldFacts` static from the owner's `set_procedures`; `active_icao`
+  needs the region index, which `XCOPILOT_ATC_REGION=off` never loads).
+- **Frozen**: the monitor already skips the whole tick in replay and pause (its own
+  `IS_IN_REPLAY` / `PAUSED` gate, the same as `sim_frozen`), so the fleet is not ticked then;
+  the clock is `sim/time/total_running_time_sec` (`datarefs::TOTAL_RUNNING_TIME_SEC`, read with
+  `ELEVATION_M` in one join only while the fleet flies; a failed read is no time), clamped by
+  the `SimClock`. Above 1.2x (`climb_watch::sim_speed_now()`, the monitor's own read) the fleet
+  freezes, blackboxed `traffic` `frozen` once per spell (it is SAID in step 9).
+- **Our aircraft in the picture** is keyed `OWNSHIP` (the tower names us by `FlightId::Own`,
+  never by it), true feet MSL from `ELEVATION_M` (the snapshot's `alt_ft` is the altimeter's).
+- **The next hour**: a generated schedule is extended by another `HORIZON_S` (seed = the hour)
+  once the last one is spent; the pilot's file is flown once.
+- **The reinstall rule** is in `Link::tick`: a flight noted last tick whose strip is gone (we
+  retire only what we despawn) means an install under us; every aircraft not parked leaves
+  (`TickOut.left_frequency`, blackboxed `despawn` `reinstalled`), the parked stay and their
+  strips reopen at the next note. A new field (`installed_icao` changes) is a new link.
+- **One traffic picture**: `world::targets(xp)` (atc `tcas.rs`) returns
+  `party_line::traffic_picture()` while the fleet flies, else the sim's TCAS; the raw read is
+  private to `tcas.rs` and the station's own reads (`build_ctx`, `inbound_traffic_for_strip`)
+  go through it too. `nearest_traffic_factor` under the picture computes the factor from our
+  position and heading (`factor_from_picture`, the same selection). The picture is a
+  `TrafficStrips` static (`TRAFFIC_PICTURE`), so an install clears it and the link republishes
+  it every tick. Pinned by `every_tcas_read_goes_through_world_targets` (no
+  `read_tcas_targets` or `TCAS_FLIGHT_ID` outside `tcas.rs`).
+- **`drain_traffic_calls`** (`src/main/station_work.rs`, after `sync_tower`): only under
+  `ours`; the replies are spoken in step 9.
+- **Blackbox kind `traffic`**, one record per fact: `up`, `stand_down`, `file_refused`,
+  `frozen`, `spawn` (id, callsign, type, plan, runway), `despawn` (id, reason), `phase`,
+  `touchdown`, `call` (id, callsign, text), `order` (a change of the tower state or runway on
+  the order view), `tower` (a line from a traffic flight's runway watch). The station's answers
+  are its own `atc` `route: traffic` records.
+
+Increment 9 (speech):
+- **The frequency is a queue in the voice** (`Voice::overhear(speaker, text, made)`, an
+  `Inner` field, never a static): the fleet's calls in their flight's ghost voice
+  (`StationSpeaker::Ghost { seed: station_voice_seed(callsign) }`, the party line's hash), the
+  tower's runway-watch lines and its answers to traffic calls in the tower's voice. Both threads
+  feed it (the monitor its tick's lines, the command loop the answers via
+  `traffic_link::overhear_replies`) and it keeps the order the lines were MADE: an answer is
+  stamped 1 ms after the call it answers (`TrafficCall.state.at`), so it never airs first
+  whichever thread got there first. An accepted readback says nothing.
+- **`Voice::pump_overheard(now, pilot_line_pending)`**, per monitor tick (in
+  `WorldTick::traffic_link`, with `pollers::command_waiting()`): tuned elsewhere than the TOWER
+  the lines are the void (dropped, never saved; unknown tuning fails open, as the arbiter);
+  under our PTT (`Voice::held`) or a pilot's line waiting they go back 3 to 5 s (by the line's
+  hash); older than 8 s (`OVERHEARD_STALE_S`) they are dropped; the rest air as an OVERHEARD
+  exchange (never the controller's last word to us, so "say again" never repeats it) with a
+  `stale_by` of made + 8 s (the radio's dequeue drops one that waited past it), mirrored to the
+  panel dimmed (`~GHOST:`, `~TWR:`), each one blackboxed `said` by the voice. The fleet never
+  waits on any of it: its calls went to the station when they were made.
+- The fast-forward freeze is SAID once per spell by the copilot ("The traffic holds while the
+  sim runs fast.").
+- Tests are on a voice with no speaker threads (`threadless`): the order made, the overheard
+  flag and the 8 s perish, the PTT and pilot-line retry then the stale drop, the tower-only rule.
+- Not done: a per-field call rate cap (the spec's "speech flood" risk); the stale drop and the
+  one frequency are the only limits so far.
+
+Increment 10 (the app half of the wire):
+- **`traffic::wire`** (`crates/traffic/src/wire.rs`, pure): `encode_roster(seq, entries)`,
+  `encode_frames(seq, sim_time_s, entries)`, `roster_entry(ac)`, `frame_entry(ac)`, and
+  `decode_roster` / `decode_frames` for tests and tools (the plugin is the one reader). The
+  layout is the plugin's `plugin/src/traffic_wire.h`, byte for byte (see "Wire (as built)").
+  A buffer is cut at the plugin's 16 KB (`MAX_ROSTER` 341, `MAX_FRAMES` 409 aircraft); strings
+  are cut, never overrun (ASCII, else `?`); a heading of 360 is 0; numbers are clamped to
+  their field; a non-finite value goes out as 0 (the plugin refuses a non-finite position
+  whole).
+- **What an aircraft says on it**: airline = the callsign's first three letters when they are
+  followed by a figure (`EZY4069`), none for a registration; squawk 7000 in the circuit (and
+  parked), else `2` and the id's three octal figures; mode S 0 (the plugin picks); livery empty;
+  engines running from the beacon (lit for the taxi call) until it parks; no spoiler or reverser
+  in v1.
+- **`TrafficSink`** (`src/traffic_sink.rs`): started with the first link on the monitor's
+  runtime; `publish(fleet, sim_time_s)` hands the LATEST packet to a detached writer over a
+  `tokio::sync::watch` (a frame the writer had no time for is replaced, never queued); the
+  roster's sequence moves only when who is flying changes and is written then, the frames
+  every round, at most one round per 250 ms (so 3 Hz at the monitor's default rate, never
+  over 4). `xcopilot/traffic/enable` is 1 while the fleet flies; `withdraw()` at a stand-down
+  writes an empty roster and 0. A failed write (a plugin without the datarefs) backs off
+  10 s. `set_data` (base64, the `xcopilot/fms/route` path) for the two data datarefs,
+  `set_int` for enable. Frames' sim time is the `total_running_time_sec` the fleet stepped to.
+  `/labels` is left at the plugin's default (0).
+- **`health::PLUGIN_DATAREFS`** lists `xcopilot/traffic/enable`, `/frames`, `/roster`: a plugin
+  without them is SAID at boot ("out of date", a caution) and is never fatal; nothing writes
+  them unless `XCOPILOT_TRAFFIC=ours`. (The test that every `xcopilot/` literal is listed
+  requires the listing in any case.)
+
+### Wire (as built)
+
+Golden bytes, `traffic::wire::tests::the_golden_bytes` (and the same bytes from an independent
+Python `struct.pack` of the header's layout). The plugin's `plugin/test/traffic_wire_test.cpp`
+must decode exactly these.
+
+Roster, `encode_roster(7, ..)`, 104 bytes: header version 1, count 2, seq 7; entry 1: id 1,
+mode S 0, squawk 7000, reserved 0, type `C172`, airline empty, livery empty, callsign
+`G-ABCD`; entry 2: id 258, mode S `0xabcdef`, squawk 2341, reserved 0, type `A320`, airline
+`EZY`, livery `EZY`, callsign `EZY12AB`.
+
+```
+01000200070000000100000000000000581b0000433137320000000000000000000000000000000000000000472d4142434400000000000002010000efcdab002509000041333230455a5900455a5900000000000000000000000000455a59313241420000000000
+```
+
+Frames, `encode_frames(42, 1234.5, ..)`, 96 bytes: header version 1, count 2, seq 42, sim
+time 1234.5; entry 1: id 1, alt 1000.0 ft, lat 36.5, lon -4.25, heading 90.00, pitch 2.50,
+roll -10.00, gs 85.5 kt, vs -500 fpm, gear 1 (255), flaps 0.5 (128), spoiler 0, reverser 0,
+lights `0x0f` (nav, beacon, strobe, landing), flags `0x02` (engines); entry 2: id 258, alt
+25.0 ft, lat -33.75, lon 151.125, heading 359.99, pitch 0, roll 0, gs 0, vs 0, gear 255,
+flaps 0, spoiler 255, reverser 255, lights `0x11` (nav, taxi), flags `0x03` (on the ground,
+engines).
+
+```
+010002002a00000000000000004a93400100000000007a44000000000040424000000000000011c02823fa0018fc57030cfeff8000000f02020100000000c8410000000000e040c00000000000e462409f8c0000000000000000ff00ffff1103
+```
+
+### What step 11 (the live test) must watch
+
+- `XCOPILOT_TRAFFIC=ours` in the `.env` (the default is `off`), ATC on, a station installed
+  with `set_procedures` (both of the bin's install paths do): blackbox `traffic` `up` names
+  the field and the movement count; `spawn`, `phase`, `call`, `order`, `tower`, `despawn`
+  follow. `atc` `route: traffic` records are the station's answers.
+- The plugin's `xcopilot/traffic/status` (`roster_seq`, `frame_seq`, `errors=0`,
+  `drawn=N`, `tcas=ours`): `frame_seq` should climb about 3 a second at the monitor's 3 Hz.
+  `api_load` for the added requests (one roster on change, one frames write per tick, plus
+  the two reads of the link: running time and elevation).
+- The frequency: our traffic only on the TOWER, ghost voices per callsign, the tower's
+  answers after the calls, nothing over a PTT, nothing older than 8 s; listen for a crowd at
+  a busy hour (there is no rate cap yet).
+- Our own aircraft in the tower's picture (`OWNSHIP`, true MSL): a traffic departure held
+  for us on final, a traffic arrival sent round for us on the runway. OUR departure, once
+  airborne, still holds the strip by its `TakeoffCleared` until our next call (only traffic
+  strips lapse when airborne): watch traffic holding behind our own climb-out.
+- The world sweep's findings: traffic taxiing onto a runway without a crossing clearance and
+  a takeoff cleared on a strip another flight stands on (ULMM, BIEG, EFKU, UEMH); fields with
+  runway crossings on the taxi routes are where to look.
+- Time acceleration freezes the fleet (said once); a reinstall (region switch, ATC toggle)
+  sends every moving aircraft off the frequency (`despawn` `reinstalled`).

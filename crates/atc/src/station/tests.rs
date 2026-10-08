@@ -3781,6 +3781,7 @@ fn lxgb() -> Station {
         procedures: None,
         sid_exits: Default::default(),
         last_qnh: None,
+        reply_at: None,
     }
 }
 

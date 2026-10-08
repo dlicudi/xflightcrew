@@ -40,6 +40,9 @@ pub const IS_IN_REPLAY: &str = "sim/time/is_in_replay";
 /// its clamp against a frozen airspeed and surges on unpause), and the crew /
 /// world watches have nothing to react to. See `xplane::sim_frozen`.
 pub const PAUSED: &str = "sim/time/paused";
+/// Seconds the sim has run (it stops with a pause): our own traffic's
+/// clock (`traffic::SimClock`), so the fleet moves on the sim's time.
+pub const TOTAL_RUNNING_TIME_SEC: &str = "sim/time/total_running_time_sec";
 /// Height above the terrain directly below, in METERS (× 3.28084 for feet).
 pub const AGL_METERS: &str = "sim/flightmodel/position/y_agl";
 pub const LATITUDE: &str = "sim/flightmodel/position/latitude";

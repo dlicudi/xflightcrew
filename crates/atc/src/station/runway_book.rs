@@ -129,9 +129,16 @@ impl RunwayBook {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .map(|c| (c.state, c.runway_ident.clone(), c.holds_runway));
+        // A traffic flight known to be flying has USED its takeoff
+        // clearance, which holds the strip no more (it keeps the clearance
+        // until it leaves the area, 12 nm out: held whole all that way, it
+        // closed the field behind it). Ours is unchanged: our next call
+        // moves our clearance on.
+        let airborne = !e.strip.is_own() && e.state.is_some_and(|s| !s.on_ground);
         if let Some((state, ident, held)) = &clr {
             let kind = match state {
                 tower::State::LinedUp => Some((ClaimKind::LineUp, true)),
+                tower::State::TakeoffCleared if airborne => None,
                 tower::State::TakeoffCleared => Some((ClaimKind::Takeoff, true)),
                 // A landing reported vacated claims nothing.
                 tower::State::ClearedToLand if *held => Some((ClaimKind::Landing, true)),
@@ -241,7 +248,6 @@ impl RunwayBook {
     }
 
     /// Every claim in the book.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn claims(&self) -> &[Claim] {
         &self.claims
     }
@@ -434,4 +440,68 @@ pub(super) fn own_strip_claim() -> Option<(String, bool)> {
 pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bool {
     let own = AircraftState::at_position(lat, lon, true, gs_kts);
     RunwayBook::now(Some(own)).occupancy_authorised(FlightId::Own)
+}
+
+/// The book's own audit: every pair of flights whose claims on ONE strip
+/// cannot stand together now, described ("Traffic(1) Takeoff 09 / Traffic(2)
+/// Occupying 09"), with our state where the caller holds it. Two flights
+/// each holding the whole strip (lined up, cleared for takeoff, cleared to
+/// land and not reported off), or one cleared for takeoff on a strip
+/// another stands on. Empty is a clean book. A read for tests and the
+/// traffic harness (a field hour has zero), never a decision.
+pub fn runway_conflicts(own: Option<AircraftState>) -> Vec<String> {
+    let book = RunwayBook::now(own);
+    let whole = |c: &Claim| {
+        c.whole_strip
+            && matches!(
+                c.kind,
+                ClaimKind::Landing | ClaimKind::LineUp | ClaimKind::Takeoff
+            )
+    };
+    let same_strip = |a: &Claim, b: &Claim| {
+        matches!(
+            (strip(&book.runways, &a.end), strip(&book.runways, &b.end)),
+            (Some(x), Some(y)) if std::ptr::eq(x, y)
+        )
+    };
+    let mut out = Vec::new();
+    let claims = book.claims();
+    for (i, a) in claims.iter().enumerate() {
+        for b in &claims[i + 1..] {
+            let (Claimant::Strip(fa), Claimant::Strip(fb)) = (&a.who, &b.who) else {
+                continue;
+            };
+            if fa == fb || !same_strip(a, b) {
+                continue;
+            }
+            // "Behind the landing traffic, line up": a conditional line-up
+            // stands beside the landing it waits for, so long as it is not
+            // ON the strip while that landing is still in the air.
+            let conditional =
+                |x: &Claim, y: &Claim| x.kind == ClaimKind::LineUp && y.kind == ClaimKind::Landing;
+            let on_strip = |f: &FlightId| {
+                claims
+                    .iter()
+                    .any(|c| c.who == Claimant::Strip(*f) && c.kind == ClaimKind::Occupying)
+            };
+            let flying = |f: &FlightId| book.states.iter().any(|(id, s)| id == f && !s.on_ground);
+            let lined_up_under = |x: &Claim, fx: &FlightId, y: &Claim, fy: &FlightId| {
+                conditional(x, y) && on_strip(fx) && flying(fy)
+            };
+            let both_whole = whole(a)
+                && whole(b)
+                && !((conditional(a, b) && !lined_up_under(a, fa, b, fb))
+                    || (conditional(b, a) && !lined_up_under(b, fb, a, fa)));
+            let rolls_into = |x: &Claim, y: &Claim| {
+                x.kind == ClaimKind::Takeoff && y.kind == ClaimKind::Occupying
+            };
+            if both_whole || rolls_into(a, b) || rolls_into(b, a) {
+                out.push(format!(
+                    "{fa:?} {:?} {} / {fb:?} {:?} {}",
+                    a.kind, a.end, b.kind, b.end
+                ));
+            }
+        }
+    }
+    out
 }

@@ -575,3 +575,41 @@ fn a_retired_traffic_flight_leaves_the_station() {
     assert!(!st.desks.contains_key(&FlightId::Traffic(11)));
     Station::uninstall();
 }
+
+/// While our fleet flies, its picture IS the traffic: published, read back
+/// whole, cleared by an install; the advisory's factor is its nearest
+/// airborne aircraft, by our heading (a parked one is no factor).
+#[test]
+fn the_fleet_picture_is_the_one_traffic_picture() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let st = gatwick_live();
+    let target = |cs: &str, lat: f64, lon: f64, ele_ft: f64, on_ground: bool| TcasTarget {
+        callsign: cs.into(),
+        lat,
+        lon,
+        ele_ft,
+        on_ground,
+        vs_fpm: 0.0,
+    };
+    assert!(traffic_picture().is_none(), "no fleet, the sim's TCAS");
+    publish_traffic_picture(Some(vec![
+        target("N1", 51.20, -0.20, 2000.0, false),
+        target("N2", 51.10, -0.15, 200.0, true),
+    ]));
+    assert_eq!(traffic_picture().map(|p| p.len()), Some(2));
+    // Two miles east of us, level, us heading north: three o'clock.
+    let f = factor_from_picture(
+        51.20,
+        -0.20 - 2.0 / 37.6,
+        2100.0,
+        0.0,
+        &traffic_picture().unwrap(),
+    )
+    .expect("the airborne one is a factor");
+    assert_eq!(f.clock, 3, "{f:?}");
+    assert!((f.nm - 2.0).abs() < 0.1, "{f:?}");
+    assert_eq!(f.ft, -100.0, "{f:?}");
+    st.install();
+    assert!(traffic_picture().is_none(), "an install clears the picture");
+}
