@@ -1,0 +1,27 @@
+# A quick LEMG traffic test: something moves within seconds.
+#   XCOPILOT_TRAFFIC=ours XCOPILOT_TRAFFIC_FILE=bench/traffic/lemg-quick.yaml ./target/release/xvl
+# The departure first, so the tower has a runway in use before the arrivals call.
+- t_s: 0
+  callsign: RYR4521
+  type: B738
+  kind: departure
+- t_s: 10
+  callsign: IBE3302
+  type: A320
+  kind: arrival
+- t_s: 45
+  callsign: VLG1187
+  type: A320
+  kind: departure
+- t_s: 70
+  callsign: EZY8843
+  type: A320
+  kind: arrival
+- t_s: 120
+  callsign: ANE8012
+  type: AT76
+  kind: arrival
+- t_s: 150
+  callsign: RYR9066
+  type: B738
+  kind: departure
