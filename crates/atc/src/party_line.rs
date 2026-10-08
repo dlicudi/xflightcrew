@@ -33,7 +33,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::nav;
-use crate::station::{ClearanceSnap, Handoff, LandingHold, SquawkWatch, TakeoffHold, VectorPlan};
+use crate::station::{
+    ClearanceSnap, ComplianceFlight, Handoff, LandingHold, SquawkWatch, TakeoffHold, VectorPlan,
+};
 use crate::tower;
 
 // ---- published state (world-side writes live in station.rs) ----
@@ -230,6 +232,11 @@ flight_strip! {
             /// The go-around order was last spoken at: once per half minute is urgency,
             /// not stutter.
             go_around_last: Mutex<Option<Instant>> = Mutex::new(None),
+            /// The compliance watch's memory of this flight (ground and air history,
+            /// its runway start, its landed strip, its liftoff, the calls made once):
+            /// split from the field's `COMPLIANCE`, whose radio cooldowns stay one
+            /// per field.
+            compliance_flight: Mutex<ComplianceFlight> = Mutex::new(ComplianceFlight::NEW),
         },
     }
 }

@@ -614,6 +614,9 @@ mod tests {
         install.extend(names(&station_field));
         // New with the traffic strips (increment 5): the field's traffic.
         install.extend(names(&["STRIPS"]));
+        // Split from COMPLIANCE (increment 7), which `install` and
+        // `uninstall` overwrite: the flight part, a strip `watch` cell.
+        install.extend(names(&["COMPLIANCE_FLIGHT"]));
         assert_eq!(door_cells(INSTALL_RESETS), install, "install");
 
         let mut uninstall = install.clone();

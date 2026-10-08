@@ -213,7 +213,18 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   new crew need gets an ACCESSOR, never a `pub static`. `station` is `pub(crate)`: the crew's
   inputs, reads and types are `party_line`'s, the ticks `atc::world`'s
   (`the_station_is_reached_only_through_the_seam`).
-- Tests touching a process-wide static hold `SIDE_STATE_LOCK`; setting the mode, `mode::TEST_LOCK`.
+- **One strip per flight** (`party_line::FlightStrip`, every cell inside its lifetime group):
+  `OWN_STRIP` ours, `STRIPS` the traffic's (cleared by install/uninstall, never by a new flight of
+  ours); the desk half (`StripDesk`, tower FSM and worksheet) per flight, a traffic desk swapped
+  in only for its synchronous answer (`Station::respond_for`, drop guard); the ticks are
+  `_for(strip, state)` cores. `FlightId::Own` is never keyed by callsign.
+- **The runway book is COMPUTED, never stored** (`station::RunwayBook`): every strip's claim from
+  its clearance and position, plus the ghost memory; `own_strip_claim`, `player_blocked_strip`,
+  `runway_occupancy_authorised` and the holds' releases are its queries (pinned to the old
+  functions by `the_runway_book_answers_as_the_functions_it_replaced`).
+- Tests touching a process-wide static hold `SIDE_STATE_LOCK` (a test opening a traffic strip
+  clears `STRIPS` through a drop guard, `strip_tests::ClearStrips`); setting the mode,
+  `mode::TEST_LOCK`.
 - `Station::install()` publishes side state, never `from_airport`; `uninstall()` retires it all.
 - **A mishear may earn "say again", never a clearance.** Only mayday/pan-pan lands without a final.
 - **One callsign for tower and crew** (`atc::callsign::resolve`): env > plan > tail, read through a

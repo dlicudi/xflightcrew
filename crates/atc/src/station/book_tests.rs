@@ -104,7 +104,7 @@ pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bo
         }
     }
     let (started_here, landed_here) = {
-        let w = COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner());
+        let w = OWN_STRIP.compliance_flight.lock().unwrap_or_else(|e| e.into_inner());
         (
             w.runway_start.as_deref() == Some(here.as_str()),
             w.landed_strip.as_deref() == Some(here.as_str()) && gs_kts >= LANDED_VACATING_KTS,
@@ -250,7 +250,7 @@ fn the_runway_book_answers_as_the_functions_it_replaced() {
                     *OWN_STRIP.taxi_route.lock().unwrap() = route;
                     for (start, landed) in compliance {
                         {
-                            let mut w = COMPLIANCE.lock().unwrap();
+                            let mut w = OWN_STRIP.compliance_flight.lock().unwrap();
                             w.runway_start = start.map(String::from);
                             w.landed_strip = landed.map(String::from);
                         }
@@ -344,7 +344,7 @@ fn the_runway_book_answers_as_the_functions_it_replaced() {
     // Spot checks that the matrix exercised what it names.
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
     *OWN_STRIP.taxi_to_stand.lock().unwrap() = false;
-    *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
         state: tower::State::ClearedToLand,
         callsign: "Test".into(),

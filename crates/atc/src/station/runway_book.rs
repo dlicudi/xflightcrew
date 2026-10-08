@@ -191,15 +191,17 @@ impl RunwayBook {
             held: false,
             since: None,
         };
-        let (started_here, landed_here) = if e.id == FlightId::Own {
-            let w = COMPLIANCE.lock().unwrap_or_else(|p| p.into_inner());
+        let (started_here, landed_here) = {
+            let w = e
+                .strip
+                .compliance_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             (
                 w.runway_start.as_deref() == Some(here.as_str()),
                 w.landed_strip.as_deref() == Some(here.as_str())
                     && state.gs_kts >= LANDED_VACATING_KTS,
             )
-        } else {
-            (false, false)
         };
         if started_here {
             self.claims.push(position_claim(ClaimKind::RunwayStart));

@@ -42,7 +42,8 @@ pub struct PartyExchange {
 /// behind us (the wake and departure spacing a real tower gives the next
 /// departure). Read from the compliance watch's memory of our liftoff.
 pub(super) fn own_departure_spacing(ghost_end: &str, now: Instant) -> bool {
-    let Some((ours, at)) = COMPLIANCE
+    let Some((ours, at)) = OWN_STRIP
+        .compliance_flight
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .liftoff

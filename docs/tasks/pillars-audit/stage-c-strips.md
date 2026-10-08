@@ -201,3 +201,13 @@ callsign-keyed map, single strip mutex, `Ctx` split, world_tick cadence or TCAS 
   still keeps its flight memory in `COMPLIANCE` until increment 7, so its per-strip test lands
   there. Tests: one per tick (station/tick_tests.rs), each checking the traffic strip's cells
   moved and every cell of ours stayed at rest.
+- **Increment 7**: the flight part is `ComplianceFlight` (a strip `watch` cell,
+  `compliance_flight`): the six fields the table names plus the three it leaves out that are
+  per aircraft too (`cleared_to_land_seen`, `takeoff_berated`, `landing_berated`); `COMPLIANCE`
+  keeps only the radio cooldowns (`last_call`, `zone_last`, `off_route_last`). The lifetime is
+  unchanged: `install` and `uninstall` overwrote `COMPLIANCE` and now also reset the `watch`
+  group (the door test lists `COMPLIANCE_FLIGHT`). The compliance core locks the flight cell
+  then `COMPLIANCE`, the only place both are held. The runway book reads every strip's runway
+  start and landed strip from its own cell, and the oracles in `book_tests.rs` read
+  `OWN_STRIP.compliance_flight` where they read `COMPLIANCE` (the data moved; the logic is
+  verbatim). The compliance per-strip test lands here (`tick_tests.rs`).

@@ -570,7 +570,7 @@ pub(super) fn own_json(own: Option<(f64, f64)>) -> (serde_json::Value, serde_jso
     )
 }
 
-/// The tower protects the one aircraft it controls: cleared to land (or held
+/// The tower protects the flight it has cleared: cleared to land (or held
 /// for the landing clearance), low, and a ghost on the runway that will still
 /// be there when we arrive: the clearance is cancelled out loud instead of
 /// letting the world contradict it. Crew phrasing when the pilot isn't tuned

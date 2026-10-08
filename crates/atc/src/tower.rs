@@ -1923,7 +1923,10 @@ fn ifr_correction(
 /// actually get behind it — inside this, "hold position" is the honest call.
 pub(crate) const CONDITIONAL_MIN_NM: f64 = 1.5;
 
-/// The tower's side of the dialogue: one aircraft (the player), one runway.
+/// The tower's side of the dialogue with ONE flight: its FSM and its owed
+/// readbacks, no field facts. Each flight's strip has its own on its desk
+/// (`station::StripDesk`): ours on frequency, a traffic flight's swapped in
+/// for the answer to its call (`Station::respond_for`).
 pub struct Tower {
     pub state: State,
     /// The arrival asked for a touch and go; shapes the landing clearance.

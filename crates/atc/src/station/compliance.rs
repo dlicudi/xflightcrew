@@ -31,26 +31,23 @@ pub struct ComplianceCall {
     pub crew: bool,
 }
 
-/// The compliance watch's memory between ticks.
-pub(super) struct ComplianceState {
+/// The compliance watch's memory of ONE flight between ticks: a cell of its
+/// strip (`watch`, reset by `install` and `uninstall` as the field fact it
+/// was split from), so each aircraft's ground and air history is its own.
+#[derive(Default)]
+pub(crate) struct ComplianceFlight {
     pub(super) prev_on_ground: Option<bool>,
-    /// Continuously airborne since — a landing accusation needs a FLIGHT
+    /// Continuously airborne since: a landing accusation needs a FLIGHT
     /// first. A one-sample unstick during the takeoff roll (0.3 ft AGL for
     /// one tick at 83 knots, Jerez 2026-07-11) read as air-then-ground and
     /// earned "you landed without clearance" mid-departure.
     pub(super) airborne_since: Option<Instant>,
-    /// Last violation call of any kind — one thing at a time on frequency.
-    pub(super) last_call: Option<Instant>,
-    /// When the tower state was last seen at ClearedToLand — grace for the
+    /// When the tower state was last seen at ClearedToLand: grace for the
     /// rollout and vacating after a legal landing.
     pub(super) cleared_to_land_seen: Option<Instant>,
     /// Each transition violation is called once, not every tick.
     pub(super) takeoff_berated: bool,
     pub(super) landing_berated: bool,
-    pub(super) zone_last: Option<Instant>,
-    /// Last off-route taxi challenge — its own cooldown; wandering is a
-    /// nudge, not a violation.
-    pub(super) off_route_last: Option<Instant>,
     /// The strip (its `ident_a`) the aircraft stood on at the last ground
     /// tick, `None` off every runway, airborne or before the first tick.
     pub(super) prev_strip: Option<String>,
@@ -73,20 +70,36 @@ pub(super) struct ComplianceState {
     pub(super) liftoff: Option<(String, Instant)>,
 }
 
-impl ComplianceState {
-    pub(super) const NEW: ComplianceState = ComplianceState {
+impl ComplianceFlight {
+    pub(crate) const NEW: ComplianceFlight = ComplianceFlight {
         prev_on_ground: None,
         airborne_since: None,
-        last_call: None,
         cleared_to_land_seen: None,
         takeoff_berated: false,
         landing_berated: false,
-        zone_last: None,
-        off_route_last: None,
         prev_strip: None,
         runway_start: None,
         landed_strip: None,
         liftoff: None,
+    };
+}
+
+/// The compliance watch's radio cooldowns, the FIELD's: one frequency, one
+/// thing at a time on it, whichever aircraft the call is about.
+pub(super) struct ComplianceState {
+    /// Last violation call of any kind: one thing at a time on frequency.
+    pub(super) last_call: Option<Instant>,
+    pub(super) zone_last: Option<Instant>,
+    /// Last off-route taxi challenge: its own cooldown; wandering is a
+    /// nudge, not a violation.
+    pub(super) off_route_last: Option<Instant>,
+}
+
+impl ComplianceState {
+    pub(super) const NEW: ComplianceState = ComplianceState {
+        last_call: None,
+        zone_last: None,
+        off_route_last: None,
     };
 }
 
@@ -179,59 +192,62 @@ pub(super) fn compliance_tick_for(
         .as_ref()
         .map(|c| (c.state, c.callsign.clone()));
 
+    // This flight's memory, then the field's radio cooldowns (always in this
+    // order; nothing else holds both).
+    let mut f = flight.compliance_flight.lock().unwrap_or_else(|e| e.into_inner());
     let mut w = COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner());
-    let prev_ground = w.prev_on_ground.replace(on_ground);
+    let prev_ground = f.prev_on_ground.replace(on_ground);
     // How long the flight before THIS ground contact lasted (0.0 while the
     // wheels never left) — read before the touchdown resets the clock.
-    let airborne_secs = w
+    let airborne_secs = f
         .airborne_since
         .map_or(0.0, |t| now.duration_since(t).as_secs_f64());
     if on_ground {
-        w.airborne_since = None;
+        f.airborne_since = None;
         // Down: the landing-clearance coach is moot, and a stale handoff must
         // not nag on the next takeoff.
         *flight.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    } else if w.airborne_since.is_none() {
-        w.airborne_since = Some(now);
+    } else if f.airborne_since.is_none() {
+        f.airborne_since = Some(now);
     }
     // A runway start: first seen on this strip, and stopped. A taxi onto a
     // runway arrives moving, a landing arrives airborne; only the sim's own
     // placement (boot, a reposition, the first tick of a fresh station)
     // shows a stopped aircraft on a strip it was not on a tick ago.
     let here = if on_ground { strip_under(lat, lon) } else { None };
-    if here.is_none() || w.runway_start != here {
-        w.runway_start = None;
+    if here.is_none() || f.runway_start != here {
+        f.runway_start = None;
     }
-    if here.is_some() && here != w.prev_strip && gs_kts < RUNWAY_START_MAX_KTS {
-        w.runway_start = here.clone();
+    if here.is_some() && here != f.prev_strip && gs_kts < RUNWAY_START_MAX_KTS {
+        f.runway_start = here.clone();
     }
     // Our liftoff, off the strip we rolled on (see `liftoff`).
     if prev_ground == Some(true) && !on_ground {
-        if let Some(strip) = w.prev_strip.clone() {
-            w.liftoff = Some((strip, now));
+        if let Some(strip) = f.prev_strip.clone() {
+            f.liftoff = Some((strip, now));
         }
     }
     // A landing's strip is ours until we leave it (see `landed_strip`).
     if !on_ground {
-        w.landed_strip = None;
+        f.landed_strip = None;
     } else if prev_ground == Some(false) && airborne_secs >= MIN_FLIGHT_SECS {
-        w.landed_strip = here.clone();
-    } else if w.landed_strip.is_some() && here != w.landed_strip {
-        w.landed_strip = None;
+        f.landed_strip = here.clone();
+    } else if f.landed_strip.is_some() && here != f.landed_strip {
+        f.landed_strip = None;
     }
     let landed_here =
-        here.is_some() && w.landed_strip == here && gs_kts >= LANDED_VACATING_KTS;
-    w.prev_strip = here;
-    let runway_start = w.runway_start.is_some();
+        here.is_some() && f.landed_strip == here && gs_kts >= LANDED_VACATING_KTS;
+    f.prev_strip = here;
+    let runway_start = f.runway_start.is_some();
     if clr
         .as_ref()
         .is_some_and(|(s, _)| *s == tower::State::ClearedToLand)
     {
-        w.cleared_to_land_seen = Some(now);
+        f.cleared_to_land_seen = Some(now);
         // Cleared to land — the coach got what it was waiting for.
         *flight.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
-    let vacating = w
+    let vacating = f
         .cleared_to_land_seen
         .is_some_and(|t| now.duration_since(t).as_secs_f64() < VACATE_GRACE_SECS);
     let quiet = w
@@ -245,11 +261,11 @@ pub(super) fn compliance_tick_for(
         if prev_ground == Some(false)
             && on_ground
             && airborne_secs >= MIN_FLIGHT_SECS
-            && !w.landing_berated
+            && !f.landing_berated
             && *state != tower::State::ClearedToLand
         {
             if let Some(rwy) = on_active_runway_facing(lat, lon, heading_true) {
-                w.landing_berated = true;
+                f.landing_berated = true;
                 w.last_call = Some(now);
                 let rwy = atis::spoken_runway(&rwy);
                 return Some(if tuned {
@@ -274,13 +290,13 @@ pub(super) fn compliance_tick_for(
         if prev_ground == Some(true)
             && !on_ground
             && dist_nm < 5.0
-            && !w.takeoff_berated
+            && !f.takeoff_berated
             && !matches!(
                 state,
                 tower::State::TakeoffCleared | tower::State::ClearedToLand
             )
         {
-            w.takeoff_berated = true;
+            f.takeoff_berated = true;
             w.last_call = Some(now);
             return Some(if tuned {
                 ComplianceCall {

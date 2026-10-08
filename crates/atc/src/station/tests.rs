@@ -331,6 +331,7 @@ fn compliance_watch_holds_the_pilot_to_clearances() {
     }];
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     // No arrival taxi-in in play — this test's occupancy berate depends on it
     // (a prior test could leave the shared flag set).
     *OWN_STRIP.taxi_to_stand.lock().unwrap() = false;
@@ -419,6 +420,7 @@ fn compliance_watch_holds_the_pilot_to_clearances() {
     // A LEGAL landing: ClearedToLand grants the vacate grace — sitting on
     // the runway right after touchdown is not an occupancy violation.
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     OWN_STRIP.clearance.lock().unwrap().as_mut().unwrap().state = tower::State::ClearedToLand;
     assert!(compliance_tick(36.15155, -5.342, 12.0, true, 15.0, true, t4 + sec(200)).is_none());
 
@@ -427,6 +429,7 @@ fn compliance_watch_holds_the_pilot_to_clearances() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 /// Issue #63, 2026-09-26: an autoland with no landing clearance touched
@@ -486,6 +489,7 @@ fn an_uncleared_landing_is_called_at_touchdown_whoever_flies() {
     };
     let reset = |state: tower::State| {
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
         *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
             state,
             callsign: "November eight one six November November".into(),
@@ -542,6 +546,7 @@ fn an_uncleared_landing_is_called_at_touchdown_whoever_flies() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 #[test]
@@ -565,6 +570,7 @@ fn arrival_taxi_in_is_not_a_runway_incursion() {
         lon_b: -5.3366,
     }];
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
     // Down, cleared to taxi to the stand: FSM Parked, still physically on 27.
     *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
@@ -601,6 +607,7 @@ fn arrival_taxi_in_is_not_a_runway_incursion() {
     // is a runway start.)
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     let call = compliance_tick(36.15155, -5.342, 20.0, true, 5.0, true, t0 + sec(300))
         .expect("occupancy berate with the flag but no published route");
     assert!(call.line.contains("without clearance"), "{}", call.line);
@@ -609,6 +616,7 @@ fn arrival_taxi_in_is_not_a_runway_incursion() {
     // an incursion — proving the exemption, not the geometry, silenced it.
     *OWN_STRIP.taxi_to_stand.lock().unwrap() = false;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     let call = compliance_tick(36.15155, -5.342, 20.0, true, 5.0, true, t0 + sec(400))
         .expect("occupancy berate without the taxi-in flag");
     assert!(call.line.contains("without clearance"), "{}", call.line);
@@ -619,6 +627,7 @@ fn arrival_taxi_in_is_not_a_runway_incursion() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 #[test]
@@ -715,6 +724,7 @@ fn a_cleared_route_crossing_is_not_an_incursion() {
         holds_runway: false,
     });
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     // The cleared route: south to north straight across the runway at
     // lon -5.342, the crossing leg flagged as runway pavement.
     *OWN_STRIP.taxi_route.lock().unwrap() = Some(TaxiWatch {
@@ -746,6 +756,7 @@ fn a_cleared_route_crossing_is_not_an_incursion() {
     // ends NEAR the runway, never crosses): nosing onto the pavement is
     // still an incursion — the berate stands.
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     OWN_STRIP.taxi_route.lock().unwrap().as_mut().unwrap().path =
         vec![(36.1490, -5.3420), (36.1505, -5.3420)];
     assert!(compliance_tick(36.1490, -5.3420, 15.0, true, 10.0, true, t0 + sec(70)).is_none());
@@ -757,6 +768,7 @@ fn a_cleared_route_crossing_is_not_an_incursion() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
 }
 
@@ -858,6 +870,7 @@ fn off_route_stray_gets_a_fresh_route_from_present_position() {
     *ACTIVE_FIELD.lock().unwrap() = Some(("Testfield".into(), 36.0, -5.0));
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
         state: tower::State::TaxiCleared,
         callsign: "November one seven two Sierra Papa".into(),
@@ -951,6 +964,7 @@ fn off_route_stray_gets_a_fresh_route_from_present_position() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 #[test]
@@ -959,6 +973,7 @@ fn landing_handoff_clears_on_clearance_and_on_touchdown() {
     *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.1512, -5.3554));
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
         state: tower::State::Inbound,
         callsign: "November five five zero Charlie Romeo".into(),
@@ -991,6 +1006,7 @@ fn landing_handoff_clears_on_clearance_and_on_touchdown() {
     // so the next takeoff isn't nagged by a stale handoff.
     *OWN_STRIP.landing_handoff.lock().unwrap() = Some("two seven".into());
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     compliance_tick(36.1512, -5.3554, 12.0, true, 5.0, true, t0 + sec(40));
     assert!(
         crate::party_line::landing_handoff_runway().is_none(),
@@ -1001,6 +1017,7 @@ fn landing_handoff_clears_on_clearance_and_on_touchdown() {
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *OWN_STRIP.landing_handoff.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 /// LEMG 12 (2026-09-26, a 737): landed 12, stopped in the far half of
@@ -1036,6 +1053,7 @@ fn a_runway_is_named_by_the_end_the_aircraft_points_down() {
         holds_runway: false,
     });
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     let t0 = Instant::now();
     assert!(compliance_tick_facing(lat, lon, 400.0, false, 140.0, true, t0, Some(21.0)).is_none());
     let call = compliance_tick_facing(
@@ -1048,6 +1066,7 @@ fn a_runway_is_named_by_the_end_the_aircraft_points_down() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 /// Issue #108, the recorded case itself: LEMG 12/30 from apt.dat, the
@@ -1098,6 +1117,7 @@ fn the_lemg_landing_is_named_one_two_from_its_recorded_numbers() {
     *OWN_STRIP.taxi_to_stand.lock().unwrap() = false;
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     let t0 = Instant::now();
     let sec = std::time::Duration::from_secs;
     assert!(compliance_tick_facing(36.70, -4.53, 900.0, false, 146.0, true, t0, Some(hdg)).is_none());
@@ -1110,6 +1130,7 @@ fn the_lemg_landing_is_named_one_two_from_its_recorded_numbers() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 /// EGKK's two strips from apt.dat: 08R/26L and the close parallel
@@ -1157,6 +1178,7 @@ fn a_runway_start_is_lined_up_not_an_incursion() {
     *OWN_STRIP.taxi_to_stand.lock().unwrap() = false;
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     let t0 = Instant::now();
     let at = |s: f64| t0 + std::time::Duration::from_secs_f64(s);
     let (lat, lon, hdg) = (51.14768083914999, -0.19354614043732044, 256.3);
@@ -1187,6 +1209,7 @@ fn a_runway_start_is_lined_up_not_an_incursion() {
 
     // A fresh watch whose first sight is a taxi onto the strip: ordered off.
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     let call = compliance_tick_facing(lat, lon, 203.0, true, 8.0, true, at(400.0), Some(hdg))
         .expect("moving onto the strip is no runway start");
     assert!(call.line.contains("Exit the runway"), "{}", call.line);
@@ -1195,6 +1218,7 @@ fn a_runway_start_is_lined_up_not_an_incursion() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 /// Issue #124, sortie 1790534902-full_auto (EGBB-EGKK, 2026-09-27):
@@ -1213,6 +1237,7 @@ fn a_cleared_landing_holds_its_runway_until_vacated() {
     *OWN_STRIP.taxi_to_stand.lock().unwrap() = false;
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     let landed = |holds: bool, ident: &str| {
         *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
             state: tower::State::ClearedToLand,
@@ -1268,6 +1293,7 @@ fn a_cleared_landing_holds_its_runway_until_vacated() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 /// EGBB 15/33 as apt.dat has it (46 m wide).
@@ -1302,6 +1328,7 @@ fn an_uncleared_landing_still_vacates_its_own_runway() {
     *OWN_STRIP.taxi_to_stand.lock().unwrap() = false;
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     // The book at the touchdown: Inbound (held, never released).
     *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
         state: tower::State::Inbound,
@@ -1354,6 +1381,7 @@ fn an_uncleared_landing_still_vacates_its_own_runway() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 /// Issue #155, sortie 1790601822-full_auto (EGKK 08R, 2026-09-28), from
@@ -1379,6 +1407,7 @@ fn one_departure_on_the_runway_at_a_time() {
     *WAKE.lock().unwrap() = None;
     *WAKE_PREV.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *OWN_STRIP.taxi_to_stand.lock().unwrap() = false;
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
     let t0 = Instant::now();
@@ -1454,6 +1483,7 @@ fn one_departure_on_the_runway_at_a_time() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *GHOSTS.lock().unwrap() = None;
     *WAKE.lock().unwrap() = None;
     *WAKE_PREV.lock().unwrap() = None;
@@ -1497,6 +1527,7 @@ fn a_holding_point_is_not_the_runway_and_a_skip_is_not_a_landing() {
         holds_runway: false,
     });
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     let t0 = Instant::now();
     let sec = std::time::Duration::from_secs;
     // Holding short at E1 with only a taxi clearance: no occupancy call.
@@ -1533,6 +1564,7 @@ fn a_holding_point_is_not_the_runway_and_a_skip_is_not_a_landing() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
 }
 
 #[test]
@@ -7132,6 +7164,7 @@ fn off_route_taxiing_gets_a_nudge_with_the_via_line() {
         holds_runway: false,
     });
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     // The cleared route: a straight east-west line 1 km north of the
     // runway.
     *OWN_STRIP.taxi_route.lock().unwrap() = Some(TaxiWatch {
@@ -7163,6 +7196,7 @@ fn off_route_taxiing_gets_a_nudge_with_the_via_line() {
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
 }
 
@@ -7281,6 +7315,7 @@ fn fresh_station_install_arms_the_zone_grace() {
     );
     *ATIS.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *ACTIVE_PANEL.lock().unwrap() = None;
     *ACTIVE_FIELD.lock().unwrap() = None;
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
@@ -7304,6 +7339,7 @@ fn zone_challenge_on_frequency_is_published_for_the_crew() {
     ));
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *OWN_STRIP.zone_challenge.lock().unwrap() = false;
     let t0 = Instant::now();
     // Airborne, 2 nm out, 1,500 ft, tuned to the tower: the controller asks.
@@ -7349,6 +7385,7 @@ fn a_transit_answers_the_zone_challenge_and_the_watch_stands_down() {
     ));
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
     *OWN_STRIP.zone_challenge.lock().unwrap() = false;
     let t0 = Instant::now();
     let t = t0 + std::time::Duration::from_secs_f64(ZONE_COOLDOWN_SECS + 1.0);

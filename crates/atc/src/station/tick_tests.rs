@@ -339,3 +339,67 @@ fn a_traffic_position_note_moves_only_its_strip() {
     assert!(own_strip_moved().is_empty(), "{:?}", own_strip_moved());
     Station::uninstall();
 }
+
+/// The compliance watch's memory is the flight's (increment 7): a traffic
+/// strip that lands uncleared is called on its own history and leaves ours
+/// at rest; only the field's radio cooldown is shared.
+#[test]
+fn a_traffic_compliance_watch_moves_only_its_strip() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let t = traffic_on_gatwick(8);
+    *t.clearance.lock().unwrap() = Some(ClearanceSnap {
+        state: tower::State::Inbound,
+        ..cleared_to_land("26L")
+    });
+    let r = &book_runways()[0];
+    let t0 = Instant::now();
+    let (lat, lon) = crate::nav::project_latlon(r.lat_b, r.lon_b, r.heading_a_deg(), 2.0);
+    let approach = AircraftState {
+        alt_ft: 900.0,
+        ..AircraftState::at_position(lat, lon, false, 130.0)
+    };
+    assert!(compliance_tick_for(&t, &approach, true, t0).is_none());
+    let (lat, lon) = along(r, 0.5);
+    let landed = AircraftState {
+        alt_ft: 200.0,
+        psi_deg: Some(r.heading_b_deg()),
+        ..AircraftState::at_position(lat, lon, true, 60.0)
+    };
+    let call = compliance_tick_for(&t, &landed, true, t0 + std::time::Duration::from_secs(40))
+        .expect("an uncleared landing");
+    assert!(
+        call.line
+            .starts_with("Easy four five six, you landed on runway two six left"),
+        "{}",
+        call.line
+    );
+    {
+        let f = t.compliance_flight.lock().unwrap();
+        assert!(f.landing_berated, "called once, on its own history");
+        assert_eq!(f.landed_strip.as_deref(), Some("08R"));
+        assert_eq!(f.prev_on_ground, Some(true));
+    }
+    {
+        let ours = OWN_STRIP.compliance_flight.lock().unwrap();
+        assert!(
+            ours.prev_on_ground.is_none() && ours.landed_strip.is_none() && !ours.landing_berated
+        );
+    }
+    assert!(
+        COMPLIANCE.lock().unwrap().last_call.is_some(),
+        "the field's cooldown is shared"
+    );
+    assert!(own_strip_moved().is_empty(), "{:?}", own_strip_moved());
+    // The book reads the traffic's landed strip from ITS strip.
+    let book = RunwayBook::compute(&[BookEntry {
+        id: FlightId::Traffic(8),
+        strip: &t,
+        state: Some(landed),
+    }]);
+    assert!(
+        book.occupancy_authorised(FlightId::Traffic(8)),
+        "rolling off the strip it landed on"
+    );
+    Station::uninstall();
+}
