@@ -185,3 +185,13 @@ Redesign, for the 172, after the pillars, REPLACING the frozen code rather than 
   pre-existing) and alignment (3.1 deg); the 172 flare has no hold-off (283 fpm). Filed for the
   autonomy redesign, not patched: #240 (flare), #241 (taxi). #239: a swap away from the Zibo
   stalls X-Plane for minutes.
+- 2026-10-08: **Stage D steps 1 to 10 merged** (offline; all green: atc 241, nav 56, sim 54,
+  traffic 44, lib 87, xvl 2,171; plugin `make test` decodes the app's golden bytes).
+  `crates/traffic` (fleet, phase machine, schedules), the atc traffic seam (positions in the
+  book, calls through `respond_for`, field-fact guards, orders as data), `src/traffic_link.rs`
+  (headless field hour at XTST 9/9 and LEMG 12/12 movements, 0 runway conflicts, every readback
+  accepted), speech on the tuned frequency, the packed sink, and the plugin's XPMP2 v3.7.0
+  `traffic.cpp`. `XCOPILOT_TRAFFIC` defaults to `off`. The new plugin is installed (atomic
+  rename) but NOT reloaded: the panel status was non-empty and a reload needs a click in the
+  sim. Decisions taken while the owner was away (reversible): the CSL folder read-only from
+  LiveTraffic's; the default stays `off` until the live test.
