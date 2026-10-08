@@ -8,12 +8,16 @@
 //! must not outlive its field or its flight (TOWER_WIND, ZONE_CHALLENGE,
 //! OWN_FIXES and SELF_TAXI all did, each found by a different sortie).
 //!
+//! One aircraft's cells live on its strip ([`FlightStrip`](crate::party_line::FlightStrip), `OWN_STRIP` for
+//! ours), each declared inside its lifetime group; the strip's groups are
+//! reset alongside the statics' by the same doors ([`Group`]).
+//!
 //! | Lifetime | Group | Dies at |
 //! |---|---|---|
-//! | flight AND field: the party line's clearance picture | [`PartyLineFacts`] | `install`, `uninstall`, `retire_for_new_flight` |
-//! | flight AND field: the station's own worksheets | [`StationFlight`] | `install`, `uninstall`, `retire_for_new_flight` |
-//! | flight, carried across a region handoff | [`FlightCarried`] | `uninstall`, `retire_for_new_flight` (never `install`) |
-//! | field: the installed station's watches | [`StationField`] | `install`, `uninstall` |
+//! | flight AND field: the party line's clearance picture | strip `facts` | `install`, `uninstall`, `retire_for_new_flight` |
+//! | flight AND field: the station's own worksheets | strip `worksheet`, [`StationFlight`] | `install`, `uninstall`, `retire_for_new_flight` |
+//! | flight, carried across a region handoff | strip `carried`, [`FlightCarried`] | `uninstall`, `retire_for_new_flight` (never `install`) |
+//! | field: the installed station's watches | strip `watch`, [`StationField`] | `install`, `uninstall` |
 //! | field: facts built FROM the station | [`FieldFacts`] | `install` writes `for_station`, `uninstall` writes `empty` |
 //! | world: survives install, ends with ATC | [`WorldOnly`] | `uninstall` |
 //! | transition | `NEW_FLIGHT_PENDING` | set FIRST by `retire_for_new_flight`, cleared LAST by `install` / `uninstall` |
@@ -33,7 +37,7 @@
 use super::*;
 
 /// One cell of world state that can be put back to its boot value.
-pub(super) trait ResetCell {
+pub(crate) trait ResetCell {
     fn reset(&self);
 }
 
@@ -68,57 +72,22 @@ macro_rules! lifetime_group {
 }
 
 lifetime_group! {
-    /// The party line's flight facts (crate-private statics in
-    /// `party_line.rs`; the crew reads them through accessors only). Each
-    /// belongs to the flight AND to the field that issued it: a region
-    /// handoff's install retires them as surely as a new flight does.
-    pub(crate) struct PartyLineFacts {
-        CLEARANCE,
-        SQUAWK_NUDGE,
-        TAXI_ROUTE,
-        TAXI_TO_STAND,
-        TAKEOFF_HOLD,
-        LANDING_HOLD,
-        PENDING_LANDING_RELEASE,
-        VECTORS,
-        PENDING_TAKEOFF_CLEARANCE,
-        PENDING_LINE_UP,
-        PENDING_GO_AROUND,
-        RESEQUENCED_ORDER,
-        LINE_UP_CONDITION,
-        DEPARTURE_HANDOFF,
-        ZONE_CHALLENGE,
-        LANDING_HANDOFF,
-        ASSIGNED_SQUAWK,
-        IFR_CLEARANCE,
-    }
-}
-
-lifetime_group! {
-    /// The station's own worksheets for this flight at this field.
-    /// `SELF_TAXI` is the crew's own runway standing in for a cleared one
-    /// (`party_line::clearance_runway`), so it dies with `TAXI_ROUTE`.
+    /// The station's own worksheet for this flight at this field that is not
+    /// a strip cell: the wind the tower worked it with (a field fact).
     pub(crate) struct StationFlight {
-        SQUAWK_WATCH,
-        HANDOFF,
-        PENDING_RESEQUENCE,
         TOWER_WIND,
-        UNCONTROLLED_ARRIVAL,
-        SELF_TAXI,
     }
 }
 
 lifetime_group! {
-    /// The FLIGHT's, carried across a region handoff: `install` keeps them
-    /// because the main loop installs the next station before the crew has
-    /// consumed the handoff, and an IFR flight keeps its code unit to unit.
-    /// A new flight and the end of ATC retire them. (`arm_new_flight` also
-    /// drops the pin and the handoff, but only for a field with a tower.)
+    /// The FLIGHT's, carried across a region handoff, that are the crew's
+    /// projection rather than a strip cell: `install` keeps them because the
+    /// main loop installs the next station before the crew has consumed the
+    /// handoff. A new flight and the end of ATC retire them. (`arm_new_flight`
+    /// also drops the pin and the handoff, but only for a field with a tower.)
     pub(crate) struct FlightCarried {
-        IFR_FLIGHT,
         REGION_HANDOFF,
         ARRIVAL_PIN,
-        OWN_FIXES,
     }
 }
 
@@ -126,7 +95,6 @@ lifetime_group! {
     /// The installed station's watches over its field and its traffic.
     pub(crate) struct StationField {
         OUT_OF_REACH,
-        GO_AROUND_LAST,
         STRIP_SEEN,
         GHOSTS,
         WAKE,
@@ -145,6 +113,98 @@ lifetime_group! {
     pub(crate) struct WorldOnly {
         PENDING_STATION,
         SURFACE_WIND,
+    }
+}
+
+/// The strips: each cell's lifetime is the strip group it is declared in
+/// ([`FlightStrip`](crate::party_line::FlightStrip)), reset through [`Group`].
+#[allow(dead_code)]
+pub(crate) const STRIP: &[&str] = &["OWN_STRIP"];
+
+/// One lifetime group as a door names it: a group of our strip's cells, or
+/// a group of statics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Group {
+    StripFacts,
+    StripWorksheet,
+    StripCarried,
+    StripWatch,
+    StationFlight,
+    FlightCarried,
+    StationField,
+    WorldOnly,
+}
+
+impl Group {
+    /// Every cell of this group back to its boot value.
+    fn reset(self) {
+        match self {
+            Group::StripFacts => OWN_STRIP.reset_facts(),
+            Group::StripWorksheet => OWN_STRIP.reset_worksheet(),
+            Group::StripCarried => OWN_STRIP.reset_carried(),
+            Group::StripWatch => OWN_STRIP.reset_watch(),
+            Group::StationFlight => StationFlight::reset(),
+            Group::FlightCarried => FlightCarried::reset(),
+            Group::StationField => StationField::reset(),
+            Group::WorldOnly => WorldOnly::reset(),
+        }
+    }
+
+    /// The cells of this group by name: a strip cell as `OWN_STRIP.<cell>`.
+    #[cfg(test)]
+    fn cells(self) -> Vec<String> {
+        let strip = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|n| format!("OWN_STRIP.{n}")).collect()
+        };
+        let statics = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        };
+        match self {
+            Group::StripFacts => strip(crate::party_line::FlightStrip::FACTS),
+            Group::StripWorksheet => strip(crate::party_line::FlightStrip::WORKSHEET),
+            Group::StripCarried => strip(crate::party_line::FlightStrip::CARRIED),
+            Group::StripWatch => strip(crate::party_line::FlightStrip::WATCH),
+            Group::StationFlight => statics(StationFlight::NAMES),
+            Group::FlightCarried => statics(FlightCarried::NAMES),
+            Group::StationField => statics(StationField::NAMES),
+            Group::WorldOnly => statics(WorldOnly::NAMES),
+        }
+    }
+}
+
+/// What [`Station::install`] resets, in order.
+pub(crate) const INSTALL_RESETS: &[Group] = &[
+    Group::StripFacts,
+    Group::StripWorksheet,
+    Group::StationFlight,
+    Group::StripWatch,
+    Group::StationField,
+];
+
+/// What [`Station::uninstall`] resets, in order.
+pub(crate) const UNINSTALL_RESETS: &[Group] = &[
+    Group::StripFacts,
+    Group::StripWorksheet,
+    Group::StationFlight,
+    Group::StripCarried,
+    Group::FlightCarried,
+    Group::StripWatch,
+    Group::StationField,
+    Group::WorldOnly,
+];
+
+/// What [`retire_for_new_flight`] resets, in order.
+pub(crate) const RETIRE_RESETS: &[Group] = &[
+    Group::StripFacts,
+    Group::StripWorksheet,
+    Group::StationFlight,
+    Group::StripCarried,
+    Group::FlightCarried,
+];
+
+fn reset_groups(groups: &[Group]) {
+    for g in groups {
+        g.reset();
     }
 }
 
@@ -307,9 +367,7 @@ impl Station {
     /// occupancy from the incursion watch. [`FlightCarried`] and
     /// [`WorldOnly`] are kept on purpose (their docs say why).
     pub fn install(&self) {
-        PartyLineFacts::reset();
-        StationFlight::reset();
-        StationField::reset();
+        reset_groups(INSTALL_RESETS);
         FieldFacts::for_station(self).publish();
         // ...and is the new flight's station: its replies publish again.
         NEW_FLIGHT_PENDING.store(false, Ordering::SeqCst);
@@ -322,11 +380,7 @@ impl Station {
     /// the app leaves an ATC-capable mode; the session memos (region index,
     /// taxi net, ILS facts) survive so re-enabling is cheap.
     pub fn uninstall() {
-        PartyLineFacts::reset();
-        StationFlight::reset();
-        FlightCarried::reset();
-        StationField::reset();
-        WorldOnly::reset();
+        reset_groups(UNINSTALL_RESETS);
         FieldFacts::empty().publish();
         NEW_FLIGHT_PENDING.store(false, Ordering::SeqCst);
     }
@@ -351,14 +405,13 @@ impl Station {
 pub fn retire_for_new_flight() {
     // FIRST: the old station publishes nothing from here (module docs).
     NEW_FLIGHT_PENDING.store(true, Ordering::SeqCst);
-    PartyLineFacts::reset();
-    StationFlight::reset();
-    FlightCarried::reset();
+    reset_groups(RETIRE_RESETS);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::party_line::FlightStrip;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
@@ -406,7 +459,7 @@ mod tests {
                 }
             }
         };
-        add(PartyLineFacts::NAMES, "PartyLineFacts");
+        add(STRIP, "FlightStrip");
         add(StationFlight::NAMES, "StationFlight");
         add(FlightCarried::NAMES, "FlightCarried");
         add(StationField::NAMES, "StationField");
@@ -439,9 +492,18 @@ mod tests {
                 }
             }
         }
+        let strip_cells = [
+            FlightStrip::FACTS,
+            FlightStrip::WORKSHEET,
+            FlightStrip::CARRIED,
+            FlightStrip::WATCH,
+        ]
+        .iter()
+        .map(|g| g.len())
+        .sum::<usize>();
         assert!(
-            found.len() > 40,
-            "the scan found only {} statics",
+            found.len() + strip_cells > 40,
+            "the scan found only {} statics and {strip_cells} strip cells",
             found.len()
         );
         let classes = classified();
@@ -463,6 +525,88 @@ mod tests {
             stale.is_empty(),
             "classified but not declared anywhere: {stale:?}"
         );
+    }
+
+    /// The cells a door resets, with a strip cell named by the static it was
+    /// before the strip (`OWN_STRIP.clearance` is `CLEARANCE`).
+    fn door_cells(groups: &[Group]) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for g in groups {
+            for c in g.cells() {
+                let name = match c.strip_prefix("OWN_STRIP.") {
+                    Some(cell) => cell.to_uppercase(),
+                    None => c,
+                };
+                assert!(out.insert(name.clone()), "{name} is reset twice by one door");
+            }
+        }
+        out
+    }
+
+    fn names(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Moving the statics onto [`FlightStrip`](crate::party_line::FlightStrip) moved no lifetime: each door
+    /// resets exactly the cells it reset when they were statics (the lists
+    /// below are the groups as they stood at 8215677).
+    #[test]
+    fn each_door_resets_exactly_what_it_reset_before_the_strip() {
+        let party_line_facts = [
+            "CLEARANCE",
+            "SQUAWK_NUDGE",
+            "TAXI_ROUTE",
+            "TAXI_TO_STAND",
+            "TAKEOFF_HOLD",
+            "LANDING_HOLD",
+            "PENDING_LANDING_RELEASE",
+            "VECTORS",
+            "PENDING_TAKEOFF_CLEARANCE",
+            "PENDING_LINE_UP",
+            "PENDING_GO_AROUND",
+            "RESEQUENCED_ORDER",
+            "LINE_UP_CONDITION",
+            "DEPARTURE_HANDOFF",
+            "ZONE_CHALLENGE",
+            "LANDING_HANDOFF",
+            "ASSIGNED_SQUAWK",
+            "IFR_CLEARANCE",
+        ];
+        let station_flight = [
+            "SQUAWK_WATCH",
+            "HANDOFF",
+            "PENDING_RESEQUENCE",
+            "TOWER_WIND",
+            "UNCONTROLLED_ARRIVAL",
+            "SELF_TAXI",
+        ];
+        let flight_carried = ["IFR_FLIGHT", "REGION_HANDOFF", "ARRIVAL_PIN", "OWN_FIXES"];
+        let station_field = [
+            "OUT_OF_REACH",
+            "GO_AROUND_LAST",
+            "STRIP_SEEN",
+            "GHOSTS",
+            "WAKE",
+            "WAKE_PREV",
+            "DEPARTURE_STREAM",
+            "ARRIVAL_STREAM",
+        ];
+        let world_only = ["PENDING_STATION", "SURFACE_WIND"];
+
+        let mut install = names(&party_line_facts);
+        install.extend(names(&station_flight));
+        install.extend(names(&station_field));
+        assert_eq!(door_cells(INSTALL_RESETS), install, "install");
+
+        let mut uninstall = install.clone();
+        uninstall.extend(names(&flight_carried));
+        uninstall.extend(names(&world_only));
+        assert_eq!(door_cells(UNINSTALL_RESETS), uninstall, "uninstall");
+
+        let mut retire = names(&party_line_facts);
+        retire.extend(names(&station_flight));
+        retire.extend(names(&flight_carried));
+        assert_eq!(door_cells(RETIRE_RESETS), retire, "retire_for_new_flight");
     }
 
     #[test]

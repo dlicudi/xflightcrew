@@ -86,7 +86,7 @@ pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bo
     let Some(here) = strip_under(lat, lon) else {
         return false;
     };
-    let clr = CLEARANCE
+    let clr = OWN_STRIP.clearance
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
@@ -117,7 +117,7 @@ pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bo
     if started_here || landed_here {
         return true;
     }
-    let arrival_taxi = *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner());
+    let arrival_taxi = *OWN_STRIP.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner());
     let cleared_taxi = clr
         .as_ref()
         .is_some_and(|(s, _, _)| *s == tower::State::TaxiCleared)

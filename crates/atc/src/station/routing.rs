@@ -176,7 +176,7 @@ impl Station {
             if let Some(reply) = self.twr.gate(transcript, intent.clone(), ctx) {
                 if reply.is_empty() {
                     // Correct readback: the debt is paid; tell the coach.
-                    if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                         c.pending_readback = None;
                     }
                     if let Some(ifr) = self.twr.take_accepted_ifr() {
@@ -251,7 +251,7 @@ impl Station {
             }
             // The departure clearance's suggested readback is paid.
             self.twr.clear_clearance_readback();
-            if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 c.pending_readback = None;
             }
             return String::new();

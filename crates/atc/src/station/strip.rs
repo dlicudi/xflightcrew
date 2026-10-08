@@ -2,16 +2,6 @@
 
 use super::*;
 
-/// The go-around order was last spoken at — once per half minute is urgency,
-/// not stutter.
-pub(super) static GO_AROUND_LAST: Mutex<Option<Instant>> = Mutex::new(None);
-
-/// Our recent airborne positions (lat, lon, when), from the monitor's
-/// [`note_aircraft`]: the go-around judgement's distance and time to the
-/// threshold. Cleared on the ground.
-pub(super) static OWN_FIXES: Mutex<std::collections::VecDeque<(f64, f64, Instant)>> =
-    Mutex::new(std::collections::VecDeque::new());
-
 /// Recent positions of ghosts on the ground, by callsign: how a strip's
 /// occupant is MOVING (rolling, vacating, standing) is what says whether it
 /// will still be there when we arrive.
@@ -28,7 +18,7 @@ pub(super) const TRACK_MIN_DT_S: f64 = 1.0;
 /// Record our own position for the go-around judgement. Airborne only: on
 /// the ground there is no threshold to reach.
 pub(crate) fn note_own_fix(lat: f64, lon: f64, on_ground: bool, now: Instant) {
-    let mut f = OWN_FIXES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = OWN_STRIP.own_fixes.lock().unwrap_or_else(|e| e.into_inner());
     if on_ground {
         f.clear();
         return;
@@ -404,7 +394,7 @@ pub(crate) fn strip_exit(
 /// monitor noted. `None` without a fresh fix (a test, the first tick).
 pub(super) fn own_time_to_threshold(r: &nav::Runway, landing_end: &str, now: Instant) -> Option<(f64, f64)> {
     let f = LandingFrame::new(r, landing_end)?;
-    let fixes = OWN_FIXES.lock().unwrap_or_else(|e| e.into_inner());
+    let fixes = OWN_STRIP.own_fixes.lock().unwrap_or_else(|e| e.into_inner());
     let &(lat, lon, at) = fixes.back()?;
     if now.saturating_duration_since(at).as_secs_f64() > 3.0 {
         return None;
@@ -570,14 +560,14 @@ pub fn go_around_tick(
     if on_ground || own_agl_ft > 800.0 {
         return None;
     }
-    let cleared = CLEARANCE
+    let cleared = OWN_STRIP.clearance
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .filter(|c| c.state == tower::State::ClearedToLand)
         .map(|c| (c.callsign.clone(), c.runway_ident.clone()));
     let held = || {
-        LANDING_HOLD
+        OWN_STRIP.landing_hold
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -613,7 +603,7 @@ pub fn go_around_tick(
         }
         return None;
     }
-    let mut last = GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last = OWN_STRIP.go_around_last.lock().unwrap_or_else(|e| e.into_inner());
     if last.is_some_and(|t| now.duration_since(t).as_secs_f64() < 30.0) {
         return None;
     }
@@ -624,12 +614,12 @@ pub fn go_around_tick(
             "own_nm": own_nm, "own_s": own_s, "occupants": exits_json(&exits)}),
     );
     // A withheld landing is over: the order is the answer it was waiting for.
-    *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.landing_hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // The order voids the clearance in the FSM too, or the coach keeps
     // suggesting "cleared to land ..." as the readback owed while the tower
     // is shouting go around (seen live, 2026-07-14). The sync is handed to
     // the main loop, which owns the `Station`, same as the hold release.
-    *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    *OWN_STRIP.pending_go_around.lock().unwrap_or_else(|e| e.into_inner()) = true;
     // An occupant that will not leave on its own clock (standing, or using
     // the other direction) would send the next approach round the same way:
     // the tower re-sequences now (issue #162). Only a flight on the
@@ -641,7 +631,7 @@ pub fn go_around_tick(
     };
     // The runway the order names rides with it, published BEFORE its count
     // moves, so a crew watch that sees the order sees its runway (#182).
-    *RESEQUENCED_ORDER.lock().unwrap_or_else(|e| e.into_inner()) = expect.clone().map(|to| {
+    *OWN_STRIP.resequenced_order.lock().unwrap_or_else(|e| e.into_inner()) = expect.clone().map(|to| {
         (
             GO_AROUND_ORDERS.load(std::sync::atomic::Ordering::SeqCst) + 1,
             to,
@@ -671,11 +661,6 @@ pub fn go_around_tick(
 /// The wind the tower last worked with (the field's surface wind when it
 /// had one), for the re-sequence the go-around watch makes between calls.
 pub(super) static TOWER_WIND: Mutex<Option<(f64, f64)>> = Mutex::new(None);
-
-/// A re-sequence decided with a go-around order, for the main loop's FSM
-/// sync ([`Station::apply_monitor_go_around`]): (the end given up, the end
-/// offered). Station-private.
-pub(super) static PENDING_RESEQUENCE: Mutex<Option<(String, String)>> = Mutex::new(None);
 
 /// The runway the tower offers an arrival sent round by an occupant that
 /// will not leave on its own clock, or why none. Pure. `oncoming` (traffic
@@ -819,7 +804,7 @@ pub(super) fn resequence_after_go_around(
             "occupants": exits_json(exits)}),
     );
     let to = pick.ok()?;
-    *PENDING_RESEQUENCE.lock().unwrap_or_else(|e| e.into_inner()) =
+    *OWN_STRIP.pending_resequence.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((runway_ident.to_string(), to.clone()));
     Some(to)
 }
@@ -845,7 +830,7 @@ pub struct LandingHold {
 /// ([`Station::sync_landing_release`]). Landed, the hold is moot: dropped.
 /// The go-around order, when the traffic stays, is [`go_around_tick`]'s.
 pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) -> Option<String> {
-    let mut guard = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = OWN_STRIP.landing_hold.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_ref()?;
     if on_ground || station_unavailable() {
         *guard = None;
@@ -870,7 +855,7 @@ pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) 
         serde_json::json!({"event": "landing_released", "runway": hold.runway_ident,
             "own_nm": own_nm, "own_s": own_s, "occupants": exits_json(&exits)}),
     );
-    if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         c.state = tower::State::ClearedToLand;
         c.holds_runway = true;
         c.runway_ident = hold.runway_ident.clone();
@@ -879,8 +864,8 @@ pub fn landing_hold_tick(targets: &[TcasTarget], on_ground: bool, now: Instant) 
             hold.runway, hold.callsign
         ));
     }
-    *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *PENDING_LANDING_RELEASE
+    *OWN_STRIP.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.pending_landing_release
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some((hold.runway.clone(), hold.line.clone()));
     Some(hold.line)

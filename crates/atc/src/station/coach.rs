@@ -150,7 +150,7 @@ pub fn suggest_call(
         let (name, _, svcs) = p.as_ref()?;
         (spoken_airport(name).to_string(), svcs.clone())
     };
-    let clr = CLEARANCE
+    let clr = OWN_STRIP.clearance
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
@@ -186,7 +186,7 @@ pub fn suggest_call(
         // Handed to the tower with an APPROACH clearance: the "final" report
         // is owed before any landing clearance — the same fact the monitor's
         // voice coach reads.
-        if let Some(rwy) = LANDING_HANDOFF
+        if let Some(rwy) = OWN_STRIP.landing_handoff
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -198,7 +198,7 @@ pub fn suggest_call(
                 arrival: true,
             });
         }
-        if let Some((ils_cleared, rwy)) = VECTORS
+        if let Some((ils_cleared, rwy)) = OWN_STRIP.vectors
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -259,7 +259,7 @@ pub fn suggest_call(
         // Taxi clearance in hand: report ready at the REAL holding point —
         // the cleared route's destination, when the taxi network knows it.
         (Some(tower::State::TaxiCleared), true) => {
-            let hp = TAXI_ROUTE
+            let hp = OWN_STRIP.taxi_route
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()

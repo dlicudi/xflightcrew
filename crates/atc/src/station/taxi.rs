@@ -463,7 +463,7 @@ pub fn first_designator(name: &str) -> &str {
 pub(super) fn on_cleared_runway_crossing(lat: f64, lon: f64) -> bool {
     const CORRIDOR_M: f64 = 60.0;
     let nearest = {
-        let route = TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let route = OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner());
         let Some(r) = route.as_ref() else {
             return false;
         };

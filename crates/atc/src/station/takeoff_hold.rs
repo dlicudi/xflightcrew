@@ -178,13 +178,13 @@ pub fn void_takeoff_hold_by_roll(gs_kts: f64) -> bool {
     if gs_kts < HOLD_ROLL_KTS {
         return false;
     }
-    let voided = TAKEOFF_HOLD
+    let voided = OWN_STRIP.takeoff_hold
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
         .is_some();
     if voided {
-        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.line_up_condition.lock().unwrap_or_else(|e| e.into_inner()) = None;
         tracing::info!(gs_kts, "held takeoff release voided: the aircraft rolled");
     }
     voided
@@ -282,7 +282,7 @@ pub(super) fn departure_strip_occupied(
     own: Option<(f64, f64)>,
     now: Instant,
 ) -> bool {
-    let held_for = TAKEOFF_HOLD
+    let held_for = OWN_STRIP.takeoff_hold
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
@@ -305,7 +305,7 @@ pub fn takeoff_hold_tick_from(
     }
     // The standing clocks the stale-ghost rule reads (idempotent per tick).
     note_ground_traffic(targets, now);
-    let mut guard = TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = OWN_STRIP.takeoff_hold.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_mut()?;
     // Airborne, the hold is moot: either the pilot departed through the
     // cancel (the compliance watch owns that conversation) or the whole
@@ -314,7 +314,7 @@ pub fn takeoff_hold_tick_from(
     // nobody — void it, silently.
     if !player_on_ground {
         *guard = None;
-        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.line_up_condition.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return None;
     }
     // Our strip, cloned out so the runway lock isn't held across the checks.
@@ -370,7 +370,7 @@ pub fn takeoff_hold_tick_from(
     // line five seconds after "behind the landing Bee-line, line up behind"
     // with the lander at 2.4 nm, and only its 85 s crawl kept it off the
     // pavement until 15 s after the touchdown (12:21Z, 2026-09-11).
-    *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) =
+    *OWN_STRIP.line_up_condition.lock().unwrap_or_else(|e| e.into_inner()) =
         hold.behind.then(|| inbound.is_none());
     let traffic = match &rwy {
         Some(_) => on_strip || inbound.as_ref().is_some_and(|f| f.nm < DEPART_GAP_NM),
@@ -447,10 +447,10 @@ pub fn takeoff_hold_tick_from(
                 "{}, line up and wait runway {}, {reason}.",
                 hold.callsign, hold.runway
             );
-            if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 c.state = tower::State::LinedUp;
             }
-            *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            *OWN_STRIP.pending_line_up.lock().unwrap_or_else(|e| e.into_inner()) = true;
             return Some(line);
         }
         return None;
@@ -463,14 +463,14 @@ pub fn takeoff_hold_tick_from(
         "{}, traffic clear. Runway {}, cleared for takeoff.",
         hold.callsign, hold.runway
     );
-    if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         c.state = tower::State::TakeoffCleared;
     }
-    *PENDING_TAKEOFF_CLEARANCE
+    *OWN_STRIP.pending_takeoff_clearance
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = true;
     *guard = None;
     // Released: the clearance stands on its own, no condition left to wait on.
-    *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.line_up_condition.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Some(line)
 }

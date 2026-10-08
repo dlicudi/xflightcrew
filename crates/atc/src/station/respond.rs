@@ -120,7 +120,7 @@ impl Station {
         // to release once the strip clears (`landing_hold_tick`).
         if service == Service::Tower {
             if self.twr.state != tower::State::Inbound || intent == tower::Intent::GoAround {
-                *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *OWN_STRIP.landing_hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
             if intent == tower::Intent::ReportFinal
                 && self.twr.state == tower::State::Inbound
@@ -133,7 +133,7 @@ impl Station {
                     serde_json::json!({"event": "landing_withheld", "runway": ident,
                         "why": "runway_occupied"}),
                 );
-                *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some(LandingHold {
+                *OWN_STRIP.landing_hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(LandingHold {
                     callsign: ctx.callsign.clone(),
                     runway: ctx.runway.clone(),
                     runway_ident: ident,
@@ -152,7 +152,7 @@ impl Station {
                 || taxi_first)
             && self.twr.state == tower::State::TaxiCleared
         {
-            *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = self
+            *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = self
                 .planned_route
                 .as_ref()
                 .filter(|r| r.path.len() >= 2)
@@ -163,8 +163,8 @@ impl Station {
                     holding_point: r.holding_point.clone(),
                     lead_on: r.lead_on.clone(),
                 });
-            *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
-            *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_STRIP.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            *OWN_STRIP.self_taxi.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         // The arrival taxi-in publishes its stand route the same way, so the
         // crew's auto_taxi drives it to parking. `was` is the pre-transition
@@ -173,7 +173,7 @@ impl Station {
             && (intent == tower::Intent::RequestTaxiIn
                 || (intent == tower::Intent::RequestTaxi && was == tower::State::ClearedToLand))
         {
-            *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = self
+            *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = self
                 .planned_route
                 .as_ref()
                 .filter(|r| r.path.len() >= 2)
@@ -184,7 +184,7 @@ impl Station {
                     holding_point: r.holding_point.clone(),
                     lead_on: r.lead_on.clone(),
                 });
-            *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            *OWN_STRIP.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner()) = true;
         }
         // A takeoff request answered with anything SHORT of the clearance —
         // hold position (traffic, wake, occupied strip), a conditional or
@@ -207,7 +207,7 @@ impl Station {
                 || ctx.runway_occupied
                 || ctx.wake_secs_left.is_some())
         {
-            let mut held = TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+            let mut held = OWN_STRIP.takeoff_hold.lock().unwrap_or_else(|e| e.into_inner());
             // Asking again does not restart the separation you have already
             // waited out. The wake gate is capped at one full interval AT THE
             // HOLD (`takeoff_hold_tick`), measured from `armed_at` — and
@@ -267,11 +267,11 @@ impl Station {
             && ctx.on_ground
             && matches!(was, tower::State::TakeoffCleared | tower::State::LinedUp)
         {
-            *PENDING_TAKEOFF_CLEARANCE
+            *OWN_STRIP.pending_takeoff_clearance
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = false;
-            *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
-            *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_STRIP.pending_line_up.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            *OWN_STRIP.handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
             tracing::info!(runway = ?self.runway_in_use, "takeoff rejected; clearance cancelled");
         }
         // A held release lives only while the tower still owes one: the
@@ -285,8 +285,8 @@ impl Station {
                     tower::State::TaxiCleared | tower::State::LinedUp
                 ))
         {
-            *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_STRIP.takeoff_hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_STRIP.line_up_condition.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         reply
     }
@@ -305,7 +305,7 @@ impl Station {
             ctx.runway.clone(),
             format!("runway {}, cleared for takeoff.", ctx.runway),
         );
-        if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             c.pending_readback = self.twr.suggested_readback(&ctx.callsign);
         }
         self.arm_departure_handoff(&ctx);
@@ -323,7 +323,7 @@ impl Station {
             ctx.runway.clone(),
             format!("line up and wait runway {}.", ctx.runway),
         );
-        if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             c.pending_readback = self.twr.suggested_readback(&ctx.callsign);
         }
     }
@@ -339,7 +339,7 @@ impl Station {
     /// before the station answers anything, so the crew's readback of the
     /// released clearance meets a tower that knows it gave it.
     pub(super) fn sync_landing_release(&mut self) {
-        let released = PENDING_LANDING_RELEASE
+        let released = OWN_STRIP.pending_landing_release
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
@@ -354,7 +354,7 @@ impl Station {
         // the runway in use moves with it, and the published clearance
         // names it, so the crew's approach follows once its missed approach
         // is flown (`autoland::clearance_switch`). Issue #162.
-        let reseq = PENDING_RESEQUENCE
+        let reseq = OWN_STRIP.pending_resequence
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
@@ -364,7 +364,7 @@ impl Station {
             self.stated_runway = None;
         }
         self.resequenced = reseq.clone();
-        if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             c.state = tower::State::Inbound;
             c.pending_readback = Some(format!("Going around, {}.", c.callsign));
             if let Some((_, to)) = &reseq {
@@ -536,12 +536,12 @@ impl Station {
     /// cancel is told so rather than acknowledged.
     fn cancel_ifr(&mut self, ctx: &tower::Ctx) -> String {
         let owed = self.twr.cancel_ifr();
-        let published = IFR_CLEARANCE
+        let published = OWN_STRIP.ifr_clearance
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .is_some();
-        let flight = IFR_FLIGHT
+        let flight = OWN_STRIP.ifr_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
@@ -570,7 +570,7 @@ impl Station {
     /// for one.
     fn amend_sid(&mut self, transcript: &str, ctx: &tower::Ctx) -> String {
         let cs = &ctx.callsign;
-        let held = IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let held = OWN_STRIP.ifr_clearance.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let Some(mut c) = held else {
             return format!("{cs}, request your IFR clearance first.");
         };
@@ -612,7 +612,7 @@ impl Station {
                 "from": c.sid, "to": sid, "runway": c.runway}),
         );
         c.sid = Some(sid.clone());
-        *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
+        *OWN_STRIP.ifr_clearance.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
         format!("{cs}, {} departure approved, runway {rwy}.", tower::spoken_sid(&sid))
     }
 
@@ -628,7 +628,7 @@ impl Station {
     /// clearance's destination and this field's filed route to it. `None`
     /// without a clearance, a filed route or a filed level.
     pub(super) fn filed_cruise_ft(&self) -> Option<i64> {
-        let dest = IFR_CLEARANCE
+        let dest = OWN_STRIP.ifr_clearance
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()?
@@ -705,8 +705,8 @@ impl Station {
         } else {
             self.assigned_squawk.unwrap_or(7000)
         };
-        *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.ifr_clearance.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.ifr_flight.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Some(tower::IfrOffer {
             clearance: tower::IfrClearance {
                 dest: icao,
@@ -752,19 +752,19 @@ impl Station {
     /// Issue this flight its discrete code (idempotent — the same flight
     /// keeps the same code) and arm the radar watch. Returns the spoken code
     /// for the reply. The watch side effect mirrors [`Station::arm_departure_handoff`]'s
-    /// `HANDOFF` write: reply paths own their monitor-tick state.
+    /// `OWN_STRIP.handoff` write: reply paths own their monitor-tick state.
     pub(super) fn assign_squawk(&mut self, callsign: &str, speaker: StationSpeaker) -> String {
         let code = *self
             .assigned_squawk
             .get_or_insert_with(|| discrete_squawk(callsign));
         // Publish it for the crew (the transponder gets dialled to this).
-        *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+        *OWN_STRIP.assigned_squawk.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
         // Circuit traffic gets no radar service: the code, but no watch
         // (no "radar contact" from a tower working the pattern by eye).
         if self.circuits {
             return atis::spoken_digits(&code.to_string());
         }
-        let mut w = SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let mut w = OWN_STRIP.squawk_watch.lock().unwrap_or_else(|e| e.into_inner());
         // Same code from a new controller: the watch keeps its history (no
         // second grace period, no second "radar contact") but the VOICE is
         // whoever issued it last, the one we are actually talking to.
@@ -814,10 +814,10 @@ impl Station {
         );
         tracing::info!(circuits = now, "departure intent noted");
         if now {
-            *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_STRIP.squawk_watch.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_STRIP.squawk_nudge.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_STRIP.handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_STRIP.departure_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 
@@ -845,7 +845,7 @@ impl Station {
         };
         self.dep_checked_in = false;
         // "Radar contact" is now the check-in's answer on the new frequency.
-        if let Some(w) = SQUAWK_WATCH
+        if let Some(w) = OWN_STRIP.squawk_watch
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
@@ -857,7 +857,7 @@ impl Station {
         } else {
             Service::Approach
         });
-        *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = Some(Handoff {
+        *OWN_STRIP.handoff.lock().unwrap_or_else(|e| e.into_inner()) = Some(Handoff {
             line: format!(
                 "{}, contact {} {} on {}.",
                 ctx.callsign,
@@ -882,7 +882,7 @@ impl Station {
             self.twr.state = tower::State::Parked;
         }
         self.twr.clear_clearance_readback();
-        if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(c) = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             c.state = self.twr.state;
             c.holds_runway = self.twr.holds_runway();
             c.pending_readback = None;
@@ -934,9 +934,9 @@ impl Station {
             // hand the flight to the tower, drop the plan so the tick stops
             // steering a pilot who's already on the localizer.
             tower::Intent::ReportFinal
-                if VECTORS.lock().unwrap_or_else(|e| e.into_inner()).is_some() =>
+                if OWN_STRIP.vectors.lock().unwrap_or_else(|e| e.into_inner()).is_some() =>
             {
-                *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *OWN_STRIP.vectors.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 format!(
                     "{}, roger. Contact {} Tower on {}.",
                     ctx.callsign,
@@ -1039,7 +1039,7 @@ impl Station {
             None => JOIN_FINAL_NM,
         };
         let runway_spoken = atis::spoken_runway(&ident);
-        *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = Some(VectorPlan {
+        *OWN_STRIP.vectors.lock().unwrap_or_else(|e| e.into_inner()) = Some(VectorPlan {
             callsign: ctx.callsign.clone(),
             thr_lat,
             thr_lon,

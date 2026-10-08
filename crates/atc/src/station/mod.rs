@@ -24,11 +24,7 @@ use sim::xplane::SimView;
 // `party_line`'s accessors, never these statics.
 pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
-    IfrFlight, ARRIVAL_PIN, ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, GO_AROUND_ORDERS,
-    IFR_CLEARANCE, IFR_FLIGHT, LANDING_HANDOFF, LANDING_HOLD, LINE_UP_CONDITION, PENDING_GO_AROUND,
-    PENDING_LANDING_RELEASE, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE,
-    REGION_HANDOFF, RESEQUENCED_ORDER, SQUAWK_NUDGE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND,
-    VECTORS, ZONE_CHALLENGE,
+    IfrFlight, ARRIVAL_PIN, GO_AROUND_ORDERS, OWN_STRIP, PENDING_STATION, REGION_HANDOFF,
 };
 
 // The airline telephony and the ghost speaker live with the callsign
@@ -135,7 +131,7 @@ pub struct Station {
     /// `None` means the VFR conspicuity 7000 is the answer.
     assigned_squawk: Option<i64>,
     /// The taxi route planned when the ctx was last built on the ground —
-    /// published to [`TAXI_ROUTE`] iff the taxi clearance is actually issued.
+    /// published to `OWN_STRIP.taxi_route` iff the taxi clearance is actually issued.
     planned_route: Option<nav::TaxiRoutePlan>,
     /// Challenge missing/wrong readbacks of runway-critical clearances
     /// (`XCOPILOT_ATC_READBACK`). The pending state still arms when this is

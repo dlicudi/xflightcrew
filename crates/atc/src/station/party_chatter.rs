@@ -48,7 +48,7 @@ pub fn player_blocked_strip(on_ground: bool, lat: f64, lon: f64) -> Option<Strin
         return None;
     }
     on_active_runway(lat, lon).or_else(|| {
-        CLEARANCE
+        OWN_STRIP.clearance
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -64,7 +64,7 @@ pub fn player_blocked_strip(on_ground: bool, lat: f64, lon: f64) -> Option<Strin
 /// Inbound, a go-around's), its DIRECTION is (nobody is cleared off or onto
 /// its reciprocal). `None` without a clearance or a runway.
 pub(super) fn own_strip_claim() -> Option<(String, bool)> {
-    let clr = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner());
+    let clr = OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner());
     let c = clr.as_ref().filter(|c| !c.runway_ident.is_empty())?;
     match c.state {
         tower::State::ClearedToLand if c.holds_runway => Some((c.runway_ident.clone(), true)),

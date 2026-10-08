@@ -129,3 +129,19 @@ static, no new lifetime.
 No traffic producer, kinematics, `TrafficTarget` feed or `ClearanceQueue`; the ghost defences
 stay (as book queries); no per-strip chatter or voices; no `World` outliving `Station`; no
 callsign-keyed map, single strip mutex, `Ctx` split, world_tick cadence or TCAS change.
+
+## Deviations (as built)
+- **Increment 1**: `go_around_last` is in a `watch` group (reset by `install` and `uninstall`
+  only), not `worksheet`: `worksheet` is reset by `retire_for_new_flight`, which would change
+  its lifetime. `watch` is where `compliance_flight` lands in increment 7.
+- **Increment 1**: the macro names each group's reset and name list explicitly
+  (`facts (reset_facts, FACTS) { ... }`): `macro_rules!` cannot build `reset_<group>` without a
+  paste crate. `FlightStrip::new()` is a `const fn`, not a `NEW` const (a const holding a
+  `Mutex` trips clippy's `declare_interior_mutable_const`).
+- **Increment 1**: the doors reset through data, `station::state::Group` and
+  `INSTALL_RESETS`/`UNINSTALL_RESETS`/`RETIRE_RESETS`, so the door test
+  (`each_door_resets_exactly_what_it_reset_before_the_strip`) pins the lists the doors run;
+  `the_doors_reset_our_strip_by_group` checks one cell per strip group behaviourally.
+  `PartyLineFacts` is gone (all its cells are strip `facts`); `StationFlight` keeps only
+  `TOWER_WIND`, `FlightCarried` only `REGION_HANDOFF` and `ARRIVAL_PIN`. `OWN_STRIP` is
+  classified as `FlightStrip` (`state::STRIP`); `STRIPS` is left for increment 5.

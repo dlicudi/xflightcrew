@@ -184,7 +184,7 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     // approach (or departure) position, and a tower-only field is passed
     // over, save the active one and the pinned arrival (the flight is
     // landing there; its tower is where the inbound call goes).
-    let ifr = IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let ifr = OWN_STRIP.ifr_flight.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let ifr_airborne = !on_ground && ifr.is_some();
     let pin = arrival_pin_khz();
     let eligible = |a: &RegionApt| {
@@ -250,11 +250,11 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     // controller terminating a service it never provided (heard live
     // 2026-07-11: app start near Sevilla answered by "radar services
     // terminated" from a departure position never called).
-    let had_contact = CLEARANCE
+    let had_contact = OWN_STRIP.clearance
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_some()
-        || SQUAWK_WATCH
+        || OWN_STRIP.squawk_watch
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
@@ -289,7 +289,7 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         // A discrete code in effect goes back to conspicuity with the service
         // that assigned it.
         let squawk_vfr = ifr.is_none()
-            && SQUAWK_WATCH
+            && OWN_STRIP.squawk_watch
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some();
@@ -549,38 +549,32 @@ pub fn pin_arrival_station(tower_khz: Option<i64>) {
     *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = tower_khz;
 }
 
-/// The filed destination has no staffed tower in the installed airport data.
-/// The last radar unit remains installed for the region, but it no longer
-/// works this flight: it must not answer the destination's inbound/final calls
-/// or make its clearances look applicable at another field.
-pub(super) static UNCONTROLLED_ARRIVAL: AtomicBool = AtomicBool::new(false);
-
 /// End radar service for an arrival to a field with no staffed tower.
 /// Idempotent: the enroute/arrival seam may be retried, but the retirement is
 /// one transition and never an invented station for the destination.
 pub fn begin_uncontrolled_arrival(destination: &str) {
-    if UNCONTROLLED_ARRIVAL.swap(true, Ordering::SeqCst) {
+    if OWN_STRIP.uncontrolled_arrival.swap(true, Ordering::SeqCst) {
         return;
     }
     *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *REGION_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *PENDING_LANDING_RELEASE
+    *OWN_STRIP.departure_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.assigned_squawk.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.ifr_clearance.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.ifr_flight.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.squawk_watch.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.squawk_nudge.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.vectors.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.landing_hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.pending_landing_release
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
-    *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *OWN_STRIP.self_taxi.lock().unwrap_or_else(|e| e.into_inner()) = None;
     tracing::info!(%destination, "radar service ended for uncontrolled arrival");
     sim::blackbox::record(
         "atc",
@@ -593,13 +587,13 @@ pub fn begin_uncontrolled_arrival(destination: &str) {
 }
 
 pub(crate) fn uncontrolled_arrival() -> bool {
-    UNCONTROLLED_ARRIVAL.load(Ordering::SeqCst)
+    OWN_STRIP.uncontrolled_arrival.load(Ordering::SeqCst)
 }
 
 /// Release the arrival-only service suppression. The next region tick may use
 /// the installed station normally again; a new station install also clears it.
 pub fn end_arrival() {
-    UNCONTROLLED_ARRIVAL.store(false, Ordering::SeqCst);
+    OWN_STRIP.uncontrolled_arrival.store(false, Ordering::SeqCst);
 }
 
 /// The pinned arrival field's tower frequency, if the crew has committed to

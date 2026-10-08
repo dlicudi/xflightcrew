@@ -15,7 +15,7 @@ pub(crate) fn new_flight_pending() -> bool {
 
 /// The reply path's one write of the clearance picture.
 pub(super) fn publish_clearance(snap: ClearanceSnap) {
-    *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+    *OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
 }
 
 /// A NEW FLIGHT at `icao` (the crew's "put us on a ten mile final", which
@@ -107,7 +107,7 @@ pub struct EnrouteStation {
     /// "Approach" or "Departure", and its frequency: where COM1 goes.
     pub position: &'static str,
     pub khz: i64,
-    /// The flight's discrete code, kept unit to unit ([`IFR_FLIGHT`]).
+    /// The flight's discrete code, kept unit to unit (`OWN_STRIP.ifr_flight`).
     pub code: i64,
 }
 
@@ -128,7 +128,7 @@ pub(super) fn enroute_field_in(region: &[RegionApt], lat: f64, lon: f64) -> Opti
 
 /// A NEW FLIGHT put in the air on its plan, mid-route: the world holds it
 /// as an IFR flight already under radar service. Its code
-/// ([`discrete_squawk`] of the callsign) is published as [`IFR_FLIGHT`],
+/// ([`discrete_squawk`] of the callsign) is published as `OWN_STRIP.ifr_flight`,
 /// airborne, so every region handoff after this keeps it and goes to a
 /// radar position; the station for the nearest field with a radar unit is
 /// rebuilt ([`arm_new_flight`]), and its approach (else departure)
@@ -143,7 +143,7 @@ pub fn arm_new_flight_enroute(
     now: Instant,
 ) -> Option<EnrouteStation> {
     let code = discrete_squawk(callsign);
-    *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = Some(IfrFlight {
+    *OWN_STRIP.ifr_flight.lock().unwrap_or_else(|e| e.into_inner()) = Some(IfrFlight {
         code,
         callsign: callsign.to_string(),
         airborne: true,
@@ -287,15 +287,15 @@ pub fn note_aircraft(lat: f64, lon: f64, on_ground: bool) {
     // runway must never read as a cleared one at the destination (autoland
     // takes the cleared runway).
     if !on_ground {
-        let mut own = SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner());
+        let mut own = OWN_STRIP.self_taxi.lock().unwrap_or_else(|e| e.into_inner());
         if own.take().is_some() {
-            *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
     // An IFR flight ends at its landing: airborne since the clearance, the
     // next ground contact retires it (never a region switch).
     {
-        let mut ifr = IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ifr = OWN_STRIP.ifr_flight.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(f) = ifr.as_mut() {
             if !on_ground {
                 f.airborne = true;
@@ -319,15 +319,15 @@ pub fn note_aircraft(lat: f64, lon: f64, on_ground: bool) {
             .map(|f| f.0.clone());
         tracing::info!(?station, "ATC station out of reach on the ground: standing it down here");
         sim::blackbox::record("atc", serde_json::json!({ "route": "reach", "station": station, "out": true }));
-        *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        if SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
-            *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *OWN_STRIP.clearance.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.assigned_squawk.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.ifr_clearance.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.ifr_flight.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.takeoff_hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.line_up_condition.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if OWN_STRIP.self_taxi.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *OWN_STRIP.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner()) = false;
         }
     } else if was && !far {
         sim::blackbox::record("atc", serde_json::json!({ "route": "reach", "out": false }));

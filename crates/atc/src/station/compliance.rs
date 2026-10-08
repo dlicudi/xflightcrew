@@ -115,7 +115,7 @@ pub(super) const MIN_FLIGHT_SECS: f64 = 30.0;
 
 /// One tick of the compliance watch: the tower holds the pilot to the
 /// clearances it actually issued, and challenges zone traffic it has never
-/// talked to. Everything is derived from the published [`CLEARANCE`] state —
+/// talked to. Everything is derived from the published `OWN_STRIP.clearance` state:
 /// a tower that never saw you on its ground can't accuse you of an uncleared
 /// takeoff.
 #[cfg_attr(not(test), allow(dead_code))] // station tests only
@@ -153,7 +153,7 @@ pub fn compliance_tick_facing(
         (*la, *lo)
     };
     let dist_nm = crate::nav::haversine_nm(lat, lon, field_lat, field_lon);
-    let clr: Option<(tower::State, String)> = CLEARANCE
+    let clr: Option<(tower::State, String)> = OWN_STRIP.clearance
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
@@ -170,7 +170,7 @@ pub fn compliance_tick_facing(
         w.airborne_since = None;
         // Down: the landing-clearance coach is moot, and a stale handoff must
         // not nag on the next takeoff.
-        *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
     } else if w.airborne_since.is_none() {
         w.airborne_since = Some(now);
     }
@@ -209,7 +209,7 @@ pub fn compliance_tick_facing(
     {
         w.cleared_to_land_seen = Some(now);
         // Cleared to land — the coach got what it was waiting for.
-        *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     let vacating = w
         .cleared_to_land_seen
@@ -286,7 +286,7 @@ pub fn compliance_tick_facing(
                 .is_some_and(|t| now.duration_since(t).as_secs_f64() < 45.0)
             && on_active_runway(lat, lon).is_none()
         {
-            let stray = TAXI_ROUTE
+            let stray = OWN_STRIP.taxi_route
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
@@ -319,7 +319,7 @@ pub fn compliance_tick_facing(
                 let line = if let Some(r) = fresh {
                     let via = spoken_via(&r.via).join(", ");
                     let hp = spoken_taxiway(&r.holding_point);
-                    *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaxiWatch {
+                    *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaxiWatch {
                         path: r.path.clone(),
                         via: via.clone(),
                         seg: r.seg.clone(),
@@ -357,8 +357,8 @@ pub fn compliance_tick_facing(
         // incursion berate outright, and a bare flag that survived a swap or
         // a route-less clearance would switch that safety net off with
         // nothing to show the occupancy is part of a cleared drive.
-        let arrival_taxi = *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner())
-            && TAXI_ROUTE
+        let arrival_taxi = *OWN_STRIP.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner())
+            && OWN_STRIP.taxi_route
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some();
@@ -460,7 +460,7 @@ pub fn compliance_tick_facing(
             return Some(if tuned {
                 // The crew hears the question as data too: an inbound call is
                 // the answer when this is the destination's tower.
-                *ZONE_CHALLENGE.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                *OWN_STRIP.zone_challenge.lock().unwrap_or_else(|e| e.into_inner()) = true;
                 ComplianceCall {
                     line: format!(
                         "Aircraft in the {zone_name} control zone, you are inside \

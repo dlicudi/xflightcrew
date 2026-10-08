@@ -31,8 +31,6 @@ pub struct SquawkWatch {
     pub(super) nudges: u32,
 }
 
-pub(super) static SQUAWK_WATCH: Mutex<Option<SquawkWatch>> = Mutex::new(None);
-
 /// Knob-spinning time before the first nudge.
 pub(super) const SQUAWK_GRACE_SECS: f64 = 20.0;
 /// Quiet time between nudges.
@@ -43,7 +41,7 @@ pub(super) const SQUAWK_MAX_NUDGES: u32 = 2;
 /// Cheap gate for the monitor: only read the transponder datarefs while a
 /// watch is armed.
 pub fn squawk_watch_active() -> bool {
-    SQUAWK_WATCH
+    OWN_STRIP.squawk_watch
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
@@ -59,7 +57,7 @@ pub(super) fn radar_unit(s: StationSpeaker) -> bool {
 /// The departure check-in's reply said "radar contact": the watch is
 /// satisfied, and says nothing more.
 pub(super) fn radar_contact_at_check_in() {
-    if let Some(w) = SQUAWK_WATCH
+    if let Some(w) = OWN_STRIP.squawk_watch
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
@@ -86,7 +84,7 @@ pub fn squawk_tick(
     tuned: StationSpeaker,
     now: Instant,
 ) -> Option<(String, StationSpeaker)> {
-    let mut guard = SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = OWN_STRIP.squawk_watch.lock().unwrap_or_else(|e| e.into_inner());
     let w = guard.as_mut()?;
     let first = *w.first_seen.get_or_insert(now);
     if actual == Some(w.code) && mode_on {
@@ -116,7 +114,7 @@ pub fn squawk_tick(
     // 2026-07-13) — a nag that reads as "your digits are wrong" when the
     // digits are the one thing that's right.
     let recycle = actual == Some(w.code);
-    *SQUAWK_NUDGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::party_line::SquawkNudge {
+    *OWN_STRIP.squawk_nudge.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::party_line::SquawkNudge {
         code: w.code,
         recycle,
     });
@@ -148,13 +146,11 @@ pub struct Handoff {
     pub khz: i64,
 }
 
-pub(super) static HANDOFF: Mutex<Option<Handoff>> = Mutex::new(None);
-
 /// One tick of the after-takeoff handoff, ~monitor rate: silence until the
 /// flight is airborne and through the arming altitude, then the handoff
 /// exactly once.
 pub fn handoff_tick(alt_ft: f64, on_ground: bool) -> Option<String> {
-    let mut guard = HANDOFF.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = OWN_STRIP.handoff.lock().unwrap_or_else(|e| e.into_inner());
     let plan = guard.as_ref()?;
     if on_ground || alt_ft < plan.min_alt_ft {
         return None;
@@ -164,7 +160,7 @@ pub fn handoff_tick(alt_ft: f64, on_ground: bool) -> Option<String> {
     // as audio: a readback, a retune and a check-in are owed, and until this
     // was published nothing on the crew side could do them — the Malaga
     // departure stayed on tower for thirteen minutes (12:23Z, 2026-09-11).
-    *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) =
+    *OWN_STRIP.departure_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((plan.to.clone(), plan.khz));
     *guard = None;
     Some(line)
@@ -240,7 +236,7 @@ pub fn vector_tick(
     on_ground: bool,
     now: Instant,
 ) -> Option<String> {
-    let mut guard = VECTORS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = OWN_STRIP.vectors.lock().unwrap_or_else(|e| e.into_inner());
     let plan = guard.as_mut()?;
     if on_ground {
         *guard = None; // landed (or armed on the ramp by mistake): vectors over
@@ -304,7 +300,7 @@ pub fn vector_tick(
         // (the compliance watch clears this on the landing clearance and on
         // touchdown). Only when there's a tower to report to.
         if plan.tower_spoken.is_some() {
-            *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) =
+            *OWN_STRIP.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(plan.runway_spoken.clone());
         }
         *guard = None; // approach's job is done

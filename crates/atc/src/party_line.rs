@@ -22,28 +22,220 @@
 //! copilot see of ATC?" stays answerable on one page.
 //!
 //! Every static here has a LIFETIME, classified with the station's in
-//! `station/state.rs` (`PartyLineFacts`, `FlightCarried`, `WorldOnly`,
-//! `SESSION`): the groups are what `Station::install`, `Station::uninstall`
-//! and [`retire_for_new_flight`] reset, and a source scan fails the tests
-//! on a static nobody classified.
+//! `station/state.rs` (`FlightCarried`, `WorldOnly`, `SESSION`), and every
+//! cell of our flight's strip ([`OWN_STRIP`]) is declared inside its
+//! lifetime group: the groups are what `Station::install`,
+//! `Station::uninstall` and [`retire_for_new_flight`] reset, and a source
+//! scan fails the tests on a static nobody classified.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
 
 use crate::nav;
-use crate::station::{ClearanceSnap, LandingHold, TakeoffHold, VectorPlan};
+use crate::station::{ClearanceSnap, Handoff, LandingHold, SquawkWatch, TakeoffHold, VectorPlan};
 use crate::tower;
 
 // ---- published state (world-side writes live in station.rs) ----
 
-/// The standing clearance: FSM state, callsign, runway, the readback owed.
-pub(crate) static CLEARANCE: Mutex<Option<ClearanceSnap>> = Mutex::new(None);
+/// A flight's strip, every cell declared INSIDE its lifetime group: the
+/// struct, its `new()` and one reset (and one name list) per group come from
+/// the one declaration, so a cell with no group does not compile.
+macro_rules! flight_strip {
+    (
+        $(#[$m:meta])*
+        $vis:vis struct $strip:ident {
+            $(
+                $(#[$gm:meta])*
+                $group:ident ($reset:ident, $names:ident) {
+                    $( $(#[$fm:meta])* $field:ident : $ty:ty = $init:expr ),* $(,)?
+                }
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$m])*
+        $vis struct $strip {
+            $( $( $(#[$fm])* pub(crate) $field: $ty, )* )*
+        }
 
-/// A radar controller's squawk nudge, armed by the squawk watch as it speaks
-/// it: the crew acts on the instruction it heard ("recycle transponder",
-/// "confirm squawk ..."), which it never did (EGPH 2026-09-20: two recycles,
-/// nobody answered).
-pub(crate) static SQUAWK_NUDGE: Mutex<Option<SquawkNudge>> = Mutex::new(None);
+        impl $strip {
+            /// Every cell at its boot value.
+            pub(crate) const fn new() -> Self {
+                Self { $( $( $field: $init, )* )* }
+            }
+            $(
+                $(#[$gm])*
+                pub(crate) fn $reset(&self) {
+                    $( crate::station::ResetCell::reset(&self.$field); )*
+                }
+                /// The cells of this group, by name, for the lifetime tests.
+                #[allow(dead_code)]
+                pub(crate) const $names: &'static [&'static str] = &[$(stringify!($field)),*];
+            )*
+        }
+    };
+}
+
+flight_strip! {
+    /// One flight's strip: every cell of world state that belongs to ONE
+    /// aircraft, each behind its own mutex (`note_aircraft` holds one cell while
+    /// locking another, so one lock per strip would deadlock). A cell is declared
+    /// inside its lifetime group, so a cell without one does not compile; each
+    /// group's reset is called by the doors in `station/state.rs`.
+    pub(crate) struct FlightStrip {
+        /// The party line's clearance picture, the flight's AND the field's:
+        /// reset by `install`, `uninstall` and `retire_for_new_flight`.
+        facts (reset_facts, FACTS) {
+            /// The standing clearance: FSM state, callsign, runway, the readback owed.
+            clearance: Mutex<Option<ClearanceSnap>> = Mutex::new(None),
+            /// A radar controller's squawk nudge, armed by the squawk watch as it speaks
+            /// it: the crew acts on the instruction it heard ("recycle transponder",
+            /// "confirm squawk ..."), which it never did (EGPH 2026-09-20: two recycles,
+            /// nobody answered).
+            squawk_nudge: Mutex<Option<SquawkNudge>> = Mutex::new(None),
+            /// The taxi route the pilot is CLEARED on: feeds the compliance watch
+            /// (world) and the progressive taxi guide (crew).
+            taxi_route: Mutex<Option<TaxiWatch>> = Mutex::new(None),
+            /// Whether the current `OWN_STRIP.taxi_route` is an ARRIVAL route to a parking stand
+            /// (vs a departure to a holding point): set alongside the route so the crew
+            /// phrases "stand ..." instead of "holding point ...". Kept parallel rather
+            /// than a `TaxiWatch` field to avoid churning every construction of it.
+            taxi_to_stand: Mutex<bool> = Mutex::new(false),
+            /// A takeoff clearance withheld for landing traffic: armed by the reply
+            /// path, released by the monitor once the final has stayed clear.
+            takeoff_hold: Mutex<Option<TakeoffHold>> = Mutex::new(None),
+            /// A landing clearance withheld for traffic on the runway ("continue
+            /// approach, traffic on the runway") -- armed by the reply path to a final
+            /// report, released by the monitor's traffic watch once the strip is clear or
+            /// its occupant will be off it before we arrive
+            /// (`station::landing_hold_tick`). LEMG 13, 2026-09-28: the tower cleared the
+            /// circuit to land with a departure lined up and cancelled it 0.8 s later.
+            landing_hold: Mutex<Option<LandingHold>> = Mutex::new(None),
+            /// The landing clearance the monitor released (its spoken runway and the
+            /// instruction), for the station to sync its FSM before it answers the next
+            /// call (the readback): `Station::sync_landing_release`.
+            pending_landing_release: Mutex<Option<(String, String)>> = Mutex::new(None),
+            /// An armed vectors-to-final plan: the approach controller's worksheet.
+            vectors: Mutex<Option<VectorPlan>> = Mutex::new(None),
+            /// Set when the monitor speaks the released takeoff clearance; the main
+            /// loop consumes it and syncs the tower FSM to what was said on frequency.
+            pending_takeoff_clearance: Mutex<bool> = Mutex::new(false),
+            /// Set when the monitor sequences a held departure onto the runway with a
+            /// line-up-and-wait; the main loop consumes it and syncs the tower FSM to
+            /// what was said on frequency, exactly like `OWN_STRIP.pending_takeoff_clearance`.
+            pending_line_up: Mutex<bool> = Mutex::new(false),
+            /// Set when the monitor orders a go-around (traffic on the runway); the main
+            /// loop consumes it and voids the landing clearance in the tower FSM, so the
+            /// coach can never keep suggesting the readback of a cancelled clearance.
+            pending_go_around: Mutex<bool> = Mutex::new(false),
+            /// The runway the tower's LATEST go-around order re-sequenced the arrival to
+            /// ("go around, traffic on the runway ... expect runway one three"), with
+            /// that order's number in [`GO_AROUND_ORDERS`]; `None` when the latest order
+            /// named none. Written with the order, before its count moves, so a watch
+            /// that sees the order sees its runway. Read through
+            /// [`GoAroundOrders::expected_runway`]. LEMG, 2026-09-29 (sortie
+            /// 1790668215-full_auto): re-sequenced from 30 to 13 at t+649, the crew
+            /// flew 5.5 minutes of pattern to 30, because during a missed approach the
+            /// runway published with `Inbound` is only the runway in use (EGTE).
+            resequenced_order: Mutex<Option<(u64, String)>> = Mutex::new(None),
+            /// A CONDITIONAL line-up's condition, as the world sees it: `Some(false)`
+            /// while the named arrival is still on final, `Some(true)` once it is down on
+            /// the strip or gone, `None` when no conditional line-up stands. Published by
+            /// the release watch every tick, so the crew waits on the world's picture of
+            /// the traffic and never on its own guess.
+            line_up_condition: Mutex<Option<bool>> = Mutex::new(None),
+            /// The after-takeoff handoff the tower spoke ("contact Malaga Departure on
+            /// one two one decimal zero two five"): the station's spoken name and its
+            /// frequency, armed once when the line goes out and consumed by the crew
+            /// that works the radio.
+            departure_handoff: Mutex<Option<(String, i64)>> = Mutex::new(None),
+            /// The zone watch challenged us on the frequency ("aircraft in the Granada
+            /// control zone, you are inside controlled airspace without clearance, say
+            /// callsign and intentions"): the tower has never heard from this aircraft
+            /// and is asking. Armed each time the tuned line goes out; consumed by the
+            /// crew that works the radio, which answers with the inbound call when the
+            /// challenging tower is the destination's (a full-auto arrival flew the last
+            /// enroute leg through Granada's zone with three challenges unanswered,
+            /// 2026-09-15). The crew-side "we're inside the zone" variant, spoken by the
+            /// copilot when the radio is NOT on the tower, never arms it.
+            zone_challenge: Mutex<bool> = Mutex::new(false),
+            /// The runway the APPROACH controller cleared you toward and handed to the
+            /// tower ("cleared visual/ILS approach runway X, contact Tower"). You still
+            /// owe the tower a "final" report before you're cleared to LAND: an approach
+            /// clearance is not a landing clearance. The crew's landing-clearance coach
+            /// reads it; the world clears it on the landing clearance and on touchdown, so
+            /// it never lingers into the next circuit.
+            landing_handoff: Mutex<Option<String>> = Mutex::new(None),
+            /// The discrete transponder code the controller assigned with the clearance,
+            /// so the crew can dial it into the transponder: the full-auto orchestrator
+            /// reads it after requesting clearance. Published by the tower on assignment,
+            /// cleared on `Station::uninstall`.
+            assigned_squawk: Mutex<Option<i64>> = Mutex::new(None),
+            /// The IFR clearance the tower issued AND heard read back correctly: the
+            /// destination, the SID, the runway, the initial altitude and the code.
+            /// Set only by the accepted readback (a clearance nobody read back is not
+            /// one the crew may fly), retired with the squawk: by `Station::install`
+            /// (a new field), `Station::uninstall` and the out-of-reach stand-down.
+            ifr_clearance: Mutex<Option<tower::IfrClearance>> = Mutex::new(None),
+        },
+        /// The station's own worksheets for this flight at this field: reset by
+        /// `install`, `uninstall` and `retire_for_new_flight`. `self_taxi` is the
+        /// crew's own runway standing in for a cleared one
+        /// (`party_line::clearance_runway`), so it dies with `taxi_route`.
+        worksheet (reset_worksheet, WORKSHEET) {
+            squawk_watch: Mutex<Option<SquawkWatch>> = Mutex::new(None),
+            handoff: Mutex<Option<Handoff>> = Mutex::new(None),
+            /// A re-sequence decided with a go-around order, for the main loop's FSM
+            /// sync ([`Station::apply_monitor_go_around`]): (the end given up, the end
+            /// offered). Station-private.
+            pending_resequence: Mutex<Option<(String, String)>> = Mutex::new(None),
+            /// The filed destination has no staffed tower in the installed airport data.
+            /// The last radar unit remains installed for the region, but it no longer
+            /// works this flight: it must not answer the destination's inbound/final calls
+            /// or make its clearances look applicable at another field.
+            uncontrolled_arrival: AtomicBool = AtomicBool::new(false),
+            /// The published `OWN_STRIP.taxi_route` is the crew's own (an uncontrolled field),
+            /// not a controller's, to this runway end. Cleared by any controller's
+            /// route, and with the flight and the field (`StationFlight`). It stands
+            /// where a controller's cleared runway would for the line-up: with none,
+            /// the line-up took the nearest end and lined the Evolution up on LILB 21
+            /// for a route planned to 03 (2026-09-25).
+            self_taxi: Mutex<Option<String>> = Mutex::new(None),
+        },
+        /// The FLIGHT's, carried across a region handoff: reset by `uninstall`
+        /// and `retire_for_new_flight`, never by `install` (the main loop installs
+        /// the next station before the crew has consumed the handoff, and an IFR
+        /// flight keeps its code unit to unit).
+        carried (reset_carried, CARRIED) {
+            /// This flight holds an accepted IFR clearance: its code and callsign, from
+            /// the readback the tower accepted. Unlike `OWN_STRIP.ifr_clearance` (the departure
+            /// field's worksheet, retired with that field) it is the FLIGHT's, so it
+            /// survives `Station::install`: the region handoff that follows the flight
+            /// must know it is IFR. LIEA-LEBL, 2026-09-27: an IFR-cleared 737 on 4501
+            /// was told "radar services terminated, squawk seven thousand" at FL200 and
+            /// set it. Retired at the landing (`station::note_aircraft`), by a ground
+            /// stand-down out of reach, by a new clearance offer and by `uninstall`,
+            /// never at a region switch.
+            ifr_flight: Mutex<Option<IfrFlight>> = Mutex::new(None),
+            /// Our recent airborne positions (lat, lon, when), from the monitor's
+            /// [`note_aircraft`]: the go-around judgement's distance and time to the
+            /// threshold. Cleared on the ground.
+            own_fixes: Mutex<std::collections::VecDeque<(f64, f64, Instant)>> = Mutex::new(std::collections::VecDeque::new()),
+        },
+        /// The installed station's watches over this flight: reset by `install`
+        /// and `uninstall`, never by `retire_for_new_flight` (`go_around_last`
+        /// kept the field lifetime it had as a static; changing it is a
+        /// behaviour change, decided separately).
+        watch (reset_watch, WATCH) {
+            /// The go-around order was last spoken at: once per half minute is urgency,
+            /// not stutter.
+            go_around_last: Mutex<Option<Instant>> = Mutex::new(None),
+        },
+    }
+}
+
+/// Our own flight's strip (the only one until traffic strips exist).
+pub(crate) static OWN_STRIP: FlightStrip = FlightStrip::new();
 
 /// What the controller asked of the transponder: the code it wants, and
 /// whether it asked to RECYCLE (the code shows, the box does not reply) or
@@ -53,36 +245,6 @@ pub struct SquawkNudge {
     pub code: i64,
     pub recycle: bool,
 }
-
-/// The taxi route the pilot is CLEARED on — feeds the compliance watch
-/// (world) and the progressive taxi guide (crew).
-pub(crate) static TAXI_ROUTE: Mutex<Option<TaxiWatch>> = Mutex::new(None);
-
-/// Whether the current [`TAXI_ROUTE`] is an ARRIVAL route to a parking stand
-/// (vs a departure to a holding point) — set alongside the route so the crew
-/// phrases "stand ..." instead of "holding point ...". Kept parallel rather
-/// than a `TaxiWatch` field to avoid churning every construction of it.
-pub(crate) static TAXI_TO_STAND: Mutex<bool> = Mutex::new(false);
-
-/// A takeoff clearance withheld for landing traffic — armed by the reply
-/// path, released by the monitor once the final has stayed clear.
-pub(crate) static TAKEOFF_HOLD: Mutex<Option<TakeoffHold>> = Mutex::new(None);
-
-/// A landing clearance withheld for traffic on the runway ("continue
-/// approach, traffic on the runway") -- armed by the reply path to a final
-/// report, released by the monitor's traffic watch once the strip is clear or
-/// its occupant will be off it before we arrive
-/// (`station::landing_hold_tick`). LEMG 13, 2026-09-28: the tower cleared the
-/// circuit to land with a departure lined up and cancelled it 0.8 s later.
-pub(crate) static LANDING_HOLD: Mutex<Option<LandingHold>> = Mutex::new(None);
-
-/// The landing clearance the monitor released (its spoken runway and the
-/// instruction), for the station to sync its FSM before it answers the next
-/// call (the readback): `Station::sync_landing_release`.
-pub(crate) static PENDING_LANDING_RELEASE: Mutex<Option<(String, String)>> = Mutex::new(None);
-
-/// An armed vectors-to-final plan — the approach controller's worksheet.
-pub(crate) static VECTORS: Mutex<Option<VectorPlan>> = Mutex::new(None);
 
 /// A station swap the main loop must consume (it owns the `Station`): the
 /// new field's ICAO (for the voice casting) and airport, armed by
@@ -163,20 +325,6 @@ pub fn filed_route_for(origin: &str, dest: &str) -> Option<FiledRoute> {
     })
 }
 
-/// Set when the monitor speaks the released takeoff clearance; the main
-/// loop consumes it and syncs the tower FSM to what was said on frequency.
-pub(crate) static PENDING_TAKEOFF_CLEARANCE: Mutex<bool> = Mutex::new(false);
-
-/// Set when the monitor sequences a held departure onto the runway with a
-/// line-up-and-wait; the main loop consumes it and syncs the tower FSM to
-/// what was said on frequency, exactly like [`PENDING_TAKEOFF_CLEARANCE`].
-pub(crate) static PENDING_LINE_UP: Mutex<bool> = Mutex::new(false);
-
-/// Set when the monitor orders a go-around (traffic on the runway); the main
-/// loop consumes it and voids the landing clearance in the tower FSM, so the
-/// coach can never keep suggesting the readback of a cancelled clearance.
-pub(crate) static PENDING_GO_AROUND: Mutex<bool> = Mutex::new(false);
-
 /// Every go-around order the tower has given, counted and never reset: the
 /// crew's loops each watch it through a [`GoAroundOrders`], so one reader
 /// can never consume another's order. The FSM sync above is a `take_*` flag
@@ -184,30 +332,6 @@ pub(crate) static PENDING_GO_AROUND: Mutex<bool> = Mutex::new(false);
 /// same flag, and the main loop (polling every ~150 ms against autoland's
 /// ~400 ms tick) won it: 15 orders in the logs, not one `ordered_go_around`.
 pub(crate) static GO_AROUND_ORDERS: AtomicU64 = AtomicU64::new(0);
-
-/// The runway the tower's LATEST go-around order re-sequenced the arrival to
-/// ("go around, traffic on the runway ... expect runway one three"), with
-/// that order's number in [`GO_AROUND_ORDERS`]; `None` when the latest order
-/// named none. Written with the order, before its count moves, so a watch
-/// that sees the order sees its runway. Read through
-/// [`GoAroundOrders::expected_runway`]. LEMG, 2026-09-29 (sortie
-/// 1790668215-full_auto): re-sequenced from 30 to 13 at t+649, the crew
-/// flew 5.5 minutes of pattern to 30, because during a missed approach the
-/// runway published with `Inbound` is only the runway in use (EGTE).
-pub(crate) static RESEQUENCED_ORDER: Mutex<Option<(u64, String)>> = Mutex::new(None);
-
-/// A CONDITIONAL line-up's condition, as the world sees it: `Some(false)`
-/// while the named arrival is still on final, `Some(true)` once it is down on
-/// the strip or gone, `None` when no conditional line-up stands. Published by
-/// the release watch every tick, so the crew waits on the world's picture of
-/// the traffic and never on its own guess.
-pub(crate) static LINE_UP_CONDITION: Mutex<Option<bool>> = Mutex::new(None);
-
-/// The after-takeoff handoff the tower spoke ("contact Malaga Departure on
-/// one two one decimal zero two five"): the station's spoken name and its
-/// frequency, armed once when the line goes out and consumed by the crew
-/// that works the radio.
-pub(crate) static DEPARTURE_HANDOFF: Mutex<Option<(String, i64)>> = Mutex::new(None);
 
 /// The enroute handoff the region watch spoke ("radar services terminated,
 /// squawk seven thousand, contact Malaga Tower on ..."): whom to call, on
@@ -219,17 +343,6 @@ pub(crate) static DEPARTURE_HANDOFF: Mutex<Option<(String, i64)>> = Mutex::new(N
 /// and an install that wiped it would lose every handoff. `uninstall` and a
 /// new flight end it.
 pub(crate) static REGION_HANDOFF: Mutex<Option<RegionHandoff>> = Mutex::new(None);
-
-/// The zone watch challenged us on the frequency ("aircraft in the Granada
-/// control zone, you are inside controlled airspace without clearance, say
-/// callsign and intentions"): the tower has never heard from this aircraft
-/// and is asking. Armed each time the tuned line goes out; consumed by the
-/// crew that works the radio, which answers with the inbound call when the
-/// challenging tower is the destination's (a full-auto arrival flew the last
-/// enroute leg through Granada's zone with three challenges unanswered,
-/// 2026-09-15). The crew-side "we're inside the zone" variant, spoken by the
-/// copilot when the radio is NOT on the tower, never arms it.
-pub(crate) static ZONE_CHALLENGE: Mutex<bool> = Mutex::new(false);
 
 /// What the enroute controller told us at the region boundary.
 #[derive(Debug, Clone, PartialEq)]
@@ -247,18 +360,7 @@ pub struct RegionHandoff {
     pub ifr_code: Option<i64>,
 }
 
-/// This flight holds an accepted IFR clearance: its code and callsign, from
-/// the readback the tower accepted. Unlike [`IFR_CLEARANCE`] (the departure
-/// field's worksheet, retired with that field) it is the FLIGHT's, so it
-/// survives `Station::install`: the region handoff that follows the flight
-/// must know it is IFR. LIEA-LEBL, 2026-09-27: an IFR-cleared 737 on 4501
-/// was told "radar services terminated, squawk seven thousand" at FL200 and
-/// set it. Retired at the landing (`station::note_aircraft`), by a ground
-/// stand-down out of reach, by a new clearance offer and by `uninstall`,
-/// never at a region switch.
-pub(crate) static IFR_FLIGHT: Mutex<Option<IfrFlight>> = Mutex::new(None);
-
-/// See [`IFR_FLIGHT`].
+/// See `OWN_STRIP.ifr_flight`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfrFlight {
     /// The discrete code the clearance assigned.
@@ -268,27 +370,6 @@ pub struct IfrFlight {
     /// Airborne since the clearance: the next ground contact is the landing.
     pub airborne: bool,
 }
-
-/// The runway the APPROACH controller cleared you toward and handed to the
-/// tower ("cleared visual/ILS approach runway X, contact Tower"). You still
-/// owe the tower a "final" report before you're cleared to LAND — an approach
-/// clearance is not a landing clearance. The crew's landing-clearance coach
-/// reads it; the world clears it on the landing clearance and on touchdown, so
-/// it never lingers into the next circuit.
-pub(crate) static LANDING_HANDOFF: Mutex<Option<String>> = Mutex::new(None);
-
-/// The discrete transponder code the controller assigned with the clearance,
-/// so the crew can dial it into the transponder — the full-auto orchestrator
-/// reads it after requesting clearance. Published by the tower on assignment,
-/// cleared on `Station::uninstall`.
-pub(crate) static ASSIGNED_SQUAWK: Mutex<Option<i64>> = Mutex::new(None);
-
-/// The IFR clearance the tower issued AND heard read back correctly: the
-/// destination, the SID, the runway, the initial altitude and the code.
-/// Set only by the accepted readback (a clearance nobody read back is not
-/// one the crew may fly), retired with the squawk: by `Station::install`
-/// (a new field), `Station::uninstall` and the out-of-reach stand-down.
-pub(crate) static IFR_CLEARANCE: Mutex<Option<tower::IfrClearance>> = Mutex::new(None);
 
 fn lock<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -346,7 +427,7 @@ pub fn plan_self_taxi(
 }
 
 pub fn clearance_state() -> Option<tower::State> {
-    lock(&CLEARANCE).as_ref().map(|c| c.state)
+    lock(&OWN_STRIP.clearance).as_ref().map(|c| c.state)
 }
 
 /// The tower's book puts us on the strip we stand on (cleared onto it,
@@ -361,7 +442,7 @@ pub fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bool {
 /// the auto-takeoff line-up crosscheck reads it against the strip the
 /// aircraft is actually pointing down.
 pub fn clearance_runway() -> Option<String> {
-    lock(&CLEARANCE)
+    lock(&OWN_STRIP.clearance)
         .as_ref()
         .map(|c| c.runway_ident.clone())
         .filter(|r| !r.is_empty())
@@ -377,7 +458,7 @@ pub fn clearance_runway() -> Option<String> {
 /// was neither echoed nor obeyed while autoland flew 27 into a 21 kt
 /// tailwind (LXGB, 2026-09-14).
 pub fn readback_owed() -> Option<String> {
-    lock(&CLEARANCE)
+    lock(&OWN_STRIP.clearance)
         .as_ref()
         .and_then(|c| c.pending_readback.clone())
         .filter(|r| !r.is_empty())
@@ -386,7 +467,7 @@ pub fn readback_owed() -> Option<String> {
 /// Read the cleared taxi route under its lock. Closure-scoped so a guard
 /// can never be held across an await.
 pub fn with_taxi_route<R>(f: impl FnOnce(Option<&TaxiWatch>) -> R) -> R {
-    f(lock(&TAXI_ROUTE).as_ref())
+    f(lock(&OWN_STRIP.taxi_route).as_ref())
 }
 
 /// True when the cleared taxi route is an ARRIVAL to a parking stand — the crew
@@ -457,7 +538,7 @@ pub fn stands_known() -> bool {
 }
 
 pub fn taxi_to_stand() -> bool {
-    *lock(&TAXI_TO_STAND)
+    *lock(&OWN_STRIP.taxi_to_stand)
 }
 
 /// The drive OFF the runway we have just landed on, planned from the field's
@@ -484,7 +565,7 @@ pub fn plan_vacate(
 /// The discrete squawk the controller assigned, if one has been — the crew dials
 /// it into the transponder after the clearance.
 pub fn assigned_squawk() -> Option<i64> {
-    *lock(&ASSIGNED_SQUAWK)
+    *lock(&OWN_STRIP.assigned_squawk)
 }
 
 /// The IFR clearance this flight holds, read back and accepted: fly the
@@ -492,34 +573,34 @@ pub fn assigned_squawk() -> Option<i64> {
 /// altitude. `None` before the readback, after a swap, and at a field the
 /// flight left.
 pub fn assigned_clearance() -> Option<IfrClearance> {
-    lock(&IFR_CLEARANCE).clone()
+    lock(&OWN_STRIP.ifr_clearance).clone()
 }
 
 pub use crate::tower::IfrClearance;
 
 /// The flight is IFR (an accepted IFR clearance, not yet landed): its
 /// discrete code. Survives the region handoffs the clearance does not
-/// ([`IFR_FLIGHT`]).
+/// (`OWN_STRIP.ifr_flight`).
 pub fn ifr_flight_code() -> Option<i64> {
-    lock(&IFR_FLIGHT).as_ref().map(|f| f.code)
+    lock(&OWN_STRIP.ifr_flight).as_ref().map(|f| f.code)
 }
 
 /// The controller's last squawk nudge, consumed: the crew recycles or
 /// re-dials once per call it heard.
 pub fn take_squawk_nudge() -> Option<SquawkNudge> {
-    lock(&SQUAWK_NUDGE).take()
+    lock(&OWN_STRIP.squawk_nudge).take()
 }
 
 /// A takeoff clearance is currently being withheld for traffic.
 pub fn takeoff_hold_armed() -> bool {
-    lock(&TAKEOFF_HOLD).is_some()
+    lock(&OWN_STRIP.takeoff_hold).is_some()
 }
 
 /// A landing clearance is currently being withheld for traffic on the
 /// runway: the monitor's traffic watch must keep reading the picture to
 /// release it (or order the go-around).
 pub fn landing_hold_armed() -> bool {
-    lock(&LANDING_HOLD).is_some()
+    lock(&OWN_STRIP.landing_hold).is_some()
 }
 
 /// The condition of a CONDITIONAL line-up ("behind the landing X, line up
@@ -527,14 +608,14 @@ pub fn landing_hold_armed() -> bool {
 /// has passed, `None` when the standing line-up is unconditional or there is
 /// none. A crew about to cross the hold line waits on `Some(false)`.
 pub fn line_up_condition_clear() -> Option<bool> {
-    *lock(&LINE_UP_CONDITION)
+    *lock(&OWN_STRIP.line_up_condition)
 }
 
 /// Consume the after-takeoff handoff the tower spoke: the station to call
 /// ("Malaga Departure") and its frequency in kHz. The crew that works the
 /// radio reads it back, retunes, and checks in.
 pub fn take_departure_handoff() -> Option<(String, i64)> {
-    lock(&DEPARTURE_HANDOFF).take()
+    lock(&OWN_STRIP.departure_handoff).take()
 }
 
 /// Consume the enroute handoff the region watch spoke: the tower to call, its
@@ -550,12 +631,12 @@ pub fn take_region_handoff() -> Option<RegionHandoff> {
 /// unconditionally by the crew's loop each pass: an answer is owed the tower
 /// it came from, and a challenge nobody answered is not kept for a later one.
 pub fn take_zone_challenge() -> bool {
-    std::mem::take(&mut *lock(&ZONE_CHALLENGE))
+    std::mem::take(&mut *lock(&OWN_STRIP.zone_challenge))
 }
 
 /// The callsign under approach vectors, if a plan is armed.
 pub fn vectored_callsign() -> Option<String> {
-    lock(&VECTORS).as_ref().map(|p| p.callsign.clone())
+    lock(&OWN_STRIP.vectors).as_ref().map(|p| p.callsign.clone())
 }
 
 /// What the controller has actually TOLD US to fly, for a crew that intends to
@@ -582,7 +663,7 @@ pub struct AssignedVector {
 /// The vector currently owed, if a controller is working us and has spoken at
 /// least one instruction.
 pub fn assigned_vector() -> Option<AssignedVector> {
-    let g = lock(&VECTORS);
+    let g = lock(&OWN_STRIP.vectors);
     let p = g.as_ref()?;
     Some(AssignedVector {
         heading_deg: p.last_heading_deg()? as f64,
@@ -596,7 +677,7 @@ pub fn assigned_vector() -> Option<AssignedVector> {
 /// "final" report — i.e. cleared for the APPROACH but not to LAND. `None` once
 /// the tower clears the landing or the wheels are down.
 pub fn landing_handoff_runway() -> Option<String> {
-    lock(&LANDING_HANDOFF).clone()
+    lock(&OWN_STRIP.landing_handoff).clone()
 }
 
 /// Consume the armed station swap. Main loop only — it owns the `Station`.
@@ -624,18 +705,18 @@ pub fn retire_for_new_flight() {
 
 /// Consume the released-takeoff-clearance flag. Main loop only.
 pub fn take_pending_takeoff_clearance() -> bool {
-    std::mem::take(&mut *lock(&PENDING_TAKEOFF_CLEARANCE))
+    std::mem::take(&mut *lock(&OWN_STRIP.pending_takeoff_clearance))
 }
 
 /// Consume the sequenced-line-up flag. Main loop only.
 pub fn take_pending_line_up() -> bool {
-    std::mem::take(&mut *lock(&PENDING_LINE_UP))
+    std::mem::take(&mut *lock(&OWN_STRIP.pending_line_up))
 }
 
 /// Consume the go-around-ordered flag. Main loop only (the tower FSM sync):
 /// a loop that FLIES the order watches it through [`GoAroundOrders`].
 pub fn take_pending_go_around() -> bool {
-    std::mem::take(&mut *lock(&PENDING_GO_AROUND))
+    std::mem::take(&mut *lock(&OWN_STRIP.pending_go_around))
 }
 
 /// One crew loop's watch on the tower's go-around orders. Armed when the
@@ -669,7 +750,7 @@ impl GoAroundOrders {
     /// one. Takes nothing: the order itself is still [`Self::take`]'s.
     pub fn expected_runway(&self) -> Option<String> {
         let now = GO_AROUND_ORDERS.load(Ordering::SeqCst);
-        lock(&RESEQUENCED_ORDER)
+        lock(&OWN_STRIP.resequenced_order)
             .as_ref()
             .filter(|(n, _)| *n > self.armed && *n <= now)
             .map(|(_, rwy)| rwy.clone())

@@ -21,17 +21,9 @@ pub(super) fn field_at(apt_path: &str, lat: f64, lon: f64) -> Option<(String, na
     best.map(|(_, icao, apt)| (icao, apt))
 }
 
-/// The published [`TAXI_ROUTE`] is the crew's own (an uncontrolled field),
-/// not a controller's, to this runway end. Cleared by any controller's
-/// route, and with the flight and the field (`StationFlight`). It stands
-/// where a controller's cleared runway would for the line-up: with none,
-/// the line-up took the nearest end and lined the Evolution up on LILB 21
-/// for a route planned to 03 (2026-09-25).
-pub(super) static SELF_TAXI: Mutex<Option<String>> = Mutex::new(None);
-
 /// The runway of the crew's own route, when there is one.
 pub(crate) fn self_taxi_runway() -> Option<String> {
-    SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    OWN_STRIP.self_taxi.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// A name a pilot could say: a taxiway designator ("A", "B2", "TL").
@@ -92,15 +84,15 @@ pub fn plan_self_taxi_to_stand(
         .into_iter()
         .map(|(n, rwy)| (if rwy || designator(&n) { n } else { String::new() }, rwy))
         .collect();
-    *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaxiWatch {
+    *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaxiWatch {
         path: plan.path,
         via: via.clone(),
         seg: plan.seg,
         holding_point: stand.clone(),
         lead_on: plan.lead_on,
     });
-    *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = true;
-    *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OWN_STRIP.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    *OWN_STRIP.self_taxi.lock().unwrap_or_else(|e| e.into_inner()) = None;
     sim::blackbox::record(
         "atc",
         serde_json::json!({
@@ -200,15 +192,15 @@ pub fn plan_self_taxi(
     } else {
         String::new()
     };
-    *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaxiWatch {
+    *OWN_STRIP.taxi_route.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaxiWatch {
         path: plan.path.clone(),
         via: via.clone(),
         seg,
         holding_point,
         lead_on: plan.lead_on.clone(),
     });
-    *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *SELF_TAXI.lock().unwrap_or_else(|e| e.into_inner()) = Some(ident.clone());
+    *OWN_STRIP.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *OWN_STRIP.self_taxi.lock().unwrap_or_else(|e| e.into_inner()) = Some(ident.clone());
     sim::blackbox::record(
         "atc",
         serde_json::json!({ "route": "self_taxi", "field": icao, "runway": ident, "via": raw_via }),

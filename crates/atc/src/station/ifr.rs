@@ -56,12 +56,12 @@ pub(super) fn publish_ifr_clearance(
             "sid_join": basis.and_then(SidBasis::join),
         }),
     );
-    *IFR_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = Some(IfrFlight {
+    *OWN_STRIP.ifr_flight.lock().unwrap_or_else(|e| e.into_inner()) = Some(IfrFlight {
         code: c.squawk,
         callsign: callsign.to_string(),
         airborne: false,
     });
-    *IFR_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
+    *OWN_STRIP.ifr_clearance.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
 }
 
 /// An IFR destination as heard, resolved against the region index: a code
