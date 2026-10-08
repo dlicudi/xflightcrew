@@ -224,6 +224,130 @@ impl FieldModel {
     }
 }
 
+/// A taxi stops this far along its route short of where the route comes
+/// onto a runway's pavement (nav's [`nav::on_strip`], the tower's own
+/// test): the holding position of a crossing.
+pub const CROSSING_STOP_M: f64 = 20.0;
+
+/// The route is sampled this often for the crossings.
+const CROSSING_SAMPLE_M: f64 = 2.0;
+
+/// A taxi route cut at the runways it crosses, by the strips' GEOMETRY
+/// (never the network's flags): `pieces[i]` ends at the stop short of
+/// `crossings[i]` (the end nearer where the route comes onto it); the last
+/// piece runs on to the route's end. A route that starts on a strip (a
+/// vacate's end) does not stop for it; a route that ENDS on a strip stops
+/// short of it and goes no further.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CutRoute {
+    pub pieces: Vec<Vec<LatLon>>,
+    pub crossings: Vec<String>,
+}
+
+impl FieldModel {
+    /// The strip under `p`, by index, and the nearer end's ident.
+    fn strip_at(&self, p: LatLon) -> Option<(usize, String)> {
+        self.airport
+            .runways
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| nav::on_strip(r, p.0, p.1).map(|end| (i, end)))
+    }
+
+    /// `path` cut at every runway it crosses ([`CutRoute`]).
+    pub fn cut_at_crossings(&self, path: &[LatLon]) -> CutRoute {
+        if path.len() < 2 {
+            return CutRoute {
+                pieces: vec![path.to_vec()],
+                crossings: Vec::new(),
+            };
+        }
+        // Each sample: metres along, the point, the strip under it.
+        let mut samples: Vec<(f64, LatLon, Option<(usize, String)>)> = Vec::new();
+        let mut along = 0.0;
+        for (i, w) in path.windows(2).enumerate() {
+            let len = dist_m(w[0], w[1]);
+            let n = ((len / CROSSING_SAMPLE_M).ceil() as usize).max(1);
+            for k in usize::from(i > 0)..=n {
+                let f = k as f64 / n as f64;
+                let p = (
+                    w[0].0 + (w[1].0 - w[0].0) * f,
+                    w[0].1 + (w[1].1 - w[0].1) * f,
+                );
+                samples.push((along + len * f, p, self.strip_at(p)));
+            }
+            along += len;
+        }
+        // The entries: where the route comes onto a strip it was not on, the
+        // first sample excepted (already on it), and whether it leaves again.
+        let mut stops: Vec<(f64, String, bool)> = Vec::new();
+        let mut prev: Option<usize> = samples.first().and_then(|s| s.2.as_ref().map(|x| x.0));
+        for s in samples.iter().skip(1) {
+            let here = s.2.as_ref().map(|x| x.0);
+            if here.is_some() && prev.is_none() {
+                let (_, end) = s.2.clone().unwrap_or_default();
+                stops.push((s.0, end, false));
+            }
+            if here.is_none() && prev.is_some() {
+                if let Some(last) = stops.last_mut() {
+                    last.2 = true;
+                }
+            }
+            prev = here;
+        }
+        let mut out = CutRoute::default();
+        let mut from = 0.0;
+        for (enter_m, end, leaves) in stops {
+            let stop = (enter_m - CROSSING_STOP_M).max(from);
+            out.pieces.push(slice_m(path, from, stop));
+            if !leaves {
+                // It ends on the strip: short of it is where it stops.
+                return out;
+            }
+            out.crossings.push(end);
+            from = stop;
+        }
+        out.pieces.push(slice_m(path, from, f64::INFINITY));
+        out
+    }
+}
+
+/// The part of `path` from `a_m` to `b_m` metres along it.
+fn slice_m(path: &[LatLon], a_m: f64, b_m: f64) -> Vec<LatLon> {
+    let at = |m: f64| -> LatLon {
+        let mut along = 0.0;
+        for w in path.windows(2) {
+            let len = dist_m(w[0], w[1]);
+            if along + len >= m && len > 0.0 {
+                let f = ((m - along) / len).clamp(0.0, 1.0);
+                return (
+                    w[0].0 + (w[1].0 - w[0].0) * f,
+                    w[0].1 + (w[1].1 - w[0].1) * f,
+                );
+            }
+            along += len;
+        }
+        *path.last().unwrap_or(&(0.0, 0.0))
+    };
+    let mut out = vec![at(a_m)];
+    let mut along = 0.0;
+    for w in path.windows(2) {
+        along += dist_m(w[0], w[1]);
+        if along > a_m + 0.5 && along < b_m - 0.5 {
+            out.push(w[1]);
+        }
+    }
+    if b_m.is_finite() {
+        out.push(at(b_m));
+    } else if let Some(&last) = path.last() {
+        if out.last() != Some(&last) {
+            out.push(last);
+        }
+    }
+    out.dedup();
+    out
+}
+
 /// An aircraft this close to a stand is on it.
 pub const STAND_TAKEN_M: f64 = 20.0;
 
@@ -295,5 +419,47 @@ mod tests {
             .taxi_to_runway((36.0026, -5.0003), &e09)
             .expect("a route to 09");
         assert!(!route.lead_on.is_empty(), "the hold is short of the strip");
+    }
+
+    /// A route across a runway is cut short of its PAVEMENT (the strip's
+    /// geometry, as the tower reads it), the crossing named by the nearer
+    /// end; a route that starts on a strip is not stopped for it; one that
+    /// ends on a strip stops short and goes no further.
+    #[test]
+    fn a_route_is_cut_short_of_every_runway_it_crosses() {
+        let f = fixtures::xtst();
+        let e09 = f.end("09").unwrap();
+        // North to south across 09/27 (30 m wide), a quarter of the way along.
+        let across = vec![(36.0015, -5.004), (35.9985, -5.004)];
+        let cut = f.cut_at_crossings(&across);
+        assert_eq!(cut.crossings, vec!["09".to_string()]);
+        assert_eq!(cut.pieces.len(), 2);
+        let stop = *cut.pieces[0].last().unwrap();
+        let off = e09.frame(stop).1;
+        // The pavement test reaches 15 + 10 m off the centreline; the stop
+        // is CROSSING_STOP_M before it, on the near (north, left) side.
+        assert!((-47.0..=-43.0).contains(&off), "stop {off:.1} m off");
+        assert_eq!(
+            cut.pieces[1].first(),
+            Some(&stop),
+            "the next piece starts there"
+        );
+        assert_eq!(cut.pieces[1].last(), across.last(), "and runs to the end");
+        // Starting on the strip (a vacate's end): nothing to hold short of.
+        let off_it = vec![(36.0, -5.004), (35.9985, -5.004)];
+        let cut = f.cut_at_crossings(&off_it);
+        assert!(cut.crossings.is_empty() && cut.pieces.len() == 1);
+        // Ending on it: short of it, and no further.
+        let onto = vec![(36.0015, -5.004), (36.0, -5.004)];
+        let cut = f.cut_at_crossings(&onto);
+        assert!(cut.crossings.is_empty());
+        assert_eq!(cut.pieces.len(), 1);
+        let end = *cut.pieces[0].last().unwrap();
+        assert!(e09.frame(end).1 < -40.0, "stopped short of the pavement");
+        // Along the parallel taxiway: no crossing at all.
+        let parallel = vec![(36.0008, -5.008), (36.0008, -4.992)];
+        let cut = f.cut_at_crossings(&parallel);
+        assert!(cut.crossings.is_empty());
+        assert_eq!(cut.pieces, vec![parallel]);
     }
 }

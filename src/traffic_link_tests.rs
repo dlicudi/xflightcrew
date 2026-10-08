@@ -41,6 +41,10 @@ fn in_own_process(test: &str) {
             "XVL_TRAFFIC_TRACE",
             std::env::var("XVL_TRAFFIC_TRACE").unwrap_or_default(),
         )
+        .env(
+            "XVL_TRAFFIC_SWEEP_ONLY",
+            std::env::var("XVL_TRAFFIC_SWEEP_ONLY").unwrap_or_default(),
+        )
         .output()
         .expect("run the harness");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -62,6 +66,8 @@ pub(super) struct HarnessScore {
     pub(super) readbacks: usize,
     pub(super) readbacks_accepted: usize,
     pub(super) tower_lines: usize,
+    /// Every line the tower said: its answers and its runway watch's.
+    pub(super) said: Vec<String>,
     pub(super) conflicts: Vec<String>,
     pub(super) oracle: Vec<String>,
     pub(super) unfinished: Vec<String>,
@@ -120,11 +126,13 @@ pub(super) fn fly_field(
     // Each readback the fleet gave, by flight: the tower's owed text.
     let mut readbacks: HashMap<u32, Vec<String>> = HashMap::new();
     let mut seen_ids: HashSet<u32> = HashSet::new();
+    let trace = std::env::var("XVL_TRAFFIC_TRACE").is_ok_and(|v| !v.is_empty());
     while t < max_s {
         t += dt;
         let now = epoch + Duration::from_secs_f64(t);
         let out = link.tick(None, dt, now);
         s.tower_lines += out.tower.len();
+        s.said.extend(out.tower.iter().map(|(_, l)| l.clone()));
         for ev in &out.events {
             match ev {
                 Event::Spawn { id } => {
@@ -149,17 +157,22 @@ pub(super) fn fly_field(
                     }
                 }
                 Event::Touchdown { .. } => s.touchdowns += 1,
-                Event::Phase { .. } => {}
+                Event::Phase { id, from, to } => {
+                    if trace {
+                        let pos = link.fleet().get(*id).map(|a| a.kin.pos());
+                        println!("{t:7.1} [{id}] {from:?} -> {to:?} at {pos:?}");
+                    }
+                }
             }
         }
         // The command loop's half, as often as the monitor ticks.
         station.sync_traffic_desks();
-        let trace = std::env::var("XVL_TRAFFIC_TRACE").is_ok_and(|v| !v.is_empty());
         for line in out.tower.iter().filter(|_| trace) {
             println!("{t:7.1} TWR(tick) [{}] {}", line.0, line.1);
         }
         for call in crate::world::take_traffic_calls() {
             let reply = station.answer_traffic(&call);
+            s.said.push(reply.line.clone());
             if trace {
                 println!(
                     "{t:7.1} [{}] {}\n{t:7.1}   TWR: {}",
@@ -194,6 +207,15 @@ pub(super) fn fly_field(
         }
         for ac in link.fleet().aircraft() {
             if let Some(line) = crate::world::traffic_compliance_oracle(ac.id, now) {
+                if trace {
+                    println!(
+                        "ORACLE {t:.1} [{}] {line}\n  at {:?} gs {:.1} hdg {:.0}",
+                        ac.id,
+                        ac.kin.pos(),
+                        ac.kin.gs_kts,
+                        ac.kin.hdg_deg
+                    );
+                }
                 if s.oracle.len() < 20 {
                     s.oracle
                         .push(format!("{t:.0} s {} {:?}: {line}", ac.callsign, ac.phase));
@@ -240,6 +262,29 @@ fn assert_clean(s: &HarnessScore, what: &str) {
     );
 }
 
+/// The world sweep's window at each field: ten minutes of fleet time.
+const SWEEP_S: f64 = 600.0;
+
+/// What the sweep asserts of a field's window (completion is not asked of
+/// ten minutes): the runway book never held two incompatible claims, the
+/// compliance oracle stayed silent, every traffic readback was accepted.
+fn assert_sweep_clean(s: &HarnessScore, what: &str) {
+    assert!(
+        s.conflicts.is_empty(),
+        "{what}: runway conflicts {:?}",
+        s.conflicts
+    );
+    assert!(
+        s.oracle.is_empty(),
+        "{what}: the oracle spoke {:?}",
+        s.oracle
+    );
+    assert_eq!(
+        s.readbacks, s.readbacks_accepted,
+        "{what}: every readback accepted"
+    );
+}
+
 /// The orders map one to one.
 #[test]
 fn an_order_maps_onto_the_fleet() {
@@ -255,6 +300,7 @@ fn an_order_maps_onto_the_fleet() {
         line_up_condition: None,
         go_around: true,
         readback_owed: Some("Going around, Cessna".into()),
+        crossing: Some("13".into()),
     };
     let m = map_order(&o);
     assert_eq!(m.state, traffic::TowerState::ClearedToLand);
@@ -263,6 +309,7 @@ fn an_order_maps_onto_the_fleet() {
     assert_eq!(m.holding_point, None);
     assert_eq!(m.follow, Some(4));
     assert!(m.go_around);
+    assert_eq!(m.cross_cleared.as_deref(), Some("13"));
     let ours = crate::world::TrafficOrder {
         follow: Some(crate::party_line::FlightId::Own),
         ..o
@@ -298,6 +345,104 @@ fn a_field_hour_inner() {
     Station::uninstall();
 }
 
+/// A real field's layout from the fixtures (`crates/traffic/fixtures/<icao>.dat`,
+/// cut from the install's apt.dat: runways, frequencies, the taxi network
+/// and stands) with the procedure NAMES its CIFP publishes (what the
+/// schedule reads), and the station for it, installed.
+fn fixture_field(icao: &str, sids: &[&str], approaches: &[&str]) -> (FieldModel, Station, String) {
+    let apt = format!("{}/{}.dat", fixtures(), icao.to_ascii_lowercase());
+    let mut field = FieldModel::load(&apt, icao).unwrap().unwrap();
+    field.procs.sids = sids.iter().map(|s| s.to_string()).collect();
+    field.procs.approaches = approaches.iter().map(|s| s.to_string()).collect();
+    let st = installed_station(&apt, icao);
+    (field, st, apt)
+}
+
+/// ULMM's procedure names, as the install's CIFP lists them.
+const ULMM_SIDS: [&str; 30] = [
+    "ASGO2E", "ASGO2G", "ASGO2J", "ASGO2N", "ASGO2P", "ASGO2S", "EKLE2E", "EKLE2G", "EKLE2J",
+    "EKLE2N", "EKLE2P", "EKLE2S", "LOPR2E", "LOPR2G", "LOPR2J", "LOPR2N", "LOPR2P", "LOPR2S",
+    "PELO2E", "PELO2G", "PELO2J", "PELO2N", "PELO2P", "PELO2S", "ULME2E", "ULME2G", "ULME2J",
+    "ULME2N", "ULME2P", "ULME2S",
+];
+const ULMM_APPROACHES: [&str; 14] = [
+    "I13-Y", "I13-Z", "I31-Y", "I31-Z", "J13", "J31", "N13-X", "N13-Y", "N13-Z", "N31-X", "N31-Y",
+    "N31-Z", "R13", "R31",
+];
+
+/// THE WORLD SWEEP'S ULMM (2026-10-08): the taxi routes from the north
+/// apron reach the 13 holds (Foxtrot, Charlie) ACROSS runway 13/31 itself.
+/// The tower cleared the crossing in the taxi clearance ("cross runway one
+/// three") and the traffic drove straight over: 20 conflicts (a takeoff on
+/// 13 with a flight crossing it) and the oracle's "you are on runway three
+/// one without clearance" at the pavement's edge. Now each flight holds
+/// short, asks, and is held while the strip is busy. The sweep's own
+/// schedule (seed 3) on the real layout, flown to the end.
+#[test]
+fn ulmm_traffic_holds_short_of_the_runway_it_crosses() {
+    in_own_process("traffic_link::tests::ulmm_traffic_holds_short_inner");
+}
+
+#[test]
+#[ignore = "run in its own process by ulmm_traffic_holds_short_of_the_runway_it_crosses"]
+fn ulmm_traffic_holds_short_inner() {
+    if std::env::var(HARNESS_ENV).is_err() {
+        return;
+    }
+    let (field, mut st, _) = fixture_field("ULMM", &ULMM_SIDS, &ULMM_APPROACHES);
+    let schedule = traffic::generate(&field, Density::Normal, 3, &SpawnCtx::default());
+    let s = fly_field(&mut st, field, schedule, SWEEP_S);
+    assert!(
+        s.said
+            .iter()
+            .any(|l| l.contains("hold short runway one three, traffic on the runway")),
+        "a crossing was held for the busy strip: {:?}",
+        s.said
+    );
+    assert!(
+        s.said
+            .iter()
+            .any(|l| l.ends_with("cross runway one three.")),
+        "and cleared once it was free"
+    );
+    assert_sweep_clean(&s, "ULMM crossings");
+    Station::uninstall();
+}
+
+/// THE WORLD SWEEP'S BIEG (2026-10-08): an arrival vacated 03 on the far
+/// side and its taxi in crossed the strip again ("taxi to parking one,
+/// cross runway zero three") while a departure released by the takeoff
+/// hold rolled on 03: 20 conflicts. Now the taxi in holds short of 21,
+/// asks, and waits for the departure.
+#[test]
+fn bieg_taxi_in_holds_short_of_the_runway_it_landed_on() {
+    in_own_process("traffic_link::tests::bieg_taxi_in_holds_short_inner");
+}
+
+#[test]
+#[ignore = "run in its own process by bieg_taxi_in_holds_short_of_the_runway_it_landed_on"]
+fn bieg_taxi_in_holds_short_inner() {
+    if std::env::var(HARNESS_ENV).is_err() {
+        return;
+    }
+    let (field, mut st, _) = fixture_field(
+        "BIEG",
+        &[
+            "BRUS2A", "ELVU2A", "FELI1B", "FELI3A", "VAD1A", "VAD1B", "VAD2A",
+        ],
+        &["I03", "Q03", "Q21", "R03", "R21"],
+    );
+    let schedule = traffic::generate(&field, Density::Normal, 3, &SpawnCtx::default());
+    let s = fly_field(&mut st, field, schedule, SWEEP_S);
+    assert!(
+        s.said.iter().any(|l| l.contains("hold short runway")),
+        "the taxi in held short: {:?}",
+        s.said
+    );
+    assert_sweep_clean(&s, "BIEG crossings");
+    Station::uninstall();
+}
+
 /// The field hour at the REAL LEMG (no circuits there: IFR both ways, jets
 /// on 13), against the real station, as XTST's. Needs the install.
 #[test]
@@ -326,9 +471,13 @@ fn real_install_lemg_traffic_hour_inner() {
 }
 
 /// THE WORLD SWEEP, traffic: a generated schedule at each of the first N
-/// towered fields in the install (`XVL_TRAFFIC_SWEEP_N`, default 20),
-/// flown for ten minutes against its real station: nothing panics.
-/// Completion is not asked (minutes, not the hour); the numbers print.
+/// towered fields in the install (`XVL_TRAFFIC_SWEEP_N`, default 150;
+/// `XVL_TRAFFIC_SWEEP_ONLY=ULMM,BIEG` for named ones), flown for ten
+/// minutes against its real station: nothing panics, and at every field the
+/// runway book never holds two incompatible claims, the compliance oracle
+/// stays silent and every traffic readback is accepted
+/// ([`assert_sweep_clean`]). Completion is not asked (minutes, not the
+/// hour); the numbers print. Seconds in release.
 #[test]
 #[ignore = "needs X-Plane's Global Airports apt.dat; run with -- --ignored"]
 fn real_install_traffic_world_sweep() {
@@ -345,10 +494,17 @@ fn real_install_traffic_world_sweep_inner() {
     let n: usize = std::env::var("XVL_TRAFFIC_SWEEP_N")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
+        .unwrap_or(150);
+    // `XVL_TRAFFIC_SWEEP_ONLY=ULMM,BIEG` sweeps just those fields.
+    let only = std::env::var("XVL_TRAFFIC_SWEEP_ONLY")
+        .ok()
+        .filter(|v| !v.is_empty());
     let mut fields: Vec<(String, crate::nav::AirportInfo)> = Vec::new();
     let scanned = crate::nav::scan_airports(&apt, |icao, a| {
-        if fields.len() < n && a.freq(crate::nav::FREQ_TOWER).is_some() {
+        let wanted = only
+            .as_ref()
+            .is_none_or(|o| o.split(',').any(|f| f == icao));
+        if wanted && fields.len() < n && a.freq(crate::nav::FREQ_TOWER).is_some() {
             fields.push((icao.to_string(), a));
         }
     });
@@ -358,6 +514,7 @@ fn real_install_traffic_world_sweep_inner() {
     }
     let cifp = crate::nav::test_xplane_path("Custom Data/CIFP");
     let (mut flown, mut spawned, mut calls) = (0, 0, 0);
+    let mut dirty: Vec<String> = Vec::new();
     for (icao, a) in fields {
         let net = crate::nav::find_taxi_net(&apt, &icao).ok().flatten();
         let has_stands = net.as_ref().is_some_and(|n| !n.stands.is_empty());
@@ -367,7 +524,7 @@ fn real_install_traffic_world_sweep_inner() {
             continue;
         };
         let mut st = install(st, &apt, &icao, has_stands);
-        let s = fly_field(&mut st, field, schedule, 600.0);
+        let s = fly_field(&mut st, field, schedule, SWEEP_S);
         println!(
             "{icao}: {} scheduled, {} calls, {} readbacks ({} accepted), {} conflicts, {} oracle",
             s.movements,
@@ -380,13 +537,28 @@ fn real_install_traffic_world_sweep_inner() {
         for line in s.conflicts.iter().take(1).chain(s.oracle.iter().take(1)) {
             println!("    {line}");
         }
+        let clean =
+            s.conflicts.is_empty() && s.oracle.is_empty() && s.readbacks == s.readbacks_accepted;
+        if !clean {
+            dirty.push(format!(
+                "{icao}: {:?} {:?} readbacks {}/{}",
+                s.conflicts.first(),
+                s.oracle.first(),
+                s.readbacks_accepted,
+                s.readbacks
+            ));
+        }
         flown += 1;
         spawned += s.movements;
         calls += s.calls;
     }
     Station::uninstall();
-    println!("swept {flown} fields: {spawned} movements, {calls} calls, no panic");
+    println!(
+        "swept {flown} fields: {spawned} movements, {calls} calls, no panic, {} dirty",
+        dirty.len()
+    );
     assert!(flown > 0);
+    assert!(dirty.is_empty(), "fields with findings: {dirty:#?}");
 }
 
 /// `XCOPILOT_TRAFFIC` unset is `off`, and `off` (or `real`, or ATC off, or

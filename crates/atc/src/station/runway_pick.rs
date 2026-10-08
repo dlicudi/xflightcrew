@@ -29,6 +29,11 @@ impl Station {
             _ => None,
         };
         self.desk.call.requested_ident = None;
+        self.desk.call.crossing_request = match intent {
+            tower::Intent::RequestCrossing => tower::stated_runway(transcript),
+            _ => None,
+        };
+        self.desk.call.crossing_ident = None;
     }
 
     /// The caller of the stated runway stands ON that strip, on the ground:

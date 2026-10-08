@@ -428,6 +428,7 @@ pub(crate) fn map_order(o: &TrafficOrder) -> Order {
         hold: o.hold,
         go_around: o.go_around,
         readback_owed: o.readback_owed.clone(),
+        cross_cleared: o.crossing.clone(),
     }
 }
 

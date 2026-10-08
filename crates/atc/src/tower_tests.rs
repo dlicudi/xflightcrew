@@ -23,6 +23,8 @@ fn ctx() -> Ctx {
         wake_secs_left: None,
         taxi_via: Vec::new(),
         taxi_crossings: Vec::new(),
+        hold_short_crossings: false,
+        crossing: None,
         on_ground: false,
         ifr: None,
         circuit: None,
@@ -916,6 +918,7 @@ fn state_intent_matrix_holds_the_invariants() {
         RunwayVacated,
         RequestRunway,
         RequestBacktrack,
+        RequestCrossing,
         CancelIfr,
         RequestSid,
         RequestVectors,
@@ -999,6 +1002,9 @@ fn state_intent_matrix_holds_the_invariants() {
                     // A backtrack is a ground request (ctx() is airborne: a
                     // garble) and a cancellation is the station's book.
                     RequestBacktrack | CancelIfr | RequestSid => start,
+                    // A crossing is a ground request (a garble airborne), and
+                    // on the ground it clears a crossing, not a state.
+                    RequestCrossing => start,
                     // The IFR clearance clears a route, not a runway: the
                     // sequence stands (and with no offer it is "say again").
                     RequestIfrClearance { .. } => start,
@@ -2122,4 +2128,94 @@ fn arrival_taxi_in_clears_to_the_planned_stand() {
     assert!(twr3
         .handle(Intent::RequestTaxiIn, &c3)
         .contains("taxi to parking"));
+}
+
+/// A crossing request: asked in words the pilot (or our traffic) uses, its
+/// readback never a request; answered from the station's judgement, cleared
+/// with a readback owed, held short with the reason, and never from the air.
+#[test]
+fn a_runway_crossing_is_asked_answered_and_read_back() {
+    for words in [
+        "Gatwick Tower, Cessna three four five, holding short runway two six right, \
+         request crossing",
+        "tower, november one two three, request to cross runway two six right",
+        "requesting crossing runway zero eight left",
+    ] {
+        assert_eq!(parse_intent(words), Intent::RequestCrossing, "{words}");
+    }
+    assert_ne!(
+        parse_intent("crossing runway two six right, Cessna three four five"),
+        Intent::RequestCrossing,
+        "the readback"
+    );
+    assert_eq!(
+        parse_intent("request runway two six right"),
+        Intent::RequestRunway,
+        "a runway request stays one"
+    );
+    let ground = Ctx {
+        on_ground: true,
+        crossing: Some(("two six right".into(), None)),
+        ..ctx()
+    };
+    let mut twr = Tower::new();
+    twr.state = State::TaxiCleared;
+    let r = twr.handle(Intent::RequestCrossing, &ground);
+    assert_eq!(
+        r,
+        format!("{}, cross runway two six right.", ground.callsign)
+    );
+    assert_eq!(twr.state, State::TaxiCleared, "still on its taxi");
+    assert_eq!(
+        twr.suggested_readback("N123").as_deref(),
+        Some("Crossing runway two six right, N123.")
+    );
+    assert_eq!(
+        twr.gate(
+            "crossing runway two six right, N123",
+            Intent::Unknown,
+            &ground
+        ),
+        Some(String::new()),
+        "read back"
+    );
+    let busy = Ctx {
+        crossing: Some(("two six right".into(), Some("traffic on final".into()))),
+        ..ground.clone()
+    };
+    let r = twr.handle(Intent::RequestCrossing, &busy);
+    assert_eq!(
+        r,
+        format!(
+            "{}, hold short runway two six right, traffic on final.",
+            busy.callsign
+        )
+    );
+    assert!(twr.pending().is_none(), "nothing to read back");
+    let unnamed = Ctx {
+        crossing: None,
+        ..ground.clone()
+    };
+    let r = twr.handle(Intent::RequestCrossing, &unnamed);
+    assert!(r.contains("say again"), "{r}");
+    let airborne = Ctx {
+        on_ground: false,
+        ..ground.clone()
+    };
+    let r = twr.handle(Intent::RequestCrossing, &airborne);
+    assert!(r.contains("say again"), "{r}");
+    // The taxi clearance of a flight that asks at the runway holds it short;
+    // ours is cleared across in it, as before.
+    let taxi = Ctx {
+        taxi_crossings: vec!["two six right".into()],
+        ..ground.clone()
+    };
+    let ours = Tower::new().handle(Intent::RequestTaxi, &taxi);
+    assert!(ours.contains(", cross runway two six right"), "{ours}");
+    let asks = Ctx {
+        hold_short_crossings: true,
+        ..taxi
+    };
+    let held = Tower::new().handle(Intent::RequestTaxi, &asks);
+    assert!(held.contains(", hold short runway two six right"), "{held}");
 }

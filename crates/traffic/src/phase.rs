@@ -38,6 +38,9 @@ pub struct Order {
     pub go_around: bool,
     /// A readback the tower is owed, answered verbatim once.
     pub readback_owed: Option<String>,
+    /// The runway the tower has cleared this aircraft to cross ("cross
+    /// runway one three"): the taxi goes on past the stop short of it.
+    pub cross_cleared: Option<String>,
 }
 
 /// What a traffic aircraft is doing.
@@ -157,6 +160,10 @@ pub enum Call {
     Final,
     Vacated,
     GoingAround,
+    /// Holding short of a runway the taxi route crosses, asking to cross.
+    RequestCrossing {
+        runway: String,
+    },
     /// The owed readback, verbatim.
     Readback(String),
 }
@@ -185,6 +192,10 @@ impl Call {
             // tower's own suggested wording.
             Call::Vacated => format!("{spoken}, runway vacated, request taxi to parking"),
             Call::GoingAround => format!("{spoken}, going around"),
+            Call::RequestCrossing { runway } => format!(
+                "Tower, {spoken}, holding short runway {}, request crossing",
+                runway_words(runway)
+            ),
             // The tower's phrasing already names the flight: said as it is.
             Call::Readback(text) if text.contains(spoken) => text.trim_end_matches('.').to_string(),
             Call::Readback(text) => format!("{text}, {spoken}"),
@@ -329,6 +340,13 @@ mod tests {
                 .text("Cessna one", None),
             "Cleared to land runway two seven, Cessna one",
             "a readback already naming the flight is said as it is"
+        );
+        assert_eq!(
+            Call::RequestCrossing {
+                runway: "13".into()
+            }
+            .text("Cessna one", None),
+            "Tower, Cessna one, holding short runway one three, request crossing"
         );
         assert_eq!(
             Call::Base.text("Cessna one", Some("27")),

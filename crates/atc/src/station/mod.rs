@@ -210,6 +210,14 @@ struct CallScratch {
     /// That request resolved to a strip end the tower can hand out ("08L"),
     /// committed as the runway in use when the tower grants it.
     requested_ident: Option<String>,
+    /// The runway a crossing request named, canonical ("13"), for the ctx
+    /// that answers it (`note_stated_runway`, `judge_crossing`). Never the
+    /// stated runway: the strip crossed is not the one departed from.
+    crossing_request: Option<String>,
+    /// That request resolved to a strip end of this field ("13") and
+    /// judged clear: the reply that clears it notes it on the strip
+    /// ([`crate::party_line::FlightStrip::crossing`]).
+    crossing_ident: Option<String>,
 }
 
 impl StripDesk {

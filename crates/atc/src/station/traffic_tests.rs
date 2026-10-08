@@ -613,3 +613,56 @@ fn the_fleet_picture_is_the_one_traffic_picture() {
     st.install();
     assert!(traffic_picture().is_none(), "an install clears the picture");
 }
+
+/// A point `off_m` north of the twin strip (08L/26R), halfway along it.
+fn by_the_twin(off_m: f64) -> AircraftState {
+    let (lat, lon) = along(&book_runways()[1], 0.5);
+    AircraftState::at_position(lat + off_m / 111_320.0, lon, true, 0.0)
+}
+
+/// A TRAFFIC CROSSING IS ASKED FOR AND JUDGED ON THE BOOK: through the same
+/// keyed path as any call, held short while somebody stands on the strip,
+/// cleared once it is free (the readback owed, the crossing on its strip
+/// and its order), and spent once the flight has been on the strip and is
+/// off it again. The world sweep's ULMM, EFKU, UEMH (2026-10-08): the
+/// crossing was given in the taxi clearance and flown at once.
+#[test]
+fn a_traffic_crossing_is_asked_for_and_judged_on_the_book() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let mut st = gatwick_live();
+    let ask = "Gatwick Tower, Cessna three four five, holding short runway two six right, \
+               request crossing";
+    let short = by_the_twin(-80.0);
+    note_traffic_state(12, short);
+    let held = st.answer_traffic(&call(12, ask, short, vec![ghost_on_the_twin()]));
+    assert_eq!(
+        held.line,
+        format!("{CS}, hold short runway two six right, traffic on the runway.")
+    );
+    let order = || traffic_order(12).expect("its strip");
+    assert_eq!(order().crossing, None, "nothing cleared");
+    let cleared = st.answer_traffic(&call(12, ask, short, Vec::new()));
+    assert_eq!(cleared.line, format!("{CS}, cross runway two six right."));
+    assert_eq!(order().crossing.as_deref(), Some("26R"));
+    assert_eq!(
+        order().readback_owed.as_deref(),
+        Some("Crossing runway two six right, Cessna three four five.")
+    );
+    let rb = st.answer_traffic(&call(
+        12,
+        "Crossing runway two six right, Cessna three four five",
+        short,
+        Vec::new(),
+    ));
+    assert!(rb.line.is_empty(), "the readback is accepted: {}", rb.line);
+    assert_eq!(order().readback_owed, None);
+    // On the strip, then off the far side: the crossing is spent.
+    for (off, still) in [(-80.0, true), (0.0, true), (80.0, false)] {
+        note_traffic_state(12, by_the_twin(off));
+        traffic_tick(12, &[], Instant::now());
+        assert_eq!(order().crossing.is_some(), still, "{off} m");
+    }
+    assert!(own_strip_moved().is_empty(), "{:?}", own_strip_moved());
+    Station::uninstall();
+}

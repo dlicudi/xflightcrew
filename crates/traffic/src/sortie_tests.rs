@@ -48,6 +48,7 @@ impl ScriptedTower {
                 o.state = TowerState::Inbound;
                 o.go_around = false;
             }
+            Call::RequestCrossing { runway } => o.cross_cleared = Some(runway.clone()),
             Call::Base | Call::Readback(_) => {}
         }
     }
@@ -193,6 +194,77 @@ fn assert_flown(s: &Score, what: &str) {
             s.runway_len_m
         );
     }
+}
+
+/// A taxi route across a runway stops short of its pavement (the strip's
+/// geometry, never a network flag), asks to cross, holds (asking again
+/// every [`CROSS_ASK_RETRY_S`]) and goes on only once the tower has
+/// cleared THAT strip and heard the readback. The world sweep (ULMM, EFKU,
+/// UEMH, 2026-10-08): traffic drove straight across under its taxi
+/// clearance.
+#[test]
+fn a_taxi_holds_short_of_a_runway_it_crosses_until_cleared() {
+    use crate::aircraft::CROSS_ASK_RETRY_S;
+    let field = fixtures::xtst();
+    let e09 = field.end("09").unwrap();
+    let mut ac = cessna(&field, 1, "GA2", "09", 1);
+    // From the stand south across 09/27 to beyond it.
+    let route = vec![(36.0022, -5.0), (36.0022, -5.004), (35.9985, -5.004)];
+    let mut o = Order {
+        state: TowerState::TaxiCleared,
+        taxi_path: Some(route.clone()),
+        ..Default::default()
+    };
+    let mut events = Vec::new();
+    let run = |ac: &mut TrafficAircraft, o: &Order, secs: f64, events: &mut Vec<Event>| {
+        let mut nearest = f64::INFINITY;
+        for _ in 0..(secs * 10.0) as usize {
+            ac.substep(0.1, Some(o), &field, &[], events);
+            nearest = nearest.min(e09.frame(ac.kin.pos()).1.abs());
+        }
+        nearest
+    };
+    let asks = |events: &[Event]| {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(e, Event::Call { call: Call::RequestCrossing { runway }, .. }
+                    if runway == "09")
+            })
+            .count()
+    };
+    // Uncleared for four minutes: stopped short, asking every half minute.
+    let nearest = run(&mut ac, &o, 240.0, &mut events);
+    assert_eq!(ac.phase, Phase::TaxiOut);
+    assert!(ac.kin.gs_kts < 0.5, "held, {:.1} kt", ac.kin.gs_kts);
+    assert!(
+        nearest > 40.0,
+        "never nearer the centreline than {nearest:.1} m"
+    );
+    let n = asks(&events);
+    assert!(
+        (2..=(240.0 / CROSS_ASK_RETRY_S) as usize).contains(&n),
+        "{n} asks"
+    );
+    // Cleared across the strip (by its other end), the readback still owed:
+    // it holds; heard, it crosses and reaches the end of its route.
+    o.cross_cleared = Some("27".into());
+    o.readback_owed = Some("Crossing runway two seven, Cessna three four five.".into());
+    let nearest = run(&mut ac, &o, 10.0, &mut events);
+    assert!(nearest > 40.0, "no move before the readback");
+    o.readback_owed = None;
+    run(&mut ac, &o, 120.0, &mut events);
+    assert_eq!(ac.phase, Phase::HoldShort, "across and at the route's end");
+    assert!(e09.frame(ac.kin.pos()).1 > 40.0, "south of the runway now");
+    // A crossing cleared for ANOTHER strip is no clearance for this one:
+    // a fresh aircraft with the same order but a foreign runway holds.
+    let mut other = cessna(&field, 2, "GA2", "09", 1);
+    let foreign = Order {
+        cross_cleared: Some("18".into()),
+        ..o.clone()
+    };
+    let nearest = run(&mut other, &foreign, 120.0, &mut Vec::new());
+    assert!(nearest > 40.0 && other.phase == Phase::TaxiOut);
 }
 
 #[test]

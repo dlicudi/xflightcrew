@@ -1389,6 +1389,17 @@ impl TaxiNet {
         // from the holding point onto the runway centreline — survives on the
         // plan for the line-up to drive.
         let full = path.clone();
+        // The aircraft's own position is put in front of the route below
+        // when it is off the first node: then the trims may cut the network
+        // part down to that one node and the route still has two points.
+        // UEMH (2026-10-08, the traffic sweep): stand 13 snaps to the node
+        // ONE edge from the runway, the two-node route could not be trimmed
+        // by either rule and ended on the centreline junction, so the taxi
+        // clearance drove onto runway zero niner.
+        let fronted = path
+            .first()
+            .is_some_and(|f| dist_m((from_lat, from_lon), *f) > 1.0);
+        let keep_nodes = if fronted { 1 } else { 2 };
         let zone_edges = if hold_zone.is_empty() {
             0
         } else {
@@ -1397,7 +1408,7 @@ impl TaxiNet {
                 .rev()
                 .take_while(|&&ei| self.edges[ei].zone_of.iter().any(|z| hold_zone.contains(z)))
                 .count()
-                .min(path.len().saturating_sub(2))
+                .min(path.len().saturating_sub(keep_nodes))
         };
         if zone_edges > 0 {
             path.truncate(path.len() - zone_edges);

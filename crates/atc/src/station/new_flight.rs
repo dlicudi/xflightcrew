@@ -360,4 +360,29 @@ pub(super) fn note_aircraft_state_for(flight: &FlightStrip, state: &AircraftStat
             }
         }
     }
+    note_crossing_for(flight, lat, lon, on_ground);
+}
+
+/// A cleared crossing ([`FlightStrip::crossing`]) is spent once the flight
+/// has been on the strip it crossed and is seen off it again (or airborne).
+/// Nothing is read past the cell while no crossing stands.
+fn note_crossing_for(flight: &FlightStrip, lat: f64, lon: f64, on_ground: bool) {
+    let Some((end, entered)) = flight
+        .crossing
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    else {
+        return;
+    };
+    let runways = active_runways();
+    let on_it =
+        on_ground && strip(&runways, &end).is_some_and(|r| on_runway(r, lat, lon).is_some());
+    let next = match (entered, on_it) {
+        _ if !on_ground => None,
+        (_, true) => Some((end, true)),
+        (true, false) => None,
+        (false, false) => Some((end, false)),
+    };
+    *flight.crossing.lock().unwrap_or_else(|e| e.into_inner()) = next;
 }

@@ -186,6 +186,13 @@ flight_strip! {
             /// report, cleared once the flight is no longer Inbound. Read only
             /// by a traffic flight's order view (`world::traffic_order`).
             sequence: Mutex<Option<(u8, Option<FlightId>)>> = Mutex::new(None),
+            /// The runway END this flight was cleared to CROSS ("cross runway
+            /// one three", the answer to `Intent::RequestCrossing`), and
+            /// whether it has been seen on that strip yet. Set by the reply
+            /// that clears it; cleared once the flight is seen OFF the strip
+            /// after being on it (`station::note_aircraft_state_for`). Read by
+            /// a traffic flight's order view (`world::traffic_order`).
+            crossing: Mutex<Option<(String, bool)>> = Mutex::new(None),
         },
         /// The station's own worksheets for this flight at this field: reset by
         /// `install`, `uninstall` and `retire_for_new_flight`. `self_taxi` is the

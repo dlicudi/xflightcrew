@@ -270,6 +270,9 @@ pub struct TrafficOrder {
     pub go_around: bool,
     /// The readback the tower is waiting for, phrased; `None` once heard.
     pub readback_owed: Option<String>,
+    /// The runway END the flight is cleared to cross ("13"), from the
+    /// clearance until it is seen off that strip again; `None` otherwise.
+    pub crossing: Option<String>,
 }
 
 /// How the acknowledgement a go-around order owes begins
@@ -297,6 +300,12 @@ pub fn traffic_order(id: u32) -> Option<TrafficOrder> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let sequence = *strip.sequence.lock().unwrap_or_else(|e| e.into_inner());
+    let crossing = strip
+        .crossing
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|c| c.0.clone());
     let takeoff_held = strip
         .takeoff_hold
         .lock()
@@ -339,6 +348,7 @@ pub fn traffic_order(id: u32) -> Option<TrafficOrder> {
         line_up_condition,
         go_around,
         readback_owed,
+        crossing,
     })
 }
 

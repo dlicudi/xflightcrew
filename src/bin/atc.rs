@@ -327,6 +327,8 @@ fn main() -> Result<()> {
                     wake_secs_left: None,
                     taxi_via: Vec::new(),
                     taxi_crossings: Vec::new(),
+                    hold_short_crossings: false,
+                    crossing: None,
                     on_ground: false,
                     own_on_runway: false,
                     helicopter: false,

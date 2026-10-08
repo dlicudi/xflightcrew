@@ -247,3 +247,35 @@ pub fn strip_frame(r: &Runway, lat: f64, lon: f64, ref_lat: f64) -> Option<Strip
         len2,
     })
 }
+
+/// Lateral capture around a runway centreline when the 100-row carried no
+/// width: 40 m covers everything up to a wide-body runway (60 m / 2 + slack)
+/// without capturing a parallel taxiway.
+pub const RUNWAY_HALF_WIDTH_M: f64 = 40.0;
+
+/// Slack past the real pavement edge: edge lines, a mainwheel over the
+/// threshold stripe, not the holding point. Jerez's E1 sits 40 m off the
+/// 45 m runway's centreline; the blanket 40 m capture accused a pilot
+/// holding SHORT of runway 20 of being ON it (2026-07-11).
+pub const RUNWAY_EDGE_SLACK_M: f64 = 10.0;
+
+/// Is `(lat, lon)` ON strip `r`'s pavement? The one test the tower's
+/// occupancy and our traffic's runway crossings share: within the half
+/// width plus [`RUNWAY_EDGE_SLACK_M`] of the centreline (or
+/// [`RUNWAY_HALF_WIDTH_M`] with no width), slightly past either threshold
+/// included (displaced, overrun). Returns the nearer end's ident. Pure.
+pub fn on_strip(r: &Runway, lat: f64, lon: f64) -> Option<String> {
+    // Scaled at the position's latitude; a degenerate row is nowhere.
+    let f = strip_frame(r, lat, lon, lat)?;
+    let t = f.t();
+    let half_width = if r.width_m > 1.0 {
+        r.width_m / 2.0 + RUNWAY_EDGE_SLACK_M
+    } else {
+        RUNWAY_HALF_WIDTH_M
+    };
+    if (-0.02..=1.02).contains(&t) && f.cross_m() <= half_width {
+        let ident = if t < 0.5 { &r.ident_a } else { &r.ident_b };
+        return Some(ident.clone());
+    }
+    None
+}
