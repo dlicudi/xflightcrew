@@ -7,8 +7,10 @@ pub const SUBSTEP_S: f64 = 0.1;
 
 /// The most one tick may advance the clock. A long gap (a load, a debugger,
 /// a stalled monitor) is time the fleet did not see; it must not arrive as
-/// one giant step that teleports every aircraft.
-pub const MAX_TICK_S: f64 = 0.5;
+/// one giant step that teleports every aircraft. A normal tick must pass
+/// whole: the monitor ticked every ~1.25 s live (LEMG, 2026-10-08), and a
+/// half-second cap ran the fleet at 0.4x. Substeps keep a long tick smooth.
+pub const MAX_TICK_S: f64 = 3.0;
 
 /// The fleet's clock. Fed either a delta ([`SimClock::advance`]) or the
 /// sim's own running time ([`SimClock::observe`]), and answers how many
@@ -85,10 +87,10 @@ mod tests {
     #[test]
     fn a_long_gap_is_clamped_and_a_negative_one_is_nothing() {
         let mut c = SimClock::new();
-        assert_eq!(c.advance(30.0), 5, "half a second at most");
+        assert_eq!(c.advance(30.0), 30, "three seconds at most");
         assert_eq!(c.advance(-3.0), 0);
         assert_eq!(c.advance(f64::NAN), 0);
-        assert_eq!(c.steps(), 5);
+        assert_eq!(c.steps(), 30);
     }
 
     #[test]

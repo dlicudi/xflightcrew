@@ -120,6 +120,8 @@ pub(crate) struct Link {
     /// for it (an airborne aircraft's route is planned once, for one
     /// runway), and an arrival waits for it ([`ARRIVAL_WAIT_S`]).
     tower_runway: Option<String>,
+    /// Fleet time of the last heartbeat log line.
+    heartbeat_s: f64,
     /// The flights noted on their strips last tick (the reinstall rule).
     noted: Vec<u32>,
     /// Each flight's order as last seen (state, runway): a change is logged.
@@ -148,6 +150,7 @@ impl Link {
             next_id: 1,
             tower_name: tower_name.to_string(),
             tower_runway: None,
+            heartbeat_s: f64::NEG_INFINITY,
             noted: Vec::new(),
             seen_orders: HashMap::new(),
         }
@@ -322,6 +325,13 @@ impl Link {
 
     fn spawn_due(&mut self, own: Option<&OwnState>, out: &mut TickOut) {
         let now_s = self.fleet.clock.now_s();
+        // A heartbeat every 30 s of fleet time: the clock, what is due, the tower's runway.
+        if now_s - self.heartbeat_s >= 30.0 {
+            self.heartbeat_s = now_s;
+            tracing::info!(now_s, frozen = self.fleet.clock.frozen, due = self.due.len(),
+                next_s = self.due.first().map(|d| d.at_s), runway = ?self.tower_runway,
+                flying = self.fleet.aircraft().len(), "traffic: heartbeat");
+        }
         if self.fleet.clock.frozen || self.due.first().is_none_or(|d| d.at_s > now_s) {
             return;
         }
@@ -350,7 +360,17 @@ impl Link {
                 }
                 _ => {}
             }
-            match d.m.spawn(self.next_id, &self.fleet.field, &ctx) {
+            let spawned = d.m.spawn(self.next_id, &self.fleet.field, &ctx);
+            if let Err(why) = &spawned {
+                tracing::info!(callsign = %d.m.callsign, kind = ?d.m.kind, runway = %d.m.runway,
+                    tries = d.tries, "traffic: spawn refused ({why:?})");
+                crate::blackbox::record(
+                    "traffic",
+                    serde_json::json!({ "event": "spawn_refused", "callsign": d.m.callsign,
+                        "runway": d.m.runway, "why": format!("{why:?}"), "tries": d.tries }),
+                );
+            }
+            match spawned {
                 Ok(ac) => {
                     let id = ac.id;
                     let cs = ac.callsign.clone();
