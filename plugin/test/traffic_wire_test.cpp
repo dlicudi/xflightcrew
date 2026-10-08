@@ -138,10 +138,85 @@ static void refusals() {
     CHECK(r.seq == 9 && r.entries.empty());
 }
 
+// The app's golden bytes (`traffic::wire::tests::the_golden_bytes`, the spec's
+// "Wire (as built)"): what the Rust encoder writes must decode to what it was given.
+static std::vector<uint8_t> from_hex(const char* h) {
+    std::vector<uint8_t> v;
+    for (size_t i = 0; h[i] && h[i + 1]; i += 2) {
+        unsigned b = 0;
+        std::sscanf(h + i, "%2x", &b);
+        v.push_back(static_cast<uint8_t>(b));
+    }
+    return v;
+}
+
+static void app_golden_bytes_decode() {
+    const auto ros = from_hex(
+        "01000200070000000100000000000000581b0000433137320000000000000000000000000000000000000000"
+        "472d4142434400000000000002010000efcdab002509000041333230455a5900455a59000000000000000000"
+        "00000000455a59313241420000000000");
+    CHECK(ros.size() == 104);
+    Roster r;
+    CHECK(decode_roster(ros.data(), ros.size(), r) == Error::None);
+    CHECK(r.seq == 7);
+    CHECK(r.entries.size() == 2);
+    if (r.entries.size() == 2) {
+        CHECK(r.entries[0].id == 1);
+        CHECK(r.entries[0].squawk == 7000);
+        CHECK(r.entries[0].type == "C172");
+        CHECK(r.entries[0].callsign == "G-ABCD");
+        CHECK(r.entries[1].id == 258);
+        CHECK(r.entries[1].mode_s == 0xabcdef);
+        CHECK(r.entries[1].squawk == 2341);
+        CHECK(r.entries[1].type == "A320");
+        CHECK(r.entries[1].airline == "EZY");
+        CHECK(r.entries[1].livery == "EZY");
+        CHECK(r.entries[1].callsign == "EZY12AB");
+    }
+
+    const auto fr = from_hex(
+        "010002002a00000000000000004a93400100000000007a44000000000040424000000000000011c02823fa00"
+        "18fc57030cfeff8000000f02020100000000c8410000000000e040c00000000000e462409f8c000000000000"
+        "0000ff00ffff1103");
+    CHECK(fr.size() == 96);
+    Frames f;
+    CHECK(decode_frames(fr.data(), fr.size(), f) == Error::None);
+    CHECK(f.seq == 42);
+    CHECK(f.sim_time_s == 1234.5);
+    CHECK(f.entries.size() == 2);
+    if (f.entries.size() == 2) {
+        const FrameEntry& a = f.entries[0];
+        CHECK(a.id == 1);
+        CHECK(a.alt_ft == 1000.0f);
+        CHECK(a.lat == 36.5);
+        CHECK(a.lon == -4.25);
+        CHECK(near(a.hdg_deg, 90.0, 1e-4));
+        CHECK(near(a.pitch_deg, 2.5, 1e-4));
+        CHECK(near(a.roll_deg, -10.0, 1e-4));
+        CHECK(near(a.gs_kts, 85.5, 1e-4));
+        CHECK(a.vs_fpm == -500.0f);
+        CHECK(a.gear == 1.0f);
+        CHECK(near(a.flaps, 128.0 / 255.0, 1e-6));
+        CHECK(a.lights == 0x0f);
+        CHECK(a.flags == kFlagEngines);
+        const FrameEntry& b = f.entries[1];
+        CHECK(b.id == 258);
+        CHECK(b.alt_ft == 25.0f);
+        CHECK(b.lat == -33.75);
+        CHECK(b.lon == 151.125);
+        CHECK(near(b.hdg_deg, 359.99, 1e-3));
+        CHECK(b.spoiler == 1.0f);
+        CHECK(b.reverser == 1.0f);
+        CHECK(b.lights == (kLightNav | kLightTaxi));
+        CHECK(b.flags == (kFlagOnGround | kFlagEngines));
+    }
+}
+
 int main() {
     roster_decodes();
     frames_decode();
     refusals();
+    app_golden_bytes_decode();
     if (g_failed) {
         std::fprintf(stderr, "traffic_wire: %d check(s) failed\n", g_failed);
         return 1;
