@@ -333,7 +333,12 @@ pub fn follow(path: &[LatLon], at: &mut Follow, kin: &mut Kin, spec: &FollowSpec
             .map(|w| dist_m(w[0], w[1]))
             .sum::<f64>();
 
-    let look = spec.min_look_m.max(radius).max(v_ms * 1.5);
+    let look_radius = if spec.slow_for_corners {
+        radius
+    } else {
+        0.5 * radius
+    };
+    let look = spec.min_look_m.max(look_radius).max(v_ms * 1.5);
 
     // The lookahead point: `look` metres on from the foot of the
     // perpendicular, along the path (or straight on past its end).
@@ -401,6 +406,21 @@ pub fn follow(path: &[LatLon], at: &mut Follow, kin: &mut Kin, spec: &FollowSpec
         (kappa * v_ms).to_degrees()
     };
     turn_dps = turn_dps.clamp(-spec.max_turn_dps, spec.max_turn_dps);
+    // In the air, the LEAD TURN: closing on the leg with no more room
+    // than a full-rate arc needs to roll out on it, turn at the full rate.
+    // The pursuit alone eases off near the end of an arc and overshoots.
+    if !spec.slow_for_corners {
+        let course = bearing(a, b);
+        let ce = signed_diff_deg(course, kin.hdg_deg);
+        let (_, xte, _) = project(a, b, here);
+        let closing = (kin.hdg_deg - course).to_radians().sin() * xte < 0.0;
+        if closing
+            && ce.abs() > 2.0
+            && xte.abs() <= 1.1 * radius * (1.0 - ce.to_radians().cos()) + 0.5
+        {
+            turn_dps = spec.max_turn_dps * ce.signum();
+        }
+    }
     if spec.slow_for_corners && alpha.abs() > 45.0 {
         let frac = CORNER_MIN_FRACTION.max(1.0 - alpha.abs() / 120.0);
         v_allow = v_allow.min(spec.kts * frac * KT_TO_MS);

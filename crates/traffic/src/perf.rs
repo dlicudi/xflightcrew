@@ -37,10 +37,13 @@ pub struct Perf {
     pub base_ext_nm: f64,
     /// Takeoff-roll acceleration, knots a second.
     pub roll_accel_kts_s: f64,
-    /// The most the aircraft turns in the air, degrees a second.
+    /// The most the aircraft turns in the air, degrees a second (a light
+    /// aircraft banks about 20 degrees round a circuit: 5 at 85 kt).
     pub turn_air_dps: f64,
     /// Speed on the circuit's downwind.
     pub pattern_kts: f64,
+    /// The gear comes up after takeoff (a 172 has none to raise).
+    pub retractable_gear: bool,
 }
 
 /// A wake turbulence category (ICAO: L, M, H, J).
@@ -80,11 +83,12 @@ pub const PISTON_SINGLE: Perf = Perf {
     vref_kts: 61.0,
     decel_kts_s: 3.0,
     pattern_agl_ft: 1000.0,
-    downwind_offset_nm: 0.75,
-    base_ext_nm: 0.75,
+    downwind_offset_nm: 0.8,
+    base_ext_nm: 1.0,
     roll_accel_kts_s: 3.5,
-    turn_air_dps: 3.0,
+    turn_air_dps: 5.0,
     pattern_kts: 85.0,
+    retractable_gear: false,
 };
 
 /// A King Air or ATR class turboprop.
@@ -105,8 +109,9 @@ pub const TURBOPROP: Perf = Perf {
     downwind_offset_nm: 1.5,
     base_ext_nm: 1.5,
     roll_accel_kts_s: 4.0,
-    turn_air_dps: 3.0,
+    turn_air_dps: 4.0,
     pattern_kts: 160.0,
+    retractable_gear: true,
 };
 
 /// An A320 or 737 class jet.
@@ -129,6 +134,7 @@ pub const JET_MED: Perf = Perf {
     roll_accel_kts_s: 4.0,
     turn_air_dps: 3.0,
     pattern_kts: 210.0,
+    retractable_gear: true,
 };
 
 /// A 777 or A330 class jet.
@@ -151,6 +157,7 @@ pub const JET_HEAVY: Perf = Perf {
     roll_accel_kts_s: 3.0,
     turn_air_dps: 3.0,
     pattern_kts: 220.0,
+    retractable_gear: true,
 };
 
 /// The class table and wake category for an ICAO type designator. An

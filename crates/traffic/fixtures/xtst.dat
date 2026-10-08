@@ -1,0 +1,51 @@
+I
+1200 Synthetic traffic test fields (crates/traffic fixtures, not real airports)
+
+1 50 0 0 XTST Traffic Test Field
+1302 allows_circuits 1
+1302 transition_level 6000
+100 30.00 1 0 0.25 1 2 1 09 36.00000000 -5.00832800 0.00 0.00 2 0 0 0 27 36.00000000 -4.99167200 0.00 0.00 2 0 0 0
+1054 118250 XTST Tower
+1053 121750 XTST Ground
+1000 West flow
+1101 27 right
+1201 36.00134750 -5.00800000 both 1 A_west
+1201 36.00134750 -5.00000000 both 2 A_mid
+1201 36.00134750 -4.99200000 both 3 A_east
+1201 36.00080000 -5.00800000 both 4 A1_hold
+1201 36.00080000 -5.00000000 both 5 A2_hold
+1201 36.00080000 -4.99200000 both 6 A3_hold
+1201 36.00000000 -5.00800000 both 7 rwy_west
+1201 36.00000000 -5.00000000 both 8 rwy_mid
+1201 36.00000000 -4.99200000 both 9 rwy_east
+1201 36.00220000 -5.00000000 both 10 apron
+1201 36.00220000 -5.00060000 both 11 apron_w
+1201 36.00220000 -4.99940000 both 12 apron_e
+1201 36.00220000 -5.00120000 both 13 apron_ww
+1202 1 2 twoway taxiway A
+1202 2 3 twoway taxiway A
+1202 1 4 twoway taxiway A1
+1202 4 7 twoway taxiway A1
+1204 departure 09,27
+1204 arrival 09,27
+1202 2 5 twoway taxiway A2
+1202 5 8 twoway taxiway A2
+1204 departure 09,27
+1204 arrival 09,27
+1202 3 6 twoway taxiway A3
+1202 6 9 twoway taxiway A3
+1204 departure 09,27
+1204 arrival 09,27
+1202 7 8 twoway runway 09/27
+1202 8 9 twoway runway 09/27
+1202 2 10 twoway taxiway B
+1202 10 11 twoway taxiway B
+1202 10 12 twoway taxiway B
+1202 11 13 twoway taxiway B
+1300 36.00260000 -5.00060000 180.0 tie_down props GA1
+1300 36.00260000 -5.00000000 180.0 tie_down props GA2
+1300 36.00260000 -4.99940000 180.0 tie_down props GA3
+1300 36.00260000 -5.00120000 180.0 tie_down props GA4
+1300 36.00300000 -5.00180000 180.0 hangar props Hangar
+
+99

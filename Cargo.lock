@@ -2647,6 +2647,7 @@ dependencies = [
 name = "traffic"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "nav",
 ]
 

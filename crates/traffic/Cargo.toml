@@ -12,3 +12,4 @@ publish = false
 # bin (`cargo tree -p traffic` stays as lean as nav).
 [dependencies]
 nav = { path = "../nav" }
+anyhow = { workspace = true }

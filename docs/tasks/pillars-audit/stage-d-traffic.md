@@ -206,3 +206,32 @@ Increment 1 (`crates/traffic` skeleton):
   a 90 degree taxi corner is cut by under 4 m (slowed to 35% of the taxi pace).
 - `Perf` gained `roll_accel_kts_s`, `turn_air_dps` and `pattern_kts`; `class_for_type(icao)`
   picks the table and the `Wake`. `SimClock` also takes the sim's running time (`observe`).
+
+Increment 2 (the phase machine, `aircraft.rs`, `fleet.rs`, `field.rs`, `phase.rs`):
+- **A `Phase` carries no path.** The aircraft holds ONE `Route` (path, a `Leg` per segment,
+  its `Follow`, the threshold's index), and the airborne phases follow from the leg reached:
+  the roll's route runs on through upwind, crosswind, downwind, base and final, so a corner is
+  flown by and never re-planned. `Phase::Arrive` and `Phase::Pattern { leg: Leg }` take a
+  `Leg`, not an index.
+- **`Order.state` is `TowerState`**, a copy of `tower::State`'s six names (the crate never
+  sees atc); `Order::default()` (no strip) clears nothing, so an aircraft with no order waits on
+  the stand and goes around at 300 ft.
+- **`Event` gained `Phase { id, from, to }` and `Touchdown { id, at, along_m }`**; `Despawn`
+  carries a reason (`LeftTheArea`, `Parked`, `Removed`). `Call::text(spoken, runway)` renders
+  plain English ("Tower, Cessna three four five, ready for departure runway one three");
+  `Call::Inbound` is `{ miles, from }` (a compass point), not a position.
+- **The final is flown on a ramp** (fed forward on groundspeed, trimmed on the error), and so
+  are the downwind and base once the 3 degree path along the rest of the circuit is below
+  circuit height: the final is joined ON the path. In the air the follow adds a LEAD TURN (full
+  rate when the arc to roll out on the leg needs all the room left) and halves its lookahead:
+  without them the turn onto a short 172 final ended 10 to 25 m off and took a mile to settle.
+- The 172's circuit is 0.8 nm out with a 1.0 nm base extension and 5 degrees a second in the
+  turns (about 20 degrees of bank); the flare holds 200 fpm below 30 ft.
+- `FieldModel` is `AirportInfo` plus `TaxiNet` with `RunwayEnd` geometry (`at`, `frame`,
+  `side`), `taxi_to_runway` / `vacate` / `taxi_to_stand` over nav's planners, `free_stand`.
+  LEMG exists only in the install, so its sortie is `#[ignore]`
+  (`real_install_lemg_172_circuit_stand_to_stand`) and a synthetic `fixtures/xtst.dat`
+  (09/27, 1,500 m, a parallel taxiway, four stands, 27 published right) covers the rest.
+- Measured (the sortie tests print them): XTST 09 stand to stand in 810 s, taxi cross-track at
+  most 3.2 m (corner cuts), final below 300 ft at most 0.6 m, touchdown 381 m into 1,500 m;
+  LEMG 13 from stand W4 in 1,321 s, taxi 3.3 m, final 0.5 m, touchdown 381 m into 3,206 m.
