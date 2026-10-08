@@ -477,3 +477,82 @@ Increment 9 (speech):
   flag and the 8 s perish, the PTT and pilot-line retry then the stale drop, the tower-only rule.
 - Not done: a per-field call rate cap (the spec's "speech flood" risk); the stale drop and the
   one frequency are the only limits so far.
+
+Increment 10 (the app half of the wire):
+- **`traffic::wire`** (`crates/traffic/src/wire.rs`, pure): `encode_roster(seq, entries)`,
+  `encode_frames(seq, sim_time_s, entries)`, `roster_entry(ac)`, `frame_entry(ac)`, and
+  `decode_roster` / `decode_frames` for tests and tools (the plugin is the one reader). The
+  layout is the plugin's `plugin/src/traffic_wire.h`, byte for byte (see "Wire (as built)").
+  A buffer is cut at the plugin's 16 KB (`MAX_ROSTER` 341, `MAX_FRAMES` 409 aircraft); strings
+  are cut, never overrun (ASCII, else `?`); a heading of 360 is 0; numbers are clamped to
+  their field; a non-finite value goes out as 0 (the plugin refuses a non-finite position
+  whole).
+- **What an aircraft says on it**: airline = the callsign's first three letters when they are
+  followed by a figure (`EZY4069`), none for a registration; squawk 7000 in the circuit (and
+  parked), else `2` and the id's three octal figures; mode S 0 (the plugin picks); livery empty;
+  engines running from the beacon (lit for the taxi call) until it parks; no spoiler or reverser
+  in v1.
+- **`TrafficSink`** (`src/traffic_sink.rs`): started with the first link on the monitor's
+  runtime; `publish(fleet, sim_time_s)` hands the LATEST packet to a detached writer over a
+  `tokio::sync::watch` (a frame the writer had no time for is replaced, never queued); the
+  roster's sequence moves only when who is flying changes and is written then, the frames
+  every round, at most one round per 250 ms (so 3 Hz at the monitor's default rate, never
+  over 4). `xcopilot/traffic/enable` is 1 while the fleet flies; `withdraw()` at a stand-down
+  writes an empty roster and 0. A failed write (a plugin without the datarefs) backs off
+  10 s. `set_data` (base64, the `xcopilot/fms/route` path) for the two data datarefs,
+  `set_int` for enable. Frames' sim time is the `total_running_time_sec` the fleet stepped to.
+  `/labels` is left at the plugin's default (0).
+- **`health::PLUGIN_DATAREFS`** lists `xcopilot/traffic/enable`, `/frames`, `/roster`: a plugin
+  without them is SAID at boot ("out of date", a caution) and is never fatal; nothing writes
+  them unless `XCOPILOT_TRAFFIC=ours`. (The test that every `xcopilot/` literal is listed
+  requires the listing in any case.)
+
+### Wire (as built)
+
+Golden bytes, `traffic::wire::tests::the_golden_bytes` (and the same bytes from an independent
+Python `struct.pack` of the header's layout). The plugin's `plugin/test/traffic_wire_test.cpp`
+must decode exactly these.
+
+Roster, `encode_roster(7, ..)`, 104 bytes: header version 1, count 2, seq 7; entry 1: id 1,
+mode S 0, squawk 7000, reserved 0, type `C172`, airline empty, livery empty, callsign
+`G-ABCD`; entry 2: id 258, mode S `0xabcdef`, squawk 2341, reserved 0, type `A320`, airline
+`EZY`, livery `EZY`, callsign `EZY12AB`.
+
+```
+01000200070000000100000000000000581b0000433137320000000000000000000000000000000000000000472d4142434400000000000002010000efcdab002509000041333230455a5900455a5900000000000000000000000000455a59313241420000000000
+```
+
+Frames, `encode_frames(42, 1234.5, ..)`, 96 bytes: header version 1, count 2, seq 42, sim
+time 1234.5; entry 1: id 1, alt 1000.0 ft, lat 36.5, lon -4.25, heading 90.00, pitch 2.50,
+roll -10.00, gs 85.5 kt, vs -500 fpm, gear 1 (255), flaps 0.5 (128), spoiler 0, reverser 0,
+lights `0x0f` (nav, beacon, strobe, landing), flags `0x02` (engines); entry 2: id 258, alt
+25.0 ft, lat -33.75, lon 151.125, heading 359.99, pitch 0, roll 0, gs 0, vs 0, gear 255,
+flaps 0, spoiler 255, reverser 255, lights `0x11` (nav, taxi), flags `0x03` (on the ground,
+engines).
+
+```
+010002002a00000000000000004a93400100000000007a44000000000040424000000000000011c02823fa0018fc57030cfeff8000000f02020100000000c8410000000000e040c00000000000e462409f8c0000000000000000ff00ffff1103
+```
+
+### What step 11 (the live test) must watch
+
+- `XCOPILOT_TRAFFIC=ours` in the `.env` (the default is `off`), ATC on, a station installed
+  with `set_procedures` (both of the bin's install paths do): blackbox `traffic` `up` names
+  the field and the movement count; `spawn`, `phase`, `call`, `order`, `tower`, `despawn`
+  follow. `atc` `route: traffic` records are the station's answers.
+- The plugin's `xcopilot/traffic/status` (`roster_seq`, `frame_seq`, `errors=0`,
+  `drawn=N`, `tcas=ours`): `frame_seq` should climb about 3 a second at the monitor's 3 Hz.
+  `api_load` for the added requests (one roster on change, one frames write per tick, plus
+  the two reads of the link: running time and elevation).
+- The frequency: our traffic only on the TOWER, ghost voices per callsign, the tower's
+  answers after the calls, nothing over a PTT, nothing older than 8 s; listen for a crowd at
+  a busy hour (there is no rate cap yet).
+- Our own aircraft in the tower's picture (`OWNSHIP`, true MSL): a traffic departure held
+  for us on final, a traffic arrival sent round for us on the runway. OUR departure, once
+  airborne, still holds the strip by its `TakeoffCleared` until our next call (only traffic
+  strips lapse when airborne): watch traffic holding behind our own climb-out.
+- The world sweep's findings: traffic taxiing onto a runway without a crossing clearance and
+  a takeoff cleared on a strip another flight stands on (ULMM, BIEG, EFKU, UEMH); fields with
+  runway crossings on the taxi routes are where to look.
+- Time acceleration freezes the fleet (said once); a reinstall (region switch, ATC toggle)
+  sends every moving aircraft off the frequency (`despawn` `reinstalled`).

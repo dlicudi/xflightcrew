@@ -521,6 +521,8 @@ pub(crate) struct TrafficWorld {
     hours: Option<u32>,
     /// Links built this session: each new field's seed.
     built: u64,
+    /// The packed sink to the plugin, started with the first link.
+    sink: Option<crate::traffic_sink::TrafficSink>,
 }
 
 impl TrafficWorld {
@@ -615,6 +617,14 @@ impl TrafficWorld {
             }
         }
         crate::party_line::publish_traffic_picture(Some(link.targets()));
+        if self.sink.is_none() {
+            self.sink = crate::traffic_sink::TrafficSink::start(
+                crate::settings::live().xplane_base_url.clone(),
+            );
+        }
+        if let Some(sink) = self.sink.as_mut() {
+            sink.publish(link.fleet().aircraft(), self.last_sim_s.unwrap_or(0.0));
+        }
         record(&out, link);
         // The frequency: each call in its flight's own ghost voice, the
         // tower's runway-watch lines in the tower's.
@@ -642,6 +652,9 @@ impl TrafficWorld {
         }
         if self.field.is_some() {
             crate::party_line::publish_traffic_picture(None);
+        }
+        if let Some(sink) = self.sink.as_mut() {
+            sink.withdraw();
         }
         self.loading = None;
         self.last_sim_s = None;
