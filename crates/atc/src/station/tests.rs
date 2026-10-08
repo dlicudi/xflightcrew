@@ -9830,3 +9830,54 @@ fn the_doors_reset_our_strip_by_group() {
     Station::uninstall();
     assert_eq!(state(), (false, false, false, false), "uninstall");
 }
+
+/// The ctx is built from a HANDED-IN state with no sim behind the view
+/// (every read fails): our ground flag, position and type are the state's,
+/// never a read. A runway start on LXGB's strip asking for takeoff is on the
+/// runway; the same state airborne is not on the ground.
+#[test]
+fn a_ctx_is_built_from_a_handed_in_state_with_no_sim() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    Station::uninstall();
+    let path = lxgb_apt_file();
+    let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+    let rw = st.apt.runways[0].clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let xp = sim::xplane::XPlaneClient::new("http://127.0.0.1:1".into());
+    let on_strip = AircraftState {
+        lat: (rw.lat_a + rw.lat_b) / 2.0,
+        lon: (rw.lon_a + rw.lon_b) / 2.0,
+        alt_ft: 11.0,
+        on_ground: true,
+        gs_kts: 0.0,
+        psi_deg: Some(rw.heading_a_deg()),
+        helicopter: true,
+        at: Instant::now(),
+    };
+    let (ctx, _) = rt.block_on(st.build_ctx(
+        xp.view(),
+        Some(&on_strip),
+        tower::Intent::RequestTakeoff,
+    ));
+    assert!(ctx.on_ground, "the state's ground flag, not a failed read's");
+    assert!(ctx.own_on_runway, "the state's position is on the strip");
+    assert!(ctx.helicopter, "the state's type");
+
+    let airborne = AircraftState {
+        on_ground: false,
+        helicopter: false,
+        ..on_strip
+    };
+    let (ctx, _) = rt.block_on(st.build_ctx(
+        xp.view(),
+        Some(&airborne),
+        tower::Intent::RequestTakeoff,
+    ));
+    assert!(!ctx.on_ground);
+    assert!(!ctx.own_on_runway);
+    assert!(!ctx.helicopter);
+    Station::uninstall();
+}

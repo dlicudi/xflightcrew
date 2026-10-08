@@ -237,6 +237,35 @@ flight_strip! {
 /// Our own flight's strip (the only one until traffic strips exist).
 pub(crate) static OWN_STRIP: FlightStrip = FlightStrip::new();
 
+/// One aircraft as the world sees it at one moment: what a controller's
+/// radar and the frequency say about it. Ours is read from the sim once per
+/// call (`Station::build_ctx`) or handed in by the crew from the snapshot it
+/// already holds (`Station::handle_transmission_with`, [`note_aircraft_state`]).
+/// A value that did not read is NaN ([`AircraftState::position`] is then
+/// `None`), never a made-up number.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AircraftState {
+    pub lat: f64,
+    pub lon: f64,
+    /// Feet MSL.
+    pub alt_ft: f64,
+    pub on_ground: bool,
+    /// Groundspeed, knots.
+    pub gs_kts: f64,
+    /// True heading, degrees; `None` when it did not read.
+    pub psi_deg: Option<f64>,
+    pub helicopter: bool,
+    /// When the state was taken.
+    pub at: Instant,
+}
+
+impl AircraftState {
+    /// Where the aircraft is, when both halves of the position read.
+    pub fn position(&self) -> Option<(f64, f64)> {
+        (self.lat.is_finite() && self.lon.is_finite()).then_some((self.lat, self.lon))
+    }
+}
+
 /// What the controller asked of the transponder: the code it wants, and
 /// whether it asked to RECYCLE (the code shows, the box does not reply) or
 /// to confirm the code (the digits are wrong).
@@ -778,8 +807,8 @@ impl GoAroundOrders {
 /// asks for. Each one is a write on world state; nothing else the crew does
 /// writes there.
 ///
-/// - `note_aircraft`: where our aircraft is, per monitor tick (the landing
-///   and the out-of-reach stand-down key on it).
+/// - `note_aircraft` / `note_aircraft_state`: where our aircraft is, per
+///   monitor tick (the landing and the out-of-reach stand-down key on it).
 /// - `set_surface_wind`: the field's own wind, from its METAR.
 /// - `pin_arrival_station` / `end_arrival` / `begin_uncontrolled_arrival`:
 ///   the arrival the crew committed to, and its end.
@@ -791,8 +820,8 @@ impl GoAroundOrders {
 ///   data, loaded when the crew installs a station.
 pub use crate::station::{
     arm_new_flight, arm_new_flight_at, arm_new_flight_enroute, arm_station_for_freq,
-    begin_uncontrolled_arrival, end_arrival, load_region, note_aircraft, pin_arrival_station,
-    set_surface_wind, spawn_ils_load, spawn_taxi_net_load,
+    begin_uncontrolled_arrival, end_arrival, load_region, note_aircraft, note_aircraft_state,
+    pin_arrival_station, set_surface_wind, spawn_ils_load, spawn_taxi_net_load,
 };
 
 /// World READS: what the station holds, asked by the crew. Nothing here

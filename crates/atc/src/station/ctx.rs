@@ -2,11 +2,61 @@
 
 use super::*;
 
+/// Our own aircraft, read from the sim once for one call. Best-effort, as
+/// the reads it replaces: a failed ground flag is airborne, a failed
+/// position is NaN (no position, so nothing is planned or judged from it),
+/// a failed heading `None`, a failed helicopter flag an aeroplane.
+pub(super) async fn read_own_state(xp: SimView<'_>) -> AircraftState {
+    let on_ground = xp.get_float(datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
+    let (lat, lon) = match (
+        xp.get_float(datarefs::LATITUDE).await,
+        xp.get_float(datarefs::LONGITUDE).await,
+    ) {
+        (Ok(lat), Ok(lon)) => (lat, lon),
+        _ => (f64::NAN, f64::NAN),
+    };
+    let alt_ft = xp
+        .get_float(datarefs::ELEVATION_M)
+        .await
+        .map(|m| m * 3.28084)
+        .unwrap_or(f64::NAN);
+    let gs_kts = xp
+        .get_float(datarefs::GROUNDSPEED_MS)
+        .await
+        .map(|v| v * 1.943844)
+        .unwrap_or(f64::NAN);
+    let psi_deg = xp.get_float(TRUE_PSI).await.ok();
+    let helicopter = xp
+        .get_float("sim/aircraft2/metadata/is_helicopter")
+        .await
+        .is_ok_and(|v| v > 0.5);
+    AircraftState {
+        lat,
+        lon,
+        alt_ft,
+        on_ground,
+        gs_kts,
+        psi_deg,
+        helicopter,
+        at: Instant::now(),
+    }
+}
+
 impl Station {
     /// Read the sim once and build the live context for a reply. Best-effort:
     /// a failed read falls back to silence on that item rather than a wrong
-    /// number.
-    pub(super) async fn build_ctx(&mut self, xp: SimView<'_>, intent: tower::Intent) -> (tower::Ctx, Wx) {
+    /// number. Our own aircraft is `state` when the caller holds it, else
+    /// read here, once, before anything else ([`read_own_state`]).
+    pub(super) async fn build_ctx(
+        &mut self,
+        xp: SimView<'_>,
+        state: Option<&AircraftState>,
+        intent: tower::Intent,
+    ) -> (tower::Ctx, Wx) {
+        let state = match state {
+            Some(s) => *s,
+            None => read_own_state(xp).await,
+        };
         let mut wx = Wx {
             wind_from_deg: xp
                 .get_float(datarefs::WIND_DIR_DEG_TRUE)
@@ -25,7 +75,7 @@ impl Station {
             .await
             .map(|r| r.spoken)
             .unwrap_or_else(|| "aircraft calling".to_string());
-        let on_ground = xp.get_float(datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
+        let on_ground = state.on_ground;
         // An IFR clearance's runway is held for its departure only: airborne
         // it has been flown (or abandoned), and the pick is free again.
         // So is a runway start's strip (`start_strip`).
@@ -62,10 +112,7 @@ impl Station {
             now,
         );
         if on_ground && self.desk.call.stated_runway.is_some() {
-            if let (Ok(lat), Ok(lon)) = (
-                xp.get_float(datarefs::LATITUDE).await,
-                xp.get_float(datarefs::LONGITUDE).await,
-            ) {
+            if let Some((lat, lon)) = state.position() {
                 self.note_caller_on_strip(on_ground, lat, lon);
             }
         }
@@ -81,13 +128,7 @@ impl Station {
         // Our own position, for a takeoff request made ON the strip: only
         // the pavement ahead of us is in the way of the roll.
         let own = if on_ground && intent == tower::Intent::RequestTakeoff {
-            match (
-                xp.get_float(datarefs::LATITUDE).await,
-                xp.get_float(datarefs::LONGITUDE).await,
-            ) {
-                (Ok(lat), Ok(lon)) => Some((lat, lon)),
-                _ => None,
-            }
+            state.position()
         } else {
             None
         };
@@ -124,18 +165,14 @@ impl Station {
         let mut own_on_runway = false;
         let mut pos = None;
         if on_ground {
-            if let (Ok(lat), Ok(lon)) = (
-                xp.get_float(datarefs::LATITUDE).await,
-                xp.get_float(datarefs::LONGITUDE).await,
-            ) {
+            if let Some((lat, lon)) = state.position() {
                 pos = Some((lat, lon));
                 own_on_runway = strip(&self.apt.runways, &ident)
                     .is_some_and(|r| on_runway(r, lat, lon).is_some());
                 self.desk.planned_route = if arrival {
                     // The heading says which way is forward off a runway we
                     // may still be on; a failed read plans as before.
-                    let psi = xp.get_float(TRUE_PSI).await.ok();
-                    plan_taxi_route_to_stand(&self.apt.runways, lat, lon, psi)
+                    plan_taxi_route_to_stand(&self.apt.runways, lat, lon, state.psi_deg)
                 } else {
                     plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
                 };
@@ -155,10 +192,7 @@ impl Station {
         if intent == tower::Intent::RequestRunway {
             self.apply_runway_request(&mut ctx, pos);
         }
-        ctx.helicopter = xp
-            .get_float("sim/aircraft2/metadata/is_helicopter")
-            .await
-            .is_ok_and(|v| v > 0.5);
+        ctx.helicopter = state.helicopter;
         (ctx, wx)
     }
 

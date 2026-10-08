@@ -297,7 +297,7 @@ impl Station {
     /// clearance had been issued on the reply path.
     pub async fn apply_monitor_takeoff_clearance(&mut self, xp: SimView<'_>) {
         // A departure context (the monitor's release watch) — never an arrival.
-        let (ctx, _wx) = self.build_ctx(xp, tower::Intent::RequestTakeoff).await;
+        let (ctx, _wx) = self.build_ctx(xp, None, tower::Intent::RequestTakeoff).await;
         self.desk.twr.state = tower::State::TakeoffCleared;
         // The released clearance owes its readback exactly like one issued
         // on the reply path.
@@ -317,7 +317,7 @@ impl Station {
     /// if the instruction had been issued on the reply path. The hold stays
     /// armed — the release is still to come.
     pub async fn apply_monitor_line_up(&mut self, xp: SimView<'_>) {
-        let (ctx, _wx) = self.build_ctx(xp, tower::Intent::RequestTakeoff).await;
+        let (ctx, _wx) = self.build_ctx(xp, None, tower::Intent::RequestTakeoff).await;
         self.desk.twr.state = tower::State::LinedUp;
         self.desk.twr.arm_line_up_readback(
             ctx.runway.clone(),

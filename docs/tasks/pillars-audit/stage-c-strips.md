@@ -145,3 +145,16 @@ callsign-keyed map, single strip mutex, `Ctx` split, world_tick cadence or TCAS 
   `PartyLineFacts` is gone (all its cells are strip `facts`); `StationFlight` keeps only
   `TOWER_WIND`, `FlightCarried` only `REGION_HANDOFF` and `ARRIVAL_PIN`. `OWN_STRIP` is
   classified as `FlightStrip` (`state::STRIP`); `STRIPS` is left for increment 5.
+- **Increment 3**: `build_ctx(xp, state: Option<&AircraftState>, intent)` reads our state at its
+  top only when none is handed in, so the old `try_handle` / `handle_transmission` keep their
+  word gates and COM1 read BEFORE any read of our aircraft (the common cockpit command still
+  costs nothing). `AircraftState` (party_line, crew-visible) marks a value that did not read as
+  NaN, `position()` `None` then, which keeps every "both lat and lon read" branch as it was; the
+  own read stays the separate LATITUDE/LONGITUDE reads (not `sim::position::read`), and adds the
+  elevation and groundspeed reads nothing consumes yet.
+- **Increment 3**: the crew is unchanged. The command loop's two `handle_transmission` sites and
+  the one `try_handle` hold no aircraft snapshot (only the monitor does), and the monitor's
+  `note_aircraft(lat, lon, on_ground)` stays: its snapshot has indicated altitude, no
+  helicopter flag and a 0-on-failure heading, so mapping it is a decision, not a pass-through.
+  `note_aircraft` is the wrapper over `note_aircraft_state`. atc gains `tokio` as a dev-dependency
+  for the no-sim ctx test (`a_ctx_is_built_from_a_handed_in_state_with_no_sim`).

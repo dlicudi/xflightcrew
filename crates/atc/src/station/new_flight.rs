@@ -280,9 +280,25 @@ pub(crate) fn station_unavailable() -> bool {
 /// are not at is nobody's (the crew then departs as from an uncontrolled
 /// field). A route the crew planned for itself is left alone.
 pub fn note_aircraft(lat: f64, lon: f64, on_ground: bool) {
+    note_aircraft_state(&AircraftState {
+        lat,
+        lon,
+        alt_ft: f64::NAN,
+        on_ground,
+        gs_kts: f64::NAN,
+        psi_deg: None,
+        helicopter: false,
+        at: Instant::now(),
+    });
+}
+
+/// [`note_aircraft`] from the whole state the crew holds: only the
+/// position, the ground flag and the time are read.
+pub fn note_aircraft_state(state: &AircraftState) {
     use std::sync::atomic::Ordering::Relaxed;
+    let (lat, lon, on_ground) = (state.lat, state.lon, state.on_ground);
     // Where we are, for the go-around judgement's time to the threshold.
-    note_own_fix(lat, lon, on_ground, Instant::now());
+    note_own_fix(lat, lon, on_ground, state.at);
     // The crew's own route and runway end at the liftoff: a departure's
     // runway must never read as a cleared one at the destination (autoland
     // takes the cleared runway).

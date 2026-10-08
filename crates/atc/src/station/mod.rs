@@ -24,7 +24,8 @@ use sim::xplane::SimView;
 // `party_line`'s accessors, never these statics.
 pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
-    IfrFlight, ARRIVAL_PIN, GO_AROUND_ORDERS, OWN_STRIP, PENDING_STATION, REGION_HANDOFF,
+    AircraftState, IfrFlight, ARRIVAL_PIN, GO_AROUND_ORDERS, OWN_STRIP, PENDING_STATION,
+    REGION_HANDOFF,
 };
 
 // The airline telephony and the ghost speaker live with the callsign

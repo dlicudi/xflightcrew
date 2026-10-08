@@ -20,6 +20,29 @@ impl Station {
         transcript: &str,
         xp: SimView<'_>,
     ) -> Option<(String, StationSpeaker)> {
+        self.try_handle_own(None, transcript, xp).await
+    }
+
+    /// [`Station::try_handle`] with our aircraft's state handed in by a
+    /// caller that already holds it: the sim is read for the field (COM1,
+    /// wind, pressure, traffic, callsign), never for our own aircraft.
+    pub async fn try_handle_with(
+        &mut self,
+        state: &AircraftState,
+        transcript: &str,
+        xp: SimView<'_>,
+    ) -> Option<(String, StationSpeaker)> {
+        self.try_handle_own(Some(state), transcript, xp).await
+    }
+
+    /// Both doors of [`Station::try_handle`]: `state` `None` reads our own
+    /// aircraft where `build_ctx` starts, after the word gates and COM1.
+    async fn try_handle_own(
+        &mut self,
+        state: Option<&AircraftState>,
+        transcript: &str,
+        xp: SimView<'_>,
+    ) -> Option<(String, StationSpeaker)> {
         // Cheap word gates before any dataref read — the common case is a
         // cockpit command, and it must cost nothing. route_unkeyed re-applies
         // the same gates; only the trace differs per exit. A call that names
@@ -54,7 +77,7 @@ impl Station {
             return None;
         };
         self.note_stated_runway(transcript, intent.clone());
-        let (ctx, wx) = self.build_ctx(xp, intent.clone()).await;
+        let (ctx, wx) = self.build_ctx(xp, state, intent.clone()).await;
         let before = self.desk.twr.state;
         let reply = self.route_unkeyed(transcript, service, &ctx, wx)?;
         sim::blackbox::record(
@@ -117,6 +140,28 @@ impl Station {
         transcript: &str,
         xp: SimView<'_>,
     ) -> Option<(String, StationSpeaker)> {
+        self.handle_transmission_own(None, transcript, xp).await
+    }
+
+    /// [`Station::handle_transmission`] with our aircraft's state handed in
+    /// by a caller that already holds it (see [`Station::try_handle_with`]).
+    pub async fn handle_transmission_with(
+        &mut self,
+        state: &AircraftState,
+        transcript: &str,
+        xp: SimView<'_>,
+    ) -> Option<(String, StationSpeaker)> {
+        self.handle_transmission_own(Some(state), transcript, xp).await
+    }
+
+    /// Both doors of [`Station::handle_transmission`]: `state` `None` reads
+    /// our own aircraft where `build_ctx` starts, after COM1.
+    async fn handle_transmission_own(
+        &mut self,
+        state: Option<&AircraftState>,
+        transcript: &str,
+        xp: SimView<'_>,
+    ) -> Option<(String, StationSpeaker)> {
         let Some(service) = self.tuned_service(xp).await else {
             sim::blackbox::record(
                 "atc",
@@ -128,7 +173,7 @@ impl Station {
             return None;
         };
         self.note_stated_runway(transcript, tower::parse_intent(transcript));
-        let (ctx, wx) = self.build_ctx(xp, tower::parse_intent(transcript)).await;
+        let (ctx, wx) = self.build_ctx(xp, state, tower::parse_intent(transcript)).await;
         let before = self.desk.twr.state;
         let reply = self.route_keyed(transcript, service, &ctx, wx);
         sim::blackbox::record(
