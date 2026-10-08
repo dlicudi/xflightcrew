@@ -657,9 +657,20 @@ fn a_traffic_crossing_is_asked_for_and_judged_on_the_book() {
     ));
     assert!(rb.line.is_empty(), "the readback is accepted: {}", rb.line);
     assert_eq!(order().readback_owed, None);
-    // On the strip, then off the far side: the crossing is spent.
-    for (off, still) in [(-80.0, true), (0.0, true), (80.0, false)] {
-        note_traffic_state(12, by_the_twin(off));
+    // On the strip, then off the far side: the crossing is spent. On the
+    // pavement under its crossing the compliance watch is silent, at the
+    // edge too (EFKU 15: a corner cut there read as an incursion).
+    for (off, still) in [(-80.0, true), (-30.0, true), (0.0, true), (80.0, false)] {
+        let moving = AircraftState {
+            gs_kts: 8.0,
+            ..by_the_twin(off)
+        };
+        note_traffic_state(12, moving);
+        assert_eq!(
+            traffic_compliance_oracle(12, Instant::now()),
+            None,
+            "{off} m"
+        );
         traffic_tick(12, &[], Instant::now());
         assert_eq!(order().crossing.is_some(), still, "{off} m");
     }

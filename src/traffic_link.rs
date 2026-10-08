@@ -16,7 +16,7 @@
 //! The station never actuates: the fleet moves its own aircraft, and the
 //! plugin draws them from the packed frames this side writes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use traffic::{
@@ -79,6 +79,89 @@ pub(crate) struct Transmission {
     pub(crate) id: u32,
     pub(crate) callsign: String,
     pub(crate) text: String,
+    /// A safety call ([`is_safety_call`]): keyed without waiting its turn.
+    pub(crate) safety: bool,
+}
+
+/// No more than one traffic transmission is STARTED per this many seconds
+/// of fleet time on the frequency (the spec's "speech flood" risk: a busy
+/// field's calls all at once); the rest wait their turn in order. A safety
+/// call is never held ([`is_safety_call`]).
+pub(crate) const CALL_GAP_S: f64 = 3.0;
+
+/// A call that never waits for the frequency: a go-around, or the
+/// acknowledgement of a go-around order ("Going around, ...").
+pub(crate) fn is_safety_call(call: &Call) -> bool {
+    match call {
+        Call::GoingAround => true,
+        Call::Readback(text) => text.starts_with("Going around"),
+        _ => false,
+    }
+}
+
+/// The traffic's calls not yet keyed on the one frequency (the tower's), in
+/// the order made. Pure: the link feeds it the fleet's calls and keys what
+/// [`Outbox::due`] hands back.
+#[derive(Debug, Default)]
+pub(crate) struct Outbox {
+    queue: VecDeque<(u32, Call)>,
+    /// Fleet seconds the last transmission started.
+    last_keyed_s: Option<f64>,
+}
+
+impl Outbox {
+    /// Queue a call. The same call from the same flight already waiting is
+    /// not queued twice (a crossing asked again while its first ask waits).
+    pub(crate) fn push(&mut self, id: u32, call: Call) {
+        if !self.queue.iter().any(|(i, c)| *i == id && *c == call) {
+            self.queue.push_back((id, call));
+        }
+    }
+
+    /// A flight left: its waiting calls go with it.
+    pub(crate) fn forget(&mut self, id: u32) {
+        self.queue.retain(|(i, _)| *i != id);
+    }
+
+    /// Calls waiting.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// What to key now, at fleet second `now_s`: every safety call at once,
+    /// then at most ONE other, once [`CALL_GAP_S`] has run since the last
+    /// transmission started (a readback first: it completes a clearance
+    /// the flight is waiting on; else the oldest).
+    pub(crate) fn due(&mut self, now_s: f64) -> Vec<(u32, Call)> {
+        let mut out: Vec<(u32, Call)> = Vec::new();
+        let mut i = 0;
+        while i < self.queue.len() {
+            if is_safety_call(&self.queue[i].1) {
+                out.extend(self.queue.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        if !out.is_empty() {
+            self.last_keyed_s = Some(now_s);
+        }
+        let free = self
+            .last_keyed_s
+            .is_none_or(|t| now_s - t >= CALL_GAP_S - 1e-9);
+        if free && out.is_empty() {
+            let next = self
+                .queue
+                .iter()
+                .position(|(_, c)| matches!(c, Call::Readback(_)))
+                .unwrap_or(0);
+            if let Some(call) = self.queue.remove(next) {
+                out.push(call);
+                self.last_keyed_s = Some(now_s);
+            }
+        }
+        out
+    }
 }
 
 /// What one tick of the link produced.
@@ -124,6 +207,8 @@ pub(crate) struct Link {
     noted: Vec<u32>,
     /// Each flight's order as last seen (state, runway): a change is logged.
     seen_orders: HashMap<u32, (TowerState, Option<String>)>,
+    /// The frequency's calls waiting their turn ([`CALL_GAP_S`]).
+    outbox: Outbox,
 }
 
 /// An arrival spawns for the tower's runway: with none known yet (nobody
@@ -150,6 +235,7 @@ impl Link {
             tower_runway: None,
             noted: Vec::new(),
             seen_orders: HashMap::new(),
+            outbox: Outbox::default(),
         }
     }
 
@@ -236,33 +322,43 @@ impl Link {
         for ev in &events {
             match ev {
                 Event::Call { id, call } => {
-                    let Some(ac) = self.fleet.get(*id) else {
-                        continue;
-                    };
-                    let order = orders.get(id);
                     // An ordered go-around is acknowledged by its readback
                     // ("Going around, ..."): the report would say it twice.
-                    if *call == Call::GoingAround && order.is_some_and(|o| o.go_around) {
+                    let ordered = orders.get(id).is_some_and(|o| o.go_around);
+                    if *call == Call::GoingAround && ordered {
                         continue;
                     }
-                    let runway = order.and_then(|o| o.runway.as_deref()).or(ac.plan.runway());
-                    let text = self.call_text(&ac.spoken, call, runway);
-                    crate::world::post_traffic_call(TrafficCall {
-                        id: *id,
-                        spoken: ac.spoken.clone(),
-                        text: text.clone(),
-                        state: aircraft_state(ac, now),
-                        picture: self.picture_for(*id, own),
-                    });
-                    out.transmissions.push(Transmission {
-                        id: *id,
-                        callsign: ac.callsign.clone(),
-                        text,
-                    });
+                    self.outbox.push(*id, call.clone());
                 }
-                Event::Despawn { id, .. } => crate::world::retire_traffic(*id),
+                Event::Despawn { id, .. } => {
+                    crate::world::retire_traffic(*id);
+                    self.outbox.forget(*id);
+                }
                 _ => {}
             }
+        }
+        // The frequency: what is due keys now, from where the flight is as
+        // it keys (the rest waits its turn, `CALL_GAP_S`).
+        for (id, call) in self.outbox.due(self.fleet.clock.now_s()) {
+            let Some(ac) = self.fleet.get(id) else {
+                continue;
+            };
+            let order = orders.get(&id);
+            let runway = order.and_then(|o| o.runway.as_deref()).or(ac.plan.runway());
+            let text = self.call_text(&ac.spoken, &call, runway);
+            crate::world::post_traffic_call(TrafficCall {
+                id,
+                spoken: ac.spoken.clone(),
+                text: text.clone(),
+                state: aircraft_state(ac, now),
+                picture: self.picture_for(id, own),
+            });
+            out.transmissions.push(Transmission {
+                id,
+                callsign: ac.callsign.clone(),
+                text,
+                safety: is_safety_call(&call),
+            });
         }
         for ac in self.fleet.aircraft() {
             let picture = self.picture_for(ac.id, own);
@@ -289,6 +385,7 @@ impl Link {
         for id in &ids {
             self.fleet.remove(*id);
             crate::world::retire_traffic(*id);
+            self.outbox.forget(*id);
         }
         ids
     }
@@ -865,6 +962,7 @@ pub(crate) fn despawn_word(d: Despawn) -> &'static str {
         Despawn::Parked => "parked",
         Despawn::Removed => "removed",
         Despawn::NoStand => "no_stand",
+        Despawn::ReadbackFailed => "readback_failed",
     }
 }
 

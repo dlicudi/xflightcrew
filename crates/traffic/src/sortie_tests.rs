@@ -49,7 +49,7 @@ impl ScriptedTower {
                 o.go_around = false;
             }
             Call::RequestCrossing { runway } => o.cross_cleared = Some(runway.clone()),
-            Call::Base | Call::Readback(_) => {}
+            Call::Base | Call::Readback(_) | Call::SayAgain => {}
         }
     }
 }
@@ -729,5 +729,84 @@ fn a_generated_hour_of_jets_flies_to_the_end() {
     assert!(
         tds.iter().all(|d| *d > 0.0 && *d < len / 3.0),
         "touchdowns {tds:?}"
+    );
+}
+
+/// THE READBACK CAP (the spec's risk "a traffic readback failing the gate
+/// forever"): an owed readback is given once per owing; still owed
+/// [`READBACK_RETRY_S`] later (not taken) it is given again, twice in all,
+/// then "say again" once, then the flight leaves the frequency
+/// ([`Despawn::ReadbackFailed`]). A readback taken and owed again later (the
+/// next lap's identical landing clearance) is given afresh: the old
+/// once-ever dedupe never answered it, and the owed text stood for good.
+#[test]
+fn a_readback_not_taken_twice_says_again_once_then_leaves() {
+    use crate::aircraft::{READBACK_RETRY_S, READBACK_TRIES};
+    use crate::phase::Despawn;
+    let field = fixtures::xtst();
+    let mut ac = cessna(&field, 1, "GA1", "09", 1);
+    let rb = "Cleared to land runway zero niner, Cessna three four five.".to_string();
+    let owed = Order {
+        readback_owed: Some(rb.clone()),
+        ..Default::default()
+    };
+    let none = Order::default();
+    let mut events = Vec::new();
+    let t = std::cell::Cell::new(0.0);
+    let gone_at = std::cell::Cell::new(None);
+    let step = |ac: &mut TrafficAircraft, o: &Order, secs: f64, events: &mut Vec<Event>| {
+        for _ in 0..(secs * 10.0).round() as usize {
+            if ac.phase == Phase::Gone {
+                return;
+            }
+            ac.substep(0.1, Some(o), &field, &[], events);
+            t.set(t.get() + 0.1);
+            if ac.phase == Phase::Gone {
+                gone_at.set(Some(t.get()));
+            }
+        }
+    };
+    let calls = |events: &[Event]| -> Vec<Call> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Call { call, .. } if *call != Call::Taxi => Some(call.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // Taken at once, then owed again: read back again.
+    step(&mut ac, &owed, 1.0, &mut events);
+    step(&mut ac, &none, 1.0, &mut events);
+    step(&mut ac, &owed, 1.0, &mut events);
+    assert_eq!(
+        calls(&events),
+        vec![Call::Readback(rb.clone()), Call::Readback(rb.clone())]
+    );
+    events.clear();
+    // Never taken: again, then "say again", then gone.
+    let started = t.get();
+    step(&mut ac, &owed, 120.0, &mut events);
+    assert_eq!(
+        calls(&events),
+        vec![Call::Readback(rb.clone()), Call::SayAgain],
+        "{READBACK_TRIES} readbacks in all, then one say again"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::Despawn {
+            reason: Despawn::ReadbackFailed,
+            ..
+        }
+    )));
+    let gone = gone_at.get().expect("it left") - started;
+    let expect = 3.0 * READBACK_RETRY_S;
+    assert!(
+        (expect - 2.0..expect + 0.5).contains(&gone),
+        "gone {gone:.1} s after the last owing"
+    );
+    assert_eq!(
+        Call::SayAgain.text("Cessna one", None),
+        "Tower, Cessna one, say again"
     );
 }

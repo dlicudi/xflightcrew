@@ -590,15 +590,16 @@ engines).
   `api_load` for the added requests (one roster on change, one frames write per tick, plus
   the two reads of the link: running time and elevation).
 - The frequency: our traffic only on the TOWER, ghost voices per callsign, the tower's
-  answers after the calls, nothing over a PTT, nothing older than 8 s; listen for a crowd at
-  a busy hour (there is no rate cap yet).
+  answers after the calls, nothing over a PTT, nothing older than 8 s; at a busy hour one
+  traffic call keyed per `CALL_GAP_S` (3 s), a go-around at once (see "Sweep fixes").
 - Our own aircraft in the tower's picture (`OWNSHIP`, true MSL): a traffic departure held
   for us on final, a traffic arrival sent round for us on the runway. OUR departure, once
   airborne, still holds the strip by its `TakeoffCleared` until our next call (only traffic
   strips lapse when airborne): watch traffic holding behind our own climb-out.
-- The world sweep's findings: traffic taxiing onto a runway without a crossing clearance and
-  a takeoff cleared on a strip another flight stands on (ULMM, BIEG, EFKU, UEMH); fields with
-  runway crossings on the taxi routes are where to look.
+- The world sweep's findings (fixed, see "Sweep fixes"): at fields with runway crossings on
+  the taxi routes, traffic holds short and asks ("holding short runway ..., request
+  crossing"); watch the `atc` `route: traffic` records for `RequestCrossing` and the hold
+  shorts, and that nothing departs or lands across a cleared crossing.
 - Time acceleration freezes the fleet (said once); a reinstall (region switch, ATC toggle)
   sends every moving aircraft off the frequency (`despawn` `reinstalled`).
 
@@ -691,3 +692,47 @@ flight on 21).
   twin, the audit names it), and `ulmm_traffic_holds_short_of_the_runway_it_crosses` now flies
   the schedule to its end (every movement completes, zero conflicts, a silent oracle); it
   failed at 2,551 s without the claim.
+
+**C. The readback cap** (the risk "a traffic readback failing the gate forever").
+- `TrafficAircraft::answer_readback`: an owed readback is given once per OWING; still owed
+  `READBACK_RETRY_S` (12 s, several `CALL_GAP_S`: the link may hold a call a few seconds) after
+  it went out, it was not taken and is given again, `READBACK_TRIES` (2) in all; then
+  `Call::SayAgain` ("Tower, <callsign>, say again") once; still owed after that the flight leaves
+  the frequency, `Despawn::ReadbackFailed` (blackbox `readback_failed`), its strip retired.
+- Found on the way, and fixed with it: the old dedupe answered an owed text once EVER
+  (`last_readback` never forgotten), so the next lap's IDENTICAL landing clearance ("cleared
+  to land runway zero three, ...") was never read back and stood owed for good, which A's
+  crossing gate (no move while a readback is owed) would have turned into a flight frozen at
+  its first crossing. Nothing owed now forgets it.
+- Test: `a_readback_not_taken_twice_says_again_once_then_leaves` (traffic).
+
+**D. One traffic call per `CALL_GAP_S` on the frequency** (the risk "a speech flood at busy
+fields").
+- `traffic_link::Outbox`, the link's one queue for the one frequency (the tower's): the fleet's
+  calls are queued as made (the same call from the same flight not twice; a despawned flight's
+  calls dropped), and `Outbox::due(fleet_s)` keys at most ONE per `CALL_GAP_S` (3 s of fleet
+  time), a readback before the older requests (it completes a clearance a flight waits on), else
+  the oldest. A safety call (`is_safety_call`: the fleet's own "going around", or the
+  acknowledgement of a go-around order, "Going around, ...") is keyed at once, inside the gap,
+  and the gap runs from it; nothing is ever dropped for the pace. A call keys from where the
+  flight IS when it keys (its state and the picture then), so the tower answers the position it
+  hears. `Transmission.safety` says which went out unpaced.
+- The harness checks the pace (`assert_paced`, `crowded`): no transmission but a safety call
+  within `CALL_GAP_S` of the one before, in both asserts and the sweep. A readback is counted
+  as it KEYS (one still waiting when a window closes was never heard).
+- The pace shifted a crossing at EFKU 15 by 3 s and the oracle spoke again ("on runway one five
+  without clearance") with the flight CLEARED to cross, at the pavement's edge: the compliance
+  watch now takes the strip's `crossing` cell as legal occupancy of that strip
+  (`cleared_to_cross`, beside the cleared taxi route's crossings; "expedite" when stopped on
+  it). Our flight holds no crossing unless our pilot asked, so its watch is unchanged.
+- Test: `the_traffic_frequency_keys_one_call_per_gap_and_never_holds_a_go_around` (pure), and
+  every harness run (XTST's field hour, ULMM, BIEG, the sweep) paced.
+
+Left, filed: #242 (BIEG 03, flown to the end: a 172 landing short rolls 1.2 km to the far exit
+at taxi pace and despawns `NoStand` the moment its vacate ends, the linger timed from the start
+of `Vacate`; the strip held four and a half minutes, 23 go-arounds in three hours). Not a sweep
+finding; BIEG's test flies the sweep's ten minutes until it is fixed.
+
+Measured after A to D: the sweep 150 fields, 985 movements, 1,256 calls, zero conflicts, a
+silent oracle, every readback accepted, never two calls inside 3 s; XTST's field hour and the
+real LEMG hour clean; ULMM flown to the end (every movement completes).

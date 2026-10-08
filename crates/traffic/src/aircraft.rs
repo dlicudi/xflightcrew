@@ -51,6 +51,15 @@ const REPLAN_S: f64 = 10.0;
 /// Held short of a crossing, the request is made again this often.
 pub const CROSS_ASK_RETRY_S: f64 = 30.0;
 
+/// An owed readback still owed this long after it went out was not taken:
+/// it is given again (the link may hold a call a few seconds before it
+/// keys, `CALL_GAP_S` in the bin, so this is several of those).
+pub const READBACK_RETRY_S: f64 = 12.0;
+
+/// A readback is given this many times before the flight asks "say
+/// again", once, and then leaves the frequency (the spec's readback cap).
+pub const READBACK_TRIES: u32 = 2;
+
 /// A departure climbs to this above the field before it is gone.
 const DEPART_CLIMB_AGL_FT: f64 = 6000.0;
 
@@ -146,6 +155,8 @@ pub struct TrafficAircraft {
     taxi_rest: Vec<(String, Vec<LatLon>)>,
     /// When the crossing held short of was last asked for (phase seconds).
     cross_asked_at: Option<f64>,
+    /// Seconds since it spawned (the readback's clock: phases reset theirs).
+    age_s: f64,
     /// Seconds in the current phase.
     phase_s: f64,
     /// Metres the downwind has been extended.
@@ -191,6 +202,7 @@ impl TrafficAircraft {
             lead_on: Vec::new(),
             taxi_rest: Vec::new(),
             cross_asked_at: None,
+            age_s: 0.0,
             phase_s: 0.0,
             ext_m: 0.0,
             flown: false,
@@ -381,14 +393,9 @@ impl TrafficAircraft {
     ) {
         let none = Order::default();
         let o = order.unwrap_or(&none);
-        if let Some(rb) = &o.readback_owed {
-            if self.radio.last_readback.as_ref() != Some(rb) {
-                self.radio.last_readback = Some(rb.clone());
-                events.push(Event::Call {
-                    id: self.id,
-                    call: Call::Readback(rb.clone()),
-                });
-            }
+        self.age_s += dt;
+        if self.answer_readback(o, events) {
+            return;
         }
         let end = self.runway_end(field, o);
         match self.phase {
@@ -518,6 +525,48 @@ impl TrafficAircraft {
         self.set_taxi_route(&full, field);
         self.kin.lights.taxi = true;
         self.set_phase(Phase::TaxiOut, events);
+    }
+
+    /// The owed readback ([`Order::readback_owed`]), once per owing: given
+    /// when it comes owed, given again if it is still owed
+    /// [`READBACK_RETRY_S`] later (not taken), [`READBACK_TRIES`] times in
+    /// all, then "say again" once, then the flight leaves the frequency
+    /// ([`Despawn::ReadbackFailed`], true: the substep stops). Nothing owed
+    /// forgets it, so the next identical clearance is read back afresh.
+    fn answer_readback(&mut self, o: &Order, events: &mut Vec<Event>) -> bool {
+        let r = &mut self.radio;
+        let Some(rb) = &o.readback_owed else {
+            r.last_readback = None;
+            r.readback_tries = 0;
+            r.said_again = false;
+            return false;
+        };
+        let call = if r.last_readback.as_ref() != Some(rb) {
+            r.last_readback = Some(rb.clone());
+            r.readback_tries = 1;
+            r.said_again = false;
+            Some(Call::Readback(rb.clone()))
+        } else if self.age_s - r.readback_at_s < READBACK_RETRY_S {
+            None
+        } else if r.readback_tries < READBACK_TRIES {
+            r.readback_tries += 1;
+            Some(Call::Readback(rb.clone()))
+        } else if !r.said_again {
+            r.said_again = true;
+            Some(Call::SayAgain)
+        } else {
+            self.set_phase(Phase::Gone, events);
+            events.push(Event::Despawn {
+                id: self.id,
+                reason: Despawn::ReadbackFailed,
+            });
+            return true;
+        };
+        if let Some(call) = call {
+            self.radio.readback_at_s = self.age_s;
+            events.push(Event::Call { id: self.id, call });
+        }
+        false
     }
 
     /// Taxi `full`, stopping short of every runway it crosses (by the

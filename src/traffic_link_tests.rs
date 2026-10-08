@@ -68,6 +68,9 @@ pub(super) struct HarnessScore {
     pub(super) tower_lines: usize,
     /// Every line the tower said: its answers and its runway watch's.
     pub(super) said: Vec<String>,
+    /// When each traffic transmission started (harness seconds), and
+    /// whether it was a safety call.
+    pub(super) keyed: Vec<(f64, bool)>,
     pub(super) conflicts: Vec<String>,
     pub(super) oracle: Vec<String>,
     pub(super) unfinished: Vec<String>,
@@ -132,6 +135,8 @@ pub(super) fn fly_field(
         let now = epoch + Duration::from_secs_f64(t);
         let out = link.tick(None, dt, now);
         s.tower_lines += out.tower.len();
+        s.keyed
+            .extend(out.transmissions.iter().map(|tx| (t, tx.safety)));
         s.said.extend(out.tower.iter().map(|(_, l)| l.clone()));
         for ev in &out.events {
             match ev {
@@ -152,7 +157,6 @@ pub(super) fn fly_field(
                         s.go_arounds += 1;
                     }
                     if let Call::Readback(rb) = call {
-                        s.readbacks += 1;
                         readbacks.entry(*id).or_default().push(rb.clone());
                     }
                 }
@@ -187,6 +191,9 @@ pub(super) fn fly_field(
                 Some(v.remove(i))
             });
             if let Some(rb) = owed {
+                // Counted as it KEYS: one still waiting its turn on the
+                // frequency when the window closes was never heard.
+                s.readbacks += 1;
                 let still = crate::world::traffic_order(call.id)
                     .and_then(|o| o.readback_owed)
                     .is_some_and(|o| o == rb);
@@ -239,6 +246,7 @@ pub(super) fn fly_field(
 
 fn assert_clean(s: &HarnessScore, what: &str) {
     println!("{what}: {s:#?}");
+    assert_paced(s, what);
     assert!(s.movements > 0, "{what}: nothing scheduled");
     assert_eq!(
         s.completed, s.movements,
@@ -262,6 +270,23 @@ fn assert_clean(s: &HarnessScore, what: &str) {
     );
 }
 
+/// The frequency was never crowded: no traffic transmission but a safety
+/// call started within [`CALL_GAP_S`] of the one before it.
+fn assert_paced(s: &HarnessScore, what: &str) {
+    if let Some((gap, at)) = crowded(s) {
+        panic!("{what}: two transmissions {gap:.2} s apart at {at:.1} s");
+    }
+}
+
+/// The first transmission (not a safety call) that started within
+/// [`CALL_GAP_S`] of the one before it: (the gap, when).
+fn crowded(s: &HarnessScore) -> Option<(f64, f64)> {
+    s.keyed.windows(2).find_map(|w| {
+        let ((a, _), (b, safety)) = (w[0], w[1]);
+        (!safety && b - a < CALL_GAP_S - 1e-6).then_some((b - a, b))
+    })
+}
+
 /// The world sweep's window at each field: ten minutes of fleet time.
 const SWEEP_S: f64 = 600.0;
 
@@ -269,6 +294,7 @@ const SWEEP_S: f64 = 600.0;
 /// ten minutes): the runway book never held two incompatible claims, the
 /// compliance oracle stayed silent, every traffic readback was accepted.
 fn assert_sweep_clean(s: &HarnessScore, what: &str) {
+    assert_paced(s, what);
     assert!(
         s.conflicts.is_empty(),
         "{what}: runway conflicts {:?}",
@@ -315,6 +341,57 @@ fn an_order_maps_onto_the_fleet() {
         ..o
     };
     assert_eq!(map_order(&ours).follow, None, "ours is no traffic id");
+}
+
+/// THE FREQUENCY'S PACE (the spec's "speech flood" risk): one traffic
+/// transmission started per [`CALL_GAP_S`], the rest waiting in the order
+/// made (a readback first), a call already waiting not queued twice, a
+/// departed flight's calls gone with it, and a safety call (a go-around,
+/// its acknowledgement) never held and never dropped.
+#[test]
+fn the_traffic_frequency_keys_one_call_per_gap_and_never_holds_a_go_around() {
+    let mut ob = Outbox::default();
+    ob.push(1, Call::Taxi);
+    ob.push(2, Call::Ready);
+    ob.push(3, Call::Downwind);
+    ob.push(2, Call::Ready);
+    assert_eq!(ob.waiting(), 3, "the same call is not queued twice");
+    assert_eq!(ob.due(0.0), vec![(1, Call::Taxi)]);
+    assert!(ob.due(1.0).is_empty(), "inside the gap");
+    // A readback made now goes before the older requests.
+    ob.push(
+        4,
+        Call::Readback("Cleared to land runway two seven, N4.".into()),
+    );
+    assert_eq!(
+        ob.due(CALL_GAP_S),
+        vec![(
+            4,
+            Call::Readback("Cleared to land runway two seven, N4.".into())
+        )]
+    );
+    // A go-around keys at once, inside the gap, and the gap runs from it.
+    ob.push(5, Call::GoingAround);
+    ob.push(6, Call::Readback("Going around, N6.".into()));
+    assert!(is_safety_call(&Call::GoingAround));
+    assert!(!is_safety_call(&Call::Readback(
+        "Cleared to land, N4.".into()
+    )));
+    assert_eq!(
+        ob.due(CALL_GAP_S + 0.5),
+        vec![
+            (5, Call::GoingAround),
+            (6, Call::Readback("Going around, N6.".into()))
+        ]
+    );
+    assert!(
+        ob.due(2.0 * CALL_GAP_S).is_empty(),
+        "the gap from the go-around"
+    );
+    // A flight that left takes its calls with it; the rest go in order.
+    ob.forget(2);
+    assert_eq!(ob.due(2.0 * CALL_GAP_S + 0.5), vec![(3, Call::Downwind)]);
+    assert_eq!(ob.waiting(), 0);
 }
 
 /// A FIELD HOUR: the generated schedule at XTST (circuits and ATR 72
@@ -479,8 +556,8 @@ fn real_install_lemg_traffic_hour_inner() {
 /// `XVL_TRAFFIC_SWEEP_ONLY=ULMM,BIEG` for named ones), flown for ten
 /// minutes against its real station: nothing panics, and at every field the
 /// runway book never holds two incompatible claims, the compliance oracle
-/// stays silent and every traffic readback is accepted
-/// ([`assert_sweep_clean`]). Completion is not asked (minutes, not the
+/// stays silent, every traffic readback is accepted and the frequency is
+/// paced ([`assert_sweep_clean`]). Completion is not asked (minutes, not the
 /// hour); the numbers print. Seconds in release.
 #[test]
 #[ignore = "needs X-Plane's Global Airports apt.dat; run with -- --ignored"]
@@ -541,15 +618,18 @@ fn real_install_traffic_world_sweep_inner() {
         for line in s.conflicts.iter().take(1).chain(s.oracle.iter().take(1)) {
             println!("    {line}");
         }
-        let clean =
-            s.conflicts.is_empty() && s.oracle.is_empty() && s.readbacks == s.readbacks_accepted;
+        let clean = s.conflicts.is_empty()
+            && s.oracle.is_empty()
+            && s.readbacks == s.readbacks_accepted
+            && crowded(&s).is_none();
         if !clean {
             dirty.push(format!(
-                "{icao}: {:?} {:?} readbacks {}/{}",
+                "{icao}: {:?} {:?} readbacks {}/{} crowded {:?}",
                 s.conflicts.first(),
                 s.oracle.first(),
                 s.readbacks_accepted,
-                s.readbacks
+                s.readbacks,
+                crowded(&s)
             ));
         }
         flown += 1;

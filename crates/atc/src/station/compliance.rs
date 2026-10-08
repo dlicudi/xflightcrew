@@ -126,6 +126,21 @@ pub(super) const LANDED_VACATING_KTS: f64 = 3.0;
 /// shorter is a skip on the takeoff roll or a bounce, not an arrival.
 pub(super) const MIN_FLIGHT_SECS: f64 = 30.0;
 
+/// The flight stands on the strip its strip's `crossing` cell clears it to
+/// cross ([`FlightStrip::crossing`]). The cell is locked alone and dropped
+/// before the runways are read.
+fn cleared_to_cross(flight: &FlightStrip, lat: f64, lon: f64) -> bool {
+    let end = flight
+        .crossing
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|c| c.0.clone());
+    end.is_some_and(|end| {
+        strip(&active_runways(), &end).is_some_and(|r| on_runway(r, lat, lon).is_some())
+    })
+}
+
 /// One tick of the compliance watch: the tower holds the pilot to the
 /// clearances it actually issued, and challenges zone traffic it has never
 /// talked to. Everything is derived from the published `OWN_STRIP.clearance` state:
@@ -426,7 +441,15 @@ pub(super) fn compliance_tick_for(
                 // a pilot following its own route, 2026-07-14). Holds for a
                 // DEPARTURE (state TaxiCleared) and an ARRIVAL taxi-in alike.
                 let cleared_taxi = *state == tower::State::TaxiCleared || arrival_taxi;
-                if cleared_taxi && on_cleared_runway_crossing_for(flight, lat, lon) {
+                // A crossing the tower cleared on request ("cross runway one
+                // three", the strip's `crossing`) is the same legal
+                // occupancy, wherever on the strip's pavement the flight is:
+                // a corner cut at the pavement's edge left the route's
+                // nearest point just off it (EFKU 15, the world sweep).
+                let cleared_across = cleared_to_cross(flight, lat, lon);
+                if cleared_across
+                    || (cleared_taxi && on_cleared_runway_crossing_for(flight, lat, lon))
+                {
                     if gs_kts < 3.0 {
                         w.last_call = Some(now);
                         // Crossing, the heading is square to the strip and
