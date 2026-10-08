@@ -55,6 +55,11 @@ pub const OWN_CLEAR_NM: f64 = 3.0;
 /// An arrival starts this far out.
 pub const ENTRY_NM: f64 = 10.0;
 
+/// The schedule's first movement comes this soon after the fleet starts,
+/// seconds (a draw between the two): the first live hour at LEMG
+/// (2026-10-08) showed an empty field for four to six minutes.
+pub const FIRST_MOVE_S: (f64, f64) = (30.0, 60.0);
+
 /// The shortest runway a jet is scheduled on, and a turboprop.
 pub const JET_MIN_RUNWAY_M: f64 = 1800.0;
 pub const TURBOPROP_MIN_RUNWAY_M: f64 = 1100.0;
@@ -258,6 +263,10 @@ fn field_seed(icao: &str, seed: u64) -> u64 {
 ///   arrivals (straight in where the runway has an approach, else to the
 ///   downwind) where it publishes approaches or STARs, every 20 (light) or
 ///   10 (normal) minutes, on a runway long enough for the type;
+/// - the first movement within [`FIRST_MOVE_S`] of the start: the stream
+///   it belongs to (a ground start's, circuits or departures, before the
+///   arrivals') is brought forward whole, so its spacing and the hour's
+///   count are unchanged;
 /// - never on an occupied stand (ours, anyone's in `ctx`, or one already
 ///   handed out), never an entry within [`OWN_CLEAR_NM`] of us.
 pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx) -> Vec<Movement> {
@@ -394,8 +403,32 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
             t += every * rng.range_f64(0.8, 1.2);
         }
     }
+    bring_first_forward(&mut out, &mut rng);
     out.sort_by(|a, b| a.t_s.total_cmp(&b.t_s));
     out
+}
+
+/// The first movement within [`FIRST_MOVE_S`]: the earliest ground start
+/// (a circuit or a departure: something seen moving on the field), else the
+/// earliest arrival, and every movement of its kind with it, by the same
+/// shift. Already that soon, nothing moves. One draw of `rng`, always.
+fn bring_first_forward(out: &mut [Movement], rng: &mut XorShift64) {
+    let first_s = rng.range_f64(FIRST_MOVE_S.0, FIRST_MOVE_S.1);
+    let earliest = |ground: bool| {
+        out.iter()
+            .filter(|m| (m.kind != MovementKind::Arrival) == ground)
+            .min_by(|a, b| a.t_s.total_cmp(&b.t_s))
+            .map(|m| (m.kind, m.t_s))
+    };
+    let Some((kind, t)) = earliest(true).or_else(|| earliest(false)) else {
+        return;
+    };
+    let shift = t - first_s;
+    if shift > 0.0 {
+        for m in out.iter_mut().filter(|m| m.kind == kind) {
+            m.t_s -= shift;
+        }
+    }
 }
 
 /// An entry [`ENTRY_NM`] out, within 50 degrees of the extended

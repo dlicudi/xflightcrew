@@ -736,3 +736,18 @@ finding; BIEG's test flies the sweep's ten minutes until it is fixed.
 Measured after A to D: the sweep 150 fields, 985 movements, 1,256 calls, zero conflicts, a
 silent oracle, every readback accepted, never two calls inside 3 s; XTST's field hour and the
 real LEMG hour clean; ULMM flown to the end (every movement completes).
+
+### Startup fixes
+
+The first live hour at LEMG (2026-10-08) showed the field EMPTY for the first four to six
+minutes and no parked aircraft at all.
+
+**1. The first movement within a minute.** `schedule::generate` ends in
+`bring_first_forward`: one draw in `FIRST_MOVE_S` (30 to 60 s), and the stream of the earliest
+GROUND start (circuits, else departures; arrivals only at a field with neither) is brought
+forward WHOLE by the same shift, so its spacing and the hour's count are unchanged and the other
+streams untouched. Before: circuits from 30 to 180 s, the first departure from 60 s to one
+interval (LEMG seed 1: 227 s); after, LEMG seed 1's first departure is at 44 s. The pilot's
+file is not touched. Test: `the_first_movement_comes_within_a_minute` (two fixtures, both
+densities, 30 seeds: the first is a ground start inside the window, the departures keep their
+0.8 to 1.2 interval spacing).

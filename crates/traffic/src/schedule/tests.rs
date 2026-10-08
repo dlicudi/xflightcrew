@@ -92,6 +92,47 @@ fn off_is_nothing_and_the_words_parse() {
     assert_eq!(Density::parse("busy"), None);
 }
 
+/// THE FIELD IS NOT EMPTY FOR MINUTES (LEMG, 2026-10-08: the first
+/// movement came four to six minutes after the fleet started): the first
+/// movement is within [`FIRST_MOVE_S`], a ground start where there is one,
+/// its stream brought forward whole (the spacing kept, so the hour's count
+/// is the hour's), the other streams untouched.
+#[test]
+fn the_first_movement_comes_within_a_minute() {
+    for f in [fixtures::xtst_ifr(), fixtures::xnoc()] {
+        for density in [Density::Light, Density::Normal] {
+            for seed in 0..30 {
+                let ms = generate(&f, density, seed, &SpawnCtx::default());
+                let first = &ms[0];
+                assert!(
+                    (FIRST_MOVE_S.0..=FIRST_MOVE_S.1).contains(&first.t_s),
+                    "{} {density:?} seed {seed}: first at {:.0} s",
+                    f.icao,
+                    first.t_s
+                );
+                assert_ne!(first.kind, MovementKind::Arrival, "a ground start first");
+                assert!(ms.iter().all(|m| m.t_s >= first.t_s && m.t_s < HORIZON_S));
+                // The departures keep their spacing (0.8 to 1.2 intervals).
+                let every = if density == Density::Light {
+                    1200.0
+                } else {
+                    600.0
+                };
+                let deps: Vec<f64> = ms
+                    .iter()
+                    .filter(|m| m.kind == MovementKind::Departure)
+                    .map(|m| m.t_s)
+                    .collect();
+                assert!(
+                    deps.windows(2)
+                        .all(|w| (0.8 * every - 1e-6..=1.2 * every + 1e-6).contains(&(w[1] - w[0]))),
+                    "{deps:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn the_same_seed_is_the_same_schedule() {
     let f = fixtures::xtst_ifr();
