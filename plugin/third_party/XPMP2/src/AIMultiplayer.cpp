@@ -1214,6 +1214,20 @@ void XPMPMultiplayerDisable()
     // short-cut if we are not in control
     if (!XPMPHasControlOfAIAircraft())
         return;
+
+    // XVoiceLayer patch: ask X-Plane who really controls the planes. On a
+    // plugin reload X-Plane takes them before the plugin's disable/stop, and
+    // writing the TCAS/map overrides then makes X-Plane call the plugin buggy.
+    {
+        int total = 0, active = 0;
+        XPLMPluginID controller = XPLM_NO_PLUGIN_ID;
+        XPLMCountAircraft(&total, &active, &controller);
+        if (controller != XPLMGetMyID()) {
+            glob.bHasControlOfAIAircraft = false;
+            LOG_MSG(logINFO, "AI planes already taken back by X-Plane, nothing to release");
+            return;
+        }
+    }
     
     // Override in global config?
     if (glob.eAIOverride == SWITCH_CFG_ON) {
