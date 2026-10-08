@@ -89,6 +89,13 @@ XPLMDataRef g_roster_dref = nullptr;
 XPLMDataRef g_frames_dref = nullptr;
 XPLMDataRef g_enable_dref = nullptr;
 XPLMDataRef g_labels_dref = nullptr;
+XPLMDataRef g_volume_dref = nullptr;
+// XPMP2's master volume. Without FMOD its sound rides X-Plane's exterior
+// environment bus, mixed well under engines: at 1.0 the pilot heard our traffic
+// "still low" next to LiveTraffic's own FMOD instance (2026-10-08). Writable
+// live (xcopilot/traffic/volume, 0 to 10) to tune by ear.
+float g_volume_req = 2.5f;
+float g_volume_applied = -1.0f;
 XPLMDataRef g_status_dref = nullptr;
 
 XPLMDataRef g_sim_time = nullptr;  // sim/time/total_running_time_sec
@@ -610,6 +617,10 @@ float TrafficLoop(float, float, int, void*) {
         g_tcas_retry = false;
         take_tcas();
     }
+    if (g_inited && g_volume_req != g_volume_applied) {
+        XPMPSoundSetMasterVolume(g_volume_req);
+        g_volume_applied = g_volume_req;
+    }
     const bool want_labels = g_labels_req != 0;
     if (want_labels != g_labels) {
         g_labels = want_labels;
@@ -660,6 +671,10 @@ void WriteFrames(void*, void* in, int offset, int len) {
 }
 int ReadEnable(void*) { return g_enable_req; }
 void WriteEnable(void*, int v) { g_enable_req = v ? 1 : 0; }
+float ReadVolume(void*) { return g_volume_req; }
+void WriteVolume(void*, float v) {
+    if (std::isfinite(v)) g_volume_req = v < 0.0f ? 0.0f : (v > 10.0f ? 10.0f : v);
+}
 int ReadLabels(void*) { return g_labels_req; }
 void WriteLabels(void*, int v) { g_labels_req = v ? 1 : 0; }
 
@@ -689,6 +704,10 @@ void start() {
     g_frames_dref = register_data("xcopilot/traffic/frames", ReadWire, WriteFrames, &g_frames_in);
     g_enable_dref = register_int("xcopilot/traffic/enable", ReadEnable, WriteEnable);
     g_labels_dref = register_int("xcopilot/traffic/labels", ReadLabels, WriteLabels);
+    g_volume_dref = XPLMRegisterDataAccessor("xcopilot/traffic/volume", xplmType_Float, 1, nullptr,
+                                             nullptr, ReadVolume, WriteVolume, nullptr, nullptr,
+                                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                             nullptr, nullptr);
     g_status_dref = register_data("xcopilot/traffic/status", ReadText, nullptr, &g_status);
     g_sim_time = XPLMFindDataRef("sim/time/total_running_time_sec");
     g_paused = XPLMFindDataRef("sim/time/paused");
@@ -735,6 +754,7 @@ void stop() {
     }
     unregister(g_status_dref);
     unregister(g_labels_dref);
+    unregister(g_volume_dref);
     unregister(g_enable_dref);
     unregister(g_frames_dref);
     unregister(g_roster_dref);
