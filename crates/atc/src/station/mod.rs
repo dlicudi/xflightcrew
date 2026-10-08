@@ -29,10 +29,10 @@ pub(crate) use crate::party_line::{
     REGION_HANDOFF,
 };
 
+pub(crate) use crate::party_line::open_traffic_strip;
+
 // The airline telephony and the ghost speaker live with the callsign
 // resolver, one table for our flight id and everyone else's.
-#[cfg(test)]
-pub(crate) use crate::party_line::open_traffic_strip;
 pub use crate::callsign::spoken_ghost;
 use crate::callsign::{TELEPHONY, TELEPHONY_IATA};
 
@@ -404,6 +404,7 @@ mod takeoff_hold;
 mod taxi;
 mod tcas;
 mod traffic;
+mod traffic_desk;
 mod wake;
 
 pub use atis_watch::*;
@@ -425,6 +426,7 @@ pub use takeoff_hold::*;
 pub use taxi::*;
 pub use tcas::*;
 pub use traffic::*;
+pub use traffic_desk::*;
 pub use wake::*;
 
 #[cfg(test)]

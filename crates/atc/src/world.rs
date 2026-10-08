@@ -29,6 +29,10 @@ pub use crate::station::{
     wake_note_targets,
 };
 
+/// Our own AI traffic (stage D): where each traffic flight is, by its
+/// stable number.
+pub use crate::station::note_traffic_state;
+
 /// Traffic: the TCAS read, the near-miss and the traffic advisory.
 pub use crate::station::{
     advisory_line, is_near_miss, near_miss_line, nearest_traffic_factor, read_tcas_targets,

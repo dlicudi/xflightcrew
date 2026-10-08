@@ -617,6 +617,9 @@ mod tests {
         // Split from COMPLIANCE (increment 7), which `install` and
         // `uninstall` overwrite: the flight part, a strip `watch` cell.
         install.extend(names(&["COMPLIANCE_FLIGHT"]));
+        // New with our own traffic (stage D, increment 4): where a traffic
+        // flight was last seen, a strip `watch` cell (never written on ours).
+        install.extend(names(&["SEEN"]));
         assert_eq!(door_cells(INSTALL_RESETS), install, "install");
 
         let mut uninstall = install.clone();

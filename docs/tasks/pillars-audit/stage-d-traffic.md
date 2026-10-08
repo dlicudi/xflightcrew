@@ -188,3 +188,20 @@ Crew flight laws for traffic; online schedules; wind triangle; per-category wake
 or "number two cleared to land" conditionals; strips re-adopted across a reinstall; departure
 or approach handoff for traffic (it leaves at 12 nm); traffic at uncontrolled fields; traffic
 with ATC off (parked aircraft drawn only); any `pub static` for traffic.
+
+## Deviations (as built)
+
+### ATC side (steps 4 to 6)
+
+- **Increment 4**: `seen` is a strip `watch` cell (reset by `install` and `uninstall`; a
+  traffic strip dies whole with `STRIPS`); ours is never written (our state is handed to each
+  query), and the door test lists `SEEN`. `world::note_traffic_state` OPENS the strip when none
+  is open: the tower sees every aircraft on its field, called or not. The book's answer to the
+  holds and to `make_ctx`'s `runway_occupied` (`strip_held_by_others`) is now "another strip
+  holds it whole OR stands on it" (`RunwayBook::blocked`: the whole-strip clearance claims, plus
+  an `Occupying` claim on the same strip); `held_whole` and `held_by_another` are unchanged.
+  So a traffic flight standing on our strip holds our line-up, our takeoff release and our
+  landing release, by the same rule. For a traffic strip's own holds, ours is a claimant by its
+  clearance only (no position of ours is held in a cell): our position reaches a traffic tick
+  through the picture it is handed. `seen` never goes stale by itself: the producer retires a
+  strip it despawns (increment 6).

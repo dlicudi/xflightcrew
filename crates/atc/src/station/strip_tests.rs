@@ -1,7 +1,7 @@
 //! Traffic strips: a traffic flight's claim is the book's, its answers write
 //! its own strip, and an empty map changes nothing for ours.
 
-use super::book_tests::book_runways;
+use super::book_tests::{along, book_runways};
 use super::tests::SIDE_STATE_LOCK;
 use super::*;
 
@@ -160,6 +160,69 @@ fn a_traffic_strip_cleared_to_land_blocks_our_line_up() {
     let line = released.expect("released once the book frees the runway");
     assert!(line.contains("cleared for takeoff"), "{line}");
     Station::uninstall();
+}
+
+/// A TRAFFIC AIRCRAFT STANDING ON OUR RUNWAY BLOCKS OUR LINE-UP: its
+/// producer's report puts it on the pavement in the book, our ready call is
+/// held, and the release waits until it has left the strip. One standing on
+/// the twin, or flying over ours, blocks nothing.
+#[test]
+fn a_traffic_aircraft_on_our_runway_blocks_our_line_up() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let ready = "Gatwick Tower, Speedbird one two three, ready for departure";
+    let runways = book_runways();
+    let (lat, lon) = along(&runways[0], 0.5);
+
+    let mut st = gatwick();
+    st.install();
+    note_traffic_state(4, AircraftState::at_position(lat, lon, true, 0.0));
+    st.desk.twr.state = tower::State::TaxiCleared;
+    let ctx = ctx_for(&mut st, "Speedbird one two three", true);
+    assert!(ctx.runway_occupied, "the traffic stands on 26L");
+    let r = st.route_keyed(ready, Service::Tower, &ctx, westerly());
+    assert!(r.contains("hold position, traffic on the runway"), "{r}");
+    assert!(crate::party_line::takeoff_hold_armed());
+    let t0 = Instant::now();
+    for s in [0, 20, 40] {
+        let at = t0 + std::time::Duration::from_secs(s);
+        assert!(
+            takeoff_hold_tick(&[], 200.0, true, at).is_none(),
+            "+{s}: the traffic is still on the strip"
+        );
+    }
+    // It vacates onto the taxiway, 300 m off the centreline.
+    note_traffic_state(
+        4,
+        AircraftState::at_position(lat - 300.0 / 111_320.0, lon, true, 10.0),
+    );
+    let mut released = None;
+    for s in [60, 80] {
+        released = released.or(takeoff_hold_tick(
+            &[],
+            200.0,
+            true,
+            t0 + std::time::Duration::from_secs(s),
+        ));
+    }
+    let line = released.expect("released once the traffic has left the strip");
+    assert!(line.contains("cleared for takeoff"), "{line}");
+    Station::uninstall();
+
+    for (what, (lat, lon), on_ground) in [
+        ("on the twin", along(&runways[1], 0.5), true),
+        ("over our runway", (lat, lon), false),
+    ] {
+        let mut st = gatwick();
+        st.install();
+        note_traffic_state(4, AircraftState::at_position(lat, lon, on_ground, 0.0));
+        st.desk.twr.state = tower::State::TaxiCleared;
+        let ctx = ctx_for(&mut st, "Speedbird one two three", true);
+        assert!(!ctx.runway_occupied, "traffic {what}");
+        let r = st.route_keyed(ready, Service::Tower, &ctx, westerly());
+        assert!(r.contains("cleared for takeoff"), "traffic {what}: {r}");
+        Station::uninstall();
+    }
 }
 
 /// A TRAFFIC STRIP'S ANSWERS ARE ITS OWN: its final call and its readback

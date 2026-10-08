@@ -80,8 +80,8 @@ pub(crate) struct RunwayBook {
 
 impl RunwayBook {
     /// The book over our own strip (with our state where the caller holds
-    /// it), every open traffic strip (by its clearance: no traffic state is
-    /// held yet) and the ghost memory.
+    /// it), every open traffic strip (by its clearance and where it was
+    /// last seen, [`FlightStrip::seen`]) and the ghost memory.
     pub(crate) fn now(own: Option<AircraftState>) -> RunwayBook {
         // The map's lock is dropped here, before any strip's cell.
         let traffic = traffic_strips();
@@ -93,7 +93,7 @@ impl RunwayBook {
         entries.extend(traffic.iter().map(|(n, s)| BookEntry {
             id: FlightId::Traffic(*n),
             strip: &**s,
-            state: None,
+            state: seen(s),
         }));
         RunwayBook::compute(&entries)
     }
@@ -312,6 +312,21 @@ impl RunwayBook {
         self.held_whole(end, Some(id))
     }
 
+    /// A strip (other than `except`) holds the strip `end` is on WHOLE, or
+    /// stands on its pavement ([`ClaimKind::Occupying`]: on the ground, on
+    /// the strip, authorised or not). Nobody lines up, departs or lands on a
+    /// strip a flight stands on.
+    fn blocked(&self, end: &str, except: Option<FlightId>) -> Option<&Claim> {
+        self.held_whole(end, except).or_else(|| {
+            let ours = strip(&self.runways, end)?;
+            self.claims.iter().find(|c| {
+                matches!(&c.who, Claimant::Strip(f) if Some(*f) != except)
+                    && c.kind == ClaimKind::Occupying
+                    && strip(&self.runways, &c.end).is_some_and(|r| std::ptr::eq(r, ours))
+            })
+        })
+    }
+
     /// A strip (other than `except`) holds the strip `end` is on WHOLE.
     fn held_whole(&self, end: &str, except: Option<FlightId>) -> Option<&Claim> {
         let ours = strip(&self.runways, end)?;
@@ -338,17 +353,25 @@ impl RunwayBook {
     }
 }
 
+/// Where a traffic strip's flight was last seen ([`FlightStrip::seen`]).
+pub(super) fn seen(strip: &FlightStrip) -> Option<AircraftState> {
+    *strip.seen.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// A traffic strip holds the strip `end` is on whole (cleared onto it or to
-/// land on it), on these runways: our line-up, takeoff and released holds
-/// wait for it as for an occupied runway. Nothing to read (and nothing
-/// locked past the map) while no traffic strip is open.
+/// land on it) or stands on its pavement, on these runways: our line-up,
+/// takeoff and released holds wait for it as for an occupied runway.
+/// Nothing to read (and nothing locked past the map) while no traffic strip
+/// is open.
 pub(super) fn strip_held_by_traffic(runways: &[nav::Runway], end: &str) -> bool {
     strip_held_by_others(runways, end, &OWN_STRIP)
 }
 
 /// [`strip_held_by_traffic`] for any flight's strip `me`: every OTHER strip
-/// is a claimant (ours too, for a traffic strip). For our strip, nothing is
-/// read past the map while no traffic strip is open.
+/// is a claimant (ours too, for a traffic strip, by its clearance: our
+/// position is the caller's picture, never a cell), each traffic strip with
+/// the state it was last seen in. For our strip, nothing is read past the
+/// map while no traffic strip is open.
 pub(super) fn strip_held_by_others(runways: &[nav::Runway], end: &str, me: &FlightStrip) -> bool {
     let traffic = traffic_strips();
     if me.is_own() && traffic.is_empty() {
@@ -369,11 +392,11 @@ pub(super) fn strip_held_by_others(runways: &[nav::Runway], end: &str, me: &Flig
             .map(|(n, s)| BookEntry {
                 id: FlightId::Traffic(*n),
                 strip: &**s,
-                state: None,
+                state: seen(s),
             }),
     );
     RunwayBook::compute_on(runways.to_vec(), &entries)
-        .held_whole(end, None)
+        .blocked(end, None)
         .is_some()
 }
 

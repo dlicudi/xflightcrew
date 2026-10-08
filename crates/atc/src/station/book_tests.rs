@@ -369,3 +369,113 @@ fn the_runway_book_answers_as_the_functions_it_replaced() {
     clear_ghost_memory();
     Station::uninstall();
 }
+
+/// A TRAFFIC FLIGHT'S POSITION IS READ BY THE RULES OURS IS: the state its
+/// producer reported ([`note_traffic_state`]) makes the same claims as the
+/// state handed in for a flight, cell for cell, on our strip at either end,
+/// on the twin, off the pavement, on the ground or not, stopped or moving;
+/// and only a flight standing on our strip blocks it, never one on the twin
+/// or one in the air over it. A runway start, a vacate and a moving cleared
+/// crossing are its claims too.
+#[test]
+fn a_traffic_position_claims_by_the_rules_ours_does() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = super::strip_tests::ClearStrips;
+    Station::uninstall();
+    clear_ghost_memory();
+    let runways = book_runways();
+    *ACTIVE_RUNWAYS.lock().unwrap() = runways.clone();
+    let (ours, twin) = (&runways[0], &runways[1]);
+    let ours_a = along(ours, 0.2);
+    let mid = along(ours, 0.5);
+    let positions = [
+        ("ours_a", ours_a),
+        ("ours_b", along(ours, 0.8)),
+        ("twin", along(twin, 0.3)),
+        ("off", (mid.0 - 300.0 / 111_320.0, mid.1)),
+    ];
+    let mut cells = 0;
+    for (pname, (lat, lon)) in positions {
+        for on_ground in [true, false] {
+            for gs in [0.0, 10.0] {
+                cells += 1;
+                STRIPS.lock().unwrap().clear();
+                let state = AircraftState::at_position(lat, lon, on_ground, gs);
+                note_traffic_state(1, state);
+                let t = traffic_strip(1).expect("the report opened its strip");
+                let book = RunwayBook::now(None);
+                let handed = RunwayBook::compute(&[
+                    BookEntry {
+                        id: FlightId::Own,
+                        strip: &OWN_STRIP,
+                        state: None,
+                    },
+                    BookEntry {
+                        id: FlightId::Traffic(1),
+                        strip: &t,
+                        state: Some(state),
+                    },
+                ]);
+                let cell = format!("at {pname} ground {on_ground} gs {gs}");
+                assert_eq!(book.claims(), handed.claims(), "{cell}");
+                let occupying = book.claims().iter().any(|c| {
+                    c.who == Claimant::Strip(FlightId::Traffic(1)) && c.kind == ClaimKind::Occupying
+                });
+                assert_eq!(occupying, on_ground && pname != "off", "{cell}");
+                let on_ours = on_ground && pname.starts_with("ours");
+                let on_twin = on_ground && pname == "twin";
+                for end in ["08R", "26L"] {
+                    assert_eq!(strip_held_by_traffic(&runways, end), on_ours, "{end} {cell}");
+                }
+                for end in ["08L", "26R"] {
+                    assert_eq!(strip_held_by_traffic(&runways, end), on_twin, "{end} {cell}");
+                }
+            }
+        }
+    }
+    assert_eq!(cells, 16, "the matrix ran whole");
+
+    // The strip's own memory and route make the claims they make for ours.
+    STRIPS.lock().unwrap().clear();
+    note_traffic_state(2, AircraftState::at_position(ours_a.0, ours_a.1, true, 0.0));
+    let t = traffic_strip(2).unwrap();
+    let kinds = || -> Vec<ClaimKind> {
+        RunwayBook::now(None)
+            .claims()
+            .iter()
+            .filter(|c| c.who == Claimant::Strip(FlightId::Traffic(2)))
+            .map(|c| c.kind)
+            .collect()
+    };
+    assert_eq!(kinds(), vec![ClaimKind::Occupying]);
+    assert!(!RunwayBook::now(None).occupancy_authorised(FlightId::Traffic(2)));
+    t.compliance_flight.lock().unwrap().runway_start = Some("08R".into());
+    assert!(kinds().contains(&ClaimKind::RunwayStart));
+    assert!(RunwayBook::now(None).occupancy_authorised(FlightId::Traffic(2)));
+    *t.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
+    t.compliance_flight.lock().unwrap().landed_strip = Some("08R".into());
+    note_traffic_state(2, AircraftState::at_position(ours_a.0, ours_a.1, true, 10.0));
+    assert!(kinds().contains(&ClaimKind::Vacating));
+    *t.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
+    *t.clearance.lock().unwrap() = Some(ClearanceSnap {
+        state: tower::State::TaxiCleared,
+        callsign: "Easy four five six".into(),
+        runway_ident: "26R".into(),
+        pending_readback: None,
+        holds_runway: false,
+    });
+    *t.taxi_route.lock().unwrap() = Some(TaxiWatch {
+        path: vec![(ours_a.0 + 0.0013, ours_a.1), (ours_a.0 - 0.0013, ours_a.1)],
+        via: "Alpha".into(),
+        seg: vec![("A".into(), false)],
+        holding_point: "A1".into(),
+        lead_on: Vec::new(),
+    });
+    assert!(kinds().contains(&ClaimKind::Crossing));
+    assert!(RunwayBook::now(None).occupancy_authorised(FlightId::Traffic(2)));
+    // A crossing traffic flight still stands on our strip: it blocks it.
+    assert!(strip_held_by_traffic(&runways, "26L"));
+    // None of it is ours.
+    assert!(RunwayBook::now(None).strip_claim(FlightId::Own).is_none());
+    Station::uninstall();
+}

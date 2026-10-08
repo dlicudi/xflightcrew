@@ -237,6 +237,12 @@ flight_strip! {
             /// split from the field's `COMPLIANCE`, whose radio cooldowns stay one
             /// per field.
             compliance_flight: Mutex<ComplianceFlight> = Mutex::new(ComplianceFlight::NEW),
+            /// Where a TRAFFIC flight was last seen, as its producer reported
+            /// it (`world::note_traffic_state`): the runway book's position for
+            /// the strip, so its Occupying, RunwayStart, Vacating and Crossing
+            /// claims are read by the same rules as ours. Ours is never written
+            /// here (our state is handed to each query), so it stays `None`.
+            seen: Mutex<Option<AircraftState>> = Mutex::new(None),
         },
     }
 }
@@ -274,8 +280,8 @@ pub(crate) fn traffic_strips() -> Vec<(u32, std::sync::Arc<FlightStrip>)> {
         .collect()
 }
 
-/// Open (or find) the traffic strip under this number.
-#[cfg_attr(not(test), allow(dead_code))] // the traffic producer is stage D's
+/// Open (or find) the traffic strip under this number. The map's lock is
+/// dropped on return, before the caller touches any cell.
 pub(crate) fn open_traffic_strip(n: u32) -> std::sync::Arc<FlightStrip> {
     lock(&STRIPS)
         .entry(n)
