@@ -166,3 +166,15 @@ Redesign, for the 172, after the pillars, REPLACING the frozen code rather than 
   snapshot from the real logs byte-identical (ignored test `grammar_snapshot`), `xvl analyze
   --now` unchanged. Found on the way: a multi-byte panic in `phrase::fix_value_mishear`, fixed.
   Next: stage C.
+- 2026-10-08: **Stage C done** (offline; all green: atc 228, nav 56, sim 54, lib 87, xvl
+  2,160; `atc_world_sweep` 38,886 airports). `crates/nav` split out. Per-flight strips per
+  `stage-c-strips.md`: `OWN_STRIP` in four lifetime groups (doors pinned), `StripDesk` out of
+  `Station`, `AircraftState` passed in, a computed `RunwayBook` (78,080-cell matrix against the
+  old functions as oracles), `STRIPS` + `respond_for` + `_for` tick cores, compliance memory per
+  flight. Own flight behaviour unchanged; traffic strips reachable only from tests.
+  **Stage D needs** (not built): a producer opening/closing strips; a public traffic entry over
+  `respond_for` and a traffic `Ctx` (build_ctx is own-only); a stored `AircraftState` per traffic
+  strip (so Occupying/RunwayStart/Vacating/Crossing claims appear); the monitor ticking traffic
+  cores; desks that survive a reinstall; party-line holds against traffic claims; sequencing
+  ("number two", "land after"); traffic calls not moving field facts (`runway_in_use`); a crew
+  view of traffic.
