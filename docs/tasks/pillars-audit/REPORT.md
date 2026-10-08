@@ -178,3 +178,10 @@ Redesign, for the 172, after the pillars, REPLACING the frozen code rather than 
   cores; desks that survive a reinstall; party-line holds against traffic claims; sequencing
   ("number two", "land after"); traffic calls not moving field facts (`runway_in_use`); a crew
   view of traffic.
+- 2026-10-08: **Regression flight** over stages A to C (`bench/sorties/c172-regress.yaml`,
+  sortie 1791455961-full_auto, 172 LEMG circuit from the ramp): unattended, no give-up; every
+  tower exchange right (circuits, named taxi route, takeoff, report base/final, landing), the
+  runway book released us between arrivals, the readback out once. Scorer FAIL on taxi (5.7 m,
+  pre-existing) and alignment (3.1 deg); the 172 flare has no hold-off (283 fpm). Filed for the
+  autonomy redesign, not patched: #240 (flare), #241 (taxi). #239: a swap away from the Zibo
+  stalls X-Plane for minutes.
