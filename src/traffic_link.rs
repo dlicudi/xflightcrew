@@ -220,7 +220,10 @@ const ARRIVAL_WAIT_S: f64 = 120.0;
 /// The station's runway in use, as the command loop last saw it: traffic
 /// spawns for it before the tower has cleared anyone (the link learnt the
 /// runway only from orders, so traffic flew the plan's 13 under a tower on 12,
-/// LEMG, 2026-10-08). Overwritten every command-loop turn.
+/// LEMG, 2026-10-08). Overwritten every command-loop turn with
+/// `Station::runway_for_now`: the runway in use, else the pick the first
+/// traffic call would make, so arrivals spawn for the tower's runway from
+/// the install on instead of waiting [`ARRIVAL_WAIT_S`] for a first call.
 static STATION_RUNWAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Note the station's runway in use (the command loop, each turn).

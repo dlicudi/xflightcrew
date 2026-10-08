@@ -77,6 +77,8 @@ pub(super) struct HarnessScore {
     pub(super) touchdowns: usize,
     pub(super) go_arounds: usize,
     pub(super) secs: f64,
+    /// When each movement spawned (harness seconds) and its callsign.
+    pub(super) spawned: Vec<(f64, String)>,
 }
 
 /// A station for `icao` from `apt` with its taxi network loaded, installed.
@@ -130,6 +132,9 @@ pub(super) fn fly_field(
     let mut readbacks: HashMap<u32, Vec<String>> = HashMap::new();
     let mut seen_ids: HashSet<u32> = HashSet::new();
     let trace = std::env::var("XVL_TRAFFIC_TRACE").is_ok_and(|v| !v.is_empty());
+    // The command loop notes the station's runway each turn, from the
+    // install on (`station_work::drain_traffic_calls`).
+    note_station_runway(station.runway_for_now().as_deref());
     while t < max_s {
         t += dt;
         let now = epoch + Duration::from_secs_f64(t);
@@ -138,6 +143,8 @@ pub(super) fn fly_field(
         s.keyed
             .extend(out.transmissions.iter().map(|tx| (t, tx.safety)));
         s.said.extend(out.tower.iter().map(|(_, l)| l.clone()));
+        s.spawned
+            .extend(out.spawned.iter().map(|(_, cs)| (t, cs.clone())));
         for ev in &out.events {
             match ev {
                 Event::Spawn { id } => {
@@ -170,6 +177,7 @@ pub(super) fn fly_field(
             }
         }
         // The command loop's half, as often as the monitor ticks.
+        note_station_runway(station.runway_for_now().as_deref());
         station.sync_traffic_desks();
         for line in out.tower.iter().filter(|_| trace) {
             println!("{t:7.1} TWR(tick) [{}] {}", line.0, line.1);
@@ -417,8 +425,22 @@ fn a_field_hour_inner() {
         .with_cifp(&format!("{}/cifp", fixtures()));
     let schedule = traffic::generate(&field, Density::Normal, 7, &SpawnCtx::default());
     let mut st = installed_station(&apt, "XTST");
+    // The field has a runway for the traffic from the install on: the first
+    // arrival spawns at its time, not ARRIVAL_WAIT_S later for a first call.
+    assert!(st.runway_in_use().is_none() && st.runway_for_now().is_some());
+    let first_in = schedule
+        .iter()
+        .find(|m| m.kind == traffic::MovementKind::Arrival)
+        .map(|m| (m.t_s, m.callsign.clone()))
+        .expect("an arrival");
     let s = fly_field(&mut st, field, schedule, 2.5 * 3600.0);
     assert_clean(&s, "XTST field hour");
+    let spawned = s.spawned.iter().find(|(_, cs)| *cs == first_in.1);
+    assert!(
+        spawned.is_some_and(|(t, _)| *t < first_in.0 + 1.0),
+        "the first arrival spawned at {spawned:?}, scheduled {:.0} s",
+        first_in.0
+    );
     Station::uninstall();
 }
 
@@ -546,7 +568,16 @@ fn real_install_lemg_traffic_hour_inner() {
     let field = field.with_cifp(&crate::nav::test_xplane_path("Custom Data/CIFP"));
     let schedule = traffic::generate(&field, Density::Normal, 7, &SpawnCtx::default());
     let mut st = installed_station(&apt, "LEMG");
+    println!(
+        "LEMG at install: runway in use {:?}, for the traffic {:?}",
+        st.runway_in_use(),
+        st.runway_for_now()
+    );
     let s = fly_field(&mut st, field, schedule, 3.0 * 3600.0);
+    println!(
+        "LEMG first spawns: {:?}",
+        &s.spawned[..s.spawned.len().min(4)]
+    );
     assert_clean(&s, "LEMG field hour");
     Station::uninstall();
 }

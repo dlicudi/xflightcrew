@@ -751,3 +751,19 @@ interval (LEMG seed 1: 227 s); after, LEMG seed 1's first departure is at 44 s. 
 file is not touched. Test: `the_first_movement_comes_within_a_minute` (two fixtures, both
 densities, 30 seeds: the first is a ground start inside the window, the departures keep their
 0.8 to 1.2 interval spacing).
+
+**3. The tower's runway for the traffic from the install on.** Writing `runway_in_use` at
+install would have changed OUR first call (in calm a runway in use skips the wind pick and the
+stream rule's "none yet" branch), so the station gained a PURE `Station::runway_for_now()`
+instead (`runway_pick.rs`): the runway in use, else the pick the first traffic GROUND call would
+make on the field (its wind as `traffic_ctx` takes it, `TOWER_WIND` else the field's surface
+wind else calm; the remembered streams; a departure's wind pick; the close-parallel rule). It
+writes nothing. The command loop notes it for the link each turn (`note_station_runway`, which
+read `runway_in_use()`), so arrivals spawn for the tower's runway at their time instead of
+waiting `ARRIVAL_WAIT_S` (kept as the fallback with no station). The harness notes it too, at
+its start and every command-loop half. LEMG at install, calm: `runway_for_now` is 12 (the
+runway in use stays `None` until a call). Tests:
+`the_runway_for_now_is_the_first_traffic_calls_pick_and_writes_nothing` (three winds: the
+answer is the first traffic call's pick, nothing written), XTST's field hour asserts the first
+arrival spawns at its scheduled time. Sweep after: 150 fields, 985 movements, 1,356 calls (the
+arrivals no longer wait), clean.
