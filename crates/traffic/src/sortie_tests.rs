@@ -844,7 +844,9 @@ fn a_long_vacate_calls_vacated_before_its_wait_for_a_stand_begins() {
     // 1.4 km along the strip and off it: about 270 s at the 172's 10 kt.
     let start = end.at(100.0, 0.0);
     let exit = project_m(start, end.course_deg, 1400.0);
-    let off = project_m(exit, end.course_deg + 90.0, 60.0);
+    // The leg off the strip is long too: down the runway is now flown at
+    // the brisker backtrack pace.
+    let off = project_m(exit, end.course_deg + 90.0, 600.0);
     let mut kin = Kin::parked(start, end.elev_ft, end.course_deg);
     kin.gs_kts = 10.0;
     let mut ac = TrafficAircraft::new(

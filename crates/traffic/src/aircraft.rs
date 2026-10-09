@@ -45,6 +45,11 @@ pub const MAX_DOWNWIND_EXT_NM: f64 = 4.0;
 /// Line-up pace, knots.
 const LINE_UP_KTS: f64 = 6.0;
 
+/// A backtrack's pace as a share of the type's taxi pace...
+const BACKTRACK_PACE: f64 = 1.6;
+/// ...and never faster than this, knots.
+const BACKTRACK_MAX_KTS: f64 = 25.0;
+
 /// The line-up ends this far along the centreline from where the lead-on
 /// meets it, so the aircraft stops ALIGNED.
 const LINE_UP_ALIGN_M: f64 = 60.0;
@@ -405,6 +410,15 @@ impl TrafficAircraft {
     /// "hold position" stops it where it is. Traffic ahead on the route
     /// slows it to a pace it can stop from short of the spacing
     /// ([`GroundSpacing::free_m`]), and holds it there until the way clears.
+    /// The pace down a runway (a backtrack, a line-up along it, the
+    /// vacate's roll to its exit): brisker than a taxiway's, the corners
+    /// still slowed for. UUYY and BIEG (world sweep, 2026-10-09): a jet's
+    /// backtrack at taxi pace held the only runway three minutes, a line-up
+    /// at 6 kt seventy seconds, and the arrivals behind went around.
+    fn backtrack_kts(&self) -> f64 {
+        (self.perf.taxi_kts * BACKTRACK_PACE).min(BACKTRACK_MAX_KTS)
+    }
+
     fn drive(&mut self, kts: f64, order: &Order, dt: f64) -> bool {
         if order.hold {
             self.hold_still(dt);
@@ -460,7 +474,12 @@ impl TrafficAircraft {
                 }
             }
             Phase::LineUp => {
-                let done = self.drive(LINE_UP_KTS.min(self.perf.taxi_kts), o, dt);
+                let kts = if field.on_runway(self.kin.pos()) {
+                    self.backtrack_kts()
+                } else {
+                    LINE_UP_KTS.min(self.perf.taxi_kts)
+                };
+                let done = self.drive(kts, o, dt);
                 if done && o.state == TowerState::TakeoffCleared {
                     if let Some(end) = &end {
                         self.route = self.takeoff_route(end, field);
@@ -485,7 +504,12 @@ impl TrafficAircraft {
                 }
             }
             Phase::Vacate => {
-                let driven = self.drive(self.perf.taxi_kts, o, dt);
+                let kts = if field.on_runway(self.kin.pos()) {
+                    self.backtrack_kts()
+                } else {
+                    self.perf.taxi_kts
+                };
+                let driven = self.drive(kts, o, dt);
                 // Stopped clear of the strip behind traffic in the exit, it
                 // HAS vacated: said and on to the stand from here. A vacate
                 // waiting to reach its drawn end never reported off, its

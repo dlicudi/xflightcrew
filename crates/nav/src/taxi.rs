@@ -291,7 +291,7 @@ pub fn after_vacate(vacate: VacatePlan, rest: TaxiRoutePlan) -> TaxiRoutePlan {
 /// crossed, the holding-point name, and the node polyline for the
 /// off-route compliance watch. Names are RAW apt.dat strings — the station
 /// speaks them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TaxiRoutePlan {
     pub via: Vec<String>,
     pub crossings: Vec<String>,
@@ -691,6 +691,7 @@ impl TaxiNet {
     /// than inventing a drive across an unseen apron.
     pub fn plan_to_stand(&self, from_lat: f64, from_lon: f64, stand: &Stand) -> Option<TaxiRoutePlan> {
         let mut plan = self.plan(from_lat, from_lon, stand.lat, stand.lon, 0.0, &[])?;
+        trim_snap_spur(&mut plan);
         let end = *plan.path.last()?;
         let m_per_deg_lon = 111_320.0 * stand.lat.to_radians().cos();
         let gap = {
@@ -1727,3 +1728,79 @@ pub(super) const STRIP_NODE_SHOULDER_M: f64 = 15.0;
 /// the strip's own (authors' centreline nodes wander a degree or two; a
 /// crossing runway is tens of degrees off).
 pub(super) const STRIP_EDGE_ALIGN_DEG: f64 = 15.0;
+
+/// How far into a route a snap spur is looked for, points.
+const SPUR_SCAN_PTS: usize = 30;
+
+/// The route back out of its first point counts as a spur only when it
+/// comes back this much nearer the start than the snap took it, metres.
+const SPUR_MARGIN_M: f64 = 5.0;
+
+/// A route that opens by snapping BACK to a node behind the aircraft and
+/// retracing the line it is already on: cut from the start straight to the
+/// point where the route passes nearest it. UUYY 18 (world sweep,
+/// 2026-10-09): a vacate stopped clear of the runway end behind a
+/// departure, and its stand route snapped 40 m back onto the runway corner
+/// and came straight out again, a phantom "hold short runway one eight"
+/// the arrival waited at, ON the runway, for six minutes.
+fn trim_snap_spur(plan: &mut TaxiRoutePlan) {
+    if plan.path.len() < 3 {
+        return;
+    }
+    let start = plan.path[0];
+    let m_per_deg_lon = 111_320.0 * start.0.to_radians().cos();
+    let d = |p: (f64, f64)| {
+        let (dx, dy) = ((p.1 - start.1) * m_per_deg_lon, (p.0 - start.0) * 111_320.0);
+        (dx * dx + dy * dy).sqrt()
+    };
+    let first = d(plan.path[1]);
+    let Some((m, dm)) = plan
+        .path
+        .iter()
+        .enumerate()
+        .skip(2)
+        .take(SPUR_SCAN_PTS)
+        .map(|(i, p)| (i, d(*p)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+    else {
+        return;
+    };
+    if dm + SPUR_MARGIN_M >= first {
+        return;
+    }
+    let lead = plan.seg.get(m - 1).cloned().unwrap_or_default();
+    let mut path = vec![start];
+    path.extend_from_slice(&plan.path[m..]);
+    let mut seg = vec![lead];
+    seg.extend_from_slice(plan.seg.get(m..).unwrap_or(&[]));
+    plan.path = path;
+    plan.seg = seg;
+}
+
+#[cfg(test)]
+mod spur_tests {
+    use super::*;
+
+    /// UUYY 18 (2026-10-09): a route that snaps 40 m back and retraces the
+    /// line it starts on is cut from the start to where it passes nearest;
+    /// a route that simply leads away is left alone.
+    #[test]
+    fn a_snap_spur_back_onto_the_runway_corner_is_cut() {
+        let m = 1.0 / 111_320.0;
+        let start = (60.0, 50.0);
+        let back = (60.0 - 40.0 * m, 50.0);
+        let mut plan = TaxiRoutePlan {
+            path: vec![start, back, (60.0 - 20.0 * m, 50.0), (60.0 + 2.0 * m, 50.0), (60.0 + 50.0 * m, 50.0)],
+            seg: vec![("RWY".into(), true), ("RWY".into(), true), ("A".into(), false), ("A".into(), false)],
+            ..Default::default()
+        };
+        trim_snap_spur(&mut plan);
+        assert_eq!(plan.path, vec![start, (60.0 + 2.0 * m, 50.0), (60.0 + 50.0 * m, 50.0)]);
+        assert_eq!(plan.seg.len(), plan.path.len() - 1);
+        assert_eq!(plan.seg[0].0, "A");
+        let away = vec![start, (60.0 + 10.0 * m, 50.0), (60.0 + 30.0 * m, 50.0)];
+        let mut plain = TaxiRoutePlan { path: away.clone(), seg: vec![Default::default(); 2], ..Default::default() };
+        trim_snap_spur(&mut plain);
+        assert_eq!(plain.path, away);
+    }
+}

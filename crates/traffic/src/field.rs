@@ -212,6 +212,8 @@ impl FieldModel {
             return ahead;
         };
         let behind = plan((hdg + 180.0).rem_euclid(360.0));
+        let ahead = ahead.map(|v| self.off_the_strip(v, stand));
+        let behind = behind.map(|v| self.off_the_strip(v, stand));
         // The whole drive to the parking: the vacate, then the stand route.
         let drive_m = |v: &VacatePlan| -> Option<f64> {
             let off = *v.path.last()?;
@@ -225,6 +227,43 @@ impl FieldModel {
             },
             (a, b) => a.or(b),
         }
+    }
+
+    /// `v` carried on along the stand route until it is OFF the runway's
+    /// pavement. UNSS 15 (world sweep, 2026-10-09): the taxiways there are
+    /// drawn down the runway itself, so both vacates ended on the centreline;
+    /// the arrival said "runway vacated" standing on it and the tower called
+    /// it on the runway without clearance. A vacate already off, or with no
+    /// route on, is left as it is.
+    fn off_the_strip(&self, mut v: VacatePlan, stand: &Stand) -> VacatePlan {
+        let Some(&last) = v.path.last() else {
+            return v;
+        };
+        if !self.on_runway(last) {
+            return v;
+        }
+        let Some(route) = self.net.plan_to_stand(last.0, last.1, stand) else {
+            return v;
+        };
+        let start = route
+            .path
+            .iter()
+            .position(|p| dist_m(*p, last) >= 1.0)
+            .unwrap_or(route.path.len());
+        for (k, p) in route.path.iter().enumerate().skip(start) {
+            v.path.push(*p);
+            v.seg.push(
+                route
+                    .seg
+                    .get(k.saturating_sub(1))
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            if !self.on_runway(*p) {
+                break;
+            }
+        }
+        v
     }
 
     /// The taxi route from `from` onto `stand`.

@@ -245,7 +245,7 @@ impl Station {
                     // shows somebody on (the parked aircraft); ours over
                     // the stands our own fleet's parked aircraft stand on
                     // (#243), else it plans as it always did.
-                    let occupied: Vec<(f64, f64)> = if self.desk.strip.is_traffic() {
+                    let mut occupied: Vec<(f64, f64)> = if self.desk.strip.is_traffic() {
                         targets
                             .iter()
                             .filter(|t| t.on_ground)
@@ -254,6 +254,10 @@ impl Station {
                     } else {
                         stands_taken()
                     };
+                    // ...and the stands already given to another arrival still
+                    // taxiing in (UUYY, world sweep 2026-10-09: two arrivals
+                    // sent to "stand one niner" a minute apart).
+                    occupied.extend(stands_assigned(&self.desk.strip));
                     plan_taxi_route_to_stand(&self.apt.runways, lat, lon, state.psi_deg, &occupied)
                 } else {
                     plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
@@ -461,6 +465,29 @@ pub(super) fn landing_sequence_tail(me: &FlightStrip) -> Option<(u8, FlightId)> 
         .collect();
     let last = placed.iter().max_by_key(|(n, _)| *n)?.1;
     Some((u8::try_from(placed.len()).unwrap_or(u8::MAX), last))
+}
+
+/// Where the stands the tower has given to OTHER arrivals are: the end of
+/// every other strip's taxi-in route, ours and the traffic's, not counting
+/// `me`. The flight is not on its stand yet, but the stand is spoken for.
+pub(super) fn stands_assigned(me: &FlightStrip) -> Vec<(f64, f64)> {
+    let end = |s: &FlightStrip| {
+        if !*s.taxi_to_stand.lock().unwrap_or_else(|e| e.into_inner()) {
+            return None;
+        }
+        s.taxi_route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|w| w.path.last().copied())
+    };
+    let own = (!std::ptr::eq(me, &OWN_STRIP)).then(|| end(&OWN_STRIP)).flatten();
+    traffic_strips()
+        .into_iter()
+        .filter(|(_, s)| !std::ptr::eq(me, s.as_ref()))
+        .filter_map(|(_, s)| end(&s))
+        .chain(own)
+        .collect()
 }
 
 /// An arrival this close on a strip's final keeps a crossing flight short of
