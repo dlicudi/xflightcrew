@@ -247,6 +247,7 @@ fn a_stand_is_entered_along_its_parking_line() {
         name: "7C".into(),
         kind: "tie_down".into(),
         accepts: vec![],
+        width: None,
     };
     let mpl = 111_320.0 * stand.lat.to_radians().cos();
     let h = 237.5_f64.to_radians();
@@ -550,6 +551,8 @@ fn taxi_net_parses_routes_and_names_the_crossings() {
         "1300 36.0031000 -5.0050000 180.0 gate turboprops|props Stand 1"
     )
     .unwrap();
+    // Its size: wingspan code B (the 1301 row under it).
+    writeln!(f, "1301 B general_aviation").unwrap();
     writeln!(f, "1300 36.0060000 -5.0050000 90.0 hangar jets Maintenance").unwrap();
     writeln!(f, "1 1027 0 0 0MU1 Sunderland").unwrap();
     writeln!(f, "1202 5 6 twoway taxiway Z").unwrap();
@@ -574,6 +577,13 @@ fn taxi_net_parses_routes_and_names_the_crossings() {
     assert_eq!(
         near.accepts,
         vec!["turboprops".to_string(), "props".to_string()]
+    );
+    assert_eq!(near.width, Some('B'), "the 1301 row sizes its stand");
+    assert!(
+        net.stands
+            .iter()
+            .any(|s| s.kind == "hangar" && s.width.is_none()),
+        "a stand with no 1301 row has no size"
     );
 
     // From the stand to the 09 threshold: via A and B, crossing 14/32,

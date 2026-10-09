@@ -10,11 +10,13 @@
 use nav::Stand;
 use serde::Deserialize;
 
-use crate::aircraft::TrafficAircraft;
+use crate::aircraft::{landing_distance_m, TrafficAircraft};
 pub use crate::aircraft::{DEPART_GONE_NM, PARKED_LINGER_S};
-use crate::field::{stand_taken, FieldModel, RunwayEnd};
+use crate::field::{
+    neighbour_taken, stand_taken, stand_width, tightest_first, FieldModel, RunwayEnd,
+};
 use crate::kin::{dist_m, project_m, LatLon};
-use crate::perf::{class_for_type, Perf, JET_HEAVY, JET_MED, PISTON_SINGLE, TURBOPROP};
+use crate::perf::{class_for_type, wingspan_code, Perf, JET_MED, PISTON_SINGLE, TURBOPROP};
 use crate::phase::Plan;
 use crate::rng::XorShift64;
 
@@ -60,6 +62,11 @@ pub const ENTRY_NM: f64 = 10.0;
 /// seconds (a draw between the two): the first live hour at LEMG
 /// (2026-10-08) showed an empty field for four to six minutes.
 pub const FIRST_MOVE_S: (f64, f64) = (30.0, 60.0);
+
+/// The regional turboprop the schedule flies (an ATR 72, code C), and the
+/// smaller one where no stand is wide enough for it (a Saab 340, code B).
+pub const REGIONAL: &str = "AT76";
+pub const SMALL_REGIONAL: &str = "SF34";
 
 /// The shortest runway a jet is scheduled on, and a turboprop.
 pub const JET_MIN_RUNWAY_M: f64 = 1800.0;
@@ -184,15 +191,14 @@ impl Movement {
             .ok_or(Refusal::NoRunway);
         }
         let taken = ctx.taken();
-        let (perf, _) = class_for_type(&self.icao_type);
         let wanted = self
             .stand
             .as_deref()
             .and_then(|n| field.stand(n))
-            .filter(|s| !stand_taken(s, &taken));
+            .filter(|s| !stand_taken(s, &taken) && field.takes(s, &self.icao_type));
         let stand = match wanted {
             Some(s) => s.name.clone(),
-            None => free_stands(field, perf, &taken)
+            None => free_stands(field, &self.icao_type, &taken)
                 .into_iter()
                 .next()
                 .ok_or(Refusal::NoStand)?,
@@ -292,40 +298,56 @@ pub fn default_runway(field: &FieldModel) -> Option<String> {
         .cloned()
 }
 
-/// Stand names a `perf`-class aircraft may use, free of `taken`, in file
-/// order. A stand that names its categories must name this class's.
-fn free_stands(field: &FieldModel, perf: &Perf, taken: &[LatLon]) -> Vec<String> {
-    let cat = category(perf);
-    field
-        .net
-        .stands
+/// Stand names an `icao_type` may start on, free of `taken`, in file
+/// order: the stands that take it ([`stand_fits`]: its category and its
+/// wingspan), of the tightest size that has one free; a bigger stand only
+/// when none of its own size is; of those, the ones with nobody beside them
+/// ([`neighbour_taken`]) when there are any. Empty when none fits: no
+/// spawn, never a stand too small.
+fn free_stands(field: &FieldModel, icao_type: &str, taken: &[LatLon]) -> Vec<String> {
+    let fits = tightest_first(
+        field
+            .net
+            .stands
+            .iter()
+            // Never a stand on or against a runway strip, which starts the
+            // aircraft on it (UEMH 27, world sweep 2026-10-09: "you are on
+            // runway two seven without clearance" as it began to taxi), nor
+            // one whose way out runs through its neighbours.
+            .filter(|s| field.takes(s, icao_type))
+            .filter(|s| !stand_taken(s, taken)),
+        icao_type,
+    );
+    let Some(size) = fits.first().map(|s| stand_width(s)) else {
+        return Vec::new();
+    };
+    let tier: Vec<&Stand> = fits
+        .into_iter()
+        .take_while(|s| stand_width(s) == size)
+        .collect();
+    let lonely: Vec<&Stand> = tier
         .iter()
-        .filter(|s| s.is_suitable())
-        // A stand on or against a runway strip starts the aircraft on it
-        // (UEMH 27, world sweep 2026-10-09: "you are on runway two seven
-        // without clearance" as it began to taxi).
-        .filter(|s| !field.beside_runway((s.lat, s.lon)))
-        .filter(|s| {
-            s.accepts.is_empty()
-                || s.accepts
-                    .iter()
-                    .any(|a| a == cat || (cat == "jets" && a == "heavy"))
-        })
-        .filter(|s| !stand_taken(s, taken))
+        .copied()
+        .filter(|s| !neighbour_taken(s, taken))
+        .collect();
+    if lonely.is_empty() { tier } else { lonely }
+        .into_iter()
         .map(|s| s.name.clone())
         .collect()
 }
 
-/// apt.dat's stand category for a class.
-fn category(perf: &Perf) -> &'static str {
-    // By name: a `const` table's address is not one address.
-    if perf.name == JET_MED.name || perf.name == JET_HEAVY.name {
-        "jets"
-    } else if perf.name == TURBOPROP.name {
-        "turboprops"
-    } else {
-        "props"
-    }
+/// The shortest runway a `p`-class airliner is scheduled on: `floor_m`, or
+/// its good landing ([`landing_distance_m`]) where that is longer. PABV's
+/// 1,220 m held an ATR's good landing (1,150 m) and not the long ones that
+/// went off its end; a 1,100 m strip did not hold even the good one.
+fn runway_needed_m(p: &Perf, floor_m: f64) -> f64 {
+    floor_m.max(landing_distance_m(p))
+}
+
+/// Some stand at `field` takes an `icao_type` ([`FieldModel::takes`]): the
+/// type can come and go there at all.
+fn parks_at(field: &FieldModel, icao_type: &str) -> bool {
+    field.net.stands.iter().any(|s| field.takes(s, icao_type))
 }
 
 /// A seed for the field: the same field and seed, the same schedule.
@@ -362,8 +384,8 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
     let mut rng = XorShift64::new(field_seed(&field.icao, seed));
     let mut taken = ctx.taken();
     let take_stand =
-        |perf: &Perf, rng: &mut XorShift64, taken: &mut Vec<LatLon>| -> Option<String> {
-            let free = free_stands(field, perf, taken);
+        |icao_type: &str, rng: &mut XorShift64, taken: &mut Vec<LatLon>| -> Option<String> {
+            let free = free_stands(field, icao_type, taken);
             let name = free.get(rng.below(free.len() as u64) as usize)?.clone();
             let s = field.stand(&name)?;
             taken.push((s.lat, s.lon));
@@ -379,7 +401,7 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
         let mut t = rng.range_f64(30.0, 180.0);
         for _ in 0..n {
             let icao_type = ["C172", "C152", "PA28", "SR22"][rng.below(4) as usize];
-            let Some(stand) = take_stand(&PISTON_SINGLE, &mut rng, &mut taken) else {
+            let Some(stand) = take_stand(icao_type, &mut rng, &mut taken) else {
                 break;
             };
             let (callsign, spoken) = registration(prefix, icao_type, &mut rng);
@@ -404,14 +426,27 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
         }
     }
 
+    // The airline types the runway takes and a stand at the field fits: an
+    // airliner is never scheduled where it has nowhere to park. Where no
+    // stand is wide enough for the ATR (code C) the regional is the Saab
+    // ([`SMALL_REGIONAL`], code B): UNSS's ten stands and ULKK's are all B.
+    let regional = if parks_at(field, REGIONAL) {
+        REGIONAL
+    } else {
+        SMALL_REGIONAL
+    };
+    let pool: Vec<&'static str> = if end.length_m >= runway_needed_m(&JET_MED, JET_MIN_RUNWAY_M) {
+        vec!["A320", "B738", "A319", regional]
+    } else if end.length_m >= runway_needed_m(&TURBOPROP, TURBOPROP_MIN_RUNWAY_M) {
+        vec![regional]
+    } else {
+        Vec::new()
+    }
+    .into_iter()
+    .filter(|t| parks_at(field, t))
+    .collect();
     let ifr_type = |rng: &mut XorShift64| -> Option<&'static str> {
-        if end.length_m >= JET_MIN_RUNWAY_M {
-            Some(["A320", "B738", "A319", "AT76"][rng.below(4) as usize])
-        } else if end.length_m >= TURBOPROP_MIN_RUNWAY_M {
-            Some("AT76")
-        } else {
-            None
-        }
+        (!pool.is_empty()).then(|| pool[rng.below(pool.len() as u64) as usize])
     };
     let every = density.ifr_interval_s();
     let has_stands = field.net.stands.iter().any(|s| s.is_suitable());
@@ -430,8 +465,7 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
             let Some(icao_type) = ifr_type(&mut rng) else {
                 break;
             };
-            let (perf, _) = class_for_type(icao_type);
-            let Some(stand) = take_stand(perf, &mut rng, &mut taken) else {
+            let Some(stand) = take_stand(icao_type, &mut rng, &mut taken) else {
                 break;
             };
             let sid = (!field.procs.sids.is_empty()).then(|| {
@@ -585,12 +619,22 @@ pub fn park_at_start(
     // A parked aircraft never moves, so it never stands by a lane others
     // taxi along: BIRK (world sweep, 2026-10-09) parked one 8 m off the
     // way to the apron and every arrival's wingtip went through it.
-    let mut free: Vec<&Stand> = suitable
+    let free: Vec<&Stand> = suitable
         .into_iter()
         .filter(|s| !stand_taken(s, &taken))
         .filter(|s| field.lane_clearance_m((s.lat, s.lon)) >= PARKED_LANE_CLEAR_M)
         .collect();
-    let n = budget.min(free.len().saturating_sub(STANDS_KEPT_FREE));
+    // Nobody parked beside a stand the schedule's flights leave from or come
+    // to while the apron has room elsewhere ([`neighbour_taken`]): the
+    // stands beside them are drawn from last.
+    let movers: Vec<LatLon> = schedule
+        .iter()
+        .filter_map(|m| m.stand.as_deref().and_then(|n| field.stand(n)))
+        .map(|s| (s.lat, s.lon))
+        .collect();
+    let (mut free, mut beside): (Vec<&Stand>, Vec<&Stand>) =
+        free.into_iter().partition(|s| !neighbour_taken(s, &movers));
+    let n = budget.min((free.len() + beside.len()).saturating_sub(STANDS_KEPT_FREE));
     let mut rng = XorShift64::new(field_seed(&field.icao, seed) ^ 0x5041_524B_4544);
     let longest = field
         .airport
@@ -600,7 +644,10 @@ pub fn park_at_start(
         .fold(0.0, f64::max);
     let prefix = registration_prefix(&field.icao);
     let mut out = Vec::new();
-    while out.len() < n && !free.is_empty() {
+    while out.len() < n && !(free.is_empty() && beside.is_empty()) {
+        if free.is_empty() {
+            std::mem::swap(&mut free, &mut beside);
+        }
         let stand = free.swap_remove(rng.below(free.len() as u64) as usize);
         let Some(icao_type) = parked_type(stand, longest, &mut rng) else {
             continue;
@@ -637,9 +684,13 @@ pub fn park_at_start(
 /// field's longest runway (`longest_m`) is scheduled for (one stand in five
 /// that also takes turboprops gets the regional turboprop). A stand naming
 /// no class is judged by its kind (a gate takes an airliner, anything else
-/// a light aircraft). `None` when it takes nothing this field flies.
+/// a light aircraft). Never a type wider than the stand ([`stand_width`]):
+/// an airliner on a light aircraft's stand stands in its neighbours, and
+/// where the ATR is too wide the Saab ([`SMALL_REGIONAL`]) stands. `None`
+/// when it takes nothing this field flies.
 fn parked_type(stand: &Stand, longest_m: f64, rng: &mut XorShift64) -> Option<&'static str> {
     let takes = |c: &str| stand.accepts.iter().any(|a| a == c);
+    let wide = |t: &str| stand_width(stand) >= wingspan_code(t);
     let (jets, turboprops, props) = if stand.accepts.is_empty() {
         let gate = stand.kind.eq_ignore_ascii_case("gate");
         (gate, gate, !gate)
@@ -652,11 +703,13 @@ fn parked_type(stand: &Stand, longest_m: f64, rng: &mut XorShift64) -> Option<&'
     };
     // A stand that takes both is a turboprop's one time in five.
     let regional = turboprops && rng.below(5) == 0;
-    if jets && !regional && longest_m >= JET_MIN_RUNWAY_M {
+    if jets && !regional && longest_m >= JET_MIN_RUNWAY_M && wide("A320") {
         Some(["A320", "B738", "A319"][rng.below(3) as usize])
-    } else if (jets || turboprops) && longest_m >= TURBOPROP_MIN_RUNWAY_M {
-        Some("AT76")
-    } else if props || stand.accepts.is_empty() {
+    } else if (jets || turboprops) && longest_m >= TURBOPROP_MIN_RUNWAY_M && wide(REGIONAL) {
+        Some(REGIONAL)
+    } else if (jets || turboprops) && longest_m >= TURBOPROP_MIN_RUNWAY_M && wide(SMALL_REGIONAL) {
+        Some(SMALL_REGIONAL)
+    } else if (props || stand.accepts.is_empty()) && wide("C172") {
         Some(["C172", "C152", "PA28", "SR22"][rng.below(4) as usize])
     } else {
         None
@@ -744,7 +797,7 @@ fn fleet_of(code: &str) -> &'static [&'static str] {
     match code {
         "RYR" | "TVF" => &["B738"],
         "EZY" | "BAW" => &["A320", "A319"],
-        "ANE" | "LOG" | "HOP" => &["AT76"],
+        "ANE" | "LOG" | "HOP" => &[REGIONAL, SMALL_REGIONAL],
         _ => &["A320"],
     }
 }
@@ -778,7 +831,7 @@ fn airline(icao: &str, icao_type: &'static str, rng: &mut XorShift64) -> (String
         _ => &[("RYR", "Ryanair"), ("EZY", "Easy"), ("DLH", "Lufthansa")],
     };
     let (mut code, mut telephony) = carriers[rng.below(carriers.len() as u64) as usize];
-    if icao_type == "AT76" {
+    if icao_type == REGIONAL || icao_type == SMALL_REGIONAL {
         (code, telephony) = regional(icao);
     }
     let fleet = fleet_of(code);

@@ -214,9 +214,100 @@ pub fn class_for_type(icao_type: &str) -> (&'static Perf, Wake) {
     }
 }
 
+/// A type's wingspan, metres, from its manufacturer's figures (rounded).
+/// `None` for a type not in the table.
+fn type_span_m(icao_type: &str) -> Option<f64> {
+    let span = match icao_type {
+        "C152" => 10.1,
+        "C172" => 11.0,
+        "PA28" => 10.7,
+        "SR22" => 11.7,
+        "B350" => 17.7,
+        "BE20" => 16.6,
+        "BE9L" => 15.3,
+        "C208" => 15.9,
+        "PC12" => 16.3,
+        "SF34" => 21.4,
+        "D328" => 21.0,
+        "JS41" => 18.4,
+        "AT43" | "AT45" => 24.6,
+        "AT72" | "AT76" => 27.1,
+        "DH8A" | "DH8B" => 25.9,
+        "DH8C" => 27.4,
+        "DH8D" => 28.4,
+        "CRJ7" => 23.2,
+        "CRJ9" => 24.9,
+        "E170" | "E175" => 26.0,
+        "E190" | "E195" => 28.7,
+        "BCS1" | "BCS3" => 35.1,
+        "A318" | "A319" | "A320" | "A321" => 34.1,
+        "A19N" | "A20N" | "A21N" => 35.8,
+        "B736" | "B737" | "B738" | "B739" => 34.3,
+        "B38M" | "B39M" => 35.9,
+        "MD82" | "MD83" | "MD88" => 32.9,
+        "B752" | "B753" => 38.1,
+        "B763" | "B764" => 47.6,
+        "MD11" => 51.7,
+        "A332" | "A333" | "A343" | "A346" => 60.3,
+        "A339" => 64.0,
+        "A359" | "A35K" => 64.8,
+        "B772" | "B77L" => 60.9,
+        "B77W" => 64.8,
+        "B788" | "B789" | "B78X" => 60.1,
+        "B744" => 64.4,
+        "B748" => 68.4,
+        "A388" => 79.8,
+        _ => return None,
+    };
+    Some(span)
+}
+
+/// The ICAO aerodrome reference code letter for a wingspan: 'A' under
+/// 15 m, 'B' under 24, 'C' under 36, 'D' under 52, 'E' under 65, else 'F'.
+pub fn span_code(span_m: f64) -> char {
+    match span_m {
+        s if s < 15.0 => 'A',
+        s if s < 24.0 => 'B',
+        s if s < 36.0 => 'C',
+        s if s < 52.0 => 'D',
+        s if s < 65.0 => 'E',
+        _ => 'F',
+    }
+}
+
+/// The ICAO wingspan code of `icao_type`: the stand size it needs (apt.dat's
+/// 1301 row sizes a stand the same way). A type not in the table is judged
+/// by its class's span ([`class_for_type`]).
+pub fn wingspan_code(icao_type: &str) -> char {
+    let t = icao_type.trim().to_ascii_uppercase();
+    span_code(type_span_m(&t).unwrap_or_else(|| class_for_type(&t).0.span_m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand is sized by the wingspan code, and the schedule's types each
+    /// have theirs: the light aircraft A, the regional turboprop and the
+    /// narrowbodies C, a widebody E, the A380 F; an unknown type by its class.
+    #[test]
+    fn every_type_has_the_wingspan_code_of_its_span() {
+        for t in ["C172", "C152", "PA28", "SR22"] {
+            assert_eq!(wingspan_code(t), 'A', "{t}");
+        }
+        for t in ["AT76", "A320", "A319", "B738", "E190"] {
+            assert_eq!(wingspan_code(t), 'C', "{t}");
+        }
+        assert_eq!(wingspan_code("b738"), 'C', "any case");
+        assert_eq!(wingspan_code("C208"), 'B');
+        assert_eq!(wingspan_code("B763"), 'D');
+        assert_eq!(wingspan_code("B77W"), 'E');
+        assert_eq!(wingspan_code("A388"), 'F');
+        assert_eq!(wingspan_code("ZZZZ"), span_code(PISTON_SINGLE.span_m));
+        assert_eq!(span_code(14.9), 'A');
+        assert_eq!(span_code(15.0), 'B');
+        assert_eq!(span_code(36.0), 'D');
+    }
 
     #[test]
     fn the_172_flies_its_book() {

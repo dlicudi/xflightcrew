@@ -511,3 +511,134 @@ fn a_field_without_procedures_gets_visual_airline_traffic() {
         }
     }
 }
+
+/// XNOC with every stand sized `width`.
+fn xnoc_sized(width: char) -> FieldModel {
+    let mut f = fixtures::xnoc();
+    for s in &mut f.net.stands {
+        s.width = Some(width);
+    }
+    f
+}
+
+/// The hour sweep (2026-10-09): airliners were scheduled onto light
+/// aircraft's stands. A type is flown only where a stand fits it: at a
+/// field of code B stands the regional is the Saab, at one of code A
+/// stands no airliner comes or goes at all; every ground start's stand
+/// fits its type.
+#[test]
+fn an_airliner_is_never_scheduled_where_no_stand_fits_it() {
+    for seed in 0..10 {
+        let wide = fixtures::xnoc();
+        let ms = generate(&wide, Density::Normal, seed, &SpawnCtx::default());
+        assert!(
+            ms.iter().any(|m| m.icao_type != SMALL_REGIONAL),
+            "{seed}: jets where they fit"
+        );
+        let b = xnoc_sized('B');
+        let ms = generate(&b, Density::Normal, seed, &SpawnCtx::default());
+        assert!(
+            !ms.is_empty(),
+            "{seed}: still traffic at a field of B stands"
+        );
+        for m in &ms {
+            assert_eq!(m.icao_type, SMALL_REGIONAL, "{seed}: {m:?}");
+            if let Some(s) = m.stand.as_deref().and_then(|n| b.stand(n)) {
+                assert!(
+                    b.takes(s, &m.icao_type),
+                    "{seed}: {} on {}",
+                    m.icao_type,
+                    s.name
+                );
+            }
+        }
+        let a = xnoc_sized('A');
+        let ms = generate(&a, Density::Normal, seed, &SpawnCtx::default());
+        assert!(
+            ms.iter().all(|m| m.kind == MovementKind::Circuit),
+            "{seed}: no airliner at a field of A stands: {ms:?}"
+        );
+    }
+}
+
+/// A parked aircraft is never wider than its stand (ULMM's 1301 rows: code
+/// A tie-downs, C and D gates), and while the apron has room none is
+/// parked beside a stand the schedule's flights leave from.
+#[test]
+fn a_parked_aircraft_fits_its_stand_and_leaves_the_movers_room() {
+    let f = ulmm();
+    assert!(
+        f.net.stands.iter().all(|s| s.width.is_some()),
+        "ULMM sizes every stand"
+    );
+    for seed in 0..10 {
+        let mut ms = generate(&f, Density::Normal, seed, &SpawnCtx::default());
+        let parked = park_at_start(&f, Density::Normal, seed, &SpawnCtx::default(), &mut ms);
+        let movers: Vec<LatLon> = ms
+            .iter()
+            .filter_map(|m| m.stand.as_deref().and_then(|n| f.stand(n)))
+            .map(|s| (s.lat, s.lon))
+            .collect();
+        let lonely_left = |taken: &[LatLon]| {
+            f.net.stands.iter().any(|s| {
+                s.is_suitable()
+                    && !stand_taken(s, taken)
+                    && !neighbour_taken(s, &movers)
+                    && f.lane_clearance_m((s.lat, s.lon)) >= PARKED_LANE_CLEAR_M
+            })
+        };
+        let mut taken = movers.clone();
+        for p in &parked {
+            let s = f.stand(p.stand.as_deref().unwrap()).unwrap();
+            assert!(
+                stand_width(s) >= wingspan_code(&p.icao_type),
+                "{seed}: {} on {} ({:?})",
+                p.icao_type,
+                s.name,
+                s.width
+            );
+            if neighbour_taken(s, &movers) {
+                assert!(
+                    !lonely_left(&taken),
+                    "{seed}: {} parked beside a mover",
+                    s.name
+                );
+            }
+            taken.push((s.lat, s.lon));
+        }
+    }
+}
+
+/// PABV 2L (the hour sweep, 2026-10-09): two ATRs reached the flare 540 and
+/// 890 m down a 1,220 m strip and rolled off its end into the parking. A
+/// good landing of each class stops inside the shortest runway the
+/// schedule gives it; the long ones that went off the end are long flares
+/// that would not have.
+#[test]
+fn the_runway_minima_hold_a_good_landing_and_not_a_long_one() {
+    use crate::aircraft::{flare_along_m, landing_run_m, FLARE_AGL_FT, LONG_FLARE_M};
+    for (p, floor) in [
+        (&TURBOPROP, TURBOPROP_MIN_RUNWAY_M),
+        (&JET_MED, JET_MIN_RUNWAY_M),
+    ] {
+        let good = landing_distance_m(p);
+        assert!(good <= runway_needed_m(p, floor), "{}: {good:.0} m", p.name);
+    }
+    let atr = landing_distance_m(&TURBOPROP);
+    assert!(atr < 1220.0, "PABV held a good one, {atr:.0} m");
+    assert!(
+        runway_needed_m(&TURBOPROP, TURBOPROP_MIN_RUNWAY_M) > 1100.0,
+        "not 1,100 m"
+    );
+    let f = fixtures::xtst_ifr();
+    let needed = runway_needed_m(&TURBOPROP, TURBOPROP_MIN_RUNWAY_M);
+    assert!(
+        f.end("27").unwrap().length_m >= needed,
+        "XTST's 1,500 m takes the ATR"
+    );
+    for along in [540.0, 890.0] {
+        assert!(along > flare_along_m() + LONG_FLARE_M, "a long flare");
+        let stop = along + landing_run_m(&TURBOPROP, TURBOPROP.vref_kts, FLARE_AGL_FT);
+        assert!(stop > 1220.0, "{along} m down: stops at {stop:.0} m");
+    }
+}

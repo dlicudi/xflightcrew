@@ -1398,6 +1398,7 @@ mod tests {
             name: name.into(),
             kind: kind.into(),
             accepts: accepts.iter().map(|s| s.to_string()).collect(),
+            width: None,
         };
         let stands = vec![
             st("H1", "hangar", &["jets"]),
