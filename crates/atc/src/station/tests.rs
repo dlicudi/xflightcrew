@@ -4460,6 +4460,30 @@ fn a_committed_arrival_keeps_its_tower_from_a_nearer_field() {
 }
 
 #[test]
+fn the_exact_channel_takes_the_swap_over_a_nearer_field_five_khz_off() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // LXGB-LEJR 2026-10-09: Jerez Tower on 118.555, Trebujena on 118.550
+    // and nearer.
+    let mut jerez = region_apt("Jerez", 36.74, -6.06);
+    jerez.apt.freqs[0].khz = 118555;
+    let mut trebujena = region_apt("Trebujena", 36.87, -6.20);
+    trebujena.apt.freqs[0].khz = 118550;
+    *REGION.lock().unwrap() = vec![region_apt("Gibraltar", 36.15, -5.35), jerez, trebujena];
+    *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
+    let now = Instant::now();
+    for (khz, want) in [(118555, "Jerez"), (118550, "Trebujena")] {
+        *PENDING_STATION.lock().unwrap() = None;
+        arm_station_for_freq(khz, 37.0, -6.25, 3000.0, now);
+        let armed = PENDING_STATION.lock().unwrap().take().expect("swap armed");
+        assert_eq!(armed.1.name, want, "{khz}");
+    }
+    *REGION.lock().unwrap() = Vec::new();
+    *ACTIVE_FIELD.lock().unwrap() = None;
+    *PENDING_STATION.lock().unwrap() = None;
+    *LAST_REGION_SWITCH.lock().unwrap() = None;
+}
+
+#[test]
 fn transmission_on_another_fields_freq_arms_the_swap() {
     let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut badajoz = region_apt("Badajoz", 38.89, -6.82);

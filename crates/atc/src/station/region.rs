@@ -630,18 +630,27 @@ pub fn arm_station_for_freq(com1_khz: i64, lat: f64, lon: f64, alt_msl_ft: f64, 
         .as_ref()
         .map(|(name, _, _)| name.clone());
     let region = REGION.lock().unwrap_or_else(|e| e.into_inner());
+    // The channel nearest the dial first, then the nearest field: the 5 kHz
+    // slack is for a 25 kHz row read against an 8.33 dial, never a reason
+    // for a nearer field to take the call. LXGB-LEJR 2026-10-09: Jerez
+    // Tower tuned on 118.555, Trebujena's 118.550 16.9 nm away answered
+    // "join final runway zero eight" for a field with only 02/20.
     let hit = region
         .iter()
         .filter(|a| active_name.as_deref() != Some(a.apt.name.as_str()))
-        .filter(|a| {
+        .filter_map(|a| {
             services(&a.apt)
                 .iter()
-                .any(|(word, khz)| word != "unicom" && (khz - com1_khz).abs() <= 5)
+                .filter(|(word, _)| word != "unicom")
+                .map(|(_, khz)| (khz - com1_khz).abs())
+                .filter(|gap| *gap <= 5)
+                .min()
+                .map(|gap| (gap, a))
         })
-        .map(|a| (crate::nav::haversine_nm(lat, lon, a.lat, a.lon), a))
-        .filter(|(d, a)| *d <= vhf_range_nm(alt_msl_ft - a.apt.elev_ft))
-        .min_by(|x, y| x.0.total_cmp(&y.0));
-    if let Some((d, a)) = hit {
+        .map(|(gap, a)| (gap, crate::nav::haversine_nm(lat, lon, a.lat, a.lon), a))
+        .filter(|(_, d, a)| *d <= vhf_range_nm(alt_msl_ft - a.apt.elev_ft))
+        .min_by(|x, y| x.0.cmp(&y.0).then(x.1.total_cmp(&y.1)));
+    if let Some((_, d, a)) = hit {
         tracing::info!(
             to = %a.apt.name,
             khz = com1_khz,
