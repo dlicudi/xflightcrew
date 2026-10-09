@@ -527,7 +527,7 @@ impl TrafficAircraft {
             }
             Phase::Landing => {
                 if let Some(end) = &end {
-                    self.landing(dt, o, field, end, events);
+                    self.landing(dt, o, field, end, others, events);
                 }
             }
             Phase::Vacate => {
@@ -1132,6 +1132,7 @@ impl TrafficAircraft {
         o: &Order,
         field: &FieldModel,
         end: &RunwayEnd,
+        others: &[Seen],
         events: &mut Vec<Event>,
     ) {
         let p = self.perf;
@@ -1202,7 +1203,20 @@ impl TrafficAircraft {
             }
         }
         let here = self.kin.pos();
-        let path = match field.vacate(here, self.kin.hdg_deg, end, &self.icao_type) {
+        // Nobody's spot is a vacate's end: the ones standing on the ground.
+        let standing: Vec<LatLon> = others
+            .iter()
+            .filter(|s| {
+                s.id != self.id
+                    && s.gs_kts < 0.5
+                    && matches!(
+                        s.phase,
+                        Phase::TaxiOut | Phase::HoldShort | Phase::Vacate | Phase::TaxiIn
+                    )
+            })
+            .map(|s| s.pos)
+            .collect();
+        let path = match field.vacate(here, self.kin.hdg_deg, end, &self.icao_type, &standing) {
             Some(v) => {
                 let mut full = vec![here];
                 full.extend(v.path.into_iter().skip_while(|p| dist_m(*p, here) < 1.0));
@@ -1321,7 +1335,7 @@ impl TrafficAircraft {
                 .map(|p| (p.path, None)),
             Phase::Vacate => end
                 .as_ref()
-                .and_then(|e| open.vacate(here, self.kin.hdg_deg, e, &self.icao_type))
+                .and_then(|e| open.vacate(here, self.kin.hdg_deg, e, &self.icao_type, &[]))
                 .map(|v| (v.path, None)),
             _ => None,
         };
