@@ -2149,6 +2149,7 @@
             band_ft: (10_000.0, Some(12_500.0)),
             message: "caution",
             min_dur: Duration::from_secs(10),
+            above_low: Default::default(),
         };
         let warning = CabinAltitude {
             id: "w",
@@ -2156,6 +2157,7 @@
             band_ft: (12_500.0, None),
             message: "warning",
             min_dur: Duration::from_secs(4),
+            above_low: Default::default(),
         };
         let mut s = snap(true, true);
         s.on_ground = false;
@@ -2171,6 +2173,47 @@
         // On the ground it never fires, however high the reading.
         s.on_ground = true;
         assert!(caution.eval(&s).is_none() && warning.eval(&s).is_none());
+    }
+
+    #[test]
+    fn a_cruise_on_the_cabin_line_is_one_caution_not_fourteen() {
+        let caution = CabinAltitude {
+            id: "c",
+            severity: Severity::Caution,
+            band_ft: (10_000.0, Some(12_500.0)),
+            message: "caution",
+            min_dur: Duration::from_secs(10),
+            above_low: Default::default(),
+        };
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        let at = |s: &mut Snapshot, ft: f64| {
+            s.cabin_altitude_ft = ft;
+            caution.eval(s).is_some()
+        };
+        // LXGB-LEJR 2026-10-09: 9,992 to 10,005 ft for 16 minutes.
+        for ft in [9_992.0, 10_005.0, 9_996.0, 10_002.0, 10_000.0] {
+            assert!(!at(&mut s, ft), "{ft} on the line is not above it");
+        }
+        assert!(at(&mut s, 10_300.0), "well above: the caution");
+        for ft in [10_005.0, 9_992.0, 9_800.0] {
+            assert!(at(&mut s, ft), "{ft}: still in, no back below");
+        }
+        assert!(!at(&mut s, 9_700.0), "well below: out");
+        // The bands never overlap, climbing or descending.
+        let warning = CabinAltitude {
+            id: "w",
+            severity: Severity::Warning,
+            band_ft: (12_500.0, None),
+            message: "warning",
+            min_dur: Duration::from_secs(4),
+            above_low: Default::default(),
+        };
+        for ft in (9_000..=14_000).step_by(50).chain((9_000..=14_000).rev().step_by(50)) {
+            s.cabin_altitude_ft = f64::from(ft);
+            let both = caution.eval(&s).is_some() && warning.eval(&s).is_some();
+            assert!(!both, "{ft}: both bands");
+        }
     }
 
     #[test]

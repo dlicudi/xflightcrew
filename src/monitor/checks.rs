@@ -816,7 +816,17 @@ pub(super) struct CabinAltitude {
     pub(super) band_ft: (f64, Option<f64>),
     pub(super) message: &'static str,
     pub(super) min_dur: Duration,
+    /// Above `low` as the band's hysteresis last judged it.
+    pub(super) above_low: std::sync::atomic::AtomicBool,
 }
+
+/// The cabin bands' hysteresis, feet: a band is entered this far past its
+/// low edge and left this far below it, and it ends this far short of its
+/// high edge, so the bands stay disjoint either way. LXGB-LEJR 2026-10-09:
+/// a 172 cruising AT 10,000 ft crossed the caution's edge by a few feet
+/// and said "above ten thousand" and "back below" fourteen times in 16
+/// minutes.
+pub(super) const CABIN_BAND_HYSTERESIS_FT: f64 = 250.0;
 
 impl Check for CabinAltitude {
     fn id(&self) -> &'static str {
@@ -826,8 +836,18 @@ impl Check for CabinAltitude {
         self.severity
     }
     fn eval(&self, s: &Snapshot) -> Option<String> {
+        use std::sync::atomic::Ordering;
         let (low, high) = self.band_ft;
-        let in_band = s.cabin_altitude_ft >= low && high.is_none_or(|h| s.cabin_altitude_ft < h);
+        let cabin = s.cabin_altitude_ft;
+        let was = self.above_low.load(Ordering::Relaxed);
+        let edge = if was {
+            low - CABIN_BAND_HYSTERESIS_FT
+        } else {
+            low + CABIN_BAND_HYSTERESIS_FT
+        };
+        let above = cabin >= edge;
+        self.above_low.store(above, Ordering::Relaxed);
+        let in_band = above && high.is_none_or(|h| cabin < h - CABIN_BAND_HYSTERESIS_FT);
         (!s.on_ground && in_band).then(|| self.message.to_string())
     }
     fn repeat_level(&self, s: &Snapshot) -> Option<i64> {

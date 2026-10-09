@@ -113,6 +113,7 @@ pub(super) fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         band_ft: (10_000.0, Some(12_500.0)),
         message: cabin_message(profile.pressurised, false),
         min_dur: Duration::from_secs(10),
+        above_low: Default::default(),
     }));
     checks.push(Box::new(CabinAltitude {
         id: "cabin_alt_warning",
@@ -120,6 +121,7 @@ pub(super) fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         band_ft: (12_500.0, None),
         message: cabin_message(profile.pressurised, true),
         min_dur: Duration::from_secs(4),
+        above_low: Default::default(),
     }));
     if !profile.electrical.is_empty() {
         // Charging source is a "generator" on a turbine (King Air PT6), an
