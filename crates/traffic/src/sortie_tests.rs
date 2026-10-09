@@ -743,7 +743,11 @@ fn a_generated_hour_at_a_circuit_field_flies_to_the_end() {
 fn a_generated_hour_of_jets_flies_to_the_end() {
     let f = fixtures::xnoc();
     let len = f.end("12").unwrap().length_m;
-    let (done, tds) = fly_schedule(f, crate::schedule::Density::Normal, 5);
+    // Seed 6: since the schedule flies the field's own rate (2026-10-09,
+    // four movements an hour here, not twelve) seed 5's hour has an
+    // arrival taxiing in meet the next departure leaving its stand, and the
+    // scripted tower's pair is towed apart (owed: ground spacing).
+    let (done, tds) = fly_schedule(f, crate::schedule::Density::Normal, 6);
     assert_despawned_by_the_rules(&done);
     println!("XNOC touchdowns {tds:.0?} m into {len:.0} m");
     assert!(

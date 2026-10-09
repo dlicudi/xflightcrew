@@ -18,6 +18,7 @@ use crate::field::{
 use crate::kin::{dist_m, project_m, LatLon};
 use crate::perf::{class_for_type, wingspan_code, Perf, JET_MED, PISTON_SINGLE, TURBOPROP};
 use crate::phase::Plan;
+use crate::rate;
 use crate::rng::XorShift64;
 
 /// How busy the generated sky is (`XCOPILOT_TRAFFIC_DENSITY`).
@@ -39,12 +40,13 @@ impl Density {
         }
     }
 
-    /// Minutes between IFR movements of each kind.
-    fn ifr_interval_s(self) -> f64 {
+    /// The share of the field's own rate ([`crate::rate::peak_per_h`])
+    /// flown: half at light, the whole at normal.
+    pub fn scale(self) -> f64 {
         match self {
-            Density::Off => f64::INFINITY,
-            Density::Light => 20.0 * 60.0,
-            Density::Normal => 10.0 * 60.0,
+            Density::Off => 0.0,
+            Density::Light => 0.5,
+            Density::Normal => 1.0,
         }
     }
 }
@@ -86,9 +88,15 @@ pub enum MovementKind {
 }
 
 /// The share of a field's suitable stands filled at the fleet's start, by
-/// density ([`park_at_start`]).
-pub const PARKED_SHARE_LIGHT: f64 = 0.15;
-pub const PARKED_SHARE_NORMAL: f64 = 0.30;
+/// density ([`park_at_start`]). A real apron by day is about half full; at
+/// 0.30 and a cap of 40 Gatwick's 195 stands stood four in five empty.
+pub const PARKED_SHARE_LIGHT: f64 = 0.25;
+pub const PARKED_SHARE_NORMAL: f64 = 0.45;
+
+/// The share added at night, times how far the day has fallen from its
+/// peak ([`crate::rate::day_factor`]): the aircraft night stopping stand on
+/// their stands till the morning wave.
+pub const PARKED_NIGHT_EXTRA: f64 = 0.20;
 
 /// Stands left free at the start for the arrivals, whatever the share.
 pub const STANDS_KEPT_FREE: usize = 3;
@@ -97,9 +105,11 @@ pub const STANDS_KEPT_FREE: usize = 3;
 pub const PARK_CLEAR_OWN_M: f64 = 60.0;
 
 /// The most aircraft parked at the start, however big the field: each is an
-/// XPMP2 aircraft the plugin draws every frame (frame cost unmeasured past
-/// 60 aircraft, see the risks).
-pub const PARKED_MAX: usize = 40;
+/// XPMP2 aircraft the plugin draws every frame. Dormant ones are dark and
+/// still, but each is still drawn; with Heathrow's peak of about 15 moving
+/// at once the whole picture stays under 100 aircraft (frame cost
+/// unmeasured past 60 aircraft, see the risks).
+pub const PARKED_MAX: usize = 80;
 
 /// One scheduled flight.
 #[derive(Debug, Clone, PartialEq)]
@@ -138,6 +148,10 @@ pub struct SpawnCtx {
     pub own: Option<LatLon>,
     /// Everyone else on the ground (stands they stand on are taken).
     pub occupied: Vec<LatLon>,
+    /// The sim's zulu time at the schedule's start, seconds after midnight
+    /// (the bin reads `sim/time/zulu_time_sec`): the day's shape at the
+    /// field's solar time ([`crate::rate`]). `None` flies the field's peak.
+    pub zulu_s: Option<f64>,
 }
 
 impl SpawnCtx {
@@ -359,11 +373,14 @@ fn field_seed(icao: &str, seed: u64) -> u64 {
 
 /// Generate an hour ([`HORIZON_S`]) of traffic for `field`:
 /// - 1 (light) or 1 to 3 (normal) circuit aircraft where the field allows
-///   circuits (`allows_circuits != Some(false)`) and has stands;
+///   circuits (`allows_circuits != Some(false)`) and has stands, by day
+///   ([`rate::circuit_hours`]) when `ctx` has the time;
 /// - IFR departures by SID where the field publishes SIDs, and IFR
 ///   arrivals (straight in where the runway has an approach, else to the
-///   downwind) where it publishes approaches or STARs, every 20 (light) or
-///   10 (normal) minutes, on a runway long enough for the type;
+///   downwind) where it publishes approaches or STARs, at the field's own
+///   rate ([`rate::rates_at`]: its airline stands and tower, the time of
+///   day at its solar time, half of it at light, each kind capped by the
+///   one runway), on a runway long enough for the type;
 /// - the first movement within [`FIRST_MOVE_S`] of the start: the stream
 ///   it belongs to (a ground start's, circuits or departures, before the
 ///   arrivals') is brought forward whole, so its spacing and the hour's
@@ -393,7 +410,11 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
         };
     let prefix = registration_prefix(&field.icao);
 
-    if field.airport.allows_circuits != Some(false) {
+    // Circuits by day only: a school does not fly the pattern at 03:00.
+    let daylight = ctx
+        .zulu_s
+        .is_none_or(|z| rate::circuit_hours(rate::local_solar_h(z, rate::field_lon(field))));
+    if field.airport.allows_circuits != Some(false) && daylight {
         let n = match density {
             Density::Normal => 1 + rng.below(3) as u32,
             _ => 1,
@@ -448,7 +469,11 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
     let ifr_type = |rng: &mut XorShift64| -> Option<&'static str> {
         (!pool.is_empty()).then(|| pool[rng.below(pool.len() as u64) as usize])
     };
-    let every = density.ifr_interval_s();
+    // The field's own rate through the day ([`crate::rate::rates_at`]),
+    // capped by the one runway everyone uses.
+    let scale = density.scale();
+    let zulu = ctx.zulu_s;
+    let rates = |t: f64| rate::rates_at(field, scale, zulu, t);
     let has_stands = field.net.stands.iter().any(|s| s.is_suitable());
 
     // A field that publishes no procedures still has its airline traffic,
@@ -459,9 +484,16 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
     let visual = field.procs.sids.is_empty()
         && field.procs.approaches.is_empty()
         && field.procs.stars.is_empty();
+    // Neither stream starts inside the first minute: the first ground
+    // start is brought there ([`bring_first_forward`]) and no arrival
+    // comes ahead of it.
     if (!field.procs.sids.is_empty() || visual) && has_stands {
-        let mut t = rng.range_f64(60.0, every);
-        while t < HORIZON_S {
+        let phase = rng.range_f64(0.0, 1.0);
+        let times = {
+            let mut draw = || rng.range_f64(0.8, 1.2);
+            rate::stream_times(HORIZON_S, FIRST_MOVE_S.1, phase, |t| rates(t).0, &mut draw)
+        };
+        for t in times {
             let Some(icao_type) = ifr_type(&mut rng) else {
                 break;
             };
@@ -489,20 +521,22 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
                 seed: rng.next_u64(),
                 parked_from_start: false,
             });
-            t += every * rng.range_f64(0.8, 1.2);
         }
     }
 
     let arrivals = !field.procs.approaches.is_empty() || !field.procs.stars.is_empty() || visual;
     if arrivals && has_stands {
         let straight_in = field.procs.approach_for(&end.ident).is_some();
-        let mut t = rng.range_f64(every * 0.3, every);
-        while t < HORIZON_S {
+        let phase = rng.range_f64(0.0, 0.7);
+        let times = {
+            let mut draw = || rng.range_f64(0.8, 1.2);
+            rate::stream_times(HORIZON_S, FIRST_MOVE_S.1, phase, |t| rates(t).1, &mut draw)
+        };
+        for t in times {
             let Some(icao_type) = ifr_type(&mut rng) else {
                 break;
             };
             let Some(entry) = entry_clear_of_own(&end, ctx.own, &mut rng) else {
-                t += every;
                 continue;
             };
             let star = (!field.procs.stars.is_empty()).then(|| {
@@ -526,7 +560,6 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
                 seed: rng.next_u64(),
                 parked_from_start: false,
             });
-            t += every * rng.range_f64(0.8, 1.2);
         }
     }
     bring_first_forward(&mut out, &mut rng);
@@ -589,7 +622,10 @@ pub fn park_at_start(
         Density::Off => return Vec::new(),
         Density::Light => PARKED_SHARE_LIGHT,
         Density::Normal => PARKED_SHARE_NORMAL,
-    };
+    } + ctx.zulu_s.map_or(0.0, |z| {
+        let h = rate::local_solar_h(z, rate::field_lon(field));
+        PARKED_NIGHT_EXTRA * (1.0 - rate::day_factor(h))
+    });
     let suitable: Vec<&Stand> = field
         .net
         .stands

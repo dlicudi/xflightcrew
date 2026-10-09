@@ -16,10 +16,9 @@ fn a_circuit_field_with_procedures_gets_all_three_kinds() {
     let ms = generate(&f, Density::Light, 1, &SpawnCtx::default());
     let (c, d, a) = kinds(&ms);
     assert_eq!(c, 1, "light: one circuit aircraft");
-    assert!(
-        d >= 2 && a >= 2,
-        "every 20 minutes for an hour: {d} out, {a} in"
-    );
+    // Four stands at a towered field: about five airline movements an hour
+    // at its peak ([`crate::rate::peak_per_h`]), half that at light.
+    assert!(d >= 1 && a >= 1, "light, its own rate: {d} out, {a} in");
     assert!(ms.windows(2).all(|w| w[0].t_s <= w[1].t_s), "in time order");
     assert!(ms.iter().all(|m| m.t_s < HORIZON_S));
     // 1,500 m: turboprops, never a jet.
@@ -38,7 +37,13 @@ fn a_circuit_field_with_procedures_gets_all_three_kinds() {
     assert!((1..=3).contains(&c), "normal: one to three circuits, {c}");
     // Four stands: the circuits and the departures share them.
     assert!(c + d <= 4, "never more ground starts than stands");
-    assert!(a >= 4, "every 10 minutes: {a} in");
+    // About its peak rate ([`crate::rate::peak_per_h`]), the departures
+    // limited by the stands left.
+    let peak = crate::rate::peak_per_h(&f);
+    assert!(
+        a >= 1 && (d + a) as f64 <= peak + 2.0,
+        "normal, the field's peak {peak:.1}: {d} out, {a} in"
+    );
 }
 
 #[test]
@@ -110,14 +115,19 @@ fn the_first_movement_comes_within_a_minute() {
                     f.icao,
                     first.t_s
                 );
-                assert_ne!(first.kind, MovementKind::Arrival, "a ground start first");
+                // A ground start first, where the hour has one (a quiet
+                // field's hour at its own rate may send nobody out).
+                let ground = ms
+                    .iter()
+                    .any(|m| matches!(m.kind, MovementKind::Circuit | MovementKind::Departure));
+                assert!(
+                    !ground || first.kind != MovementKind::Arrival,
+                    "a ground start first"
+                );
                 assert!(ms.iter().all(|m| m.t_s >= first.t_s && m.t_s < HORIZON_S));
-                // The departures keep their spacing (0.8 to 1.2 intervals).
-                let every = if density == Density::Light {
-                    1200.0
-                } else {
-                    600.0
-                };
+                // The departures keep their spacing (0.8 to 1.2 intervals
+                // at the field's rate, to the stream's 5 s step).
+                let every = 3600.0 / crate::rate::rates_at(&f, density.scale(), None, 0.0).0;
                 let deps: Vec<f64> = ms
                     .iter()
                     .filter(|m| m.kind == MovementKind::Departure)
@@ -125,7 +135,7 @@ fn the_first_movement_comes_within_a_minute() {
                     .collect();
                 assert!(
                     deps.windows(2)
-                        .all(|w| (0.8 * every - 1e-6..=1.2 * every + 1e-6).contains(&(w[1] - w[0]))),
+                        .all(|w| (0.8 * every - 5.0..=1.2 * every + 5.0).contains(&(w[1] - w[0]))),
                     "{deps:?}"
                 );
             }
@@ -641,4 +651,73 @@ fn the_runway_minima_hold_a_good_landing_and_not_a_long_one() {
         let stop = along + landing_run_m(&TURBOPROP, TURBOPROP.vref_kts, FLARE_AGL_FT);
         assert!(stop > 1220.0, "{along} m down: stops at {stop:.0} m");
     }
+}
+
+/// THE FIELD'S OWN RATE THROUGH ITS DAY (2026-10-09): every field flew 12
+/// movements an hour, Gatwick and Malaga alike, and 03:00 looked like noon.
+/// The rate grows with the airline stands, half at light; the night is
+/// nearly empty and has no circuits; the morning sends more out than it
+/// brings in and the late evening brings more home.
+#[test]
+fn the_field_flies_its_own_rate_through_its_own_day() {
+    let f = fixtures::xnoc();
+    let lon = crate::rate::field_lon(&f);
+    let at = |h: f64, d: Density, seed: u64| {
+        let ctx = SpawnCtx {
+            zulu_s: Some(crate::rate::zulu_for_local(h, lon)),
+            ..SpawnCtx::default()
+        };
+        generate(&f, d, seed, &ctx)
+    };
+    let count = |h: f64, d: Density| -> (usize, usize, usize) {
+        (0..20).fold((0, 0, 0), |acc, seed| {
+            let (c, dd, a) = kinds(&at(h, d, seed));
+            (acc.0 + c, acc.1 + dd, acc.2 + a)
+        })
+    };
+    // The arrivals the hour's rate owes (the departures also need a free
+    // stand each, and this field has few).
+    let owed = |h: f64, d: Density| {
+        let z = Some(crate::rate::zulu_for_local(h, lon));
+        (0..360)
+            .map(|k| crate::rate::rates_at(&f, d.scale(), z, k as f64 * 10.0).1)
+            .sum::<f64>()
+            / 360.0
+    };
+    let (_, d8, a8) = count(8.0, Density::Normal);
+    let (c3, d3, a3) = count(3.0, Density::Normal);
+    let (_, d22, a22) = count(22.0, Density::Normal);
+    let (_, _, a13) = count(13.0, Density::Normal);
+    let (_, _, al) = count(13.0, Density::Light);
+    let hourly = |n: usize| n as f64 / 20.0;
+    for (what, got, want) in [
+        ("13:00", hourly(a13), owed(13.0, Density::Normal)),
+        ("13:00 light", hourly(al), owed(13.0, Density::Light)),
+        ("22:00", hourly(a22), owed(22.0, Density::Normal)),
+    ] {
+        assert!(
+            (got - want).abs() < 0.6,
+            "{what}: {got} arrivals an hour, the rate owes {want:.2}"
+        );
+    }
+    assert!(owed(13.0, Density::Light) < owed(13.0, Density::Normal) * 0.6);
+    assert!(d8 > a8, "the morning goes out: {d8} out, {a8} in");
+    assert!(a22 > d22, "the evening comes home: {d22} out, {a22} in");
+    assert!(hourly(d3 + a3) < 0.5, "03:00 is quiet: {}", hourly(d3 + a3));
+    assert_eq!(c3, 0, "no circuits at night");
+}
+
+/// THE RUNWAY CAPS IT: however many stands, one runway never gets more
+/// than one arrival in [`crate::rate::ARRIVAL_GAP_S`] on average nor two
+/// of a kind within [`crate::rate::MIN_GAP_S`].
+#[test]
+fn no_stream_outruns_the_runway() {
+    let ts = crate::rate::stream_times(HORIZON_S, 0.0, 0.5, |_| 500.0, || 1.0);
+    assert!(
+        ts.len() as f64 <= crate::rate::arrivals_cap_per_h().max(3600.0 / crate::rate::MIN_GAP_S)
+    );
+    let f = fixtures::xnoc();
+    let (d, a) = crate::rate::rates_at(&f, 100.0, None, 0.0);
+    assert_eq!(d, crate::rate::departures_cap_per_h());
+    assert_eq!(a, crate::rate::arrivals_cap_per_h());
 }

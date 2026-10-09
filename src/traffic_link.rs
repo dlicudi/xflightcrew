@@ -480,6 +480,7 @@ impl Link {
             runway: None,
             own,
             occupied: fleet.stands_held(),
+            zulu_s: None,
         };
         for i in 0..self.due.len() {
             if !self.due[i].m.parked_from_start {
@@ -559,6 +560,7 @@ impl Link {
             // The stands arrivals are taxiing in to are taken too: a
             // departure spawned on one, and its arrival drove in on top.
             occupied: self.fleet.stands_held(),
+            zulu_s: None,
         };
         let mut later = Vec::new();
         while self.due.first().is_some_and(|d| d.at_s <= now_s) {
@@ -791,7 +793,10 @@ impl TrafficWorld {
             self.stand_down();
             self.field = field.clone();
             if let Some(icao) = field {
-                self.loading = Some(self.build(&icao));
+                // The schedule follows the field's day (`traffic::rate`):
+                // the sim's zulu time, read only when a schedule is made.
+                let zulu = sim_zulu_s(xp).await;
+                self.loading = Some(self.build(&icao, zulu));
             }
         }
         if let Some(rx) = &self.loading {
@@ -867,7 +872,8 @@ impl TrafficWorld {
                 let start = link.fleet().clock.now_s();
                 if start >= f64::from(*h) * traffic::schedule::HORIZON_S {
                     *h += 1;
-                    let ms = generate_for(link.fleet(), u64::from(*h), &own);
+                    let zulu = sim_zulu_s(xp).await;
+                    let ms = generate_for(link.fleet(), u64::from(*h), &own, zulu);
                     link.add_schedule(ms, start);
                 }
             }
@@ -922,7 +928,7 @@ impl TrafficWorld {
     /// Build the link for `icao` off the tick: the field (apt.dat, its
     /// taxi network and CIFP) and its schedule, the pilot's file or a
     /// generated hour.
-    fn build(&mut self, icao: &str) -> std::sync::mpsc::Receiver<Option<Link>> {
+    fn build(&mut self, icao: &str, zulu: Option<f64>) -> std::sync::mpsc::Receiver<Option<Link>> {
         let cfg = crate::settings::live();
         let (tx, rx) = std::sync::mpsc::channel();
         let (icao, apt, cifp) = (
@@ -940,7 +946,7 @@ impl TrafficWorld {
         let spawned = std::thread::Builder::new()
             .name("traffic-field".into())
             .spawn(move || {
-                let link = build_link(&icao, &apt, &cifp, &file, &density, seed, &name);
+                let link = build_link(&icao, &apt, &cifp, &file, &density, seed, &name, zulu);
                 let _ = tx.send(link);
             });
         if let Err(e) = spawned {
@@ -963,7 +969,9 @@ pub(crate) fn wanted_field(
 }
 
 /// The link for one field, built off the tick; `None` (said in the log and
-/// the blackbox) when the field or the file cannot be read.
+/// the blackbox) when the field or the file cannot be read. `zulu_s` is
+/// the sim's zulu time now, for the field's day (`traffic::rate`).
+#[allow(clippy::too_many_arguments)]
 fn build_link(
     icao: &str,
     apt: &str,
@@ -972,6 +980,7 @@ fn build_link(
     density: &str,
     seed: u64,
     name: &str,
+    zulu_s: Option<f64>,
 ) -> Option<Link> {
     let field = match FieldModel::load(apt, icao) {
         Ok(Some(f)) => f.with_cifp(cifp),
@@ -984,7 +993,10 @@ fn build_link(
             return None;
         }
     };
-    let ctx = SpawnCtx::default();
+    let ctx = SpawnCtx {
+        zulu_s,
+        ..SpawnCtx::default()
+    };
     let (schedule, source) = if file.is_empty() {
         let d = traffic::Density::parse(density).unwrap_or(traffic::Density::Normal);
         let mut schedule = traffic::generate(&field, d, seed, &ctx);
@@ -1031,7 +1043,7 @@ fn build_link(
         "traffic",
         serde_json::json!({
             "event": "up", "field": icao, "movements": movements, "parked": parked,
-            "source": source,
+            "source": source, "zulu_s": zulu_s,
         }),
     );
     // The calls address the station by the name it answers to.
@@ -1043,15 +1055,25 @@ fn build_link(
 }
 
 /// The next generated hour at the fleet's field, round us.
-fn generate_for(fleet: &Fleet, hour: u64, own: &OwnState) -> Vec<Movement> {
+fn generate_for(fleet: &Fleet, hour: u64, own: &OwnState, zulu_s: Option<f64>) -> Vec<Movement> {
     let density = traffic::Density::parse(&crate::settings::live().traffic_density)
         .unwrap_or(traffic::Density::Normal);
     let ctx = SpawnCtx {
         runway: None,
         own: Some((own.lat, own.lon)),
         occupied: fleet.stands_held(),
+        zulu_s,
     };
     traffic::generate(&fleet.field, density, hour, &ctx)
+}
+
+/// The sim's zulu time, seconds after midnight; `None` on a failed read
+/// (the schedule then flies the field's peak, never a guessed hour).
+async fn sim_zulu_s(xp: &crate::xplane::XPlaneClient) -> Option<f64> {
+    xp.get_float(crate::datarefs::ZULU_TIME_SEC)
+        .await
+        .ok()
+        .filter(|z| z.is_finite())
 }
 
 /// The blackbox's `traffic` records for one tick: one record per event, each
