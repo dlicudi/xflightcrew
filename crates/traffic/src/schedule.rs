@@ -526,6 +526,10 @@ fn bring_first_forward(out: &mut [Movement], rng: &mut XorShift64) {
     }
 }
 
+/// A parked aircraft's stand is at least this far from any lane others
+/// taxi along, metres (half a medium jet's span and a margin).
+const PARKED_LANE_CLEAR_M: f64 = 25.0;
+
 /// THE FIELD IS NOT EMPTY AT THE START (LEMG, 2026-10-08: no parked
 /// aircraft at all): a share of the field's suitable stands
 /// ([`PARKED_SHARE_LIGHT`], [`PARKED_SHARE_NORMAL`]; at most
@@ -578,9 +582,13 @@ pub fn park_at_start(
             .filter_map(|m| m.stand.as_deref().and_then(|n| field.stand(n)))
             .map(|s| (s.lat, s.lon)),
     );
+    // A parked aircraft never moves, so it never stands by a lane others
+    // taxi along: BIRK (world sweep, 2026-10-09) parked one 8 m off the
+    // way to the apron and every arrival's wingtip went through it.
     let mut free: Vec<&Stand> = suitable
         .into_iter()
         .filter(|s| !stand_taken(s, &taken))
+        .filter(|s| field.lane_clearance_m((s.lat, s.lon)) >= PARKED_LANE_CLEAR_M)
         .collect();
     let n = budget.min(free.len().saturating_sub(STANDS_KEPT_FREE));
     let mut rng = XorShift64::new(field_seed(&field.icao, seed) ^ 0x5041_524B_4544);

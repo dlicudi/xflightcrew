@@ -178,6 +178,9 @@ pub struct TrafficAircraft {
     /// and "runway vacated" was called: the wait for a stand runs from
     /// here, never from the end of the rollout (#242).
     vacated_at_s: Option<f64>,
+    /// The taxi route being driven is the tower's (its cleared route): the
+    /// spacing's guard never plans another, the tower watches it.
+    tower_route: bool,
     /// The altitude an arrival came in at.
     entry_alt_ft: f64,
     /// Its distance from the ground traffic ahead, set by the fleet each
@@ -225,6 +228,7 @@ impl TrafficAircraft {
             ext_m: 0.0,
             flown: false,
             vacated_at_s: None,
+            tower_route: false,
             spacing: GroundSpacing::default(),
             rng: XorShift64::new(seed),
         }
@@ -389,7 +393,7 @@ impl TrafficAircraft {
             self.phase = to;
             self.radio.called = false;
             self.phase_s = 0.0;
-            self.spacing.waived.clear();
+            self.spacing.new_phase();
         }
     }
 
@@ -626,7 +630,10 @@ impl TrafficAircraft {
         let Some(end) = end else { return };
         let here = self.kin.pos();
         let (path, lead_on) = match &o.taxi_path {
-            Some(p) => (p.clone(), Vec::new()),
+            Some(p) => {
+                self.tower_route = true;
+                (p.clone(), Vec::new())
+            }
             None => match field.taxi_to_runway(here, end) {
                 Some(plan) => (plan.path, plan.lead_on),
                 None => return,
@@ -1184,9 +1191,30 @@ impl TrafficAircraft {
         let Some(stand) = own.or_else(|| field.free_stand(here, &occupied)) else {
             return;
         };
-        let name = stand.name.clone();
-        let path = match &o.taxi_path {
-            Some(p) => p.clone(),
+        let mut name = stand.name.clone();
+        // The tower's route is driven unless it ends on a stand somebody
+        // stands on or is taxiing in to: the tower picks from where the
+        // aircraft stand NOW, so two arrivals in a row were both sent to
+        // the one free stand (the hour sweep, 2026-10-08). The stand it
+        // ends on is the one taken.
+        let tower = o.taxi_path.as_ref().filter(|p| {
+            p.last().is_some_and(|end| {
+                !occupied
+                    .iter()
+                    .any(|q| dist_m(*q, *end) < crate::field::STAND_TAKEN_M)
+            })
+        });
+        self.tower_route = tower.is_some();
+        let path = match tower {
+            Some(p) => {
+                let end = *p.last().unwrap_or(&here);
+                if let Some(s) = field.net.stands.iter().find(|s| {
+                    s.is_suitable() && dist_m((s.lat, s.lon), end) < crate::field::STAND_TAKEN_M
+                }) {
+                    name = s.name.clone();
+                }
+                p.clone()
+            }
             None => match field.taxi_to_stand(here, stand) {
                 Some(plan) => plan.path,
                 None => return,
@@ -1197,6 +1225,65 @@ impl TrafficAircraft {
         self.stand = Some(name);
         self.set_taxi_route(&full, field);
         self.set_phase(Phase::TaxiIn, events);
+    }
+
+    /// A new way to where the taxi is going that keeps `clear_m` from
+    /// `avoid` (an aircraft that will not move off the route), planned on
+    /// the network without the edges that pass it: the ground spacing's
+    /// guard ([`crate::spacing::apply`]), which before drove one aircraft
+    /// THROUGH the other (2026-10-09). False, and nothing changes, when
+    /// there is none.
+    pub(crate) fn reroute_around(
+        &mut self,
+        field: &FieldModel,
+        avoid: LatLon,
+        clear_m: f64,
+    ) -> bool {
+        // The tower's cleared route is the tower's to change: driven off
+        // it, the tower called "off the cleared taxi route" (PANC and ENBO,
+        // the hour sweep, 2026-10-09).
+        if self.tower_route && self.phase != Phase::Vacate {
+            return false;
+        }
+        let here = self.kin.pos();
+        let open = field.without_edges_near(avoid, clear_m);
+        let end = self.plan.runway().and_then(|r| field.end(r));
+        let planned = match self.phase {
+            Phase::TaxiOut => end
+                .as_ref()
+                .and_then(|e| open.taxi_to_runway(here, e))
+                .map(|p| (p.path, Some(p.lead_on))),
+            Phase::TaxiIn => self
+                .stand
+                .as_deref()
+                .and_then(|n| field.stand(n))
+                .and_then(|s| open.taxi_to_stand(here, s))
+                .map(|p| (p.path, None)),
+            Phase::Vacate => end
+                .as_ref()
+                .and_then(|e| open.vacate(here, self.kin.hdg_deg, e))
+                .map(|v| (v.path, None)),
+            _ => None,
+        };
+        let Some((path, lead_on)) = planned else {
+            return false;
+        };
+        let mut full = vec![here];
+        full.extend(path.into_iter().skip_while(|p| dist_m(*p, here) < 1.0));
+        // The way from where it stands to the first node is no edge: it can
+        // still run through the blocker.
+        if full.len() < 2 || crate::kin::cross_track_m(&full, avoid) < clear_m {
+            return false;
+        }
+        if self.phase == Phase::Vacate {
+            self.route = Route::taxi(full);
+        } else {
+            if let Some(l) = lead_on.filter(|l| !l.is_empty()) {
+                self.lead_on = l;
+            }
+            self.set_taxi_route(&full, field);
+        }
+        true
     }
 
     /// A number from this aircraft's own generator (jitter for the bin's

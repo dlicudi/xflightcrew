@@ -94,12 +94,15 @@ impl RunwayEnd {
 }
 
 impl FieldModel {
-    /// From parsed parts (tests and callers that already hold them).
+    /// From parsed parts (tests and callers that already hold them). Every
+    /// stand's name is made the field's own ([`unique_stand_names`]).
     pub fn new(icao: &str, airport: AirportInfo, net: Option<TaxiNet>) -> FieldModel {
+        let mut net = net.unwrap_or_default();
+        unique_stand_names(&mut net.stands);
         let mut f = FieldModel {
             icao: icao.to_string(),
             airport,
-            net: net.unwrap_or_default(),
+            net,
             procs: Procedures::default(),
         };
         if f.net.stands.is_empty() {
@@ -158,6 +161,25 @@ impl FieldModel {
             }
         }
         out
+    }
+
+    /// The field with no taxi edge passing within `clear_m` of `avoid`:
+    /// where the ground spacing's guard plans a way round an aircraft that
+    /// will not move off a route ([`crate::spacing::apply`]). The runways'
+    /// own edges stay: a vacate is planned from them, and with the one under
+    /// it gone there was no vacate at all (ULMM, 2026-10-09: a departure
+    /// held short at the exit, and every other exit refused).
+    pub fn without_edges_near(&self, avoid: LatLon, clear_m: f64) -> FieldModel {
+        let mut f = self.clone();
+        let nodes = &self.net.nodes;
+        f.net.edges.retain(|e| {
+            e.runway
+                || match (nodes.get(&e.a), nodes.get(&e.b)) {
+                    (Some(&a), Some(&b)) => crate::kin::cross_track_m(&[a, b], avoid) > clear_m,
+                    _ => true,
+                }
+        });
+        f
     }
 
     /// With the procedures from the CIFP folder.
@@ -263,7 +285,7 @@ impl FieldModel {
                 .plan_vacate(pos.0, pos.1, h, &zone, nav::VACATE_CLEAR_M)
                 .filter(|v| v.path.len() >= 2)
         };
-        let ahead = plan(hdg);
+        let ahead = plan(hdg).or_else(|| self.drive_off(pos, hdg));
         let Some(stand) = self.parking_near(pos) else {
             return ahead;
         };
@@ -283,6 +305,37 @@ impl FieldModel {
             },
             (a, b) => a.or(b),
         }
+    }
+
+    /// The vacate where the data draws none: straight to the nearest taxi
+    /// node off every runway, ahead of abeam and within [`DRIVE_OFF_M`].
+    /// PAWS 4 (world sweep, 2026-10-09): the runway is not in the field's
+    /// network at all (its runway edges are the parallel gravel strip's),
+    /// so no vacate was ever planned, every arrival rolled to the end and
+    /// stood there, and the next drove into it.
+    fn drive_off(&self, pos: LatLon, hdg: f64) -> Option<VacatePlan> {
+        let off: std::collections::HashSet<i64> = self
+            .net
+            .edges
+            .iter()
+            .filter(|e| !e.runway)
+            .flat_map(|e| [e.a, e.b])
+            .collect();
+        let to = off
+            .iter()
+            .filter_map(|id| self.net.nodes.get(id).copied())
+            .filter(|p| !self.beside_runway(*p))
+            .filter(|p| {
+                let d = (bearing(pos, *p) - hdg + 540.0).rem_euclid(360.0) - 180.0;
+                d.abs() <= 100.0
+            })
+            .filter(|p| dist_m(pos, *p) <= DRIVE_OFF_M)
+            .min_by(|a, b| dist_m(pos, *a).total_cmp(&dist_m(pos, *b)))?;
+        Some(VacatePlan {
+            path: vec![pos, to],
+            seg: vec![Default::default()],
+            exit_name: String::new(),
+        })
     }
 
     /// `v` carried on along the stand route until it is OFF the runway's
@@ -341,6 +394,38 @@ impl FieldModel {
                         && right.abs() <= r.width_m.max(30.0) / 2.0 + STAND_RUNWAY_GAP_M
                 })
             })
+    }
+
+    /// How far `p` is from the nearest lane traffic taxis along, metres:
+    /// every taxiway edge but a dead-end spur ending within
+    /// [`SPUR_END_M`] of `p` (a stand's own lead-in). Infinite with no
+    /// network.
+    pub fn lane_clearance_m(&self, p: LatLon) -> f64 {
+        let mut degree: std::collections::HashMap<i64, usize> = Default::default();
+        for e in self.net.edges.iter().filter(|e| !e.runway) {
+            *degree.entry(e.a).or_default() += 1;
+            *degree.entry(e.b).or_default() += 1;
+        }
+        let m_lon = 111_320.0 * p.0.to_radians().cos();
+        let xy = |q: LatLon| ((q.1 - p.1) * m_lon, (q.0 - p.0) * 111_320.0);
+        self.net
+            .edges
+            .iter()
+            .filter(|e| !e.runway)
+            .filter_map(|e| Some((e, *self.net.nodes.get(&e.a)?, *self.net.nodes.get(&e.b)?)))
+            .filter(|(e, a, b)| {
+                let spur = |id: i64, q: LatLon| degree.get(&id) == Some(&1) && dist_m(p, q) <= SPUR_END_M;
+                !spur(e.a, *a) && !spur(e.b, *b)
+            })
+            .map(|(_, a, b)| {
+                let ((ax, ay), (bx, by)) = (xy(a), xy(b));
+                let (dx, dy) = (bx - ax, by - ay);
+                let len2 = dx * dx + dy * dy;
+                let t = if len2 > 0.0 { ((-ax * dx - ay * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+                let (cx, cy) = (ax + t * dx, ay + t * dy);
+                (cx * cx + cy * cy).sqrt()
+            })
+            .fold(f64::INFINITY, f64::min)
     }
 
     /// The nearest stand an arrival can park on: suitable and off every
@@ -509,12 +594,42 @@ fn slice_m(path: &[LatLon], a_m: f64, b_m: f64) -> Vec<LatLon> {
     out
 }
 
+/// Every stand named once: a second stand of the same name gets a number
+/// ("GA Tie-Down 2"). Stands are found BY NAME ([`FieldModel::stand`]), and
+/// at a field that names every tie-down alike each one resolved to the
+/// first: CYJP's four "GA Tie-Down" and EFMI's eight "Apron Stand" put two
+/// and three aircraft on one stand in the hour sweep (2026-10-08).
+fn unique_stand_names(stands: &mut [Stand]) {
+    let mut used: std::collections::HashSet<String> =
+        stands.iter().map(|s| s.name.clone()).collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in stands.iter_mut() {
+        if seen.insert(s.name.clone()) {
+            continue;
+        }
+        let name = (2..)
+            .map(|k| format!("{} {k}", s.name))
+            .find(|n| !used.contains(n))
+            .unwrap_or_default();
+        used.insert(name.clone());
+        seen.insert(name.clone());
+        s.name = name;
+    }
+}
+
 /// An aircraft this close to a stand is on it.
 pub const STAND_TAKEN_M: f64 = 20.0;
 
 /// Somebody in `occupied` is on `stand`.
+/// A dead-end spur ending this close to a stand is its own lead-in, metres.
+const SPUR_END_M: f64 = 40.0;
+
 /// A stand is at least this far beyond a runway's edge, metres.
 const STAND_RUNWAY_GAP_M: f64 = 30.0;
+
+/// A vacate the data draws none for drives off to a taxi node this close,
+/// metres.
+const DRIVE_OFF_M: f64 = 200.0;
 
 /// A vacate with no route off drives straight to a stand this close, metres.
 const STRAIGHT_TO_STAND_M: f64 = 800.0;

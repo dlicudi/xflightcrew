@@ -284,11 +284,23 @@ pub enum Event {
         along_m: f64,
     },
     /// Held [`crate::spacing::STUCK_S`] on the ground behind an aircraft
-    /// that will not move for it (`past`, or our own when `None`), it goes
-    /// on past it rather than gridlock the field.
-    SpacingWaived {
+    /// that will not move for it (`around`, or our own when `None`), it
+    /// taxis another way round it ([`crate::spacing::apply`]).
+    SpacingRerouted {
         id: u32,
-        past: Option<u32>,
+        around: Option<u32>,
+    },
+    /// ...and with no other way, the traffic aircraft in its way was towed
+    /// clear (`removed`, gone with [`Despawn::Towed`]).
+    SpacingCleared {
+        id: u32,
+        removed: u32,
+    },
+    /// ...and with no other way and nothing to tow (our own aircraft, or one
+    /// that may yet move), it waits where it is: said once per blocker.
+    SpacingHeld {
+        id: u32,
+        behind: Option<u32>,
     },
 }
 
@@ -306,6 +318,9 @@ pub enum Despawn {
     /// Its readback was not taken twice and the tower's repeat did not
     /// help: it leaves the frequency rather than be challenged forever.
     ReadbackFailed,
+    /// Towed off the taxiway: it stood in the way of another with no way
+    /// round it ([`Event::SpacingCleared`]).
+    Towed,
 }
 
 /// Our own aircraft, as the fleet needs it: where not to spawn.
