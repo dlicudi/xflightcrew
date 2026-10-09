@@ -17,6 +17,7 @@ pub mod perf;
 pub mod phase;
 pub mod rng;
 pub mod schedule;
+pub mod slot;
 pub mod spacing;
 pub mod wire;
 

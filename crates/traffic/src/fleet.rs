@@ -116,6 +116,7 @@ impl Fleet {
                 phase: a.phase,
                 pos: a.kin.pos(),
                 gs_kts: a.kin.gs_kts,
+                slot: a.slot(),
             })
             .collect()
     }
@@ -142,6 +143,7 @@ impl Fleet {
                     phase: Phase::Parked,
                     pos: o.pos,
                     gs_kts: 0.0,
+                    slot: None,
                 });
             }
             // A stand somebody is taxiing in to is taken already.
@@ -151,6 +153,7 @@ impl Fleet {
                 phase: Phase::Parked,
                 pos,
                 gs_kts: 0.0,
+                slot: None,
             }));
             crate::spacing::apply(
                 &mut self.aircraft,

@@ -573,7 +573,10 @@ fn a_straight_in_arrival_lands_with_its_gear_down() {
     let ac = arrival(&field, 31, "AT72", true);
     let s = fly(field, vec![ac], ScriptedTower::default(), 3600.0, 31);
     assert!(s.phases.contains(&Phase::Parked), "{:?}", s.phases);
-    assert_eq!(s.gear_up_low, 0, "substeps with the gear up low or on the ground");
+    assert_eq!(
+        s.gear_up_low, 0,
+        "substeps with the gear up low or on the ground"
+    );
 }
 
 #[test]
@@ -914,14 +917,41 @@ fn number_two_turns_base_once_its_leader_will_be_off_the_runway() {
         phase,
         pos: project_m(end.thr, end.course_deg + 180.0, nm * 1852.0),
         gs_kts,
+        slot: None,
+    };
+    // Number two needing the runway `s` from now.
+    let own = |s: f64| crate::slot::RunwaySlot {
+        thr: end.thr,
+        far: end.far,
+        to_thr_s: s,
+        clear_s: s + 40.0,
+        unjudged_s: 0.0,
+        needs_clear_s: 0.0,
+        committed: false,
+        waiting: false,
     };
     // A 172 at 1.5 nm, 70 kt: 79 s to the threshold, plus its runway and the gap.
     let slow = [seen(Phase::Final, 1.5, 70.0)];
-    assert!(!leader_ready(1, &slow, &end, 100.0), "a jet 100 s out would catch it");
-    assert!(leader_ready(1, &slow, &end, 160.0), "a 172 160 s out follows it");
-    assert!(!leader_ready(1, &[seen(Phase::Vacate, 0.0, 10.0)], &end, 300.0), "still on the runway");
-    assert!(leader_ready(1, &[seen(Phase::TaxiIn, 0.0, 10.0)], &end, 30.0), "off it");
-    assert!(leader_ready(1, &[], &end, 30.0), "a leader gone is no leader");
+    assert!(
+        !leader_ready(1, &slow, &end, &own(100.0)),
+        "a jet 100 s out would catch it"
+    );
+    assert!(
+        leader_ready(1, &slow, &end, &own(160.0)),
+        "a 172 160 s out follows it"
+    );
+    assert!(
+        !leader_ready(1, &[seen(Phase::Vacate, 0.0, 10.0)], &end, &own(300.0)),
+        "still on the runway"
+    );
+    assert!(
+        leader_ready(1, &[seen(Phase::TaxiIn, 0.0, 10.0)], &end, &own(30.0)),
+        "off it"
+    );
+    assert!(
+        leader_ready(1, &[], &end, &own(30.0)),
+        "a leader gone is no leader"
+    );
 }
 
 /// A departure of `icao_type` already taxiing on `path` toward runway 09's
@@ -1792,4 +1822,179 @@ fn a_generated_hour_keeps_every_taxiing_pair_apart() {
         println!("{icao}: closest taxiing pair {closest:.2} of the spacing");
         assert!(closest >= 0.7, "{icao}: {closest:.2} of the spacing");
     }
+}
+
+/// An arrival to XTST 27 entering `nm` out on `bearing` from its threshold.
+fn entering(
+    field: &FieldModel,
+    id: u32,
+    icao_type: &str,
+    straight_in: bool,
+    nm: f64,
+    bearing: f64,
+) -> TrafficAircraft {
+    let end = field.end("27").unwrap();
+    let entry = crate::kin::project_m(end.thr, bearing, nm * 1852.0);
+    TrafficAircraft::at_entry(
+        id,
+        &format!("T{id}"),
+        "Traffic",
+        icao_type,
+        Plan::Arrival {
+            entry,
+            star: None,
+            runway: "27".into(),
+            straight_in,
+        },
+        field,
+        id as u64,
+    )
+    .unwrap()
+}
+
+/// What two arrivals flown together did, per id: when each touched down,
+/// when each was off the runway again, the most it extended its downwind,
+/// where it began each orbit (metres from the threshold), go-arounds.
+#[derive(Default, Debug)]
+struct Pair {
+    touchdown: HashMap<u32, f64>,
+    off: HashMap<u32, f64>,
+    ext_m: HashMap<u32, f64>,
+    orbits_at_m: HashMap<u32, Vec<f64>>,
+    go_arounds: usize,
+}
+
+/// Fly `first` from the start and `second` from `second_at` seconds, the
+/// scripted tower clearing each, until both are off the runway again.
+fn fly_pair(
+    field: FieldModel,
+    first: TrafficAircraft,
+    second: TrafficAircraft,
+    second_at: f64,
+) -> Pair {
+    let end = field.end("27").unwrap();
+    let mut fleet = Fleet::new(field.clone());
+    let ids = [first.id, second.id];
+    fleet.spawn(first);
+    let mut second = Some(second);
+    let tower = RefCell::new(ScriptedTower::default());
+    let mut p = Pair::default();
+    let mut orbits: HashMap<u32, u32> = HashMap::new();
+    let mut t = 0.0;
+    while t < 3600.0 {
+        if t >= second_at {
+            if let Some(ac) = second.take() {
+                fleet.spawn(ac);
+            }
+        }
+        let events = fleet.step(0.1, None, &|id| tower.borrow().orders.get(&id).cloned());
+        t += 0.1;
+        for e in &events {
+            tower.borrow_mut().hear(e);
+            match e {
+                Event::Touchdown { id, .. } => {
+                    p.touchdown.entry(*id).or_insert(t);
+                }
+                Event::Call {
+                    call: Call::GoingAround,
+                    ..
+                } => p.go_arounds += 1,
+                _ => {}
+            }
+        }
+        for ac in fleet.aircraft() {
+            let ext = p.ext_m.entry(ac.id).or_default();
+            *ext = ext.max(ac.ext_m);
+            let n = orbits.entry(ac.id).or_default();
+            if ac.orbits > *n {
+                p.orbits_at_m
+                    .entry(ac.id)
+                    .or_default()
+                    .push(dist_m(ac.kin.pos(), end.thr));
+            }
+            *n = ac.orbits;
+            if p.touchdown.contains_key(&ac.id)
+                && ac.kin.on_ground
+                && !field.on_runway(ac.kin.pos())
+            {
+                p.off.entry(ac.id).or_insert(t);
+            }
+        }
+        if second.is_none() && ids.iter().all(|id| p.off.contains_key(id)) {
+            break;
+        }
+    }
+    p
+}
+
+/// Seconds from its spawn to its touchdown for `ac` flown alone.
+fn touchdown_alone(field: &FieldModel, ac: TrafficAircraft) -> f64 {
+    let id = ac.id;
+    let never = entering(field, 99, "C172", true, 30.0, 0.0);
+    fly_pair(field.clone(), ac, never, f64::INFINITY).touchdown[&id]
+}
+
+/// THE BIEG FINAL (the hour sweep, 2026-10-09): a circuit 172 turned base
+/// in front of a straight-in on its long final and one of them went
+/// around, nine to twelve times an hour. Timed so the straight-in reaches
+/// the threshold just before the 172 would, the 172 now extends its
+/// downwind and lands only once the straight-in is off the runway; the
+/// straight-in flies on.
+#[test]
+fn a_circuit_extends_its_downwind_behind_a_straight_in_that_gets_there_first() {
+    let field = fixtures::xtst();
+    let join = || entering(&field, 1, "C172", false, 6.0, 140.0);
+    let jet = || entering(&field, 2, "AT72", true, 10.0, 90.0);
+    let join_alone = touchdown_alone(&field, join());
+    let jet_alone = touchdown_alone(&field, jet());
+    // The straight-in reaches the threshold 20 s before the 172 would.
+    let jet_at = join_alone - 20.0 - jet_alone;
+    assert!(
+        jet_at > 0.0,
+        "the 172 lands at {join_alone:.0} s, the jet {jet_alone:.0} s"
+    );
+    let p = fly_pair(field.clone(), join(), jet(), jet_at);
+    println!("{p:?}");
+    assert_eq!(p.go_arounds, 0);
+    assert!(p.ext_m[&1] > 0.0, "the downwind was extended");
+    assert!(!p.orbits_at_m.contains_key(&2), "the straight-in flew on");
+    assert!(
+        p.touchdown[&1] > p.off[&2] + 20.0,
+        "the 172 landed at {:.0} s, the jet was off at {:.0} s",
+        p.touchdown[&1],
+        p.off[&2]
+    );
+}
+
+/// A straight-in that cannot fit behind the traffic committed ahead of it
+/// is given its delay EARLY, an orbit well out (never inside 4 nm), and
+/// lands once the one ahead is off: never a go-around on short final.
+#[test]
+fn a_straight_in_that_cannot_fit_behind_the_one_ahead_orbits_far_out() {
+    let field = fixtures::xtst();
+    let lead = || entering(&field, 1, "C172", true, 6.0, 90.0);
+    let jet = || entering(&field, 2, "AT72", true, 10.0, 90.0);
+    let lead_alone = touchdown_alone(&field, lead());
+    let jet_alone = touchdown_alone(&field, jet());
+    // The jet would touch down 30 s behind the 172, still on the runway.
+    let jet_at = lead_alone + 30.0 - jet_alone;
+    assert!(
+        jet_at > 0.0,
+        "the 172 lands at {lead_alone:.0} s, the jet {jet_alone:.0} s"
+    );
+    let p = fly_pair(field.clone(), lead(), jet(), jet_at);
+    println!("{p:?}");
+    assert_eq!(p.go_arounds, 0);
+    let orbits = p.orbits_at_m.get(&2).expect("the jet orbited");
+    assert!(
+        orbits.iter().all(|m| *m >= crate::slot::ORBIT_MIN_M),
+        "orbits at {orbits:?} m"
+    );
+    assert!(!p.orbits_at_m.contains_key(&1), "the 172 ahead flew on");
+    assert!(
+        p.touchdown[&2] > p.off[&1],
+        "the jet landed at {:.0} s, the 172 was off at {:.0} s",
+        p.touchdown[&2],
+        p.off[&1]
+    );
 }

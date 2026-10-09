@@ -8,6 +8,9 @@ use crate::kin::{bearing, dist_m, follow, project_m, Follow, FollowSpec, Kin, La
 use crate::perf::{class_for_type, Perf, Wake};
 use crate::phase::{Call, Despawn, Event, Leg, Order, Phase, Plan, RadioState, TowerState};
 use crate::rng::XorShift64;
+use crate::slot::{
+    off_before, slot_free, DriveEstimate, Occupancy, Orbit, RunwaySlot, FOLLOW_GAP_S, MAX_ORBITS,
+};
 use crate::spacing::{GroundSpacing, SPACING_DECEL_MS2};
 
 /// A departure is gone this far from the field.
@@ -33,17 +36,15 @@ pub const GLIDE_DEG: f64 = 3.0;
 pub const TCH_FT: f64 = 50.0;
 
 /// How long a leader holds the runway once it reaches the threshold,
-/// seconds: a touch and go's roll, or a full stop's rollout to an exit.
+/// seconds, when its own slot is not in the picture: a touch and go's
+/// roll, or a full stop's rollout to an exit.
 const LEADER_RUNWAY_S: f64 = 45.0;
-
-/// The gap number two keeps behind that, seconds.
-const FOLLOW_GAP_S: f64 = 20.0;
 
 /// The longest a downwind is extended for a leader.
 pub const MAX_DOWNWIND_EXT_NM: f64 = 4.0;
 
 /// Line-up pace, knots.
-const LINE_UP_KTS: f64 = 6.0;
+pub(crate) const LINE_UP_KTS: f64 = 6.0;
 
 /// A backtrack's pace as a share of the type's taxi pace...
 const BACKTRACK_PACE: f64 = 1.6;
@@ -72,7 +73,7 @@ pub const READBACK_TRIES: u32 = 2;
 /// A departure climbs to this above the field before it is gone.
 const DEPART_CLIMB_AGL_FT: f64 = 6000.0;
 
-const FT_PER_M: f64 = 3.28084;
+pub(crate) const FT_PER_M: f64 = 3.28084;
 const NM: f64 = 1852.0;
 
 /// The path an aircraft is on, tagged leg by leg.
@@ -133,6 +134,9 @@ pub struct Seen {
     pub pos: LatLon,
     /// Groundspeed, knots: number two times its base against it.
     pub gs_kts: f64,
+    /// Its place at the runway, when it is landing or on it
+    /// ([`crate::slot`]).
+    pub slot: Option<RunwaySlot>,
 }
 
 /// One traffic aircraft.
@@ -167,17 +171,17 @@ pub struct TrafficAircraft {
     /// When the crossing held short of was last asked for (phase seconds).
     cross_asked_at: Option<f64>,
     /// Seconds since it spawned (the readback's clock: phases reset theirs).
-    age_s: f64,
+    pub(crate) age_s: f64,
     /// Seconds in the current phase.
     phase_s: f64,
     /// Metres the downwind has been extended.
-    ext_m: f64,
+    pub(crate) ext_m: f64,
     /// The flight is flown: parked again, lingering.
     flown: bool,
     /// Phase seconds at which the vacate drive ended clear of the runway
     /// and "runway vacated" was called: the wait for a stand runs from
     /// here, never from the end of the rollout (#242).
-    vacated_at_s: Option<f64>,
+    pub(crate) vacated_at_s: Option<f64>,
     /// The taxi route being driven is the tower's (its cleared route): the
     /// spacing's guard never plans another, the tower watches it.
     tower_route: bool,
@@ -186,6 +190,16 @@ pub struct TrafficAircraft {
     /// Its distance from the ground traffic ahead, set by the fleet each
     /// substep ([`crate::spacing::apply`]); the drive stops short of it.
     pub spacing: GroundSpacing,
+    /// Its place at the runway as the others see it, refreshed each
+    /// substep ([`crate::slot`]).
+    pub(crate) slot: Option<RunwaySlot>,
+    /// What a landing on the runway end in use costs it, worked out once.
+    pub(crate) occupancy: Option<Occupancy>,
+    /// The ground drive on the runway being driven, as last estimated.
+    pub(crate) drive_est: Option<DriveEstimate>,
+    /// The orbit being flown for a delay, and how many it has flown.
+    pub(crate) orbit: Option<Orbit>,
+    pub(crate) orbits: u32,
     rng: XorShift64,
 }
 
@@ -230,6 +244,11 @@ impl TrafficAircraft {
             vacated_at_s: None,
             tower_route: false,
             spacing: GroundSpacing::default(),
+            slot: None,
+            occupancy: None,
+            drive_est: None,
+            orbit: None,
+            orbits: 0,
             rng: XorShift64::new(seed),
         }
     }
@@ -393,6 +412,10 @@ impl TrafficAircraft {
             self.phase = to;
             self.radio.called = false;
             self.phase_s = 0.0;
+            // Each approach has its own orbits.
+            if to == Phase::Landing {
+                self.orbits = 0;
+            }
             self.spacing.new_phase();
         }
     }
@@ -419,7 +442,7 @@ impl TrafficAircraft {
     /// still slowed for. UUYY and BIEG (world sweep, 2026-10-09): a jet's
     /// backtrack at taxi pace held the only runway three minutes, a line-up
     /// at 6 kt seventy seconds, and the arrivals behind went around.
-    fn backtrack_kts(&self) -> f64 {
+    pub(crate) fn backtrack_kts(&self) -> f64 {
         (self.perf.taxi_kts * BACKTRACK_PACE).min(BACKTRACK_MAX_KTS)
     }
 
@@ -569,7 +592,13 @@ impl TrafficAircraft {
             Phase::Gone => {}
         }
         self.gear_for_phase(field);
+        self.refresh_slot(field, end.as_ref());
         self.phase_s += dt;
+    }
+
+    /// Its place at the runway, as last published ([`crate::slot`]).
+    pub fn slot(&self) -> Option<RunwaySlot> {
+        self.slot
     }
 
     /// The gear, whatever flew this substep: down on the ground and on any
@@ -743,7 +772,7 @@ impl TrafficAircraft {
 
     /// From the hold onto the centreline: the drawn lead-on, then along
     /// the centreline far enough to stop aligned.
-    fn line_up_path(&self, end: &RunwayEnd) -> Vec<LatLon> {
+    pub(crate) fn line_up_path(&self, end: &RunwayEnd) -> Vec<LatLon> {
         let here = self.kin.pos();
         let mut path = vec![here];
         path.extend(
@@ -905,12 +934,15 @@ impl TrafficAircraft {
             }
             Leg::Outbound | Leg::Taxi => (elev + DEPART_CLIMB_AGL_FT, p.climb_kts.min(250.0)),
         };
+        // An orbit for a delay is flown level, at the height it began.
+        let orbit_alt = self.orbit_alt();
+        let alt_target = orbit_alt.unwrap_or(alt_target);
         // On the path (the final, or a descending leg whose target IS the
         // path) the descent is a ramp: fed forward on the groundspeed,
         // trimmed on the error. A P law alone lags a ramp and arrives high.
         let on_path = matches!(leg, Leg::Downwind | Leg::Base | Leg::Inbound)
             && glide.is_some_and(|g| (g - alt_target).abs() < 1.0);
-        if landing || leg == Leg::Final || on_path {
+        if orbit_alt.is_none() && (landing || leg == Leg::Final || on_path) {
             let ff = -self.kin.gs_kts * KT_TO_MS * 196.85 * GLIDE_DEG.to_radians().tan();
             let fix = (alt_target - self.kin.alt_ft) * 60.0 / crate::kin::VS_TAU_S;
             self.kin
@@ -940,36 +972,41 @@ impl TrafficAircraft {
         self.kin.lights.nav = true;
         self.kin.lights.strobe = true;
 
-        // Number two: the downwind runs on until the leader is on short
-        // final.
-        if leg == Leg::Downwind {
-            if let Some(lid) = o.follow {
-                let seg = self.route.follow.seg;
-                let left = dist_m(here, self.route.path[seg + 1]);
-                let radius = self.kin.gs_kts * KT_TO_MS / p.turn_air_dps.to_radians();
-                // Our own time to the threshold from here: the rest of the
-                // downwind, the base, the final, at the pattern's pace.
-                let own_s = (left
-                    + self
-                        .route
-                        .path
-                        .get(seg + 2)
-                        .map_or(0.0, |b| dist_m(self.route.path[seg + 1], *b) + dist_m(*b, end.thr)))
-                    / (self.kin.gs_kts.max(40.0) * KT_TO_MS);
-                if left < radius + 200.0
-                    && self.ext_m < MAX_DOWNWIND_EXT_NM * NM
-                    && !leader_ready(lid, others, end, own_s)
-                {
-                    let step = self.kin.gs_kts * KT_TO_MS * dt;
-                    for k in [seg + 1, seg + 2] {
-                        if let Some(pt) = self.route.path.get_mut(k) {
-                            *pt = project_m(*pt, end.course_deg + 180.0, step);
-                        }
+        // The downwind runs on while the base would not fit: behind the
+        // leader the tower named (number two), and round every flight
+        // committed to the runway, a straight-in on its long final among
+        // them, which cannot wait for us ([`crate::slot`]).
+        // Extended as far as it goes and still no room: an orbit on the
+        // downwind, off the final, so the tower can still release a
+        // departure through the gap (USHQ 16, the hour sweep, 2026-10-09:
+        // three circuits turning in at the end of their extensions kept a
+        // departure at the hold for the whole hour).
+        if leg == Leg::Downwind && orbit_alt.is_none() {
+            let seg = self.route.follow.seg;
+            let left = dist_m(here, self.route.path[seg + 1]);
+            let radius = self.kin.gs_kts * KT_TO_MS / p.turn_air_dps.to_radians();
+            // Our own slot from here: the rest of the downwind, the base,
+            // the final, each at its pace, and our runway time.
+            let waits = left < radius + 200.0
+                && self.slot.is_some_and(|own| {
+                    o.follow
+                        .is_some_and(|lid| !leader_ready(lid, others, end, &own))
+                        || !slot_free(self.id, &own, others, true)
+                });
+            if waits && self.ext_m < MAX_DOWNWIND_EXT_NM * NM {
+                let step = self.kin.gs_kts * KT_TO_MS * dt;
+                for k in [seg + 1, seg + 2] {
+                    if let Some(pt) = self.route.path.get_mut(k) {
+                        *pt = project_m(*pt, end.course_deg + 180.0, step);
                     }
-                    self.ext_m += step;
                 }
+                self.ext_m += step;
+            } else if waits && self.orbits < MAX_ORBITS {
+                self.start_orbit(end);
             }
         }
+        // A straight-in that cannot fit is given its delay out here.
+        self.delay_if_no_slot(end, others);
 
         let spec = FollowSpec {
             accel_kts_s: 2.0,
@@ -1329,22 +1366,28 @@ pub fn pattern_points(end: &RunwayEnd, p: &Perf) -> PatternPoints {
 }
 
 /// The leader is far enough ahead for number two to turn base: on final
-/// and off the runway again before we reach it (`own_s`, our time to the
-/// threshold from here), off the runway, or not in the circuit at all. A
+/// and off the runway again before we need it (`own`, our slot as we
+/// would turn now), off the runway, or not in the circuit at all. A
 /// leader still ON the runway (rolling out, vacating, lining up, rolling)
 /// is the occupant the tower sequenced the downwind behind: the base waits
 /// for it to be off (BIEG 03, 2026-10-08: a backtracking jet held the strip
 /// for minutes and the base turned on time went around). Timed, never a
 /// fixed distance: a 737 that turned base with a 172 at 1.5 nm on final
 /// caught it up and went around behind it, five times running.
-pub(crate) fn leader_ready(lid: u32, others: &[Seen], end: &RunwayEnd, own_s: f64) -> bool {
+pub(crate) fn leader_ready(lid: u32, others: &[Seen], end: &RunwayEnd, own: &RunwaySlot) -> bool {
     let Some(l) = others.iter().find(|s| s.id == lid) else {
         return true;
     };
+    // Committed to the runway, the leader's own slot says when it is off
+    // (its way off at this field, a backtrack included: BIEG's took two
+    // minutes, not 45 s).
+    if let Some(x) = l.slot.filter(|x| x.committed) {
+        return off_before(&x, own);
+    }
     match l.phase {
         Phase::Final => {
             let to_thr_s = dist_m(l.pos, end.thr) / (l.gs_kts.max(40.0) * KT_TO_MS);
-            to_thr_s + LEADER_RUNWAY_S + FOLLOW_GAP_S <= own_s
+            to_thr_s + LEADER_RUNWAY_S + FOLLOW_GAP_S <= own.needs_runway_in_s()
         }
         Phase::Climb | Phase::Arrive | Phase::Pattern { .. } | Phase::GoAround => false,
         Phase::Landing | Phase::Vacate | Phase::LineUp | Phase::Roll => false,
