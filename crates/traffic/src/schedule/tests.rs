@@ -487,3 +487,27 @@ fn real_install_schedule_lemg() {
         );
     }
 }
+
+/// LXGB (2026-10-09): a field that publishes no procedures still gets its
+/// airline traffic, flown visually: departures with no SID, arrivals with
+/// no STAR joining the circuit; and no stand on or against a runway is
+/// ever given out.
+#[test]
+fn a_field_without_procedures_gets_visual_airline_traffic() {
+    let f = fixtures::xtst();
+    assert!(f.procs.sids.is_empty() && f.procs.approaches.is_empty());
+    let ms = generate(&f, Density::Normal, 3, &SpawnCtx::default());
+    let (_, dep, arr) = kinds(&ms);
+    assert!(dep > 0 && arr > 0, "departures {dep}, arrivals {arr}");
+    for m in &ms {
+        if m.kind == MovementKind::Departure {
+            assert!(m.sid.is_none(), "{m:?}");
+        }
+        if m.kind == MovementKind::Arrival {
+            assert!(m.star.is_none() && !m.straight_in, "{m:?}");
+        }
+        if let Some(s) = m.stand.as_deref().and_then(|n| f.stand(n)) {
+            assert!(!f.beside_runway((s.lat, s.lon)), "{m:?}");
+        }
+    }
+}

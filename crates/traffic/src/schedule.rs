@@ -301,6 +301,10 @@ fn free_stands(field: &FieldModel, perf: &Perf, taken: &[LatLon]) -> Vec<String>
         .stands
         .iter()
         .filter(|s| s.is_suitable())
+        // A stand on or against a runway strip starts the aircraft on it
+        // (UEMH 27, world sweep 2026-10-09: "you are on runway two seven
+        // without clearance" as it began to taxi).
+        .filter(|s| !field.beside_runway((s.lat, s.lon)))
         .filter(|s| {
             s.accepts.is_empty()
                 || s.accepts
@@ -412,7 +416,15 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
     let every = density.ifr_interval_s();
     let has_stands = field.net.stands.iter().any(|s| s.is_suitable());
 
-    if !field.procs.sids.is_empty() && has_stands {
+    // A field that publishes no procedures still has its airline traffic,
+    // flown visually: a departure off the runway heading and away, an
+    // arrival joining the circuit. LXGB (2026-10-09): Gibraltar's CIFP
+    // holds runways only and its stands take jets, so the hour was empty
+    // and the pilot sat at the field with no traffic at all.
+    let visual = field.procs.sids.is_empty()
+        && field.procs.approaches.is_empty()
+        && field.procs.stars.is_empty();
+    if (!field.procs.sids.is_empty() || visual) && has_stands {
         let mut t = rng.range_f64(60.0, every);
         while t < HORIZON_S {
             let Some(icao_type) = ifr_type(&mut rng) else {
@@ -422,7 +434,9 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
             let Some(stand) = take_stand(perf, &mut rng, &mut taken) else {
                 break;
             };
-            let sid = field.procs.sids[rng.below(field.procs.sids.len() as u64) as usize].clone();
+            let sid = (!field.procs.sids.is_empty()).then(|| {
+                field.procs.sids[rng.below(field.procs.sids.len() as u64) as usize].clone()
+            });
             let (callsign, spoken, icao_type) = airline(&field.icao, icao_type, &mut rng);
             out.push(Movement {
                 t_s: t,
@@ -435,7 +449,7 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
                 entry: None,
                 straight_in: false,
                 laps: 0,
-                sid: Some(sid),
+                sid,
                 star: None,
                 exit_bearing: rng.range_f64(0.0, 360.0),
                 seed: rng.next_u64(),
@@ -445,7 +459,7 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
         }
     }
 
-    let arrivals = !field.procs.approaches.is_empty() || !field.procs.stars.is_empty();
+    let arrivals = !field.procs.approaches.is_empty() || !field.procs.stars.is_empty() || visual;
     if arrivals && has_stands {
         let straight_in = field.procs.approach_for(&end.ident).is_some();
         let mut t = rng.range_f64(every * 0.3, every);

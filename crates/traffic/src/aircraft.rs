@@ -519,6 +519,19 @@ impl TrafficAircraft {
                 let queued = self.spacing.free_m.is_some_and(|f| f < 1.0)
                     && self.kin.gs_kts < 0.5
                     && !field.on_runway(self.kin.pos());
+                // Its drive ended still ON the runway (a strip with no way
+                // off drawn): it never says "vacated" standing on it, it
+                // leaves. BIGH 18 (world sweep, 2026-10-09): a Cessna said
+                // "runway vacated" six seconds into a vacate it could not
+                // complete and stood on the runway until it gave up.
+                if driven && field.on_runway(self.kin.pos()) {
+                    self.set_phase(Phase::Gone, events);
+                    events.push(Event::Despawn {
+                        id: self.id,
+                        reason: Despawn::NoStand,
+                    });
+                    return;
+                }
                 if driven || queued {
                     self.call_once(Call::Vacated, events);
                     let vacated_at = *self.vacated_at_s.get_or_insert(self.phase_s);

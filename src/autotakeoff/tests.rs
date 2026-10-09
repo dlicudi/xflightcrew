@@ -419,7 +419,7 @@
         assert!(!xp.wrote(super::VS_DIAL));
         xp.set_read(crate::datarefs::PAUSED, 0.0);
         assert!(!super::engage_climb(&xp, &[], &mut 0, 700.0, &mut last, &mut None).await); // commands ignored
-        assert!(xp.ran(super::CMD_VS_MODE));
+        assert!(xp.ran(super::CMD_VS_MODE), "ran {:?} panel {:?}", xp.commands(), crate::autoflight::panel().engage_status);
         xp.set_read(super::HDG_STATUS, 1.0);
         xp.set_read(super::VS_STATUS, 1.0);
         // Lit modes with the servos out are not an autopilot flying (#160).

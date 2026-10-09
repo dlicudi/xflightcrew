@@ -96,12 +96,68 @@ impl RunwayEnd {
 impl FieldModel {
     /// From parsed parts (tests and callers that already hold them).
     pub fn new(icao: &str, airport: AirportInfo, net: Option<TaxiNet>) -> FieldModel {
-        FieldModel {
+        let mut f = FieldModel {
             icao: icao.to_string(),
             airport,
             net: net.unwrap_or_default(),
             procs: Procedures::default(),
+        };
+        if f.net.stands.is_empty() {
+            f.net.stands = f.apron_spots();
         }
+        f
+    }
+
+    /// Parking for a field that publishes no stands (apt.dat 1300): the
+    /// dead ends of its taxi network clear of every runway, where a real
+    /// apron's lines end. LXGB (2026-10-09): Gibraltar draws its taxiways
+    /// and no stands, every movement needs a stand, and the pilot sat at
+    /// the field with no traffic at all. Facing the way the line runs in,
+    /// at most [`APRON_SPOTS_MAX`], none within [`APRON_SPOT_GAP_M`] of
+    /// another. Empty with no network.
+    fn apron_spots(&self) -> Vec<Stand> {
+        let mut degree: std::collections::HashMap<i64, Vec<i64>> = Default::default();
+        for e in self.net.edges.iter().filter(|e| !e.runway) {
+            degree.entry(e.a).or_default().push(e.b);
+            degree.entry(e.b).or_default().push(e.a);
+        }
+        let clear = |p: LatLon| {
+            self.airport.runways.iter().all(|r| {
+                self.end(&r.ident_a).is_none_or(|e| {
+                    let (along, right) = e.frame(p);
+                    right.abs() > APRON_CLEAR_M
+                        || along < -APRON_CLEAR_M
+                        || along > e.length_m + APRON_CLEAR_M
+                })
+            })
+        };
+        let mut ends: Vec<(i64, i64)> = degree
+            .iter()
+            .filter(|(_, n)| n.len() == 1)
+            .map(|(id, n)| (*id, n[0]))
+            .collect();
+        ends.sort();
+        let mut out: Vec<Stand> = Vec::new();
+        for (id, from) in ends {
+            let (Some(&p), Some(&q)) = (self.net.nodes.get(&id), self.net.nodes.get(&from)) else {
+                continue;
+            };
+            if !clear(p) || out.iter().any(|s| dist_m((s.lat, s.lon), p) < APRON_SPOT_GAP_M) {
+                continue;
+            }
+            out.push(Stand {
+                lat: p.0,
+                lon: p.1,
+                heading: bearing(q, p),
+                name: format!("Apron {}", out.len() + 1),
+                kind: "tie_down".into(),
+                accepts: Vec::new(),
+            });
+            if out.len() >= APRON_SPOTS_MAX {
+                break;
+            }
+        }
+        out
     }
 
     /// With the procedures from the CIFP folder.
@@ -208,7 +264,7 @@ impl FieldModel {
                 .filter(|v| v.path.len() >= 2)
         };
         let ahead = plan(hdg);
-        let Some(stand) = self.net.nearest_stand(pos.0, pos.1) else {
+        let Some(stand) = self.parking_near(pos) else {
             return ahead;
         };
         let behind = plan((hdg + 180.0).rem_euclid(360.0));
@@ -243,6 +299,12 @@ impl FieldModel {
             return v;
         }
         let Some(route) = self.net.plan_to_stand(last.0, last.1, stand) else {
+            // No way drawn off (BIGH, a gravel strip whose network is its
+            // runway): straight to a stand that close, as a crew would.
+            if dist_m(last, (stand.lat, stand.lon)) <= STRAIGHT_TO_STAND_M {
+                v.path.push((stand.lat, stand.lon));
+                v.seg.push(Default::default());
+            }
             return v;
         };
         let start = route
@@ -264,6 +326,31 @@ impl FieldModel {
             }
         }
         v
+    }
+
+    /// `p` is on a runway strip or within [`STAND_RUNWAY_GAP_M`] of its
+    /// edge, alongside it: no place for a stand. UEMH 27 (world sweep,
+    /// 2026-10-09): a stand against the runway edge put a departure on the
+    /// runway within 15 m of starting to taxi.
+    pub fn beside_runway(&self, p: LatLon) -> bool {
+        self.on_runway(p)
+            || self.airport.runways.iter().any(|r| {
+                self.end(&r.ident_a).is_some_and(|e| {
+                    let (along, right) = e.frame(p);
+                    (0.0..=e.length_m).contains(&along)
+                        && right.abs() <= r.width_m.max(30.0) / 2.0 + STAND_RUNWAY_GAP_M
+                })
+            })
+    }
+
+    /// The nearest stand an arrival can park on: suitable and off every
+    /// runway strip.
+    pub fn parking_near(&self, p: LatLon) -> Option<&Stand> {
+        self.net
+            .stands
+            .iter()
+            .filter(|s| s.is_suitable() && !self.beside_runway((s.lat, s.lon)))
+            .min_by(|a, b| dist_m(p, (a.lat, a.lon)).total_cmp(&dist_m(p, (b.lat, b.lon))))
     }
 
     /// The taxi route from `from` onto `stand`.
@@ -426,6 +513,19 @@ fn slice_m(path: &[LatLon], a_m: f64, b_m: f64) -> Vec<LatLon> {
 pub const STAND_TAKEN_M: f64 = 20.0;
 
 /// Somebody in `occupied` is on `stand`.
+/// A stand is at least this far beyond a runway's edge, metres.
+const STAND_RUNWAY_GAP_M: f64 = 30.0;
+
+/// A vacate with no route off drives straight to a stand this close, metres.
+const STRAIGHT_TO_STAND_M: f64 = 800.0;
+
+/// An apron spot is at least this far from every runway, metres.
+const APRON_CLEAR_M: f64 = 120.0;
+/// ...and this far from the next one.
+const APRON_SPOT_GAP_M: f64 = 40.0;
+/// A field without stands gets at most this many.
+const APRON_SPOTS_MAX: usize = 12;
+
 /// A backtrack vacate is taken when its drive to the parking is under this
 /// share of the forward one's ([`FieldModel::vacate`]): a turn round on the
 /// runway is paid for only by a real saving.
@@ -583,5 +683,28 @@ mod tests {
         let cut = f.cut_at_crossings(&parallel);
         assert!(cut.crossings.is_empty());
         assert_eq!(cut.pieces, vec![parallel]);
+    }
+}
+#[cfg(test)]
+mod apron_tests {
+    use super::*;
+
+    /// A field with no stands gets its own apron spots at the dead ends of
+    /// its network clear of the runway (LXGB, 2026-10-09); the stand
+    /// filter never offers one beside the runway.
+    #[test]
+    fn a_field_with_no_stands_parks_at_its_network_dead_ends() {
+        let x = fixtures::xtst();
+        let mut net = x.net.clone();
+        net.stands.clear();
+        let f = FieldModel::new("XTST", x.airport.clone(), Some(net));
+        assert!(!f.net.stands.is_empty(), "apron spots made");
+        for s in &f.net.stands {
+            assert!(!f.beside_runway((s.lat, s.lon)), "{} beside the runway", s.name);
+            assert!(s.name.starts_with("Apron "));
+        }
+        let e = f.end("09").unwrap();
+        assert!(f.beside_runway(e.at(300.0, 30.0)), "30 m off the centreline is beside it");
+        assert!(!f.beside_runway(e.at(300.0, 200.0)));
     }
 }
