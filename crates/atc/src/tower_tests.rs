@@ -720,6 +720,11 @@ fn intents_parse_from_natural_calls() {
         parse_intent("what is our final approach speed"),
         Intent::Unknown
     );
+    // A callsign holding a cockpit word is still a final report (EGKK).
+    assert_eq!(
+        parse_intent("Speedbird two zero eight five, final runway two six left"),
+        Intent::ReportFinal
+    );
     // Questions are crew talk, never clearance requests — asking "what
     // runway shall I take off from" once earned a real takeoff clearance.
     assert_eq!(

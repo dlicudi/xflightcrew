@@ -740,11 +740,14 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // final" and "established in the cruise" are crew talk, and this is the
     // arm that earns the clearance most directly, so a mishear here is the
     // exact failure the corpus exists to prevent. A real final report never
-    // carries these words, so the honest calls all still parse.
+    // carries these words, so the honest calls all still parse. WORDS, not
+    // substrings: "Speedbird two zero eight five, final runway two six left"
+    // read as a speed question, got "say again" twice and went around
+    // (EGKK, 2026-10-09).
     if (word("final") || t.contains("establish"))
         && !t.contains("what")
-        && !t.contains("how")
-        && !t.contains("speed")
+        && !word("how")
+        && !word("speed")
         && !word("check")
         && !word("checks")
         && !word("flaps")
