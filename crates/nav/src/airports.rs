@@ -220,6 +220,42 @@ impl AirportInfo {
         self.freq(FREQ_TOWER)
             .filter(|f| !f.name.trim().eq_ignore_ascii_case("unnamed entity"))
     }
+
+    /// The name the controller keys: the tower row's own station name where
+    /// apt.dat gives one, else the header's first dash segment ("Badajoz-
+    /// Talavera La Real" keys "Badajoz Tower"). The header is a gazetteer
+    /// entry: EGKK's is "London Gatwick", its tower row "Gatwick Tower",
+    /// and the station answered as "London Gatwick Tower" (the realism
+    /// review, 2026-10-09). A row that is only a label ("TWR", "Tower
+    /// Freq", "KSFO Tower") names nothing.
+    pub fn radio_name(&self) -> String {
+        let from_row = self
+            .freqs
+            .iter()
+            .filter(|f| f.kind == FREQ_TOWER)
+            .find_map(|f| {
+                let words: Vec<&str> = f.name.split_whitespace().collect();
+                let at = words.iter().position(|w| w.eq_ignore_ascii_case("tower"))?;
+                let stem = &words[..at];
+                let named = !stem.is_empty()
+                    && stem.iter().all(|w| {
+                        w.chars()
+                            .all(|c| c.is_alphabetic() || c == '\'' || c == '-')
+                    })
+                    && !stem
+                        .iter()
+                        .all(|w| w.len() <= 4 && w.chars().all(|c| c.is_ascii_uppercase()));
+                named.then(|| stem.join(" "))
+            });
+        from_row.unwrap_or_else(|| {
+            self.name
+                .split('-')
+                .map(str::trim)
+                .find(|s| !s.is_empty())
+                .unwrap_or(&self.name)
+                .to_string()
+        })
+    }
 }
 
 /// The runways `icao` actually has, from X-Plane's Global Airports `apt.dat`.

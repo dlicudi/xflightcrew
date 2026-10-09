@@ -408,6 +408,12 @@ impl Station {
     pub fn airport_name(&self) -> &str {
         &self.apt.name
     }
+
+    /// The name the controller keys ("Gatwick" for "London Gatwick"):
+    /// [`nav::AirportInfo::radio_name`].
+    pub fn radio_name(&self) -> String {
+        self.apt.radio_name()
+    }
 }
 
 mod atis_watch;

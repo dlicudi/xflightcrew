@@ -82,7 +82,7 @@ pub fn atis_retune(com1_khz: i64, lat: f64, lon: f64, alt_msl_ft: f64) {
         );
         *ATIS.lock().unwrap_or_else(|e| e.into_inner()) = Some(AtisState {
             khz,
-            airport: spoken_airport(&a.apt.name).to_string(),
+            airport: a.apt.radio_name(),
             runways: a.apt.runways.clone(),
             letter: 'A',
             edition: None,

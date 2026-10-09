@@ -319,7 +319,7 @@ impl Station {
         let route = self.desk.planned_route.as_ref();
         tower::Ctx {
             callsign,
-            airport: spoken_airport(&self.apt.name).to_string(),
+            airport: self.apt.radio_name(),
             runway: atis::spoken_runway(&runway),
             qnh,
             wind: spoken_wind(wx.wind_from_deg, wx.wind_kts),

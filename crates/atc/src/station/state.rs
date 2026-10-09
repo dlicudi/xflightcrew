@@ -326,7 +326,7 @@ impl FieldFacts {
             );
             AtisState {
                 khz: f.khz,
-                airport: spoken_airport(&st.apt.name).to_string(),
+                airport: st.apt.radio_name(),
                 runways: st.apt.runways.clone(),
                 letter: 'A',
                 edition: None,

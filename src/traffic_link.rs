@@ -1034,7 +1034,12 @@ fn build_link(
             "source": source,
         }),
     );
-    Some(Link::new(field, schedule, name))
+    // The calls address the station by the name it answers to.
+    let name = match field.airport.radio_name() {
+        n if n.is_empty() => name.to_string(),
+        n => n,
+    };
+    Some(Link::new(field, schedule, &name))
 }
 
 /// The next generated hour at the fleet's field, round us.

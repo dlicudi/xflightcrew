@@ -3606,3 +3606,34 @@ fn a_one_edge_route_from_the_stand_still_holds_short() {
         "and the lead-on runs onto it: {plan:?}"
     );
 }
+
+#[test]
+fn the_radio_name_is_the_tower_rows_own_station_name() {
+    let field = |name: &str, rows: &[&str]| crate::AirportInfo {
+        name: name.to_string(),
+        elev_ft: 0.0,
+        runways: Vec::new(),
+        freqs: rows
+            .iter()
+            .map(|r| crate::AtcFreq {
+                kind: crate::FREQ_TOWER,
+                khz: 118_000,
+                name: r.to_string(),
+            })
+            .collect(),
+        transition_level_ft: None,
+        allows_circuits: None,
+        pattern_sides: Vec::new(),
+    };
+    // EGKK, EGLL: apt.dat's tower rows name the station.
+    assert_eq!(field("London Gatwick", &["Gatwick Tower"]).radio_name(), "Gatwick");
+    assert_eq!(field("London Heathrow", &["Heathrow Tower 1"]).radio_name(), "Heathrow");
+    // A label names nothing: the header's first dash segment.
+    assert_eq!(field("Badajoz- Talavera La Real", &["TWR"]).radio_name(), "Badajoz");
+    assert_eq!(field("Malaga", &["Tower Freq"]).radio_name(), "Malaga");
+    assert_eq!(
+        field("San Francisco Intl", &["KSFO Tower"]).radio_name(),
+        "San Francisco Intl"
+    );
+    assert_eq!(field("Gibraltar", &[]).radio_name(), "Gibraltar");
+}

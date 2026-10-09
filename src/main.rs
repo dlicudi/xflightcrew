@@ -1725,7 +1725,7 @@ async fn try_route_content_atc(
     if tower::is_say_again(tl)
         && party_line::is_radio_call(
             tl,
-            &party_line::spoken_airport(st.airport_name()).to_lowercase(),
+            &st.radio_name().to_lowercase(),
         )
         && repeat_controller(voice, reporter, tl, "unkeyed")
     {
