@@ -312,6 +312,26 @@ pub(crate) fn meeting_entry_m(
     other: &[(f64, f64)],
     need_m: f64,
 ) -> Option<f64> {
+    // Routes whose boxes are further apart than `need_m` never meet: most
+    // pairs at a busy field. Heathrow's peak hour (2026-10-09, 60 an hour
+    // and 80 parked) spent most of its time in this function, every pair
+    // of movers sampled against every segment each 0.1 s substep.
+    let bbox = |w: &[(f64, f64)]| {
+        w.iter().fold(
+            (
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ),
+            |(x0, y0, x1, y1), &(x, y)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+        )
+    };
+    let (a, b) = (bbox(mine), bbox(other));
+    if a.0 > b.2 + need_m || b.0 > a.2 + need_m || a.1 > b.3 + need_m || b.1 > a.3 + need_m {
+        return None;
+    }
+    let need2 = need_m * need_m;
     let opposed = MEETING_DEG.to_radians().cos();
     let segs: Vec<Seg> = other
         .windows(2)
@@ -340,7 +360,8 @@ pub(crate) fn meeting_entry_m(
             for &(a, u, l) in &segs {
                 let t = ((p.0 - a.0) * u.0 + (p.1 - a.1) * u.1).clamp(0.0, l);
                 let (fx, fy) = (a.0 + u.0 * t, a.1 + u.1 * t);
-                if (p.0 - fx).hypot(p.1 - fy) < need_m {
+                let (ex, ey) = (p.0 - fx, p.1 - fy);
+                if ex * ex + ey * ey < need2 {
                     near = true;
                     against |= dir.0 * u.0 + dir.1 * u.1 <= opposed;
                 }

@@ -15,6 +15,7 @@ pub mod fleet;
 pub mod kin;
 pub mod perf;
 pub mod phase;
+pub mod rate;
 pub mod rng;
 pub mod schedule;
 pub mod slot;

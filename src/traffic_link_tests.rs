@@ -155,7 +155,7 @@ pub(super) fn fly_field(
         &field,
         Density::Normal,
         3,
-        &SpawnCtx::default(),
+        &sweep_ctx(&field),
         &mut schedule,
     );
     schedule.extend(parked);
@@ -449,6 +449,21 @@ fn crowded(s: &HarnessScore) -> Option<(f64, f64)> {
         let ((a, _), (b, safety)) = (w[0], w[1]);
         (!safety && b - a < CALL_GAP_S - 1e-6).then_some((b - a, b))
     })
+}
+
+/// The time of day a harness flies at: `XVL_TRAFFIC_SWEEP_LOCAL_H=8` puts
+/// every field at 08:00 its own solar time (`traffic::rate`), so a world
+/// sweep is at each field's morning peak, `=3` at each one's night; unset,
+/// no clock (the field's peak rate, an even split).
+fn sweep_ctx(field: &FieldModel) -> SpawnCtx {
+    let zulu_s = std::env::var("XVL_TRAFFIC_SWEEP_LOCAL_H")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|h| traffic::rate::zulu_for_local(h, traffic::rate::field_lon(field)));
+    SpawnCtx {
+        zulu_s,
+        ..SpawnCtx::default()
+    }
 }
 
 /// The world sweep's window at each field: ten minutes of fleet time.
@@ -793,12 +808,14 @@ fn real_install_traffic_world_sweep_inner() {
         let net = crate::nav::find_taxi_net(&apt, &icao).ok().flatten();
         let has_stands = net.as_ref().is_some_and(|n| !n.stands.is_empty());
         let field = FieldModel::new(&icao, a.clone(), net).with_cifp(&cifp);
-        let schedule = traffic::generate(&field, Density::Normal, 3, &SpawnCtx::default());
+        let schedule = traffic::generate(&field, Density::Normal, 3, &sweep_ctx(&field));
         let Some(st) = Station::from_airport(a) else {
             continue;
         };
         let mut st = install(st, &apt, &icao, has_stands);
+        let peak = traffic::rate::peak_per_h(&field);
         let s = fly_field(&mut st, field, schedule, window_s);
+        print!("{icao} peak {peak:.0}/h, ");
         println!(
             "{icao}: {} scheduled, {} completed, {} calls, {} readbacks ({} accepted), \
              {} conflicts, {} oracle, spacing {}/{}/{} rerouted/towed/held, closest {:.2} of the spacing, \
