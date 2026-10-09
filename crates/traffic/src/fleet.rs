@@ -4,11 +4,16 @@
 use crate::aircraft::{Seen, TrafficAircraft};
 use crate::clock::{SimClock, SUBSTEP_S};
 use crate::field::FieldModel;
+use crate::kin::LatLon;
 use crate::phase::{Despawn, Event, Order, OwnTarget, Phase};
 
 /// Our own aircraft's id in the picture the fleet's aircraft see: no
 /// traffic id (those count up from 1).
 const OWN_ID: u32 = u32::MAX;
+
+/// The id of a stand an arrival is taxiing in to, in the picture: no
+/// aircraft stands there yet, but the stand is taken.
+const CLAIM_ID: u32 = u32::MAX - 1;
 
 /// The traffic at one field.
 #[derive(Debug, Clone)]
@@ -79,6 +84,29 @@ impl Fleet {
         self.own
     }
 
+    /// Where the fleet's aircraft stand on the ground, and the stands those
+    /// taxiing in are bound for: nothing spawns, parks or is sent onto
+    /// any of them. A stand was free until its arrival reached it, so a
+    /// departure due there spawned on it and the arrival drove in on top
+    /// (the hour sweep, 2026-10-08).
+    pub fn stands_held(&self) -> Vec<LatLon> {
+        self.aircraft
+            .iter()
+            .filter(|a| a.kin.on_ground)
+            .map(|a| a.kin.pos())
+            .chain(self.stands_claimed())
+            .collect()
+    }
+
+    /// The stands the aircraft taxiing in are bound for.
+    fn stands_claimed(&self) -> impl Iterator<Item = LatLon> + '_ {
+        self.aircraft
+            .iter()
+            .filter(|a| a.phase == Phase::TaxiIn)
+            .filter_map(|a| a.stand.as_deref().and_then(|n| self.field.stand(n)))
+            .map(|s| (s.lat, s.lon))
+    }
+
     /// Everyone's id, phase and position.
     pub fn picture(&self) -> Vec<Seen> {
         self.aircraft
@@ -116,6 +144,14 @@ impl Fleet {
                     gs_kts: 0.0,
                 });
             }
+            // A stand somebody is taxiing in to is taken already.
+            let claimed: Vec<LatLon> = self.stands_claimed().collect();
+            picture.extend(claimed.into_iter().map(|pos| Seen {
+                id: CLAIM_ID,
+                phase: Phase::Parked,
+                pos,
+                gs_kts: 0.0,
+            }));
             crate::spacing::apply(
                 &mut self.aircraft,
                 &self.field,

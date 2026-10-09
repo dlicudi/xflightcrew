@@ -1017,7 +1017,9 @@ fn two_departures_for_one_hold_queue_behind_each_other() {
                     lined_up_at.insert(*id, t);
                 }
                 Event::Despawn { id, .. } => gone.push(*id),
-                Event::SpacingWaived { .. } => panic!("a queue is never waived: {e:?}"),
+                Event::SpacingRerouted { .. }
+                | Event::SpacingCleared { .. }
+                | Event::SpacingHeld { .. } => panic!("a queue is waited in: {e:?}"),
                 _ => {}
             }
         }
@@ -1040,54 +1042,6 @@ fn two_departures_for_one_hold_queue_behind_each_other() {
     );
     gone.sort();
     assert_eq!(gone, vec![1, 2], "both departed");
-}
-
-/// Two movers each with the other ahead (head on, one taxiway): the one
-/// with the right of way goes on, the other waits, and both reach their
-/// ends; never a standoff.
-#[test]
-fn a_head_on_meeting_on_one_taxiway_resolves() {
-    let field = fixtures::xtst();
-    let end = field.end("09").unwrap();
-    let (a_end, b_end) = (end.at(100.0, -150.0), end.at(500.0, -150.0));
-    let mut fleet = Fleet::new(field.clone());
-    fleet.spawn(taxiing(&field, 1, "C172", vec![a_end, b_end]));
-    fleet.spawn(taxiing(&field, 2, "C172", vec![b_end, a_end]));
-    let taxi = Order {
-        state: TowerState::TaxiCleared,
-        ..Default::default()
-    };
-    let mut arrived = HashMap::new();
-    let mut t = 0.0;
-    let mut stood = 0.0;
-    while t < 600.0 && arrived.len() < 2 {
-        // No "ready" answered: each stays at its end once there.
-        let events = fleet.step(0.1, None, &|_| Some(taxi.clone()));
-        t += 0.1;
-        for e in &events {
-            if let Event::Phase {
-                id,
-                to: Phase::HoldShort,
-                ..
-            } = e
-            {
-                arrived.insert(*id, t);
-            }
-        }
-        if fleet
-            .get(2)
-            .is_some_and(|b| b.phase == Phase::TaxiOut && b.kin.gs_kts < 0.1)
-        {
-            stood += 0.1;
-        }
-    }
-    println!("head on: arrived {arrived:?}, number two gave way {stood:.0} s");
-    assert_eq!(arrived.len(), 2, "both reached their ends");
-    assert!(stood > 1.0, "the lower right of way gave way");
-    assert!(
-        fleet.aircraft().iter().all(|a| a.spacing.waived.is_empty()),
-        "resolved by right of way, not by the guard"
-    );
 }
 
 /// "Ahead" is along the route, not a cone: an aircraft on a parallel
@@ -1164,7 +1118,12 @@ fn our_own_aircraft_on_the_path_stops_a_taxiing_aircraft() {
     // Standing there 80 s: less than the gridlock guard once it has stopped.
     while t < 80.0 {
         let ev = fleet.step(0.1, Some(us), &|_| None);
-        assert!(!ev.iter().any(|e| matches!(e, Event::SpacingWaived { .. })));
+        assert!(!ev.iter().any(|e| matches!(
+            e,
+            Event::SpacingRerouted { .. }
+                | Event::SpacingCleared { .. }
+                | Event::SpacingHeld { .. }
+        )));
         t += 0.1;
         closest = closest.min(dist_m(fleet.get(1).unwrap().kin.pos(), own_at));
     }
@@ -1187,43 +1146,6 @@ fn our_own_aircraft_on_the_path_stops_a_taxiing_aircraft() {
         t += 0.1;
     }
     assert_eq!(fleet.get(1).unwrap().phase, Phase::HoldShort, "went on");
-}
-
-/// The gridlock guard: an aircraft that will not move (our own here)
-/// standing on the route longer than [`crate::spacing::STUCK_S`] is passed,
-/// and said ([`Event::SpacingWaived`]), rather than the field stopping for
-/// good.
-#[test]
-fn a_blocker_that_never_moves_is_passed_after_the_guard() {
-    use crate::phase::OwnTarget;
-    use crate::spacing::STUCK_S;
-    let field = fixtures::xtst();
-    let end = field.end("09").unwrap();
-    let path = vec![end.at(100.0, -150.0), end.at(600.0, -150.0)];
-    let mut fleet = Fleet::new(field.clone());
-    fleet.spawn(taxiing(&field, 1, "C172", path));
-    let us = OwnTarget {
-        pos: end.at(350.0, -150.0),
-        alt_ft: field.elev_ft(),
-        on_ground: true,
-    };
-    let (mut waived, mut arrived, mut t) = (None, false, 0.0);
-    while t < 600.0 && !arrived {
-        for e in fleet.step(0.1, Some(us), &|_| None) {
-            match e {
-                Event::SpacingWaived { id: 1, past: None } => waived = Some(t),
-                Event::Phase {
-                    to: Phase::HoldShort,
-                    ..
-                } => arrived = true,
-                _ => {}
-            }
-        }
-        t += 0.1;
-    }
-    let w = waived.expect("the guard passed us");
-    assert!(w > STUCK_S, "only after the guard: {w:.0} s");
-    assert!(arrived, "and reached its end");
 }
 
 /// THE BIEG GRIDLOCK (world sweep, 2026-10-08): a landing's vacate stopped
@@ -1292,40 +1214,580 @@ fn a_vacate_stopped_clear_of_the_runway_behind_traffic_reports_vacated() {
     );
 }
 
-/// Nose to nose with one standing still (a departure held at its hold, the
-/// arrival taxiing in past it): it will not come on, so waiting for it only
-/// holds the mover. Passed, never waited for (UUYY's hour, 2026-10-08:
-/// six arrivals stood 90 s each in front of a held departure).
+/// The closest two taxiing aircraft (one of them moving) stand in `fleet`,
+/// as a share of the spacing sized from both: the check every new spacing
+/// test makes each substep (nothing driven through anybody, 2026-10-09).
+fn closest_taxi_share(fleet: &Fleet) -> f64 {
+    use crate::spacing::spacing_m;
+    let taxiing = |p: Phase| {
+        matches!(
+            p,
+            Phase::TaxiOut | Phase::TaxiIn | Phase::Vacate | Phase::LineUp | Phase::HoldShort
+        )
+    };
+    let ground: Vec<&TrafficAircraft> = fleet
+        .aircraft()
+        .iter()
+        .filter(|a| a.kin.on_ground && taxiing(a.phase))
+        .collect();
+    let mut closest = f64::INFINITY;
+    for (k, a) in ground.iter().enumerate() {
+        for b in &ground[k + 1..] {
+            if a.kin.gs_kts < 0.5 && b.kin.gs_kts < 0.5 {
+                continue;
+            }
+            let d = dist_m(a.kin.pos(), b.kin.pos());
+            closest = closest.min(d / spacing_m(a.perf, b.perf));
+        }
+    }
+    closest
+}
+
+/// The guard's events in `events`: (rerouted, towed, held).
+fn guard_events(events: &[Event]) -> (usize, usize, usize) {
+    let n = |f: fn(&Event) -> bool| events.iter().filter(|e| f(e)).count();
+    (
+        n(|e| matches!(e, Event::SpacingRerouted { .. })),
+        n(|e| matches!(e, Event::SpacingCleared { .. })),
+        n(|e| matches!(e, Event::SpacingHeld { .. })),
+    )
+}
+
+/// HEAD ON AT A JUNCTION (the pass-through, 2026-10-09: the one with the
+/// right of way drove THROUGH the other). [2] taxis east along the line;
+/// [1] comes up a side branch and would turn west down the same line,
+/// straight at it. [2] is already on the stretch they share, so [1] (the
+/// lower id, but not yet on it) holds short of the junction until [2] is
+/// past it, then goes; the two never come within the spacing of each
+/// other, and nobody needs the guard.
 #[test]
-fn one_standing_head_on_is_passed_not_waited_for() {
+fn head_on_at_a_junction_the_one_giving_way_holds_short_of_it() {
+    use crate::spacing::spacing_m;
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    let junction = end.at(400.0, -150.0);
+    let mut fleet = Fleet::new(field.clone());
+    fleet.spawn(taxiing(
+        &field,
+        1,
+        "C172",
+        vec![end.at(400.0, -300.0), junction, end.at(100.0, -150.0)],
+    ));
+    fleet.spawn(taxiing(
+        &field,
+        2,
+        "C172",
+        vec![end.at(100.0, -150.0), end.at(700.0, -150.0)],
+    ));
+    let gap = spacing_m(fleet.get(1).unwrap().perf, fleet.get(2).unwrap().perf);
+    let taxi = Order {
+        state: TowerState::TaxiCleared,
+        ..Default::default()
+    };
+    let (mut arrived, mut all, mut closest, mut stood, mut t) =
+        (HashMap::new(), Vec::new(), f64::INFINITY, 0.0, 0.0);
+    let mut held_at: Option<LatLon> = None;
+    while t < 600.0 && arrived.len() < 2 {
+        let events = fleet.step(0.1, None, &|_| Some(taxi.clone()));
+        t += 0.1;
+        for e in &events {
+            if let Event::Phase {
+                id,
+                to: Phase::HoldShort,
+                ..
+            } = e
+            {
+                arrived.insert(*id, t);
+            }
+        }
+        all.extend(events);
+        closest = closest.min(closest_taxi_share(&fleet));
+        let one = fleet.get(1).unwrap();
+        if one.phase == Phase::TaxiOut && one.kin.gs_kts < 0.1 && t > 5.0 {
+            stood += 0.1;
+            held_at.get_or_insert(one.kin.pos());
+        }
+    }
+    let held_at = held_at.expect("number one held");
+    println!(
+        "junction: arrived {arrived:?}, number one held {stood:.0} s {:.0} m short of the \
+         junction, closest {closest:.2} of the spacing ({gap:.0} m)",
+        dist_m(held_at, junction)
+    );
+    assert_eq!(arrived.len(), 2, "both reached their ends");
+    assert!(
+        arrived[&2] < arrived[&1],
+        "the one on the stretch went first"
+    );
+    assert!(stood > 10.0, "number one gave way: {stood:.0} s");
+    assert!(
+        end.frame(held_at).1 < -160.0,
+        "held on the branch, off the line: {:.0} m",
+        end.frame(held_at).1
+    );
+    assert!(closest >= 0.9, "never inside the spacing: {closest:.2}");
+    assert_eq!(guard_events(&all), (0, 0, 0), "no guard needed");
+}
+
+/// HEAD ON ON A DEAD END: a 172 taxiing up a line with a 737 PARKED on it,
+/// facing it, and nothing else to the way. It stops short by the spacing
+/// and waits; after the guard it is planned another way round on the
+/// network, or (with none) the 737 is towed clear, and then it goes on to
+/// its end. Never driven through it (2026-10-09).
+#[test]
+fn a_parked_blocker_on_the_line_is_gone_round_or_towed_never_driven_through() {
+    use crate::spacing::{spacing_m, STUCK_S};
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    let blocker_at = end.at(350.0, -150.0);
+    let mut fleet = Fleet::new(field.clone());
+    fleet.spawn(taxiing(
+        &field,
+        1,
+        "C172",
+        vec![end.at(100.0, -150.0), end.at(600.0, -150.0)],
+    ));
+    let mut parked = taxiing(&field, 2, "B738", vec![blocker_at, end.at(349.0, -150.0)]);
+    parked.plan = Plan::Parked;
+    parked.phase = Phase::Parked;
+    fleet.spawn(parked);
+    let gap = spacing_m(&crate::perf::PISTON_SINGLE, &crate::perf::JET_MED);
+    let (mut closest, mut t, mut acted, mut all) = (f64::INFINITY, 0.0, None, Vec::new());
+    while t < 900.0 && fleet.get(1).is_some_and(|a| a.phase == Phase::TaxiOut) {
+        let events = fleet.step(0.1, None, &|_| None);
+        t += 0.1;
+        if acted.is_none() && guard_events(&events) != (0, 0, 0) {
+            acted = Some(t);
+        }
+        all.extend(events);
+        if let (Some(a), Some(b)) = (fleet.get(1), fleet.get(2)) {
+            closest = closest.min(dist_m(a.kin.pos(), b.kin.pos()));
+        }
+    }
+    let (rerouted, towed, held) = guard_events(&all);
+    println!(
+        "dead end: guard at {acted:?} s, rerouted {rerouted} towed {towed} held {held}, \
+         closest {closest:.1} m (spacing {gap:.1})"
+    );
+    let at = acted.expect("the guard acted");
+    assert!(at >= STUCK_S, "only after the guard: {at:.0} s");
+    assert!(rerouted + towed == 1, "gone round, or the blocker towed");
+    assert!(closest >= 0.7 * gap, "{closest:.1} m inside {gap:.1}");
+    assert_eq!(
+        fleet.get(1).map(|a| a.phase),
+        Some(Phase::HoldShort),
+        "and reached its end"
+    );
+}
+
+/// OUR OWN AIRCRAFT IS NEVER TOWED AND NEVER DRIVEN THROUGH: a taxiing
+/// aircraft held behind us is planned another way round, or waits as long
+/// as we stand there, saying so once and nothing more.
+#[test]
+fn our_own_aircraft_is_gone_round_or_waited_for_never_passed() {
+    use crate::phase::OwnTarget;
+    use crate::spacing::spacing_m;
     let field = fixtures::xtst();
     let end = field.end("09").unwrap();
     let path = vec![end.at(100.0, -150.0), end.at(600.0, -150.0)];
-    // Held at 350 m along, facing back down the mover's line.
-    let mut held = taxiing(
-        &field,
-        2,
-        "B738",
-        vec![end.at(350.0, -150.0), end.at(349.0, -150.0)],
+    let mut fleet = Fleet::new(field.clone());
+    fleet.spawn(taxiing(&field, 1, "C172", path));
+    let own_at = end.at(350.0, -150.0);
+    let us = OwnTarget {
+        pos: own_at,
+        alt_ft: field.elev_ft(),
+        on_ground: true,
+    };
+    let gap = spacing_m(&crate::perf::PISTON_SINGLE, &crate::perf::JET_MED);
+    let (mut closest, mut t, mut all) = (f64::INFINITY, 0.0, Vec::new());
+    while t < 900.0 && fleet.get(1).unwrap().phase == Phase::TaxiOut {
+        all.extend(fleet.step(0.1, Some(us), &|_| None));
+        t += 0.1;
+        closest = closest.min(dist_m(fleet.get(1).unwrap().kin.pos(), own_at));
+    }
+    let (rerouted, towed, held) = guard_events(&all);
+    println!(
+        "behind us: rerouted {rerouted} held {held}, closest {closest:.1} m (spacing {gap:.1})"
     );
+    assert_eq!(towed, 0, "never towed");
+    assert!(
+        all.iter().all(|e| match e {
+            Event::SpacingRerouted { around, .. } => around.is_none(),
+            Event::SpacingHeld { behind, .. } => behind.is_none(),
+            _ => true,
+        }),
+        "the guard was about us"
+    );
+    assert!(held <= 1, "said once: {held}");
+    // Stopped by the spacing, then a turn away (its first metres swing on).
+    assert!(closest >= 0.9 * gap, "{closest:.1} m inside {gap:.1}");
+    let a = fleet.get(1).unwrap();
+    if rerouted == 1 {
+        assert_eq!(a.phase, Phase::HoldShort, "gone round to its end");
+    } else {
+        assert_eq!(held, 1);
+        assert!(a.kin.gs_kts < 0.1, "still waiting behind us");
+    }
+}
+
+/// Nose to nose with one standing still (a departure held at its hold, the
+/// arrival taxiing in past it, UUYY's hour, 2026-10-08): it stops short by
+/// the spacing, never through it, and after the guard goes another way
+/// round or has the one that will not move towed clear.
+#[test]
+fn one_standing_head_on_is_never_driven_through() {
+    use crate::spacing::spacing_m;
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    let path = vec![end.at(100.0, -150.0), end.at(600.0, -150.0)];
+    let held_at = end.at(350.0, -150.0);
+    let mut held = taxiing(&field, 2, "B738", vec![held_at, end.at(349.0, -150.0)]);
     held.phase = Phase::HoldShort;
     let mut fleet = Fleet::new(field.clone());
     fleet.spawn(taxiing(&field, 1, "C172", path));
     fleet.spawn(held);
-    let mut slowest = f64::INFINITY;
-    let mut t = 0.0;
-    while t < 300.0 && fleet.get(1).unwrap().phase == Phase::TaxiOut {
-        fleet.step(0.1, None, &|_| None);
+    let gap = spacing_m(&crate::perf::PISTON_SINGLE, &crate::perf::JET_MED);
+    let (mut closest, mut t, mut all) = (f64::INFINITY, 0.0, Vec::new());
+    while t < 900.0 && fleet.get(1).unwrap().phase == Phase::TaxiOut {
+        all.extend(fleet.step(0.1, None, &|_| None));
         t += 0.1;
-        let a = fleet.get(1).unwrap();
-        if t > 20.0 && a.phase == Phase::TaxiOut && a.route.dist_to(a.kin.pos(), 1) > 50.0 {
-            slowest = slowest.min(a.kin.gs_kts);
+        if let (Some(a), Some(b)) = (fleet.get(1), fleet.get(2)) {
+            closest = closest.min(dist_m(a.kin.pos(), b.kin.pos()));
         }
     }
+    let (rerouted, towed, _) = guard_events(&all);
+    println!("held head on: rerouted {rerouted} towed {towed}, closest {closest:.1} m");
+    assert!(closest >= 0.9 * gap, "{closest:.1} m inside {gap:.1}");
+    assert!(rerouted + towed == 1, "gone round, or towed");
     assert_eq!(
         fleet.get(1).unwrap().phase,
         Phase::HoldShort,
         "reached its end"
     );
-    assert!(slowest > 9.0, "never slowed for it: {slowest:.1} kt");
+}
+
+/// Met too late to hold short (both already on the one stretch, nose to
+/// nose, no junction between them): both stop by the spacing, neither
+/// drives through, and the guard turns ONE of them away round the network
+/// (the lesser right of way is asked first; here its only way to its hold
+/// runs back through the other, so the other turns); both reach their
+/// holds.
+#[test]
+fn met_head_on_too_late_both_stop_and_one_is_turned_away() {
+    use crate::spacing::STUCK_S;
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    let (a_end, b_end) = (end.at(100.0, -150.0), end.at(500.0, -150.0));
+    let mut fleet = Fleet::new(field.clone());
+    fleet.spawn(taxiing(&field, 1, "C172", vec![a_end, b_end]));
+    fleet.spawn(taxiing(&field, 2, "C172", vec![b_end, a_end]));
+    let taxi = Order {
+        state: TowerState::TaxiCleared,
+        ..Default::default()
+    };
+    let (mut closest, mut t, mut all) = (f64::INFINITY, 0.0, Vec::new());
+    let mut first_guard = None;
+    while t < 1200.0 && fleet.aircraft().iter().any(|a| a.phase == Phase::TaxiOut) {
+        let ev = fleet.step(0.1, None, &|_| Some(taxi.clone()));
+        t += 0.1;
+        if first_guard.is_none() {
+            first_guard = ev.iter().find_map(|e| match e {
+                Event::SpacingRerouted { id, .. } | Event::SpacingCleared { id, .. } => {
+                    Some((*id, t))
+                }
+                _ => None,
+            });
+        }
+        all.extend(ev);
+        closest = closest.min(closest_taxi_share(&fleet));
+    }
+    let (rerouted, towed, held) = guard_events(&all);
+    println!(
+        "too late: first guard {first_guard:?}, rerouted {rerouted} towed {towed} held {held}, \
+         closest {closest:.2} of the spacing"
+    );
+    let (_, at) = first_guard.expect("the guard sorted it");
+    assert!(at >= STUCK_S);
+    assert_eq!(rerouted + towed, 1, "one turned away");
+    assert!(closest >= 0.7, "never inside the spacing: {closest:.2}");
+    assert!(
+        fleet.aircraft().iter().all(|a| a.phase == Phase::HoldShort),
+        "both reached their ends: {:?}",
+        fleet
+            .aircraft()
+            .iter()
+            .map(|a| (a.id, a.phase))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// ONE STAND, ONE AIRCRAFT: `field`'s schedule for two hours (the second
+/// generated round the fleet at the hour, as the link does), its parked
+/// aircraft and its departures waiting on their stands put down at the
+/// start, everything flown against the scripted tower. At every substep no
+/// stand holds two aircraft (parked on it, or taxiing in to it), and no
+/// two parked aircraft stand inside each other (CYJP and EFMI in the hour
+/// sweep, 2026-10-08: stands of one name resolved to the first). Returns
+/// the movements flown and the findings.
+fn fly_hours_one_per_stand(field: FieldModel, seed: u64) -> (usize, Vec<String>) {
+    use crate::field::STAND_TAKEN_M;
+    use crate::schedule::{generate, park_at_start, Density, Movement, SpawnCtx};
+    let mut schedule = generate(&field, Density::Normal, seed, &SpawnCtx::default());
+    let parked = park_at_start(
+        &field,
+        Density::Normal,
+        seed,
+        &SpawnCtx::default(),
+        &mut schedule,
+    );
+    let mut fleet = Fleet::new(field);
+    let tower = RefCell::new(ScriptedTower::default());
+    let mut next = 1u32;
+    let ctx = |fleet: &Fleet| SpawnCtx {
+        occupied: fleet.stands_held(),
+        ..Default::default()
+    };
+    // (time, the dormant aircraft standing for it, the movement)
+    let mut due: Vec<(f64, Option<u32>, Movement)> = Vec::new();
+    for m in schedule {
+        let held = if m.parked_from_start {
+            m.park(next, &fleet.field, &ctx(&fleet)).ok().map(|ac| {
+                let id = ac.id;
+                fleet.spawn(ac);
+                next += 1;
+                id
+            })
+        } else {
+            None
+        };
+        due.push((m.t_s, held, m));
+    }
+    for m in parked {
+        if let Ok(ac) = m.park(next, &fleet.field, &ctx(&fleet)) {
+            fleet.spawn(ac);
+            next += 1;
+        }
+    }
+    let mut findings = Vec::new();
+    let mut flown = 0;
+    let mut regenerated = false;
+    let mut t = 0.0;
+    while t < 2.0 * 3600.0 {
+        if !regenerated && t >= 3600.0 {
+            regenerated = true;
+            for m in generate(&fleet.field, Density::Normal, seed + 1, &ctx(&fleet)) {
+                due.push((t + m.t_s, None, m));
+            }
+        }
+        let mut later = Vec::new();
+        for (at, held, m) in std::mem::take(&mut due) {
+            if at > t {
+                later.push((at, held, m));
+                continue;
+            }
+            if let Some(id) = held {
+                if let Ok(plan) = m.plan(&fleet.field) {
+                    if fleet.release(id, plan) {
+                        flown += 1;
+                        continue;
+                    }
+                }
+            }
+            match m.spawn(next, &fleet.field, &ctx(&fleet)) {
+                Ok(ac) => {
+                    fleet.spawn(ac);
+                    next += 1;
+                    flown += 1;
+                }
+                Err(crate::schedule::Refusal::NoRunway) => {}
+                Err(_) => later.push((t + 30.0, None, m)),
+            }
+        }
+        due = later;
+        let events = fleet.step(0.1, None, &|id| tower.borrow().orders.get(&id).cloned());
+        t += 0.1;
+        for e in &events {
+            tower.borrow_mut().hear(e);
+        }
+        // Who is on, or bound for, each stand.
+        let stands = &fleet.field.net.stands;
+        let mut on: HashMap<usize, Vec<u32>> = HashMap::new();
+        for a in fleet.aircraft() {
+            let k = match a.phase {
+                Phase::Parked => stands
+                    .iter()
+                    .enumerate()
+                    .map(|(k, s)| (k, dist_m(a.kin.pos(), (s.lat, s.lon))))
+                    .filter(|(_, d)| *d < STAND_TAKEN_M)
+                    .min_by(|x, y| x.1.total_cmp(&y.1))
+                    .map(|(k, _)| k),
+                Phase::TaxiIn => a
+                    .stand
+                    .as_deref()
+                    .and_then(|n| stands.iter().position(|s| s.name == n)),
+                _ => None,
+            };
+            if let Some(k) = k {
+                on.entry(k).or_default().push(a.id);
+            }
+        }
+        for (k, ids) in on.iter().filter(|(_, ids)| ids.len() > 1) {
+            if findings.len() < 10 {
+                findings.push(format!("{t:.0} s stand {:?}: {ids:?}", stands[*k].name));
+            }
+        }
+        let parked: Vec<&TrafficAircraft> = fleet
+            .aircraft()
+            .iter()
+            .filter(|a| a.phase == Phase::Parked)
+            .collect();
+        for (k, a) in parked.iter().enumerate() {
+            for b in &parked[k + 1..] {
+                let d = dist_m(a.kin.pos(), b.kin.pos());
+                if d < 5.0 && findings.len() < 10 {
+                    findings.push(format!("{t:.0} s [{}] and [{}] {d:.1} m apart", a.id, b.id));
+                }
+            }
+        }
+    }
+    (flown, findings)
+}
+
+/// EFMI's real layout: eight of its ten stands are called "Apron Stand".
+fn efmi() -> FieldModel {
+    let mut f = FieldModel::load(&fixtures::path("efmi.dat"), "EFMI")
+        .unwrap()
+        .expect("EFMI in the fixture");
+    f.procs.sids = vec!["ELBO1A".into(), "ELBO1B".into()];
+    f.procs.approaches = vec!["R11".into(), "R29".into()];
+    f
+}
+
+/// CYJP's real layout: four tie-downs all called "GA Tie-Down".
+fn cyjp() -> FieldModel {
+    FieldModel::load(&fixtures::path("cyjp.dat"), "CYJP")
+        .unwrap()
+        .expect("CYJP in the fixture")
+}
+
+/// A field that names its stands alike has them named apart: each one
+/// found by its own name.
+#[test]
+fn every_stand_has_a_name_of_its_own() {
+    for f in [efmi(), cyjp()] {
+        let names: std::collections::HashSet<&str> =
+            f.net.stands.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), f.net.stands.len(), "{}", f.icao);
+        for s in &f.net.stands {
+            let found = f.stand(&s.name).unwrap();
+            assert!(
+                (found.lat, found.lon) == (s.lat, s.lon),
+                "{} {}",
+                f.icao,
+                s.name
+            );
+        }
+    }
+    assert!(efmi().stand("Apron Stand 8").is_some());
+}
+
+/// TWO AIRCRAFT ON ONE STAND (CYJP, EFMI, the hour sweep, 2026-10-08):
+/// never, at spawn, parked at the start, or taxiing in, over two generated
+/// hours at fields with many stands, several of them named alike.
+#[test]
+fn no_stand_ever_holds_two_aircraft() {
+    let fields = [
+        efmi(),
+        cyjp(),
+        fixtures::xtst_ifr(),
+        fixtures::xnoc(),
+        FieldModel::load(&fixtures::path("ulmm.dat"), "ULMM")
+            .unwrap()
+            .map(|mut f| {
+                f.procs.sids = vec!["ASGO2E".into(), "EKLE2G".into()];
+                f.procs.approaches = vec!["I13-Y".into(), "I31-Y".into()];
+                f
+            })
+            .unwrap(),
+    ];
+    for f in fields {
+        for seed in [3, 7] {
+            let icao = f.icao.clone();
+            let (flown, findings) = fly_hours_one_per_stand(f.clone(), seed);
+            println!(
+                "{icao} seed {seed}: {flown} flown, {} findings",
+                findings.len()
+            );
+            assert!(flown > 0, "{icao}: nothing flew");
+            assert!(findings.is_empty(), "{icao} seed {seed}: {findings:#?}");
+        }
+    }
+}
+
+/// The same over real fields from the install, the sweep's two among them.
+/// `cargo test -p traffic --release -- --ignored real_install_no_stand --nocapture`
+#[test]
+#[ignore] // needs the real X-Plane install
+fn real_install_no_stand_ever_holds_two_aircraft() {
+    let apt = nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    let cifp = nav::test_xplane_path("Custom Data/CIFP");
+    for icao in [
+        "CYJP", "EFMI", "LEMG", "BIEG", "EFUT", "UUYY", "ENGM", "BIKF",
+    ] {
+        let Ok(Some(f)) = FieldModel::load(&apt, icao) else {
+            println!("{icao}: not in the install");
+            continue;
+        };
+        let f = f.with_cifp(&cifp);
+        let (flown, findings) = fly_hours_one_per_stand(f, 3);
+        println!("{icao}: {flown} flown, {} findings", findings.len());
+        assert!(findings.is_empty(), "{icao}: {findings:#?}");
+    }
+}
+
+/// A generated hour is flown with nobody ever inside anybody's spacing on
+/// the ground: every substep, every pair of taxiing aircraft.
+#[test]
+fn a_generated_hour_keeps_every_taxiing_pair_apart() {
+    for f in [fixtures::xtst_ifr(), fixtures::xnoc()] {
+        let icao = f.icao.clone();
+        let mut fleet = Fleet::new(f);
+        let plan = crate::schedule::generate(
+            &fleet.field,
+            crate::schedule::Density::Normal,
+            11,
+            &crate::schedule::SpawnCtx::default(),
+        );
+        let tower = RefCell::new(ScriptedTower::default());
+        let mut waiting: Vec<(u32, crate::schedule::Movement)> = plan
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| (i as u32 + 1, m))
+            .collect();
+        let mut closest = f64::INFINITY;
+        let mut t = 0.0;
+        while t < 2.0 * 3600.0 && (!waiting.is_empty() || !fleet.aircraft().is_empty()) {
+            let ctx = crate::schedule::SpawnCtx {
+                occupied: fleet.stands_held(),
+                ..Default::default()
+            };
+            waiting.retain(|(id, m)| {
+                m.t_s > t
+                    || match m.spawn(*id, &fleet.field, &ctx) {
+                        Ok(ac) => {
+                            fleet.spawn(ac);
+                            false
+                        }
+                        Err(_) => true,
+                    }
+            });
+            for e in fleet.step(0.1, None, &|id| tower.borrow().orders.get(&id).cloned()) {
+                tower.borrow_mut().hear(&e);
+            }
+            t += 0.1;
+            closest = closest.min(closest_taxi_share(&fleet));
+        }
+        println!("{icao}: closest taxiing pair {closest:.2} of the spacing");
+        assert!(closest >= 0.7, "{icao}: {closest:.2} of the spacing");
+    }
 }

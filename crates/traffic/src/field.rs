@@ -94,14 +94,36 @@ impl RunwayEnd {
 }
 
 impl FieldModel {
-    /// From parsed parts (tests and callers that already hold them).
+    /// From parsed parts (tests and callers that already hold them). Every
+    /// stand's name is made the field's own ([`unique_stand_names`]).
     pub fn new(icao: &str, airport: AirportInfo, net: Option<TaxiNet>) -> FieldModel {
+        let mut net = net.unwrap_or_default();
+        unique_stand_names(&mut net.stands);
         FieldModel {
             icao: icao.to_string(),
             airport,
-            net: net.unwrap_or_default(),
+            net,
             procs: Procedures::default(),
         }
+    }
+
+    /// The field with no taxi edge passing within `clear_m` of `avoid`:
+    /// where the ground spacing's guard plans a way round an aircraft that
+    /// will not move off a route ([`crate::spacing::apply`]). The runways'
+    /// own edges stay: a vacate is planned from them, and with the one under
+    /// it gone there was no vacate at all (ULMM, 2026-10-09: a departure
+    /// held short at the exit, and every other exit refused).
+    pub fn without_edges_near(&self, avoid: LatLon, clear_m: f64) -> FieldModel {
+        let mut f = self.clone();
+        let nodes = &self.net.nodes;
+        f.net.edges.retain(|e| {
+            e.runway
+                || match (nodes.get(&e.a), nodes.get(&e.b)) {
+                    (Some(&a), Some(&b)) => crate::kin::cross_track_m(&[a, b], avoid) > clear_m,
+                    _ => true,
+                }
+        });
+        f
     }
 
     /// With the procedures from the CIFP folder.
@@ -381,6 +403,29 @@ fn slice_m(path: &[LatLon], a_m: f64, b_m: f64) -> Vec<LatLon> {
     }
     out.dedup();
     out
+}
+
+/// Every stand named once: a second stand of the same name gets a number
+/// ("GA Tie-Down 2"). Stands are found BY NAME ([`FieldModel::stand`]), and
+/// at a field that names every tie-down alike each one resolved to the
+/// first: CYJP's four "GA Tie-Down" and EFMI's eight "Apron Stand" put two
+/// and three aircraft on one stand in the hour sweep (2026-10-08).
+fn unique_stand_names(stands: &mut [Stand]) {
+    let mut used: std::collections::HashSet<String> =
+        stands.iter().map(|s| s.name.clone()).collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in stands.iter_mut() {
+        if seen.insert(s.name.clone()) {
+            continue;
+        }
+        let name = (2..)
+            .map(|k| format!("{} {k}", s.name))
+            .find(|n| !used.contains(n))
+            .unwrap_or_default();
+        used.insert(name.clone());
+        seen.insert(name.clone());
+        s.name = name;
+    }
 }
 
 /// An aircraft this close to a stand is on it.

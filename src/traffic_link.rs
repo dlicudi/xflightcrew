@@ -479,12 +479,7 @@ impl Link {
         let ctx = |fleet: &Fleet| SpawnCtx {
             runway: None,
             own,
-            occupied: fleet
-                .aircraft()
-                .iter()
-                .filter(|a| a.kin.on_ground)
-                .map(|a| a.kin.pos())
-                .collect(),
+            occupied: fleet.stands_held(),
         };
         for i in 0..self.due.len() {
             if !self.due[i].m.parked_from_start {
@@ -561,13 +556,9 @@ impl Link {
         let ctx = SpawnCtx {
             runway: None,
             own: own.map(|o| (o.lat, o.lon)),
-            occupied: self
-                .fleet
-                .aircraft()
-                .iter()
-                .filter(|a| a.kin.on_ground)
-                .map(|a| a.kin.pos())
-                .collect(),
+            // The stands arrivals are taxiing in to are taken too: a
+            // departure spawned on one, and its arrival drove in on top.
+            occupied: self.fleet.stands_held(),
         };
         let mut later = Vec::new();
         while self.due.first().is_some_and(|d| d.at_s <= now_s) {
@@ -1041,12 +1032,7 @@ fn generate_for(fleet: &Fleet, hour: u64, own: &OwnState) -> Vec<Movement> {
     let ctx = SpawnCtx {
         runway: None,
         own: Some((own.lat, own.lon)),
-        occupied: fleet
-            .aircraft()
-            .iter()
-            .filter(|a| a.kin.on_ground)
-            .map(|a| a.kin.pos())
-            .collect(),
+        occupied: fleet.stands_held(),
     };
     traffic::generate(&fleet.field, density, hour, &ctx)
 }
@@ -1100,11 +1086,20 @@ fn record(out: &TickOut, link: &Link) {
                 "traffic",
                 serde_json::json!({ "event": "touchdown", "id": id, "along_m": along_m.round() }),
             ),
-            // Gave up waiting on the ground behind one that would not move
-            // (`past` null: our own aircraft): the gridlock guard, logged.
-            Event::SpacingWaived { id, past } => crate::blackbox::record(
+            // The gridlock guard on the ground, behind one that would not
+            // move (null: our own aircraft): planned another way round it,
+            // the blocker towed clear, or waiting with neither.
+            Event::SpacingRerouted { id, around } => crate::blackbox::record(
                 "traffic",
-                serde_json::json!({ "event": "spacing_waived", "id": id, "past": past }),
+                serde_json::json!({ "event": "spacing_rerouted", "id": id, "around": around }),
+            ),
+            Event::SpacingCleared { id, removed } => crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "spacing_cleared", "id": id, "removed": removed }),
+            ),
+            Event::SpacingHeld { id, behind } => crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "spacing_held", "id": id, "behind": behind }),
             ),
             Event::Call { .. } | Event::Spawn { .. } => {}
         }
@@ -1149,6 +1144,7 @@ pub(crate) fn despawn_word(d: Despawn) -> &'static str {
         Despawn::Removed => "removed",
         Despawn::NoStand => "no_stand",
         Despawn::ReadbackFailed => "readback_failed",
+        Despawn::Towed => "towed",
     }
 }
 

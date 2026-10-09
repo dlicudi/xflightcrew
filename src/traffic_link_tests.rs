@@ -84,8 +84,11 @@ pub(super) struct HarnessScore {
     pub(super) unfinished: Vec<String>,
     pub(super) touchdowns: usize,
     pub(super) go_arounds: usize,
-    /// Ground waits given up behind an aircraft that would not move.
-    pub(super) spacing_waived: usize,
+    /// The ground spacing's guard behind an aircraft that would not move:
+    /// planned round it, it towed clear, or waiting with neither.
+    pub(super) spacing_rerouted: usize,
+    pub(super) spacing_cleared: usize,
+    pub(super) spacing_held: usize,
     pub(super) secs: f64,
     /// When each movement spawned (harness seconds) and its callsign.
     pub(super) spawned: Vec<(f64, String)>,
@@ -93,6 +96,17 @@ pub(super) struct HarnessScore {
     /// departures waiting), and still parked at the end (never moved).
     pub(super) parked_at_start: usize,
     pub(super) parked: usize,
+    /// Parked aircraft (no movement) towed off the way of a taxiing one.
+    pub(super) parked_towed: usize,
+    /// The closest two taxiing aircraft came, one of them moving, as a
+    /// share of their spacing (`traffic::spacing::spacing_m`).
+    pub(super) closest_share: f64,
+    /// Who and where, for that closest pair.
+    pub(super) closest_at: String,
+    /// Two ground aircraft drawn inside each other: centres closer than a
+    /// quarter of their two lengths (one driven through another, or two on
+    /// one stand). Each pair once per spell.
+    pub(super) overlaps: Vec<String>,
 }
 
 /// A station for `icao` from `apt` with its taxi network loaded, installed.
@@ -156,7 +170,11 @@ pub(super) fn fly_field(
     // Each readback the fleet gave, by flight: the tower's owed text.
     let mut readbacks: HashMap<u32, Vec<String>> = HashMap::new();
     let mut seen_ids: HashSet<u32> = HashSet::new();
+    // Every flight given its movement (spawned, or released off its stand).
+    let mut flying: HashSet<u32> = HashSet::new();
     let trace = std::env::var("XVL_TRAFFIC_TRACE").is_ok_and(|v| !v.is_empty());
+    s.closest_share = f64::INFINITY;
+    let mut overlapping: HashSet<(u32, u32)> = HashSet::new();
     // The command loop notes the station's runway each turn, from the
     // install on (`station_work::drain_traffic_calls`).
     note_station_runway(station.runway_for_now().as_deref());
@@ -170,6 +188,7 @@ pub(super) fn fly_field(
         s.said.extend(out.tower.iter().map(|(_, l)| l.clone()));
         s.spawned
             .extend(out.spawned.iter().map(|(_, cs)| (t, cs.clone())));
+        flying.extend(out.spawned.iter().map(|(id, _)| *id));
         s.parked_at_start += out.parked.len();
         for ev in &out.events {
             match ev {
@@ -180,6 +199,10 @@ pub(super) fn fly_field(
                     *s.despawns.entry(format!("{reason:?}")).or_default() += 1;
                     if matches!(reason, Despawn::LeftTheArea | Despawn::Parked) {
                         s.completed += 1;
+                    } else if *reason == Despawn::Towed && !flying.contains(id) {
+                        // A parked aircraft towed off a stand link it stood
+                        // on: no movement of the hour (2026-10-09).
+                        s.parked_towed += 1;
                     } else {
                         s.unfinished.push(format!("{id} {reason:?} at {t:.0} s"));
                     }
@@ -194,15 +217,16 @@ pub(super) fn fly_field(
                     }
                 }
                 Event::Touchdown { .. } => s.touchdowns += 1,
-                Event::SpacingWaived { id, past } => {
-                    s.spacing_waived += 1;
+                Event::SpacingRerouted { .. }
+                | Event::SpacingCleared { .. }
+                | Event::SpacingHeld { .. } => {
+                    match ev {
+                        Event::SpacingRerouted { .. } => s.spacing_rerouted += 1,
+                        Event::SpacingCleared { .. } => s.spacing_cleared += 1,
+                        _ => s.spacing_held += 1,
+                    }
                     if trace {
-                        let at = |i: u32| link.fleet().get(i).map(|a| (a.kin.pos(), a.phase));
-                        println!(
-                            "{t:7.1} [{id}] spacing waived past {past:?}: {:?} past {:?}",
-                            at(*id),
-                            past.and_then(at)
-                        );
+                        println!("{t:7.1} {ev:?}");
                     }
                 }
                 Event::Phase { id, from, to } => {
@@ -274,6 +298,7 @@ pub(super) fn fly_field(
                 }
             }
         }
+        closeness(&link, t, &mut s, &mut overlapping);
         if link.pending() == 0 && link.active() == 0 {
             break;
         }
@@ -293,6 +318,62 @@ pub(super) fn fly_field(
     }
     let _ = seen_ids;
     s
+}
+
+/// Every pair of aircraft on the ground this tick: the closest two
+/// TAXIING ones came against their spacing, and any two drawn inside each
+/// other (the head-on pass-through and the shared stand, 2026-10-09).
+fn closeness(link: &Link, t: f64, s: &mut HarnessScore, overlapping: &mut HashSet<(u32, u32)>) {
+    use traffic::Phase;
+    let taxiing = |p: Phase| {
+        matches!(
+            p,
+            Phase::TaxiOut | Phase::TaxiIn | Phase::Vacate | Phase::LineUp | Phase::HoldShort
+        )
+    };
+    let ground: Vec<&traffic::TrafficAircraft> = link
+        .fleet()
+        .aircraft()
+        .iter()
+        .filter(|a| a.kin.on_ground && a.phase != Phase::Gone)
+        .collect();
+    let mut now: HashSet<(u32, u32)> = HashSet::new();
+    for (k, a) in ground.iter().enumerate() {
+        for b in &ground[k + 1..] {
+            let d = traffic::kin::dist_m(a.kin.pos(), b.kin.pos());
+            if d > 200.0 {
+                continue;
+            }
+            let moving = a.kin.gs_kts > 0.5 || b.kin.gs_kts > 0.5;
+            if taxiing(a.phase) && taxiing(b.phase) && moving {
+                let share = d / traffic::spacing::spacing_m(a.perf, b.perf);
+                if share < s.closest_share {
+                    s.closest_share = share;
+                    s.closest_at = format!(
+                        "{t:.0} s [{}] {:?} {:.1} kt and [{}] {:?} {:.1} kt {d:.1} m apart at {:?}",
+                        a.id,
+                        a.phase,
+                        a.kin.gs_kts,
+                        b.id,
+                        b.phase,
+                        b.kin.gs_kts,
+                        a.kin.pos()
+                    );
+                }
+            }
+            if d < (a.perf.length_m + b.perf.length_m) / 4.0 {
+                let key = (a.id.min(b.id), a.id.max(b.id));
+                now.insert(key);
+                if !overlapping.contains(&key) && s.overlaps.len() < 20 {
+                    s.overlaps.push(format!(
+                        "{t:.0} s [{}] {:?} and [{}] {:?} {d:.1} m apart",
+                        a.id, a.phase, b.id, b.phase
+                    ));
+                }
+            }
+        }
+    }
+    *overlapping = now;
 }
 
 fn assert_clean(s: &HarnessScore, what: &str) {
@@ -319,6 +400,38 @@ fn assert_clean(s: &HarnessScore, what: &str) {
         s.readbacks, s.readbacks_accepted,
         "{what}: every readback accepted"
     );
+}
+
+/// [`assert_clean`], a flight towed clear of the taxiway by the ground
+/// spacing's guard ([`Despawn::Towed`]) counted as finished, and nobody
+/// ever drawn inside anybody.
+fn assert_clean_but_towed(s: &HarnessScore, what: &str) {
+    let towed = s.despawns.get("Towed").copied().unwrap_or(0);
+    println!("{what}: {towed} towed");
+    let unfinished: Vec<&String> = s
+        .unfinished
+        .iter()
+        .filter(|u| !u.contains("Towed"))
+        .collect();
+    assert!(unfinished.is_empty(), "{what}: {unfinished:?}");
+    assert_eq!(
+        s.completed + towed,
+        s.movements,
+        "{what}: every movement completes"
+    );
+    assert!(s.overlaps.is_empty(), "{what}: {:?}", s.overlaps);
+    let clean = HarnessScore {
+        completed: s.movements,
+        unfinished: Vec::new(),
+        conflicts: s.conflicts.clone(),
+        oracle: s.oracle.clone(),
+        keyed: s.keyed.clone(),
+        movements: s.movements,
+        readbacks: s.readbacks,
+        readbacks_accepted: s.readbacks_accepted,
+        ..Default::default()
+    };
+    assert_clean(&clean, what);
 }
 
 /// The frequency was never crowded: no traffic transmission but a safety
@@ -502,7 +615,11 @@ const ULMM_APPROACHES: [&str; 14] = [
 /// past the sweep's ten minutes the takeoff hold released a departure onto
 /// 13 six seconds after two crossings of it were cleared, the crossers
 /// still short of the pavement, until a cleared crossing held the strip in
-/// the book.
+/// the book. The departures held short of 13 there wait for the crossing an
+/// hour and more, on the one way off 13 to the north apron: an arrival
+/// vacating that way once drove THROUGH them; now it stops, finds no other
+/// way, and the holder is towed clear (2026-10-09), so a towed flight
+/// counts as finished here.
 #[test]
 fn ulmm_traffic_holds_short_of_the_runway_it_crosses() {
     in_own_process("traffic_link::tests::ulmm_traffic_holds_short_inner");
@@ -530,7 +647,7 @@ fn ulmm_traffic_holds_short_inner() {
             .any(|l| l.ends_with("cross runway one three.")),
         "and cleared once it was free"
     );
-    assert_clean(&s, "ULMM crossings");
+    assert_clean_but_towed(&s, "ULMM crossings");
     Station::uninstall();
 }
 
@@ -670,6 +787,7 @@ fn real_install_traffic_world_sweep_inner() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(SWEEP_S);
     let (mut flown, mut spawned, mut calls, mut completed) = (0, 0, 0, 0);
+    let (mut overlaps, mut closest) = (0, f64::INFINITY);
     let mut dirty: Vec<String> = Vec::new();
     for (icao, a) in fields {
         let net = crate::nav::find_taxi_net(&apt, &icao).ok().flatten();
@@ -683,7 +801,8 @@ fn real_install_traffic_world_sweep_inner() {
         let s = fly_field(&mut st, field, schedule, window_s);
         println!(
             "{icao}: {} scheduled, {} completed, {} calls, {} readbacks ({} accepted), \
-             {} conflicts, {} oracle, {} spacing waived",
+             {} conflicts, {} oracle, spacing {}/{}/{} rerouted/towed/held, closest {:.2} of the spacing, \
+             {} overlaps",
             s.movements,
             s.completed,
             s.calls,
@@ -691,9 +810,20 @@ fn real_install_traffic_world_sweep_inner() {
             s.readbacks_accepted,
             s.conflicts.len(),
             s.oracle.len(),
-            s.spacing_waived
+            s.spacing_rerouted,
+            s.spacing_cleared,
+            s.spacing_held,
+            s.closest_share,
+            s.overlaps.len()
         );
-        for line in s.conflicts.iter().take(1).chain(s.oracle.iter().take(1)) {
+        for line in s
+            .conflicts
+            .iter()
+            .take(1)
+            .chain(s.oracle.iter().take(1))
+            .chain(s.overlaps.iter().take(2))
+            .chain(std::iter::once(&s.closest_at).filter(|_| s.closest_share < 0.7))
+        {
             println!("    {line}");
         }
         let clean = s.conflicts.is_empty()
@@ -711,6 +841,8 @@ fn real_install_traffic_world_sweep_inner() {
             ));
         }
         flown += 1;
+        overlaps += s.overlaps.len();
+        closest = f64::min(closest, s.closest_share);
         spawned += s.movements;
         completed += s.completed;
         calls += s.calls;
@@ -718,7 +850,8 @@ fn real_install_traffic_world_sweep_inner() {
     Station::uninstall();
     println!(
         "swept {flown} fields: {spawned} movements, {completed} completed, {calls} calls, \
-         no panic, {} dirty",
+         no panic, {} dirty; {overlaps} overlaps, closest taxiing pair {closest:.2} of its \
+         spacing",
         dirty.len()
     );
     assert!(flown > 0);
