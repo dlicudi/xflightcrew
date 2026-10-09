@@ -21,6 +21,14 @@ pub fn note_traffic_state(id: u32, state: AircraftState) {
     *strip.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
 }
 
+/// Where OUR aircraft is now, from the traffic link's tick: written to our
+/// own strip's [`FlightStrip::seen`] cell, for the queries that ask the
+/// book without our state (a traffic flight's holds). Read only while
+/// fresh ([`OWN_SEEN_FRESH`]): a link that stops ticking is no position.
+pub fn note_own_state(state: AircraftState) {
+    *OWN_STRIP.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+}
+
 /// One aircraft in a traffic flight's picture: who it is and where, as the
 /// tower's radar shows it. Ours is `FlightId::Own`.
 #[derive(Clone)]

@@ -479,3 +479,43 @@ fn a_traffic_position_claims_by_the_rules_ours_does() {
     assert!(RunwayBook::now(None).strip_claim(FlightId::Own).is_none());
     Station::uninstall();
 }
+
+#[test]
+fn a_landing_clearance_far_out_holds_only_its_direction() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = super::strip_tests::ClearStrips;
+    Station::uninstall();
+    clear_ghost_memory();
+    let runways = book_runways();
+    *ACTIVE_RUNWAYS.lock().unwrap() = runways.clone();
+    let ours = &runways[0];
+    *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
+        state: tower::State::ClearedToLand,
+        callsign: "Whiskey Alpha Tango five two four".into(),
+        runway_ident: "26L".into(),
+        pending_readback: None,
+        holds_runway: true,
+    });
+    note_traffic_state(1, AircraftState::at_position(ours.lat_a, ours.lon_a - 0.01, true, 0.0));
+    let t = traffic_strip(1).unwrap();
+    let held = || strip_held_by_others(&runways, "26L", &t);
+    let out = |nm: f64, at: Instant| AircraftState {
+        at,
+        ..AircraftState::at_position(ours.lat_b + nm / 60.0, ours.lon_b, false, 90.0)
+    };
+    // Unknown, as cleared: the whole strip.
+    assert!(held());
+    // LEJR 2026-10-09: cleared at 7 nm, then a reversal pattern. Far out,
+    // the traffic lands and departs on the strip meanwhile.
+    note_own_state(out(7.0, Instant::now()));
+    assert!(!held(), "7 nm out holds only the direction");
+    assert!(RunwayBook::now(None).conflicts(FlightId::Own, "08R"), "the reciprocal stays ours");
+    note_own_state(out(2.0, Instant::now()));
+    assert!(held(), "2 nm out holds the whole strip");
+    // A position the link stopped noting is no position.
+    note_own_state(out(7.0, Instant::now() - OWN_SEEN_FRESH * 2));
+    assert!(held(), "a stale position is unknown");
+    *OWN_STRIP.seen.lock().unwrap() = None;
+    *OWN_STRIP.clearance.lock().unwrap() = None;
+    Station::uninstall();
+}

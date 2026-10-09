@@ -848,6 +848,18 @@ impl TrafficWorld {
             on_ground: snap.on_ground,
             vs_fpm: snap.vs_fpm.unwrap_or(0.0),
         };
+        // Our position for the tower's book, which asks for a traffic
+        // flight's holds without it: how far out our landing clearance is.
+        crate::world::note_own_state(crate::party_line::AircraftState {
+            lat: snap.lat,
+            lon: snap.lon,
+            alt_ft,
+            on_ground: snap.on_ground,
+            gs_kts: snap.groundspeed_kts,
+            psi_deg: None,
+            helicopter: false,
+            at: now,
+        });
         let out = link.tick(Some(&own), dt, now);
         // The next hour of a generated schedule, once this one is spent.
         if link.pending() == 0 {

@@ -254,8 +254,9 @@ flight_strip! {
             /// Where a TRAFFIC flight was last seen, as its producer reported
             /// it (`world::note_traffic_state`): the runway book's position for
             /// the strip, so its Occupying, RunwayStart, Vacating and Crossing
-            /// claims are read by the same rules as ours. Ours is never written
-            /// here (our state is handed to each query), so it stays `None`.
+            /// claims are read by the same rules as ours. Ours is written by
+            /// the traffic link (`world::note_own_state`) for the queries that
+            /// ask without our state; a query handed our state uses that.
             seen: Mutex<Option<AircraftState>> = Mutex::new(None),
         },
     }

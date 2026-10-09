@@ -92,7 +92,7 @@ impl RunwayBook {
         let mut entries = vec![BookEntry {
             id: FlightId::Own,
             strip: &OWN_STRIP,
-            state: own,
+            state: own.or_else(own_seen),
         }];
         entries.extend(traffic.iter().map(|(n, s)| BookEntry {
             id: FlightId::Traffic(*n),
@@ -144,6 +144,20 @@ impl RunwayBook {
                 tower::State::LinedUp => Some((ClaimKind::LineUp, true)),
                 tower::State::TakeoffCleared if airborne => None,
                 tower::State::TakeoffCleared => Some((ClaimKind::Takeoff, true)),
+                // Cleared to land and still far out (a reposition flown
+                // after an early clearance) holds only the direction: LEJR
+                // 2026-10-09, our "cleared to land" from 7 nm held 02 whole
+                // through an 11 minute reversal pattern, an A320 went round
+                // twice and a departure sat held. Ours only: a traffic
+                // flight flies the final it was cleared on, and two of them
+                // cleared at once is the conflict the book exists to stop;
+                // ours back inside the ring over a landing given meanwhile
+                // is the go-around watch's, judged on time.
+                tower::State::ClearedToLand
+                    if *held && e.strip.is_own() && self.far_out(e.state, ident) =>
+                {
+                    Some((ClaimKind::Sequenced, false))
+                }
                 // A landing reported vacated claims nothing.
                 tower::State::ClearedToLand if *held => Some((ClaimKind::Landing, true)),
                 tower::State::ClearedToLand => None,
@@ -254,6 +268,23 @@ impl RunwayBook {
         {
             self.claims.push(position_claim(ClaimKind::Crossing));
         }
+    }
+
+    /// Airborne farther than [`LANDING_CLAIM_NM`] from both ends of the
+    /// strip `end` is on. Unknown (no state, no position, no strip) is not
+    /// far out: the clearance holds as it was given.
+    fn far_out(&self, state: Option<AircraftState>, end: &str) -> bool {
+        let Some(r) = strip(&self.runways, end) else {
+            return false;
+        };
+        state
+            .filter(|s| !s.on_ground)
+            .and_then(|s| s.position())
+            .is_some_and(|(lat, lon)| {
+                let a = nav::haversine_nm(lat, lon, r.lat_a, r.lon_a);
+                let b = nav::haversine_nm(lat, lon, r.lat_b, r.lon_b);
+                a.min(b) > LANDING_CLAIM_NM
+            })
     }
 
     fn add_ghosts(&mut self, mut ghosts: Vec<(String, f64, f64, Instant)>) {
@@ -399,6 +430,19 @@ pub(super) fn seen(strip: &FlightStrip) -> Option<AircraftState> {
     *strip.seen.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// How long our own position, as the traffic link noted it
+/// ([`note_own_state`]), stands for us in the book.
+pub(super) const OWN_SEEN_FRESH: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A landing clearance holds the whole strip from this close in; farther
+/// out, airborne, only its direction.
+const LANDING_CLAIM_NM: f64 = 4.0;
+
+/// Our own position as the traffic link last noted it, while fresh.
+fn own_seen() -> Option<AircraftState> {
+    seen(&OWN_STRIP).filter(|s| s.at.elapsed() < OWN_SEEN_FRESH)
+}
+
 /// A traffic strip holds the strip `end` is on whole (cleared onto it or to
 /// land on it) or stands on its pavement, on these runways: our line-up,
 /// takeoff and released holds wait for it as for an occupied runway.
@@ -424,7 +468,7 @@ pub(super) fn strip_held_by_others(runways: &[nav::Runway], end: &str, me: &Flig
         entries.push(BookEntry {
             id: FlightId::Own,
             strip: &OWN_STRIP,
-            state: None,
+            state: own_seen(),
         });
     }
     entries.extend(
