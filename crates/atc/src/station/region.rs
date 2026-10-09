@@ -36,6 +36,24 @@ pub(super) static ACTIVE_FIELD: Mutex<Option<(String, f64, f64)>> = Mutex::new(N
 /// `None` with no station, or one whose owner never named it.
 pub(super) static ACTIVE_ICAO: Mutex<Option<String>> = Mutex::new(None);
 
+/// The installed field's phraseology, for the ticks that speak without a
+/// `Station` in hand (the go-around order, the region handoff): its
+/// dialect by prefix ([`dialect_for`]) and whether it speaks CAP 413
+/// ([`speaks_cap413`]). No field installed is ICAO, not UK.
+pub(super) fn installed_phraseology() -> (Dialect, bool) {
+    match installed_icao() {
+        Some(icao) => (dialect_for(&icao), speaks_cap413(&icao)),
+        None => (Dialect::Icao, false),
+    }
+}
+
+/// The field speaks CAP 413's own words inside the ICAO dialect ("circuit
+/// height", "avoiding action"): the UK (EG), and Gibraltar (LXGB), whose
+/// tower is the RAF's.
+pub(crate) fn speaks_cap413(icao: &str) -> bool {
+    atis::is_uk_field(icao) || icao.eq_ignore_ascii_case("LXGB")
+}
+
 /// The installed station's ICAO ([`ACTIVE_ICAO`]); unlike `active_icao`
 /// it needs no region index.
 pub fn installed_icao() -> Option<String> {
@@ -326,7 +344,7 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
             ifr_code: ifr.as_ref().map(|f| f.code),
         });
         RegionSwitch {
-            line: region_handoff_line(ifr.as_ref().map(|f| f.callsign.as_str()), squawk_vfr, &to, khz),
+            line: region_handoff_line(ifr.as_ref().map(|f| f.callsign.as_str()), squawk_vfr, &to, khz, installed_phraseology().0),
             crew: false,
         }
     };
@@ -355,8 +373,9 @@ pub(crate) fn region_handoff_line(
     squawk_vfr: bool,
     to: &str,
     khz: i64,
+    dialect: Dialect,
 ) -> String {
-    let mhz = atis::spoken_mhz(khz);
+    let mhz = atis::spoken_mhz_in(khz, dialect);
     match ifr_callsign {
         Some(cs) if !cs.is_empty() => format!("{cs}, contact {to} on {mhz}."),
         Some(_) => format!("Contact {to} on {mhz}."),

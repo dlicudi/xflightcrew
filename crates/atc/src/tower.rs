@@ -275,6 +275,103 @@ pub struct Ctx {
     /// clearance request is then answered with the circuit clearance, never
     /// "cleared to leave the zone". `None` on every other flight.
     pub circuit: Option<CircuitOffer>,
+    /// The field's phraseology dialect ([`crate::atis::Dialect`]): the words
+    /// of a taxi clearance, a go-around and the pattern are the dialect's,
+    /// not only the pressure (FAA "runway two eight left, taxi via ...",
+    /// "pattern altitude"; ICAO "taxi to holding point ...", "circuit").
+    pub dialect: crate::atis::Dialect,
+    /// A field speaking CAP 413 ([`crate::atis::is_uk_field`]): "circuit
+    /// height" where ICAO elsewhere says "circuit altitude".
+    pub uk: bool,
+    /// The flight flies an INSTRUMENT arrival (an IFR flight, or an airline
+    /// not working the circuit): its go-around is the missed approach,
+    /// never "climb to circuit altitude, report downwind", which a 737 off
+    /// an ILS has no circuit to fly. `None` for circuit traffic.
+    pub missed_approach: Option<MissedApproach>,
+    /// The nearest arrival's aircraft type, spoken ("A320", "Boeing 737"),
+    /// when the picture knows it: a conditional line-up names the traffic
+    /// by TYPE and position (Doc 4444 12.3.4, CAP 413: "behind the landing
+    /// A320 on short final, line up runway one three behind"), never by a
+    /// callsign the departure is not working.
+    pub final_traffic_type: Option<String>,
+}
+
+/// What a go-around flies when the arrival is an instrument one: the
+/// runway's published missed approach where there is one, else a climb on
+/// runway heading, and the radar unit it goes back to. Built by the
+/// station, phrased by [`missed_approach_words`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissedApproach {
+    /// The runway end has a published instrument approach (an ILS in the
+    /// field's nav data): its missed approach is the one flown.
+    pub published: bool,
+    /// The altitude to climb to when none is published, feet on the QNH
+    /// ([`missed_approach_alt_ft`]).
+    pub alt_ft: f64,
+    /// The unit the go-around is handed to, as said ("Malaga Approach"),
+    /// and its frequency spoken; `None` at a tower-only field.
+    pub contact: Option<(String, String)>,
+}
+
+/// The no-procedure missed approach altitude: 2,000 ft above the field,
+/// rounded UP to the thousand, never below 3,000 (LEMG at 52 ft climbs to
+/// three thousand; LSZS at 5,600 to eight thousand).
+pub fn missed_approach_alt_ft(field_elev_ft: f64) -> f64 {
+    (((field_elev_ft.max(0.0) + 2000.0) / 1000.0).ceil() * 1000.0).max(3000.0)
+}
+
+/// The missed approach instruction, in the dialect, lower case: "fly the
+/// published missed approach, contact Malaga Approach on one two three
+/// decimal four five"; with no procedure ICAO "climb altitude three
+/// thousand feet, runway heading", FAA "fly runway heading, climb and
+/// maintain three thousand".
+pub fn missed_approach_words(m: &MissedApproach, dialect: crate::atis::Dialect) -> String {
+    let alt = crate::atis::spoken_alt(m.alt_ft);
+    let climb = match (m.published, dialect) {
+        (true, _) => "fly the published missed approach".to_string(),
+        (false, crate::atis::Dialect::Icao) => format!("climb altitude {alt} feet, runway heading"),
+        (false, crate::atis::Dialect::Faa) => {
+            format!("fly runway heading, climb and maintain {alt}")
+        }
+    };
+    match &m.contact {
+        Some((unit, freq)) => format!("{climb}, contact {unit} on {freq}"),
+        None => climb,
+    }
+}
+
+/// A circuit's go-around climb, lower case, in the field's words: CAP 413
+/// "climb to circuit height, runway heading", ICAO elsewhere "climb to
+/// circuit altitude, runway heading", FAA "fly runway heading, climb to
+/// pattern altitude".
+pub fn circuit_climb_words(dialect: crate::atis::Dialect, uk: bool) -> &'static str {
+    match (dialect, uk) {
+        (crate::atis::Dialect::Faa, _) => "fly runway heading, climb to pattern altitude",
+        (crate::atis::Dialect::Icao, true) => "climb to circuit height, runway heading",
+        (crate::atis::Dialect::Icao, false) => "climb to circuit altitude, runway heading",
+    }
+}
+
+/// What a go-around is told to fly, lower case: the missed approach for an
+/// instrument arrival, else the circuit's climb and the downwind report.
+pub fn go_around_words(
+    dialect: crate::atis::Dialect,
+    uk: bool,
+    missed: Option<&MissedApproach>,
+) -> String {
+    match missed {
+        Some(m) => missed_approach_words(m, dialect),
+        None => format!("{}, report downwind", circuit_climb_words(dialect, uk)),
+    }
+}
+
+/// A clause said as a sentence: its first letter upper case.
+pub(crate) fn sentence(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
 }
 
 /// What the station hands the tower to phrase a CIRCUIT clearance: the
@@ -294,8 +391,8 @@ pub struct CircuitOffer {
     /// `Some(true)` left, named in the clearance; `None` unpublished.
     pub left: Option<bool>,
     /// The field's data says no circuits (apt.dat `1302 allows_circuits 0`,
-    /// #182; LEMG and EGKK): the tower says so, then clears the one asked
-    /// for (the bench flies its circuits there).
+    /// #182; LEMG and EGKK): the tower declines it and clears nothing
+    /// ([`circuit_declined_line`]); the station clears a second ask.
     pub not_available: bool,
 }
 
@@ -322,12 +419,11 @@ pub fn circuit_clearance_lines(ctx: &Ctx, offer: &CircuitOffer) -> (String, Stri
         (Some(false), true) => "right ",
         (None, _) => "",
     };
-    // A field whose data says no circuits: said first, once per clearance.
-    let notice = match (offer.not_available, offer.faa) {
-        (false, _) => String::new(),
-        (true, false) => format!("circuits are not normally available at {}, ", ctx.airport),
-        (true, true) => format!("closed traffic is not normally available at {}, ", ctx.airport),
-    };
+    // A field whose data says no circuits is declined before this
+    // ([`circuit_declined_line`]); a clearance given there is one the
+    // pilot asked for again, and is given plainly.
+    // CAP 413 says "circuit height"; ICAO elsewhere "circuit altitude".
+    let height = if ctx.uk { "circuit height" } else { "circuit altitude" };
     if offer.faa {
         let s = side(true);
         let rb = match offer.left {
@@ -337,7 +433,7 @@ pub fn circuit_clearance_lines(ctx: &Ctx, offer: &CircuitOffer) -> (String, Stri
         };
         (
             format!(
-                "{}, {notice}runway {}, {s}closed traffic approved, pattern altitude {alt}{qnh}, \
+                "{}, runway {}, {s}closed traffic approved, pattern altitude {alt}{qnh}, \
                  squawk {}, report ready for departure.",
                 ctx.callsign, ctx.runway, ctx.squawk
             ),
@@ -350,14 +446,36 @@ pub fn circuit_clearance_lines(ctx: &Ctx, offer: &CircuitOffer) -> (String, Stri
         let s = side(false);
         (
             format!(
-                "{}, {notice}runway {}, {s}circuit height {alt} feet{qnh}, squawk {}, \
+                "{}, runway {}, {s}{height} {alt} feet{qnh}, squawk {}, \
                  report ready for departure.",
                 ctx.callsign, ctx.runway, ctx.squawk
             ),
             format!(
-                "Runway {}, {s}circuit height {alt} feet{qnh}, squawk {}, {}.",
+                "Runway {}, {s}{height} {alt} feet{qnh}, squawk {}, {}.",
                 ctx.runway, ctx.squawk, ctx.callsign
             ),
+        )
+    }
+}
+
+/// A circuit asked for at a field whose data says no circuits (apt.dat
+/// `1302 allows_circuits 0`: LEMG, EGKK): declined, with what the field
+/// does offer, and NOTHING cleared in the same breath. Until 2026-10-09
+/// the tower said "circuits are not normally available at Malaga" and then
+/// gave the circuit height, the code and "report ready" anyway. A pilot
+/// who asks again is cleared (the "normally" is the tower's discretion).
+pub fn circuit_declined_line(ctx: &Ctx, offer: &CircuitOffer) -> String {
+    if offer.faa {
+        format!(
+            "{}, unable closed traffic, {} is departures and arrivals only. \
+             Advise a departure or a VFR route.",
+            ctx.callsign, ctx.airport
+        )
+    } else {
+        format!(
+            "{}, circuits are not available at {}. Departure from the zone or a VFR \
+             route available, say intentions.",
+            ctx.callsign, ctx.airport
         )
     }
 }
@@ -470,6 +588,56 @@ fn via_clause(ctx: &Ctx) -> String {
     }
 }
 
+/// A departure's taxi clearance after the callsign, in the field's dialect.
+/// `lead` opens it ("takeoff clearance cancelled, ", "runway two six left
+/// approved, "), `first` marks a ready call answered with the taxi first.
+/// ICAO / CAP 413: "taxi to holding point Mike runway two six left via
+/// Alpha, Bravo, QNH ... Report ready for departure.", the via list without
+/// the holding point it ends at (LEMG, 2026-10-08: "taxi to holding point
+/// Hotel November one runway one three via Delta, Quebec, Alpha, Hotel
+/// November one"). FAA (7110.65 3-7-2): "runway two eight left, taxi via
+/// Alpha, Bravo, hold short of runway two eight left, altimeter ...": no
+/// holding point by name, the hold the route ends at said as one.
+fn departure_taxi_clause(ctx: &Ctx, lead: &str, first: bool) -> String {
+    let crossings = crossing_clause(ctx);
+    let qnh = qnh_clause(ctx);
+    match ctx.dialect {
+        crate::atis::Dialect::Faa => {
+            let r = &ctx.runway;
+            if ctx.taxi_via.is_empty() {
+                format!(
+                    "{lead}taxi to runway {r}{crossings}, hold short of runway {r}{qnh}. \
+                     Report ready for departure."
+                )
+            } else {
+                format!(
+                    "{lead}runway {r}, taxi via {}{crossings}, hold short of runway {r}{qnh}. \
+                     Report ready for departure.",
+                    ctx.taxi_via.join(", ")
+                )
+            }
+        }
+        crate::atis::Dialect::Icao => {
+            let mut via: &[String] = &ctx.taxi_via;
+            if via.last().is_some_and(|v| v.eq_ignore_ascii_case(&ctx.holding_point)) {
+                via = &via[..via.len() - 1];
+            }
+            let via = if via.is_empty() {
+                String::new()
+            } else {
+                format!(" via {}", via.join(", "))
+            };
+            format!(
+                "{lead}taxi to holding point {} runway {}{}{via}{crossings}{qnh}. \
+                 Report ready for departure.",
+                ctx.holding_point,
+                ctx.runway,
+                if first { " first" } else { "" },
+            )
+        }
+    }
+}
+
 /// The arrival taxi-in clearance: "taxi to stand one two via Alpha, cross
 /// runway zero niner, this frequency." Falls back to the flat "taxi to parking"
 /// when no stand route was planned (field has no stands, or off the network).
@@ -490,10 +658,10 @@ fn taxi_in_reply(ctx: &Ctx) -> String {
 /// short runway ..." where the crossing is asked for at the runway,
 /// [`Ctx::hold_short_crossings`]).
 fn crossing_clause(ctx: &Ctx) -> String {
-    let verb = if ctx.hold_short_crossings {
-        "hold short"
-    } else {
-        "cross"
+    let verb = match (ctx.hold_short_crossings, ctx.dialect) {
+        (true, crate::atis::Dialect::Faa) => "hold short of",
+        (true, crate::atis::Dialect::Icao) => "hold short",
+        (false, _) => "cross",
     };
     ctx.taxi_crossings
         .iter()
@@ -511,11 +679,25 @@ fn crossing_clause(ctx: &Ctx) -> String {
 /// an occupant that will not leave on its own clock and offered another
 /// runway (`station::resequence_runway`, issue #162): the runway given up
 /// and the one to expect. `from` and `to` are spoken.
-pub fn go_around_resequenced_line(callsign: &str, from: &str, to: &str) -> String {
-    format!(
-        "{callsign}, roger, go around. Climb to circuit altitude, runway heading. \
-         Runway {from} is blocked, expect runway {to}, report downwind."
-    )
+pub fn go_around_resequenced_line(
+    callsign: &str,
+    from: &str,
+    to: &str,
+    dialect: crate::atis::Dialect,
+    uk: bool,
+    missed: Option<&MissedApproach>,
+) -> String {
+    match missed {
+        Some(m) => format!(
+            "{callsign}, roger, go around. {}. Runway {from} is blocked, expect runway {to}.",
+            sentence(&missed_approach_words(m, dialect))
+        ),
+        None => format!(
+            "{callsign}, roger, go around. {}. Runway {from} is blocked, expect runway {to}, \
+             report downwind.",
+            sentence(circuit_climb_words(dialect, uk))
+        ),
+    }
 }
 
 /// A reply that moves a flight off the runway its clearance named says so
@@ -1271,6 +1453,75 @@ pub struct PendingReadback {
     /// The instruction sentence, re-spoken when challenging.
     pub instruction: String,
     pub nudges: u8,
+}
+
+/// An armed instruction without the callsign it opens with: what "I say
+/// again" repeats. The instruction is the whole line the tower said, so
+/// "<callsign>, read back: <callsign>, runway ..." named the flight twice.
+fn instruction_body<'a>(instruction: &'a str, callsign: &str) -> &'a str {
+    instruction
+        .strip_prefix(callsign)
+        .and_then(|r| r.strip_prefix(", "))
+        .unwrap_or(instruction)
+}
+
+/// The item a readback must carry, as a controller confirms it: "cleared
+/// for takeoff runway two six left".
+fn awaited_item(awaited: &Awaited) -> String {
+    match awaited {
+        Awaited::HoldPosition => "hold position".to_string(),
+        Awaited::LineUp {
+            runway,
+            behind: true,
+        } => format!("behind the landing traffic, line up runway {runway} behind"),
+        Awaited::LineUp { runway, .. } => format!("line up and wait runway {runway}"),
+        Awaited::Takeoff { runway } => format!("cleared for takeoff runway {runway}"),
+        Awaited::Crossing { runway } => format!("cross runway {runway}"),
+        Awaited::Landing {
+            runway,
+            touch_and_go: false,
+        } => format!("cleared to land runway {runway}"),
+        Awaited::Landing {
+            runway,
+            touch_and_go: true,
+        } => format!("cleared touch and go runway {runway}"),
+        Awaited::IfrClearance { .. } => "the clearance".to_string(),
+    }
+}
+
+/// The challenge a transmission that is not the readback earns, as a
+/// controller says it (CAP 413, Doc 4444 12.2.5): a question ("say again",
+/// "confirm ...") is answered by the instruction, "I say again, ..."; an
+/// echo missing its item is "readback incomplete, confirm cleared for
+/// takeoff runway two six left"; anything else is "<callsign>, read back".
+/// The callsign is said once (it was "<callsign>, read back: <callsign>,
+/// runway ..., cleared for takeoff"). Enforcement is unchanged: this is
+/// only the words of the challenge [`Tower::gate`] already makes. Pure.
+pub fn readback_challenge(
+    transcript: &str,
+    awaited: &Awaited,
+    instruction: &str,
+    callsign: &str,
+) -> String {
+    let t = transcript.to_lowercase();
+    let word = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
+    if t.contains("say again") || word("confirm") {
+        return format!("{callsign}, I say again, {}", instruction_body(instruction, callsign));
+    }
+    // An echo: readback-shaped words, or the awaited runway named back
+    // without the clearance it came with.
+    let runway = match awaited {
+        Awaited::LineUp { runway, .. }
+        | Awaited::Takeoff { runway }
+        | Awaited::Crossing { runway }
+        | Awaited::Landing { runway, .. } => canon_runway(runway),
+        Awaited::HoldPosition | Awaited::IfrClearance { .. } => None,
+    };
+    let names_runway = runway.is_some() && runway_after_keyword(&t) == runway;
+    if (is_readback(transcript) || names_runway) && !matches!(awaited, Awaited::IfrClearance { .. }) {
+        return format!("{callsign}, readback incomplete, confirm {}.", awaited_item(awaited));
+    }
+    format!("{callsign}, read back.")
 }
 
 /// What a transmission is, measured against an awaited readback.
@@ -2297,11 +2548,8 @@ impl Tower {
                 Some(line)
             }
             ReadbackCheck::WrongRunway { .. } => {
-                let instruction = pending.instruction.clone();
-                Some(format!(
-                    "{}, negative. I say again: {instruction}",
-                    ctx.callsign
-                ))
+                let body = instruction_body(&pending.instruction, &ctx.callsign);
+                Some(format!("{}, negative, I say again, {body}", ctx.callsign))
             }
             ReadbackCheck::NotAReadback => {
                 // The question-shaped calls a controller answers regardless.
@@ -2319,8 +2567,7 @@ impl Tower {
                     return None;
                 }
                 p.nudges += 1;
-                let instruction = p.instruction.clone();
-                Some(format!("{}, read back: {instruction}", ctx.callsign))
+                Some(readback_challenge(transcript, &p.awaited, &p.instruction, &ctx.callsign))
             }
         }
     }
@@ -2413,6 +2660,9 @@ impl Tower {
             // A circuit stays in the zone: its clearance is the pattern's.
             Intent::RequestClearance if ctx.circuit.is_some() => {
                 let offer = ctx.circuit.as_ref().expect("guarded");
+                if offer.not_available {
+                    return circuit_declined_line(ctx, offer);
+                }
                 let (line, readback) = circuit_clearance_lines(ctx, offer);
                 self.clearance_readback = Some(readback);
                 line
@@ -2463,15 +2713,13 @@ impl Tower {
                 None if ctx.on_ground => {
                     self.state = State::TaxiCleared;
                     format!(
-                        "{}, runway {} approved, taxi to holding point {} runway {}{}{}{}. \
-                         Report ready for departure.",
+                        "{}, {}",
                         ctx.callsign,
-                        ctx.runway,
-                        ctx.holding_point,
-                        ctx.runway,
-                        via_clause(ctx),
-                        crossing_clause(ctx),
-                        qnh_clause(ctx)
+                        departure_taxi_clause(
+                            ctx,
+                            &format!("runway {} approved, ", ctx.runway),
+                            false
+                        )
                     )
                 }
                 None => {
@@ -2511,16 +2759,7 @@ impl Tower {
                     ""
                 };
                 self.state = State::TaxiCleared;
-                format!(
-                    "{}, {cancel}taxi to holding point {} runway {}{}{}{}. \
-                     Report ready for departure.",
-                    ctx.callsign,
-                    ctx.holding_point,
-                    ctx.runway,
-                    via_clause(ctx),
-                    crossing_clause(ctx),
-                    qnh_clause(ctx)
-                )
+                format!("{}, {}", ctx.callsign, departure_taxi_clause(ctx, cancel, false))
             }
             // A crossing: on the ground only, on the station's judgement of
             // the strip. Cleared, it is read back; held, the flight asks
@@ -2622,13 +2861,19 @@ impl Tower {
                         && ctx.final_traffic_nm.unwrap_or(0.0) >= CONDITIONAL_MIN_NM =>
                 {
                     self.state = State::LinedUp;
+                    // The traffic by TYPE and position, never by a callsign
+                    // the departure is not working (Doc 4444 12.3.4, CAP
+                    // 413): "behind the landing Vueling one three one one"
+                    // was said at LEMG (2026-10-08).
                     let traffic = ctx
-                        .final_traffic_callsign
+                        .final_traffic_type
                         .clone()
                         .unwrap_or_else(|| "traffic".to_string());
                     let line = format!(
-                        "{}, behind the landing {traffic}, line up runway {} behind.",
-                        ctx.callsign, ctx.runway
+                        "{}, behind the landing {traffic} on {}, line up runway {} behind.",
+                        ctx.callsign,
+                        spoken_final(ctx.final_traffic_nm.unwrap_or(0.0)),
+                        ctx.runway
                     );
                     self.arm(
                         Awaited::LineUp {
@@ -2738,16 +2983,7 @@ impl Tower {
                 // the tower never clears a takeoff from a parking stand.
                 _ => {
                     self.state = State::TaxiCleared;
-                    format!(
-                        "{}, taxi to holding point {} runway {} first{}{}{}. \
-                         Report ready for departure.",
-                        ctx.callsign,
-                        ctx.holding_point,
-                        ctx.runway,
-                        via_clause(ctx),
-                        crossing_clause(ctx),
-                        qnh_clause(ctx)
-                    )
+                    format!("{}, {}", ctx.callsign, departure_taxi_clause(ctx, "", true))
                 }
             },
             Intent::RequestLanding { touch_and_go } => {
@@ -2837,12 +3073,16 @@ impl Tower {
                 format!("{}, roger, report downwind.", ctx.callsign)
             }
             // A balked landing: the clearance is void, rejoin the pattern.
+            // The words are the arrival's: the circuit's climb and downwind
+            // for circuit traffic, the missed approach for an instrument
+            // arrival (an airliner off the ILS was told "climb to circuit
+            // altitude, report downwind"), in the field's dialect.
             Intent::GoAround => {
                 self.state = State::Inbound;
                 format!(
-                    "{}, roger, go around. Climb to circuit altitude, runway heading, \
-                     report downwind.",
-                    ctx.callsign
+                    "{}, roger, go around. {}.",
+                    ctx.callsign,
+                    sentence(&go_around_words(ctx.dialect, ctx.uk, ctx.missed_approach.as_ref()))
                 )
             }
             // A departure stopping on the runway: the takeoff clearance is
@@ -2912,10 +3152,11 @@ impl Tower {
             }
             // Through the zone to somewhere else: cleared through, the
             // pressure, report leaving. No state change: a transit neither
-            // departs nor lands here. The dialect rides the pressure phrase
-            // (`qnh_clause` is the one seam: "altimeter" is the FAA's).
+            // departs nor lands here. The words are the field's dialect
+            // (it rode the pressure phrase, which a pilot holding the ATIS
+            // blanks, and an FAA field then spoke ICAO).
             Intent::RequestTransit => {
-                if ctx.qnh.to_lowercase().starts_with("altimeter") {
+                if ctx.dialect == crate::atis::Dialect::Faa {
                     format!(
                         "{}, transition through the {} airspace approved{}, report clear.",
                         ctx.callsign,

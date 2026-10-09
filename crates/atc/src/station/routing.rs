@@ -285,8 +285,10 @@ impl Station {
                     .map(|alt| capped_departure_climb(&alt, cap, ctx.transition_level_ft))
                 {
                     Some(alt) => format!(
-                        "{}, {} {position}, radar contact, climb {alt}.",
-                        ctx.callsign, ctx.airport
+                        "{}, {} {position}, radar contact, {}.",
+                        ctx.callsign,
+                        ctx.airport,
+                        check_in_climb(&alt, self.dialect)
                     ),
                     None => format!(
                         "{}, {} {position}, radar contact.",
@@ -385,6 +387,26 @@ impl Station {
 /// by name, or built from call vocabulary a pilot only uses on the radio.
 /// This is the content-routing gate: with the radio PTT keyed, keying itself
 /// is the addressing and this is never consulted.
+/// A departure check-in's climb, in the dialect, from the level as spoken
+/// ("six thousand", "flight level eight zero", whatever the check-in
+/// announced or [`capped_departure_climb`] capped it to). ICAO / CAP 413:
+/// "climb altitude six thousand feet", "climb flight level eight zero";
+/// FAA: "climb and maintain six thousand". It was "climb six thousand"
+/// at every field (Gibraltar Departure, the realism review, 2026-10-09).
+pub(super) fn check_in_climb(level: &str, dialect: Dialect) -> String {
+    let level = level.trim();
+    let bare = level
+        .strip_suffix(" feet")
+        .or_else(|| level.strip_suffix(" ft"))
+        .unwrap_or(level);
+    let fl = bare.to_lowercase().starts_with("flight level");
+    match (dialect, fl) {
+        (Dialect::Faa, _) => format!("climb and maintain {bare}"),
+        (Dialect::Icao, true) => format!("climb {bare}"),
+        (Dialect::Icao, false) => format!("climb altitude {bare} feet"),
+    }
+}
+
 /// The field's SPOKEN name. apt.dat names arrive as gazetteer entries —
 /// "Badajoz- Talavera La Real", "Merida - Royanejos" — but a controller keys
 /// "Badajoz Tower", not the full hyphenated row (heard live 2026-07-10, and

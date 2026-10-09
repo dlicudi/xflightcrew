@@ -25,6 +25,10 @@ fn ctx() -> Ctx {
         taxi_via: Vec::new(),
         taxi_crossings: Vec::new(),
         hold_short_crossings: false,
+        dialect: crate::atis::Dialect::Icao,
+        uk: false,
+        missed_approach: None,
+        final_traffic_type: None,
         crossing: None,
         on_ground: false,
         ifr: None,
@@ -69,6 +73,13 @@ fn circuit_ctx(faa: bool) -> Ctx {
             left: None,
             not_available: false,
         }),
+        dialect: if faa {
+            crate::atis::Dialect::Faa
+        } else {
+            crate::atis::Dialect::Icao
+        },
+        // Gibraltar's tower is the RAF's: CAP 413 words.
+        uk: !faa,
         ..ctx()
     }
 }
@@ -140,19 +151,21 @@ fn a_circuit_is_cleared_for_the_circuit_not_out_of_the_zone() {
 
 /// #182: apt.dat publishes the pattern side per runway (`1101 13 left`
 /// at LEMG) and whether the field allows circuits at all (`1302
-/// allows_circuits 0` at LEMG and EGKK). The clearance names the side,
-/// says a field without circuits first, and its readback is still a
-/// readback, never a request.
+/// allows_circuits 0` at LEMG and EGKK). The clearance names the side and
+/// its readback is still a readback, never a request. A field without
+/// circuits DECLINES the first ask and clears nothing in that breath (the
+/// tower said "circuits are not normally available at Malaga" and then
+/// gave the height, the code and "report ready" anyway, the realism
+/// review, 2026-10-09).
 #[test]
 fn a_circuit_clearance_names_the_published_side_and_a_field_without_circuits() {
     for (faa, left, line, rb) in [
         (
             false,
             Some(true),
-            "November one seven two Sierra Papa, circuits are not normally available at \
-                 Gibraltar, runway zero niner, left hand circuit, circuit height one thousand \
-                 one hundred feet, QNH one zero one niner, squawk four five zero one, report \
-                 ready for departure.",
+            "November one seven two Sierra Papa, runway zero niner, left hand circuit, \
+                 circuit height one thousand one hundred feet, QNH one zero one niner, squawk \
+                 four five zero one, report ready for departure.",
             "Runway zero niner, left hand circuit, circuit height one thousand one hundred \
                  feet, QNH one zero one niner, squawk four five zero one, November one seven \
                  two Sierra Papa.",
@@ -160,22 +173,22 @@ fn a_circuit_clearance_names_the_published_side_and_a_field_without_circuits() {
         (
             true,
             Some(false),
-            "November one seven two Sierra Papa, closed traffic is not normally available \
-                 at Gibraltar, runway zero niner, right closed traffic approved, pattern \
-                 altitude one thousand one hundred, altimeter three zero zero one, squawk four \
-                 five zero one, report ready for departure.",
+            "November one seven two Sierra Papa, runway zero niner, right closed traffic \
+                 approved, pattern altitude one thousand one hundred, altimeter three zero zero \
+                 one, squawk four five zero one, report ready for departure.",
             "Right closed traffic runway zero niner, pattern altitude one thousand one \
                  hundred, altimeter three zero zero one, squawk four five zero one, November \
                  one seven two Sierra Papa.",
         ),
     ] {
+        let offer = CircuitOffer {
+            height_ft: circuit_height_ft(52.0),
+            faa,
+            left,
+            not_available: false,
+        };
         let c = Ctx {
-            circuit: Some(CircuitOffer {
-                height_ft: circuit_height_ft(52.0),
-                faa,
-                left,
-                not_available: true,
-            }),
+            circuit: Some(offer.clone()),
             ..circuit_ctx(faa)
         };
         let mut twr = Tower::new();
@@ -186,7 +199,44 @@ fn a_circuit_clearance_names_the_published_side_and_a_field_without_circuits() {
         assert_eq!(parse_intent(sent), Intent::Unknown, "{sent}");
         assert!(is_readback(sent), "{sent}");
         assert!(!line.contains('-') && !rb.contains('-'));
+        // The same ask at a field without circuits: declined, the field's
+        // offer named, nothing cleared, no code, no readback owed.
+        let c = Ctx {
+            circuit: Some(CircuitOffer {
+                not_available: true,
+                ..offer
+            }),
+            ..circuit_ctx(faa)
+        };
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::RequestClearance, &c);
+        let want = if faa {
+            "November one seven two Sierra Papa, unable closed traffic, Gibraltar is \
+                 departures and arrivals only. Advise a departure or a VFR route."
+        } else {
+            "November one seven two Sierra Papa, circuits are not available at Gibraltar. \
+                 Departure from the zone or a VFR route available, say intentions."
+        };
+        assert_eq!(r, want);
+        for never in ["squawk", "circuit height", "pattern altitude", "report ready", "cleared"] {
+            assert!(!r.contains(never), "{never}: {r}");
+        }
+        assert_eq!(twr.suggested_readback(&c.callsign), None);
+        assert_eq!(twr.state, State::Parked);
     }
+}
+
+/// ICAO outside the UK says "circuit altitude"; CAP 413 "circuit height".
+#[test]
+fn circuit_height_is_a_uk_word() {
+    let c = Ctx {
+        uk: false,
+        ..circuit_ctx(false)
+    };
+    let (line, rb) = circuit_clearance_lines(&c, c.circuit.as_ref().unwrap());
+    assert!(line.contains("circuit altitude one thousand one hundred feet"), "{line}");
+    assert!(rb.contains("circuit altitude"), "{rb}");
+    assert!(!line.contains("circuit height"), "{line}");
 }
 
 /// ctx() on the ground at an ICAO field, offered an IFR clearance to
@@ -355,10 +405,13 @@ fn the_ifr_readback_is_enforced_item_by_item() {
     // A mishear is never the readback: challenged, twice, then let go
     // with NOTHING published. It never earns the clearance.
     let mut twr = issue();
-    for t in ["gibraltar tower, say again", "blah blah weather"] {
-        let r = twr.gate(t, parse_intent(t), &c).expect("challenged");
-        assert!(r.starts_with(&format!("{cs}, read back: cleared to Edinburgh")), "{r}");
-    }
+    let r = twr
+        .gate("gibraltar tower, say again", Intent::Unknown, &c)
+        .expect("challenged");
+    assert!(r.starts_with(&format!("{cs}, I say again, cleared to Edinburgh")), "{r}");
+    let t = "blah blah weather";
+    let r = twr.gate(t, parse_intent(t), &c).expect("challenged");
+    assert_eq!(r, format!("{cs}, read back."));
     let t = "mumble";
     assert_eq!(twr.gate(t, parse_intent(t), &c), None, "let through after two");
     assert!(twr.take_accepted_ifr().is_none(), "a mishear earned a clearance");
@@ -602,11 +655,23 @@ fn a_zone_transit_is_cleared_through_and_changes_nothing() {
     }
     let faa = Ctx {
         qnh: "altimeter three zero zero one".into(),
+        dialect: crate::atis::Dialect::Faa,
         ..ctx()
     };
     let r = Tower::new().handle(Intent::RequestTransit, &faa);
     assert!(r.contains("transition through the Gibraltar airspace approved"), "{r}");
-    assert!(r.contains("altimeter three zero zero one"), "{r}");
+    // The words are the dialect's even when the pressure is blank (the
+    // pilot holds the ATIS): they rode the pressure phrase until
+    // 2026-10-09, and an FAA field then spoke ICAO.
+    let r = Tower::new().handle(
+        Intent::RequestTransit,
+        &Ctx {
+            qnh: String::new(),
+            ..faa.clone()
+        },
+    );
+    assert!(r.contains("transition through the Gibraltar airspace approved"), "{r}");
+    assert!(!r.contains("altimeter") && !r.contains("zone"), "{r}");
 }
 
 /// ctx() with one arrival on final at `nm`.
@@ -1528,11 +1593,27 @@ fn one_arrival_far_enough_earns_a_conditional_line_up() {
     // line up behind" — the departure is staged, not parked.
     let mut twr = Tower::new();
     twr.state = State::TaxiCleared;
+    // The traffic by TYPE and position (Doc 4444 12.3.4, CAP 413), never
+    // by a callsign the departure is not working: LEMG 2026-10-08 said
+    // "behind the landing Vueling one three one one". No type known:
+    // "the landing traffic".
     let r = twr.handle(Intent::RequestTakeoff, &busy(2.4));
-    assert!(
-        r.contains("behind the landing Speedbird three zero six"),
-        "{r}"
+    assert_eq!(
+        r,
+        "November one seven two Sierra Papa, behind the landing traffic on 2 mile final, \
+             line up runway zero niner behind."
     );
+    assert!(!r.contains("Speedbird"), "{r}");
+    let mut typed = Tower::new();
+    typed.state = State::TaxiCleared;
+    let r = typed.handle(
+        Intent::RequestTakeoff,
+        &Ctx {
+            final_traffic_type: Some("A320".into()),
+            ..busy(1.6)
+        },
+    );
+    assert!(r.contains("behind the landing A320 on 2 mile final, line up"), "{r}");
     assert!(r.contains("line up runway zero niner behind"), "{r}");
     assert!(!r.contains("cleared for takeoff"), "{r}");
     assert_eq!(twr.state, State::LinedUp);
@@ -1655,13 +1736,32 @@ fn readback_gate_holds_the_runway_items() {
     let mut t4 = Tower::new();
     t4.state = State::TaxiCleared;
     t4.handle(Intent::RequestTakeoff, &c);
+    // The challenge names the flight ONCE: it was "<callsign>, read back:
+    // <callsign>, runway ..., cleared for takeoff" (the realism review,
+    // 2026-10-09). A garble earns "read back"; a question the
+    // instruction, "I say again"; an echo missing its item "readback
+    // incomplete, confirm ...".
     let g = t4
         .gate("uhh what was that", Intent::Unknown, &c)
         .expect("challenge");
-    assert!(g.contains("read back"), "{g}");
-    assert!(
-        g.contains("cleared for takeoff"),
-        "the challenge repeats the instruction: {g}"
+    assert_eq!(g, "November one seven two Sierra Papa, read back.");
+    let mut t5 = Tower::new();
+    t5.state = State::TaxiCleared;
+    t5.handle(Intent::RequestTakeoff, &c);
+    let g = t5.gate("say again", Intent::Unknown, &c).expect("challenge");
+    assert_eq!(
+        g,
+        "November one seven two Sierra Papa, I say again, runway zero niner, wind zero niner \
+             zero degrees, three knots, cleared for takeoff."
+    );
+    assert_eq!(g.matches("November one seven two Sierra Papa").count(), 1, "{g}");
+    let g = t5
+        .gate("runway zero niner, november one seven two sierra papa", Intent::Unknown, &c)
+        .expect("challenge");
+    assert_eq!(
+        g,
+        "November one seven two Sierra Papa, readback incomplete, confirm cleared for \
+             takeoff runway zero niner."
     );
     // ...the question-shaped calls a tower answers pass straight through...
     assert_eq!(t4.gate("say wind", Intent::WindCheck, &c), None);
@@ -2258,4 +2358,131 @@ fn a_runway_crossing_is_asked_answered_and_read_back() {
     };
     let held = Tower::new().handle(Intent::RequestTaxi, &asks);
     assert!(held.contains(", hold short runway two six right"), "{held}");
+}
+
+/// The realism review (2026-10-09): a go-around is told what THIS arrival
+/// flies. Circuit traffic climbs to the circuit in the field's words
+/// (CAP 413 "circuit height", ICAO "circuit altitude", FAA "pattern
+/// altitude"); an instrument arrival (an IFR flight, an airliner off the
+/// ILS) flies the published missed approach and goes back to the radar
+/// unit, or with no procedure climbs on runway heading. It was "climb to
+/// circuit altitude, report downwind" to every arrival.
+#[test]
+fn a_go_around_is_told_what_this_arrival_flies() {
+    use crate::atis::Dialect;
+    let cs = "November one seven two Sierra Papa";
+    let reply = |c: &Ctx| Tower::new().handle(Intent::GoAround, c);
+    assert_eq!(
+        reply(&Ctx { uk: true, ..ctx() }),
+        format!("{cs}, roger, go around. Climb to circuit height, runway heading, report downwind.")
+    );
+    assert_eq!(
+        reply(&ctx()),
+        format!("{cs}, roger, go around. Climb to circuit altitude, runway heading, report downwind.")
+    );
+    assert_eq!(
+        reply(&Ctx {
+            dialect: Dialect::Faa,
+            ..ctx()
+        }),
+        format!("{cs}, roger, go around. Fly runway heading, climb to pattern altitude, report downwind.")
+    );
+    let published = MissedApproach {
+        published: true,
+        alt_ft: 3000.0,
+        contact: Some(("Malaga Approach".into(), "one two three decimal four five".into())),
+    };
+    let r = reply(&Ctx {
+        missed_approach: Some(published.clone()),
+        ..ctx()
+    });
+    assert_eq!(
+        r,
+        format!(
+            "{cs}, roger, go around. Fly the published missed approach, contact Malaga \
+             Approach on one two three decimal four five."
+        )
+    );
+    assert!(!r.contains("circuit") && !r.contains("downwind"), "{r}");
+    let none = MissedApproach {
+        published: false,
+        contact: None,
+        ..published
+    };
+    assert_eq!(
+        reply(&Ctx {
+            missed_approach: Some(none.clone()),
+            ..ctx()
+        }),
+        format!("{cs}, roger, go around. Climb altitude three thousand feet, runway heading.")
+    );
+    assert_eq!(
+        reply(&Ctx {
+            missed_approach: Some(none),
+            dialect: Dialect::Faa,
+            ..ctx()
+        }),
+        format!("{cs}, roger, go around. Fly runway heading, climb and maintain three thousand.")
+    );
+    assert_eq!(missed_approach_alt_ft(52.0), 3000.0, "LEMG");
+    assert_eq!(missed_approach_alt_ft(5600.0), 8000.0, "LSZS");
+    // The re-sequenced answer speaks the same words.
+    let r = go_around_resequenced_line(cs, "three zero", "one two", Dialect::Icao, true, None);
+    assert!(
+        r.contains("Climb to circuit height, runway heading. Runway three zero is blocked"),
+        "{r}"
+    );
+}
+
+/// The realism review (2026-10-09): an FAA field's taxi clearance is the
+/// FAA's (7110.65 3-7-2: "runway two eight left, taxi via Alpha, Bravo,
+/// hold short of runway two eight left"), not ICAO's holding point by name;
+/// and an ICAO clearance's via list no longer ends with the holding point it
+/// names (LEMG, 2026-10-08: "taxi to holding point Hotel November one runway
+/// one three via Delta, Quebec, Alpha, Hotel November one").
+#[test]
+fn a_taxi_clearance_is_phrased_in_the_fields_dialect() {
+    let ground = Ctx {
+        on_ground: true,
+        runway: "one three".into(),
+        holding_point: "Hotel November one".into(),
+        taxi_via: vec![
+            "Delta".into(),
+            "Quebec".into(),
+            "Alpha".into(),
+            "Hotel November one".into(),
+        ],
+        ..ctx()
+    };
+    let r = Tower::new().handle(Intent::RequestTaxi, &ground);
+    assert_eq!(
+        r,
+        "November one seven two Sierra Papa, taxi to holding point Hotel November one runway \
+         one three via Delta, Quebec, Alpha, QNH one zero one seven. Report ready for departure."
+    );
+    let faa = Ctx {
+        dialect: crate::atis::Dialect::Faa,
+        runway: "two eight left".into(),
+        qnh: "altimeter three zero zero one".into(),
+        taxi_via: vec!["Alpha".into(), "Bravo".into()],
+        taxi_crossings: vec!["one niner".into()],
+        hold_short_crossings: true,
+        ..ground.clone()
+    };
+    let r = Tower::new().handle(Intent::RequestTaxi, &faa);
+    assert_eq!(
+        r,
+        "November one seven two Sierra Papa, runway two eight left, taxi via Alpha, Bravo, \
+         hold short of runway one niner, hold short of runway two eight left, altimeter three \
+         zero zero one. Report ready for departure."
+    );
+    assert!(!r.contains("holding point"), "{r}");
+    // A ready call from the stand: the taxi first, same words.
+    let r = Tower::new().handle(Intent::RequestTakeoff, &faa);
+    assert!(r.contains("runway two eight left, taxi via Alpha, Bravo"), "{r}");
+    let r = Tower::new().handle(Intent::RequestTakeoff, &ground);
+    assert!(
+        r.contains("Hotel November one runway one three first via Delta, Quebec, Alpha,"),
+        "{r}"
+    );
 }

@@ -260,16 +260,21 @@ impl Station {
     }
 }
 
-/// Wind spoken tower-style ("zero niner zero degrees, three knots" / "calm").
-pub(super) fn spoken_wind(from_deg: f64, kts: f64) -> String {
+/// Wind spoken tower-style in the field's dialect: ICAO / CAP 413 "zero
+/// niner zero degrees, three knots", FAA (7110.65 2-6-5) "zero niner zero
+/// at three"; "calm" in both.
+pub(super) fn spoken_wind(from_deg: f64, kts: f64, dialect: Dialect) -> String {
     if kts < 3.0 {
         return "calm".to_string();
     }
     let dir = ((from_deg / 10.0).round() as i64 * 10).rem_euclid(360);
     let dir = if dir == 0 { 360 } else { dir };
-    format!(
-        "{} degrees, {} knots",
+    let (dir, kts) = (
         atis::spoken_digits(&format!("{dir:03}")),
-        atis::spoken_digits(&format!("{kts:.0}"))
-    )
+        atis::spoken_digits(&format!("{kts:.0}")),
+    );
+    match dialect {
+        Dialect::Icao => format!("{dir} degrees, {kts} knots"),
+        Dialect::Faa => format!("{dir} at {kts}"),
+    }
 }

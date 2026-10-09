@@ -210,6 +210,10 @@ flight_strip! {
             /// works this flight: it must not answer the destination's inbound/final calls
             /// or make its clearances look applicable at another field.
             uncontrolled_arrival: AtomicBool = AtomicBool::new(false),
+            /// The flight told the tower it works the circuit (the desk's
+            /// `circuits`, mirrored here for the ticks that speak without a
+            /// desk): its go-around is the circuit's, never a missed approach.
+            circuits: AtomicBool = AtomicBool::new(false),
             /// The published `OWN_STRIP.taxi_route` is the crew's own (an uncontrolled field),
             /// not a controller's, to this runway end. Cleared by any controller's
             /// route, and with the flight and the field (`StationFlight`). It stands

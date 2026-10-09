@@ -27,11 +27,35 @@ impl Station {
             && intent == tower::Intent::RequestClearance
             && self.desk.circuits
         {
+            let offer = self.circuit_offer(&ctx.runway);
+            // Declined now (no circuits at the field); asked again, cleared.
+            if offer.not_available {
+                self.desk.circuits_declined = true;
+            }
             circuit_ctx = tower::Ctx {
-                circuit: Some(self.circuit_offer(&ctx.runway)),
+                circuit: Some(offer),
                 ..ctx.clone()
             };
             &circuit_ctx
+        } else {
+            ctx
+        };
+        let declined = ctx.circuit.as_ref().is_some_and(|c| c.not_available);
+        // The pressure once per contact: a phrase this flight was already
+        // given is not repeated in the next clearance of the exchange (an
+        // IFR clearance and then the taxi clearance both said "QNH one zero
+        // one seven"). Asked for ("say QNH", a wind check), it is said.
+        let qnh_ctx;
+        let ctx = if service == Service::Tower
+            && !ctx.qnh.is_empty()
+            && self.desk.qnh_given.as_deref() == Some(ctx.qnh.as_str())
+            && intent != tower::Intent::WindCheck
+        {
+            qnh_ctx = tower::Ctx {
+                qnh: String::new(),
+                ..ctx.clone()
+            };
+            &qnh_ctx
         } else {
             ctx
         };
@@ -41,8 +65,10 @@ impl Station {
         // keep the VFR conspicuity. The watch's "radar contact" belongs to
         // whoever has the scope.
         let assigned_ctx;
+        // A declined circuit is cleared for nothing, so it is given no code.
         let ctx = if service == Service::Tower
             && intent == tower::Intent::RequestClearance
+            && !declined
             && self.desk.assigned_squawk.is_none()
             && (self.approach_khz.is_some() || self.departure_khz.is_some())
         {
@@ -84,6 +110,11 @@ impl Station {
         let reply = self.respond_inner(transcript, service, intent.clone(), ctx, wx);
         let reply = if service == Service::Tower {
             self.state_runway_change(&intent, ctx, reply)
+        } else {
+            reply
+        };
+        let reply = if service == Service::Tower {
+            self.note_pressure_given(ctx, reply)
         } else {
             reply
         };
@@ -445,6 +476,9 @@ impl Station {
                         &ctx.callsign,
                         &atis::spoken_runway(&from),
                         &atis::spoken_runway(&to),
+                        ctx.dialect,
+                        ctx.uk,
+                        ctx.missed_approach.as_ref(),
                     ),
                     _ => reply,
                 };
@@ -547,7 +581,7 @@ impl Station {
                 "{}, contact {} Tower on {}.",
                 ctx.callsign,
                 ctx.airport,
-                atis::spoken_mhz(self.tower_khz)
+                atis::spoken_mhz_in(self.tower_khz, self.dialect)
             ),
             tower::Intent::Greeting => {
                 format!(
@@ -762,8 +796,65 @@ impl Station {
             },
             dest_spoken: spoken_airport(&name).to_string(),
             faa: self.dialect == Dialect::Faa,
-            departure_freq: self.departure_khz.or(self.approach_khz).map(atis::spoken_mhz),
+            departure_freq: self.departure_khz.or(self.approach_khz).map(|k| atis::spoken_mhz_in(k, self.dialect)),
         })
+    }
+
+    /// A tower reply that gave the pressure: noted as given to this flight
+    /// (said once per contact, [`StripDesk::qnh_given`]), and, the first
+    /// time, the current ATIS named before it when the pilot has not
+    /// reported it: "information Bravo is current, QNH one zero one seven"
+    /// (CAP 413 / Doc 4444: the controller confirms the current information
+    /// to a pilot who did not report receipt). A reply without the pressure
+    /// passes through untouched.
+    fn note_pressure_given(&mut self, ctx: &tower::Ctx, reply: String) -> String {
+        let clause = format!(", {}", ctx.qnh);
+        if ctx.qnh.is_empty() || !reply.contains(&clause) {
+            return reply;
+        }
+        self.desk.qnh_given = Some(ctx.qnh.clone());
+        let current = atis_current_letter();
+        let Some(letter) = current.filter(|_| self.desk.atis_told.is_none() && self.desk.pilot_info != current)
+        else {
+            return reply;
+        };
+        self.desk.atis_told = Some(letter);
+        let info = match self.dialect {
+            Dialect::Icao => format!(", information {} is current", atis::nato(letter)),
+            Dialect::Faa => format!(", ATIS information {} is current", atis::nato(letter)),
+        };
+        reply.replacen(&clause, &format!("{info}{clause}"), 1)
+    }
+
+    /// The missed approach this flight's go-around flies, when it is an
+    /// instrument arrival ([`instrument_arrival`]); `None` for circuit
+    /// traffic, which climbs to the circuit and reports downwind.
+    pub(super) fn missed_approach_for(&self, callsign: &str) -> Option<tower::MissedApproach> {
+        if self.desk.circuits || !instrument_arrival(&self.desk.strip, callsign) {
+            return None;
+        }
+        let contact = match (self.approach_khz, self.departure_khz) {
+            (Some(k), _) => Some(("Approach", k)),
+            (None, Some(k)) => Some(("Departure", k)),
+            (None, None) => None,
+        }
+        .map(|(unit, k)| {
+            (
+                format!("{} {unit}", spoken_airport(&self.apt.name)),
+                atis::spoken_mhz_in(k, self.dialect),
+            )
+        });
+        Some(missed_approach_at(
+            self.runway_in_use.as_deref().unwrap_or_default(),
+            self.apt.elev_ft,
+            contact,
+        ))
+    }
+
+    /// The field speaks CAP 413's own words ([`speaks_cap413`]), by the ICAO
+    /// it was loaded or given procedures by.
+    pub(super) fn speaks_cap413(&self) -> bool {
+        self.cap413
     }
 
     /// The circuit clearance's facts (#182): the height, the dialect, the
@@ -778,7 +869,7 @@ impl Station {
             .flat_map(|r| [&r.ident_a, &r.ident_b])
             .find(|id| atis::spoken_runway(id) == spoken_runway)
             .and_then(|id| self.apt.pattern_left(id));
-        let not_available = self.apt.allows_circuits == Some(false);
+        let not_available = self.apt.allows_circuits == Some(false) && !self.desk.circuits_declined;
         if not_available {
             sim::blackbox::record(
                 "atc",
@@ -852,6 +943,10 @@ impl Station {
             return;
         }
         self.desk.circuits = now;
+        self.desk
+            .strip
+            .circuits
+            .store(now, std::sync::atomic::Ordering::SeqCst);
         sim::blackbox::record(
             "atc",
             serde_json::json!({"event": "circuit_traffic", "circuits": now,
@@ -908,7 +1003,7 @@ impl Station {
                 ctx.callsign,
                 ctx.airport,
                 name,
-                atis::spoken_mhz(khz)
+                atis::spoken_mhz_in(khz, self.dialect)
             ),
             min_alt_ft: self.apt.elev_ft + 700.0,
             to: format!("{} {}", ctx.airport, name),
@@ -986,7 +1081,7 @@ impl Station {
                     "{}, roger. Contact {} Tower on {}.",
                     ctx.callsign,
                     ctx.airport,
-                    atis::spoken_mhz(self.tower_khz)
+                    atis::spoken_mhz_in(self.tower_khz, self.dialect)
                 )
             }
             // Final reports and everything runway-shaped belong to the tower.
@@ -1013,7 +1108,7 @@ impl Station {
                 "{}, contact {} Tower on {}.",
                 ctx.callsign,
                 ctx.airport,
-                atis::spoken_mhz(self.tower_khz)
+                atis::spoken_mhz_in(self.tower_khz, self.dialect)
             ),
             tower::Intent::Greeting => {
                 format!(
@@ -1091,7 +1186,7 @@ impl Station {
             thr_lon,
             course_deg,
             runway_spoken: runway_spoken.clone(),
-            tower_spoken: Some(atis::spoken_mhz(self.tower_khz)),
+            tower_spoken: Some(atis::spoken_mhz_in(self.tower_khz, self.dialect)),
             target_alt_ft,
             ils,
             join_nm,
@@ -1147,5 +1242,44 @@ impl Station {
             "{}, {} Approach, squawk {}. {}",
             ctx.callsign, ctx.airport, squawk, plan_phrase
         )
+    }
+}
+
+/// Is the flight on this strip an INSTRUMENT arrival, whose go-around is
+/// the missed approach: an IFR flight, or an airline (its callsign is an
+/// airline's telephony, [`crate::callsign::is_airline_telephony`]) not
+/// working the circuit. A 737 off the ILS was told "climb to circuit
+/// altitude, report downwind" (the realism review, 2026-10-09).
+pub(super) fn instrument_arrival(strip: &FlightStrip, callsign: &str) -> bool {
+    if strip.circuits.load(Ordering::SeqCst) {
+        return false;
+    }
+    strip
+        .ifr_flight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+        || crate::callsign::is_airline_telephony(callsign)
+}
+
+/// The missed approach off `runway_ident`: published where the field's nav
+/// data has an ILS to it ([`ILS_FACTS`]; still loading reads as none, and
+/// the no-procedure climb is said instead), else a climb to
+/// [`tower::missed_approach_alt_ft`] on runway heading.
+pub(super) fn missed_approach_at(
+    runway_ident: &str,
+    field_elev_ft: f64,
+    contact: Option<(String, String)>,
+) -> tower::MissedApproach {
+    let published = !runway_ident.is_empty()
+        && ILS_FACTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|f| f.ils.iter().any(|i| i.runway == runway_ident));
+    tower::MissedApproach {
+        published,
+        alt_ft: tower::missed_approach_alt_ft(field_elev_ft),
+        contact,
     }
 }

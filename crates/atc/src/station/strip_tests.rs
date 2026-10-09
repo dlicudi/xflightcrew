@@ -39,6 +39,7 @@ pub(super) fn gatwick() -> Station {
         runway_in_use: Some("26L".into()),
         enforce_readback: true,
         dialect: Dialect::Icao,
+        cap413: false,
         procedures: None,
         sid_exits: Default::default(),
         last_qnh: None,

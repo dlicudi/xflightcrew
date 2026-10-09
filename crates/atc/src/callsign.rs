@@ -459,6 +459,54 @@ pub(crate) const TELEPHONY_IATA: &[(&str, &str)] = &[
     ("PC", "Sunturk"),
 ];
 
+/// Is a SPOKEN callsign an airline's: a telephony from the tables (or the
+/// pilot's own) followed by a spoken digit ("Ryanair four five two one",
+/// "Speedbird two zero eight five heavy"). A tail ("November one seven
+/// two Sierra Papa") or a light aircraft by maker ("Cessna three four
+/// five") is not. What the tower reads an airline's go-around by: the
+/// missed approach, never the circuit. Pure but for the pilot's table.
+pub fn is_airline_telephony(spoken: &str) -> bool {
+    is_airline_telephony_with(spoken, &user_telephony())
+}
+
+/// [`is_airline_telephony`] with the pilot's telephony table given.
+pub fn is_airline_telephony_with(spoken: &str, user: &[(String, String)]) -> bool {
+    const DIGITS: [&str; 10] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "niner",
+    ];
+    let s = spoken.trim().to_lowercase();
+    let follows_digit = |t: &str| {
+        let t = t.to_lowercase();
+        s.strip_prefix(&t)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|w| DIGITS.contains(&w) || w == "nine")
+    };
+    user.iter().any(|(_, t)| follows_digit(t))
+        || TELEPHONY
+            .iter()
+            .chain(TELEPHONY_IATA)
+            .any(|(_, t)| follows_digit(t))
+}
+
+/// A callsign meant for speech that arrived as a RAW flight id ("RYR4521",
+/// "IBE3302"): expanded through the telephony ([`spoken_ghost`]); one
+/// already spoken (it has a space) is kept. Our own traffic's bench specs
+/// give a callsign without a `spoken`, and the tower said "RYR4521, taxi
+/// to holding point ..." on the radio (LEMG, 2026-10-08).
+pub fn spoken_if_raw(callsign: &str) -> String {
+    let c = callsign.trim();
+    let raw = !c.is_empty()
+        && !c.contains(char::is_whitespace)
+        && c.chars().any(|ch| ch.is_ascii_digit())
+        && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-');
+    if raw {
+        spoken_ghost(c)
+    } else {
+        c.to_string()
+    }
+}
+
 /// A ghost's flight id spoken like a controller would: airline telephony +
 /// digits for "IBE3421" / "BA306", full NATO for a tail number.
 pub fn spoken_ghost(id: &str) -> String {
