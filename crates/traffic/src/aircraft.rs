@@ -1031,7 +1031,19 @@ impl TrafficAircraft {
             }
             Phase::Final => {
                 let uncleared = o.state != TowerState::ClearedToLand && agl < NO_CLEARANCE_AGL_FT;
-                if o.go_around || uncleared {
+                // A flare that cannot stop on the runway left goes around
+                // with its height in hand. PABV 2L (the hour sweep,
+                // 2026-10-09): two ATRs reached the flare 540 and 890 m down
+                // a 1,220 m strip, rolled off its end and "vacated" through
+                // the GA parking beyond it, 8 m from a parked Cessna. Only a
+                // LONG flare ([`LONG_FLARE_M`] past where the path puts it):
+                // a strip too short for even a good landing is the
+                // schedule's to refuse, never a go-around every lap.
+                let along = end.frame(self.kin.pos()).0;
+                let long = agl < FLARE_AGL_FT
+                    && along > flare_along_m() + LONG_FLARE_M
+                    && along + landing_run_m(p, self.kin.gs_kts, agl) > end.length_m;
+                if o.go_around || uncleared || long {
                     self.go_around(end, events);
                 } else if agl < FLARE_AGL_FT {
                     self.set_phase(Phase::Landing, events);
@@ -1153,7 +1165,7 @@ impl TrafficAircraft {
             }
         }
         let here = self.kin.pos();
-        let path = match field.vacate(here, self.kin.hdg_deg, end) {
+        let path = match field.vacate(here, self.kin.hdg_deg, end, &self.icao_type) {
             Some(v) => {
                 let mut full = vec![here];
                 full.extend(v.path.into_iter().skip_while(|p| dist_m(*p, here) < 1.0));
@@ -1188,7 +1200,7 @@ impl TrafficAircraft {
             .as_deref()
             .and_then(|n| field.stand(n))
             .filter(|s| !crate::field::stand_taken(s, &occupied));
-        let Some(stand) = own.or_else(|| field.free_stand(here, &occupied)) else {
+        let Some(stand) = own.or_else(|| field.free_stand(here, &occupied, &self.icao_type)) else {
             return;
         };
         let mut name = stand.name.clone();
@@ -1197,11 +1209,22 @@ impl TrafficAircraft {
         // aircraft stand NOW, so two arrivals in a row were both sent to
         // the one free stand (the hour sweep, 2026-10-08). The stand it
         // ends on is the one taken.
+        // Nor a stand too small for the type: the tower's pick is the
+        // nearest stand, whatever its size.
+        let fits_end = |end: &LatLon| {
+            field
+                .net
+                .stands
+                .iter()
+                .filter(|s| dist_m((s.lat, s.lon), *end) < crate::field::STAND_TAKEN_M)
+                .all(|s| field.takes(s, &self.icao_type))
+        };
         let tower = o.taxi_path.as_ref().filter(|p| {
             p.last().is_some_and(|end| {
-                !occupied
-                    .iter()
-                    .any(|q| dist_m(*q, *end) < crate::field::STAND_TAKEN_M)
+                fits_end(end)
+                    && !occupied
+                        .iter()
+                        .any(|q| dist_m(*q, *end) < crate::field::STAND_TAKEN_M)
             })
         });
         self.tower_route = tower.is_some();
@@ -1261,7 +1284,7 @@ impl TrafficAircraft {
                 .map(|p| (p.path, None)),
             Phase::Vacate => end
                 .as_ref()
-                .and_then(|e| open.vacate(here, self.kin.hdg_deg, e))
+                .and_then(|e| open.vacate(here, self.kin.hdg_deg, e, &self.icao_type))
                 .map(|v| (v.path, None)),
             _ => None,
         };
@@ -1296,6 +1319,36 @@ impl TrafficAircraft {
 /// Feet of height on the 3 degree path `d_m` metres out.
 pub fn glide_ft(d_m: f64) -> f64 {
     d_m.max(0.0) * GLIDE_DEG.to_radians().tan() * FT_PER_M
+}
+
+/// Metres past the threshold the 3 degree path reaches the flare height.
+pub fn flare_along_m() -> f64 {
+    (TCH_FT - FLARE_AGL_FT) / FT_PER_M / GLIDE_DEG.to_radians().tan()
+}
+
+/// Metres from the threshold a good landing of `p` takes to slow to the
+/// exit: the flare where the path puts it, then [`landing_run_m`].
+pub fn landing_distance_m(p: &Perf) -> f64 {
+    flare_along_m() + landing_run_m(p, p.vref_kts, FLARE_AGL_FT)
+}
+
+/// A flare this far beyond [`flare_along_m`] is a long one, metres.
+pub const LONG_FLARE_M: f64 = 150.0;
+
+/// Metres from a flare begun `agl_ft` up at `gs_kts` to the speed the
+/// runway is left at: the float at the flare's sink and the landing law's
+/// pace ([`TrafficAircraft`]'s landing), then the rollout at the class's
+/// deceleration down to the exit speed.
+pub fn landing_run_m(p: &Perf, gs_kts: f64, agl_ft: f64) -> f64 {
+    let approach_sink = p.vref_kts * KT_TO_MS * 196.85 * GLIDE_DEG.to_radians().tan();
+    let sink_fpm = FLARE_SINK_FPM.max(0.5 * approach_sink);
+    let float_s = agl_ft.max(0.0) / sink_fpm * 60.0;
+    let touch_kts = gs_kts.min(p.vref_kts - 5.0).max(0.0);
+    let float_m = 0.5 * (gs_kts + touch_kts) * KT_TO_MS * float_s;
+    let exit = (p.taxi_kts + 2.0) * KT_TO_MS;
+    let v = touch_kts * KT_TO_MS;
+    let roll_m = (v * v - exit * exit).max(0.0) / (2.0 * p.decel_kts_s * KT_TO_MS);
+    float_m + roll_m
 }
 
 /// The straight-in's final fix: far enough out to be established.

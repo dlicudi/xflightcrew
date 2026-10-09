@@ -132,6 +132,7 @@ fn net(frame: &Frame) -> TaxiNet {
         name: "Stand 1".into(),
         kind: "gate".into(),
         accepts: Vec::new(),
+        width: None,
     });
     n
 }

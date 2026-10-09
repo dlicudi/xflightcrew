@@ -41,6 +41,10 @@ pub struct Stand {
     /// Aircraft categories the stand accepts (apt.dat field: heavy / jets /
     /// turboprops / props / helos / fighters), lowercased. Empty = unspecified.
     pub accepts: Vec<String>,
+    /// The biggest aircraft the stand takes, as its ICAO wingspan code
+    /// ('A' under 15 m to 'F' under 80 m): the 1301 row under the 1300.
+    /// `None` where the file gives none.
+    pub width: Option<char>,
 }
 
 impl Stand {
@@ -333,6 +337,8 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
     // The pavement polygon being read (a 110 block), and its current ring.
     let mut in_pavement = false;
     let mut ring: Vec<PaintNode> = Vec::new();
+    // The row before was a 1300 that made a stand: a 1301 there is its size.
+    let mut stand_open = false;
     loop {
         buf.clear();
         if reader.read_until(b'\n', &mut buf).unwrap_or(0) == 0 {
@@ -346,6 +352,7 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
         };
         let mut f = line.split_whitespace();
         let row = f.next();
+        let after_stand = std::mem::replace(&mut stand_open, row == Some("1300"));
         // Any row that opens a new block ends the feature being read.
         if !matches!(row, Some("111" | "112" | "113" | "114" | "115" | "116")) {
             flush_paint_feature(&mut feature, &mut net.paint);
@@ -494,7 +501,10 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
                     f.next().and_then(|s| s.parse::<f64>().ok()),
                 ) {
                     (Some(a), Some(b), Some(h)) => (a, b, h),
-                    _ => continue,
+                    _ => {
+                        stand_open = false;
+                        continue;
+                    }
                 };
                 let kind = f.next().unwrap_or("misc").to_string();
                 let accepts = f
@@ -512,7 +522,20 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
                     name,
                     kind,
                     accepts,
+                    width: None,
                 });
+            }
+            Some("1301") if in_airport && after_stand => {
+                // width_code operation_type [airlines...]
+                // e.g. `1301 C airline baw afr klm`
+                let width = f
+                    .next()
+                    .and_then(|w| w.chars().next())
+                    .map(|c| c.to_ascii_uppercase())
+                    .filter(|c| ('A'..='F').contains(c));
+                if let Some(s) = net.stands.last_mut() {
+                    s.width = width;
+                }
             }
             Some("1204") if in_airport => {
                 // classification runway-list — attaches to the 1202 row

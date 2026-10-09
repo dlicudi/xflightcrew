@@ -879,6 +879,7 @@ fn a_stand_route_avoiding_the_parked_goes_to_the_next_free_stand() {
         name: name.into(),
         kind: "gate".into(),
         accepts: vec![],
+        width: None,
     };
     let net = nav::TaxiNet {
         nodes,
@@ -924,6 +925,7 @@ fn our_stand_route_passes_over_a_stand_our_parked_traffic_stands_on() {
         name: name.into(),
         kind: "gate".into(),
         accepts: vec![],
+        width: None,
     };
     *TAXI_NET.lock().unwrap() = Some(std::sync::Arc::new(nav::TaxiNet {
         nodes,

@@ -14,6 +14,10 @@ pub struct FieldModel {
     pub net: TaxiNet,
     /// The field's published procedures by name (empty without CIFP).
     pub procs: Procedures,
+    /// Stands nothing taxis to or from, only parks on: the way between the
+    /// stand and the network runs through another stand
+    /// ([`FieldModel::joins_through_a_stand`]).
+    pub parked_only: std::collections::HashSet<String>,
 }
 
 /// The terminal procedures a field publishes, by ident: what the
@@ -104,11 +108,59 @@ impl FieldModel {
             airport,
             net,
             procs: Procedures::default(),
+            parked_only: Default::default(),
         };
         if f.net.stands.is_empty() {
             f.net.stands = f.apron_spots();
         }
+        f.parked_only = f
+            .net
+            .stands
+            .iter()
+            .filter(|s| f.joins_through_a_stand(s))
+            .map(|s| s.name.clone())
+            .collect();
         f
+    }
+
+    /// The way onto the network from `stand` runs through another stand: the
+    /// straight join to the nearest taxiway node (where nav's routes start
+    /// and end, [`nav::TaxiNet::plan`]) passes within half its wingspan code
+    /// of a stand beside it. ULKK (the hour sweep, 2026-10-09): a row of
+    /// eight stands the network never reaches, so the Cirrus on the fourth
+    /// joined the taxiway straight down the row and through the ATR parked
+    /// on the ninth, 8 m from its nose.
+    pub fn joins_through_a_stand(&self, stand: &Stand) -> bool {
+        let at = (stand.lat, stand.lon);
+        let Some(node) = self.join_node(at) else {
+            return false;
+        };
+        self.net.stands.iter().any(|o| {
+            let p = (o.lat, o.lon);
+            dist_m(p, at) >= STAND_TAKEN_M
+                && crate::kin::cross_track_m(&[at, node], p) < max_span_m(stand_width(o)) / 2.0
+        })
+    }
+
+    /// The taxiway node nearest `p`: where a route from `p` starts.
+    fn join_node(&self, p: LatLon) -> Option<LatLon> {
+        self.net
+            .edges
+            .iter()
+            .filter(|e| !e.runway)
+            .flat_map(|e| [e.a, e.b])
+            .filter_map(|id| self.net.nodes.get(&id).copied())
+            .min_by(|a, b| dist_m(p, *a).total_cmp(&dist_m(p, *b)))
+    }
+
+    /// `stand` takes an `icao_type` that taxis to or from it: it fits
+    /// ([`stand_fits`]), stands clear of the runways
+    /// ([`FieldModel::beside_runway`]) and its way onto the network is its
+    /// own ([`FieldModel::parked_only`]).
+    pub fn takes(&self, stand: &Stand, icao_type: &str) -> bool {
+        stand_fits(stand, icao_type)
+            && !self.parked_only.contains(&stand.name)
+            && !self.beside_runway((stand.lat, stand.lon))
     }
 
     /// Parking for a field that publishes no stands (apt.dat 1300): the
@@ -155,10 +207,33 @@ impl FieldModel {
                 name: format!("Apron {}", out.len() + 1),
                 kind: "tie_down".into(),
                 accepts: Vec::new(),
+                width: None,
             });
             if out.len() >= APRON_SPOTS_MAX {
                 break;
             }
+        }
+        // Each spot's size is the room it has: half the way to the next
+        // spot each side, and its wingtip clear of every lane but its own
+        // lead-in; never more than [`APRON_SPOT_WIDTH`].
+        let sizes: Vec<char> = out
+            .iter()
+            .map(|s| {
+                let p = (s.lat, s.lon);
+                let neighbour = out
+                    .iter()
+                    .map(|o| dist_m(p, (o.lat, o.lon)))
+                    .filter(|d| *d > 0.0)
+                    .fold(f64::INFINITY, f64::min);
+                let room = f64::min(
+                    neighbour - STAND_WINGTIP_GAP_M,
+                    2.0 * (self.lane_clearance_m(p) - LANE_WINGTIP_GAP_M),
+                );
+                widest_code_within(room).min(APRON_SPOT_WIDTH)
+            })
+            .collect();
+        for (s, w) in out.iter_mut().zip(sizes) {
+            s.width = Some(w);
         }
         out
     }
@@ -277,16 +352,24 @@ impl FieldModel {
     /// strip held for minutes, 22 go-arounds in the hour. A real crew turns
     /// round and backtracks as it slows. The backtrack is taken when its
     /// drive to the stand is under [`BACKTRACK_SAVES`] of the forward one,
-    /// or when there is no exit ahead at all.
-    pub fn vacate(&self, pos: LatLon, hdg: f64, end: &RunwayEnd) -> Option<VacatePlan> {
+    /// or when there is no exit ahead at all. The parking is the one an
+    /// `icao_type` takes ([`FieldModel::parking_near`]).
+    pub fn vacate(
+        &self,
+        pos: LatLon,
+        hdg: f64,
+        end: &RunwayEnd,
+        icao_type: &str,
+    ) -> Option<VacatePlan> {
         let zone = [end.ident.clone(), end.reciprocal.clone()];
         let plan = |h: f64| {
             self.net
                 .plan_vacate(pos.0, pos.1, h, &zone, nav::VACATE_CLEAR_M)
                 .filter(|v| v.path.len() >= 2)
+                .map(|v| self.short_of_the_stands(v))
         };
         let ahead = plan(hdg).or_else(|| self.drive_off(pos, hdg));
-        let Some(stand) = self.parking_near(pos) else {
+        let Some(stand) = self.parking_near(pos, icao_type) else {
             return ahead;
         };
         let behind = plan((hdg + 180.0).rem_euclid(360.0));
@@ -305,6 +388,34 @@ impl FieldModel {
             },
             (a, b) => a.or(b),
         }
+    }
+
+    /// `v` ended short of the stands it would end among: cut back to its
+    /// last point [`VACATE_STAND_CLEAR_M`] from every stand and off the
+    /// runway's side ([`FieldModel::beside_runway`]); left whole when no
+    /// point is. BIRK 13 (the hour sweep, 2026-10-09): exit B runs on into
+    /// a dead end ringed by GA tie-downs 11 m round its last node, the
+    /// vacate drove to that node and stopped there, wingtips in the parked
+    /// Cessnas, and the taxi-in turned round through them.
+    fn short_of_the_stands(&self, mut v: VacatePlan) -> VacatePlan {
+        let among = |p: LatLon| {
+            self.net
+                .stands
+                .iter()
+                .any(|s| dist_m(p, (s.lat, s.lon)) < VACATE_STAND_CLEAR_M)
+        };
+        if !v.path.last().is_some_and(|p| among(*p)) {
+            return v;
+        }
+        let keep = v
+            .path
+            .iter()
+            .rposition(|p| !among(*p) && !self.beside_runway(*p));
+        if let Some(i) = keep.filter(|i| *i >= 1) {
+            v.path.truncate(i + 1);
+            v.seg.truncate(i);
+        }
+        v
     }
 
     /// The vacate where the data draws none: straight to the nearest taxi
@@ -428,14 +539,15 @@ impl FieldModel {
             .fold(f64::INFINITY, f64::min)
     }
 
-    /// The nearest stand an arrival can park on: suitable and off every
-    /// runway strip.
-    pub fn parking_near(&self, p: LatLon) -> Option<&Stand> {
-        self.net
-            .stands
-            .iter()
-            .filter(|s| s.is_suitable() && !self.beside_runway((s.lat, s.lon)))
-            .min_by(|a, b| dist_m(p, (a.lat, a.lon)).total_cmp(&dist_m(p, (b.lat, b.lon))))
+    /// The stand an `icao_type` arrival parks on, nearest `p`: one that
+    /// takes it ([`stand_fits`]), off every runway strip, of the tightest
+    /// size there is.
+    pub fn parking_near(&self, p: LatLon, icao_type: &str) -> Option<&Stand> {
+        nearest_tightest(
+            self.net.stands.iter().filter(|s| self.takes(s, icao_type)),
+            icao_type,
+            p,
+        )
     }
 
     /// The taxi route from `from` onto `stand`.
@@ -453,15 +565,29 @@ impl FieldModel {
         })
     }
 
-    /// The nearest suitable stand to `from` that nobody in `occupied`
-    /// stands on (within [`STAND_TAKEN_M`]).
-    pub fn free_stand(&self, from: LatLon, occupied: &[LatLon]) -> Option<&Stand> {
-        self.net
-            .stands
-            .iter()
-            .filter(|s| s.is_suitable())
-            .filter(|s| !stand_taken(s, occupied))
-            .min_by(|a, b| dist_m(from, (a.lat, a.lon)).total_cmp(&dist_m(from, (b.lat, b.lon))))
+    /// The stand nearest `from` that takes an `icao_type` ([`stand_fits`])
+    /// and nobody in `occupied` stands on (within [`STAND_TAKEN_M`]), of the
+    /// tightest size free: a bigger stand only when none of its own size is.
+    /// Of those, one with no neighbour in `occupied` ([`neighbour_taken`])
+    /// first: a quiet apron is not filled stand by stand.
+    pub fn free_stand(&self, from: LatLon, occupied: &[LatLon], icao_type: &str) -> Option<&Stand> {
+        let free = || {
+            self.net
+                .stands
+                .iter()
+                .filter(|s| self.takes(s, icao_type) && !stand_taken(s, occupied))
+        };
+        nearest_tightest(
+            free().filter(|s| !neighbour_taken(s, occupied)),
+            icao_type,
+            from,
+        )
+        .filter(|s| {
+            // Lonely, but not of a bigger size than one free beside somebody.
+            nearest_tightest(free(), icao_type, from)
+                .is_none_or(|t| stand_width(t) == stand_width(s))
+        })
+        .or_else(|| nearest_tightest(free(), icao_type, from))
     }
 }
 
@@ -620,7 +746,6 @@ fn unique_stand_names(stands: &mut [Stand]) {
 /// An aircraft this close to a stand is on it.
 pub const STAND_TAKEN_M: f64 = 20.0;
 
-/// Somebody in `occupied` is on `stand`.
 /// A dead-end spur ending this close to a stand is its own lead-in, metres.
 const SPUR_END_M: f64 = 40.0;
 
@@ -630,6 +755,10 @@ const STAND_RUNWAY_GAP_M: f64 = 30.0;
 /// A vacate the data draws none for drives off to a taxi node this close,
 /// metres.
 const DRIVE_OFF_M: f64 = 200.0;
+
+/// A vacate ends at least this far from every stand, metres
+/// ([`FieldModel::vacate`]).
+const VACATE_STAND_CLEAR_M: f64 = 25.0;
 
 /// A vacate with no route off drives straight to a stand this close, metres.
 const STRAIGHT_TO_STAND_M: f64 = 800.0;
@@ -651,10 +780,138 @@ fn path_m(path: &[LatLon]) -> f64 {
     path.windows(2).map(|w| dist_m(w[0], w[1])).sum()
 }
 
+/// Somebody in `occupied` is on `stand`.
 pub fn stand_taken(stand: &Stand, occupied: &[LatLon]) -> bool {
     occupied
         .iter()
         .any(|p| dist_m(*p, (stand.lat, stand.lon)) < STAND_TAKEN_M)
+}
+
+/// Somebody in `taken` stands on a stand beside `stand`: within its
+/// wingspan code's widest span and [`NEIGHBOUR_GAP_M`], never on it
+/// ([`STAND_TAKEN_M`]). An aircraft leaving `stand` passes them on its way
+/// out. The hour sweep (2026-10-09): sized to fit, ENVA's airliners all
+/// took its eleven code C gates, 40 m apart, and every departure left past
+/// the one parked beside it.
+pub fn neighbour_taken(stand: &Stand, taken: &[LatLon]) -> bool {
+    let reach = max_span_m(stand_width(stand)) + NEIGHBOUR_GAP_M;
+    taken.iter().any(|p| {
+        let d = dist_m(*p, (stand.lat, stand.lon));
+        (STAND_TAKEN_M..reach).contains(&d)
+    })
+}
+
+/// A stand is a neighbour's within its span and this, metres.
+const NEIGHBOUR_GAP_M: f64 = 10.0;
+
+/// A field's own apron spot is at most this size (a narrowbody): a dead end
+/// in a network is no widebody's stand.
+const APRON_SPOT_WIDTH: char = 'C';
+/// Two aircraft parked side by side keep this between their wingtips,
+/// metres (ICAO Annex 14's stand clearance for code C is 4.5 m).
+const STAND_WINGTIP_GAP_M: f64 = 4.5;
+/// A parked wingtip keeps this from the centreline of a lane traffic taxis
+/// along, metres.
+const LANE_WINGTIP_GAP_M: f64 = 10.0;
+
+/// The widest wingspan a code letter takes, metres.
+fn max_span_m(code: char) -> f64 {
+    match code {
+        'A' => 15.0,
+        'B' => 24.0,
+        'C' => 36.0,
+        'D' => 52.0,
+        'E' => 65.0,
+        _ => 80.0,
+    }
+}
+
+/// The biggest wingspan code whose every aircraft spans `room_m` or less
+/// ('A' when even that one does not fit: a spot is never sized to nothing).
+fn widest_code_within(room_m: f64) -> char {
+    ['F', 'E', 'D', 'C', 'B']
+        .into_iter()
+        .find(|c| max_span_m(*c) <= room_m)
+        .unwrap_or('A')
+}
+
+/// apt.dat's stand category for `icao_type`'s class: heavy, jets,
+/// turboprops or props.
+pub fn stand_category(icao_type: &str) -> &'static str {
+    let (perf, _) = crate::perf::class_for_type(icao_type);
+    // By name: a `const` table's address is not one address.
+    if perf.name == crate::perf::JET_HEAVY.name {
+        "heavy"
+    } else if perf.name == crate::perf::JET_MED.name {
+        "jets"
+    } else if perf.name == crate::perf::TURBOPROP.name {
+        "turboprops"
+    } else {
+        "props"
+    }
+}
+
+/// The biggest wingspan code `stand` takes: its 1301 row's, else what the
+/// categories it names imply (a heavy's stand E, a jet's or a turboprop's
+/// C, anything else B), else its kind (a gate C, anything else B).
+pub fn stand_width(stand: &Stand) -> char {
+    if let Some(w) = stand.width {
+        return w;
+    }
+    let takes = |c: &str| stand.accepts.iter().any(|a| a == c);
+    if takes("heavy") {
+        'E'
+    } else if takes("jets") || takes("turboprops") {
+        'C'
+    } else if stand.accepts.is_empty() && stand.kind.eq_ignore_ascii_case("gate") {
+        'C'
+    } else {
+        'B'
+    }
+}
+
+/// `stand` takes an `icao_type`: a suitable stand ([`Stand::is_suitable`])
+/// that names the type's category among its own (a jet's stand takes a
+/// heavy's too, and a heavy's a jet), or names none, and is as wide as the
+/// type's wingspan code ([`crate::perf::wingspan_code`]). The hour sweep
+/// (2026-10-09): airliners on light aircraft's stands, packed 20 m apart,
+/// left their stands through the neighbours parked beside them.
+pub fn stand_fits(stand: &Stand, icao_type: &str) -> bool {
+    let cat = stand_category(icao_type);
+    let named = stand.accepts.is_empty()
+        || stand.accepts.iter().any(|a| {
+            a == cat || (cat == "jets" && a == "heavy") || (cat == "heavy" && a == "jets")
+        });
+    stand.is_suitable() && named && stand_width(stand) >= crate::perf::wingspan_code(icao_type)
+}
+
+/// `stands` that take an `icao_type` ([`stand_fits`]), the tightest first:
+/// every stand of the smallest size that fits, then the next size up, each
+/// size in the order given. A big stand is kept for a big aircraft.
+pub fn tightest_first<'a>(
+    stands: impl IntoIterator<Item = &'a Stand>,
+    icao_type: &str,
+) -> Vec<&'a Stand> {
+    let mut out: Vec<&Stand> = stands
+        .into_iter()
+        .filter(|s| stand_fits(s, icao_type))
+        .collect();
+    out.sort_by_key(|s| stand_width(s));
+    out
+}
+
+/// Of `stands`, the one nearest `p` among those of the tightest size that
+/// takes an `icao_type` ([`tightest_first`]).
+fn nearest_tightest<'a>(
+    stands: impl IntoIterator<Item = &'a Stand>,
+    icao_type: &str,
+    p: LatLon,
+) -> Option<&'a Stand> {
+    let fits = tightest_first(stands, icao_type);
+    let size = stand_width(fits.first()?);
+    fits.into_iter()
+        .take_while(|s| stand_width(s) == size)
+        .min_by(|a, b| dist_m(p, (a.lat, a.lon)).total_cmp(&dist_m(p, (b.lat, b.lon))))
 }
 
 #[cfg(test)]
@@ -714,7 +971,9 @@ mod tests {
             .expect("BIEG in the fixture");
         let e03 = f.end("03").unwrap();
         let here = (65.28663668654765, -14.397736800949273);
-        let v = f.vacate(here, e03.course_deg, &e03).expect("a vacate");
+        let v = f
+            .vacate(here, e03.course_deg, &e03, "C172")
+            .expect("a vacate");
         let off = *v.path.last().unwrap();
         assert!(
             e03.frame(off).0 < e03.frame(here).0,
@@ -733,7 +992,9 @@ mod tests {
         let x = fixtures::xtst();
         let e09 = x.end("09").unwrap();
         let roll = e09.at(500.0, 0.0);
-        let v = x.vacate(roll, e09.course_deg, &e09).expect("a vacate");
+        let v = x
+            .vacate(roll, e09.course_deg, &e09, "C172")
+            .expect("a vacate");
         assert!(
             e09.frame(*v.path.last().unwrap()).0 > 500.0,
             "forward to the next exit"
@@ -821,5 +1082,196 @@ mod apron_tests {
         let e = f.end("09").unwrap();
         assert!(f.beside_runway(e.at(300.0, 30.0)), "30 m off the centreline is beside it");
         assert!(!f.beside_runway(e.at(300.0, 200.0)));
+        // Each is sized by the room it has, never past a narrowbody's.
+        for s in &f.net.stands {
+            let w = s.width.expect("an apron spot has a size");
+            assert!(('A'..=APRON_SPOT_WIDTH).contains(&w), "{} is {w}", s.name);
+        }
+    }
+
+    fn stand(name: &str, at: LatLon, accepts: &[&str], width: Option<char>) -> Stand {
+        Stand {
+            lat: at.0,
+            lon: at.1,
+            heading: 180.0,
+            name: name.into(),
+            kind: "tie_down".into(),
+            accepts: accepts.iter().map(|a| a.to_string()).collect(),
+            width,
+        }
+    }
+
+    /// XTST with `stands` for its own.
+    fn xtst_with(stands: Vec<Stand>) -> FieldModel {
+        let x = fixtures::xtst();
+        let mut net = x.net.clone();
+        net.stands = stands;
+        FieldModel::new("XTST", x.airport.clone(), Some(net))
+    }
+
+    /// The hour sweep (2026-10-09): airliners on light aircraft's stands
+    /// left them through the aircraft parked beside them. A stand takes a
+    /// type of its category and no wider than its 1301 size; of those the
+    /// tightest size is taken first, a bigger one only when none of its own
+    /// size is free, and nothing when none is wide enough.
+    #[test]
+    fn an_airliner_is_never_put_on_a_light_aircrafts_stand() {
+        let small = stand("Small", (36.0026, -5.0006), &["jets", "props"], Some('B'));
+        let c = stand("C", (36.0026, -4.9994), &["jets"], Some('C'));
+        let e = stand("E", (36.0026, -5.0), &["heavy", "jets"], Some('E'));
+        let props = stand("Props", (36.0026, -5.0012), &["props"], Some('C'));
+        assert!(
+            !stand_fits(&small, "A320"),
+            "a B stand is too small for an A320"
+        );
+        assert!(stand_fits(&c, "A320") && stand_fits(&e, "B738"));
+        assert!(stand_fits(&e, "B77W") && !stand_fits(&c, "B77W"));
+        assert!(
+            !stand_fits(&props, "A320"),
+            "a props stand takes no jet, however wide"
+        );
+        assert!(stand_fits(&small, "C172") && stand_fits(&props, "C172"));
+        let order: Vec<&str> = tightest_first([&e, &small, &c], "A319")
+            .into_iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(order, vec!["C", "E"]);
+
+        let f = xtst_with(vec![small.clone(), c.clone(), e.clone()]);
+        let near_e = (e.lat, e.lon);
+        assert_eq!(
+            f.free_stand(near_e, &[], "A320").map(|s| s.name.as_str()),
+            Some("C"),
+            "the code C stand, though the E is nearer"
+        );
+        assert_eq!(
+            f.free_stand(near_e, &[(c.lat, c.lon)], "A320")
+                .map(|s| s.name.as_str()),
+            Some("E"),
+            "the next size up when it is taken"
+        );
+        assert_eq!(
+            f.free_stand(near_e, &[(c.lat, c.lon), (e.lat, e.lon)], "A320")
+                .map(|s| s.name.as_str()),
+            None,
+            "never the B stand"
+        );
+        assert_eq!(
+            f.parking_near(near_e, "A320").map(|s| s.name.as_str()),
+            Some("C")
+        );
+        // No 1301 row: judged by what it takes.
+        assert_eq!(stand_width(&stand("x", (0.0, 0.0), &["props"], None)), 'B');
+        assert_eq!(stand_width(&stand("x", (0.0, 0.0), &["jets"], None)), 'C');
+        assert_eq!(stand_width(&stand("x", (0.0, 0.0), &["heavy"], None)), 'E');
+    }
+
+    /// ULKK (the hour sweep, 2026-10-09): a row of stands the network never
+    /// reaches; the way from each onto it runs straight down the row through
+    /// the others, so they are parked on and never taxied to or from. The
+    /// one nearest the network keeps its own way.
+    #[test]
+    fn a_stand_whose_way_out_runs_through_its_neighbours_is_only_parked_on() {
+        // Straight north of the apron node (36.0022, -5.0), 33 m apart.
+        let row: Vec<Stand> = (0..4)
+            .map(|k| {
+                let at = (36.0040 - 0.0003 * k as f64, -5.0);
+                stand(&format!("Row {k}"), at, &["props"], Some('A'))
+            })
+            .collect();
+        let f = xtst_with(row);
+        for k in 0..3 {
+            let name = format!("Row {k}");
+            assert!(
+                f.parked_only.contains(&name),
+                "{name} joins through the row"
+            );
+            assert!(!f.takes(f.stand(&name).unwrap(), "C172"));
+        }
+        assert!(
+            !f.parked_only.contains("Row 3"),
+            "the nearest has its own way"
+        );
+        assert_eq!(
+            f.free_stand((36.0040, -5.0), &[], "C172")
+                .map(|s| s.name.as_str()),
+            Some("Row 3")
+        );
+    }
+
+    /// BIRK 13 (the hour sweep, 2026-10-09): an exit running on into a dead
+    /// end ringed by tie-downs. The vacate stops short of them, on its own
+    /// path, off the runway's side.
+    #[test]
+    fn a_vacate_stops_short_of_the_stands_its_exit_runs_into() {
+        let x = fixtures::xtst();
+        let e09 = x.end("09").unwrap();
+        let roll = e09.at(500.0, 0.0);
+        let open = xtst_with(Vec::new());
+        let whole = open
+            .vacate(roll, e09.course_deg, &e09, "C172")
+            .expect("a vacate");
+        let end = *whole.path.last().unwrap();
+        let ring: Vec<Stand> = [(0.0001, 0.0), (0.0, 0.00012), (0.0, -0.00012)]
+            .iter()
+            .enumerate()
+            .map(|(k, d)| {
+                stand(
+                    &format!("Ring {k}"),
+                    (end.0 + d.0, end.1 + d.1),
+                    &["props"],
+                    Some('A'),
+                )
+            })
+            .collect();
+        let f = xtst_with(ring);
+        let v = f
+            .vacate(roll, e09.course_deg, &e09, "C172")
+            .expect("a vacate");
+        let off = *v.path.last().unwrap();
+        assert!(v.path.len() < whole.path.len(), "cut short");
+        assert_eq!(v.seg.len(), v.path.len() - 1);
+        assert!(whole.path.starts_with(&v.path), "along the same way");
+        for s in &f.net.stands {
+            assert!(
+                dist_m(off, (s.lat, s.lon)) >= VACATE_STAND_CLEAR_M,
+                "{}",
+                s.name
+            );
+        }
+        assert!(!f.beside_runway(off), "and off the runway's side");
+    }
+
+    /// ENVA (the hour sweep, 2026-10-09): sized to fit, the airliners all
+    /// took its eleven code C gates and every departure left past the one
+    /// beside it. An arrival takes a stand with nobody beside it while one
+    /// of its size is free.
+    #[test]
+    fn an_arrival_parks_away_from_the_aircraft_already_parked() {
+        let gates: Vec<Stand> = (0..3)
+            .map(|k| {
+                let at = (36.0026, -5.0012 + 0.00045 * k as f64);
+                stand(&format!("Gate {k}"), at, &["jets"], Some('C'))
+            })
+            .collect();
+        let f = xtst_with(gates.clone());
+        let parked = [(gates[0].lat, gates[0].lon)];
+        assert!(
+            neighbour_taken(&gates[1], &parked),
+            "40 m apart is beside it"
+        );
+        assert!(!neighbour_taken(&gates[2], &parked));
+        let from = (gates[1].lat, gates[1].lon);
+        assert_eq!(
+            f.free_stand(from, &parked, "A320").map(|s| s.name.as_str()),
+            Some("Gate 2"),
+            "not the nearer one beside the parked aircraft"
+        );
+        let both = [parked[0], (gates[2].lat, gates[2].lon)];
+        assert_eq!(
+            f.free_stand(from, &both, "A320").map(|s| s.name.as_str()),
+            Some("Gate 1"),
+            "beside somebody when that is all there is"
+        );
     }
 }
