@@ -787,7 +787,7 @@ fn real_install_traffic_world_sweep_inner() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(SWEEP_S);
     let (mut flown, mut spawned, mut calls, mut completed) = (0, 0, 0, 0);
-    let (mut overlaps, mut closest) = (0, f64::INFINITY);
+    let (mut overlaps, mut closest, mut go_arounds) = (0, f64::INFINITY, 0);
     let mut dirty: Vec<String> = Vec::new();
     for (icao, a) in fields {
         let net = crate::nav::find_taxi_net(&apt, &icao).ok().flatten();
@@ -802,7 +802,7 @@ fn real_install_traffic_world_sweep_inner() {
         println!(
             "{icao}: {} scheduled, {} completed, {} calls, {} readbacks ({} accepted), \
              {} conflicts, {} oracle, spacing {}/{}/{} rerouted/towed/held, closest {:.2} of the spacing, \
-             {} overlaps",
+             {} overlaps, {} go-arounds",
             s.movements,
             s.completed,
             s.calls,
@@ -814,7 +814,8 @@ fn real_install_traffic_world_sweep_inner() {
             s.spacing_cleared,
             s.spacing_held,
             s.closest_share,
-            s.overlaps.len()
+            s.overlaps.len(),
+            s.go_arounds
         );
         for line in s
             .conflicts
@@ -842,6 +843,7 @@ fn real_install_traffic_world_sweep_inner() {
         }
         flown += 1;
         overlaps += s.overlaps.len();
+        go_arounds += s.go_arounds;
         closest = f64::min(closest, s.closest_share);
         spawned += s.movements;
         completed += s.completed;
@@ -850,8 +852,8 @@ fn real_install_traffic_world_sweep_inner() {
     Station::uninstall();
     println!(
         "swept {flown} fields: {spawned} movements, {completed} completed, {calls} calls, \
-         no panic, {} dirty; {overlaps} overlaps, closest taxiing pair {closest:.2} of its \
-         spacing",
+         no panic, {} dirty; {overlaps} overlaps, {go_arounds} go-arounds, closest taxiing \
+         pair {closest:.2} of its spacing",
         dirty.len()
     );
     assert!(flown > 0);
