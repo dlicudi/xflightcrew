@@ -118,8 +118,14 @@ pub struct GroundSpacing {
     /// Seconds standing still on the ground, whatever the reason.
     pub still_s: f64,
     /// The movers it holds short of a meeting stretch for: kept while it
-    /// can still hold, so the right of way does not flip as both move.
-    pub giving_way: Vec<u32>,
+    /// can still hold, so the right of way does not flip as both move. With
+    /// each, where it holds while the other's route runs on past
+    /// [`MEETING_LOOKAHEAD_M`]: the stretch is seen only that far, so its
+    /// start ran toward the one holding as the other came on, the hold with
+    /// it, and the one giving way was let go up the very lane it had
+    /// stopped short of (ENAT 11, the hour sweep, 2026-10-09). The hold
+    /// never runs toward it now; it moves on only when the stretch does.
+    pub giving_way: Vec<(u32, Option<HoldAt>)>,
     /// The blocker the guard found no way round and nothing to tow: it
     /// waits, said once ([`Event::SpacingHeld`]).
     pub no_way: Option<Blocker>,
@@ -198,6 +204,30 @@ fn route_ahead(ac: &TrafficAircraft, len_m: f64) -> Option<Vec<LatLon>> {
     (way.len() >= 2).then_some(way)
 }
 
+/// Where a mover holds short of a meeting stretch: metres along its own
+/// route from the route's first point ([`route_s`]), on the route that
+/// starts there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HoldAt {
+    s_m: f64,
+    from: LatLon,
+}
+
+/// How far along its own route an aircraft is, metres from the route's
+/// first point: the legs behind it, then its place along the one it is on.
+fn route_s(ac: &TrafficAircraft) -> f64 {
+    let path = &ac.route.path;
+    if path.len() < 2 {
+        return 0.0;
+    }
+    let seg = ac.route.follow.seg.min(path.len() - 2);
+    let behind: f64 = path[..=seg].windows(2).map(|w| dist_m(w[0], w[1])).sum();
+    let (bx, by) = offset_m(path[seg], path[seg + 1]);
+    let (px, py) = offset_m(path[seg], ac.kin.pos());
+    let len = bx.hypot(by).max(1e-9);
+    behind + ((px * bx + py * by) / len).clamp(0.0, len)
+}
+
 /// Where `p` sits against `way`: metres along it, metres off it, and the
 /// way's bearing there. Nothing behind its start; a point round the
 /// outside of a corner (or just past the end) is measured to the vertex.
@@ -229,7 +259,13 @@ fn project(way: &[LatLon], p: LatLon) -> Option<(f64, f64, f64)> {
 }
 
 /// Where `way` first runs onto a runway's strip and off it again, metres
-/// along it; `None` when it never does, or never comes off.
+/// along it; `None` when it never does. One that does not come off again
+/// inside the way is on it to the end and beyond (an infinite way off): a
+/// crossing that runs down the runway past the lookahead is on the runway
+/// all the way it can see (ENAT 11, the hour sweep, 2026-10-09: a Ryanair
+/// cleared across, its way 227 m down the strip, was let on to give way
+/// at the far exit's junction, ON the runway, nose to nose with a Cirrus
+/// coming up the exit, "expedite crossing", until the Cirrus was towed).
 fn runway_span(field: &FieldModel, way: &[LatLon]) -> Option<(f64, f64)> {
     let mut along = 0.0;
     let mut s_in = None;
@@ -251,7 +287,7 @@ fn runway_span(field: &FieldModel, way: &[LatLon]) -> Option<(f64, f64)> {
         }
         along += len;
     }
-    None
+    s_in.map(|a| (a, f64::INFINITY))
 }
 
 /// A stretch of route in metres: its start, unit direction and length.
@@ -526,7 +562,7 @@ pub fn apply(
             spans[i] = Some(runway_span(field, w));
         }
     }
-    let mut giving: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut giving: Vec<Vec<(u32, Option<HoldAt>)>> = vec![Vec::new(); n];
     for i in 0..n {
         for j in i + 1..n {
             let (Some(mi), Some(mj), Some(ti), Some(tj)) =
@@ -544,10 +580,22 @@ pub fn apply(
                 continue;
             };
             // Held back from the stretch so the other passes the junction a
-            // whole spacing from it, never just a wingtip.
+            // whole spacing from it, never just a wingtip. Once giving way,
+            // at the point first set ([`GroundSpacing::giving_way`]).
             let hold = |k: usize, e: f64, other: usize| {
                 let back = spacing_m(fleet[k].perf, fleet[other].perf) - need;
-                e - back.max(fleet[k].perf.length_m / 2.0 + HOLD_MARGIN_M)
+                let short = e - back.max(fleet[k].perf.length_m / 2.0 + HOLD_MARGIN_M);
+                let set = fleet[k]
+                    .spacing
+                    .giving_way
+                    .iter()
+                    .find(|(id, _)| *id == fleet[other].id)
+                    .and_then(|(_, at)| *at)
+                    .filter(|a| fleet[k].route.path.first() == Some(&a.from));
+                match set {
+                    Some(at) => short.max(at.s_m - route_s(&fleet[k])),
+                    None => short,
+                }
             };
             // Standing still and not in the other's way (a departure just
             // started up on its stand beside the lane an arrival is taxiing
@@ -565,8 +613,18 @@ pub fn apply(
             };
             let can_hold = |k: usize, e: f64, other: usize| {
                 let v = fleet[k].kin.gs_kts * crate::kin::KT_TO_MS;
-                let was = fleet[k].spacing.giving_way.contains(&fleet[other].id);
-                if !off_runways(k, e, other) {
+                let was = fleet[k]
+                    .spacing
+                    .giving_way
+                    .iter()
+                    .any(|(id, _)| *id == fleet[other].id);
+                // Standing where the other has stopped for it, it gives way
+                // to nobody: it is in the way, for the guard below (held to
+                // its hold point it would stand there for good, the other
+                // waiting on it: USRK, the hour sweep, 2026-10-09).
+                let blocking =
+                    fleet[k].kin.gs_kts < 0.5 && fleet[other].kin.gs_kts < 0.5 && in_way(k, other);
+                if !off_runways(k, e, other) || blocking {
                     false
                 } else if fleet[k].kin.gs_kts < 0.5 && !in_way(k, other) {
                     true
@@ -582,8 +640,14 @@ pub fn apply(
                 (false, true) => Some(j),
                 (false, false) => None,
                 (true, true) => {
-                    let was_i = fleet[i].spacing.giving_way.contains(&fleet[j].id);
-                    let was_j = fleet[j].spacing.giving_way.contains(&fleet[i].id);
+                    let gives = |k: usize, to: usize| {
+                        fleet[k]
+                            .spacing
+                            .giving_way
+                            .iter()
+                            .any(|(id, _)| *id == fleet[to].id)
+                    };
+                    let (was_i, was_j) = (gives(i, j), gives(j, i));
                     if was_i != was_j {
                         Some(if was_i { i } else { j })
                     } else {
@@ -600,7 +664,6 @@ pub fn apply(
             };
             if let Some(g) = giver {
                 let (other, e) = if g == i { (j, ei) } else { (i, ej) };
-                giving[g].push(fleet[other].id);
                 let ob = obstacles
                     .iter()
                     .position(|o| o.idx == Some(other))
@@ -615,6 +678,25 @@ pub fn apply(
                 } else {
                     hold(g, e, other).max(0.0)
                 };
+                // Where it holds, as metres along its own route, while the
+                // other's way runs on past what is seen of it: the hold then
+                // never runs toward it (it moves on only when the stretch
+                // does, away).
+                let unseen = {
+                    let r = &fleet[other].route.path;
+                    let whole: f64 = r.windows(2).map(|w| dist_m(w[0], w[1])).sum();
+                    whole - route_s(&fleet[other]) > MEETING_LOOKAHEAD_M
+                };
+                let at = fleet[g]
+                    .route
+                    .path
+                    .first()
+                    .filter(|_| free > 0.0 && unseen)
+                    .map(|&from| HoldAt {
+                        s_m: route_s(&fleet[g]) + free,
+                        from,
+                    });
+                giving[g].push((fleet[other].id, at));
                 keep(
                     &mut stops,
                     g,
@@ -721,11 +803,17 @@ pub fn apply(
         // clear (a real tug would); ours never, and one that may yet move
         // (it has only just stopped, or can still find its own way round)
         // is waited for.
+        // Nor one that stands waiting on this one: two each stopped for the
+        // other never move (USRK, the hour sweep, 2026-10-09: an arrival
+        // for the stand a departure had just left, nose to its side).
+        let me = Blocker::Traffic(fleet[i].id);
         let towable = ob.idx.filter(|&j| {
             let b = &fleet[j];
             b.phase == Phase::Parked
                 || (b.spacing.still_s >= STUCK_S
-                    && (ways[j].is_none() || b.spacing.no_way.is_some()))
+                    && (ways[j].is_none()
+                        || b.spacing.no_way.is_some()
+                        || b.spacing.blocker == Some(me)))
         });
         if let Some(j) = towable {
             let from = fleet[j].phase;

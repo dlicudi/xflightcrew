@@ -296,7 +296,7 @@ impl TrafficAircraft {
                 + touch_kts * KT_TO_MS * flare_s
                 + 0.5 * (touch_kts + self.exit_kts()) * KT_TO_MS * roll_s;
             let at = end.at(stop.clamp(0.0, (end.length_m - 50.0).max(0.0)), 0.0);
-            match field.vacate(at, end.course_deg, end, &self.icao_type) {
+            match field.vacate(at, end.course_deg, end, &self.icao_type, &[]) {
                 Some(v) => {
                     let mut kin = Kin::parked(at, end.elev_ft, end.course_deg);
                     kin.gs_kts = self.exit_kts();

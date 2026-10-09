@@ -354,7 +354,58 @@ impl FieldModel {
     /// drive to the stand is under [`BACKTRACK_SAVES`] of the forward one,
     /// or when there is no exit ahead at all. The parking is the one an
     /// `icao_type` takes ([`FieldModel::parking_near`]).
+    ///
+    /// It never ends where somebody stands (`standing`, the aircraft
+    /// stopped on the ground): another way off round them, else cut back
+    /// short of them while that is still off the runway's side, else as
+    /// planned (the spacing stops it behind them). BIGH (the runway-slot
+    /// sweep, 2026-10-09, #249): a vacate ended exactly where the last
+    /// arrival had ended its own and stood, held short of a crossing of the
+    /// same runway, the two inside each other.
     pub fn vacate(
+        &self,
+        pos: LatLon,
+        hdg: f64,
+        end: &RunwayEnd,
+        icao_type: &str,
+        standing: &[LatLon],
+    ) -> Option<VacatePlan> {
+        let v = self.vacate_open(pos, hdg, end, icao_type)?;
+        let near = |p: LatLon| -> Vec<LatLon> {
+            standing
+                .iter()
+                .copied()
+                .filter(|s| dist_m(p, *s) < VACATE_TAKEN_M)
+                .collect()
+        };
+        let taken = |p: &LatLon| !near(*p).is_empty();
+        let Some(&off) = v.path.last().filter(|p| taken(p)) else {
+            return Some(v);
+        };
+        let open = near(off)
+            .into_iter()
+            .fold(self.clone(), |f, s| f.without_edges_near(s, VACATE_TAKEN_M));
+        let round = open
+            .vacate_open(pos, hdg, end, icao_type)
+            .filter(|r| r.path.last().is_some_and(|p| !taken(p)));
+        if round.is_some() {
+            return round;
+        }
+        let keep = v
+            .path
+            .iter()
+            .rposition(|p| !taken(p) && !self.beside_runway(*p))
+            .filter(|i| *i >= 1);
+        let mut v = v;
+        if let Some(i) = keep {
+            v.path.truncate(i + 1);
+            v.seg.truncate(i);
+        }
+        Some(v)
+    }
+
+    /// [`FieldModel::vacate`] with nobody in the way.
+    fn vacate_open(
         &self,
         pos: LatLon,
         hdg: f64,
@@ -760,6 +811,10 @@ const DRIVE_OFF_M: f64 = 200.0;
 /// ([`FieldModel::vacate`]).
 const VACATE_STAND_CLEAR_M: f64 = 25.0;
 
+/// A vacate ends at least this far from an aircraft standing on the
+/// ground, metres, centre to centre: two light aircraft's taxi spacing.
+const VACATE_TAKEN_M: f64 = 40.0;
+
 /// A vacate with no route off drives straight to a stand this close, metres.
 const STRAIGHT_TO_STAND_M: f64 = 800.0;
 
@@ -972,7 +1027,7 @@ mod tests {
         let e03 = f.end("03").unwrap();
         let here = (65.28663668654765, -14.397736800949273);
         let v = f
-            .vacate(here, e03.course_deg, &e03, "C172")
+            .vacate(here, e03.course_deg, &e03, "C172", &[])
             .expect("a vacate");
         let off = *v.path.last().unwrap();
         assert!(
@@ -993,7 +1048,7 @@ mod tests {
         let e09 = x.end("09").unwrap();
         let roll = e09.at(500.0, 0.0);
         let v = x
-            .vacate(roll, e09.course_deg, &e09, "C172")
+            .vacate(roll, e09.course_deg, &e09, "C172", &[])
             .expect("a vacate");
         assert!(
             e09.frame(*v.path.last().unwrap()).0 > 500.0,
@@ -1209,7 +1264,7 @@ mod apron_tests {
         let roll = e09.at(500.0, 0.0);
         let open = xtst_with(Vec::new());
         let whole = open
-            .vacate(roll, e09.course_deg, &e09, "C172")
+            .vacate(roll, e09.course_deg, &e09, "C172", &[])
             .expect("a vacate");
         let end = *whole.path.last().unwrap();
         let ring: Vec<Stand> = [(0.0001, 0.0), (0.0, 0.00012), (0.0, -0.00012)]
@@ -1226,7 +1281,7 @@ mod apron_tests {
             .collect();
         let f = xtst_with(ring);
         let v = f
-            .vacate(roll, e09.course_deg, &e09, "C172")
+            .vacate(roll, e09.course_deg, &e09, "C172", &[])
             .expect("a vacate");
         let off = *v.path.last().unwrap();
         assert!(v.path.len() < whole.path.len(), "cut short");

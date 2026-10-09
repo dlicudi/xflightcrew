@@ -1553,6 +1553,164 @@ fn met_head_on_too_late_both_stop_and_one_is_turned_away() {
     );
 }
 
+/// THE ENAT CROSSING (the hour sweep, 2026-10-09): a Ryanair cleared across
+/// runway 11 ran 227 m down the strip and turned off into an exit a Cirrus
+/// was taxiing up, to cross back the other way. The Cirrus held short at
+/// first, was let go up the lane as the crossing came on (the stretch they
+/// shared is seen only to the lookahead, so its start ran toward the
+/// Cirrus), and the Ryanair stopped ON the runway nose to nose with it at
+/// its hold short: "expedite crossing", until the Cirrus was towed. Here a
+/// 737 crosses XTST 09 the same way, 230 m down the strip and off into a
+/// 300 m lane a 172 is starting up from its foot: the 172 holds well down
+/// the lane (it drove up it to its hold short, 0.19 of the spacing from
+/// the 737), and the 737 never stands on the runway; neither comes inside
+/// the spacing of the other.
+#[test]
+fn a_crossing_down_the_runway_is_never_held_on_it_by_traffic_coming_up_its_exit() {
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    // South of the runway (no taxiways there: the routes are given).
+    let crossing = vec![
+        end.at(930.0, 80.0),
+        end.at(930.0, 0.0),
+        end.at(700.0, 0.0),
+        end.at(700.0, 80.0),
+        end.at(700.0, 400.0),
+        end.at(400.0, 400.0),
+    ];
+    let climbing = vec![end.at(700.0, 370.0), end.at(700.0, 80.0)];
+    let mut fleet = Fleet::new(field.clone());
+    fleet.spawn(taxiing(&field, 1, "B738", crossing));
+    fleet.spawn(taxiing(&field, 2, "C172", climbing));
+    let taxi = Order {
+        state: TowerState::TaxiCleared,
+        ..Default::default()
+    };
+    let (mut closest, mut stood_on_runway, mut t, mut all) = (f64::INFINITY, 0.0, 0.0, Vec::new());
+    let mut held: f64 = 0.0;
+    while t < 900.0 {
+        let ev = fleet.step(0.1, None, &|_| Some(taxi.clone()));
+        t += 0.1;
+        all.extend(ev);
+        closest = closest.min(closest_taxi_share(&fleet));
+        if let Some(a) = fleet.get(1) {
+            if a.kin.gs_kts < 0.5 && field.on_runway(a.kin.pos()) && t > 1.0 {
+                stood_on_runway += 0.1;
+            }
+        }
+        if let Some(b) = fleet.get(2) {
+            if b.phase == Phase::TaxiOut && b.kin.gs_kts < 0.1 && t > 5.0 {
+                held = held.max(end.frame(b.kin.pos()).1);
+            }
+        }
+        if fleet
+            .get(1)
+            .is_none_or(|a| a.phase == Phase::HoldShort || end.frame(a.kin.pos()).1 > 300.0)
+        {
+            break;
+        }
+    }
+    let (rerouted, towed, said) = guard_events(&all);
+    println!(
+        "ENAT crossing: {t:.0} s, the 737 stood on the runway {stood_on_runway:.1} s, the 172 \
+         held {held:.0} m south of the centreline, closest {closest:.2} of the spacing, guard \
+         {rerouted}/{towed}/{said}"
+    );
+    assert_eq!(stood_on_runway, 0.0, "never held on the runway");
+    assert!(held > 100.0, "the 172 held well down its lane: {held:.0} m");
+    assert!(closest >= 0.7, "never inside the spacing: {closest:.2}");
+    let a = fleet.get(1);
+    assert!(
+        a.is_none_or(|a| !field.on_runway(a.kin.pos())),
+        "and the 737 is off the runway"
+    );
+}
+
+/// THE BIGH VACATE (#249, the runway-slot sweep, 2026-10-09): an arrival's
+/// vacate ended exactly where the last arrival had ended its own and
+/// stood, held short of a crossing of the same runway; closest taxiing
+/// pair 0.00 of the spacing. With one standing at the end its vacate would
+/// have, a 172 landing on XTST 27 ends its vacate off the runway and clear
+/// of it, never inside the spacing.
+#[test]
+fn a_vacate_never_ends_where_an_aircraft_stands() {
+    let field = fixtures::xtst();
+    let lone = arrival(&field, 30, "C172", true);
+    let mut alone = Fleet::new(field.clone());
+    alone.spawn(lone);
+    let mut vacate_end = None;
+    let mut t = 0.0;
+    while t < 1800.0 && vacate_end.is_none() {
+        alone.step(0.1, None, &|_| {
+            Some(Order {
+                state: TowerState::ClearedToLand,
+                ..Default::default()
+            })
+        });
+        t += 0.1;
+        if let Some(a) = alone.get(30).filter(|a| a.phase == Phase::Vacate) {
+            vacate_end = a.route.path.last().copied();
+        }
+    }
+    let spot = vacate_end.expect("it vacated");
+    let mut standing = taxiing(&field, 4, "C172", vec![spot, (spot.0, spot.1 + 1e-5)]);
+    standing.phase = Phase::HoldShort;
+    let mut fleet = Fleet::new(field.clone());
+    fleet.spawn(standing);
+    fleet.spawn(arrival(&field, 30, "C172", true));
+    let (mut ended, mut planned) = (None, None);
+    let mut closest = f64::INFINITY;
+    let mut t = 0.0;
+    while t < 1800.0 && ended.is_none() {
+        let ev = fleet.step(0.1, None, &|id| {
+            (id == 30).then(|| Order {
+                state: TowerState::ClearedToLand,
+                ..Default::default()
+            })
+        });
+        t += 0.1;
+        closest = closest.min(closest_taxi_share(&fleet));
+        if let Some(a) = fleet.get(30).filter(|a| a.phase == Phase::Vacate) {
+            planned.get_or_insert(*a.route.path.last().unwrap());
+        }
+        if ev.iter().any(|e| {
+            matches!(
+                e,
+                Event::Call {
+                    id: 30,
+                    call: Call::Vacated
+                }
+            )
+        }) {
+            ended = fleet.get(30).map(|a| a.kin.pos());
+        }
+    }
+    let at = ended.expect("runway vacated");
+    let planned = planned.expect("a vacate planned");
+    let apart = dist_m(at, spot);
+    println!(
+        "BIGH vacate: planned to end {:.0} m from the one standing, ended {apart:.0} m from it, \
+         closest {closest:.2} of the spacing",
+        dist_m(planned, spot)
+    );
+    assert!(
+        dist_m(planned, spot) >= 40.0,
+        "the vacate is never planned onto its spot: {:.0} m",
+        dist_m(planned, spot)
+    );
+    assert!(
+        !field.beside_runway(planned),
+        "and ends off the runway's side"
+    );
+    assert!(!field.on_runway(at), "off the runway");
+    assert!(
+        apart
+            >= crate::spacing::spacing_m(&crate::perf::PISTON_SINGLE, &crate::perf::PISTON_SINGLE),
+        "clear of the one standing: {apart:.0} m"
+    );
+    assert!(closest >= 0.7, "never inside the spacing: {closest:.2}");
+}
+
 /// ONE STAND, ONE AIRCRAFT: `field`'s schedule for two hours (the second
 /// generated round the fleet at the hour, as the link does), its parked
 /// aircraft and its departures waiting on their stands put down at the
