@@ -612,7 +612,9 @@ pub(crate) fn panel_sync(v: i64, published: Option<i64>, applied: i64) -> PanelS
 }
 
 /// The panel's text settings, app to plugin: one row per registry knob of
-/// [`settings::Kind::Text`], `key|label|pinned_env|value|notice|help`, rows
+/// [`settings::Kind::Text`] and [`PANEL_CHOICES`],
+/// `key|label|pinned_env|value|notice|help|options` (options comma-separated,
+/// empty for a text knob), rows
 /// '\n'-separated. `pinned_env` names the variable that pins the knob (the
 /// field is then read-only), empty when the panel may edit it; `notice` is
 /// the refusal of the last edit, empty after one that took.
@@ -641,13 +643,29 @@ pub(crate) fn parse_text_edits(raw: &str) -> Vec<(String, String)> {
 pub(crate) fn apply_text_edit(key: &str, raw: &str) -> Result<(), String> {
     let s = settings::ALL
         .iter()
-        .find(|s| s.key == key && matches!(s.kind, settings::Kind::Text { .. }))
+        .find(|s| s.key == key && on_panel_rows(s))
         .ok_or_else(|| format!("no text setting {key}"))?;
-    let v = s
-        .kind
-        .parse(raw)
-        .ok_or_else(|| format!("{} is too long or not one line", s.label))?;
+    let v = s.kind.parse(raw).ok_or_else(|| match s.kind {
+        settings::Kind::Choice(options) => format!("{} is one of {}", s.label, options.join(", ")),
+        _ => format!("{} is too long or not one line", s.label),
+    })?;
     settings::set(key, &v)
+}
+
+/// The choice knobs the panel draws as a dropdown on the text rows, a
+/// seventh field naming the options: our own traffic and how busy it is
+/// (2026-10-09: the pilot looked for the traffic setting on the panel and
+/// it was only in the terminal and the EFB).
+pub(crate) const PANEL_CHOICES: &[&str] = &["traffic", "traffic_density"];
+
+/// A registry knob the panel's text rows carry: every text knob, and the
+/// [`PANEL_CHOICES`].
+fn on_panel_rows(s: &settings::Setting) -> bool {
+    match s.kind {
+        settings::Kind::Text { .. } => true,
+        settings::Kind::Choice(_) => PANEL_CHOICES.contains(&s.key),
+        _ => false,
+    }
 }
 
 /// The [`DR_OPT_TEXT`] payload: every text knob with its live value.
@@ -655,17 +673,25 @@ pub(crate) fn text_settings_payload(notices: &std::collections::HashMap<String, 
     let clean = |t: &str| t.replace(['|', '\n'], " ");
     settings::ALL
         .iter()
-        .filter(|s| matches!(s.kind, settings::Kind::Text { .. }))
+        .filter(|s| on_panel_rows(s))
         .map(|s| {
-            let value = s.value().as_text().map(str::to_string).unwrap_or_default();
+            let value = match s.value() {
+                settings::Value::Choice(c) => c,
+                v => v.as_text().map(str::to_string).unwrap_or_default(),
+            };
+            let options = match s.kind {
+                settings::Kind::Choice(o) => o.join(","),
+                _ => String::new(),
+            };
             format!(
-                "{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}",
                 s.key,
                 clean(s.label),
                 if s.env_pinned() { s.env } else { "" },
                 clean(&value),
                 clean(notices.get(s.key).map(String::as_str).unwrap_or("")),
                 clean(s.help),
+                options,
             )
         })
         .collect::<Vec<_>>()
@@ -859,7 +885,8 @@ mod tests {
             .find(|l| l.starts_with("airline_telephony|"))
             .expect("published");
         let f: Vec<&str> = row.split('|').collect();
-        assert_eq!(f.len(), 6, "{row}");
+        assert_eq!(f.len(), 7, "{row}");
+        assert_eq!(f[6], "", "a text knob names no options");
         assert_eq!(f[2], "XCOPILOT_AIRLINE_TELEPHONY");
         assert_eq!(f[3], "WAT=Walker");
         assert!(
@@ -874,6 +901,34 @@ mod tests {
         unsafe { std::env::remove_var("XCOPILOT_AIRLINE_TELEPHONY") };
         settings::update(|c| c.airline_telephony = String::new());
         assert!(apply_text_edit("mode", "atc").is_err(), "not a text knob");
+    }
+
+    /// The traffic knobs ride the panel's rows as dropdowns (2026-10-09:
+    /// the pilot looked for them on the panel): their options in the
+    /// seventh field, and a pick outside them refused by the registry,
+    /// naming the options, with nothing written.
+    #[test]
+    fn the_traffic_choices_are_published_as_dropdowns() {
+        let _guard = settings::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let payload = text_settings_payload(&std::collections::HashMap::new());
+        let row = |k: &str| {
+            payload
+                .lines()
+                .find(|l| l.starts_with(&format!("{k}|")))
+                .map(|l| l.split('|').map(str::to_string).collect::<Vec<_>>())
+        };
+        let t = row("traffic").expect("traffic published");
+        assert_eq!(t.len(), 7);
+        assert_eq!(t[6], "off,real,ours");
+        assert!(["off", "real", "ours"].contains(&t[3].as_str()), "{t:?}");
+        assert_eq!(row("traffic_density").expect("density published")[6], "off,light,normal");
+        let before = settings::live().traffic.clone();
+        let err = apply_text_edit("traffic", "livetraffic").expect_err("not an option");
+        assert!(err.contains("off, real, ours"), "{err}");
+        assert_eq!(settings::live().traffic, before);
+        assert!(apply_text_edit("mode", "atc").is_err(), "not on the panel's rows");
     }
 
     #[test]

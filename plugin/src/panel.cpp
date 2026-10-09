@@ -446,6 +446,7 @@ private:
         const std::string all(text.buf, static_cast<size_t>(text.len));
         ImGui::Spacing();
         ImGui::TextUnformatted("Radio");
+        mChoiceHeading = false;
         size_t pos = 0;
         while (pos <= all.size()) {
             size_t nl = all.find('\n', pos);
@@ -453,6 +454,13 @@ private:
             pos = (nl == std::string::npos) ? all.size() + 1 : nl + 1;
             const std::vector<std::string> f = SplitBar(row);
             if (f.size() < 6 || f[0].empty()) continue;
+            // A choice knob (a seventh field naming its options, comma
+            // separated): a dropdown under its own heading, the pick sent
+            // on the text edit channel the app already validates.
+            if (f.size() >= 7 && !f[6].empty()) {
+                buildChoiceRow(f, mChoiceHeading);
+                continue;
+            }
             const std::string& key = f[0];
             const std::string& label = f[1];
             const std::string& pinned = f[2];
@@ -527,6 +535,59 @@ private:
             }
             ImGui::PopID();
         }
+    }
+
+    // One choice row: `key|label|pinned_env|value|notice|help|a,b,c`. The
+    // heading "Traffic" goes over the first. Pinned by the environment, the
+    // dropdown is shown disabled, naming the variable.
+    bool mChoiceHeading = false;
+    void buildChoiceRow(const std::vector<std::string>& f, bool& heading) {
+        const std::string& key = f[0];
+        const std::string& label = f[1];
+        const std::string& pinned = f[2];
+        const std::string& value = f[3];
+        const std::string& notice = f[4];
+        const std::string& help = f[5];
+        std::vector<std::string> options;
+        size_t start = 0;
+        for (;;) {
+            size_t c = f[6].find(',', start);
+            options.push_back(f[6].substr(start, c == std::string::npos ? std::string::npos : c - start));
+            if (c == std::string::npos) break;
+            start = c + 1;
+        }
+        if (!heading) {
+            ImGui::Spacing();
+            ImGui::TextUnformatted("Traffic");
+            heading = true;
+        }
+        ImGui::PushID(key.c_str());
+        ImGui::TextUnformatted(label.c_str());
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (!pinned.empty()) ImGui::BeginDisabled();
+        if (ImGui::BeginCombo("##choice", value.c_str())) {
+            for (const std::string& o : options) {
+                const bool sel = o == value;
+                if (ImGui::Selectable(o.c_str(), sel) && !sel) {
+                    drefs::send_text_edit(key.c_str(), o.c_str());
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (!pinned.empty()) {
+            ImGui::EndDisabled();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "Set by %s in your .env; edit it there.", pinned.c_str());
+        } else if (ImGui::IsItemHovered() && !help.empty()) {
+            ImGui::SetTooltip("%s", help.c_str());
+        }
+        if (!notice.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_AMBER), "%s", notice.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        ImGui::PopID();
     }
 
     // The minimum the tab strip needs at the current font: every label at
