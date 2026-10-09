@@ -115,6 +115,9 @@ pub struct FinalTraffic {
     /// Every arrival in the corridor, by its raw callsign: the traffic a
     /// held departure was held FOR ([`TakeoffHold::held_for`]).
     pub ghosts: Vec<String>,
+    /// The nearest arrival's type as said ("A320"), when the type table
+    /// knows it ([`traffic_type`]).
+    pub type_spoken: Option<String>,
 }
 
 /// Lateral capture around the extended centerline: half of the tightest
@@ -286,6 +289,7 @@ pub fn final_traffic_for(
         callsign: (!nearest.callsign.is_empty()).then(|| spoken_ghost(&nearest.callsign)),
         count: hits.len(),
         ghosts: hits.iter().map(|(_, t)| t.callsign.clone()).collect(),
+        type_spoken: traffic_type(&nearest.callsign).and_then(|t| spoken_type(&t)),
     })
 }
 

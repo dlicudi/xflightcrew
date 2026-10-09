@@ -826,3 +826,28 @@ fn the_book_audits_a_takeoff_over_a_cleared_crossing() {
     drop(st);
     Station::uninstall();
 }
+
+/// LEMG, 2026-10-08 (bench/traffic/lemg-quick.yaml gives a callsign and no
+/// `spoken`): our own traffic keyed its RAW flight id and the tower
+/// answered "RYR4521, taxi to holding point ...". The tower addresses a
+/// flight by its telephony, whatever the call carried.
+#[test]
+fn a_raw_traffic_callsign_is_answered_by_its_telephony() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let mut st = gatwick_live();
+    let r = st.answer_traffic(&TrafficCall {
+        id: 4,
+        spoken: "RYR4521".into(),
+        text: "Gatwick Tower, RYR4521, request taxi".into(),
+        state: at_the_hold(),
+        picture: Vec::new(),
+    });
+    assert!(
+        r.line.starts_with("Ryanair four five two one, "),
+        "{}",
+        r.line
+    );
+    assert!(!r.line.contains("RYR"), "{}", r.line);
+    Station::uninstall();
+}

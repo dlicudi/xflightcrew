@@ -6,6 +6,25 @@
 //! individually ("one three one decimal two"), "niner" for 9, QNH in whole
 //! hectopascals, wind direction rounded to ten degrees.
 
+/// Radio phraseology dialect. ICAO/CAP 413 style ("descend to altitude two
+/// thousand five hundred feet, QNH one zero two zero") serves most of the
+/// world; FAA style ("descend and maintain two thousand five hundred") for
+/// North America. Same lever as geography-accurate voice casting: a Heathrow
+/// controller must not sound like Chicago Center, in accent OR in grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dialect {
+    #[default]
+    Icao,
+    Faa,
+}
+
+/// Is `icao` a United Kingdom field (EG)? CAP 413 has words of its own
+/// inside the ICAO dialect: "circuit height" where ICAO elsewhere says
+/// "circuit altitude", "avoiding action" for the safety alert.
+pub fn is_uk_field(icao: &str) -> bool {
+    icao.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("EG"))
+}
+
 /// Everything one ATIS edition is built from. The `atc` binary fills this
 /// from datarefs each broadcast cycle.
 #[derive(Debug, Clone)]
@@ -143,6 +162,19 @@ pub fn spoken_mhz(khz: i64) -> String {
         format!("{frac:03}")
     };
     spoken_digits(&format!("{mhz}.{frac}"))
+}
+
+/// [`spoken_mhz`] in the field's dialect: ICAO says the separator
+/// "decimal" (Annex 10 5.2.1.4), the FAA "point" (7110.65 2-4-17):
+/// "one two one point eight" at a K field, never "decimal". The one seam
+/// for every frequency the station speaks; [`spoken_mhz`] stays the ICAO
+/// form for callers outside it.
+pub fn spoken_mhz_in(khz: i64, dialect: Dialect) -> String {
+    let icao = spoken_mhz(khz);
+    match dialect {
+        Dialect::Icao => icao,
+        Dialect::Faa => icao.replace("decimal", "point"),
+    }
 }
 
 /// A runway designator spoken out: "27" -> "two seven", "16L" -> "one six left".

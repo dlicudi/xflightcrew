@@ -102,6 +102,10 @@ pub struct Station {
     /// Phraseology dialect for this field's controllers (set by the owner
     /// from the ICAO prefix, like the voice casting). Defaults to ICAO.
     dialect: Dialect,
+    /// The field speaks CAP 413 inside the ICAO dialect ([`speaks_cap413`]:
+    /// "circuit height"), from the ICAO the station was loaded or given
+    /// procedures by.
+    cap413: bool,
     /// The CIFP directory and this field's ICAO, for the SID an IFR
     /// clearance names (set by the owner, like the dialect). `None` = no
     /// procedure data: IFR clearances say "fly runway heading".
@@ -156,10 +160,23 @@ struct StripDesk {
     /// taxi, zone or IFR request that does not (a new departure says what it
     /// is again); the station is rebuilt for a new flight.
     circuits: bool,
+    /// A circuit asked for at a field whose data says no circuits has been
+    /// declined once ([`tower::circuit_declined_line`]): asked again, it is
+    /// cleared (the "not normally" is the tower's discretion).
+    circuits_declined: bool,
     /// The ATIS information letter the pilot last reported having ("with
     /// information Alpha"). When it matches the current broadcast, clearances
     /// skip the QNH — the whole point of an ATIS.
     pilot_info: Option<char>,
+    /// The ATIS letter the tower told this flight is current ("information
+    /// Bravo is current, QNH ..."), once, on the first reply that gave the
+    /// pressure to a pilot who had not reported it.
+    atis_told: Option<char>,
+    /// The tower's pressure phrase as last given to this flight: the same
+    /// pressure is given once per contact, not in every clearance of one
+    /// exchange (the IFR clearance AND the taxi clearance both said it). A
+    /// change of pressure is given again; "say QNH" is always answered.
+    qnh_given: Option<String>,
     /// This flight's assigned discrete squawk, once a radar service (vectors,
     /// flight following) has issued one. Repeated by every squawk check;
     /// `None` means the VFR conspicuity 7000 is the answer.
@@ -236,7 +253,10 @@ impl StripDesk {
             dep_checked_in: false,
             handed_to: None,
             circuits: false,
+            circuits_declined: false,
             pilot_info: None,
+            atis_told: None,
+            qnh_given: None,
             assigned_squawk: None,
             planned_route: None,
             ifr_bearings: None,
@@ -248,16 +268,9 @@ impl StripDesk {
     }
 }
 
-/// Radio phraseology dialect. ICAO/CAP 413 style ("descend to altitude two
-/// thousand five hundred feet, QNH one zero two zero") serves most of the
-/// world; FAA style ("descend and maintain two thousand five hundred") for
-/// North America. Same lever as geography-accurate voice casting: a Heathrow
-/// controller must not sound like Chicago Center, in accent OR in grammar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dialect {
-    Icao,
-    Faa,
-}
+// The dialect lives with the spoken-number helpers (`atis`), so the pure
+// phrasing layers (`tower`, `atis`) take it without reaching into the station.
+pub use crate::atis::Dialect;
 
 /// The dialect for a field, by ICAO prefix: K (CONUS), P (US Pacific/Alaska)
 /// and C (Canada) speak FAA-style; everywhere else speaks ICAO. Coarse on
@@ -316,7 +329,10 @@ impl Station {
             tracing::warn!(%icao, "ATC station: no tower frequency in apt.dat; ATC off");
             return None;
         }
-        Self::from_airport(apt)
+        Self::from_airport(apt).map(|mut st| {
+            st.cap413 = speaks_cap413(icao);
+            st
+        })
     }
 
     /// Build the station from an already-parsed airport. `None` without a
@@ -351,6 +367,7 @@ impl Station {
             runway_in_use: None,
             enforce_readback: true,
             dialect: Dialect::Icao,
+            cap413: false,
             procedures: None,
             sid_exits: Default::default(),
             last_qnh: None,
@@ -375,6 +392,7 @@ impl Station {
     /// of `earth_fix.dat` and `earth_nav.dat`), so the SID toward the
     /// destination is a lookup by the time anyone asks.
     pub fn set_procedures(&mut self, cifp_dir: &str, fix_path: &str, nav_path: &str, icao: &str) {
+        self.cap413 = speaks_cap413(icao);
         self.procedures = Some((cifp_dir.to_string(), icao.to_uppercase()));
         let (cifp, fix, nav_p, icao) = (
             cifp_dir.to_string(),

@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn traffic_is_called_again_only_when_it_is_more_of_a_factor() {
-    let f = |nm: f64, ft: f64| TrafficFactor { nm, clock: 3, ft };
+    let f = |nm: f64, ft: f64| TrafficFactor::new(nm, 3, ft);
     let called = f(6.0, -900.0);
     assert!(!traffic_worth_recalling(&called, &f(6.0, -700.0)), "200 ft closer is the same call");
     assert!(!traffic_worth_recalling(&called, &f(6.0, -1400.0)), "diverging");
@@ -2652,8 +2652,8 @@ fn lemg30_a_head_on_lander_sends_us_round_and_we_are_resequenced_to_twelve() {
     assert_eq!(
         call.line,
         format!(
-            "{SR22}, go around, traffic on the runway. Climb to circuit altitude, \
-                 expect runway one two, report downwind."
+            "{SR22}, go around, I say again, go around, traffic on the runway. Climb to \
+                 circuit altitude, runway heading, expect runway one two, report downwind."
         )
     );
     assert_eq!(
@@ -2823,7 +2823,7 @@ fn a_standing_occupant_resequences_to_another_strip_or_holds() {
         .expect("the order");
     assert_eq!(
         call.line,
-        format!("{SR22}, go around, traffic on the runway. Climb to circuit altitude, report downwind.")
+        format!("{SR22}, go around, I say again, go around, traffic on the runway. Climb to circuit altitude, runway heading, report downwind.")
     );
     assert!(OWN_STRIP.pending_resequence.lock().unwrap().is_none());
     // The hold: downwind number two, the final continued, not cleared.
@@ -3821,6 +3821,7 @@ fn lxgb() -> Station {
         runway_in_use: None,
         enforce_readback: true,
         dialect: Dialect::Icao,
+        cap413: false,
         procedures: None,
         sid_exits: Default::default(),
         last_qnh: None,
@@ -4680,15 +4681,15 @@ fn real_install_self_taxi_lilb() {
 #[test]
 fn the_region_handoff_line_by_flight_rules() {
     assert_eq!(
-        region_handoff_line(None, true, "Barcelona Tower", 118_105),
+        region_handoff_line(None, true, "Barcelona Tower", 118_105, Dialect::Icao),
         "Radar services terminated. Squawk seven thousand. Contact Barcelona Tower on one one eight decimal one zero five."
     );
     assert_eq!(
-        region_handoff_line(Some("November eight one six November November"), false, "Barcelona Tower", 118_105),
+        region_handoff_line(Some("November eight one six November November"), false, "Barcelona Tower", 118_105, Dialect::Icao),
         "November eight one six November November, contact Barcelona Tower on one one eight decimal one zero five."
     );
     assert_eq!(
-        region_handoff_line(None, false, "Malaga Tower", 118_100),
+        region_handoff_line(None, false, "Malaga Tower", 118_100, Dialect::Icao),
         "Radar services terminated. Contact Malaga Tower on one one eight decimal one."
     );
 }
@@ -5944,7 +5945,7 @@ fn a_runway_start_keeps_its_strip_in_a_light_tailwind() {
     ctx.on_ground = true;
     ctx.own_on_runway = true;
     let r = st.route_keyed(words, Service::Tower, &ctx, wx);
-    assert!(r.contains("runway one three, circuit height"), "{r}");
+    assert!(r.contains("runway one three, circuit altitude"), "{r}");
     *OWN_STRIP.clearance.lock().unwrap() = None;
 }
 
@@ -5983,7 +5984,7 @@ fn a_runway_turned_under_a_cleared_start_is_said() {
     ctx.on_ground = true;
     ctx.own_on_runway = true;
     let r = st.route_keyed(clearance, Service::Tower, &ctx, wx);
-    assert!(r.contains("runway three zero, circuit height"), "{r}");
+    assert!(r.contains("runway three zero, circuit altitude"), "{r}");
     // +46.1: D85023's touchdown makes 13 the arrival stream's end.
     assert_eq!(st.pick_runway_with(wx.wind_from_deg, wx.wind_kts, Some("13"), None), "13");
     // +58.1: the ready call from 30, off the strip in use.
@@ -6115,7 +6116,7 @@ fn parallel_runways_never_trade_places_under_a_departure() {
 /// o'clock, 1 miles, 300 feet above" (+3240.1). One mile is "a mile".
 #[test]
 fn a_traffic_advisory_says_a_mile() {
-    let f = |nm: f64, clock: i32, ft: f64| TrafficFactor { nm, clock, ft };
+    let f = |nm: f64, clock: i32, ft: f64| TrafficFactor::new(nm, clock, ft);
     assert_eq!(
         advisory_line(&f(1.2, 5, 900.0)),
         "traffic, 5 o'clock, a mile, 900 feet above."
@@ -6131,7 +6132,11 @@ fn a_traffic_advisory_says_a_mile() {
 
 #[test]
 fn near_miss_alert_names_the_way_out() {
-    let f = |nm: f64, clock: i32, ft: f64| TrafficFactor { nm, clock, ft };
+    // The FAA's words (7110.65 2-1-6) at an FAA field.
+    let f = |nm: f64, clock: i32, ft: f64| TrafficFactor {
+        dialect: Dialect::Faa,
+        ..TrafficFactor::new(nm, clock, ft)
+    };
     // The line: half a mile, 500 ft. Outside it, only the advisory tier.
     assert!(is_near_miss(&f(0.4, 3, 0.0)));
     assert!(!is_near_miss(&f(0.6, 3, 0.0)), "outside half a mile");
@@ -6153,6 +6158,25 @@ fn near_miss_alert_names_the_way_out() {
     let atc = near_miss_line(&f(0.4, 2, 0.0), false);
     assert!(atc.starts_with("traffic alert"), "{atc}");
     assert!(atc.ends_with("immediately."), "{atc}");
+    // Europe never hears the FAA's words (the realism review, 2026-10-09):
+    // ICAO Doc 4444's avoiding action, and CAP 413's own words in the UK.
+    let icao = near_miss_line(&TrafficFactor::new(0.4, 2, 0.0), false);
+    assert_eq!(
+        icao,
+        "turn left immediately to avoid traffic, 2 o'clock, less than a mile, same altitude."
+    );
+    let uk = TrafficFactor {
+        uk: true,
+        ..TrafficFactor::new(0.4, 12, -300.0)
+    };
+    assert_eq!(
+        near_miss_line(&uk, false),
+        "avoiding action, climb immediately, traffic 12 o'clock, less than a mile, 300 feet \
+         below."
+    );
+    for line in [icao, near_miss_line(&uk, false)] {
+        assert!(!line.contains("traffic alert") && !line.contains("advise you"), "{line}");
+    }
     let crew = near_miss_line(&f(0.4, 2, 0.0), true);
     assert!(crew.starts_with("Traffic!"), "{crew}");
     assert!(crew.contains("now."), "{crew}");
@@ -6297,7 +6321,8 @@ fn approach_takes_the_departure_check_in_when_it_is_the_handoff() {
     let r = st.route_keyed(checkin, Service::Approach, &ctx, wx);
     assert_eq!(
         r,
-        "November one seven two Sierra Papa, Gibraltar Approach, radar contact, climb one five thousand."
+        "November one seven two Sierra Papa, Gibraltar Approach, radar contact, climb altitude \
+         one five thousand feet."
     );
     assert_eq!(st.desk.twr.state, tower::State::Parked, "the tower's book is closed");
     let snap = crate::party_line::clearance_state();
@@ -6714,8 +6739,8 @@ fn readback_discipline_runs_through_the_keyed_route() {
         owed.contains("Cleared for takeoff runway zero niner"),
         "{owed}"
     );
-    // A different call is challenged, and the challenge repeats the
-    // instruction; nothing moves. (A TAXI request is not challenged: it
+    // A different call is challenged ("<callsign>, read back", the flight
+    // named once); nothing moves. (A TAXI request is not challenged: it
     // cancels the takeoff, see `a_taxi_request_cancels_a_takeoff_clearance`.)
     let r = st.route_keyed(
         "gibraltar tower, request start up",
@@ -6723,8 +6748,7 @@ fn readback_discipline_runs_through_the_keyed_route() {
         &ctx,
         wx,
     );
-    assert!(r.contains("read back"), "{r}");
-    assert!(r.contains("cleared for takeoff"), "{r}");
+    assert_eq!(r, "November one seven two Sierra Papa, read back.");
     assert_eq!(
         st.desk.twr.state,
         tower::State::TakeoffCleared,
@@ -6993,7 +7017,7 @@ fn conditional_line_up_arms_the_release_watch() {
     st.respond("", Service::Tower, tower::Intent::RequestTaxi, &ctx, wx);
     let r = st.respond("", Service::Tower, tower::Intent::RequestTakeoff, &ctx, wx);
     assert!(
-        r.contains("behind the landing Speedbird three zero six"),
+        r.contains("behind the landing traffic on 2 mile final"),
         "{r}"
     );
     assert!(r.contains("line up runway zero niner behind"), "{r}");
@@ -7742,27 +7766,35 @@ fn a_circuit_clearance_carries_the_fields_circuit_data() {
     st.apt.allows_circuits = Some(false);
     st.apt.pattern_sides = vec![("27".into(), Some(false))];
     let ctx = scripted_ctx(&mut st, wx);
-    let r = st.route_keyed(
-        "november one seven two sierra papa, request clearance, runway two seven, \
-             for circuits",
-        Service::Tower,
-        &ctx,
-        wx,
+    let ask = "november one seven two sierra papa, request clearance, runway two seven, \
+             for circuits";
+    // Declined the first time, with nothing cleared and no code given
+    // (it was "circuits are not normally available" and the height, the
+    // code and "report ready" in the same breath, 2026-10-09).
+    let offer = st.circuit_offer("two seven");
+    assert!(offer.not_available && offer.left == Some(false));
+    let r = st.route_keyed(ask, Service::Tower, &ctx, wx);
+    assert_eq!(
+        r,
+        "November one seven two Sierra Papa, circuits are not available at Gibraltar. \
+         Departure from the zone or a VFR route available, say intentions."
     );
+    assert_eq!(st.desk.assigned_squawk, None, "a declined circuit gets no code");
+    assert_eq!(crate::party_line::readback_owed(), None);
+    // Asked again, the tower uses its discretion: cleared, plainly.
+    let r = st.route_keyed(ask, Service::Tower, &ctx, wx);
     assert!(
-        r.contains("circuits are not normally available at Gibraltar, runway two seven, \
-                        right hand circuit, circuit height"),
+        r.contains("runway two seven, right hand circuit, circuit height"),
         "{r}"
     );
+    assert!(!r.contains("not available"), "{r}");
     let owed = crate::party_line::readback_owed().expect("readback suggested");
     assert!(owed.contains("right hand circuit"), "{owed}");
     let r = st.route_keyed(owed.trim_end_matches('.'), Service::Tower, &ctx, wx);
     assert_eq!(r, "", "the readback is accepted");
     // Silent data: the clearance as before.
-    let offer = st.circuit_offer("two seven");
     st.apt.allows_circuits = None;
     st.apt.pattern_sides.clear();
-    assert!(offer.not_available && offer.left == Some(false));
     let offer = st.circuit_offer("two seven");
     assert!(!offer.not_available && offer.left.is_none());
 }
@@ -7951,6 +7983,10 @@ fn takeoff_clearance_arms_the_departure_handoff() {
         taxi_via: Vec::new(),
         taxi_crossings: Vec::new(),
         hold_short_crossings: false,
+        dialect: crate::atis::Dialect::Icao,
+        uk: false,
+        missed_approach: None,
+        final_traffic_type: None,
         crossing: None,
         on_ground: false,
     };
@@ -8575,7 +8611,7 @@ fn an_ifr_clearance_with_enforcement_off_stands_on_any_readback() {
     );
     // No procedures set: FAA runway heading, the departure frequency.
     let r = st.route_keyed("request ifr clearance to egph", Service::Tower, &ctx, wx);
-    assert!(r.contains("cleared to Edinburgh airport as filed, after departure fly runway heading, climb and maintain five thousand, departure frequency one three zero decimal four"), "{r}");
+    assert!(r.contains("cleared to Edinburgh airport as filed, after departure fly runway heading, climb and maintain five thousand, departure frequency one three zero point four"), "{r}");
     // A mishear is still no readback: nothing stands.
     st.route_keyed("gibraltar tower, blah", Service::Tower, &ctx, wx);
     assert_eq!(crate::party_line::assigned_clearance(), None);
@@ -9056,6 +9092,10 @@ fn lxgb_vectored_arrival_flies_to_a_landing_clearance() {
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
             hold_short_crossings: false,
+            dialect: crate::atis::Dialect::Icao,
+            uk: false,
+            missed_approach: None,
+            final_traffic_type: None,
             crossing: None,
             on_ground: false,
         },
@@ -9324,6 +9364,10 @@ fn lxgb_vectored_arrival_flies_to_a_landing_clearance() {
         taxi_via: Vec::new(),
         taxi_crossings: Vec::new(),
         hold_short_crossings: false,
+        dialect: crate::atis::Dialect::Icao,
+        uk: false,
+        missed_approach: None,
+        final_traffic_type: None,
         crossing: None,
         on_ground: false,
     };
@@ -9974,4 +10018,253 @@ fn a_ctx_is_built_from_a_handed_in_state_with_no_sim() {
     assert!(!ctx.own_on_runway);
     assert!(!ctx.helicopter);
     Station::uninstall();
+}
+
+/// The realism review (2026-10-09), the spoken pieces in the field's
+/// dialect: a check-in's climb (ICAO "climb altitude six thousand feet",
+/// FAA "climb and maintain six thousand"; it was "climb six thousand"),
+/// the wind (FAA "two seven zero at five"), frequencies (FAA "point"),
+/// where to park (FAA "gate"), the traffic's type, and who is an airline.
+#[test]
+fn the_spoken_pieces_are_the_fields_dialect() {
+    assert_eq!(check_in_climb("six thousand", Dialect::Icao), "climb altitude six thousand feet");
+    assert_eq!(check_in_climb("six thousand feet", Dialect::Icao), "climb altitude six thousand feet");
+    assert_eq!(check_in_climb("flight level eight zero", Dialect::Icao), "climb flight level eight zero");
+    assert_eq!(check_in_climb("six thousand", Dialect::Faa), "climb and maintain six thousand");
+    assert_eq!(
+        check_in_climb("flight level one eight zero", Dialect::Faa),
+        "climb and maintain flight level one eight zero"
+    );
+    assert_eq!(spoken_wind(270.0, 5.0, Dialect::Icao), "two seven zero degrees, five knots");
+    assert_eq!(spoken_wind(270.0, 5.0, Dialect::Faa), "two seven zero at five");
+    assert_eq!(spoken_wind(270.0, 2.0, Dialect::Faa), "calm");
+    assert_eq!(atis::spoken_mhz_in(121800, Dialect::Faa), "one two one point eight");
+    assert_eq!(atis::spoken_mhz_in(121800, Dialect::Icao), "one two one decimal eight");
+    assert_eq!(spoken_stand_in("12", Dialect::Faa), "gate one two");
+    assert_eq!(spoken_stand_in("12", Dialect::Icao), "stand one two");
+    assert_eq!(spoken_stand_in("Ramp 3", Dialect::Faa), "ramp three");
+    assert_eq!(spoken_type("A320").as_deref(), Some("A320"));
+    assert_eq!(spoken_type("A20N").as_deref(), Some("A320"));
+    assert_eq!(spoken_type("B738").as_deref(), Some("Boeing 737"));
+    assert_eq!(spoken_type("AT76").as_deref(), Some("ATR"));
+    assert_eq!(spoken_type("C172").as_deref(), Some("Cessna"));
+    assert_eq!(spoken_type("ZZZZ"), None, "an unknown type is never guessed");
+    let none: &[(String, String)] = &[];
+    assert!(crate::callsign::is_airline_telephony_with("Ryanair four five two one", none));
+    assert!(crate::callsign::is_airline_telephony_with("Speedbird two zero eight five heavy", none));
+    assert!(!crate::callsign::is_airline_telephony_with("November one seven two Sierra Papa", none));
+    assert!(!crate::callsign::is_airline_telephony_with("Cessna three four five", none));
+    assert!(!crate::callsign::is_airline_telephony_with("Ryanair", none));
+    // LEMG, 2026-10-08: a raw flight id reached speech ("RYR4521, taxi to
+    // holding point ..."); it is expanded, a spoken one kept.
+    assert_eq!(crate::callsign::spoken_if_raw("RYR4521"), "Ryanair four five two one");
+    assert_eq!(crate::callsign::spoken_if_raw("IBE3302"), "Iberia three three zero two");
+    assert_eq!(
+        crate::callsign::spoken_if_raw("Cessna three four five"),
+        "Cessna three four five"
+    );
+}
+
+/// The realism review (2026-10-09): the pressure is given ONCE per contact
+/// (an IFR clearance and then the taxi clearance both said it), again when
+/// it changes or is asked for; and the first reply that gives it to a
+/// pilot who did not report the ATIS names the current letter ("information
+/// Bravo is current, QNH ..."), once.
+#[test]
+fn the_pressure_is_given_once_and_the_atis_named_once() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = lxgb_apt_file();
+    let wx = Wx {
+        wind_from_deg: 250.0,
+        wind_kts: 12.0,
+    };
+    *OWN_STRIP.squawk_watch.lock().unwrap() = None;
+    *OWN_STRIP.clearance.lock().unwrap() = None;
+    *ATIS.lock().unwrap() = Some(AtisState {
+        khz: 118950,
+        airport: "Gibraltar".into(),
+        runways: Vec::new(),
+        letter: 'B',
+        edition: Some(atis::Snapshot {
+            airport: "Gibraltar".into(),
+            zulu_sec: 0.0,
+            runway: "27".into(),
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+            visibility_sm: 10.0,
+            qnh_hpa: 1017.0,
+            oat_c: 20.0,
+        }),
+        last_spoken: None,
+    });
+    let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+    let mut ctx = scripted_ctx(&mut st, wx);
+    ctx.on_ground = true;
+    let cs = "November one seven two Sierra Papa";
+    let r = st.route_keyed("gibraltar tower, request start up", Service::Tower, &ctx, wx);
+    assert_eq!(
+        r,
+        format!("{cs}, start-up approved, information Bravo is current, QNH one zero one seven.")
+    );
+    let r = st.route_keyed("gibraltar tower, request taxi", Service::Tower, &ctx, wx);
+    assert!(r.contains("taxi to holding point"), "{r}");
+    assert!(!r.contains("QNH") && !r.contains("information"), "said once: {r}");
+    // Asked for, it is said.
+    let r = st.route_keyed("gibraltar tower, say QNH", Service::Tower, &ctx, wx);
+    assert!(r.contains("QNH one zero one seven"), "{r}");
+    assert!(!r.contains("information"), "the letter is named once: {r}");
+    // A new pressure is given again.
+    let changed = tower::Ctx {
+        qnh: "QNH one zero one eight".into(),
+        ..ctx.clone()
+    };
+    let r = st.route_keyed("gibraltar tower, request taxi", Service::Tower, &changed, wx);
+    assert!(r.contains("QNH one zero one eight"), "{r}");
+    *ATIS.lock().unwrap() = None;
+    *OWN_STRIP.clearance.lock().unwrap() = None;
+    *OWN_STRIP.taxi_route.lock().unwrap() = None;
+}
+
+/// The realism review (2026-10-09): the tower's go-around ORDER is said
+/// twice ("go around, I say again, go around", CAP 413 / Doc 4444) and
+/// tells the arrival what it flies: an airliner the missed approach and
+/// the radar unit (published where the field's nav data has the ILS),
+/// circuit traffic the circuit in the field's words. It was "climb to
+/// circuit altitude, report downwind" to every arrival.
+#[test]
+fn the_go_around_order_tells_the_arrival_what_it_flies() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved = (
+        ACTIVE_ICAO.lock().unwrap().clone(),
+        ACTIVE_PANEL.lock().unwrap().clone(),
+        CONTROLLER_FREQS.lock().unwrap().clone(),
+        ILS_FACTS.lock().unwrap().clone(),
+    );
+    *ACTIVE_ICAO.lock().unwrap() = Some("LEMG".into());
+    *ACTIVE_PANEL.lock().unwrap() = Some(("Malaga".into(), 52.0, Vec::new()));
+    *CONTROLLER_FREQS.lock().unwrap() = vec![
+        (118150, StationSpeaker::Tower),
+        (123450, StationSpeaker::Approach),
+    ];
+    *ILS_FACTS.lock().unwrap() = None;
+    let strip = FlightStrip::new();
+    let airline = "Ryanair four five two one";
+    assert_eq!(
+        go_around_order_line(&strip, airline, "13", None),
+        format!(
+            "{airline}, go around, I say again, go around, traffic on the runway. Climb \
+             altitude three thousand feet, runway heading, contact Malaga Approach on one two \
+             three decimal four five."
+        )
+    );
+    *ILS_FACTS.lock().unwrap() = Some(std::sync::Arc::new(IlsFacts {
+        ils: vec![nav::AirportIls {
+            runway: "13".into(),
+            freq_10khz: 10990,
+            course_mag: 130.0,
+            gs_deg: Some(3.0),
+        }],
+        platform_ft: Default::default(),
+    }));
+    let r = go_around_order_line(&strip, airline, "13", None);
+    assert!(
+        r.ends_with("Fly the published missed approach, contact Malaga Approach on one two three \
+                     decimal four five."),
+        "{r}"
+    );
+    assert!(!r.contains("circuit") && !r.contains("downwind"), "{r}");
+    // The same airline working the circuit, and a light aircraft: the
+    // circuit's climb; "circuit height" in the UK; FAA "pattern altitude".
+    strip.circuits.store(true, Ordering::SeqCst);
+    let r = go_around_order_line(&strip, airline, "13", Some("12"));
+    assert!(
+        r.ends_with("Climb to circuit altitude, runway heading, expect runway one two, report \
+                     downwind."),
+        "{r}"
+    );
+    let ga = FlightStrip::new();
+    *ACTIVE_ICAO.lock().unwrap() = Some("EGKK".into());
+    let r = go_around_order_line(&ga, "Golf Alpha Bravo Charlie Delta", "26L", None);
+    assert!(r.contains("go around, I say again, go around"), "{r}");
+    assert!(r.contains("Climb to circuit height, runway heading, report downwind."), "{r}");
+    *ACTIVE_ICAO.lock().unwrap() = Some("KSFO".into());
+    let r = go_around_order_line(&ga, "November one two three", "28L", None);
+    assert_eq!(
+        r,
+        "November one two three, go around, traffic on the runway. Fly runway heading, climb \
+         to pattern altitude, report downwind."
+    );
+    *ACTIVE_ICAO.lock().unwrap() = saved.0;
+    *ACTIVE_PANEL.lock().unwrap() = saved.1;
+    *CONTROLLER_FREQS.lock().unwrap() = saved.2;
+    *ILS_FACTS.lock().unwrap() = saved.3;
+}
+
+/// Doc 4444 12.3.1 traffic information: the direction of flight and the
+/// type where known ("traffic, two o'clock, four miles, westbound, A320,
+/// 1000 feet above"), and a target BEHIND us and moving away is never
+/// called: the next one is.
+#[test]
+fn traffic_information_names_direction_and_type_and_skips_a_diverging_tail() {
+    // Slot 0 is us (heading 090); 1 is half a mile behind flying away
+    // (track 270); 2 is four miles at two o'clock, westbound, an A320.
+    let dist = [0.0, 0.5 * 1852.0, 4.0 * 1852.0];
+    let bear = [0.0, 180.0, 60.0];
+    let alt = [0.0, 0.0, 1000.0 / 3.28084];
+    let wow = [0.0, 0.0, 0.0];
+    let tracks = [None, Some(270.0), Some(270.0)];
+    let types = [None, None, Some("A320".to_string())];
+    let f = select_traffic_factor_with(&dist, &bear, &alt, &wow, &tracks, Some(90.0), &types)
+        .expect("the one ahead is a factor");
+    assert_eq!(f.clock, 2);
+    assert_eq!(f.bound, Some("westbound"));
+    assert_eq!(
+        advisory_line(&f),
+        "traffic, 2 o'clock, 4 miles, westbound, A320, 1000 feet above."
+    );
+    // The same tail flying TOWARD us (track 090, overtaking) is called.
+    let tracks = [None, Some(90.0), Some(270.0)];
+    let f = select_traffic_factor_with(&dist, &bear, &alt, &wow, &tracks, Some(90.0), &types)
+        .expect("a factor");
+    assert_eq!(f.clock, 6, "an overtaking tail is a factor");
+    assert_eq!(f.bound, Some("eastbound"));
+    // No track known: judged as before, no direction said.
+    let f = select_traffic_factor(&dist, &bear, &alt, &wow).expect("a factor");
+    assert_eq!(f.clock, 6);
+    assert_eq!(advisory_line(&f), "traffic, 6 o'clock, under a mile, same altitude.");
+    assert_eq!(bound_word(0.0), "northbound");
+    assert_eq!(bound_word(135.0), "south eastbound");
+    assert_eq!(bound_word(350.0), "northbound");
+}
+
+/// Our own fleet's TCAS targets carry no heading: the track is the
+/// target's movement since it was last seen, and its type the type table's.
+#[test]
+fn a_picture_target_s_track_comes_from_its_last_sighting() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    *TRACK_MEMORY.lock().unwrap() = None;
+    *TRAFFIC_TYPES.lock().unwrap() = None;
+    note_traffic_type("VLG1311", "A320");
+    let t0 = Instant::now();
+    let at = |lon: f64| TcasTarget {
+        callsign: "VLG1311".into(),
+        lat: 36.70,
+        lon,
+        ele_ft: 3000.0,
+        on_ground: false,
+        vs_fpm: 0.0,
+    };
+    // We are at 36.68 N 4.50 W heading north; the target is NE of us,
+    // flying west.
+    let first = factor_from_picture_at(36.68, -4.50, 3000.0, 0.0, &[at(-4.46)], t0)
+        .expect("a factor");
+    assert_eq!(first.bound, None, "one sighting has no track");
+    assert_eq!(first.type_spoken.as_deref(), Some("A320"));
+    let later = t0 + std::time::Duration::from_secs(10);
+    let f = factor_from_picture_at(36.68, -4.50, 3000.0, 0.0, &[at(-4.465)], later)
+        .expect("a factor");
+    assert_eq!(f.bound, Some("westbound"));
+    assert!(advisory_line(&f).contains("westbound, A320, same altitude"), "{}", advisory_line(&f));
+    *TRACK_MEMORY.lock().unwrap() = None;
+    *TRAFFIC_TYPES.lock().unwrap() = None;
 }

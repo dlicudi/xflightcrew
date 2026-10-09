@@ -527,3 +527,16 @@
 - {text: "request clearance for closed traffic", intent: request_clearance, radio: true}
 - {text: "Runway one three, circuit height one thousand one hundred feet, QNH one zero one niner, squawk four five zero one, November eight one six November November", intent: unknown, readback: true}
 - {text: "Closed traffic runway one three, pattern altitude one thousand one hundred, altimeter three zero zero one, squawk four five zero one, November eight one six November November", intent: unknown, readback: true}
+
+# --- 2026-10-09: the phraseology realism pass --------------------------------
+# Our own traffic at LEMG (lemg-quick.yaml, 2026-10-08) keyed its RAW flight id
+# ("RYR4521"); the calls still parse as what they ask for, and the tower now
+# answers by the telephony. The ICAO-elsewhere circuit readback ("circuit
+# altitude"), a conditional line-up read back with the traffic's TYPE, and a
+# first call carrying the ATIS letter are readbacks / requests as before.
+- {text: "Malaga Tower, RYR4521, request taxi", intent: request_taxi, radio: true}
+- {text: "Malaga Tower, IBE3302, ten miles west, inbound for landing", intent: request_landing, radio: true}
+- {text: "EZY8843, final runway one three", intent: report_final, radio: true}
+- {text: "Malaga Tower, Ryanair four five two one, with information Bravo, request taxi", intent: request_taxi, radio: true}
+- {text: "Runway one three, circuit altitude one thousand one hundred feet, QNH one zero one niner, squawk four five zero one, November eight one six November November", intent: unknown, readback: true}
+- {text: "Behind the landing A320, lining up runway one three behind, Ryanair four five two one", intent: unknown, readback: true}

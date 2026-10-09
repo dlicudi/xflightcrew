@@ -281,6 +281,22 @@ pub fn spoken_stand(name: &str) -> String {
     }
 }
 
+/// [`spoken_stand`] in the field's dialect: ICAO and Europe park on a
+/// "stand", the FAA at a "gate" (7110.65 says gate, ramp or parking; a
+/// stand is not an American word). A name that says ramp, apron or
+/// tie-down keeps it; "stand" itself becomes "gate" at an FAA field.
+pub fn spoken_stand_in(name: &str, dialect: Dialect) -> String {
+    let spoken = spoken_stand(name);
+    match dialect {
+        Dialect::Icao => spoken,
+        Dialect::Faa => spoken
+            .split(' ')
+            .map(|w| if w == "stand" { "gate" } else { w })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
 pub(super) fn plan_taxi_route_to(
     runways: &[nav::Runway],
     ident: &str,

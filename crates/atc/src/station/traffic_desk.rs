@@ -143,11 +143,13 @@ impl Station {
         open_traffic_strip(call.id);
         let id = FlightId::Traffic(call.id);
         let intent = tower::parse_intent(&call.text);
+        // The tower addresses the flight by its TELEPHONY: a callsign that
+        // came in raw ("RYR4521") is expanded, never read out as letters.
+        let spoken = crate::callsign::spoken_if_raw(&call.spoken);
         let built = self.with_desk(id, |st| {
             st.note_stated_runway(&call.text, intent.clone());
             let before = st.desk.twr.state;
-            let (ctx, wx) =
-                st.traffic_ctx(&call.state, &call.spoken, intent.clone(), &call.picture);
+            let (ctx, wx) = st.traffic_ctx(&call.state, &spoken, intent.clone(), &call.picture);
             (ctx, wx, before)
         });
         let line = built.and_then(|(ctx, wx, before)| {

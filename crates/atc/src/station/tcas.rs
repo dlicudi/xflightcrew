@@ -86,6 +86,15 @@ async fn read_tcas_targets(xp: SimView<'_>) -> Vec<TcasTarget> {
         .get_float_array(datarefs::TCAS_VS_FPM)
         .await
         .unwrap_or_default();
+    // The type of each slot, for a controller who names traffic by it (a
+    // conditional line-up, a traffic information): optional like the
+    // vertical speed, noted in the field's type table by flight id.
+    if let Ok(types) = xp.get_bytes("sim/cockpit2/tcas/targets/icao_type").await {
+        for (id, ty) in ids.iter().zip(types.chunks(8)).skip(1) {
+            let ty = String::from_utf8_lossy(ty);
+            note_traffic_type(id, ty.trim_matches(char::from(0)).trim());
+        }
+    }
     lat.iter()
         .zip(&lon)
         .zip(&ele)

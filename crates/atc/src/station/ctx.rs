@@ -275,12 +275,17 @@ impl Station {
             qnh
         };
         let route = self.desk.planned_route.as_ref();
+        let missed_approach = self.missed_approach_for(&callsign);
         tower::Ctx {
+            dialect: self.dialect,
+            uk: self.speaks_cap413(),
+            missed_approach,
+            final_traffic_type: final_traffic.as_ref().and_then(|f| f.type_spoken.clone()),
             callsign,
             airport: spoken_airport(&self.apt.name).to_string(),
             runway: atis::spoken_runway(&runway),
             qnh,
-            wind: spoken_wind(wx.wind_from_deg, wx.wind_kts),
+            wind: spoken_wind(wx.wind_from_deg, wx.wind_kts, self.dialect),
             holding_point: route
                 .map(|r| spoken_taxiway(&r.holding_point))
                 .filter(|h| !h.is_empty())
@@ -289,12 +294,14 @@ impl Station {
             // name for "taxi to stand ...". Empty on a departure.
             stand: if arrival {
                 route
-                    .map(|r| spoken_stand(&r.holding_point))
+                    .map(|r| spoken_stand_in(&r.holding_point, self.dialect))
                     .unwrap_or_default()
             } else {
                 String::new()
             },
-            approach: self.approach_khz.map(atis::spoken_mhz),
+            approach: self
+                .approach_khz
+                .map(|k| atis::spoken_mhz_in(k, self.dialect)),
             squawk: self
                 .desk.assigned_squawk
                 .map(|c| atis::spoken_digits(&c.to_string()))

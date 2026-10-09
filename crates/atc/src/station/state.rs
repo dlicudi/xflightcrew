@@ -102,6 +102,7 @@ lifetime_group! {
         WAKE_PREV,
         DEPARTURE_STREAM,
         ARRIVAL_STREAM,
+        TRAFFIC_TYPES,
     }
 }
 
@@ -228,9 +229,10 @@ fn reset_groups(groups: &[Group]) {
 
 /// World memory that ages out by itself and is TRUE across stations: a
 /// ghost that has stood on a runway for ten minutes is still stale after a
-/// reposition (`GHOST_MEMORY_S`), and a log cadence stamp.
+/// reposition (`GHOST_MEMORY_S`), a log cadence stamp, and where each
+/// traffic target was last seen, for its track (`TRACK_MEMORY_S`).
 #[allow(dead_code)]
-pub(crate) const SELF_EXPIRING: &[&str] = &["STANDING", "GO_AROUND_DEFER_LOGGED"];
+pub(crate) const SELF_EXPIRING: &[&str] = &["STANDING", "GO_AROUND_DEFER_LOGGED", "TRACK_MEMORY"];
 
 /// Never reset, and why: (name, reason).
 #[allow(dead_code)]
@@ -610,6 +612,10 @@ mod tests {
             "TOWER_WIND",
             "UNCONTROLLED_ARRIVAL",
             "SELF_TAXI",
+            // New with the realism pass (2026-10-09): the flight works the
+            // circuit, for the go-around order's words, a strip `worksheet`
+            // cell.
+            "CIRCUITS",
         ];
         let flight_carried = ["IFR_FLIGHT", "REGION_HANDOFF", "ARRIVAL_PIN", "OWN_FIXES"];
         let station_field = [
@@ -621,6 +627,8 @@ mod tests {
             "WAKE_PREV",
             "DEPARTURE_STREAM",
             "ARRIVAL_STREAM",
+            // New with the realism pass (2026-10-09): the traffic's types.
+            "TRAFFIC_TYPES",
         ];
         let world_only = ["PENDING_STATION", "SURFACE_WIND"];
 

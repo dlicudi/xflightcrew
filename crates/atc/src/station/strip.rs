@@ -1,5 +1,6 @@
 //! Strip occupancy, go-around orders, re-sequencing, the landing hold.
 
+use super::respond::{instrument_arrival, missed_approach_at};
 use super::*;
 
 /// Recent positions of ghosts on the ground, by callsign: how a strip's
@@ -712,14 +713,8 @@ pub(super) fn go_around_tick_for(
         GO_AROUND_ORDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     Some(if tuned {
-        let expect = expect
-            .map(|to| format!("expect runway {}, ", atis::spoken_runway(&to)))
-            .unwrap_or_default();
         ComplianceCall {
-            line: format!(
-                "{callsign}, go around, traffic on the runway. Climb to circuit \
-                 altitude, {expect}report downwind."
-            ),
+            line: go_around_order_line(flight, &callsign, &runway_ident, expect.as_deref()),
             crew: false,
         }
     } else {
@@ -728,6 +723,58 @@ pub(super) fn go_around_tick_for(
             crew: true,
         }
     })
+}
+
+/// The tower's go-around order, in the installed field's words. ICAO /
+/// CAP 413: the order said twice, "go around, I say again, go around",
+/// then what to fly: the missed approach for an instrument arrival
+/// ([`instrument_arrival`], with the radar unit to call), the circuit's
+/// climb for circuit traffic ("circuit height" in the UK, "circuit
+/// altitude" elsewhere, FAA "pattern altitude"), and the runway it is
+/// re-sequenced to (`expect`, an end ident). It was "climb to circuit
+/// altitude, report downwind" to every arrival, airliners off the ILS
+/// included (the realism review, 2026-10-09).
+pub(super) fn go_around_order_line(
+    flight: &FlightStrip,
+    callsign: &str,
+    runway_ident: &str,
+    expect: Option<&str>,
+) -> String {
+    let (dialect, uk) = installed_phraseology();
+    let order = match dialect {
+        Dialect::Icao => "go around, I say again, go around",
+        Dialect::Faa => "go around",
+    };
+    let expect = expect
+        .map(|to| format!(", expect runway {}", atis::spoken_runway(to)))
+        .unwrap_or_default();
+    if instrument_arrival(flight, callsign) {
+        let panel = ACTIVE_PANEL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (name, elev_ft) = panel
+            .map(|(name, elev, _)| (spoken_airport(&name).to_string(), elev))
+            .unwrap_or_default();
+        let contact = CONTROLLER_FREQS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(_, s)| matches!(s, StationSpeaker::Approach))
+            .map(|(k, _)| *k)
+            .filter(|_| !name.is_empty())
+            .map(|k| (format!("{name} Approach"), atis::spoken_mhz_in(k, dialect)));
+        let missed = missed_approach_at(runway_ident, elev_ft, contact);
+        format!(
+            "{callsign}, {order}, traffic on the runway. {}{expect}.",
+            tower::sentence(&tower::missed_approach_words(&missed, dialect))
+        )
+    } else {
+        format!(
+            "{callsign}, {order}, traffic on the runway. {}{expect}, report downwind.",
+            tower::sentence(tower::circuit_climb_words(dialect, uk))
+        )
+    }
 }
 
 /// The wind the tower last worked with (the field's surface wind when it
