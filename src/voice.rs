@@ -751,7 +751,37 @@ struct Inner {
     /// fleet's calls and the tower's answers to them, in the order they were
     /// made, released by the monitor's [`Voice::pump_overheard`].
     overheard: Mutex<std::collections::VecDeque<Overheard>>,
+    /// The radio channel's turns, for the overheard frequency (#260).
+    airtime: Mutex<Airtime>,
+    /// A station line addressed to US is on the air (not an overheard
+    /// exchange): our own traffic does not key over the tower talking to
+    /// us ([`Voice::frequency_ours`]).
+    radio_ours: std::sync::atomic::AtomicBool,
 }
+
+/// When the radio channel last went quiet, for the overheard frequency's
+/// turns: a line keys only once the last transmission has ended and its
+/// gap has run ([`Voice::pump_overheard`]).
+#[derive(Default)]
+struct Airtime {
+    /// The radio last finished (or dropped) a transmission.
+    quiet_at: Option<Instant>,
+    /// The pump last handed the radio an overheard line: until the radio
+    /// has finished it, the frequency is busy.
+    pumped_at: Option<Instant>,
+    /// Our PTT was last released: our own transmission ended then.
+    ptt_released_at: Option<Instant>,
+}
+
+/// An overheard line handed to the radio that never came back finished
+/// (a barge-in drained the queue) frees the frequency after this long.
+const PUMPED_LOST_S: f64 = 20.0;
+
+/// The test a queued overheard line passes before it is aired: `None`
+/// still good, `Some(reason)` overtaken by events and dropped, never
+/// spoken (#260: a "cleared to land" queued beside the same flight's "going
+/// around").
+pub type StillValid = Box<dyn Fn() -> Option<&'static str> + Send>;
 
 /// One line of our own traffic's frequency, waiting for the air.
 struct Overheard {
@@ -765,11 +795,34 @@ struct Overheard {
     made: Instant,
     /// Not before this: a PTT or a pilot's line pending put it back.
     retry_at: Instant,
+    /// The silence on the frequency before it keys: a controller's beat
+    /// (1 to 3 s), a pilot's gap (1 to 4 s).
+    gap: std::time::Duration,
+    /// Re-validated before it is aired ([`StillValid`]).
+    check: Option<StillValid>,
 }
 
 /// A traffic line not aired within this of being made is dropped: the
-/// frequency has moved on (and the fleet never waits on speech).
-pub const OVERHEARD_STALE_S: f64 = 8.0;
+/// frequency has moved on (and the fleet never waits on speech). Long
+/// enough for a call, the controller's beat and its answer in turn (#260:
+/// the answer waits the call's airtime and a 1 to 3 s beat), short enough
+/// that a backlog never airs a minute late.
+pub const OVERHEARD_STALE_S: f64 = 15.0;
+
+/// The silence a line of the overheard frequency leaves before it: a
+/// controller answers after a beat, a pilot keys after a gap, each its own
+/// and the same for the same line (`traffic_link::jitter`).
+fn overheard_gap(speaker: StationSpeaker, text: &str) -> std::time::Duration {
+    let h = text
+        .bytes()
+        .fold(7u64, |h, b| h.wrapping_mul(131).wrapping_add(u64::from(b)));
+    let band = if is_controller(speaker) {
+        crate::traffic_link::REPLY_BEAT_S
+    } else {
+        crate::traffic_link::KEY_GAP_S
+    };
+    std::time::Duration::from_secs_f64(crate::traffic_link::jitter(h, band))
+}
 
 /// A traffic line that met our PTT or a pilot's line waiting is tried again
 /// this much later: 3 to 5 s, by the line (a crowd does not all key at once).
@@ -946,6 +999,8 @@ impl Voice {
             com1_khz: std::sync::atomic::AtomicI64::new(i64::MIN),
             radio_log: Mutex::new(None),
             overheard: Mutex::new(std::collections::VecDeque::new()),
+            airtime: Mutex::new(Airtime::default()),
+            radio_ours: std::sync::atomic::AtomicBool::new(false),
         });
         // Independent channel volumes (a real audio panel's COM vs intercom
         // knobs). Applied in tts::play per thread channel.
@@ -1196,9 +1251,19 @@ impl Voice {
     }
 
     pub fn set_hold(&self, held: bool) {
-        self.inner
+        let was = self
+            .inner
             .hold
-            .store(held, std::sync::atomic::Ordering::Relaxed);
+            .swap(held, std::sync::atomic::Ordering::Relaxed);
+        if was && !held {
+            // Our transmission ended NOW: the overheard frequency's next
+            // line leaves its gap after it, never on our heels.
+            self.inner
+                .airtime
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ptt_released_at = Some(Instant::now());
+        }
         if !held {
             // Release: whatever was muted during the hold is simply gone — no
             // mid-word replay of a stepped-on transmission. Like a real
@@ -1257,6 +1322,13 @@ impl Voice {
                 }
             }
         }
+        // The press silenced the radio: what was handed to it is gone, and
+        // the frequency's turns run from now.
+        self.inner
+            .airtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .quiet_at = Some(now);
         for queue in [&self.inner.queue, &self.inner.radio_queue] {
             let mut q = queue.lock().unwrap();
             for utt in q.heap.drain() {
@@ -1710,6 +1782,7 @@ impl Voice {
     /// `made`. Never aired here: [`Voice::pump_overheard`] releases it in
     /// the order the lines were made (the tower's answer after the call it
     /// answers, whichever thread got here first).
+    #[cfg(test)]
     pub fn overhear(&self, speaker: StationSpeaker, text: impl Into<String>, made: Instant) {
         self.overhear_on(StationSpeaker::Tower, speaker, text, made);
     }
@@ -1717,6 +1790,7 @@ impl Voice {
     /// [`Voice::overhear`] for a line said on position `on`'s frequency (a
     /// traffic call to Ground, Ground's answer): aired only while COM1 is
     /// on that position.
+    #[cfg(test)]
     pub fn overhear_on(
         &self,
         on: StationSpeaker,
@@ -1724,10 +1798,25 @@ impl Voice {
         text: impl Into<String>,
         made: Instant,
     ) {
+        self.overhear_checked(on, speaker, text, made, None);
+    }
+
+    /// [`Voice::overhear_on`] for a line that may be overtaken before its
+    /// turn: `check` is asked as it is about to air, and a line it calls
+    /// stale is dropped, never spoken (blackbox `traffic` `radio_stale`).
+    pub fn overhear_checked(
+        &self,
+        on: StationSpeaker,
+        speaker: StationSpeaker,
+        text: impl Into<String>,
+        made: Instant,
+        check: Option<StillValid>,
+    ) {
         let text = crate::phrase::scrub_dashes(&text.into());
         if text.trim().is_empty() {
             return;
         }
+        let gap = overheard_gap(speaker, &text);
         let mut q = self
             .inner
             .overheard
@@ -1742,77 +1831,184 @@ impl Voice {
                 text,
                 made,
                 retry_at: made,
+                gap,
+                check,
             },
         );
     }
 
-    /// Air what of our own traffic's frequencies is due, per monitor tick:
-    /// each line only while COM1 is on the position it was said on (the
-    /// rest is the void, dropped; unknown tuning fails open, as the arbiter
-    /// does), never over our PTT
-    /// or a pilot's line waiting (`pilot_line_pending`: the lines go back
-    /// 3 to 5 s), and never later than [`OVERHEARD_STALE_S`] after it was
-    /// made (dropped waiting, or at the radio's dequeue). Aired as an
-    /// OVERHEARD exchange (never the controller's last word to us), mirrored
-    /// to the panel dimmed. Returns what it queued.
+    /// Is our own pilot on the frequency: the PTT down, or a station line
+    /// addressed to us on the air? Our traffic keys over neither.
+    pub fn frequency_ours(&self) -> bool {
+        self.held()
+            || self
+                .inner
+                .radio_ours
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The station COM1 resolves to as of the monitor's last read (`None`
+    /// off every station, or before any read).
+    pub fn tuned_station(&self) -> Option<StationSpeaker> {
+        *self
+            .inner
+            .tuned_station
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Since when the radio has been clear for an overheard line, at `now`:
+    /// `None` while anything is on the air or waiting for it (the radio
+    /// queue, the last line handed over and not yet finished); else the
+    /// end of the last transmission or of our own PTT (`Some(None)`:
+    /// silent since the start).
+    fn radio_clear_since(&self, now: Instant) -> Option<Option<Instant>> {
+        if radio_is_on_air(&self.inner) {
+            return None;
+        }
+        if !self
+            .inner
+            .radio_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .heap
+            .is_empty()
+        {
+            return None;
+        }
+        let a = self.inner.airtime.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = a.pumped_at {
+            let finished = a.quiet_at.is_some_and(|q| q >= p);
+            let lost = now.saturating_duration_since(p).as_secs_f64() > PUMPED_LOST_S;
+            if !finished && !lost {
+                return None;
+            }
+        }
+        Some(a.quiet_at.max(a.ptt_released_at))
+    }
+
+    /// Air what of our own traffic's frequencies is due, per monitor tick,
+    /// ONE line at a time as the frequency allows (#260): only once the
+    /// radio is clear (nothing on the air or queued for it, the last line
+    /// handed over finished) and the line's own silence after it has run
+    /// (a controller's 1 to 3 s beat, a pilot's 1 to 4 s gap), in the order
+    /// the lines were made. Each line only while COM1 is on the position it
+    /// was said on (the rest is the void, dropped; unknown tuning fails
+    /// open, as the arbiter does), never over our PTT or a pilot's line
+    /// waiting (`pilot_line_pending`: the lines go back 3 to 5 s), never
+    /// later than [`OVERHEARD_STALE_S`] after it was made, and never once
+    /// its [`StillValid`] calls it overtaken (dropped, blackbox `traffic`
+    /// `radio_stale`). Aired as an OVERHEARD exchange (never the
+    /// controller's last word to us), mirrored to the panel dimmed. Returns
+    /// what it queued.
     pub fn pump_overheard(&self, now: Instant, pilot_line_pending: bool) -> Vec<String> {
         let stale = std::time::Duration::from_secs_f64(OVERHEARD_STALE_S);
         let known = self
             .inner
             .com1_known
             .load(std::sync::atomic::Ordering::Relaxed);
-        let tuned = *self
-            .inner
-            .tuned_station
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let tuned = self.tuned_station();
         let hears = |on: StationSpeaker| !known || tuned == Some(on);
         let held = self.held();
-        let due: Vec<Overheard> = {
+        let clear = self.radio_clear_since(now);
+        let mut dropped: Vec<(Overheard, &'static str)> = Vec::new();
+        let due: Option<(Overheard, Option<Instant>)> = {
             let mut q = self
                 .inner
                 .overheard
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            q.retain(|l| now.saturating_duration_since(l.made) <= stale && hears(l.on));
+            let mut kept = std::collections::VecDeque::with_capacity(q.len());
+            for l in q.drain(..) {
+                if !hears(l.on) {
+                    continue;
+                }
+                if now.saturating_duration_since(l.made) > stale {
+                    dropped.push((l, "late"));
+                    continue;
+                }
+                kept.push_back(l);
+            }
+            *q = kept;
             if held || pilot_line_pending {
                 for l in q.iter_mut().filter(|l| l.retry_at <= now) {
                     l.retry_at = now + overheard_retry(&l.text);
                 }
-                return Vec::new();
+                None
+            } else if let Some(since) = clear {
+                let mut next = None;
+                while let Some(front) = q.front() {
+                    let ready = front.retry_at <= now && since.is_none_or(|t| now >= t + front.gap);
+                    if !ready {
+                        break;
+                    }
+                    let Some(l) = q.pop_front() else {
+                        break;
+                    };
+                    match l.check.as_ref().and_then(|c| c()) {
+                        Some(reason) => dropped.push((l, reason)),
+                        None => {
+                            next = Some((l, since));
+                            break;
+                        }
+                    }
+                }
+                next
+            } else {
+                None
             }
-            let mut due = Vec::new();
-            while q.front().is_some_and(|l| l.retry_at <= now) {
-                due.extend(q.pop_front());
-            }
-            due
         };
+        for (l, reason) in &dropped {
+            crate::blackbox::record(
+                "traffic",
+                serde_json::json!({
+                    "event": "radio_stale", "reason": reason, "text": &l.text,
+                    "who": l.speaker.tag(), "on": l.on.tag(),
+                    "waited_s": now.saturating_duration_since(l.made).as_secs_f64(),
+                }),
+            );
+        }
+        let Some((l, since)) = due else {
+            return Vec::new();
+        };
+        crate::blackbox::record(
+            "traffic",
+            serde_json::json!({
+                "event": "radio_aired", "who": l.speaker.tag(), "on": l.on.tag(),
+                "waited_s": now.saturating_duration_since(l.made).as_secs_f64(),
+                "gap_s": since.map(|t| now.saturating_duration_since(t).as_secs_f64()),
+            }),
+        );
+        self.inner
+            .airtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pumped_at = Some(now);
         let status = self
             .inner
             .status
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut aired = Vec::new();
-        for l in due {
-            if let Some(s) = status.as_ref() {
-                s.action(&format!("~{}: {}", l.speaker.tag(), l.text));
-            }
-            aired.push(l.text.clone());
-            self.push(Utterance {
-                priority: Priority::Advisory,
-                seq: 0,
-                text: l.text,
-                chime: false,
-                negative: false,
-                station: Some(l.speaker),
-                overheard: true,
-                cabin: false,
-                stale_by: Some(l.made + stale),
-                resume: None,
-                done: None,
-            });
+        if let Some(s) = status.as_ref() {
+            s.action(&format!("~{}: {}", l.speaker.tag(), l.text));
         }
+        let aired = vec![l.text.clone()];
+        self.push(Utterance {
+            priority: Priority::Advisory,
+            seq: 0,
+            text: l.text,
+            chime: false,
+            negative: false,
+            station: Some(l.speaker),
+            overheard: true,
+            cabin: false,
+            // Handed over only onto a clear radio: it airs now or not at
+            // all (a retune, a press).
+            stale_by: Some(now + stale),
+            resume: None,
+            done: None,
+        });
         aired
     }
 
@@ -2499,11 +2695,15 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         // same way.
         let stale = utt.stale_by.is_some_and(|t| Instant::now() > t);
         if stale || station_unhearable(inner, utt.station) {
+            radio_went_quiet(inner);
             fire_latch(utt.done);
             continue;
         }
 
         set_channel_speaking(inner, &gate, true, true);
+        inner
+            .radio_ours
+            .store(!utt.overheard, std::sync::atomic::Ordering::Relaxed);
         interrupt_intercom_for_radio(inner);
         if let Some(who) = utt.station {
             crate::efb::feed::note_station(&utt.text, who, utt.overheard);
@@ -2593,8 +2793,22 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         remember_spoken(inner, &utt.text);
+        inner
+            .radio_ours
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        radio_went_quiet(inner);
         fire_latch(utt.done);
     }
+}
+
+/// The radio finished (or dropped) a transmission: the overheard
+/// frequency's next line counts its gap from now.
+fn radio_went_quiet(inner: &Inner) {
+    inner
+        .airtime
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .quiet_at = Some(Instant::now());
 }
 
 fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
@@ -2893,6 +3107,8 @@ mod tests {
             com1_khz: std::sync::atomic::AtomicI64::new(i64::MIN),
             radio_log: Mutex::new(None),
             overheard: Mutex::new(std::collections::VecDeque::new()),
+            airtime: Mutex::new(Airtime::default()),
+            radio_ours: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2922,61 +3138,92 @@ mod tests {
             .collect()
     }
 
+    /// The radio thread's half, for the threadless voice: everything handed
+    /// to the radio is played and done at `at` (the frequency goes quiet
+    /// then). Returns the texts in the order they would have played.
+    fn air_all(v: &Voice, at: Instant) -> Vec<String> {
+        let mut q = v.inner.radio_queue.lock().unwrap();
+        let mut items: Vec<Utterance> = q.heap.drain().collect();
+        items.sort_by_key(|u| u.seq);
+        drop(q);
+        v.inner.airtime.lock().unwrap().quiet_at = Some(at);
+        items.into_iter().map(|u| u.text).collect()
+    }
+
     /// OUR TRAFFIC ON THE FREQUENCY: a traffic call in its ghost voice and
     /// the tower's answer air in the order they were MADE (the answer may
-    /// reach the voice first, from the command loop), both as an overheard
-    /// exchange (never the controller's last word to us), each perishing 8 s
-    /// after it was made.
+    /// reach the voice first, from the command loop), one at a time, both
+    /// as an overheard exchange (never the controller's last word to us).
+    /// The answer waits for the call to finish and then the controller's
+    /// beat (1 to 3 s, #260), never on the call's heels.
     #[test]
     fn traffic_lines_air_in_the_order_made_as_an_overheard_exchange() {
         let v = threadless();
         let t0 = Instant::now();
-        let ms = std::time::Duration::from_millis;
+        let s = std::time::Duration::from_secs_f64;
         v.overhear(
             StationSpeaker::Tower,
             "Cessna one, cleared to land",
-            t0 + ms(1),
+            t0 + s(0.001),
         );
         v.overhear(
             StationSpeaker::Ghost { seed: 5 },
             "Cessna one, final runway two seven",
             t0,
         );
-        let aired = v.pump_overheard(t0 + ms(10), false);
-        assert_eq!(
-            aired,
-            [
-                "Cessna one, final runway two seven",
-                "Cessna one, cleared to land"
-            ]
-        );
+        let aired = v.pump_overheard(t0 + s(0.01), false);
+        assert_eq!(aired, ["Cessna one, final runway two seven"]);
         let q = radio_order(&v, t0);
-        assert_eq!(q.len(), 2);
-        assert_eq!(
-            q[0].0, "Cessna one, final runway two seven",
-            "the call first"
-        );
-        assert!(q.iter().all(|(_, overheard, _)| *overheard));
-        assert!((q[0].2.unwrap() - OVERHEARD_STALE_S).abs() < 1e-3, "{q:?}");
+        assert_eq!(q.len(), 1);
+        assert!(q[0].1, "overheard");
         assert!(
-            (q[1].2.unwrap() - OVERHEARD_STALE_S - 0.001).abs() < 1e-3,
+            (q[0].2.unwrap() - 0.01 - OVERHEARD_STALE_S).abs() < 1e-3,
             "{q:?}"
         );
-        let rq = v.inner.radio_queue.lock().unwrap();
-        assert!(rq
+        assert!(v
+            .inner
+            .radio_queue
+            .lock()
+            .unwrap()
             .heap
             .iter()
             .any(|u| u.station == Some(StationSpeaker::Ghost { seed: 5 })));
-        drop(rq);
+        // The call is on the air: the answer waits.
         assert!(
-            v.pump_overheard(t0 + ms(20), false).is_empty(),
+            v.pump_overheard(t0 + s(1.0), false).is_empty(),
+            "on the air"
+        );
+        // The call ends at 3 s: the answer keys a beat later, not before.
+        assert_eq!(
+            air_all(&v, t0 + s(3.0)),
+            ["Cessna one, final runway two seven"]
+        );
+        assert!(
+            v.pump_overheard(t0 + s(3.0 + REPLY_BEAT_MIN_S - 0.01), false)
+                .is_empty(),
+            "on the call's heels"
+        );
+        let mut t = 3.0 + REPLY_BEAT_MIN_S;
+        let mut aired = Vec::new();
+        while aired.is_empty() && t < 10.0 {
+            aired = v.pump_overheard(t0 + s(t), false);
+            t += 0.1;
+        }
+        assert_eq!(aired, ["Cessna one, cleared to land"]);
+        assert!(t - 0.1 - 3.0 <= REPLY_BEAT_MAX_S + 1e-6, "beat {}", t - 3.1);
+        assert!(
+            v.pump_overheard(t0 + s(20.0), false).is_empty(),
             "aired once"
         );
     }
 
+    const REPLY_BEAT_MIN_S: f64 = crate::traffic_link::REPLY_BEAT_S.0;
+    const REPLY_BEAT_MAX_S: f64 = crate::traffic_link::REPLY_BEAT_S.1;
+
     /// Never over our PTT or a pilot's line waiting: the lines go back 3 to
-    /// 5 s and air after; one that cannot air within 8 s of being made is
-    /// dropped, and the fleet never waited for it.
+    /// 5 s and air after, a gap after our release; one that cannot air
+    /// within [`OVERHEARD_STALE_S`] of being made is dropped, and the fleet
+    /// never waited for it.
     #[test]
     fn traffic_lines_wait_out_our_ptt_and_go_stale() {
         let v = threadless();
@@ -2990,11 +3237,17 @@ mod tests {
         v.set_hold(true);
         assert!(v.pump_overheard(t0, false).is_empty(), "never over our PTT");
         v.set_hold(false);
+        let released = v.inner.airtime.lock().unwrap().ptt_released_at.unwrap();
         assert!(
             v.pump_overheard(t0 + s(1.0), false).is_empty(),
             "back 3 to 5 s"
         );
-        assert_eq!(v.pump_overheard(t0 + s(5.1), false).len(), 1, "then aired");
+        assert_eq!(
+            v.pump_overheard(released + s(5.1), false).len(),
+            1,
+            "then aired"
+        );
+        air_all(&v, released + s(7.0));
 
         v.overhear(
             StationSpeaker::Ghost { seed: 1 },
@@ -3006,11 +3259,111 @@ mod tests {
             "never over a pilot's line waiting"
         );
         assert!(
-            v.pump_overheard(t0 + s(8.5), false).is_empty(),
-            "8 s old: the frequency moved on"
+            v.pump_overheard(t0 + s(OVERHEARD_STALE_S + 0.5), true)
+                .is_empty(),
+            "too old: the frequency moved on"
         );
         assert!(v.inner.overheard.lock().unwrap().is_empty(), "dropped");
-        assert_eq!(v.inner.radio_queue.lock().unwrap().heap.len(), 1);
+        assert!(v.inner.radio_queue.lock().unwrap().heap.is_empty());
+    }
+
+    /// A PILOT'S TRANSMISSION IS NEVER STEPPED ON (#260): a traffic call
+    /// due while our PTT is down waits; released, it still leaves its gap
+    /// after our last word, and a station line to US on the air holds it
+    /// the same as one of its own.
+    #[test]
+    fn a_traffic_call_never_keys_into_our_transmission() {
+        let v = threadless();
+        let t0 = Instant::now();
+        let s = std::time::Duration::from_secs_f64;
+        v.overhear(StationSpeaker::Ghost { seed: 4 }, "Cessna four, ready", t0);
+        v.set_hold(true);
+        assert!(v.frequency_ours(), "our PTT is the frequency");
+        for k in 0..30 {
+            assert!(v
+                .pump_overheard(t0 + s(0.1 * f64::from(k)), false)
+                .is_empty());
+        }
+        v.set_hold(false);
+        let released = v.inner.airtime.lock().unwrap().ptt_released_at.unwrap();
+        // The lines put back while we keyed come round 3 to 5 s on; even
+        // past that, never inside the gap after our release.
+        let gap = overheard_gap(StationSpeaker::Ghost { seed: 4 }, "Cessna four, ready");
+        let mut aired_at = None;
+        for k in 0..100 {
+            let t = released + s(0.1 * f64::from(k));
+            if !v.pump_overheard(t, false).is_empty() {
+                aired_at = Some(t);
+                break;
+            }
+        }
+        let aired_at = aired_at.expect("aired once clear");
+        assert!(aired_at >= released + gap, "keyed into our release");
+        air_all(&v, aired_at + s(2.0));
+        // The tower answering US is on the air: nothing of ours keys.
+        v.inner
+            .radio_ours
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        v.inner.speaking.lock().unwrap().1 = true;
+        assert!(v.frequency_ours());
+        v.overhear(
+            StationSpeaker::Ghost { seed: 4 },
+            "Cessna four, lining up",
+            aired_at,
+        );
+        assert!(v.pump_overheard(aired_at + s(8.0), false).is_empty());
+    }
+
+    /// A REPLY OVERTAKEN BY EVENTS IS NEVER SPOKEN (#260, t=1791477548): a
+    /// "cleared to land" queued behind traffic is re-validated as it comes
+    /// to the air; the flight went around meanwhile, so it is dropped and
+    /// the next line keys in its place.
+    #[test]
+    fn a_stale_reply_after_a_go_around_is_dropped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let v = threadless();
+        let t0 = Instant::now();
+        let s = std::time::Duration::from_secs_f64;
+        let went_around = Arc::new(AtomicBool::new(false));
+        let flag = went_around.clone();
+        let check: StillValid =
+            Box::new(move || flag.load(Ordering::Relaxed).then_some("went_around"));
+        let tower = StationSpeaker::Tower;
+        v.overhear(
+            StationSpeaker::Ghost { seed: 9 },
+            "Speedbird one, ready",
+            t0,
+        );
+        v.overhear_checked(
+            tower,
+            tower,
+            "Easy two, cleared to land runway two seven",
+            t0 + s(0.1),
+            Some(check),
+        );
+        v.overhear(
+            StationSpeaker::Ghost { seed: 7 },
+            "Easy two, going around",
+            t0 + s(0.2),
+        );
+        assert_eq!(
+            v.pump_overheard(t0 + s(0.3), false),
+            ["Speedbird one, ready"]
+        );
+        went_around.store(true, Ordering::Relaxed);
+        air_all(&v, t0 + s(3.0));
+        let mut aired = Vec::new();
+        let mut t = 3.0;
+        while aired.is_empty() && t < 12.0 {
+            aired = v.pump_overheard(t0 + s(t), false);
+            t += 0.1;
+        }
+        assert_eq!(
+            aired,
+            ["Easy two, going around"],
+            "the landing clearance never aired"
+        );
+        assert!(v.inner.overheard.lock().unwrap().is_empty());
     }
 
     /// One frequency: our traffic is heard only on the TOWER. Tuned
@@ -3026,6 +3379,7 @@ mod tests {
             1,
             "unknown tuning fails open"
         );
+        air_all(&v, t0);
         v.set_com1(Some(119_100), Some(StationSpeaker::Approach));
         v.overhear(
             StationSpeaker::Ghost { seed: 2 },
@@ -3036,7 +3390,8 @@ mod tests {
         assert!(v.inner.overheard.lock().unwrap().is_empty(), "the void");
         v.set_com1(Some(118_100), Some(StationSpeaker::Tower));
         v.overhear(StationSpeaker::Tower, "Cessna two, number two", t0);
-        assert_eq!(v.pump_overheard(t0, false).len(), 1, "on the tower");
+        let later = t0 + std::time::Duration::from_secs(4);
+        assert_eq!(v.pump_overheard(later, false).len(), 1, "on the tower");
     }
 
     #[test]

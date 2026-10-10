@@ -375,6 +375,24 @@ impl WorldTick {
                         .get_float(crate::datarefs::OAT_DEG_C)
                         .await
                         .unwrap_or(15.0),
+                    // The FAA broadcast's dew point: the air at the
+                    // aircraft, as the temperature is; a failed read says
+                    // nothing (the snapshot's -30 is an unread default,
+                    // `monitor`, never a measurement to broadcast).
+                    dewpoint_c: {
+                        let (dew, levels) = tokio::join!(
+                            xp.get_float_array(crate::tools::anti_ice::DEWPOINT_LEVELS),
+                            xp.get_float_array(crate::tools::anti_ice::ATMOSPHERE_LEVELS_M),
+                        );
+                        match (dew, levels) {
+                            (Ok(d), Ok(l)) => crate::tools::anti_ice::dewpoint_at(
+                                &l,
+                                &d,
+                                snap.alt_ft / 3.28084,
+                            ),
+                            _ => None,
+                        }
+                    },
                 };
                 if let Some(report) =
                     crate::world::atis_tick(com1, &wx, std::time::Instant::now())

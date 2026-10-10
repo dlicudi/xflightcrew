@@ -206,6 +206,13 @@ pub(super) fn compliance_tick_for(
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map(|c| (c.state, c.callsign.clone()));
+    // The cleared runway, for an FAA correction's "hold short of runway".
+    let cleared_runway: Option<String> = flight.clearance
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|c| c.runway_ident.clone())
+        .filter(|r| !r.is_empty());
 
     // This flight's memory, then the field's radio cooldowns (always in this
     // order; nothing else holds both).
@@ -367,6 +374,14 @@ pub(super) fn compliance_tick_for(
                     net.plan(lat, lon, glat, glon, nav::HOLD_SHORT_STANDOFF_M, &[])
                         .filter(|r| r.path.len() >= 2)
                 });
+                // FAA (7110.65 3-7-2): no holding point by name, the route
+                // and the hold short of its runway (#263: the correction
+                // still said "holding point" at FAA fields).
+                let faa = active_dialect() == Dialect::Faa;
+                let hold_short = cleared_runway
+                    .as_deref()
+                    .map(|r| format!(", hold short of runway {}", atis::spoken_runway(r)))
+                    .unwrap_or_default();
                 let line = if let Some(r) = fresh {
                     let via = spoken_via(&r.via).join(", ");
                     let hp = spoken_taxiway(&r.holding_point);
@@ -377,9 +392,21 @@ pub(super) fn compliance_tick_for(
                         holding_point: r.holding_point.clone(),
                         lead_on: r.lead_on.clone(),
                     });
+                    if faa {
+                        format!(
+                            "{callsign}, you appear to be off the cleared taxi route. \
+                             Taxi via {via}{hold_short}."
+                        )
+                    } else {
+                        format!(
+                            "{callsign}, you appear to be off the cleared taxi route. \
+                             Taxi to holding point {hp} via {via}."
+                        )
+                    }
+                } else if via.is_empty() && faa {
                     format!(
                         "{callsign}, you appear to be off the cleared taxi route. \
-                         Taxi to holding point {hp} via {via}."
+                         Continue with caution{hold_short}."
                     )
                 } else if via.is_empty() {
                     format!(
@@ -389,7 +416,8 @@ pub(super) fn compliance_tick_for(
                 } else {
                     format!(
                         "{callsign}, you appear to be off the cleared taxi route. \
-                         Taxi via {via}."
+                         Taxi via {via}{}.",
+                        if faa { hold_short.as_str() } else { "" }
                     )
                 };
                 return Some(ComplianceCall { line, crew: false });

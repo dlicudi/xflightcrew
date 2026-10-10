@@ -41,6 +41,9 @@ pub struct Snapshot {
     pub visibility_sm: f64,
     pub qnh_hpa: f64,
     pub oat_c: f64,
+    /// The dew point, degrees C, where it was read (the FAA broadcast says
+    /// it beside the temperature).
+    pub dewpoint_c: Option<f64>,
 }
 
 /// Below this, the wind direction is meaningless for edition purposes (a
@@ -194,9 +197,24 @@ pub fn spoken_runway(id: &str) -> String {
     words.join(" ")
 }
 
-/// Build one full broadcast for this edition.
+/// Build one full broadcast for this edition, ICAO style (the standalone
+/// `atc` binary's).
 pub fn report(s: &Snapshot, letter: char) -> String {
+    report_in(s, letter, Dialect::Icao)
+}
+
+/// Build one full broadcast in the field's dialect. ICAO (Doc 9432, CAP
+/// 413): "Wind two five zero degrees, one two knots. Visibility one zero
+/// kilometers or more. Temperature two four. QNH one zero one eight."; FAA
+/// (7110.65 2-9-3, AIM 4-1-13): "Wind two five zero at one two. Visibility
+/// one zero. Temperature two four, dew point one six. Altimeter three zero
+/// zero six. Landing and departing runway two seven. Advise on initial
+/// contact you have information Alpha." (#263: the broadcast stayed ICAO,
+/// hectopascals and "degrees, knots", at FAA fields after the phraseology
+/// pass).
+pub fn report_in(s: &Snapshot, letter: char, dialect: Dialect) -> String {
     let info = nato(letter.to_ascii_uppercase());
+    let faa = dialect == Dialect::Faa;
 
     let hh = ((s.zulu_sec / 3600.0) as i64).rem_euclid(24);
     let mm = ((s.zulu_sec / 60.0) as i64).rem_euclid(60);
@@ -208,39 +226,85 @@ pub fn report(s: &Snapshot, letter: char) -> String {
         // Direction to the nearest ten degrees; a north wind is 360, not 000.
         let dir = ((s.wind_from_deg / 10.0).round() as i64 * 10).rem_euclid(360);
         let dir = if dir == 0 { 360 } else { dir };
-        format!(
-            "Wind {} degrees, {} knots",
+        let (dir, kts) = (
             spoken_digits(&format!("{dir:03}")),
-            spoken_digits(&format!("{:.0}", s.wind_kts))
-        )
+            spoken_digits(&format!("{:.0}", s.wind_kts)),
+        );
+        if faa {
+            format!("Wind {dir} at {kts}")
+        } else {
+            format!("Wind {dir} degrees, {kts} knots")
+        }
     };
 
-    let km = s.visibility_sm * 1.609344;
-    let vis = if km >= 9.9 {
-        "Visibility one zero kilometers or more".to_string()
+    let vis = if faa {
+        // Statute miles, whole, ten and more said as ten.
+        let sm = s.visibility_sm.clamp(1.0, 10.0).floor();
+        format!("Visibility {}", spoken_digits(&format!("{sm:.0}")))
     } else {
+        let km = s.visibility_sm * 1.609344;
+        if km >= 9.9 {
+            "Visibility one zero kilometers or more".to_string()
+        } else {
+            format!(
+                "Visibility {} kilometers",
+                spoken_digits(&format!("{:.0}", km.max(1.0)))
+            )
+        }
+    };
+
+    let degrees = |c: f64| {
+        let t = c.round() as i64;
+        if t < 0 {
+            format!("minus {}", spoken_digits(&format!("{}", -t)))
+        } else {
+            spoken_digits(&format!("{t}"))
+        }
+    };
+    let mut temp = format!("Temperature {}", degrees(s.oat_c));
+    // The dew point only where it was read: never invented.
+    if faa {
+        if let Some(d) = s.dewpoint_c.filter(|d| d.is_finite()) {
+            temp.push_str(&format!(", dew point {}", degrees(d.min(s.oat_c))));
+        }
+    }
+
+    let pressure = if faa {
+        let inhg_hundredths = (s.qnh_hpa * 100.0 / 33.8639).round();
         format!(
-            "Visibility {} kilometers",
-            spoken_digits(&format!("{:.0}", km.max(1.0)))
+            "Altimeter {}",
+            spoken_digits(&format!("{inhg_hundredths:.0}"))
         )
-    };
-
-    let t = s.oat_c.round() as i64;
-    let temp = if t < 0 {
-        format!("Temperature minus {}", spoken_digits(&format!("{}", -t)))
     } else {
-        format!("Temperature {}", spoken_digits(&format!("{t}")))
+        format!("QNH {}", spoken_digits(&format!("{:.0}", s.qnh_hpa)))
     };
-
-    let qnh = spoken_digits(&format!("{:.0}", s.qnh_hpa));
 
     let mut out = format!("{} information {}. Time {} zulu.", s.airport, info, time);
+    if faa {
+        // The time opens its own sentence: the first sentence names the
+        // edition alone (the transcript logs one entry per edition by it).
+        let mut t = time.clone();
+        if let Some(c) = t.get_mut(..1) {
+            c.make_ascii_uppercase();
+        }
+        out = format!("{} information {}. {t} zulu.", s.airport, info);
+        out.push_str(&format!(" {wind}. {vis}. {temp}. {pressure}."));
+        if !s.runway.is_empty() {
+            out.push_str(&format!(
+                " Landing and departing runway {}.",
+                spoken_runway(&s.runway)
+            ));
+        }
+        out.push_str(&format!(
+            " Advise on initial contact you have information {info}."
+        ));
+        return out;
+    }
     if !s.runway.is_empty() {
         out.push_str(&format!(" Runway in use {}.", spoken_runway(&s.runway)));
     }
     out.push_str(&format!(
-        " {}. {}. {}. QNH {}. Advise on initial contact, you have information {}.",
-        wind, vis, temp, qnh, info
+        " {wind}. {vis}. {temp}. {pressure}. Advise on initial contact, you have information {info}."
     ));
     out
 }
@@ -259,6 +323,7 @@ mod tests {
             visibility_sm: 10.0,
             qnh_hpa: 1018.4,
             oat_c: 24.3,
+            dewpoint_c: Some(16.2),
         }
     }
 
@@ -288,6 +353,38 @@ mod tests {
         assert!(r.contains("Temperature two four"), "{r}");
         assert!(r.contains("QNH one zero one eight"), "{r}");
         assert!(r.ends_with("you have information Alpha."), "{r}");
+    }
+
+    /// #263: an FAA field's broadcast is FAA: "at" winds, statute miles,
+    /// the dew point, the altimeter in inches, the runway as landing and
+    /// departing.
+    #[test]
+    fn an_faa_field_broadcasts_in_its_dialect() {
+        let mut s = snap();
+        s.airport = "Boston".into();
+        s.qnh_hpa = 1013.25;
+        let r = report_in(&s, 'C', Dialect::Faa);
+        assert_eq!(
+            r,
+            "Boston information Charlie. One two five zero zulu. \
+             Wind two five zero at one two. Visibility one zero. \
+             Temperature two four, dew point one six. Altimeter two niner niner two. \
+             Landing and departing runway two seven. \
+             Advise on initial contact you have information Charlie."
+        );
+        assert!(
+            !r.contains("QNH") && !r.contains("degrees") && !r.contains("knots"),
+            "{r}"
+        );
+        s.dewpoint_c = None;
+        s.visibility_sm = 3.4;
+        let r = report_in(&s, 'C', Dialect::Faa);
+        assert!(
+            r.contains("Temperature two four. Altimeter"),
+            "no dew point read: {r}"
+        );
+        assert!(r.contains("Visibility three."), "{r}");
+        assert_eq!(report(&snap(), 'A'), report_in(&snap(), 'A', Dialect::Icao));
     }
 
     #[test]

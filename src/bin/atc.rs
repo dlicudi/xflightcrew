@@ -103,6 +103,7 @@ fn read_snapshot(sim: &SimView, apt: &nav::AirportInfo) -> Result<atis::Snapshot
         visibility_sm: sim.get_float(datarefs::VISIBILITY_SM)?,
         qnh_hpa: sim.get_float(datarefs::QNH_PASCALS)? / 100.0,
         oat_c: sim.get_float(datarefs::OAT_DEG_C)?,
+        dewpoint_c: None,
     })
 }
 

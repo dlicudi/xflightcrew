@@ -12,6 +12,8 @@ pub struct AtisState {
     pub(super) airport: String,
     pub(super) runways: Vec<nav::Runway>,
     pub(super) letter: char,
+    /// The field's phraseology: an FAA field's broadcast is FAA (#263).
+    pub(super) dialect: Dialect,
     pub(super) edition: Option<atis::Snapshot>,
     pub(super) last_spoken: Option<Instant>,
 }
@@ -30,6 +32,8 @@ pub struct AtisWx {
     pub visibility_sm: f64,
     pub qnh_hpa: f64,
     pub oat_c: f64,
+    /// `None` when it did not read.
+    pub dewpoint_c: Option<f64>,
 }
 
 /// The monitor's cheap gate: true when an ATIS exists, COM1 is on it, AND a
@@ -85,6 +89,7 @@ pub fn atis_retune(com1_khz: i64, lat: f64, lon: f64, alt_msl_ft: f64) {
             airport: a.apt.radio_name(),
             runways: a.apt.runways.clone(),
             letter: 'A',
+            dialect: dialect_for(&a.icao),
             edition: None,
             last_spoken: None,
         });
@@ -131,6 +136,7 @@ pub fn atis_tick(com1_khz: i64, wx: &AtisWx, now: Instant) -> Option<String> {
         visibility_sm: wx.visibility_sm,
         qnh_hpa: wx.qnh_hpa,
         oat_c: wx.oat_c,
+        dewpoint_c: wx.dewpoint_c,
     };
     match &st.edition {
         None => st.edition = Some(snap),
@@ -147,7 +153,7 @@ pub fn atis_tick(com1_khz: i64, wx: &AtisWx, now: Instant) -> Option<String> {
         }
     }
     st.last_spoken = Some(now);
-    Some(atis::report(st.edition.as_ref()?, st.letter))
+    Some(atis::report_in(st.edition.as_ref()?, st.letter, st.dialect))
 }
 
 /// The information letter currently on the broadcast — `None` until the first
