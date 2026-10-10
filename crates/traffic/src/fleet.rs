@@ -219,13 +219,28 @@ impl Fleet {
             // [`crate::schedule::STANDS_KEPT_FREE`] free stands: XTST's few
             // filled with turned-round aircraft and the next arrival, with
             // nowhere to park, was taken away (2026-10-10).
+            // Counted as stands an airliner fits (BIEG, 2026-10-10: a
+            // Cessna turned round on one of its few jet stands, the free
+            // ones left were the light aircraft's, and the next 737 had
+            // nowhere to park).
             let held = self.stands_held();
+            let airliner = if self
+                .field
+                .net
+                .stands
+                .iter()
+                .any(|s| self.field.takes(s, "A320"))
+            {
+                "A320"
+            } else {
+                crate::schedule::REGIONAL
+            };
             let free = self
                 .field
                 .net
                 .stands
                 .iter()
-                .filter(|s| s.is_suitable() && !crate::field::stand_taken(s, &held))
+                .filter(|s| self.field.takes(s, airliner) && !crate::field::stand_taken(s, &held))
                 .count();
             if !clear || free < crate::schedule::STANDS_KEPT_FREE {
                 continue;

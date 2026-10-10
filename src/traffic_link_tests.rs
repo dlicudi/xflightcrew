@@ -436,6 +436,20 @@ pub(super) fn fly_field_hours(
                             a.route.follow.done,
                             a.route.path.last()
                         );
+                        for o in link.fleet().aircraft().iter().filter(|o| {
+                            o.id != id
+                                && o.kin.on_ground
+                                && traffic::kin::dist_m(o.kin.pos(), a.kin.pos()) < 150.0
+                        }) {
+                            println!(
+                                "      by [{}] {} {:?} {:.0} m at {:?}",
+                                o.id,
+                                o.icao_type,
+                                o.phase,
+                                traffic::kin::dist_m(o.kin.pos(), a.kin.pos()),
+                                o.kin.pos()
+                            );
+                        }
                     }
                 }
             }

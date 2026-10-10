@@ -836,6 +836,14 @@ pub fn apply(
             ac.spacing.held_s += dt;
             let limit = if on_strip[i] { RUNWAY_STUCK_S } else { STUCK_S };
             guard_due = ac.spacing.held_s >= limit;
+        } else if stopped && s.junction && ob.idx.is_some_and(|j| standing[j]) {
+            // Giving way to one that is standing still itself (giving way in
+            // its turn to a third, round a ring): EGLL (the traffic hour
+            // sweep, 2026-10-10), a 789 and an A333 each held at a junction
+            // for the other's stretch, and the arrivals behind them stood for
+            // half an hour. Twice the guard's patience, then it acts.
+            ac.spacing.held_s += dt;
+            guard_due = ac.spacing.held_s >= 2.0 * STUCK_S;
         } else {
             ac.spacing.held_s = 0.0;
         }
