@@ -52,6 +52,13 @@ pub struct Perf {
     /// The gap kept behind the aircraft ahead on a taxiway, tail to nose,
     /// metres (a jet's is its blast).
     pub taxi_gap_m: f64,
+    /// Nose gear to main gear, metres, for a type not in
+    /// [`type_wheelbase_m`]'s table ([`crate::kin::Gear`]).
+    pub wheelbase_m: f64,
+    /// The main gear behind the published point (mid-length, where the
+    /// model is drawn and the spacing measures from), metres; negative
+    /// ahead.
+    pub mains_aft_m: f64,
 }
 
 /// A wake turbulence category (ICAO: L, M, H, J).
@@ -100,6 +107,10 @@ pub const PISTON_SINGLE: Perf = Perf {
     span_m: 11.0,
     length_m: 8.3,
     taxi_gap_m: 30.0,
+    // The 172: 1.65 m (65 in) from the nosewheel to the mains, which stand
+    // about 2.8 m behind the spinner, 1.3 m ahead of mid-length.
+    wheelbase_m: 1.65,
+    mains_aft_m: -1.3,
 };
 
 /// A King Air or ATR class turboprop.
@@ -126,6 +137,10 @@ pub const TURBOPROP: Perf = Perf {
     span_m: 27.0,
     length_m: 27.0,
     taxi_gap_m: 35.0,
+    // The ATR 72: 10.8 m, its mains under the wing's trailing edge at
+    // about mid-length (27.2 m).
+    wheelbase_m: 10.8,
+    mains_aft_m: 0.0,
 };
 
 /// An A320 or 737 class jet.
@@ -152,6 +167,11 @@ pub const JET_MED: Perf = Perf {
     span_m: 36.0,
     length_m: 38.0,
     taxi_gap_m: 40.0,
+    // Between the A320's 12.6 m and the 737-800's 15.6 m; the mains are
+    // within a metre of mid-length on both (A320 17.7 m behind the nose
+    // of 37.6, 737-800 about 20 of 39.5).
+    wheelbase_m: 14.0,
+    mains_aft_m: 0.0,
 };
 
 /// A 777 or A330 class jet.
@@ -178,6 +198,10 @@ pub const JET_HEAVY: Perf = Perf {
     span_m: 65.0,
     length_m: 70.0,
     taxi_gap_m: 50.0,
+    // The A330-300's 25.4 m, the 777-200's 25.9, the 747-400's 25.6; the
+    // mains near mid-length again (the 777-300ER's 31.2 is in the table).
+    wheelbase_m: 26.0,
+    mains_aft_m: 0.0,
 };
 
 /// The class table and wake category for an ICAO type designator. An
@@ -281,6 +305,52 @@ pub fn span_code(span_m: f64) -> char {
 pub fn wingspan_code(icao_type: &str) -> char {
     let t = icao_type.trim().to_ascii_uppercase();
     span_code(type_span_m(&t).unwrap_or_else(|| class_for_type(&t).0.span_m))
+}
+
+/// Nose gear to main gear, metres, from the manufacturers' airport
+/// planning figures (rounded; a bogie's centre). `None` for a type not in
+/// the table: its class's figure stands. Matched without allocating, as
+/// it is asked every taxi substep.
+pub fn type_wheelbase_m(icao_type: &str) -> Option<f64> {
+    const TABLE: &[(&str, f64)] = &[
+        ("C172", 1.65),
+        ("AT43", 8.8),
+        ("AT45", 8.8),
+        ("AT72", 10.8),
+        ("AT76", 10.8),
+        ("A319", 11.0),
+        ("A19N", 11.0),
+        ("A320", 12.6),
+        ("A20N", 12.6),
+        ("A321", 16.9),
+        ("A21N", 16.9),
+        ("B737", 12.6),
+        ("B738", 15.6),
+        ("B38M", 15.6),
+        ("B739", 17.2),
+        ("B752", 18.3),
+        ("B763", 22.8),
+        ("A332", 22.2),
+        ("A333", 25.4),
+        ("B772", 25.9),
+        ("B77W", 31.2),
+        ("B744", 25.6),
+    ];
+    let t = icao_type.trim();
+    TABLE
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(t))
+        .map(|&(_, w)| w)
+}
+
+/// The taxi geometry of `icao_type` flying `perf`: its own wheelbase where
+/// the table has it, the class's mains and pace.
+pub fn gear_for(icao_type: &str, perf: &Perf) -> crate::kin::Gear {
+    crate::kin::Gear {
+        wheelbase_m: type_wheelbase_m(icao_type).unwrap_or(perf.wheelbase_m),
+        mains_aft_m: perf.mains_aft_m,
+        pace_kts: perf.taxi_kts,
+    }
 }
 
 #[cfg(test)]

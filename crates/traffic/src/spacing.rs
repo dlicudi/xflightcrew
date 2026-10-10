@@ -650,7 +650,13 @@ pub fn apply(
                 } else if fleet[k].kin.gs_kts < 0.5 && !in_way(k, other) {
                     true
                 } else if was {
-                    hold(k, e, other) > -1.0
+                    // Stopped where it gave way, it stays: released there
+                    // because the other's route came into full view (its
+                    // hold point is then measured afresh, from inside the
+                    // stretch), it drove at the other still turning off the
+                    // runway onto its stretch (XTST's ENAT crossing, with the
+                    // 737 taking its corners on its wheels, 2026-10-10).
+                    hold(k, e, other) > -1.0 || fleet[k].kin.gs_kts < 0.5
                 } else {
                     hold(k, e, other) >= v * v / (2.0 * SPACING_DECEL_MS2)
                 }
