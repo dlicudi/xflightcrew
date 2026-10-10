@@ -75,6 +75,10 @@ const STRIP_GUARD_M: f64 = 10.0;
 /// stop it on the strip), never through it.
 pub const CONTACT_MARGIN_M: f64 = 3.0;
 
+/// How far past the contact distance a mover's nose looks straight ahead
+/// for one in its way, whatever its route says, metres.
+const NOSE_REACH_M: f64 = 30.0;
+
 /// A traffic aircraft parked on a stand stops a mover only this close to
 /// its line, metres: the network's stand links run past the neighbours'
 /// stand points (LEMG, 2026-10-08: three departures in the hour held 90 s
@@ -499,10 +503,15 @@ pub fn apply(
             if ob.parked && ob.idx.is_some() && dist_m(ac.kin.pos(), ob.pos) < PARKED_CORRIDOR_M {
                 continue;
             }
+            // The wider of the two sets the corridor: an A321 took its place
+            // in LFPG's departure queue 27 m abeam an A359, outside its own
+            // half span and inside the A359's, and the A359 towed four
+            // narrowbodies off its way, one after another (the traffic hour
+            // sweep, 2026-10-10, the first widebodies).
             let corridor = if ob.on_stand {
                 PARKED_CORRIDOR_M
             } else {
-                corridor_m(ac.perf)
+                corridor_m(ac.perf) + (ob.perf.span_m - ac.perf.span_m).max(0.0) / 2.0
             };
             if off > corridor {
                 continue;
@@ -550,6 +559,42 @@ pub fn apply(
                     obstacle: k,
                     free_m: free,
                     immovable: ob.parked || (still && facing),
+                    junction: false,
+                },
+            );
+        }
+    }
+    // NOSE TO TAIL WHATEVER THE ROUTE SAYS: one standing right in front of
+    // a mover's nose, within its own length and the spacing's contact,
+    // stops it there, seen on the route or not. LFPG and EDDF (the traffic
+    // hour sweep, 2026-10-10): an A359 and a 747-8 on a long leg of their
+    // way to the runway closed up on the departure queue unseen and drove
+    // into the one at its end at 5.6 kt.
+    for (i, ac) in fleet.iter().enumerate() {
+        if !taxi_phase(ac.phase) || !ac.kin.on_ground || on_strip[i] {
+            continue;
+        }
+        for (k, ob) in obstacles.iter().enumerate() {
+            if ob.idx == Some(i) || ob.on_stand {
+                continue;
+            }
+            let d = dist_m(ac.kin.pos(), ob.pos);
+            let reach = contact_m(ac.perf, ob.perf) + NOSE_REACH_M;
+            if d >= reach {
+                continue;
+            }
+            let rel = signed_diff_deg(bearing(ac.kin.pos(), ob.pos), ac.kin.hdg_deg).to_radians();
+            let (along, off) = (d * rel.cos(), (d * rel.sin()).abs());
+            if along <= 0.0 || off > (ac.perf.span_m + ob.perf.span_m) / 4.0 {
+                continue;
+            }
+            keep(
+                &mut stops,
+                i,
+                Stop {
+                    obstacle: k,
+                    free_m: along - contact_m(ac.perf, ob.perf),
+                    immovable: ob.parked,
                     junction: false,
                 },
             );
@@ -669,6 +714,15 @@ pub fn apply(
             let giver = match (hi, hj) {
                 (true, false) => Some(i),
                 (false, true) => Some(j),
+                // Neither can stop short comfortably: one crossing a runway
+                // still never gives way, the other brakes for it as best it
+                // can. EHAM 22 (the traffic hour sweep, 2026-10-10): a 737
+                // taxiing at 18 kt to its hold short met an E190 coming off
+                // the crossing there, both stopped nose to nose and the E190
+                // stood on the runway.
+                (false, false) if on_strip[i] != on_strip[j] => {
+                    Some(if on_strip[i] { j } else { i })
+                }
                 (false, false) => None,
                 (true, true) => {
                     let gives = |k: usize, to: usize| {
@@ -782,6 +836,14 @@ pub fn apply(
             ac.spacing.held_s += dt;
             let limit = if on_strip[i] { RUNWAY_STUCK_S } else { STUCK_S };
             guard_due = ac.spacing.held_s >= limit;
+        } else if stopped && s.junction && ob.idx.is_some_and(|j| standing[j]) {
+            // Giving way to one that is standing still itself (giving way in
+            // its turn to a third, round a ring): EGLL (the traffic hour
+            // sweep, 2026-10-10), a 789 and an A333 each held at a junction
+            // for the other's stretch, and the arrivals behind them stood for
+            // half an hour. Twice the guard's patience, then it acts.
+            ac.spacing.held_s += dt;
+            guard_due = ac.spacing.held_s >= 2.0 * STUCK_S;
         } else {
             ac.spacing.held_s = 0.0;
         }
@@ -951,5 +1013,47 @@ mod tests {
         // The parallel the other way, 45 m off.
         let parallel = vec![(-300.0, 45.0), (300.0, 45.0)];
         assert_eq!(meeting_entry_m(&parallel, &other, 25.0), None);
+    }
+
+    /// One standing right in front of a mover's nose stops it, whatever its
+    /// route says: an A359 and a 747-8 whose way ahead did not show the
+    /// queue at the hold drove into it at 5.6 kt (LFPG, EDDF, 2026-10-10).
+    /// One off to the side, or behind, does not.
+    #[test]
+    fn one_right_in_front_of_the_nose_stops_a_mover() {
+        use crate::aircraft::{Route, TrafficAircraft};
+        use crate::kin::{shift, Kin};
+        use crate::phase::{Phase, Plan};
+        let field = crate::field::fixtures::xtst();
+        // Well clear of the field's runways.
+        let o = shift(
+            (field.net.stands[0].lat, field.net.stands[0].lon),
+            5000.0,
+            5000.0,
+        );
+        let mover = |at: LatLon| {
+            let mut kin = Kin::parked(at, 0.0, 90.0);
+            kin.gs_kts = 10.0;
+            let mut a =
+                TrafficAircraft::new(1, "A", "A", "B77W", Plan::Parked, kin, Phase::TaxiOut, 1);
+            // The way the follower has ahead turns away north at once.
+            a.route = Route::taxi(vec![at, shift(at, 0.0, 300.0)]);
+            a
+        };
+        let standing = |at: LatLon| {
+            let kin = Kin::parked(at, 0.0, 90.0);
+            TrafficAircraft::new(2, "B", "B", "A320", Plan::Parked, kin, Phase::TaxiOut, 2)
+        };
+        for (east, north, stops) in [(45.0, 0.0, true), (45.0, -60.0, false), (-45.0, 0.0, false)] {
+            let mut fleet = vec![mover(o), standing(shift(o, east, north))];
+            let mut events = Vec::new();
+            apply(&mut fleet, &field, None, 0.1, &mut events);
+            let free = fleet[0].spacing.free_m;
+            assert_eq!(
+                free.is_some_and(|f| f < 0.0),
+                stops,
+                "{east} east {north} north: {free:?}"
+            );
+        }
     }
 }

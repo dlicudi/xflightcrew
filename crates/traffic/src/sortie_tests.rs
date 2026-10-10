@@ -2444,3 +2444,111 @@ fn an_airliner_go_around_flies_the_missed_approach_and_comes_back_round() {
         "{after:?}"
     );
 }
+
+/// TURNAROUNDS (realism review, 2026-10-09): an arrival that parks stays
+/// on its stand, dark and silent, for its turnaround, then leaves from that
+/// stand as the same carrier's next flight; it was gone two minutes after
+/// parking and every later departure appeared out of nothing.
+#[test]
+fn an_arrival_turns_round_and_leaves_as_its_carriers_next_flight() {
+    use crate::schedule::{generate, next_flight, Density, MovementKind, SpawnCtx};
+    let mut field = fixtures::xnoc();
+    let ms = generate(&field, Density::Normal, 4, &SpawnCtx::default());
+    // XNOC's three stands leave the arrivals still to come too few once one
+    // is held (`STANDS_KEPT_FREE`): spare ones far off, as a real apron has.
+    let spare = field.net.stands[0].clone();
+    for k in 0..4 {
+        let mut s = spare.clone();
+        s.name = format!("spare {k}");
+        s.lat += 0.01 * f64::from(k + 1);
+        field.net.stands.push(s);
+    }
+    let arr = ms
+        .iter()
+        .find(|m| m.kind == MovementKind::Arrival)
+        .expect("an arrival")
+        .clone();
+    let dep = ms
+        .iter()
+        .find(|m| m.kind == MovementKind::Departure)
+        .expect("a departure")
+        .clone();
+    let mut fleet = Fleet::new(field);
+    fleet.turn_round = true;
+    assert!(fleet.spawn(arr.spawn(1, &fleet.field, &SpawnCtx::default()).unwrap()));
+    let tower = RefCell::new(ScriptedTower::default());
+    let mut t = 0.0;
+    let mut turned_at = None;
+    while t < 3600.0 && turned_at.is_none() {
+        let events = fleet.step(0.1, None, &|id| tower.borrow().orders.get(&id).cloned());
+        t += 0.1;
+        for e in &events {
+            tower.borrow_mut().hear(e);
+            assert!(!matches!(e, Event::Despawn { .. }), "{e:?}");
+            if matches!(e, Event::TurnedRound { id: 1 }) {
+                turned_at = Some(t);
+            }
+        }
+    }
+    let turned_at = turned_at.expect("parked and turned round");
+    let a = fleet.get(1).expect("still on its stand");
+    let stand = a.stand.clone().expect("on a stand");
+    assert!(a.dormant() && a.phase == Phase::Parked && a.kin.gs_kts == 0.0);
+    assert!(!a.kin.lights.beacon && fleet.turned_round(1));
+    assert_eq!(a.callsign, arr.callsign);
+    let pos = a.kin.pos();
+    // Not ready before its turnaround: a narrowbody stands 35 minutes at
+    // least, an hour at most.
+    let all = |_: &TrafficAircraft| true;
+    let mut ready = None;
+    while t < turned_at + 4000.0 {
+        assert!(
+            fleet.step(1.0, None, &|_| None).is_empty(),
+            "silent and still"
+        );
+        t += 1.0;
+        if fleet.ready_to_leave(&[], &all).is_some() {
+            ready = Some(t - turned_at);
+            break;
+        }
+    }
+    let ready = ready.expect("ready within the hour");
+    assert!((34.0 * 60.0..=61.0 * 60.0).contains(&ready), "{ready:.0} s");
+    assert!(
+        fleet.ready_to_leave(&[1], &all).is_none(),
+        "held for another"
+    );
+    let (cs, spoken) =
+        next_flight("XNOC", &arr.callsign, &mut crate::rng::XorShift64::new(1)).unwrap();
+    assert_eq!(cs[..3], arr.callsign[..3], "the same carrier");
+    assert_ne!(cs, arr.callsign);
+    assert!(fleet.release_as(1, dep.plan(&fleet.field).unwrap(), &cs, &spoken));
+    assert!(!fleet.turned_round(1));
+    let events = fleet.step(1.0, None, &|_| None);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::Call {
+            id: 1,
+            call: Call::Taxi
+        }
+    )));
+    let a = fleet.get(1).unwrap();
+    assert_eq!((a.callsign.as_str(), a.kin.pos()), (cs.as_str(), pos));
+    assert_eq!(
+        a.stand.as_deref(),
+        Some(stand.as_str()),
+        "from the stand it parked on"
+    );
+    assert_eq!(a.icao_type, arr.icao_type, "the same airframe");
+}
+
+/// Off (the phase machine's own default), a finished arrival lingers and
+/// is gone as before.
+#[test]
+fn without_turnarounds_a_finished_arrival_still_goes() {
+    let (done, _) = fly_schedule(fixtures::xtst_ifr(), crate::schedule::Density::Normal, 11);
+    assert!(done
+        .iter()
+        .any(|(k, r, _)| *k == crate::schedule::MovementKind::Arrival
+            && *r == crate::phase::Despawn::Parked));
+}
