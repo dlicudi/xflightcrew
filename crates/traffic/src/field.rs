@@ -630,6 +630,22 @@ impl FieldModel {
         v
     }
 
+    /// A runway strip lies between `a` and `b`: the straight line from one
+    /// to the other crosses its centreline between its ends. A stand there
+    /// is reached across that runway.
+    pub fn runway_between(&self, a: LatLon, b: LatLon) -> bool {
+        self.airport.runways.iter().any(|r| {
+            self.end(&r.ident_a).is_some_and(|e| {
+                let ((xa, ya), (xb, yb)) = (e.frame(a), e.frame(b));
+                if ya * yb >= 0.0 {
+                    return false;
+                }
+                let along = xa + (xb - xa) * ya / (ya - yb);
+                (0.0..=e.length_m).contains(&along)
+            })
+        })
+    }
+
     /// `p` is on a runway strip or within [`STAND_RUNWAY_GAP_M`] of its
     /// edge, alongside it: no place for a stand. UEMH 27 (world sweep,
     /// 2026-10-09): a stand against the runway edge put a departure on the
@@ -708,12 +724,23 @@ impl FieldModel {
     /// tightest size free: a bigger stand only when none of its own size is.
     /// Of those, one with no neighbour in `occupied` ([`neighbour_taken`])
     /// first: a quiet apron is not filled stand by stand.
+    ///
+    /// A free stand on this side of every runway first: a widebody vacated
+    /// north off LFPG's 09R and was given the nearest heavy stand, south
+    /// of it, and held short of the runway it had landed on for the rest of
+    /// the hour, the arrivals behind it stopping on top of it (the hour
+    /// sweep, 2026-10-10). Across a runway only when this side has none.
     pub fn free_stand(&self, from: LatLon, occupied: &[LatLon], icao_type: &str) -> Option<&Stand> {
+        let near_side = |s: &&Stand| !self.runway_between(from, (s.lat, s.lon));
+        let any_near = self.net.stands.iter().any(|s| {
+            self.takes(s, icao_type) && !stand_taken(s, occupied) && near_side(&s)
+        });
         let free = || {
-            self.net
-                .stands
-                .iter()
-                .filter(|s| self.takes(s, icao_type) && !stand_taken(s, occupied))
+            self.net.stands.iter().filter(move |s| {
+                self.takes(s, icao_type)
+                    && !stand_taken(s, occupied)
+                    && (!any_near || near_side(s))
+            })
         };
         nearest_tightest(
             free().filter(|s| !neighbour_taken(s, occupied)),

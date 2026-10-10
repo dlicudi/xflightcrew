@@ -228,6 +228,12 @@ pub(super) fn fly_field_hours(
             let Some(ac) = link.fleet().get(*id) else {
                 continue;
             };
+            if trace {
+                println!(
+                    "{t:7.1} [{id}] {} {} {:?} on {:?}",
+                    ac.callsign, ac.icao_type, ac.plan, ac.stand
+                );
+            }
             if !seen_ids.contains(id) {
                 let entry = traffic::wire::roster_entry(ac);
                 let code = if entry.airline.is_empty() {
@@ -318,6 +324,23 @@ pub(super) fn fly_field_hours(
                     if trace {
                         let pos = link.fleet().get(*id).map(|a| a.kin.pos());
                         println!("{t:7.1} [{id}] {from:?} -> {to:?} at {pos:?}");
+                        // Who stands near where a vacate or a landing begins
+                        // (what a vacate is planned round).
+                        if matches!(to, traffic::Phase::Vacate | traffic::Phase::TaxiIn) {
+                            for o in link.fleet().aircraft().iter().filter(|o| {
+                                o.id != *id
+                                    && o.kin.on_ground
+                                    && pos.is_some_and(|p| traffic::kin::dist_m(p, o.kin.pos()) < 600.0)
+                            }) {
+                                println!(
+                                    "          near: [{}] {} {:?} at {:?}",
+                                    o.id,
+                                    o.icao_type,
+                                    o.phase,
+                                    o.kin.pos()
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -380,6 +403,23 @@ pub(super) fn fly_field_hours(
                 if s.oracle.len() < 20 {
                     s.oracle
                         .push(format!("{t:.0} s {} {:?}: {line}", ac.callsign, ac.phase));
+                }
+            }
+        }
+        // `XVL_TRAFFIC_WATCH=17,19` prints those flights every 5 s.
+        if let Ok(w) = std::env::var("XVL_TRAFFIC_WATCH") {
+            if (t % 5.0) < dt {
+                for id in w.split(',').filter_map(|x| x.trim().parse::<u32>().ok()) {
+                    if let Some(a) = link.fleet().get(id) {
+                        println!(
+                            "WATCH {t:7.1} [{id}] {:?} {:?} {:.1} kt hdg {:.0} free {:?}",
+                            a.phase,
+                            a.kin.pos(),
+                            a.kin.gs_kts,
+                            a.kin.hdg_deg,
+                            a.spacing.free_m
+                        );
+                    }
                 }
             }
         }
@@ -1002,7 +1042,7 @@ fn real_install_traffic_world_sweep_inner() {
             .iter()
             .take(1)
             .chain(s.oracle.iter().take(1))
-            .chain(s.overlaps.iter().take(2))
+            .chain(s.overlaps.iter().take(if only.is_some() { 20 } else { 2 }))
             .chain(std::iter::once(&s.closest_at).filter(|_| s.closest_share < 0.7))
         {
             println!("    {line}");

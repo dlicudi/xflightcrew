@@ -499,10 +499,15 @@ pub fn apply(
             if ob.parked && ob.idx.is_some() && dist_m(ac.kin.pos(), ob.pos) < PARKED_CORRIDOR_M {
                 continue;
             }
+            // The wider of the two sets the corridor: an A321 took its place
+            // in LFPG's departure queue 27 m abeam an A359, outside its own
+            // half span and inside the A359's, and the A359 towed four
+            // narrowbodies off its way, one after another (the traffic hour
+            // sweep, 2026-10-10, the first widebodies).
             let corridor = if ob.on_stand {
                 PARKED_CORRIDOR_M
             } else {
-                corridor_m(ac.perf)
+                corridor_m(ac.perf) + (ob.perf.span_m - ac.perf.span_m).max(0.0) / 2.0
             };
             if off > corridor {
                 continue;

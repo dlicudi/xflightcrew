@@ -908,6 +908,66 @@ fn a_stand_route_avoiding_the_parked_goes_to_the_next_free_stand() {
     assert!(stand_route_avoiding(&net, &[], lat, lon, None, &full).is_none());
 }
 
+/// A traffic arrival is sent to the nearest free stand on its own side of
+/// every runway before one across it (LFPG 09R and EDDF 07R, the traffic
+/// hour sweep 2026-10-10: arrivals sent across the runway they had landed
+/// on held short of it for the rest of the hour).
+#[test]
+fn a_traffic_stand_route_keeps_to_its_side_of_the_runway() {
+    let mut nodes = std::collections::HashMap::new();
+    nodes.insert(1, (36.0000, -5.0000));
+    nodes.insert(2, (36.0000, -4.9990));
+    nodes.insert(3, (36.0000, -4.9980));
+    let stand = |name: &str, lon: f64| nav::Stand {
+        lat: 36.0003,
+        lon,
+        heading: 180.0,
+        name: name.into(),
+        kind: "gate".into(),
+        accepts: vec![],
+        width: None,
+    };
+    let edge = |a: i64, b: i64| nav::TaxiEdge {
+        a,
+        b,
+        oneway: false,
+        runway: false,
+        name: "A".into(),
+        zone_of: Vec::new(),
+    };
+    let net = nav::TaxiNet {
+        nodes,
+        edges: vec![edge(1, 2), edge(2, 3)],
+        stands: vec![stand("S1", -4.9996), stand("S2", -4.9980)],
+        paint: vec![],
+        pavement: vec![],
+        stand_lines: vec![],
+    };
+    // A runway north-south between S1 and where the arrival stands.
+    let runway = nav::Runway {
+        ident_a: "18".into(),
+        ident_b: "36".into(),
+        lat_a: 36.0100,
+        lon_a: -4.9994,
+        lat_b: 35.9900,
+        lon_b: -4.9994,
+        width_m: 30.0,
+        surface: 1,
+    };
+    let (lat, lon) = (36.0000, -4.9990);
+    let far = [(0.0, 0.0)];
+    let no_runway = stand_route_avoiding(&net, &[], lat, lon, None, &far).expect("a route");
+    assert_eq!(no_runway.holding_point, "S1", "the nearest");
+    let rw = [runway];
+    let traffic = stand_route_avoiding(&net, &rw, lat, lon, None, &far).expect("a route");
+    assert_eq!(traffic.holding_point, "S2", "the nearest reached without a crossing");
+    assert!(traffic.crossings.is_empty());
+    let full = [(36.0003, -4.9980)];
+    let across = stand_route_avoiding(&net, &rw, lat, lon, None, &full).expect("a route");
+    assert_eq!(across.holding_point, "S1", "across only when nothing else is free");
+    assert!(!across.crossings.is_empty());
+}
+
 /// Our own arrival passes over a stand our own fleet's parked aircraft
 /// stands on (#243): the link publishes where they stand, our stand route
 /// (the arrival desk's and the self taxi's) reads it; with no fleet the
@@ -10391,4 +10451,26 @@ fn a_picture_target_s_track_comes_from_its_last_sighting() {
     assert!(advisory_line(&f).contains("westbound, A320, same altitude"), "{}", advisory_line(&f));
     *TRACK_MEMORY.lock().unwrap() = None;
     *TRAFFIC_TYPES.lock().unwrap() = None;
+}
+
+/// LFPG 09R (the traffic hour sweep, 2026-10-10): an arrival stopped 66 m
+/// south of the runway, nearest a node of exit Y3 inside the runway's strip,
+/// was routed back up Y3 through the strip and held short of the runway it
+/// had just left for the rest of the hour. Its stand route now starts from
+/// the nearest node clear of the strip, with no crossing.
+/// `cargo test -p atc --release -- --ignored real_install_lfpg_off_strip --nocapture`
+#[test]
+#[ignore] // needs the real X-Plane install; run with --ignored
+fn real_install_lfpg_off_strip_stand_route_needs_no_crossing() {
+    let apt = crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    if !std::path::Path::new(&apt).exists() {
+        return;
+    }
+    let st = Station::load(&apt, "LFPG").expect("LFPG");
+    let net = nav::find_taxi_net(&apt, "LFPG").unwrap().expect("its network");
+    let (lat, lon) = (49.02153743889608, 2.542026196488463);
+    let far = [(0.0, 0.0)];
+    let plan = stand_route_avoiding(&net, &st.apt.runways, lat, lon, None, &far).expect("a route");
+    println!("{} {:?} via {:?}", plan.holding_point, plan.crossings, plan.via);
+    assert!(plan.crossings.is_empty(), "{:?}", plan.crossings);
 }

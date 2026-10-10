@@ -143,7 +143,6 @@ const EXS: Carrier = c(
     &[("B738", 60), ("A321", 25), ("A21N", 15)],
     (100, 999),
 );
-const NBT: Carrier = c("NBT", "Norstar", &[("B789", 1)], (1, 799));
 const UAE: Carrier = c("UAE", "Emirates", &[("A388", 60), ("B77W", 40)], (1, 99));
 const VIR: Carrier = c(
     "VIR",
@@ -426,7 +425,7 @@ const HOP: Carrier = c(
 pub fn field_mix(icao: &str) -> Option<&'static [Share]> {
     Some(match icao {
         // Gatwick: easyJet's base, BA's 2xxx and its 777s, the leisure
-        // carriers, Norse's 787s and Emirates' A380 a few a day.
+        // carriers and Emirates' A380 a few a day.
         "EGKK" => &[
             (EZY_GATWICK, 45),
             (BAW_GATWICK, 15),
@@ -439,7 +438,6 @@ pub fn field_mix(icao: &str) -> Option<&'static [Share]> {
             (RYR, 2),
             (THY, 2),
             (QTR, 1),
-            (NBT, 1),
             (UAE, 1),
         ],
         // Heathrow: BA half of it, long-haul a third.

@@ -793,3 +793,22 @@ fn a_turnaround_takes_the_types_own_time() {
         "a registration stays"
     );
 }
+
+/// A runway lies between two points only when the line joining them
+/// crosses its centreline between its ends: what the arrival's own stand
+/// pick keeps to ([`FieldModel::free_stand`], this side first).
+#[test]
+fn a_runway_between_is_a_crossing_of_its_centreline() {
+    let f = fixtures::xnoc();
+    let e = f.end("12").unwrap();
+    let mid = e.at(e.length_m / 2.0, 0.0);
+    let left = project_m(mid, e.course_deg - 90.0, 300.0);
+    let right = project_m(mid, e.course_deg + 90.0, 300.0);
+    let left2 = project_m(left, e.course_deg, 200.0);
+    assert!(f.runway_between(left, right));
+    assert!(!f.runway_between(left, left2));
+    let beyond = project_m(e.thr, e.course_deg + 180.0, 500.0);
+    let beyond_l = project_m(beyond, e.course_deg - 90.0, 300.0);
+    let beyond_r = project_m(beyond, e.course_deg + 90.0, 300.0);
+    assert!(!f.runway_between(beyond_l, beyond_r), "past its end");
+}

@@ -410,7 +410,6 @@ pub(crate) const TELEPHONY: &[(&str, &str)] = &[
     ("ITY", "Itarrow"),
     ("HOP", "Air Hop"),
     ("IBS", "Iberexpres"),
-    ("NBT", "Norstar"),
     ("SWA", "Southwest"),
     ("ASA", "Alaska"),
 ];
