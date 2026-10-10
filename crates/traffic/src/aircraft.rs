@@ -53,6 +53,39 @@ const BACKTRACK_PACE: f64 = 1.6;
 /// ...and never faster than this, knots.
 const BACKTRACK_MAX_KTS: f64 = 25.0;
 
+/// A turn-off this acute or less is a rapid exit, taken at the type's
+/// exit speed ([`Perf::exit_kts`]); anything squarer at taxi pace.
+pub(crate) const RAPID_EXIT_MAX_DEG: f64 = 45.0;
+
+/// A rapid exit is worth this much further down the runway than a square
+/// one, metres: about the distance a jet saves by leaving at speed rather
+/// than slowing to taxi pace on the strip.
+const RAPID_EXIT_BONUS_M: f64 = 300.0;
+
+/// The least braking a rollout to a far exit uses, metres a second
+/// squared: it slows early and rolls on at the exit's speed, as a crew
+/// does, never holds its touchdown speed to brake late.
+pub(crate) const EXIT_MIN_DECEL_MS2: f64 = 0.8;
+
+/// Anybody on the ground this far along the exit beyond its junction (and
+/// in its corridor) sends the rollout in at taxi pace: the spacing then
+/// stops it behind them, which it could not from the exit's speed.
+const EXIT_LOOK_M: f64 = 300.0;
+
+/// A rollout turning off at taxi pace hands over to the vacate's taxi
+/// follower this far short of the junction, metres, which slows for the
+/// corner and keeps to the paint: flown round at the rollout's own turn
+/// the 172 cut a square exit 8 m inside the line (XTST 27).
+const EXIT_HANDOVER_M: f64 = 60.0;
+
+/// A taxi in is joined at its nearest point this far along its start,
+/// metres ([`joined`]).
+const TAXI_JOIN_M: f64 = 400.0;
+
+/// Off a fast exit, still above taxi pace, the vacate brakes at this share
+/// of the class's most (all of it behind traffic).
+const EXIT_BRAKE_SHARE: f64 = 0.7;
+
 /// The line-up ends this far along the centreline from where the lead-on
 /// meets it, so the aircraft stops ALIGNED.
 const LINE_UP_ALIGN_M: f64 = 60.0;
@@ -126,6 +159,19 @@ impl Route {
                 .map(|w| dist_m(w[0], w[1]))
                 .sum::<f64>()
     }
+}
+
+/// A rollout's way off, planned at touchdown ([`TrafficAircraft::plan_exit`]):
+/// the route's vertex at the junction it turns off at, and the speed it
+/// turns off at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ExitRun {
+    pub junction: usize,
+    pub kts: f64,
+    /// From the junction on, as DRIVEN ([`crate::slot`]): seconds until off
+    /// the strip, and until the drive ends (the report).
+    pub off_s: f64,
+    pub done_s: f64,
 }
 
 /// What one aircraft sees of another.
@@ -202,6 +248,8 @@ pub struct TrafficAircraft {
     /// The orbit being flown for a delay, and how many it has flown.
     pub(crate) orbit: Option<Orbit>,
     pub(crate) orbits: u32,
+    /// The way off the rollout is driving to, planned at touchdown.
+    pub(crate) exit: Option<ExitRun>,
     rng: XorShift64,
 }
 
@@ -251,6 +299,7 @@ impl TrafficAircraft {
             drive_est: None,
             orbit: None,
             orbits: 0,
+            exit: None,
             rng: XorShift64::new(seed),
         }
     }
@@ -457,7 +506,7 @@ impl TrafficAircraft {
             Some(free) => kts.min((2.0 * SPACING_DECEL_MS2 * free.max(0.0)).sqrt() / KT_TO_MS),
             None => kts,
         };
-        let spec = FollowSpec::taxi(kts, self.perf.turn_taxi_dps);
+        let spec = self.ground_spec(kts, self.spacing.free_m.is_some());
         follow_on_gear(
             &self.route.path,
             &mut self.route.follow,
@@ -466,6 +515,26 @@ impl TrafficAircraft {
             &crate::perf::gear_for(&self.icao_type, self.perf),
             dt,
         )
+    }
+
+    /// The taxi follower at `kts`, braking off a fast exit: still above
+    /// taxi pace, it slows at [`EXIT_BRAKE_SHARE`] of the class's braking
+    /// (all of it with traffic ahead, `behind`), never the taxi's gentle
+    /// 2 kt/s, which from a jet's 50 kt needs 330 m it may not have.
+    pub(crate) fn ground_spec(&self, kts: f64, behind: bool) -> FollowSpec {
+        let mut spec = FollowSpec::taxi(kts, self.perf.turn_taxi_dps);
+        spec.decel_kts_s = self.exit_spec_decel(self.kin.gs_kts, kts, spec.decel_kts_s, behind);
+        spec
+    }
+
+    /// The taxi follower's braking `base` at `gs_kts` toward `kts`, as
+    /// [`TrafficAircraft::ground_spec`] brakes it (the slot's estimate too).
+    pub(crate) fn exit_spec_decel(&self, gs_kts: f64, kts: f64, base: f64, behind: bool) -> f64 {
+        if gs_kts <= kts + 1.0 {
+            return base;
+        }
+        let share = if behind { 1.0 } else { EXIT_BRAKE_SHARE };
+        base.max(share * self.perf.decel_kts_s)
     }
 
     /// One fixed substep of the phase machine.
@@ -561,6 +630,25 @@ impl TrafficAircraft {
                         reason: Despawn::NoStand,
                     });
                     return;
+                }
+                // Clear of the pavement, tail and all, it says so as it goes
+                // on to the end of its way off: the tower's book is the
+                // pavement's. EGKK and LEMG (the hour sweep, 2026-10-09):
+                // the drawn way off runs 270 to 800 m on past the hold, and
+                // "runway vacated" at its end came 25 to 80 s after the
+                // runway was free.
+                if !driven && self.vacated_at_s.is_none() && self.clear_of_runway(field) {
+                    self.call_once(Call::Vacated, events);
+                    self.vacated_at_s = Some(self.phase_s);
+                }
+                // Reported off and cleared to its stand while it still drives
+                // its way off: it taxis in from where it is.
+                if !driven
+                    && !queued
+                    && self.vacated_at_s.is_some()
+                    && o.state == TowerState::TaxiCleared
+                {
+                    self.start_taxi_in(o, field, others, events);
                 }
                 if driven || queued {
                     self.call_once(Call::Vacated, events);
@@ -1173,6 +1261,63 @@ impl TrafficAircraft {
                     at,
                     along_m: end.frame(at).0,
                 });
+                // The way off is chosen now, at speed, as a crew briefs it:
+                // the first exit the braking makes, rapid ones at speed.
+                self.exit = None;
+                if !self.touch_and_go() {
+                    let standing = standing_on_ground(self.id, others);
+                    let gs = self.kin.gs_kts;
+                    if let Some((path, run)) =
+                        self.plan_exit(field, end, at, self.kin.hdg_deg, gs, &standing)
+                    {
+                        self.route = Route::taxi(path);
+                        self.exit = Some(run);
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(run) = self.exit {
+            // Braked to reach the junction at its turn-off speed: as hard
+            // as that takes, never less than [`EXIT_MIN_DECEL_MS2`] (then
+            // rolling on at the exit's speed), never more than the class
+            // brakes. Traffic in the exit: in at taxi pace.
+            let blocked = self.exit_blocked(run, others);
+            let ve = if blocked {
+                run.kts.min(p.taxi_kts)
+            } else {
+                run.kts
+            };
+            let d = self.route.dist_to(self.kin.pos(), run.junction);
+            let d_brake = exit_brake_m(p, ve, d);
+            let a = exit_brake_ms2(p, self.kin.gs_kts * KT_TO_MS, ve * KT_TO_MS, d_brake);
+            let spec = FollowSpec {
+                kts: ve,
+                max_turn_dps: p.turn_taxi_dps,
+                accel_kts_s: 0.0,
+                decel_kts_s: a / KT_TO_MS,
+                stop_at_end: false,
+                slow_for_corners: false,
+                min_look_m: 30.0,
+            };
+            follow(
+                &self.route.path,
+                &mut self.route.follow,
+                &mut self.kin,
+                &spec,
+                dt,
+            );
+            self.kin.flaps = 0.0;
+            // A turn-off at taxi pace is the taxi's to make, on the paint
+            // ([`EXIT_HANDOVER_M`]); one at speed is flown round from here.
+            let slow = ve <= p.taxi_kts + 2.0;
+            if self.route.follow.seg >= run.junction || (slow && d <= EXIT_HANDOVER_M) {
+                self.exit = None;
+                self.kin.lights.landing = false;
+                self.kin.lights.strobe = false;
+                self.kin.lights.taxi = true;
+                self.vacated_at_s = None;
+                self.set_phase(Phase::Vacate, events);
             }
             return;
         }
@@ -1206,19 +1351,7 @@ impl TrafficAircraft {
             }
         }
         let here = self.kin.pos();
-        // Nobody's spot is a vacate's end: the ones standing on the ground.
-        let standing: Vec<LatLon> = others
-            .iter()
-            .filter(|s| {
-                s.id != self.id
-                    && s.gs_kts < 0.5
-                    && matches!(
-                        s.phase,
-                        Phase::TaxiOut | Phase::HoldShort | Phase::Vacate | Phase::TaxiIn
-                    )
-            })
-            .map(|s| s.pos)
-            .collect();
+        let standing = standing_on_ground(self.id, others);
         let path = match field.vacate(here, self.kin.hdg_deg, end, &self.icao_type, &standing) {
             Some(v) => {
                 let mut full = vec![here];
@@ -1297,8 +1430,15 @@ impl TrafficAircraft {
                 None => return,
             },
         };
-        let mut full = vec![here];
-        full.extend(path.into_iter().skip_while(|p| dist_m(*p, here) < 1.0));
+        // Still rolling off the runway (it said "vacated" as it cleared
+        // the pavement), it joins the route; stopped, it drives it whole.
+        let full = if self.kin.gs_kts > 1.0 {
+            joined(here, self.kin.hdg_deg, path)
+        } else {
+            let mut full = vec![here];
+            full.extend(path.into_iter().skip_while(|p| dist_m(*p, here) < 1.0));
+            full
+        };
         self.stand = Some(name);
         self.set_taxi_route(&full, field);
         self.set_phase(Phase::TaxiIn, events);
@@ -1363,10 +1503,196 @@ impl TrafficAircraft {
         true
     }
 
+    /// The way off a rollout at `at`, heading `hdg` at `gs_kts`, can make
+    /// ([`FieldModel::vacate_picked`]): the first exit past where its
+    /// planned braking ([`Perf::exit_decel_ms2`], from touchdown) brings it
+    /// down to the exit's speed, a rapid exit at [`Perf::exit_kts`], a
+    /// square one at taxi pace. The path from `at`, and the run to drive;
+    /// `None` when it can make none (then it slows on the strip and plans
+    /// from there, a backtrack included). The landing and its slot
+    /// ([`crate::slot`]) both plan by this.
+    pub(crate) fn plan_exit(
+        &self,
+        field: &FieldModel,
+        end: &RunwayEnd,
+        at: LatLon,
+        hdg: f64,
+        gs_kts: f64,
+        standing: &[LatLon],
+    ) -> Option<(Vec<LatLon>, ExitRun)> {
+        let p = self.perf;
+        let v = gs_kts * KT_TO_MS;
+        let from = |kts: f64| {
+            let ve = kts * KT_TO_MS;
+            (v * v - ve * ve).max(0.0) / (2.0 * p.exit_decel_ms2)
+        };
+        let fast = p.exit_kts > p.taxi_kts + 2.0;
+        let pick = nav::ExitPick {
+            rapid_from_m: from(p.exit_kts),
+            square_from_m: from(p.taxi_kts),
+            rapid_max_deg: RAPID_EXIT_MAX_DEG,
+            rapid_bonus_m: if fast { RAPID_EXIT_BONUS_M } else { 0.0 },
+        };
+        let plan = field.vacate_picked(at, hdg, end, &self.icao_type, standing, Some(&pick))?;
+        let turn = plan.turn_off?;
+        let mut path = vec![at];
+        path.extend(plan.path.into_iter().skip_while(|q| dist_m(*q, at) < 1.0));
+        let junction = (1..path.len())
+            .min_by(|a, b| dist_m(path[*a], turn.at).total_cmp(&dist_m(path[*b], turn.at)))
+            .filter(|i| dist_m(path[*i], turn.at) < 10.0 && *i + 1 < path.len())?;
+        let kts = if turn.deg <= RAPID_EXIT_MAX_DEG {
+            p.exit_kts
+        } else {
+            p.taxi_kts
+        };
+        let (off_s, done_s) = self.exit_drive_s(field, end, &path[junction..], kts);
+        Some((
+            path,
+            ExitRun {
+                junction,
+                kts,
+                off_s,
+                done_s,
+            },
+        ))
+    }
+
+    /// Off every runway's pavement and its side, the tail too
+    /// ([`FieldModel::beside_runway`] for the nose, the pavement for the
+    /// tail a length behind it).
+    fn clear_of_runway(&self, field: &FieldModel) -> bool {
+        self.clear_of_runway_at(field, &self.kin)
+    }
+
+    /// [`TrafficAircraft::clear_of_runway`] at `kin` (the slot's drives).
+    pub(crate) fn clear_of_runway_at(&self, field: &FieldModel, kin: &Kin) -> bool {
+        let nose = kin.pos();
+        let tail = project_m(nose, kin.hdg_deg + 180.0, self.perf.length_m);
+        !field.beside_runway(nose) && !field.on_runway(tail)
+    }
+
+    /// Somebody stands or taxis on the exit ahead of `run`'s junction, in
+    /// its corridor, within [`EXIT_LOOK_M`] of it.
+    fn exit_blocked(&self, run: ExitRun, others: &[Seen]) -> bool {
+        let path = &self.route.path;
+        let Some(&j) = path.get(run.junction) else {
+            return false;
+        };
+        let mut ahead = vec![j];
+        let mut gone = 0.0;
+        for q in &path[run.junction + 1..] {
+            gone += dist_m(*ahead.last().unwrap_or(&j), *q);
+            ahead.push(*q);
+            if gone > EXIT_LOOK_M {
+                break;
+            }
+        }
+        let corridor = self.perf.span_m / 2.0 + crate::spacing::LATERAL_MARGIN_M + 5.0;
+        others.iter().any(|s| {
+            s.id != self.id
+                && matches!(
+                    s.phase,
+                    Phase::TaxiOut | Phase::HoldShort | Phase::Vacate | Phase::TaxiIn
+                )
+                && crate::kin::cross_track_m(&ahead, s.pos) < corridor
+        })
+    }
+
     /// A number from this aircraft's own generator (jitter for the bin's
     /// schedules; the phase machine itself draws none).
     pub fn draw(&mut self) -> f64 {
         self.rng.next_f64()
+    }
+}
+
+/// A taxi route from `here`, joined at its nearest point within
+/// [`TAXI_JOIN_M`] of its start (the one after, when that point is behind):
+/// the tower plans from where the flight was when it called, and a vacate
+/// that said "runway vacated" as it cleared the pavement drives on while
+/// the clearance comes. EDDF 07R (the hour sweep, 2026-10-09): planned from
+/// just off the runway, the route was driven from 250 m further up the
+/// exit, straight back across the grass to its first node and round a
+/// hairpin onto the runway's edge as a departure rolled.
+fn joined(here: LatLon, hdg: f64, path: Vec<LatLon>) -> Vec<LatLon> {
+    let mut gone = 0.0;
+    let mut best: Option<(usize, f64)> = None;
+    for (i, p) in path.iter().enumerate() {
+        if i > 0 {
+            gone += dist_m(path[i - 1], *p);
+        }
+        if gone > TAXI_JOIN_M {
+            break;
+        }
+        let d = dist_m(here, *p);
+        if best.is_none_or(|(_, b)| d < b) {
+            best = Some((i, d));
+        }
+    }
+    let mut k = best.map(|(i, _)| i).unwrap_or(0);
+    let behind = |q: LatLon| crate::kin::signed_diff_deg(bearing(here, q), hdg).abs() > 90.0;
+    if k + 1 < path.len() && dist_m(here, path[k]) > 1.0 && behind(path[k]) {
+        k += 1;
+    }
+    let mut full = vec![here];
+    full.extend(
+        path.into_iter()
+            .skip(k)
+            .skip_while(|p| dist_m(*p, here) < 1.0),
+    );
+    full
+}
+
+/// Nobody's spot is a vacate's end: the ones standing on the ground.
+fn standing_on_ground(me: u32, others: &[Seen]) -> Vec<LatLon> {
+    others
+        .iter()
+        .filter(|s| {
+            s.id != me
+                && s.gs_kts < 0.5
+                && matches!(
+                    s.phase,
+                    Phase::TaxiOut | Phase::HoldShort | Phase::Vacate | Phase::TaxiIn
+                )
+        })
+        .map(|s| s.pos)
+        .collect()
+}
+
+/// The braking that brings `v_ms` down to `ve_ms` in `d_m`, metres a second
+/// squared: at least [`EXIT_MIN_DECEL_MS2`], at most the class's.
+pub(crate) fn exit_brake_ms2(p: &Perf, v_ms: f64, ve_ms: f64, d_m: f64) -> f64 {
+    let need = (v_ms * v_ms - ve_ms * ve_ms).max(0.0) / (2.0 * d_m.max(1.0));
+    need.clamp(EXIT_MIN_DECEL_MS2, p.decel_kts_s * KT_TO_MS)
+}
+
+/// Seconds a rollout at `gs_kts` takes over `d_m` to its exit's junction,
+/// braked by [`exit_brake_ms2`] down to `exit_kts` and rolled on at it.
+pub(crate) fn time_to_exit_s(p: &Perf, gs_kts: f64, exit_kts: f64, d_j: f64) -> f64 {
+    let (v, ve) = (gs_kts * KT_TO_MS, exit_kts * KT_TO_MS);
+    if v <= ve + 0.01 {
+        return d_j / v.max(1.0);
+    }
+    let d_m = exit_brake_m(p, exit_kts, d_j);
+    let then_s = (d_j - d_m) / ve.max(1.0);
+    let a = exit_brake_ms2(p, v, ve, d_m);
+    let d1 = (v * v - ve * ve) / (2.0 * a);
+    if d1 >= d_m {
+        // Braked as hard as it may and still fast at the junction.
+        let vj = (v * v - 2.0 * a * d_m).max(0.0).sqrt();
+        return (v - vj) / a + then_s;
+    }
+    (v - ve) / a + (d_m - d1) / ve.max(1.0) + then_s
+}
+
+/// The metres of `d_j` to a junction a rollout brakes over toward
+/// `exit_kts`: all of it for a turn-off at speed, all but
+/// [`EXIT_HANDOVER_M`] for one at taxi pace (it is down to taxi pace when
+/// the taxi takes over).
+pub(crate) fn exit_brake_m(p: &Perf, exit_kts: f64, d_j: f64) -> f64 {
+    if exit_kts <= p.taxi_kts + 2.0 {
+        (d_j - EXIT_HANDOVER_M).max(1.0)
+    } else {
+        d_j
     }
 }
 

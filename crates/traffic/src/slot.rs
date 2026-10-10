@@ -28,8 +28,8 @@
 //! short final.
 
 use crate::aircraft::{
-    Seen, TrafficAircraft, FLARE_AGL_FT, FLARE_SINK_FPM, FT_PER_M, GLIDE_DEG, LINE_UP_KTS,
-    NO_CLEARANCE_AGL_FT, TCH_FT,
+    time_to_exit_s, Seen, TrafficAircraft, FLARE_AGL_FT, FLARE_SINK_FPM, FT_PER_M, GLIDE_DEG,
+    LINE_UP_KTS, NO_CLEARANCE_AGL_FT, TCH_FT,
 };
 use crate::field::{FieldModel, RunwayEnd};
 use crate::kin::{bearing, dist_m, follow, project_m, Follow, FollowSpec, Kin, LatLon, KT_TO_MS};
@@ -187,6 +187,10 @@ pub(crate) struct Occupancy {
     pub off_s: f64,
     pub done_s: f64,
     pub backtrack: bool,
+    /// The rollout is to a junction planned at speed
+    /// ([`TrafficAircraft::plan_exit`]): the tower reads it as rolling on
+    /// down the strip until it turns off there.
+    pub turns_off: bool,
 }
 
 /// A ground drive's estimate while it is driven: the phase it was made
@@ -210,10 +214,13 @@ pub(crate) struct Orbit {
 }
 
 /// A drive DRIVEN: seconds until last on the strip, until the drive ends,
-/// and whether it ended on the strip back toward the threshold.
+/// until "runway vacated" is said (clear of the pavement, tail and all,
+/// `TrafficAircraft::clear_of_runway`, else the drive's end), and whether
+/// it ended on the strip back toward the threshold.
 struct Drive {
     off_s: f64,
     done_s: f64,
+    report_s: f64,
     backtrack: bool,
 }
 
@@ -259,7 +266,7 @@ impl TrafficAircraft {
     }
 
     /// A touch and go follows this landing.
-    fn touch_and_go(&self) -> bool {
+    pub(crate) fn touch_and_go(&self) -> bool {
         matches!(self.plan, Plan::Circuit { laps, .. } if self.laps_done + 1 < laps)
     }
 
@@ -280,18 +287,43 @@ impl TrafficAircraft {
         let p = self.perf;
         let flare_s = FLARE_AGL_FT / self.flare_sink_fpm() * 60.0;
         let touch_kts = p.vref_kts - 5.0;
-        let roll_s = ((touch_kts - self.exit_kts()) / p.decel_kts_s).max(0.0);
-        let drive = if self.touch_and_go() {
+        let mut roll_s = ((touch_kts - self.exit_kts()) / p.decel_kts_s).max(0.0);
+        let flare_at = (TCH_FT - FLARE_AGL_FT) / (GLIDE_DEG.to_radians().tan() * FT_PER_M);
+        // The way off planned at speed from where the flare puts the
+        // wheels down, as the landing plans it at touchdown
+        // ([`TrafficAircraft::plan_exit`]): the rollout to its junction,
+        // then its drive.
+        let touch_m = flare_at + touch_kts * KT_TO_MS * flare_s;
+        let touch = end.at(touch_m.clamp(0.0, (end.length_m - 50.0).max(0.0)), 0.0);
+        let fast = if self.touch_and_go() {
+            None
+        } else {
+            self.plan_exit(field, end, touch, end.course_deg, touch_kts, &[])
+        };
+        let drive = if let Some((path, run)) = &fast {
+            let d: f64 = path[..=run.junction]
+                .windows(2)
+                .map(|w| dist_m(w[0], w[1]))
+                .sum();
+            roll_s = time_to_exit_s(p, touch_kts, run.kts, d);
+            let run = *run;
+            Drive {
+                off_s: run.off_s,
+                done_s: run.done_s,
+                report_s: run.done_s,
+                backtrack: false,
+            }
+        } else if self.touch_and_go() {
             let s = ((p.vr_kts - self.exit_kts()) / p.roll_accel_kts_s).max(0.0);
             Drive {
                 off_s: s,
                 done_s: s,
+                report_s: s,
                 backtrack: false,
             }
         } else {
             // Where the flare starts on the path, then the flare and the
             // rollout: where the way off begins.
-            let flare_at = (TCH_FT - FLARE_AGL_FT) / (GLIDE_DEG.to_radians().tan() * FT_PER_M);
             let stop = flare_at
                 + touch_kts * KT_TO_MS * flare_s
                 + 0.5 * (touch_kts + self.exit_kts()) * KT_TO_MS * roll_s;
@@ -302,11 +334,12 @@ impl TrafficAircraft {
                     kin.gs_kts = self.exit_kts();
                     let mut path = vec![at];
                     path.extend(v.path.into_iter().skip_while(|q| dist_m(*q, at) < 1.0));
-                    self.runway_drive(field, end, kin, &path, p.taxi_kts)
+                    self.runway_drive(field, end, kin, &path, p.taxi_kts, false)
                 }
                 None => Drive {
                     off_s: 0.0,
                     done_s: 0.0,
+                    report_s: 0.0,
                     backtrack: false,
                 },
             }
@@ -317,8 +350,9 @@ impl TrafficAircraft {
             flare_s,
             roll_s,
             off_s: drive.off_s,
-            done_s: drive.done_s,
+            done_s: drive.report_s,
             backtrack: drive.backtrack,
+            turns_off: fast.is_some(),
         };
         self.occupancy = Some(o);
         o
@@ -335,19 +369,35 @@ impl TrafficAircraft {
         mut kin: Kin,
         path: &[LatLon],
         off_kts: f64,
+        exit_brake: bool,
     ) -> Drive {
         let mut at = Follow::default();
         let (mut t, mut off_s) = (0.0, 0.0);
         let (mut first, mut last) = (None, None);
+        let mut report = None;
+        // A way off is over, for the slot, once it is said: a line-up is
+        // driven to its end.
+        let to_report = !matches!(self.phase, Phase::LineUp | Phase::HoldShort);
         while t < DRIVE_MAX_S {
             let on = field.on_runway(kin.pos());
+            if report.is_none() && !on && self.clear_of_runway_at(field, &kin) {
+                report = Some(t);
+                if to_report {
+                    break;
+                }
+            }
             if on {
                 off_s = t + DRIVE_STEP_S;
                 first.get_or_insert(kin.pos());
                 last = Some(kin.pos());
             }
             let kts = if on { self.backtrack_kts() } else { off_kts };
-            let spec = FollowSpec::taxi(kts, self.perf.turn_taxi_dps);
+            let mut spec = FollowSpec::taxi(kts, self.perf.turn_taxi_dps);
+            if exit_brake {
+                // Braked off the fast exit as the vacate brakes
+                // (`TrafficAircraft::ground_spec`).
+                spec.decel_kts_s = self.exit_spec_decel(kin.gs_kts, kts, spec.decel_kts_s, false);
+            }
             t += DRIVE_STEP_S;
             if follow(path, &mut at, &mut kin, &spec, DRIVE_STEP_S) {
                 break;
@@ -360,8 +410,32 @@ impl TrafficAircraft {
         Drive {
             off_s,
             done_s: t,
+            report_s: report.unwrap_or(t),
             backtrack,
         }
+    }
+
+    /// The way off from its junction (`path`, entered at `kts`), DRIVEN as
+    /// the vacate drives it: seconds until off the strip, and until it says
+    /// "runway vacated".
+    pub(crate) fn exit_drive_s(
+        &self,
+        field: &FieldModel,
+        end: &RunwayEnd,
+        path: &[LatLon],
+        kts: f64,
+    ) -> (f64, f64) {
+        let Some(&j) = path.first() else {
+            return (0.0, 0.0);
+        };
+        let hdg = path
+            .get(1)
+            .map(|q| bearing(j, *q))
+            .unwrap_or(end.course_deg);
+        let mut kin = Kin::parked(j, end.elev_ft, hdg);
+        kin.gs_kts = kts;
+        let d = self.runway_drive(field, end, kin, path, self.perf.taxi_kts, true);
+        (d.off_s, d.report_s)
     }
 
     /// The ground drive now driven (a vacate, a line-up), driven again
@@ -381,12 +455,19 @@ impl TrafficAircraft {
                     .min(self.route.path.len().saturating_sub(1));
                 let mut rest = vec![self.kin.pos()];
                 rest.extend(self.route.path.iter().skip(seg + 1).copied());
-                let drive = self.runway_drive(field, end, self.kin.clone(), &rest, off_kts);
+                let drive = self.runway_drive(field, end, self.kin.clone(), &rest, off_kts, true);
                 let d = DriveEstimate {
                     phase: self.phase,
                     made_at_s: self.age_s,
                     off_at_s: self.age_s + drive.off_s,
-                    done_at_s: self.age_s + drive.done_s,
+                    // A vacate's end is its report: said as it clears the
+                    // pavement.
+                    done_at_s: self.age_s
+                        + if self.phase == Phase::Vacate {
+                            drive.report_s
+                        } else {
+                            drive.done_s
+                        },
                     backtrack: drive.backtrack,
                 };
                 self.drive_est = Some(d);
@@ -442,10 +523,23 @@ impl TrafficAircraft {
                     _ => true,
                 };
                 let down = to + o.flare_s + o.roll_s;
+                // A rollout at speed to its turn-off is, to the tower's
+                // track, a lander still rolling down the strip until it
+                // turns: seen leaving only there. EHAM 09 (the peak hour,
+                // 2026-10-10): a jet rolling at its exit speed to a turn-off
+                // 1.9 km in was off 8 s after the tower sent the next one
+                // round from 4 km out.
+                let unjudged = if o.backtrack {
+                    down + o.off_s
+                } else if o.turns_off {
+                    down
+                } else {
+                    0.0
+                };
                 Some(RunwaySlot {
                     to_thr_s: to,
                     clear_s: down + o.done_s,
-                    unjudged_s: if o.backtrack { down + o.off_s } else { 0.0 },
+                    unjudged_s: unjudged,
                     needs_clear_s: lead_s.min(to),
                     committed,
                     ..on_runway(0.0, 0.0, false)
@@ -453,13 +547,32 @@ impl TrafficAircraft {
             }
             Phase::Landing => {
                 let o = self.occupancy(field, end);
+                // Its way off planned at touchdown: to the junction, then
+                // the drive from there.
+                if let Some(run) = self.exit.filter(|_| self.kin.on_ground) {
+                    let d = self.route.dist_to(self.kin.pos(), run.junction);
+                    let rest = time_to_exit_s(self.perf, self.kin.gs_kts, run.kts, d);
+                    return Some(RunwaySlot {
+                        unjudged_s: rest,
+                        ..on_runway(rest + run.off_s, rest + run.done_s, false)
+                    });
+                }
                 let rest = if self.kin.on_ground {
                     ((self.kin.gs_kts - self.exit_kts()) / self.perf.decel_kts_s).max(0.0)
                 } else {
                     let agl = (self.kin.alt_ft - end.elev_ft).max(0.0);
                     agl / self.flare_sink_fpm() * 60.0 + o.roll_s
                 };
-                Some(on_runway(rest + o.off_s, rest + o.done_s, o.backtrack))
+                let slot = on_runway(rest + o.off_s, rest + o.done_s, o.backtrack);
+                // In the flare, a rollout to a turn-off at speed ahead.
+                Some(if o.turns_off && !self.kin.on_ground {
+                    RunwaySlot {
+                        unjudged_s: slot.unjudged_s.max(rest),
+                        ..slot
+                    }
+                } else {
+                    slot
+                })
             }
             // Off the runway once it has said so.
             Phase::Vacate if self.vacated_at_s.is_none() => {
@@ -490,7 +603,7 @@ impl TrafficAircraft {
                 let line_up = match self.drive_est.filter(|d| d.phase == Phase::HoldShort) {
                     Some(d) => d.done_at_s - d.made_at_s,
                     None => {
-                        let done = self.runway_drive(field, end, kin, &path, off).done_s;
+                        let done = self.runway_drive(field, end, kin, &path, off, false).done_s;
                         self.drive_est = Some(DriveEstimate {
                             phase: Phase::HoldShort,
                             made_at_s: self.age_s,
