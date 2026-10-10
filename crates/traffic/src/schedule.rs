@@ -193,7 +193,7 @@ impl Movement {
             {
                 return Err(Refusal::NearOwn);
             }
-            return TrafficAircraft::at_entry(
+            let ac = TrafficAircraft::at_entry(
                 id,
                 &self.callsign,
                 &self.spoken,
@@ -202,7 +202,16 @@ impl Movement {
                 field,
                 self.seed,
             )
-            .ok_or(Refusal::NoRunway);
+            .ok_or(Refusal::NoRunway)?;
+            // An instrument arrival appears further out than its entry
+            // (`crate::arrival::entry_point`): clear of us where it IS.
+            if ctx
+                .own
+                .is_some_and(|o| dist_m(o, ac.kin.pos()) < OWN_CLEAR_NM * 1852.0)
+            {
+                return Err(Refusal::NearOwn);
+            }
+            return Ok(ac);
         }
         let taken = ctx.taken();
         let wanted = self

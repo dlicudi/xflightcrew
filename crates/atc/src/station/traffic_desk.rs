@@ -50,6 +50,10 @@ pub struct TrafficCall {
     pub text: String,
     /// Where it is as it calls.
     pub state: AircraftState,
+    /// Addressed to the field's APPROACH unit (an instrument arrival's
+    /// check-in and established report); answered by approach where the
+    /// field has one, else by the tower.
+    pub approach: bool,
     /// What the tower sees round it as it answers: every OTHER aircraft,
     /// ours included (the producer's picture minus this flight, plus us).
     pub picture: Vec<TrafficTarget>,
@@ -160,8 +164,19 @@ impl Station {
             let (ctx, wx) = st.traffic_ctx(&call.state, &spoken, intent.clone(), &call.picture);
             (ctx, wx, before)
         });
+        let service = if call.approach && self.approach_khz.is_some() {
+            Service::Approach
+        } else {
+            Service::Tower
+        };
         let line = built.and_then(|(ctx, wx, before)| {
-            let line = self.respond_for(id, &call.text, Service::Tower, &ctx, wx)?;
+            let line = match service {
+                Service::Approach => {
+                    let intent = intent.clone();
+                    self.with_desk(id, |st| st.traffic_approach_reply(intent, &ctx, wx))?
+                }
+                _ => self.respond_for(id, &call.text, Service::Tower, &ctx, wx)?,
+            };
             let after = self
                 .desks
                 .get(&id)
@@ -170,7 +185,7 @@ impl Station {
             sim::blackbox::record(
                 "atc",
                 serde_json::json!({
-                    "route": "traffic", "id": call.id,
+                    "route": "traffic", "id": call.id, "service": service.name(),
                     "outcome": if line.is_empty() { "silence" } else { "reply" },
                     "transcript": call.text, "intent": format!("{intent:?}"),
                     "state": format!("{before:?}>{after}"), "reply": line,
@@ -181,7 +196,80 @@ impl Station {
         TrafficReply {
             id: call.id,
             line: line.unwrap_or_default(),
-            speaker: StationSpeaker::Tower,
+            speaker: service.speaker(),
+        }
+    }
+
+    /// The approach unit's answer to a traffic flight's call: an instrument
+    /// arrival's check-in is cleared for the approach (CAP 413 ch. 6:
+    /// "descend altitude three thousand feet, QNH ..., cleared ILS approach
+    /// runway two six left, report established"), a missed approach's
+    /// check-in is taken back for vectors to another approach, and the
+    /// established report is handed to the tower ([`Station::respond_approach`],
+    /// as everything else). The traffic flies its own vectors: nothing is
+    /// armed for the radar tick, no code assigned.
+    fn traffic_approach_reply(
+        &mut self,
+        intent: tower::Intent,
+        ctx: &tower::Ctx,
+        wx: Wx,
+    ) -> String {
+        let ident = self.runway_in_use.clone().unwrap_or_default();
+        let ils = ILS_FACTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|f| f.ils.iter().any(|i| i.runway == ident));
+        let kind = if ils { "ILS" } else { "straight in" };
+        let faa = self.dialect == Dialect::Faa;
+        let level = |ft: f64| {
+            if atis::is_flight_level(ft, ctx.transition_level_ft) {
+                (atis::spoken_flight_level(ft), String::new())
+            } else if faa {
+                (atis::spoken_alt(ft), tower::qnh_clause(ctx))
+            } else {
+                (
+                    format!("altitude {} feet", atis::spoken_alt(ft)),
+                    tower::qnh_clause(ctx),
+                )
+            }
+        };
+        let unit = format!("{} Approach", ctx.airport);
+        match intent {
+            tower::Intent::RequestLanding { .. } => {
+                let platform = ((self.apt.elev_ft + 3000.0) / 100.0).round() * 100.0;
+                let (alt, qnh) = level(platform);
+                if faa {
+                    format!(
+                        "{}, {unit}, descend and maintain {alt}{qnh}, cleared {kind} runway {} \
+                         approach, report established.",
+                        ctx.callsign, ctx.runway
+                    )
+                } else {
+                    format!(
+                        "{}, {unit}, descend {alt}{qnh}, cleared {kind} approach runway {}, \
+                         report established.",
+                        ctx.callsign, ctx.runway
+                    )
+                }
+            }
+            tower::Intent::GoAround => {
+                let (alt, _) = level(tower::missed_approach_alt_ft(self.apt.elev_ft));
+                if faa {
+                    format!(
+                        "{}, {unit}, roger, climb and maintain {alt}, expect vectors for \
+                         another {kind} runway {} approach, report established.",
+                        ctx.callsign, ctx.runway
+                    )
+                } else {
+                    format!(
+                        "{}, {unit}, roger, climb {alt}, expect vectors for a further {kind} \
+                         approach runway {}, report established.",
+                        ctx.callsign, ctx.runway
+                    )
+                }
+            }
+            _ => self.respond_approach(intent, ctx, wx),
         }
     }
 

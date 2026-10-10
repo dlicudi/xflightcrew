@@ -9,6 +9,7 @@
 //! in the bin) and never on whisper, cpal or ort.
 
 pub mod aircraft;
+pub mod arrival;
 pub mod clock;
 pub mod field;
 pub mod fleet;

@@ -469,6 +469,14 @@ pub(super) fn takeoff_hold_tick_for(
             } else if inbound
                 .as_ref()
                 .is_some_and(|f| f.count <= 1 && f.nm >= tower::CONDITIONAL_MIN_NM)
+                // A TRAFFIC departure is never put on the runway in front of
+                // an arrival it cannot go ahead of: lined up there, waiting
+                // for a release only that landing can give, its clearance
+                // held the strip in the book and the tower sent the arrival
+                // round. LFPG 09R (the hour sweep, 2026-10-10): an ATR at
+                // 2 nm went around for an A320 lined up at 1327 s. It waits
+                // at the hold and is released into the next gap.
+                && flight.is_own()
             {
                 Some("landing traffic ahead of you")
             } else {

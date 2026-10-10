@@ -257,6 +257,7 @@ impl Link {
             .partition(|m| m.kind == MovementKind::Parked);
         let mut due: Vec<Due> = schedule
             .into_iter()
+            .map(with_telephony)
             .map(|m| Due {
                 at_s: m.t_s,
                 m,
@@ -275,7 +276,7 @@ impl Link {
             noted: Vec::new(),
             seen_orders: HashMap::new(),
             outbox: Outbox::default(),
-            to_park,
+            to_park: to_park.into_iter().map(with_telephony).collect(),
             parked: false,
         }
     }
@@ -283,12 +284,13 @@ impl Link {
     /// More movements, `offset_s` fleet seconds from the clock's start (the
     /// next hour of a generated schedule).
     pub(crate) fn add_schedule(&mut self, schedule: Vec<Movement>, offset_s: f64) {
-        self.due.extend(schedule.into_iter().map(|m| Due {
-            at_s: m.t_s + offset_s,
-            m,
-            tries: 0,
-            held: None,
-        }));
+        self.due
+            .extend(schedule.into_iter().map(with_telephony).map(|m| Due {
+                at_s: m.t_s + offset_s,
+                m,
+                tries: 0,
+                held: None,
+            }));
         self.due.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
     }
 
@@ -431,6 +433,7 @@ impl Link {
                 text: text.clone(),
                 state: aircraft_state(ac, now),
                 picture: self.picture_for(id, own),
+                approach: call.to_approach(),
             });
             out.transmissions.push(Transmission {
                 id,
@@ -439,7 +442,24 @@ impl Link {
                 safety: is_safety_call(&call),
             });
         }
-        for ac in self.fleet.aircraft().iter().filter(|a| !a.dormant()) {
+        // The runway watch in landing order, the nearest the threshold
+        // first: a withheld landing is released to the arrival AHEAD before
+        // the one behind it, whose clearance would otherwise hold the
+        // runway in the book against its leader. LFPG 09R (the hour sweep,
+        // 2026-10-10): a departure off, the ATR 3.5 nm behind was cleared
+        // first (fleet order) and the A320 ahead of it went around uncleared
+        // at 300 ft.
+        let mut watch: Vec<&TrafficAircraft> = self
+            .fleet
+            .aircraft()
+            .iter()
+            .filter(|a| !a.dormant())
+            .collect();
+        watch.sort_by(|a, b| {
+            let to = |x: &TrafficAircraft| x.slot().map_or(f64::INFINITY, |s| s.to_thr_s);
+            to(a).total_cmp(&to(b))
+        });
+        for ac in watch {
             let picture = self.picture_for(ac.id, own);
             for line in crate::world::traffic_tick(ac.id, &picture, now) {
                 out.tower.push((ac.id, line));
@@ -508,15 +528,20 @@ impl Link {
         }
     }
 
-    /// A call in words, addressed to the field's tower by name where it
-    /// opens with "Tower".
+    /// A call in words, addressed to the field's tower (or approach unit)
+    /// by name where it opens with "Tower" ("Approach"): the station's own
+    /// replies and handoffs name its radar unit "<field> Approach".
     fn call_text(&self, spoken: &str, call: &Call, runway: Option<&str>) -> String {
         let text = call.text(spoken, runway);
-        match text.strip_prefix("Tower, ") {
-            Some(rest) if !self.tower_name.is_empty() => {
-                format!("{} Tower, {rest}", self.tower_name)
-            }
-            _ => text,
+        if self.tower_name.is_empty() {
+            return text;
+        }
+        if let Some(rest) = text.strip_prefix("Tower, ") {
+            format!("{} Tower, {rest}", self.tower_name)
+        } else if let Some(rest) = text.strip_prefix("Approach, ") {
+            format!("{} Approach, {rest}", self.tower_name)
+        } else {
+            text
         }
     }
 
@@ -618,6 +643,16 @@ impl Link {
             self.due.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
         }
     }
+}
+
+/// A movement says its callsign as its TELEPHONY: a bench spec gives a raw
+/// "RYR4521" with no `spoken`, the tower answered "Ryanair four five two
+/// one" and the readback, finding no "RYR4521" in that line, appended it
+/// raw ("..., Ryanair four five two one, RYR4521"; the phraseology pass,
+/// 2026-10-10). Expanded here, once, the flight and the tower agree.
+fn with_telephony(mut m: Movement) -> Movement {
+    m.spoken = crate::callsign::spoken_if_raw(&m.spoken);
+    m
 }
 
 /// The command loop's half: the traffic desks synced with what the ticks

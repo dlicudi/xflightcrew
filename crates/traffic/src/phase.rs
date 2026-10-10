@@ -169,9 +169,38 @@ pub enum Call {
     /// "Say again": the readback was not taken twice, the tower is asked to
     /// repeat once before the flight gives up.
     SayAgain,
+    /// An instrument arrival's first call, to the APPROACH unit, at the
+    /// level it is descending to (feet, the thousands said).
+    ArrivalCheckIn {
+        alt_ft: u32,
+    },
+    /// Off a missed approach, to the APPROACH unit, climbing to its
+    /// missed approach altitude.
+    MissedCheckIn {
+        alt_ft: u32,
+    },
+    /// Established on the final approach: to the approach unit (which
+    /// hands it to the tower) or, `miles` out, to the tower (which clears
+    /// it). `how` is the approach flown ("ILS", "RNP approach"), empty for
+    /// a final with no procedure.
+    Established {
+        approach: bool,
+        how: String,
+        miles: u32,
+    },
 }
 
 impl Call {
+    /// The call is made to the approach unit, not the tower: it opens with
+    /// "Approach, ", which the bin addresses by the field's name.
+    pub fn to_approach(&self) -> bool {
+        match self {
+            Call::ArrivalCheckIn { .. } | Call::MissedCheckIn { .. } => true,
+            Call::Established { approach, .. } => *approach,
+            _ => false,
+        }
+    }
+
     /// Plain English, addressed to the tower: "Tower, Cessna three four
     /// five, ready for departure runway one three". `runway` is the
     /// aircraft's runway where the call names one.
@@ -196,6 +225,34 @@ impl Call {
             Call::Vacated => format!("{spoken}, runway vacated, request taxi to parking"),
             Call::GoingAround => format!("{spoken}, going around"),
             Call::SayAgain => format!("Tower, {spoken}, say again"),
+            // CAP 413 6.4: the check-in names the level; "inbound" asks for
+            // the approach.
+            Call::ArrivalCheckIn { alt_ft } => format!(
+                "Approach, {spoken}, descending altitude {} feet, inbound",
+                crate::arrival::alt_words(*alt_ft as f64)
+            ),
+            Call::MissedCheckIn { alt_ft } => format!(
+                "Approach, {spoken}, missed approach, climbing altitude {} feet",
+                crate::arrival::alt_words(*alt_ft as f64)
+            ),
+            Call::Established {
+                approach: true,
+                how,
+                ..
+            } if how.is_empty() => format!("Approach, {spoken}, established on final{rwy}"),
+            Call::Established {
+                approach: true,
+                how,
+                ..
+            } => format!("Approach, {spoken}, established {how}{rwy}"),
+            Call::Established { how, miles, .. } if how.is_empty() => format!(
+                "Tower, {spoken}, long final{rwy}, {} miles",
+                number_words(*miles)
+            ),
+            Call::Established { how, miles, .. } => format!(
+                "Tower, {spoken}, established {how}{rwy}, {} miles",
+                number_words(*miles)
+            ),
             Call::RequestCrossing { runway } => format!(
                 "Tower, {spoken}, holding short runway {}, request crossing",
                 runway_words(runway)
@@ -210,6 +267,11 @@ impl Call {
 const DIGITS: [&str; 10] = [
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "niner",
 ];
+
+/// One digit as said on the radio ("niner").
+pub fn digit_word(d: u32) -> &'static str {
+    DIGITS[(d % 10) as usize]
+}
 
 /// "13" as "one three", "09L" as "zero niner left".
 pub fn runway_words(ident: &str) -> String {
@@ -389,6 +451,38 @@ mod tests {
         assert_eq!(
             Call::Base.text("Cessna one", Some("27")),
             "Cessna one, base leg runway two seven"
+        );
+    }
+
+    /// An instrument arrival's calls (CAP 413 ch. 6): the check-in and the
+    /// established report to the approach unit, then to the tower with
+    /// its distance.
+    #[test]
+    fn instrument_arrival_calls_render_in_plain_english() {
+        let s = "Speedbird one two three";
+        let check_in = Call::ArrivalCheckIn { alt_ft: 9600 };
+        assert!(check_in.to_approach());
+        assert_eq!(
+            check_in.text(s, Some("26L")),
+            "Approach, Speedbird one two three, descending altitude nine thousand feet, inbound"
+        );
+        let est = |approach| Call::Established {
+            approach,
+            how: "ILS".into(),
+            miles: 9,
+        };
+        assert_eq!(
+            est(true).text(s, Some("26L")),
+            "Approach, Speedbird one two three, established ILS runway two six left"
+        );
+        assert!(!est(false).to_approach());
+        assert_eq!(
+            est(false).text(s, Some("26L")),
+            "Tower, Speedbird one two three, established ILS runway two six left, nine miles"
+        );
+        assert_eq!(
+            Call::MissedCheckIn { alt_ft: 3000 }.text(s, None),
+            "Approach, Speedbird one two three, missed approach, climbing altitude three thousand feet"
         );
     }
 }

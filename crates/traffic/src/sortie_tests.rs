@@ -49,7 +49,21 @@ impl ScriptedTower {
                 o.go_around = false;
             }
             Call::RequestCrossing { runway } => o.cross_cleared = Some(runway.clone()),
-            Call::Base | Call::Readback(_) | Call::SayAgain => {}
+            Call::Established {
+                approach: false, ..
+            } => {
+                if self.refuse_landings > 0 {
+                    self.refuse_landings -= 1;
+                } else {
+                    o.state = TowerState::ClearedToLand;
+                }
+            }
+            Call::Base
+            | Call::Readback(_)
+            | Call::SayAgain
+            | Call::ArrivalCheckIn { .. }
+            | Call::MissedCheckIn { .. }
+            | Call::Established { .. } => {}
         }
     }
 }
@@ -978,6 +992,8 @@ fn number_two_turns_base_once_its_leader_will_be_off_the_runway() {
         needs_clear_s: 0.0,
         committed: false,
         waiting: false,
+        wake: crate::perf::Wake::Light,
+        rejoining: false,
     };
     // A 172 at 1.5 nm, 70 kt: 79 s to the threshold, plus its runway and the gap.
     let slow = [seen(Phase::Final, 1.5, 70.0)];
@@ -2154,13 +2170,15 @@ fn a_circuit_extends_its_downwind_behind_a_straight_in_that_gets_there_first() {
     let jet = || entering(&field, 2, "AT72", true, 10.0, 90.0);
     let join_alone = touchdown_alone(&field, join());
     let jet_alone = touchdown_alone(&field, jet());
-    // The straight-in reaches the threshold 20 s before the 172 would.
-    let jet_at = join_alone - 20.0 - jet_alone;
+    // The straight-in reaches the threshold 20 s before the 172 would: an
+    // airliner appears 25 nm or more out (`crate::arrival`), so the 172
+    // starts that much later.
+    let join_at = jet_alone + 20.0 - join_alone;
     assert!(
-        jet_at > 0.0,
+        join_at > 0.0,
         "the 172 lands at {join_alone:.0} s, the jet {jet_alone:.0} s"
     );
-    let p = fly_pair(field.clone(), join(), jet(), jet_at);
+    let p = fly_pair(field.clone(), jet(), join(), join_at);
     println!("{p:?}");
     assert_eq!(p.go_arounds, 0);
     assert!(p.ext_m[&1] > 0.0, "the downwind was extended");
@@ -2175,12 +2193,13 @@ fn a_circuit_extends_its_downwind_behind_a_straight_in_that_gets_there_first() {
 
 /// A straight-in that cannot fit behind the traffic committed ahead of it
 /// is given its delay EARLY, an orbit well out (never inside 4 nm), and
-/// lands once the one ahead is off: never a go-around on short final.
+/// lands once the one ahead is off: never a go-around on short final. A
+/// light single joining VFR (an airliner slows first, below).
 #[test]
 fn a_straight_in_that_cannot_fit_behind_the_one_ahead_orbits_far_out() {
     let field = fixtures::xtst();
-    let lead = || entering(&field, 1, "C172", true, 6.0, 90.0);
-    let jet = || entering(&field, 2, "AT72", true, 10.0, 90.0);
+    let lead = || entering(&field, 1, "C172", true, 10.0, 90.0);
+    let jet = || entering(&field, 2, "PA28", true, 10.0, 90.0);
     let lead_alone = touchdown_alone(&field, lead());
     let jet_alone = touchdown_alone(&field, jet());
     // The jet would touch down 30 s behind the 172, still on the runway.
@@ -2203,5 +2222,225 @@ fn a_straight_in_that_cannot_fit_behind_the_one_ahead_orbits_far_out() {
         "the jet landed at {:.0} s, the 172 was off at {:.0} s",
         p.touchdown[&2],
         p.off[&1]
+    );
+}
+
+/// XTST with an approach unit (apt.dat row 1056): instrument arrivals
+/// work it before the tower.
+fn xtst_with_approach() -> FieldModel {
+    let mut f = fixtures::xtst_ifr();
+    f.airport.freqs.push(nav::AtcFreq {
+        kind: nav::FREQ_APPROACH,
+        khz: 126_825,
+        name: "XTST Director".into(),
+    });
+    f
+}
+
+/// The realism review (2026-10-10): an airliner spawned 10 nm out and
+/// joined a 6 nm final. Now it appears 25 to 40 nm out, high on the
+/// 3 degree profile, in the 250 kt band, and joins the final 11 nm out; its calls
+/// go to approach (check-in, established), then to the tower established
+/// 9 nm out, in that order; nothing else said in the air.
+#[test]
+fn an_airliner_arrives_from_far_out_and_works_approach_then_the_tower() {
+    let field = xtst_with_approach();
+    let ac = entering(&field, 40, "AT72", true, 10.0, 100.0);
+    let end = field.end("27").unwrap();
+    let nm = dist_m(ac.kin.pos(), end.thr) / 1852.0;
+    assert!((25.0..=40.0).contains(&nm), "spawned {nm:.1} nm out");
+    assert!(
+        ac.kin.alt_ft - end.elev_ft > 7000.0,
+        "{:.0} ft",
+        ac.kin.alt_ft
+    );
+    // The 250 band, at what a turboprop flies it.
+    assert!(ac.kin.gs_kts >= 200.0, "{} kt", ac.kin.gs_kts);
+    let join = ac.route.path[ac.route.thr_idx.unwrap() - 1];
+    assert!((dist_m(join, end.thr) / 1852.0 - crate::arrival::JOIN_NM).abs() < 0.01);
+    let s = fly(field, vec![ac], ScriptedTower::default(), 3600.0, 40);
+    assert!(s.phases.contains(&Phase::Parked), "{:?}", s.phases);
+    assert!(!s.phases.iter().any(|p| matches!(p, Phase::Pattern { .. })));
+    let air: Vec<&Call> = s
+        .calls
+        .iter()
+        .filter(|c| !matches!(c, Call::Vacated | Call::Taxi | Call::Readback(_)))
+        .collect();
+    assert!(
+        matches!(
+            air.as_slice(),
+            [
+                Call::ArrivalCheckIn { .. },
+                Call::Established { approach: true, .. },
+                Call::Established {
+                    approach: false,
+                    miles: 9,
+                    ..
+                },
+            ]
+        ),
+        "{air:?}"
+    );
+    assert_eq!(s.gear_up_low, 0);
+}
+
+/// With no approach unit the tower is the first call, established 8 nm out.
+#[test]
+fn with_no_approach_unit_the_tower_is_called_established_at_eight_miles() {
+    let field = fixtures::xtst_ifr();
+    let ac = entering(&field, 41, "B738", true, 10.0, 80.0);
+    let s = fly(field, vec![ac], ScriptedTower::default(), 3600.0, 41);
+    assert!(
+        matches!(
+            s.calls.first(),
+            Some(Call::Established {
+                approach: false,
+                miles: 8,
+                ..
+            })
+        ),
+        "{:?}",
+        s.calls
+    );
+}
+
+/// Two airliners on one approach, the second spawned close behind: it is
+/// spaced by SPEED, not an orbit, and is at least its wake spacing (3 nm,
+/// medium behind medium) out as the first crosses the threshold; nobody
+/// goes around.
+#[test]
+fn a_follower_slows_to_keep_its_wake_spacing_on_final() {
+    let field = fixtures::xtst_ifr();
+    let end = field.end("27").unwrap();
+    let mut fleet = Fleet::new(field.clone());
+    let at = |id: u32, nm: f64| {
+        let e = crate::kin::project_m(end.thr, 90.0, nm * 1852.0);
+        TrafficAircraft::at_entry(
+            id,
+            &format!("T{id}"),
+            "Traffic",
+            "A320",
+            Plan::Arrival {
+                entry: e,
+                star: None,
+                runway: "27".into(),
+                straight_in: true,
+            },
+            &field,
+            id as u64,
+        )
+        .unwrap()
+    };
+    let (lead, follow) = (at(1, 30.0), at(2, 31.0));
+    assert!(dist_m(lead.kin.pos(), follow.kin.pos()) < 1.5 * 1852.0);
+    fleet.spawn(lead);
+    fleet.spawn(follow);
+    let tower = RefCell::new(ScriptedTower::default());
+    let (mut t, mut gap, mut go_arounds, mut slowest) = (0.0, None, 0, f64::INFINITY);
+    while t < 3600.0 && fleet.get(2).is_some_and(|a| a.phase != Phase::Vacate) {
+        let events = fleet.step(0.1, None, &|id| tower.borrow().orders.get(&id).cloned());
+        t += 0.1;
+        for e in &events {
+            tower.borrow_mut().hear(e);
+            match e {
+                Event::Phase {
+                    id: 1,
+                    to: Phase::Landing,
+                    ..
+                } => {
+                    let f = fleet.get(2).unwrap();
+                    gap = Some(f.route.dist_to(f.kin.pos(), f.route.thr_idx.unwrap()) / 1852.0);
+                }
+                Event::Call {
+                    call: Call::GoingAround,
+                    ..
+                } => go_arounds += 1,
+                _ => {}
+            }
+        }
+        if let Some(f) = fleet.get(2).filter(|f| f.phase == Phase::Arrive) {
+            slowest = f64::min(slowest, f.kin.gs_kts);
+        }
+    }
+    let gap = gap.expect("the leader landed");
+    assert_eq!(go_arounds, 0);
+    assert_eq!(fleet.get(2).map_or(0, |a| a.orbits), 0, "spaced by speed");
+    assert!(
+        (3.0..6.5).contains(&gap),
+        "{gap:.2} nm behind at the threshold"
+    );
+    assert!(slowest < 200.0, "it slowed ({slowest:.0} kt)");
+}
+
+/// An airliner's go-around (here: no landing clearance by 300 ft) flies the
+/// missed approach to its altitude, says so to approach, is vectored round
+/// (never a VFR downwind) and lands on its second approach 10 to 20
+/// minutes later.
+#[test]
+fn an_airliner_go_around_flies_the_missed_approach_and_comes_back_round() {
+    let field = xtst_with_approach();
+    let end = field.end("27").unwrap();
+    let ac = entering(&field, 42, "AT72", true, 30.0, 90.0);
+    let tower = ScriptedTower {
+        refuse_landings: 1,
+        ..Default::default()
+    };
+    let mut fleet = Fleet::new(field.clone());
+    fleet.spawn(ac);
+    let tower = RefCell::new(tower);
+    let (mut t, mut went, mut landed, mut top) = (0.0, None, None, 0.0_f64);
+    let mut calls = Vec::new();
+    while t < 3600.0 && landed.is_none() {
+        let events = fleet.step(0.1, None, &|id| tower.borrow().orders.get(&id).cloned());
+        t += 0.1;
+        for e in &events {
+            tower.borrow_mut().hear(e);
+            match e {
+                Event::Call { call, .. } => {
+                    if *call == Call::GoingAround {
+                        went = Some(t);
+                    }
+                    calls.push(call.clone());
+                }
+                Event::Phase { to, .. } => {
+                    assert!(!matches!(to, Phase::Pattern { .. }), "a VFR circuit");
+                }
+                Event::Touchdown { .. } => landed = Some(t),
+                _ => {}
+            }
+        }
+        if went.is_some() && landed.is_none() {
+            if let Some(a) = fleet.get(42) {
+                top = top.max(a.kin.alt_ft - end.elev_ft);
+            }
+        }
+    }
+    let (went, landed) = (went.expect("it went around"), landed.expect("it landed"));
+    let mins = (landed - went) / 60.0;
+    assert!((10.0..20.0).contains(&mins), "back {mins:.1} min later");
+    let ma = crate::arrival::missed_approach_alt_ft(end.elev_ft) - end.elev_ft;
+    assert!(
+        (top - ma).abs() < 150.0,
+        "climbed to {top:.0} ft, told {ma:.0}"
+    );
+    let after: Vec<&Call> = calls
+        .iter()
+        .skip_while(|c| **c != Call::GoingAround)
+        .collect();
+    assert!(
+        matches!(
+            after.as_slice(),
+            [
+                Call::GoingAround,
+                Call::MissedCheckIn { .. },
+                Call::Established { approach: true, .. },
+                Call::Established {
+                    approach: false,
+                    ..
+                },
+                ..
+            ]
+        ),
+        "{after:?}"
     );
 }

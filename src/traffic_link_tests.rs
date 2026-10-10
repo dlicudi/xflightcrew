@@ -110,6 +110,11 @@ pub(super) struct HarnessScore {
     /// Each full-stop landing's runway time, seconds: from the flare (over
     /// the threshold, near enough) to its "runway vacated".
     pub(super) runway_s: Vec<f64>,
+    /// The spacing on final, nm: as each landing begins its flare (over
+    /// the threshold, near enough), how far along its own approach the
+    /// next arrival for that threshold is. Read for the wake spacing
+    /// (3 to 5 nm on a real ILS).
+    pub(super) final_gap_nm: Vec<f64>,
 }
 
 /// A station for `icao` from `apt` with its taxi network loaded, installed.
@@ -243,6 +248,12 @@ pub(super) fn fly_field(
                 Event::Phase { id, from, to } => {
                     if *to == traffic::Phase::Landing {
                         flared.insert(*id, t);
+                        if let Some(gap) = final_gap_nm(&link, *id) {
+                            if trace {
+                                println!("{t:7.1} [{id}] flare, next arrival {gap:.2} nm behind");
+                            }
+                            s.final_gap_nm.push(gap);
+                        }
                     } else if *from == traffic::Phase::Landing && *to != traffic::Phase::Vacate {
                         // A touch and go, or a go-around from the flare.
                         flared.remove(id);
@@ -469,6 +480,38 @@ fn crowded(s: &HarnessScore) -> Option<(f64, f64)> {
 }
 
 /// The mean of `v` (0 for none).
+/// How far behind `lander` (just flaring) the next arrival for its
+/// threshold is, nm along that arrival's own route; `None` with nobody
+/// behind on an approach.
+fn final_gap_nm(link: &Link, lander: u32) -> Option<f64> {
+    let fleet = link.fleet();
+    let thr_of =
+        |a: &traffic::TrafficAircraft| a.route.thr_idx.and_then(|i| a.route.path.get(i).copied());
+    let thr = thr_of(fleet.get(lander)?)?;
+    fleet
+        .aircraft()
+        .iter()
+        .filter(|a| a.id != lander)
+        .filter(|a| matches!(a.phase, traffic::Phase::Final | traffic::Phase::Arrive))
+        .filter(|a| matches!(a.plan, traffic::Plan::Arrival { .. }))
+        .filter_map(|a| {
+            let i = a.route.thr_idx?;
+            let t = thr_of(a)?;
+            (traffic::kin::dist_m(t, thr) < 150.0).then(|| a.route.dist_to(a.kin.pos(), i) / 1852.0)
+        })
+        .min_by(f64::total_cmp)
+}
+
+/// The least and the median of `v` (0 when empty).
+fn min_median(v: &[f64]) -> (f64, f64) {
+    let mut v = v.to_vec();
+    v.sort_by(f64::total_cmp);
+    match v.len() {
+        0 => (0.0, 0.0),
+        n => (v[0], v[n / 2]),
+    }
+}
+
 fn mean(v: &[f64]) -> f64 {
     if v.is_empty() {
         0.0
@@ -831,6 +874,7 @@ fn real_install_traffic_world_sweep_inner() {
     let (mut overlaps, mut closest, mut go_arounds) = (0, f64::INFINITY, 0);
     let mut dirty: Vec<String> = Vec::new();
     let mut runway_s: Vec<f64> = Vec::new();
+    let mut final_gaps: Vec<f64> = Vec::new();
     for (icao, a) in fields {
         let net = crate::nav::find_taxi_net(&apt, &icao).ok().flatten();
         let has_stands = net.as_ref().is_some_and(|n| !n.stands.is_empty());
@@ -846,7 +890,8 @@ fn real_install_traffic_world_sweep_inner() {
         println!(
             "{icao}: {} scheduled, {} completed, {} calls, {} readbacks ({} accepted), \
              {} conflicts, {} oracle, spacing {}/{}/{} rerouted/towed/held, closest {:.2} of the spacing, \
-             {} overlaps, {} go-arounds, runway {:.0} s over {} landings",
+             {} overlaps, {} go-arounds, runway {:.0} s over {} landings, \
+             final gap {:.1}/{:.1} nm min/median over {}",
             s.movements,
             s.completed,
             s.calls,
@@ -861,7 +906,10 @@ fn real_install_traffic_world_sweep_inner() {
             s.overlaps.len(),
             s.go_arounds,
             mean(&s.runway_s),
-            s.runway_s.len()
+            s.runway_s.len(),
+            min_median(&s.final_gap_nm).0,
+            min_median(&s.final_gap_nm).1,
+            s.final_gap_nm.len()
         );
         for line in s
             .conflicts
@@ -891,6 +939,7 @@ fn real_install_traffic_world_sweep_inner() {
         overlaps += s.overlaps.len();
         go_arounds += s.go_arounds;
         runway_s.extend(&s.runway_s);
+        final_gaps.extend(&s.final_gap_nm);
         closest = f64::min(closest, s.closest_share);
         spawned += s.movements;
         completed += s.completed;
@@ -900,10 +949,14 @@ fn real_install_traffic_world_sweep_inner() {
     println!(
         "swept {flown} fields: {spawned} movements, {completed} completed, {calls} calls, \
          no panic, {} dirty; {overlaps} overlaps, {go_arounds} go-arounds, closest taxiing \
-         pair {closest:.2} of its spacing; runway time {:.0} s over {} landings",
+         pair {closest:.2} of its spacing; runway time {:.0} s over {} landings; \
+         final gap {:.1}/{:.1} nm min/median over {}",
         dirty.len(),
         mean(&runway_s),
-        runway_s.len()
+        runway_s.len(),
+        min_median(&final_gaps).0,
+        min_median(&final_gaps).1,
+        final_gaps.len()
     );
     assert!(flown > 0);
     assert!(dirty.is_empty(), "fields with findings: {dirty:#?}");

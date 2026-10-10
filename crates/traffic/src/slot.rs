@@ -33,6 +33,7 @@ use crate::aircraft::{
 };
 use crate::field::{FieldModel, RunwayEnd};
 use crate::kin::{bearing, dist_m, follow, project_m, Follow, FollowSpec, Kin, LatLon, KT_TO_MS};
+use crate::perf::Wake;
 use crate::phase::{Leg, Phase, Plan};
 
 /// The gap between the one ahead reporting off the runway and the follower
@@ -110,6 +111,13 @@ pub struct RunwaySlot {
     /// circuit makes room for it (it extends its downwind), a straight-in
     /// does not (the tower threads it in ahead).
     pub waiting: bool,
+    /// Its wake turbulence category: the spacing an instrument arrival
+    /// behind it keeps on final ([`crate::arrival::wake_gap_nm`]).
+    pub wake: Wake,
+    /// Coming back round off a missed approach, not yet on the final: it
+    /// takes its place at the far end of the sequence
+    /// ([`crate::arrival`]'s spacing), and nobody slows for it until then.
+    pub rejoining: bool,
 }
 
 impl RunwaySlot {
@@ -244,6 +252,15 @@ impl TrafficAircraft {
         }
         let p = &self.route.path;
         let ms = |kts: f64| kts.max(40.0) * KT_TO_MS;
+        // An instrument arrival flies the radar unit's schedule by its
+        // distance to go; the next mile at the speed it holds now.
+        if self.instrument() {
+            let d = self.route.dist_to(self.kin.pos(), i);
+            let first = d.min(1852.0);
+            let sched = crate::arrival::scheduled_kts(self.perf, d);
+            let rest = crate::arrival::scheduled_time_s(self.perf, d - first);
+            return Some(first / ms(0.5 * (self.kin.gs_kts + sched)) + rest);
+        }
         let now = 0.5 * (self.kin.gs_kts + self.leg_kts(self.route.leg()));
         let mut t = dist_m(self.kin.pos(), p[seg + 1]) / ms(now);
         for k in seg + 1..i {
@@ -493,6 +510,8 @@ impl TrafficAircraft {
             }
         );
         let lead_s = self.clearance_lead_s();
+        let wake = self.wake;
+        let rejoining = self.missed && self.route.leg() == Leg::Inbound;
         // On the runway: seconds to off the strip and to the report; a
         // backtrack is seen leaving only once it is off the strip.
         let on_runway = |off_s: f64, done_s: f64, backtrack: bool| RunwaySlot {
@@ -504,6 +523,8 @@ impl TrafficAircraft {
             needs_clear_s: 0.0,
             committed: true,
             waiting: false,
+            wake,
+            rejoining,
         };
         match self.phase {
             Phase::Arrive | Phase::Pattern { .. } | Phase::Final => {
@@ -518,7 +539,7 @@ impl TrafficAircraft {
                 let to = self.time_to_thr_s()?;
                 let o = self.occupancy(field, end);
                 let committed = match self.phase {
-                    Phase::Arrive => straight_in,
+                    Phase::Arrive => straight_in || self.instrument(),
                     Phase::Pattern { leg } => leg == Leg::Base,
                     _ => true,
                 };
@@ -736,6 +757,8 @@ mod tests {
             needs_clear_s: 0.0,
             committed: true,
             waiting: false,
+            wake: Wake::Medium,
+            rejoining: false,
         }
     }
 
