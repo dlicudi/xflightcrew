@@ -3920,6 +3920,8 @@ fn lxgb() -> Station {
         tower_khz: 131200,
         approach_khz: Some(122800),
         departure_khz: None,
+        ground_khz: None,
+        delivery_khz: None,
         desk: StripDesk::new(),
         desks: std::collections::BTreeMap::new(),
         runway_in_use: None,
@@ -7762,9 +7764,38 @@ fn atc_world_sweep_every_towered_field_stands_up() {
         }
         let r = st.route_keyed("radio check", Service::Tower, &ctx, wx);
         check(r.contains("reading you five"), &format!("radio check: {r}"));
-        let r = st.route_keyed("request taxi", Service::Tower, &ctx, wx);
+        let gctx = tower::Ctx {
+            on_ground: true,
+            ..ctx.clone()
+        };
+        // The ground positions where the field publishes them (apt.dat
+        // 1052/1053): each answers in its own name, a call on the wrong
+        // one is sent on by name and frequency, and the taxi is Ground's.
+        let gnd = st.ground_service();
+        if gnd == Service::Ground {
+            let name = st.service_name(Service::Ground);
+            let r = st.route_keyed("radio check", Service::Ground, &gctx, wx);
+            check(r.contains(&format!("{name}, reading you five")), &format!("ground radio check: {r}"));
+            let r = st.route_keyed("request taxi", Service::Tower, &gctx, wx);
+            check(
+                r.contains(&format!("contact {name} on ")) && !r.contains("holding point"),
+                &format!("taxi on the tower: {r}"),
+            );
+        }
+        if st.delivery_khz.is_some() {
+            let r = st.route_keyed("request taxi", Service::Delivery, &gctx, wx);
+            check(r.contains("contact "), &format!("taxi on delivery: {r}"));
+        }
+        let r = st.route_keyed("request taxi", gnd, &gctx, wx);
         check(r.contains("taxi to holding point"), &format!("taxi: {r}"));
-        let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
+        if gnd == Service::Ground {
+            let r = st.route_keyed("ready for departure", Service::Ground, &gctx, wx);
+            check(
+                r.contains(&format!("contact {} on ", st.service_name(Service::Tower))),
+                &format!("ready on ground: {r}"),
+            );
+        }
+        let r = st.route_keyed("ready for departure", Service::Tower, &gctx, wx);
         check(r.contains("cleared for takeoff"), &format!("takeoff: {r}"));
         if !ctx.runway.is_empty() {
             check(
@@ -7778,6 +7809,8 @@ fn atc_world_sweep_every_towered_field_stands_up() {
         check(!r.is_empty(), "vectors: empty reply");
 
         // Statics must not leak between airports (or into other tests).
+        *OWN_STRIP.position_handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OWN_STRIP.working.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *OWN_STRIP.handoff.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *OWN_STRIP.vectors.lock().unwrap_or_else(|e| e.into_inner()) = None;
     })
@@ -8429,13 +8462,17 @@ fn the_ifr_clearance_and_the_taxi_name_one_runway_at_egkk() {
 
     // The clearance names 26L and 26L's SID.
     let ctx = ctx_now(&mut st);
+    // EGKK's clearance is Gatwick Delivery's (apt.dat 1052): asked of the
+    // Tower, the pilot is sent there.
     let r = st.route_keyed("request ifr clearance to egbb", Service::Tower, &ctx, wx);
+    assert!(r.contains("contact Gatwick Delivery on one two one decimal niner five five"), "{r}");
+    let r = st.route_keyed("request ifr clearance to egbb", Service::Delivery, &ctx, wx);
     assert!(r.contains("runway two six left"), "{r}");
     assert!(r.contains("Mike departure"), "LAM6M off 26L: {r}");
     assert!(!r.contains("Victor"), "{r}");
     let r = st.route_keyed(
         &format!("cleared to birmingham via the lam six mike departure, runway two six left, climb five thousand feet, squawk {}, {cs}", atis::spoken_digits(&format!("{:04}", st.desk.assigned_squawk.unwrap()))),
-        Service::Tower,
+        Service::Delivery,
         &ctx,
         wx,
     );

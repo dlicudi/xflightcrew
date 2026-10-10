@@ -277,6 +277,7 @@ pub(super) struct FieldFacts {
     active_field: Option<(String, f64, f64)>,
     active_icao: Option<String>,
     controller_freqs: Vec<(i64, StationSpeaker)>,
+    position_names: Vec<(StationSpeaker, String)>,
     active_panel: Option<ActivePanel>,
     active_runways: Vec<nav::Runway>,
     atis: Option<AtisState>,
@@ -290,6 +291,7 @@ impl FieldFacts {
         "ACTIVE_FIELD",
         "ACTIVE_ICAO",
         "CONTROLLER_FREQS",
+        "POSITION_NAMES",
         "ACTIVE_PANEL",
         "ACTIVE_RUNWAYS",
         "ATIS",
@@ -302,6 +304,7 @@ impl FieldFacts {
             active_field: None,
             active_icao: None,
             controller_freqs: Vec::new(),
+            position_names: Vec::new(),
             active_panel: None,
             active_runways: Vec::new(),
             atis: None,
@@ -320,6 +323,12 @@ impl FieldFacts {
         }
         if let Some(k) = st.departure_khz {
             controller_freqs.push((k, StationSpeaker::Departure));
+        }
+        if let Some(k) = st.ground_khz {
+            controller_freqs.push((k, StationSpeaker::Ground));
+        }
+        if let Some(k) = st.delivery_khz {
+            controller_freqs.push((k, StationSpeaker::Delivery));
         }
         let atis = st.apt.freq(nav::FREQ_ATIS).map(|f| {
             tracing::info!(
@@ -342,6 +351,7 @@ impl FieldFacts {
                 .map(|(lat, lon)| (st.apt.name.clone(), lat, lon)),
             active_icao: st.procedures.as_ref().map(|(_, icao)| icao.clone()),
             controller_freqs,
+            position_names: st.position_names(),
             active_panel: Some((st.apt.name.clone(), st.apt.elev_ft, services(&st.apt))),
             active_runways: st.apt.runways.clone(),
             atis,
@@ -363,6 +373,7 @@ impl FieldFacts {
             active_field,
             active_icao,
             controller_freqs,
+            position_names,
             active_panel,
             active_runways,
             atis,
@@ -371,6 +382,7 @@ impl FieldFacts {
         *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = active_field;
         *ACTIVE_ICAO.lock().unwrap_or_else(|e| e.into_inner()) = active_icao;
         *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = controller_freqs;
+        *POSITION_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = position_names;
         *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) = active_panel;
         *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = active_runways;
         *ATIS.lock().unwrap_or_else(|e| e.into_inner()) = atis;
@@ -611,6 +623,12 @@ mod tests {
             "APPROACH_WATCH",
             "APPROACH_READBACK",
             "ARRIVAL_HANDOFF",
+            // New with the aerodrome positions (2026-10-10): the position
+            // working the flight, a handoff owed the crew and Ground's push
+            // approval, strip `facts` cells.
+            "WORKING",
+            "POSITION_HANDOFF",
+            "PUSH_APPROVED",
         ];
         let station_flight = [
             "SQUAWK_WATCH",

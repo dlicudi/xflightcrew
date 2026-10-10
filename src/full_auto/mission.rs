@@ -696,10 +696,13 @@ pub(super) async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, 
                 );
                 event("stale_taxi_route", json!({ "arrival": arrival }));
             }
-            // Tune COM1 to the tower first — the request goes nowhere if we're
-            // off frequency (the crew radio only reaches the tuned station).
-            if let Some(khz) = crate::party_line::home_tower_khz() {
-                let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+            // Tune COM1 to GROUND first (the tower at a field without one) —
+            // the request goes nowhere if we're off frequency (the crew radio
+            // only reaches the tuned station). A handoff owed (Delivery's
+            // "contact Ground") is read back and obeyed on the way.
+            let ground_khz = crate::party_line::home_ground_khz();
+            crate::crew_radio::work_position(&xp, &callsign, ground_khz).await;
+            if let Some(khz) = ground_khz {
                 event("tuned_tower", json!({ "khz": khz }));
             }
             // The planned departure's runway, asked for (the tower honours it
@@ -849,6 +852,9 @@ pub(super) async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, 
                             "Nose in here, so pushback first.",
                         ]),
                     );
+                    // Ground's word first, where the field has a Ground
+                    // (the radio call only; the push below is today's).
+                    request_push(&xp, &callsign).await;
                     event(
                         "pushback",
                         json!({ "back_m": plan.back_m, "target_hdg": plan.target_hdg }),
@@ -1157,6 +1163,10 @@ pub(super) async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, 
         // crew-radio drain (with the tower's reply), so we only transmit here.
         let atc_running = crate::party_line::clearance_state().is_some();
         if atc_running {
+            // The ready call is the TOWER's: Ground's "contact Tower" at the
+            // hold is read back and obeyed, else the tower is tuned.
+            crate::crew_radio::work_position(&xp, &callsign, crate::party_line::home_tower_khz())
+                .await;
             request_departure(&callsign, None).await;
             bail_if_abort!();
         }

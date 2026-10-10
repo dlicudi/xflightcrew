@@ -81,6 +81,9 @@ pub(crate) struct Transmission {
     pub(crate) text: String,
     /// A safety call ([`is_safety_call`]): keyed without waiting its turn.
     pub(crate) safety: bool,
+    /// The position whose frequency it is keyed on, as the outbox paces
+    /// it ([`Link::channel`]).
+    pub(crate) on: crate::voice::StationSpeaker,
 }
 
 /// No more than one traffic transmission is STARTED per this many seconds
@@ -99,28 +102,51 @@ pub(crate) fn is_safety_call(call: &Call) -> bool {
     }
 }
 
-/// The traffic's calls not yet keyed on the one frequency (the tower's), in
-/// the order made. Pure: the link feeds it the fleet's calls and keys what
-/// [`Outbox::due`] hands back.
+/// The traffic's calls not yet keyed, each on its position's frequency
+/// (the tower's, Ground's, the approach unit's), in the order made, PACED
+/// PER FREQUENCY: Ground's push and taxi calls never wait on the Tower's
+/// landing traffic, as two frequencies never do. Pure: the link feeds it
+/// the fleet's calls and keys what [`Outbox::due`] hands back.
 #[derive(Debug, Default)]
 pub(crate) struct Outbox {
-    queue: VecDeque<(u32, Call)>,
-    /// Fleet seconds the last transmission started.
-    last_keyed_s: Option<f64>,
+    queue: VecDeque<(u32, Call, crate::voice::StationSpeaker)>,
+    /// Fleet seconds the last transmission started, per frequency.
+    last_keyed_s: Vec<(crate::voice::StationSpeaker, f64)>,
 }
 
 impl Outbox {
-    /// Queue a call. The same call from the same flight already waiting is
-    /// not queued twice (a crossing asked again while its first ask waits).
+    /// Queue a call on the tower's frequency.
+    #[cfg(test)]
     pub(crate) fn push(&mut self, id: u32, call: Call) {
-        if !self.queue.iter().any(|(i, c)| *i == id && *c == call) {
-            self.queue.push_back((id, call));
+        self.push_on(id, call, crate::voice::StationSpeaker::Tower);
+    }
+
+    /// Queue a call on position `on`'s frequency. The same call from the
+    /// same flight already waiting is not queued twice (a crossing asked
+    /// again while its first ask waits).
+    pub(crate) fn push_on(&mut self, id: u32, call: Call, on: crate::voice::StationSpeaker) {
+        if !self.queue.iter().any(|(i, c, _)| *i == id && *c == call) {
+            self.queue.push_back((id, call, on));
         }
     }
 
     /// A flight left: its waiting calls go with it.
     pub(crate) fn forget(&mut self, id: u32) {
-        self.queue.retain(|(i, _)| *i != id);
+        self.queue.retain(|(i, _, _)| *i != id);
+    }
+
+    fn last_on(&self, on: crate::voice::StationSpeaker) -> Option<f64> {
+        self.last_keyed_s
+            .iter()
+            .find(|(s, _)| *s == on)
+            .map(|(_, t)| *t)
+    }
+
+    fn keyed_on(&mut self, on: crate::voice::StationSpeaker, now_s: f64) {
+        match self.last_keyed_s.iter_mut().find(|(s, _)| *s == on) {
+            Some(e) => e.1 = now_s,
+            None => self.last_keyed_s.push((on, now_s)),
+        }
     }
 
     /// Calls waiting.
@@ -130,11 +156,17 @@ impl Outbox {
     }
 
     /// What to key now, at fleet second `now_s`: every safety call at once,
-    /// then at most ONE other, once [`CALL_GAP_S`] has run since the last
-    /// transmission started (a readback first: it completes a clearance
-    /// the flight is waiting on; else the oldest).
+    /// then on each frequency at most ONE other, once [`CALL_GAP_S`] has
+    /// run since the last transmission on it started (a readback first: it
+    /// completes a clearance the flight is waiting on; else the oldest).
+    #[cfg(test)]
     pub(crate) fn due(&mut self, now_s: f64) -> Vec<(u32, Call)> {
-        let mut out: Vec<(u32, Call)> = Vec::new();
+        self.due_on(now_s).into_iter().map(|(i, c, _)| (i, c)).collect()
+    }
+
+    /// [`Outbox::due`] with the frequency each call is keyed on.
+    pub(crate) fn due_on(&mut self, now_s: f64) -> Vec<(u32, Call, crate::voice::StationSpeaker)> {
+        let mut out = Vec::new();
         let mut i = 0;
         while i < self.queue.len() {
             if is_safety_call(&self.queue[i].1) {
@@ -143,21 +175,40 @@ impl Outbox {
                 i += 1;
             }
         }
-        if !out.is_empty() {
-            self.last_keyed_s = Some(now_s);
+        let mut busy: Vec<crate::voice::StationSpeaker> = Vec::new();
+        for (_, _, on) in &out {
+            if !busy.contains(on) {
+                busy.push(*on);
+            }
         }
-        let free = self
-            .last_keyed_s
-            .is_none_or(|t| now_s - t >= CALL_GAP_S - 1e-9);
-        if free && out.is_empty() {
+        for on in &busy {
+            self.keyed_on(*on, now_s);
+        }
+        let mut channels: Vec<crate::voice::StationSpeaker> = Vec::new();
+        for (_, _, on) in &self.queue {
+            if !channels.contains(on) {
+                channels.push(*on);
+            }
+        }
+        for on in channels {
+            if busy.contains(&on) {
+                continue;
+            }
+            let free = self
+                .last_on(on)
+                .is_none_or(|t| now_s - t >= CALL_GAP_S - 1e-9);
+            if !free {
+                continue;
+            }
+            let mine = |c: &(u32, Call, crate::voice::StationSpeaker)| c.2 == on;
             let next = self
                 .queue
                 .iter()
-                .position(|(_, c)| matches!(c, Call::Readback(_)))
-                .unwrap_or(0);
-            if let Some(call) = self.queue.remove(next) {
+                .position(|c| mine(c) && matches!(c.1, Call::Readback(_)))
+                .or_else(|| self.queue.iter().position(mine));
+            if let Some(call) = next.and_then(|k| self.queue.remove(k)) {
                 out.push(call);
-                self.last_keyed_s = Some(now_s);
+                self.keyed_on(on, now_s);
             }
         }
         out
@@ -170,6 +221,10 @@ pub(crate) struct TickOut {
     /// The tower's lines from the traffic flights' runway watches
     /// (`world::traffic_tick`), in order: said in the tower's voice.
     pub(crate) tower: Vec<(u32, String)>,
+    /// The aerodrome positions' handoffs (`world::traffic_position_tick`):
+    /// Ground's to the Tower at the hold, the Tower's to Ground on the
+    /// rollout, each with the position that says it.
+    pub(crate) positions: Vec<(u32, String, crate::voice::StationSpeaker)>,
     /// What the traffic keyed this tick (posted to the station already).
     pub(crate) transmissions: Vec<Transmission>,
     /// The fleet's events, for the blackbox.
@@ -223,6 +278,10 @@ pub(crate) struct Link {
     seen_orders: HashMap<u32, (TowerState, Option<String>)>,
     /// The frequency's calls waiting their turn ([`CALL_GAP_S`]).
     outbox: Outbox,
+    /// The field publishes a Ground position of its own (apt.dat 1053 on
+    /// a frequency apart from the tower's): the push, the taxi out and the
+    /// taxi in are paced on Ground's frequency.
+    has_ground: bool,
     /// The field's parked aircraft ([`traffic::park_at_start`]), put on
     /// their stands at the first tick, where our own position is known.
     to_park: Vec<Movement>,
@@ -271,10 +330,19 @@ impl Link {
             })
             .collect();
         due.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+        let has_ground = match (
+            field.airport.freq(crate::nav::FREQ_GROUND),
+            field.airport.freq(crate::nav::FREQ_TOWER),
+        ) {
+            (Some(g), Some(t)) => (g.khz - t.khz).abs() > 5,
+            (Some(_), None) => true,
+            _ => false,
+        };
         // An arrival that parks stays and flies again (`Fleet::turn_round`).
         let mut fleet = Fleet::new(field);
         fleet.turn_round = true;
         Link {
+            has_ground,
             fleet,
             due,
             next_id: 1,
@@ -417,7 +485,8 @@ impl Link {
                     if *call == Call::GoingAround && ordered {
                         continue;
                     }
-                    self.outbox.push(*id, call.clone());
+                    let on = self.channel(*id, call);
+                    self.outbox.push_on(*id, call.clone(), on);
                 }
                 // A flight turned round on its stand is over: its strip
                 // retires; the airframe stays, dormant, for its next flight.
@@ -430,7 +499,7 @@ impl Link {
         }
         // The frequency: what is due keys now, from where the flight is as
         // it keys (the rest waits its turn, `CALL_GAP_S`).
-        for (id, call) in self.outbox.due(self.fleet.clock.now_s()) {
+        for (id, call, on) in self.outbox.due_on(self.fleet.clock.now_s()) {
             let Some(ac) = self.fleet.get(id) else {
                 continue;
             };
@@ -450,6 +519,7 @@ impl Link {
                 callsign: ac.callsign.clone(),
                 text,
                 safety: is_safety_call(&call),
+                on,
             });
         }
         // The runway watch in landing order, the nearest the threshold
@@ -473,6 +543,9 @@ impl Link {
             let picture = self.picture_for(ac.id, own);
             for line in crate::world::traffic_tick(ac.id, &picture, now) {
                 out.tower.push((ac.id, line));
+            }
+            if let Some((line, who)) = crate::world::traffic_position_tick(ac.id) {
+                out.positions.push((ac.id, line, who));
             }
         }
         out.events = events;
@@ -551,11 +624,50 @@ impl Link {
         }
         if let Some(rest) = text.strip_prefix("Tower, ") {
             format!("{} Tower, {rest}", self.tower_name)
+        } else if let Some(rest) = text.strip_prefix("Ground, ") {
+            format!("{} Ground, {rest}", self.tower_name)
         } else if let Some(rest) = text.strip_prefix("Approach, ") {
             format!("{} Approach, {rest}", self.tower_name)
         } else {
             text
         }
+    }
+
+    /// The frequency a call is keyed on, for its pacing: the approach
+    /// unit's for an instrument arrival's calls; a readback (or its "say
+    /// again") on the position working the flight, which gave the
+    /// instruction; Ground's for the push, the taxi out and the taxi in and
+    /// a crossing of a runway not in use, where the field has Ground; else
+    /// the Tower's. The station routes each call to the position that owns
+    /// it (`Station::owner`); this mirrors it so the pacing is per
+    /// frequency, the speech is the station's (`overhear_replies`).
+    fn channel(&self, id: u32, call: &Call) -> crate::voice::StationSpeaker {
+        use crate::voice::StationSpeaker as P;
+        if call.to_approach() {
+            return P::Approach;
+        }
+        if matches!(call, Call::Readback(_) | Call::SayAgain) {
+            return match crate::world::traffic_working(id) {
+                Some(P::Ground | P::Delivery) => P::Ground,
+                _ => P::Tower,
+            };
+        }
+        if !self.has_ground {
+            return P::Tower;
+        }
+        if call.to_ground() {
+            return P::Ground;
+        }
+        if let Call::RequestCrossing { runway } = call {
+            let field = &self.fleet.field;
+            let in_use = self.tower_runway.clone().or_else(station_runway);
+            let same = match (field.strip(runway), in_use.as_deref().and_then(|r| field.strip(r))) {
+                (Some(a), Some(b)) => std::ptr::eq(a, b),
+                _ => false,
+            };
+            return if same { P::Tower } else { P::Ground };
+        }
+        P::Tower
     }
 
     /// What traffic flight `id` sees round it: every other traffic flight,
@@ -724,22 +836,32 @@ fn with_telephony(mut m: Movement) -> Movement {
 /// The command loop's half: the traffic desks synced with what the ticks
 /// said, then every posted traffic call answered on its own desk, in
 /// order. A reply with an empty line is an accepted readback.
-/// Each reply comes with the moment its call was keyed.
-pub(crate) fn drain_calls(station: &mut Station) -> Vec<(Instant, TrafficReply)> {
+/// Each reply comes with the moment its call was keyed and the caller's
+/// spoken callsign (its ghost voice).
+pub(crate) fn drain_calls(station: &mut Station) -> Vec<(Instant, String, TrafficReply)> {
     station.sync_traffic_desks();
     crate::world::take_traffic_calls()
         .iter()
-        .map(|c| (c.state.at, station.answer_traffic(c)))
+        .map(|c| (c.state.at, c.spoken.clone(), station.answer_traffic(c)))
         .collect()
 }
 
-/// The tower's answers to our traffic, onto the frequency in its own voice,
-/// each just after the call it answers (an accepted readback says nothing).
-pub(crate) fn overhear_replies(voice: &crate::voice::Voice, replies: Vec<(Instant, TrafficReply)>) {
-    for (keyed, reply) in replies {
+/// Our traffic's exchanges onto the frequency of the position that heard
+/// each (Ground's taxi chatter on Ground's, never on the Tower's: the
+/// ONE-frequency rule): the call in the flight's own ghost voice as it
+/// was keyed, the answer in the position's voice just after it (an
+/// accepted readback says nothing).
+pub(crate) fn overhear_replies(
+    voice: &crate::voice::Voice,
+    replies: Vec<(Instant, String, TrafficReply)>,
+) {
+    for (keyed, spoken, reply) in replies {
+        let seed = crate::voice::station_voice_seed(&spoken);
+        let on = reply.speaker;
+        voice.overhear_on(on, crate::voice::StationSpeaker::Ghost { seed }, &reply.call, keyed);
         if !reply.line.is_empty() {
             let made = keyed + std::time::Duration::from_millis(1);
-            voice.overhear(reply.speaker, reply.line, made);
+            voice.overhear_on(on, reply.speaker, reply.line, made);
         }
     }
 }
@@ -775,6 +897,8 @@ pub(crate) fn map_order(o: &TrafficOrder) -> Order {
         go_around: o.go_around,
         readback_owed: o.readback_owed.clone(),
         cross_cleared: o.crossing.clone(),
+        push_approved: o.push.is_some(),
+        push_facing: o.push.flatten(),
     }
 }
 
@@ -990,14 +1114,15 @@ impl TrafficWorld {
             sink.publish(link.fleet().aircraft(), self.last_sim_s.unwrap_or(0.0));
         }
         record(&out, link);
-        // The frequency: each call in its flight's own ghost voice, the
-        // tower's runway-watch lines in the tower's.
-        for t in &out.transmissions {
-            let seed = crate::voice::station_voice_seed(&t.callsign);
-            voice.overhear(crate::voice::StationSpeaker::Ghost { seed }, &t.text, now);
-        }
+        // The frequencies: the tower's runway-watch lines in the tower's
+        // voice, the positions' handoffs in theirs, each on its own
+        // frequency. The calls themselves are said with their answers, on
+        // the position that heard them (`overhear_replies`).
         for (_, line) in &out.tower {
             voice.overhear(crate::voice::StationSpeaker::Tower, line, now);
+        }
+        for (_, line, who) in &out.positions {
+            voice.overhear_on(*who, *who, line, now);
         }
         Some(out)
     }
@@ -1284,7 +1409,8 @@ fn record(out: &TickOut, link: &Link) {
     for t in &out.transmissions {
         crate::blackbox::record(
             "traffic",
-            serde_json::json!({ "event": "call", "id": t.id, "callsign": t.callsign, "text": t.text }),
+            serde_json::json!({ "event": "call", "id": t.id, "callsign": t.callsign, "text": t.text,
+                "on": t.on.tag() }),
         );
     }
     for (id, state, runway) in &out.orders {
@@ -1299,6 +1425,12 @@ fn record(out: &TickOut, link: &Link) {
         crate::blackbox::record(
             "traffic",
             serde_json::json!({ "event": "tower", "id": id, "line": line }),
+        );
+    }
+    for (id, line, who) in &out.positions {
+        crate::blackbox::record(
+            "traffic",
+            serde_json::json!({ "event": "handoff", "id": id, "line": line, "by": who.tag() }),
         );
     }
 }

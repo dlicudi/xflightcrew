@@ -43,6 +43,10 @@ enum Service {
     Tower,
     Approach,
     Departure,
+    /// Ground movement (apt.dat 1053): push and start, taxi out, taxi in.
+    Ground,
+    /// Clearance delivery (apt.dat 1052): the departure clearance.
+    Delivery,
 }
 
 impl Service {
@@ -52,6 +56,20 @@ impl Service {
             Service::Tower => StationSpeaker::Tower,
             Service::Approach => StationSpeaker::Approach,
             Service::Departure => StationSpeaker::Departure,
+            Service::Ground => StationSpeaker::Ground,
+            Service::Delivery => StationSpeaker::Delivery,
+        }
+    }
+
+    /// The position a speaker is, back again (a strip's `working` cell).
+    fn of_speaker(s: StationSpeaker) -> Option<Service> {
+        match s {
+            StationSpeaker::Tower => Some(Service::Tower),
+            StationSpeaker::Approach => Some(Service::Approach),
+            StationSpeaker::Departure => Some(Service::Departure),
+            StationSpeaker::Ground => Some(Service::Ground),
+            StationSpeaker::Delivery => Some(Service::Delivery),
+            _ => None,
         }
     }
 
@@ -61,7 +79,16 @@ impl Service {
             Service::Tower => "tower",
             Service::Approach => "approach",
             Service::Departure => "departure",
+            Service::Ground => "ground",
+            Service::Delivery => "delivery",
         }
+    }
+
+    /// One of the AERODROME positions (tower, ground, delivery): views of
+    /// the one desk that works the flight on the field, its tower FSM and
+    /// worksheet shared, so a strip moves between them with its handoffs.
+    fn aerodrome(self) -> bool {
+        matches!(self, Service::Tower | Service::Ground | Service::Delivery)
     }
 }
 
@@ -82,6 +109,13 @@ pub struct Station {
     /// The departure frequency (row 1056) — where the tower sends you after
     /// takeoff.
     departure_khz: Option<i64>,
+    /// The ground movement frequency (row 1053): push and start, taxi out
+    /// to the holding point, taxi in from the runway ([`Station::owner`]).
+    /// `None`: the tower does it all, as before.
+    ground_khz: Option<i64>,
+    /// Clearance delivery (row 1052): the departure clearances. `None`:
+    /// Ground gives them, or without Ground the tower.
+    delivery_khz: Option<i64>,
     /// The strip on frequency: our flight's desk half (the worksheet the
     /// tower keeps for the aircraft it is talking to). A traffic flight's
     /// desk is swapped in only for the synchronous answer to its call
@@ -267,6 +301,12 @@ struct CallScratch {
     /// judged clear: the reply that clears it notes it on the strip
     /// ([`crate::party_line::FlightStrip::crossing`]).
     crossing_ident: Option<String>,
+    /// A push request asked to start too ("request push and start").
+    push_start: bool,
+    /// The way a push request's aircraft will face once pushed, degrees
+    /// true, read off its stand's lane and its route on (`ctx_for_call`,
+    /// [`push_facing_deg`]); `None` with no lane drawn.
+    push_facing: Option<f64>,
 }
 
 impl StripDesk {
@@ -389,10 +429,27 @@ impl Station {
                 "departure on frequency (handoff after takeoff)"
             );
         }
+        // The ground positions, where the field publishes them, and only
+        // on a frequency of their own: a row sharing the tower's channel
+        // is the tower working them (the tower is resolved first anyway).
+        let own = |k: i64| (k - twr_row.khz).abs() > 5;
+        let ground_khz = apt.freq(nav::FREQ_GROUND).map(|f| f.khz).filter(|k| own(*k));
+        let delivery_khz = apt
+            .freq(nav::FREQ_CLEARANCE)
+            .map(|f| f.khz)
+            .filter(|k| own(*k) && ground_khz.is_none_or(|g| (k - g).abs() > 5));
+        if let Some(k) = ground_khz {
+            tracing::info!(mhz = k as f64 / 1000.0, "ground on frequency (push, taxi)");
+        }
+        if let Some(k) = delivery_khz {
+            tracing::info!(mhz = k as f64 / 1000.0, "delivery on frequency (clearances)");
+        }
         Some(Station {
             tower_khz: twr_row.khz,
             approach_khz,
             departure_khz,
+            ground_khz,
+            delivery_khz,
             apt,
             desk: StripDesk::new(),
             desks: std::collections::BTreeMap::new(),
@@ -474,6 +531,7 @@ mod ctx;
 mod ifr;
 mod new_flight;
 mod party_chatter;
+mod positions;
 mod radar;
 mod region;
 mod respond;
@@ -499,6 +557,7 @@ pub(crate) use ifr::*;
 pub(crate) use respond::instrument_arrival;
 pub use new_flight::*;
 pub use party_chatter::*;
+pub use positions::*;
 pub use radar::*;
 pub use region::*;
 pub use routing::*;
@@ -531,3 +590,6 @@ mod traffic_tests;
 
 #[cfg(test)]
 mod arrival_tests;
+
+#[cfg(test)]
+mod positions_tests;

@@ -187,7 +187,7 @@ pub(crate) fn note_intercom(text: &str, cabin: bool) {
 pub(crate) fn note_station(text: &str, speaker: crate::voice::StationSpeaker, overheard: bool) {
     use crate::voice::StationSpeaker as S;
     let who = match speaker {
-        S::Tower | S::Approach | S::Departure => Who::Atc,
+        S::Tower | S::Approach | S::Departure | S::Ground | S::Delivery => Who::Atc,
         S::Atis => Who::Atis,
         S::Ghost { .. } => Who::Traffic,
     };

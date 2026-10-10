@@ -13,6 +13,11 @@ pub enum StationSpeaker {
     Tower,
     Approach,
     Departure,
+    /// The ground movement controller (apt.dat row 1053): push, start, taxi
+    /// out and taxi in.
+    Ground,
+    /// Clearance delivery (row 1052): the departure clearance.
+    Delivery,
     /// The ATIS broadcast — the looped recording on its own frequency.
     Atis,
     /// A GHOST pilot on the party line — live traffic given a voice. The
@@ -23,8 +28,11 @@ pub enum StationSpeaker {
     },
 }
 
+/// How many warm-session chairs [`StationSpeaker::slot`] fills.
+pub const SLOTS: usize = 7;
+
 impl StationSpeaker {
-    /// Stable position index 0..=4 — the warm-session chair this position
+    /// Stable position index 0..=6 — the warm-session chair this position
     /// occupies on the copilot side (all ghosts share one chair: the cache is
     /// keyed by model name, so a different ghost voice rebuilds it).
     pub fn slot(self) -> usize {
@@ -34,6 +42,8 @@ impl StationSpeaker {
             StationSpeaker::Departure => 2,
             StationSpeaker::Atis => 3,
             StationSpeaker::Ghost { .. } => 4,
+            StationSpeaker::Ground => 5,
+            StationSpeaker::Delivery => 6,
         }
     }
 
@@ -47,6 +57,8 @@ impl StationSpeaker {
             StationSpeaker::Departure => "DEP",
             StationSpeaker::Atis => "ATIS",
             StationSpeaker::Ghost { .. } => "TFC",
+            StationSpeaker::Ground => "GND",
+            StationSpeaker::Delivery => "DEL",
         }
     }
 }

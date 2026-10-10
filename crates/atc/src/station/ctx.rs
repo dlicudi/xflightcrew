@@ -266,6 +266,20 @@ impl Station {
                 } else {
                     plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
                 };
+                // A push is approved with the way it will leave the nose:
+                // off the stand's drawn lane, toward the route on.
+                if intent == tower::Intent::RequestPushback {
+                    self.desk.call.push_facing = match (taxi_net(), state.psi_deg) {
+                        (Some(net), Some(psi)) => push_facing_deg(
+                            &net,
+                            lat,
+                            lon,
+                            psi,
+                            self.desk.planned_route.as_ref().map(|r| r.path.as_slice()),
+                        ),
+                        _ => None,
+                    };
+                }
             }
         }
         let mut ctx = self.make_ctx(

@@ -66,7 +66,12 @@ pub struct TrafficReply {
     /// What the tower says; empty = an accepted readback (the frequency
     /// stays quiet).
     pub line: String,
+    /// The position that heard the call and answers it: its voice, and
+    /// the frequency both lines were said on.
     pub speaker: StationSpeaker,
+    /// The call as keyed, addressed to the position that heard it ("Gatwick
+    /// Ground, Speedbird one two three, request push and start").
+    pub call: String,
 }
 
 /// The traffic calls posted from the monitor's tick, for the command loop
@@ -158,24 +163,33 @@ impl Station {
         // The tower addresses the flight by its TELEPHONY: a callsign that
         // came in raw ("RYR4521") is expanded, never read out as letters.
         let spoken = crate::callsign::spoken_if_raw(&call.spoken);
+        let approach = call.approach && self.approach_khz.is_some();
+        // The aerodrome position the call is FOR: the one that owns it
+        // (`Station::owner`: the push and the taxi Ground's, the takeoff
+        // the Tower's), else the one working the flight (a readback goes
+        // back to the frequency that gave the instruction), else the Tower.
+        // Our traffic always calls the right frequency.
         let built = self.with_desk(id, |st| {
             st.note_stated_runway(&call.text, intent.clone());
             let before = st.desk.twr.state;
             let (ctx, wx) = st.traffic_ctx(&call.state, &spoken, intent.clone(), &call.picture);
-            (ctx, wx, before)
+            let service = if approach {
+                Service::Approach
+            } else {
+                st.owner(&intent, &ctx)
+                    .or_else(|| st.working().filter(|w| w.aerodrome()))
+                    .unwrap_or(Service::Tower)
+            };
+            (ctx, wx, before, service)
         });
-        let service = if call.approach && self.approach_khz.is_some() {
-            Service::Approach
-        } else {
-            Service::Tower
-        };
-        let line = built.and_then(|(ctx, wx, before)| {
+        let service = built.as_ref().map_or(Service::Tower, |b| b.3);
+        let line = built.and_then(|(ctx, wx, before, service)| {
             let line = match service {
                 Service::Approach => {
                     let intent = intent.clone();
                     self.with_desk(id, |st| st.traffic_approach_reply(intent, &ctx, wx))?
                 }
-                _ => self.respond_for(id, &call.text, Service::Tower, &ctx, wx)?,
+                _ => self.respond_for(id, &call.text, service, &ctx, wx)?,
             };
             let after = self
                 .desks
@@ -197,7 +211,22 @@ impl Station {
             id: call.id,
             line: line.unwrap_or_default(),
             speaker: service.speaker(),
+            call: self.addressed_to(&call.text, service),
         }
+    }
+
+    /// A traffic call's words addressed to the position that heard it: an
+    /// opening "<field> Tower, " (as the fleet addresses every call it
+    /// opens with a station) becomes "<that position's name>, ". Words
+    /// with no station in front are said as they are.
+    pub(super) fn addressed_to(&self, text: &str, service: Service) -> String {
+        let field = self.apt.radio_name();
+        for word in ["Tower", "Approach", "Ground", "Delivery"] {
+            if let Some(rest) = text.strip_prefix(&format!("{field} {word}, ")) {
+                return format!("{}, {rest}", self.service_name(service));
+            }
+        }
+        text.to_string()
     }
 
     /// The approach unit's answer to a traffic flight's call: an instrument
@@ -408,6 +437,9 @@ pub struct TrafficOrder {
     /// The runway END the flight is cleared to cross ("13"), from the
     /// clearance until it is seen off that strip again; `None` otherwise.
     pub crossing: Option<String>,
+    /// Ground approved the push: `Some(facing)`, the nose's way once pushed
+    /// (degrees true, `None` inside with none given); `None` until then.
+    pub push: Option<Option<f64>>,
 }
 
 /// How the acknowledgement a go-around order owes begins
@@ -471,6 +503,10 @@ pub fn traffic_order(id: u32) -> Option<TrafficOrder> {
             .as_deref()
             .is_some_and(|r| r.starts_with(GO_AROUND_READBACK));
     let (taxi_path, holding_point) = route.unwrap_or_default();
+    let push = *strip
+        .push_approved
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     Some(TrafficOrder {
         state: clr.as_ref().map_or(tower::State::Parked, |c| c.0),
         runway: clr.map(|c| c.1).unwrap_or_default(),
@@ -484,6 +520,7 @@ pub fn traffic_order(id: u32) -> Option<TrafficOrder> {
         go_around,
         readback_owed,
         crossing,
+        push,
     })
 }
 

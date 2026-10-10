@@ -256,6 +256,41 @@ impl AirportInfo {
                 .to_string()
         })
     }
+
+    /// The name a GROUND position keys ([`FREQ_GROUND`], [`FREQ_CLEARANCE`]),
+    /// from the row's own stem as [`AirportInfo::radio_name`] reads the
+    /// tower's: EGKK's rows are "Gatwick Delivery" and "Gatwick Ground", so
+    /// the positions are "Gatwick Delivery" and "Gatwick Ground". A row that
+    /// is only a label ("GND", "CLNC DEL", "KSFO Ground") falls back to the
+    /// radio name and the position's own word (`fallback`, "Ground",
+    /// "Delivery"). A Delivery row keyed "Clearance" ("San Francisco
+    /// Clearance", the FAA's name for it) keeps that word. `None` when the
+    /// field publishes no row of `kind`.
+    pub fn position_name(&self, kind: u32, fallback: &str) -> Option<String> {
+        let row = self.freq(kind)?;
+        let keys: &[&str] = if kind == FREQ_CLEARANCE {
+            &["delivery", "clearance"]
+        } else {
+            &["ground"]
+        };
+        let words: Vec<&str> = row.name.split_whitespace().collect();
+        let named = words.iter().enumerate().find_map(|(at, w)| {
+            let key = keys.iter().find(|k| w.eq_ignore_ascii_case(k))?;
+            let stem = &words[..at];
+            let ok = !stem.is_empty()
+                && stem.iter().all(|w| {
+                    w.chars()
+                        .all(|c| c.is_alphabetic() || c == '\'' || c == '-')
+                })
+                && !stem
+                    .iter()
+                    .all(|w| w.len() <= 4 && w.chars().all(|c| c.is_ascii_uppercase()));
+            let mut word = key.to_string();
+            word[..1].make_ascii_uppercase();
+            ok.then(|| format!("{} {word}", stem.join(" ")))
+        });
+        Some(named.unwrap_or_else(|| format!("{} {fallback}", self.radio_name())))
+    }
 }
 
 /// The runways `icao` actually has, from X-Plane's Global Airports `apt.dat`.

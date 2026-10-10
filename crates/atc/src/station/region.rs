@@ -394,6 +394,29 @@ pub(crate) fn region_handoff_line(
 /// published by [`Station::install`] for the monitor's traffic advisories.
 pub(super) static CONTROLLER_FREQS: Mutex<Vec<(i64, StationSpeaker)>> = Mutex::new(Vec::new());
 
+/// The active station's positions by the names they key ("Gatwick
+/// Ground"), published with [`CONTROLLER_FREQS`] for the ticks that speak
+/// as one (the ground's handoff at the hold).
+pub(super) static POSITION_NAMES: Mutex<Vec<(StationSpeaker, String)>> = Mutex::new(Vec::new());
+
+/// The installed station's position `who`: its name as keyed and its
+/// frequency (kHz). `None` when the field has no such position.
+pub(crate) fn active_position(who: StationSpeaker) -> Option<(String, i64)> {
+    let khz = CONTROLLER_FREQS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(_, s)| *s == who)
+        .map(|(k, _)| *k)?;
+    let name = POSITION_NAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(s, _)| *s == who)
+        .map(|(_, n)| n.clone())?;
+    Some((name, khz))
+}
+
 /// The active tower's frequency (kHz), for the crew side — the full-auto
 /// orchestrator tunes COM1 to it before requesting taxi. `None` when no station
 /// is installed.

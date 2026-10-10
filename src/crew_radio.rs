@@ -393,6 +393,68 @@ pub(crate) fn plan_callsign(
     })
 }
 
+/// Obey a "contact X on F" an aerodrome position said to us (Ground at the
+/// holding point, the Tower once vacated, a call on the wrong frequency;
+/// `party_line::take_position_handoff`): read it back on the frequency that
+/// gave it ("Gatwick Tower on one two four decimal two three zero", a
+/// frequency readback the controller answers with silence), let it go
+/// out, then retune COM1, as the departure handoff is obeyed. Returns the
+/// frequency tuned, `None` with no handoff owed.
+pub async fn follow_position_handoff(
+    xp: &dyn crate::xplane::XPlane,
+    callsign: &Option<String>,
+) -> Option<i64> {
+    follow_handoff(xp, callsign, crate::party_line::take_position_handoff()).await
+}
+
+/// The readback of a position handoff: "Gatwick Ground on one two one
+/// decimal eight zero five", the frequency readback the controller
+/// answers with silence (`tower::is_readback`).
+pub fn position_readback(callsign: &Option<String>, to: &str, khz: i64) -> String {
+    radio_call(callsign, &format!("{to} on {}", crate::atis::spoken_mhz(khz)))
+}
+
+/// [`follow_position_handoff`] for the handoff taken.
+pub async fn follow_handoff(
+    xp: &dyn crate::xplane::XPlane,
+    callsign: &Option<String>,
+    handoff: Option<(String, i64)>,
+) -> Option<i64> {
+    let (to, khz) = handoff?;
+    transmit(position_readback(callsign, &to, khz));
+    // The main loop routes a queued call on the frequency COM1 is on when
+    // it drains it: the readback goes out on the OLD frequency only if the
+    // radio is retuned after it has gone.
+    let t0 = std::time::Instant::now();
+    while crew_radio_pending() && t0.elapsed() < std::time::Duration::from_secs(20) {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let tuned = xp
+        .set_float(crate::datarefs::COM1_FREQ_KHZ, khz as f64)
+        .await
+        .is_ok();
+    crate::blackbox::record(
+        "crew_radio",
+        serde_json::json!({ "event": "position_handoff", "to": to, "khz": khz, "tuned": tuned }),
+    );
+    Some(khz)
+}
+
+/// Tune COM1 to the position a call is for (`khz`: Ground's for the push
+/// and the taxi, the Tower's for the ready call), obeying a handoff owed
+/// first ([`follow_position_handoff`]). Nothing to tune with `None`.
+pub async fn work_position(
+    xp: &dyn crate::xplane::XPlane,
+    callsign: &Option<String>,
+    khz: Option<i64>,
+) {
+    let handed = follow_position_handoff(xp, callsign).await;
+    if let Some(k) = khz.filter(|k| handed != Some(*k)) {
+        let _ = xp.set_float(crate::datarefs::COM1_FREQ_KHZ, k as f64).await;
+    }
+}
+
 /// Format a radio call with the callsign in front, pilot-style: "November one
 /// seven two Sierra Papa, downwind runway two seven". No callsign → bare.
 pub fn radio_call(callsign: &Option<String>, msg: &str) -> String {
@@ -419,4 +481,40 @@ pub fn spell_runway(id: &str) -> String {
         }
     }
     out.join(" ")
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    /// THE CREW FOLLOWS "CONTACT GROUND": the handoff is read back first,
+    /// on the frequency that gave it ("Gatwick Ground on one two one
+    /// decimal eight zero five", a readback the controller answers with
+    /// silence), and only once it has gone out is COM1 retuned to Ground.
+    #[tokio::test]
+    async fn the_crew_reads_back_a_contact_ground_then_retunes() {
+        let _q = QUEUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_crew_radio();
+        let xp = crate::xplane::FakeXPlane::with_reads(&[]);
+        let cs = Some("Speedbird one two three".to_string());
+        let drain = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            take_crew_radio()
+        });
+        let tuned = follow_handoff(&xp, &cs, Some(("Gatwick Ground".into(), 121_805))).await;
+        let sent = drain.await.unwrap();
+        assert_eq!(tuned, Some(121_805));
+        let words: Vec<String> = sent.iter().map(|q| call_words(&q.call)).collect();
+        assert_eq!(
+            words,
+            vec!["Speedbird one two three, Gatwick Ground on one two one decimal eight zero five"]
+        );
+        assert!(crate::tower::is_readback(&words[0]));
+        assert_eq!(xp.writes_to(crate::datarefs::COM1_FREQ_KHZ), vec![121_805.0]);
+        // Nothing owed: the position the call is for is tuned, nothing said.
+        let xp = crate::xplane::FakeXPlane::with_reads(&[]);
+        work_position(&xp, &cs, Some(124_230)).await;
+        assert_eq!(xp.writes_to(crate::datarefs::COM1_FREQ_KHZ), vec![124_230.0]);
+        assert!(take_crew_radio().is_empty());
+    }
 }

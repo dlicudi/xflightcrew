@@ -53,6 +53,13 @@ pub enum Intent {
     /// "start-up approved", never "cleared to leave the zone" (a Malaga gate
     /// got the zone clearance plus a squawk for it, 2026-07-12).
     RequestStartup,
+    /// "request push and start" / "request pushback" / "ready for push":
+    /// off a nose-in stand behind a tug, the engines started on the way
+    /// (ICAO Doc 4444 7.5.2, CAP 413 4.2, FAA 7110.65 3-7-1). Ground's
+    /// where the field has one ([`crate::station`]'s positions), approved
+    /// with the way the aircraft will face ("push and start approved,
+    /// facing west"). Request-shaped only: "pushing back" is the readback.
+    RequestPushback,
     /// "request shutdown" / "clearance to switch engines off" — the arrival
     /// bookend of start-up. Approval, not a clearance: a parked arrival
     /// asking got "cleared to leave the zone" plus a squawk, twice
@@ -1038,6 +1045,15 @@ pub fn parse_intent(transcript: &str) -> Intent {
         }
         return Intent::RequestTaxi;
     }
+    // A push (and start), before the start-up below reads "push and start"
+    // as a bare start-up and before the clearance catch-all: "request push
+    // and start", "request pushback", "ready for push", "ready to push".
+    // Request-shaped only: "pushing back, tail west" is the readback.
+    if (word("push") || word("pushback") || t.contains("push back") || t.contains("push-back"))
+        && (word("request") || word("requesting") || word("requests") || word("ready"))
+    {
+        return Intent::RequestPushback;
+    }
     // Engine start, before the clearance keyword can swallow it: "request
     // clearance to start engines" wants the start-up approval, not the zone
     // departure clearance (parsed as RequestClearance at a Malaga gate,
@@ -1278,6 +1294,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         // The destination is the case's own field (`dest` in the corpus).
         "request_ifr_clearance" => Intent::RequestIfrClearance { dest: None },
         "request_startup" => Intent::RequestStartup,
+        "request_pushback" => Intent::RequestPushback,
         "request_shutdown" => Intent::RequestShutdown,
         "request_takeoff" => Intent::RequestTakeoff,
         "request_landing" => Intent::RequestLanding {
@@ -1358,6 +1375,7 @@ pub fn is_readback(transcript: &str) -> bool {
         "wilco",
         "squawk",
         "squawking",
+        "pushing",
         "transponder",
         "copy",
         "copied",
@@ -1380,6 +1398,8 @@ fn frequency_readback(t: &str) -> bool {
         && [
             "tower",
             "ground",
+            "delivery",
+            "clearance",
             "departure",
             "approach",
             "radar",
@@ -2688,6 +2708,14 @@ impl Tower {
             Intent::RequestStartup => {
                 format!("{}, start-up approved{}.", ctx.callsign, qnh_clause(ctx))
             }
+            // The station phrases the push with the way it will face
+            // (`station::push_line`); the bare FSM approves it plainly.
+            Intent::RequestPushback => match ctx.dialect {
+                crate::atis::Dialect::Faa => format!("{}, push back approved.", ctx.callsign),
+                crate::atis::Dialect::Icao => {
+                    format!("{}, push and start approved{}.", ctx.callsign, qnh_clause(ctx))
+                }
+            },
             // The arrival bookend: nothing to clear, nowhere to go.
             Intent::RequestShutdown => {
                 format!("{}, shutdown approved. Good day.", ctx.callsign)

@@ -210,7 +210,7 @@ impl Station {
         // anything else → the challenge (which repeats the instruction).
         // Runs before the generic readback-silence path so a WRONG runway is
         // caught, not waved through as "a readback".
-        if service == Service::Tower {
+        if service.aerodrome() {
             // Judged BEFORE the gate spends it: with enforcement off, an IFR
             // readback that said any of the clearance stands as read.
             let ifr_read = self.desk.twr.pending().is_some_and(|p| {
@@ -365,9 +365,33 @@ impl Station {
     /// Same 5 kHz tolerance as [`Station::tuned_service`], no dataref read —
     /// callers with a live COM1 value (the STT prompt switch) check for free.
     pub fn covers_khz(&self, khz: i64) -> bool {
-        (khz - self.tower_khz).abs() <= 5
-            || self.approach_khz.is_some_and(|k| (khz - k).abs() <= 5)
-            || self.departure_khz.is_some_and(|k| (khz - k).abs() <= 5)
+        self.service_on(khz).is_some()
+    }
+
+    /// The position on frequency `khz` (5 kHz tolerance), tower first.
+    pub(super) fn service_on(&self, khz: i64) -> Option<Service> {
+        let on = |k: Option<i64>| k.is_some_and(|k| (khz - k).abs() <= 5);
+        [
+            (Some(self.tower_khz), Service::Tower),
+            (self.approach_khz, Service::Approach),
+            (self.departure_khz, Service::Departure),
+            (self.ground_khz, Service::Ground),
+            (self.delivery_khz, Service::Delivery),
+        ]
+        .into_iter()
+        .find(|(k, _)| on(*k))
+        .map(|(_, s)| s)
+    }
+
+    /// The frequency of one of this station's positions.
+    pub(super) fn khz_of(&self, service: Service) -> Option<i64> {
+        match service {
+            Service::Tower => Some(self.tower_khz),
+            Service::Approach => self.approach_khz,
+            Service::Departure => self.departure_khz,
+            Service::Ground => self.ground_khz,
+            Service::Delivery => self.delivery_khz,
+        }
     }
 
     /// Which service COM1 is tuned to. 8.33 channel names can sit 5 kHz off
@@ -380,16 +404,7 @@ impl Station {
             return None;
         }
         let com1 = xp.get_float(datarefs::COM1_FREQ_KHZ).await.ok()?.round() as i64;
-        if (com1 - self.tower_khz).abs() <= 5 {
-            return Some(Service::Tower);
-        }
-        if self.approach_khz.is_some_and(|k| (com1 - k).abs() <= 5) {
-            return Some(Service::Approach);
-        }
-        if self.departure_khz.is_some_and(|k| (com1 - k).abs() <= 5) {
-            return Some(Service::Departure);
-        }
-        None
+        self.service_on(com1)
     }
 }
 
@@ -438,6 +453,7 @@ pub fn is_radio_call(t: &str, airport_lc: &str) -> bool {
         || t.contains("departure")
         || (!airport_lc.is_empty() && t.contains(airport_lc))
         || t.contains("request")
+        || t.contains("ready for push")
         || t.contains("inbound")
         || t.contains("radio check")
         || word("final")

@@ -23,6 +23,12 @@ pub use crate::station::{
     handoff_tick, region_tick, squawk_tick, squawk_watch_active, vector_tick,
 };
 
+/// The aerodrome's positions: Ground's handoff to the Tower at the holding
+/// point (ours and a traffic flight's), the Tower's to Ground on a traffic
+/// flight's rollout, and the position a traffic flight
+/// is working (its readback is said on that frequency).
+pub use crate::station::{ground_handoff_tick, traffic_position_tick, traffic_working};
+
 /// The takeoff hold, the wake book and the party-line chatter.
 pub use crate::station::{
     chatter_tick, player_blocked_strip, takeoff_hold_tick_from, void_takeoff_hold_by_roll,

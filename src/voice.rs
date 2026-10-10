@@ -351,6 +351,9 @@ fn station_model(who: StationSpeaker, config: &Config, seed: usize, locals: &[St
                 v
             }
         }
+        // The ground positions share the tower's curated voice where the
+        // pool is empty: the same building, a different chair.
+        StationSpeaker::Ground | StationSpeaker::Delivery => fallback,
         StationSpeaker::Atis => {
             let v = config.atc_atis_piper_voice.as_str();
             if v.is_empty() {
@@ -364,20 +367,19 @@ fn station_model(who: StationSpeaker, config: &Config, seed: usize, locals: &[St
 }
 
 /// Whether `speaker` is audible on the currently-tuned station RIGHT NOW.
-/// Ghost pilots ride the tower's party line, so they're heard iff the tower
-/// is tuned; every other speaker matches its own position. `None` means
+/// Ghost pilots ride the field's party line, so they're heard on the
+/// field's positions (tower, ground, delivery: the overheard pump gates
+/// which one a line keyed on); every other speaker matches its own position. `None` means
 /// definitively OFF all station frequencies (the caller resolved a real
 /// COM1 read to no station) — nothing station is audible. Used to cut live
 /// audio the instant the pilot tunes away.
 fn audible_now(tuned: Option<StationSpeaker>, speaker: StationSpeaker) -> bool {
     match tuned {
         None => false,
-        Some(StationSpeaker::Tower) => {
-            matches!(
-                speaker,
-                StationSpeaker::Tower | StationSpeaker::Ghost { .. }
-            )
-        }
+        Some(t) if matches!(speaker, StationSpeaker::Ghost { .. }) => matches!(
+            t,
+            StationSpeaker::Tower | StationSpeaker::Ground | StationSpeaker::Delivery
+        ),
         Some(t) => t == speaker,
     }
 }
@@ -754,6 +756,10 @@ struct Inner {
 /// One line of our own traffic's frequency, waiting for the air.
 struct Overheard {
     speaker: StationSpeaker,
+    /// The position whose frequency it was said on: aired only while COM1
+    /// is on it (the ONE-frequency rule, a Ground taxi call is not heard on
+    /// the Tower's frequency).
+    on: StationSpeaker,
     text: String,
     /// When it was said (the fleet's tick, or the call the tower answers).
     made: Instant,
@@ -796,7 +802,11 @@ pub const RADIO_REPEAT_TTL: std::time::Duration = std::time::Duration::from_secs
 fn is_controller(speaker: StationSpeaker) -> bool {
     matches!(
         speaker,
-        StationSpeaker::Tower | StationSpeaker::Approach | StationSpeaker::Departure
+        StationSpeaker::Tower
+            | StationSpeaker::Approach
+            | StationSpeaker::Departure
+            | StationSpeaker::Ground
+            | StationSpeaker::Delivery
     )
 }
 
@@ -1701,6 +1711,19 @@ impl Voice {
     /// the order the lines were made (the tower's answer after the call it
     /// answers, whichever thread got here first).
     pub fn overhear(&self, speaker: StationSpeaker, text: impl Into<String>, made: Instant) {
+        self.overhear_on(StationSpeaker::Tower, speaker, text, made);
+    }
+
+    /// [`Voice::overhear`] for a line said on position `on`'s frequency (a
+    /// traffic call to Ground, Ground's answer): aired only while COM1 is
+    /// on that position.
+    pub fn overhear_on(
+        &self,
+        on: StationSpeaker,
+        speaker: StationSpeaker,
+        text: impl Into<String>,
+        made: Instant,
+    ) {
         let text = crate::phrase::scrub_dashes(&text.into());
         if text.trim().is_empty() {
             return;
@@ -1715,6 +1738,7 @@ impl Voice {
             at,
             Overheard {
                 speaker,
+                on,
                 text,
                 made,
                 retry_at: made,
@@ -1722,9 +1746,10 @@ impl Voice {
         );
     }
 
-    /// Air what of our own traffic's frequency is due, per monitor tick:
-    /// only while COM1 hears the TOWER (the rest is the void, dropped;
-    /// unknown tuning fails open, as the arbiter does), never over our PTT
+    /// Air what of our own traffic's frequencies is due, per monitor tick:
+    /// each line only while COM1 is on the position it was said on (the
+    /// rest is the void, dropped; unknown tuning fails open, as the arbiter
+    /// does), never over our PTT
     /// or a pilot's line waiting (`pilot_line_pending`: the lines go back
     /// 3 to 5 s), and never later than [`OVERHEARD_STALE_S`] after it was
     /// made (dropped waiting, or at the radio's dequeue). Aired as an
@@ -1732,16 +1757,16 @@ impl Voice {
     /// to the panel dimmed. Returns what it queued.
     pub fn pump_overheard(&self, now: Instant, pilot_line_pending: bool) -> Vec<String> {
         let stale = std::time::Duration::from_secs_f64(OVERHEARD_STALE_S);
-        let tower = !self
+        let known = self
             .inner
             .com1_known
-            .load(std::sync::atomic::Ordering::Relaxed)
-            || *self
-                .inner
-                .tuned_station
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                == Some(StationSpeaker::Tower);
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let tuned = *self
+            .inner
+            .tuned_station
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let hears = |on: StationSpeaker| !known || tuned == Some(on);
         let held = self.held();
         let due: Vec<Overheard> = {
             let mut q = self
@@ -1749,11 +1774,7 @@ impl Voice {
                 .overheard
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            q.retain(|l| now.saturating_duration_since(l.made) <= stale);
-            if !tower {
-                q.clear();
-                return Vec::new();
-            }
+            q.retain(|l| now.saturating_duration_since(l.made) <= stale && hears(l.on));
             if held || pilot_line_pending {
                 for l in q.iter_mut().filter(|l| l.retry_at <= now) {
                     l.retry_at = now + overheard_retry(&l.text);
@@ -2444,7 +2465,8 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     // one slot for whichever GHOST pilot spoke last), keyed by model name so
     // a cast change — or a different ghost — rebuilds only that slot. A
     // position that never speaks never loads its model.
-    let mut stations: [Option<(String, StationVoice)>; 5] = [None, None, None, None, None];
+    let mut stations: [Option<(String, StationVoice)>; crate::speaker::SLOTS] =
+        std::array::from_fn(|_| None);
     let mut stations_seed: usize = 0;
     loop {
         let mut q = inner.radio_queue.lock().unwrap();
@@ -2497,7 +2519,7 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             .station_seed
             .load(std::sync::atomic::Ordering::Relaxed);
         if seed != stations_seed {
-            stations = [None, None, None, None, None];
+            stations = std::array::from_fn(|_| None);
             stations_seed = seed;
         }
         let locals: Vec<String> = inner

@@ -970,6 +970,7 @@ fn state_intent_matrix_holds_the_invariants() {
         },
         RequestIfrClearance { dest: None },
         RequestStartup,
+        RequestPushback,
         RequestShutdown,
         RequestTakeoff,
         RequestLanding {
@@ -1065,7 +1066,7 @@ fn state_intent_matrix_holds_the_invariants() {
                 // deliberate edit to this test, not a surprise.
                 let want = match intent {
                     RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance
-                    | RequestStartup | RequestShutdown => start,
+                    | RequestStartup | RequestPushback | RequestShutdown => start,
                     // A reject is a ground report: ctx() is airborne, so it
                     // is a garble there and moves nothing (the ground half
                     // has its own test).
