@@ -4,7 +4,9 @@
 //! never asks anybody anything but its order.
 
 use crate::field::{FieldModel, RunwayEnd};
-use crate::kin::{bearing, dist_m, follow, project_m, Follow, FollowSpec, Kin, LatLon, KT_TO_MS};
+use crate::kin::{
+    bearing, dist_m, follow, follow_on_gear, project_m, Follow, FollowSpec, Kin, LatLon, KT_TO_MS,
+};
 use crate::perf::{class_for_type, Perf, Wake};
 use crate::phase::{Call, Despawn, Event, Leg, Order, Phase, Plan, RadioState, TowerState};
 use crate::rng::XorShift64;
@@ -505,11 +507,12 @@ impl TrafficAircraft {
             None => kts,
         };
         let spec = self.ground_spec(kts, self.spacing.free_m.is_some());
-        follow(
+        follow_on_gear(
             &self.route.path,
             &mut self.route.follow,
             &mut self.kin,
             &spec,
+            &crate::perf::gear_for(&self.icao_type, self.perf),
             dt,
         )
     }
