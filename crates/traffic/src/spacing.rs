@@ -66,6 +66,10 @@ pub const STUCK_S: f64 = 90.0;
 /// 03, 2026-10-08).
 pub const RUNWAY_STUCK_S: f64 = 5.0;
 
+/// On a runway, braking for one standing off it this much short of its
+/// stopping distance brings the guard at once, metres.
+const STRIP_GUARD_M: f64 = 10.0;
+
 /// On a runway an aircraft closes up to this short of the one ahead,
 /// beyond the two half lengths, metres: never the taxi spacing (it would
 /// stop it on the strip), never through it.
@@ -650,7 +654,13 @@ pub fn apply(
                 } else if fleet[k].kin.gs_kts < 0.5 && !in_way(k, other) {
                     true
                 } else if was {
-                    hold(k, e, other) > -1.0
+                    // Stopped where it gave way, it stays: released there
+                    // because the other's route came into full view (its
+                    // hold point is then measured afresh, from inside the
+                    // stretch), it drove at the other still turning off the
+                    // runway onto its stretch (XTST's ENAT crossing, with the
+                    // 737 taking its corners on its wheels, 2026-10-10).
+                    hold(k, e, other) > -1.0 || fleet[k].kin.gs_kts < 0.5
                 } else {
                     hold(k, e, other) >= v * v / (2.0 * SPACING_DECEL_MS2)
                 }
@@ -734,6 +744,7 @@ pub fn apply(
     // The stops, and the guard on the ones that will not come on.
     // (who, early): a vacate planned round at once, on the move.
     let mut due: Vec<(usize, bool)> = Vec::new();
+    let standing: Vec<bool> = fleet.iter().map(|a| a.kin.gs_kts < 0.5).collect();
     for (i, ac) in fleet.iter_mut().enumerate() {
         ac.spacing.giving_way = std::mem::take(&mut giving[i]);
         let Some(s) = stops[i].filter(|_| ways[i].is_some()) else {
@@ -752,8 +763,22 @@ pub fn apply(
         // Waiting on one that will never move for it: bounded. Off the
         // runway only behind one that will not come on (a queue moves up
         // in its own time); on it, behind anybody.
+        // On the runway and braking for one standing off it in its way, the
+        // guard acts before it stops there: ESNU 14 (the hour sweep,
+        // 2026-10-10), a Cessna cleared across and down the runway braked
+        // to a stop nose to nose with an ATR holding short at its way off,
+        // and the tower called "expedite crossing" before the ATR was
+        // towed five seconds on.
+        let v = ac.kin.gs_kts * crate::kin::KT_TO_MS;
+        let braking_on_strip = on_strip[i]
+            && !s.junction
+            && ob.idx.is_some_and(|j| standing[j] && !on_strip[j])
+            && s.free_m < v * v / (2.0 * SPACING_DECEL_MS2) + STRIP_GUARD_M;
         let mut guard_due = false;
-        if stopped && !s.junction && (s.immovable || on_strip[i]) {
+        if braking_on_strip && !stopped {
+            ac.spacing.held_s += dt;
+            guard_due = true;
+        } else if stopped && !s.junction && (s.immovable || on_strip[i]) {
             ac.spacing.held_s += dt;
             let limit = if on_strip[i] { RUNWAY_STUCK_S } else { STUCK_S };
             guard_due = ac.spacing.held_s >= limit;

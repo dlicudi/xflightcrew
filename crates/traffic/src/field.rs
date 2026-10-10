@@ -383,7 +383,28 @@ impl FieldModel {
         icao_type: &str,
         standing: &[LatLon],
     ) -> Option<VacatePlan> {
-        let v = self.vacate_open(pos, hdg, end, icao_type)?;
+        self.vacate_picked(pos, hdg, end, icao_type, standing, None)
+    }
+
+    /// [`FieldModel::vacate`] for a rollout still at speed: the exit `pick`
+    /// says it can make ([`nav::ExitPick`]), forward. `None` when it can
+    /// make none, or when its way on to the parking crosses a runway
+    /// ([`FieldModel::vacate_at_speed`]): the rollout then slows on the
+    /// runway and plans its way off from there, as before. EGKK (the hour
+    /// sweep, 2026-10-09): every arrival slowed to taxi pace about 1.1 km in
+    /// and drove on down the runway at 25 kt to the nearest exit ahead, 119
+    /// s from the flare to "runway vacated" against a real airliner's 50 to
+    /// 60, and the arrivals behind went around.
+    pub fn vacate_picked(
+        &self,
+        pos: LatLon,
+        hdg: f64,
+        end: &RunwayEnd,
+        icao_type: &str,
+        standing: &[LatLon],
+        pick: Option<&nav::ExitPick>,
+    ) -> Option<VacatePlan> {
+        let v = self.vacate_open(pos, hdg, end, icao_type, pick)?;
         let near = |p: LatLon| -> Vec<LatLon> {
             standing
                 .iter()
@@ -399,7 +420,7 @@ impl FieldModel {
             .into_iter()
             .fold(self.clone(), |f, s| f.without_edges_near(s, VACATE_TAKEN_M));
         let round = open
-            .vacate_open(pos, hdg, end, icao_type)
+            .vacate_open(pos, hdg, end, icao_type, pick)
             .filter(|r| r.path.last().is_some_and(|p| !taken(p)));
         if round.is_some() {
             return round;
@@ -424,19 +445,37 @@ impl FieldModel {
         hdg: f64,
         end: &RunwayEnd,
         icao_type: &str,
+        pick: Option<&nav::ExitPick>,
     ) -> Option<VacatePlan> {
         let zone = [end.ident.clone(), end.reciprocal.clone()];
-        let plan = |h: f64| {
+        let plan_from = |from: LatLon, h: f64, pick: Option<&nav::ExitPick>| {
             self.net
-                .plan_vacate(pos.0, pos.1, h, &zone, nav::VACATE_CLEAR_M)
+                .plan_vacate_picked(from.0, from.1, h, &zone, nav::VACATE_CLEAR_M, pick)
                 .filter(|v| v.path.len() >= 2)
                 .map(|v| self.short_of_the_stands(v))
         };
-        let ahead = plan(hdg).or_else(|| self.drive_off(pos, hdg));
+        let plan = |h: f64, pick: Option<&nav::ExitPick>| plan_from(pos, h, pick);
+        if let Some(pick) = pick {
+            let v = plan(hdg, Some(pick))?;
+            // Off to the side the stopped rollout would leave by, or not at
+            // all: ESNU 14 (the hour sweep, 2026-10-10), a Cessna's picked
+            // exit put it on the far side and the tower's way to its stand
+            // crossed back and ran a kilometre down the runway into a
+            // flight holding short.
+            let slowed = project_m(pos, hdg, pick.square_from_m);
+            let side = |v: &VacatePlan| v.path.last().map(|q| end.frame(*q).1.signum());
+            if let Some(stopped) = plan_from(slowed, hdg, None) {
+                if side(&stopped) != side(&v) {
+                    return None;
+                }
+            }
+            return self.vacate_at_speed(v, pos, icao_type);
+        }
+        let ahead = plan(hdg, None).or_else(|| self.drive_off(pos, hdg));
         let Some(stand) = self.parking_near(pos, icao_type) else {
             return ahead;
         };
-        let behind = plan((hdg + 180.0).rem_euclid(360.0));
+        let behind = plan((hdg + 180.0).rem_euclid(360.0), None);
         let ahead = ahead.map(|v| self.off_the_strip(v, stand));
         let behind = behind.map(|v| self.off_the_strip(v, stand));
         // The whole drive to the parking: the vacate, then the stand route.
@@ -452,6 +491,40 @@ impl FieldModel {
             },
             (a, b) => a.or(b),
         }
+    }
+
+    /// The exit picked at speed (`v`, from a rollout at `pos`), kept only
+    /// when its way on to the parking crosses no runway: else `None`, and
+    /// the rollout slows on the strip and plans from there as before (a
+    /// backtrack, BIEG's case, or the nearest exit). The backtrack's own
+    /// rule is never asked at speed: from the touchdown point every exit
+    /// behind reads as a short way to the parking, and LEMG 13 (the hour
+    /// sweep, 2026-10-09), with a parallel taxiway back to the terminal
+    /// behind every exit, sent every arrival to slow and backtrack 1.3 km.
+    /// Nor when, past its junction, it still runs on along a runway
+    /// ([`AT_SPEED_ON_STRIP_M`]): UNSS 15's taxiways are drawn down the
+    /// runway itself, so the far exit's way off ran 1.7 km back up it at
+    /// backtrack pace, three minutes on the strip where the slowed rollout
+    /// turns round short of that.
+    fn vacate_at_speed(&self, v: VacatePlan, pos: LatLon, icao_type: &str) -> Option<VacatePlan> {
+        let on_strip_m = |v: &VacatePlan| -> f64 {
+            v.path
+                .windows(2)
+                .skip(1)
+                .filter(|w| self.on_runway(((w[0].0 + w[1].0) / 2.0, (w[0].1 + w[1].1) / 2.0)))
+                .map(|w| dist_m(w[0], w[1]))
+                .sum()
+        };
+        let Some(stand) = self.parking_near(pos, icao_type) else {
+            return (on_strip_m(&v) <= AT_SPEED_ON_STRIP_M).then_some(v);
+        };
+        let v = self.off_the_strip(v, stand);
+        if on_strip_m(&v) > AT_SPEED_ON_STRIP_M {
+            return None;
+        }
+        let off = *v.path.last()?;
+        let route = self.net.plan_to_stand(off.0, off.1, stand)?;
+        route.crossings.is_empty().then_some(v)
     }
 
     /// `v` ended short of the stands it would end among: cut back to its
@@ -510,6 +583,7 @@ impl FieldModel {
             path: vec![pos, to],
             seg: vec![Default::default()],
             exit_name: String::new(),
+            turn_off: None,
         })
     }
 
@@ -847,6 +921,11 @@ const APRON_SPOTS_MAX: usize = 12;
 /// share of the forward one's ([`FieldModel::vacate`]): a turn round on the
 /// runway is paid for only by a real saving.
 pub const BACKTRACK_SAVES: f64 = 0.6;
+
+/// A way off picked at speed runs on a runway past its junction no further
+/// than this, metres (the turn off the pavement, a jet's wide one included):
+/// more is a drive along the strip ([`FieldModel::vacate_at_speed`]).
+const AT_SPEED_ON_STRIP_M: f64 = 150.0;
 
 /// The length of a polyline, metres.
 fn path_m(path: &[LatLon]) -> f64 {

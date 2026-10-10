@@ -235,7 +235,44 @@ pub struct VacatePlan {
     /// The taxiway we end up on, for the crew line and the "runway vacated"
     /// report. May be empty on an unnamed link.
     pub exit_name: String,
+    /// Where the way off leaves the runway and at what angle to the
+    /// rollout: the junction the turn is made at. `None` where the data
+    /// draws no junction (a drive straight off).
+    pub turn_off: Option<TurnOff>,
 }
+
+/// The junction a vacate turns off the runway at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TurnOff {
+    /// The junction, on the runway.
+    pub at: (f64, f64),
+    /// The turn off the rollout heading onto the exit, degrees (30 is a
+    /// rapid exit, 90 a square one).
+    pub deg: f64,
+}
+
+/// How a rollout STILL AT SPEED picks its exit, as a crew does: the first
+/// one it can make, a rapid (acute, angled with the landing) exit taken at
+/// its exit speed and a square one at taxi pace, so each is reachable only
+/// past the point the braking brings the aircraft down to that speed.
+/// [`TaxiNet::plan_vacate_picked`]; the stopped rollout's
+/// [`TaxiNet::plan_vacate`] takes the nearest exit ahead instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExitPick {
+    /// A rapid exit is made only this far ahead of the aircraft, metres.
+    pub rapid_from_m: f64,
+    /// A square exit (or one past [`ExitPick::rapid_max_deg`]) only this far.
+    pub square_from_m: f64,
+    /// A turn-off this acute or less is a rapid exit, degrees.
+    pub rapid_max_deg: f64,
+    /// A rapid exit is worth this much more distance down the runway than a
+    /// square one, metres: it is left at speed.
+    pub rapid_bonus_m: f64,
+}
+
+/// A turn-off more than this off the rollout is a reverse-angle exit,
+/// never picked at speed ([`ExitPick`]).
+pub const REVERSE_EXIT_DEG: f64 = 100.0;
 
 /// A stand route that begins ON the runway: the drive off it, forward, then
 /// the route to the stand from where that drive ends.
@@ -874,6 +911,22 @@ impl TaxiNet {
         zone: &[String],
         clear_m: f64,
     ) -> Option<VacatePlan> {
+        self.plan_vacate_picked(lat, lon, psi_true, zone, clear_m, None)
+    }
+
+    /// [`TaxiNet::plan_vacate`] for a rollout still at speed: with `pick`,
+    /// only an exit it can make at its speed ([`ExitPick`]), the soonest
+    /// such, a rapid one preferred; `None` when it can make none. Without,
+    /// the nearest exit ahead.
+    pub fn plan_vacate_picked(
+        &self,
+        lat: f64,
+        lon: f64,
+        psi_true: f64,
+        zone: &[String],
+        clear_m: f64,
+        pick: Option<&ExitPick>,
+    ) -> Option<VacatePlan> {
         let m_per_deg_lat = 111_320.0;
         let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
         let dist_m = |a: (f64, f64), b: (f64, f64)| -> f64 {
@@ -1037,7 +1090,30 @@ impl TaxiNet {
                         .then_with(|| dist_m(here, y.1).total_cmp(&dist_m(here, x.1)))
                 })
         };
-        let (exit, first) = taxiway_nodes
+        // The turn a junction's exit makes off the rollout, degrees.
+        let turn_deg = |at: (f64, f64), next: (f64, f64)| -> f64 {
+            sim::angles::abs_diff_deg(bearing_deg(at.0, at.1, next.0, next.1), psi_true)
+        };
+        // A picked exit's cost: the distance down the runway to it, less
+        // the rapid exit's bonus; `None` when the rollout cannot slow for it
+        // by then, or for a reverse-angle one (that is a turn at taxi pace
+        // or nothing: the stopped rollout's plan takes it).
+        let picked_cost = |k: &ExitPick, at: (f64, f64), next: (f64, f64)| -> Option<f64> {
+            let deg = turn_deg(at, next);
+            let dx = (at.1 - lon) * m_per_deg_lon;
+            let dy = (at.0 - lat) * m_per_deg_lat;
+            let (sin, cos) = psi_true.to_radians().sin_cos();
+            let along = dx * sin + dy * cos;
+            let rapid = deg <= k.rapid_max_deg;
+            let from = if rapid {
+                k.rapid_from_m
+            } else {
+                k.square_from_m
+            };
+            let bonus = if rapid { k.rapid_bonus_m } else { 0.0 };
+            (along >= from && deg <= REVERSE_EXIT_DEG).then_some(along - bonus)
+        };
+        let (exit, exit_p, first) = taxiway_nodes
             .iter()
             .filter(|id| runway_nodes.is_empty() || runway_nodes.contains(id))
             .filter_map(|id| self.nodes.get(id).map(|&p| (*id, p)))
@@ -1050,6 +1126,7 @@ impl TaxiNet {
             // through to the taxi-in from the runway — the same degradation
             // the dead-end case makes, and better than the U-turn.
             .filter_map(|(id, p)| turn_off(id, p).map(|s| (id, p, s)))
+            .filter(|c| pick.is_none_or(|k| picked_cost(k, c.1, c.2 .1).is_some()))
             .min_by(|x, y| {
                 // Toward the apron first, then nearest. A turn-off that leads
                 // away from the parking is a longer taxi at best and, where
@@ -1059,11 +1136,18 @@ impl TaxiNet {
                 let toward = |c: &TurnOffCandidate| -> bool {
                     apron_side.is_none_or(|a| side_of(c.2 .1) * a >= 0.0)
                 };
+                let far = |c: &TurnOffCandidate| match pick {
+                    Some(k) => picked_cost(k, c.1, c.2 .1).unwrap_or(f64::INFINITY),
+                    None => dist_m(here, c.1),
+                };
                 toward(y)
                     .cmp(&toward(x))
-                    .then_with(|| dist_m(here, x.1).total_cmp(&dist_m(here, y.1)))
-            })
-            .map(|(id, _, step)| (id, step))?;
+                    .then_with(|| far(x).total_cmp(&far(y)))
+            })?;
+        let turn_off_at = TurnOff {
+            at: exit_p,
+            deg: turn_deg(exit_p, first.1),
+        };
 
         // Walk outward until `clear_m` past the exit, never along a runway
         // edge and never back through a node we have used. "Outward" is
@@ -1197,6 +1281,7 @@ impl TaxiNet {
             path,
             seg,
             exit_name,
+            turn_off: Some(turn_off_at),
         })
     }
 

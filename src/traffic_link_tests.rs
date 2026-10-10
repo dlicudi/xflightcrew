@@ -119,6 +119,9 @@ pub(super) struct HarnessScore {
     /// Arrivals that turned round on their stand (the rest lingered and
     /// went: `despawns["Parked"]`).
     pub(super) turned: usize,
+    /// Each full-stop landing's runway time, seconds: from the flare (over
+    /// the threshold, near enough) to its "runway vacated".
+    pub(super) runway_s: Vec<f64>,
 }
 
 /// A station for `icao` from `apt` with its taxi network loaded, installed.
@@ -206,6 +209,8 @@ pub(super) fn fly_field_hours(
     let trace = std::env::var("XVL_TRAFFIC_TRACE").is_ok_and(|v| !v.is_empty());
     s.closest_share = f64::INFINITY;
     let mut overlapping: HashSet<(u32, u32)> = HashSet::new();
+    // When each flight began its flare, for its runway time.
+    let mut flared: HashMap<u32, f64> = HashMap::new();
     // The command loop notes the station's runway each turn, from the
     // install on (`station_work::drain_traffic_calls`).
     note_station_runway(station.runway_for_now().as_deref());
@@ -273,6 +278,12 @@ pub(super) fn fly_field_hours(
                     s.calls += 1;
                     if matches!(call, Call::GoingAround) {
                         s.go_arounds += 1;
+                        flared.remove(id);
+                    }
+                    if matches!(call, Call::Vacated) {
+                        if let Some(t0) = flared.remove(id) {
+                            s.runway_s.push(t - t0);
+                        }
                     }
                     if let Call::Readback(rb) = call {
                         readbacks.entry(*id).or_default().push(rb.clone());
@@ -298,6 +309,12 @@ pub(super) fn fly_field_hours(
                     }
                 }
                 Event::Phase { id, from, to } => {
+                    if *to == traffic::Phase::Landing {
+                        flared.insert(*id, t);
+                    } else if *from == traffic::Phase::Landing && *to != traffic::Phase::Vacate {
+                        // A touch and go, or a go-around from the flare.
+                        flared.remove(id);
+                    }
                     if trace {
                         let pos = link.fleet().get(*id).map(|a| a.kin.pos());
                         println!("{t:7.1} [{id}] {from:?} -> {to:?} at {pos:?}");
@@ -566,6 +583,15 @@ fn crowded(s: &HarnessScore) -> Option<(f64, f64)> {
         let ((a, _), (b, safety)) = (w[0], w[1]);
         (!safety && b - a < CALL_GAP_S - 1e-6).then_some((b - a, b))
     })
+}
+
+/// The mean of `v` (0 for none).
+fn mean(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().sum::<f64>() / v.len() as f64
+    }
 }
 
 /// The time of day a harness flies at: `XVL_TRAFFIC_SWEEP_LOCAL_H=8` puts
@@ -922,6 +948,7 @@ fn real_install_traffic_world_sweep_inner() {
     let (mut overlaps, mut closest, mut go_arounds) = (0, f64::INFINITY, 0);
     let mut dirty: Vec<String> = Vec::new();
     let mut deps = (0, 0, 0);
+    let mut runway_s: Vec<f64> = Vec::new();
     for (icao, a) in fields {
         let net = crate::nav::find_taxi_net(&apt, &icao).ok().flatten();
         let has_stands = net.as_ref().is_some_and(|n| !n.stands.is_empty());
@@ -938,7 +965,7 @@ fn real_install_traffic_world_sweep_inner() {
         println!(
             "{icao}: {} scheduled, {} completed, {} calls, {} readbacks ({} accepted), \
              {} conflicts, {} oracle, spacing {}/{}/{} rerouted/towed/held, closest {:.2} of the spacing, \
-             {} overlaps, {} go-arounds",
+             {} overlaps, {} go-arounds, runway {:.0} s over {} landings",
             s.movements,
             s.completed,
             s.calls,
@@ -951,7 +978,9 @@ fn real_install_traffic_world_sweep_inner() {
             s.spacing_held,
             s.closest_share,
             s.overlaps.len(),
-            s.go_arounds
+            s.go_arounds,
+            mean(&s.runway_s),
+            s.runway_s.len()
         );
         println!(
             "    departures: {} off a stand parked from the start, {} turned round, {} from nothing; \
@@ -995,6 +1024,7 @@ fn real_install_traffic_world_sweep_inner() {
         flown += 1;
         overlaps += s.overlaps.len();
         go_arounds += s.go_arounds;
+        runway_s.extend(&s.runway_s);
         closest = f64::min(closest, s.closest_share);
         spawned += s.movements;
         completed += s.completed;
@@ -1004,8 +1034,10 @@ fn real_install_traffic_world_sweep_inner() {
     println!(
         "swept {flown} fields: {spawned} movements, {completed} completed, {calls} calls, \
          no panic, {} dirty; {overlaps} overlaps, {go_arounds} go-arounds, closest taxiing \
-         pair {closest:.2} of its spacing",
-        dirty.len()
+         pair {closest:.2} of its spacing; runway time {:.0} s over {} landings",
+        dirty.len(),
+        mean(&runway_s),
+        runway_s.len()
     );
     println!(
         "departures: {} off a stand parked from the start, {} turned round, {} from nothing",

@@ -565,6 +565,50 @@ fn a_straight_in_arrival_lands_and_parks() {
     );
 }
 
+/// The runway slot a landing publishes at touchdown is the rollout it then
+/// flies (2026-10-10): its way off is planned at speed at the wheels
+/// ([`TrafficAircraft::plan_exit`]), and the slot's "off the runway" is
+/// that exit, braked for and driven, so the tower's timing is the
+/// aircraft's own. An ATR at XTST 27: the exit picked at touchdown, the
+/// report within a few seconds of the slot's time for it.
+#[test]
+fn a_landings_slot_at_touchdown_is_the_rollout_it_flies() {
+    let field = fixtures::xtst();
+    let ac = arrival(&field, 32, "AT72", true);
+    let mut fleet = Fleet::new(field);
+    assert!(fleet.spawn(ac));
+    let tower = RefCell::new(ScriptedTower::default());
+    let (mut t, mut down, mut said) = (0.0, None, None);
+    while t < 3600.0 && said.is_none() {
+        let events = {
+            let tw = &tower;
+            fleet.step(0.1, None, &|id| tw.borrow().orders.get(&id).cloned())
+        };
+        t += 0.1;
+        for ev in &events {
+            tower.borrow_mut().hear(ev);
+            match ev {
+                Event::Touchdown { id: 32, .. } => {
+                    let ac = fleet.get(32).unwrap();
+                    assert!(ac.exit.is_some(), "its way off planned at the wheels");
+                    down = Some((t, ac.slot().expect("a slot on the runway").clear_s));
+                }
+                Event::Call {
+                    id: 32,
+                    call: Call::Vacated,
+                } => said = Some(t),
+                _ => {}
+            }
+        }
+    }
+    let (t0, clear_s) = down.expect("it touched down");
+    let flown = said.expect("runway vacated") - t0;
+    assert!(
+        (flown - clear_s).abs() <= 5.0_f64.max(0.15 * clear_s),
+        "slot said off in {clear_s:.1} s, flown {flown:.1} s"
+    );
+}
+
 /// A retractable straight-in arrival has its gear down from the final to
 /// the stand (LEMG, 2026-10-08: it landed and taxied in with it up).
 #[test]
@@ -838,9 +882,10 @@ fn a_readback_not_taken_twice_says_again_once_then_leaves() {
 /// #242 (BIEG 03): a landing short rolled 1.2 km to the far exit at taxi
 /// pace, and the wait for a stand, timed from the START of the vacate, ran
 /// out the moment the drive ended: gone `NoStand` with "runway vacated"
-/// never said. The wait runs from the vacate's END: the call is made as it
-/// stops clear, and only `2 * PARKED_LINGER_S` later, still with nowhere to
-/// park, does it leave.
+/// never said. The wait runs from the call: made once it is clear of the
+/// runway's pavement (2026-10-10, said as it goes, no longer at the end of
+/// its way off), and only `2 * PARKED_LINGER_S` later, still with nowhere
+/// to park, does it leave.
 #[test]
 fn a_long_vacate_calls_vacated_before_its_wait_for_a_stand_begins() {
     use crate::aircraft::{Route, PARKED_LINGER_S};
@@ -896,8 +941,8 @@ fn a_long_vacate_calls_vacated_before_its_wait_for_a_stand_begins() {
     let vacated_at = vacated_at.expect("runway vacated was called");
     let gone_at = gone_at.expect("it left with nowhere to park");
     assert!(
-        vacated_at > 2.0 * PARKED_LINGER_S,
-        "the drive itself outlasts the old wait: called at {vacated_at:.0} s"
+        vacated_at > PARKED_LINGER_S,
+        "called only off the strip, after the long roll down it: at {vacated_at:.0} s"
     );
     let waited = gone_at - vacated_at;
     assert!(
