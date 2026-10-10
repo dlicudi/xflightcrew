@@ -3720,3 +3720,47 @@ fn the_radio_name_is_the_tower_rows_own_station_name() {
     );
     assert_eq!(field("Gibraltar", &[]).radio_name(), "Gibraltar");
 }
+
+/// The ground positions are named by their own rows' stems, as the tower
+/// is: EGKK's "1052 121955 Gatwick Delivery" and "1053 121805 Gatwick
+/// Ground". A label ("GND", "CLNC DEL") falls back to the radio name and
+/// the position's word; a row keyed "Clearance" keeps that word.
+#[test]
+fn each_ground_position_is_named_by_its_own_row() {
+    let field = |name: &str, rows: &[(u32, &str)]| crate::AirportInfo {
+        name: name.to_string(),
+        elev_ft: 0.0,
+        runways: Vec::new(),
+        freqs: rows
+            .iter()
+            .map(|(kind, r)| crate::AtcFreq {
+                kind: *kind,
+                khz: 121_000,
+                name: r.to_string(),
+            })
+            .collect(),
+        transition_level_ft: None,
+        allows_circuits: None,
+        pattern_sides: Vec::new(),
+    };
+    use crate::{FREQ_CLEARANCE as DEL, FREQ_GROUND as GND, FREQ_TOWER as TWR};
+    let egkk = field(
+        "London Gatwick",
+        &[(DEL, "Gatwick Delivery"), (GND, "Gatwick Ground"), (TWR, "Gatwick Tower")],
+    );
+    assert_eq!(egkk.position_name(DEL, "Delivery").as_deref(), Some("Gatwick Delivery"));
+    assert_eq!(egkk.position_name(GND, "Ground").as_deref(), Some("Gatwick Ground"));
+    let labels = field("Malaga", &[(DEL, "CLNC DEL"), (GND, "GND"), (TWR, "Tower Freq")]);
+    assert_eq!(labels.position_name(DEL, "Delivery").as_deref(), Some("Malaga Delivery"));
+    assert_eq!(labels.position_name(GND, "Ground").as_deref(), Some("Malaga Ground"));
+    let ksfo = field("San Francisco Intl", &[(DEL, "KSFO Clearance"), (GND, "San Francisco Ground")]);
+    assert_eq!(
+        ksfo.position_name(DEL, "Delivery").as_deref(),
+        Some("San Francisco Intl Delivery"),
+        "a label stem names nothing"
+    );
+    assert_eq!(ksfo.position_name(GND, "Ground").as_deref(), Some("San Francisco Ground"));
+    let sfo = field("San Francisco Intl", &[(DEL, "San Francisco Clearance Delivery")]);
+    assert_eq!(sfo.position_name(DEL, "Delivery").as_deref(), Some("San Francisco Clearance"));
+    assert_eq!(field("Gibraltar", &[(TWR, "Tower")]).position_name(GND, "Ground"), None);
+}

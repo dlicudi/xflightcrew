@@ -41,6 +41,12 @@ pub struct Order {
     /// The runway the tower has cleared this aircraft to cross ("cross
     /// runway one three"): the taxi goes on past the stop short of it.
     pub cross_cleared: Option<String>,
+    /// Ground has approved the push ("push and start approved, facing
+    /// west").
+    pub push_approved: bool,
+    /// The way Ground said the nose will face once pushed, degrees true;
+    /// `None` with no facing given (the aircraft picks its own).
+    pub push_facing: Option<f64>,
 }
 
 /// What a traffic aircraft is doing.
@@ -148,6 +154,12 @@ impl Plan {
 pub enum Call {
     /// Request taxi (out to the runway, or in to parking after a landing).
     Taxi,
+    /// On a nose-in stand, to Ground: "request push and start". `stand` is
+    /// the stand's name as drawn. Vocabulary only for now: the fleet's push
+    /// is owed (branch `wip-ground-push`).
+    PushStart {
+        stand: Option<String>,
+    },
     /// Ready for departure at the holding point.
     Ready,
     /// Inbound for landing, `miles` out, `from` a compass point.
@@ -201,6 +213,14 @@ impl Call {
         }
     }
 
+    /// The call is GROUND's business where the field has Ground: the push,
+    /// the taxi out and, off the runway, the taxi in (the station routes
+    /// each call to the position that owns it; this is the frequency it is
+    /// paced on).
+    pub fn to_ground(&self) -> bool {
+        matches!(self, Call::Taxi | Call::PushStart { .. } | Call::Vacated)
+    }
+
     /// Plain English, addressed to the tower: "Tower, Cessna three four
     /// five, ready for departure runway one three". `runway` is the
     /// aircraft's runway where the call names one.
@@ -210,6 +230,12 @@ impl Call {
             .unwrap_or_default();
         match self {
             Call::Taxi => format!("Tower, {spoken}, request taxi"),
+            Call::PushStart { stand } => match stand.as_deref().map(stand_words) {
+                Some(s) if !s.is_empty() => {
+                    format!("Ground, {spoken}, stand {s}, request push and start")
+                }
+                _ => format!("Ground, {spoken}, request push and start"),
+            },
             Call::Ready => format!("Tower, {spoken}, ready for departure{rwy}"),
             Call::Inbound { miles, from } => format!(
                 "Tower, {spoken}, {} miles {from}, inbound for landing",
@@ -262,6 +288,29 @@ impl Call {
             Call::Readback(text) => format!("{text}, {spoken}"),
         }
     }
+}
+
+/// A stand's name as said: "Stand 52" and "Gate 52" as "five two",
+/// "A7" as "A seven".
+pub fn stand_words(name: &str) -> String {
+    let bare = name.trim();
+    let bare = ["stand ", "gate ", "parking "]
+        .iter()
+        .find_map(|p| {
+            bare.get(..p.len())
+                .filter(|h| h.eq_ignore_ascii_case(p))
+                .map(|_| &bare[p.len()..])
+        })
+        .unwrap_or(bare);
+    let mut out: Vec<String> = Vec::new();
+    for c in bare.chars() {
+        match c.to_digit(10) {
+            Some(d) => out.push(DIGITS[d as usize].to_string()),
+            None if c.is_alphabetic() => out.push(c.to_ascii_uppercase().to_string()),
+            None => {}
+        }
+    }
+    out.join(" ")
 }
 
 const DIGITS: [&str; 10] = [

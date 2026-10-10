@@ -76,9 +76,14 @@ pub(super) struct HarnessScore {
     pub(super) tower_lines: usize,
     /// Every line the tower said: its answers and its runway watch's.
     pub(super) said: Vec<String>,
-    /// When each traffic transmission started (harness seconds), and
-    /// whether it was a safety call.
-    pub(super) keyed: Vec<(f64, bool)>,
+    /// Every traffic exchange as heard: the position that heard the call,
+    /// the call as addressed to it, and the answer.
+    pub(super) heard: Vec<(crate::voice::StationSpeaker, String, String)>,
+    /// The aerodrome positions' handoff lines (`world::traffic_position_tick`).
+    pub(super) position_lines: usize,
+    /// When each traffic transmission started (harness seconds), whether
+    /// it was a safety call, and the frequency it was keyed on.
+    pub(super) keyed: Vec<(f64, bool, crate::voice::StationSpeaker)>,
     pub(super) conflicts: Vec<String>,
     pub(super) oracle: Vec<String>,
     pub(super) unfinished: Vec<String>,
@@ -194,8 +199,10 @@ pub(super) fn fly_field(
         let out = link.tick(None, dt, now);
         s.tower_lines += out.tower.len();
         s.keyed
-            .extend(out.transmissions.iter().map(|tx| (t, tx.safety)));
+            .extend(out.transmissions.iter().map(|tx| (t, tx.safety, tx.on)));
         s.said.extend(out.tower.iter().map(|(_, l)| l.clone()));
+        s.said.extend(out.positions.iter().map(|(_, l, _)| l.clone()));
+        s.position_lines += out.positions.len();
         s.spawned
             .extend(out.spawned.iter().map(|(_, cs)| (t, cs.clone())));
         flying.extend(out.spawned.iter().map(|(id, _)| *id));
@@ -271,13 +278,20 @@ pub(super) fn fly_field(
         for line in out.tower.iter().filter(|_| trace) {
             println!("{t:7.1} TWR(tick) [{}] {}", line.0, line.1);
         }
+        for line in out.positions.iter().filter(|_| trace) {
+            println!("{t:7.1} {}(tick) [{}] {}", line.2.tag(), line.0, line.1);
+        }
         for call in crate::world::take_traffic_calls() {
             let reply = station.answer_traffic(&call);
             s.said.push(reply.line.clone());
+            s.heard.push((reply.speaker, reply.call.clone(), reply.line.clone()));
             if trace {
                 println!(
-                    "{t:7.1} [{}] {}\n{t:7.1}   TWR: {}",
-                    call.id, call.text, reply.line
+                    "{t:7.1} [{}] {}\n{t:7.1}   {}: {}",
+                    call.id,
+                    reply.call,
+                    reply.speaker.tag(),
+                    reply.line
                 );
             }
             // A readback is accepted when the tower no longer owes it.
@@ -471,12 +485,23 @@ fn assert_paced(s: &HarnessScore, what: &str) {
 }
 
 /// The first transmission (not a safety call) that started within
-/// [`CALL_GAP_S`] of the one before it: (the gap, when).
+/// [`CALL_GAP_S`] of the one before it ON ITS FREQUENCY: (the gap, when).
+/// Two positions are two frequencies: Ground's taxi call and the Tower's
+/// landing clearance may overlap, as they do.
 fn crowded(s: &HarnessScore) -> Option<(f64, f64)> {
-    s.keyed.windows(2).find_map(|w| {
-        let ((a, _), (b, safety)) = (w[0], w[1]);
-        (!safety && b - a < CALL_GAP_S - 1e-6).then_some((b - a, b))
-    })
+    let mut last: Vec<(crate::voice::StationSpeaker, f64)> = Vec::new();
+    for &(b, safety, on) in &s.keyed {
+        if let Some(e) = last.iter_mut().find(|(o, _)| *o == on) {
+            let a = e.1;
+            e.1 = b;
+            if !safety && b - a < CALL_GAP_S - 1e-6 {
+                return Some((b - a, b));
+            }
+        } else {
+            last.push((on, b));
+        }
+    }
+    None
 }
 
 /// The mean of `v` (0 for none).
@@ -554,6 +579,7 @@ fn an_order_maps_onto_the_fleet() {
         go_around: true,
         readback_owed: Some("Going around, Cessna".into()),
         crossing: Some("13".into()),
+        push: Some(Some(270.0)),
     };
     let m = map_order(&o);
     assert_eq!(m.state, traffic::TowerState::ClearedToLand);
@@ -563,6 +589,8 @@ fn an_order_maps_onto_the_fleet() {
     assert_eq!(m.follow, Some(4));
     assert!(m.go_around);
     assert_eq!(m.cross_cleared.as_deref(), Some("13"));
+    assert!(m.push_approved);
+    assert_eq!(m.push_facing, Some(270.0));
     let ours = crate::world::TrafficOrder {
         follow: Some(crate::party_line::FlightId::Own),
         ..o

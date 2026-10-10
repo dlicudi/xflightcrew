@@ -422,6 +422,22 @@ impl WorldTick {
                 );
             }
         }
+        // Ground's handoff at the holding point ("hold short runway two
+        // six left, contact Gatwick Tower on ..."): GROUND talking, heard
+        // only on Ground's frequency; the crew that works the radio takes
+        // it from the party line either way (`take_position_handoff`).
+        if let Some(line) = crate::world::ground_handoff_tick(snap.lat, snap.lon, snap.on_ground) {
+            if matches!(tuned_speaker, Some(crate::voice::StationSpeaker::Ground)) {
+                if let Some(s) = status.as_ref() {
+                    s.action(&format!("GND: {line}"));
+                }
+                voice.alert_station(
+                    Priority::Advisory,
+                    crate::voice::StationSpeaker::Ground,
+                    line,
+                );
+            }
+        }
         // Radar watch on an assigned squawk: "radar contact" once the
         // sim shows the code replying, "confirm squawk" nudges while
         // it doesn't. Transponder reads gated on an armed watch, so

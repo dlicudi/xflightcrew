@@ -34,6 +34,8 @@ pub(super) fn gatwick() -> Station {
         tower_khz: 124225,
         approach_khz: None,
         departure_khz: None,
+        ground_khz: None,
+        delivery_khz: None,
         desk: StripDesk::new(),
         desks: std::collections::BTreeMap::new(),
         runway_in_use: Some("26L".into()),

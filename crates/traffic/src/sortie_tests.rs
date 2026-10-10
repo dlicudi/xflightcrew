@@ -29,6 +29,7 @@ impl ScriptedTower {
         o.follow = self.follow.get(id).copied();
         match call {
             Call::Taxi | Call::Vacated => o.state = TowerState::TaxiCleared,
+            Call::PushStart { .. } => o.push_approved = true,
             Call::Ready => {
                 o.state = if self.line_up_and_wait && o.state != TowerState::LinedUp {
                     TowerState::LinedUp

@@ -31,7 +31,6 @@ use crate::voice::say_opt as announce;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
-const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 /// True heading — the rollout direction, so a vacate never picks an exit
 /// behind us (reaching one means taxiing back down the runway).
 const PSI_TRUE: &str = crate::datarefs::TRUE_HEADING_DEG;
@@ -613,10 +612,12 @@ async fn fly(
     // --- Phase two: the taxi-in proper, from wherever phase one left us. ---
     // Ask the tower for the taxi-in unless we already hold a stand clearance.
     if !stand_route_ready() {
-        if let Some(khz) = crate::party_line::home_tower_khz() {
-            // The crew radio only reaches the tuned station — tune the tower first.
-            let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+        if let Some(khz) = crate::party_line::home_ground_khz() {
+            // The crew radio only reaches the tuned station: tune GROUND first
+            // (the tower at a field without one), reading back the tower's
+            // "contact Ground" on the way.
             let callsign = crate::crew_radio::crew_callsign(&xp).await;
+            crate::crew_radio::work_position(&xp, &callsign, Some(khz)).await;
             crate::crew_radio::transmit(crate::crew_radio::radio_call(
                 &callsign,
                 "taxi to parking",

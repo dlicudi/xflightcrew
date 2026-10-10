@@ -211,6 +211,8 @@ pub(crate) fn station_say_again(field: &str, tag: &str) -> Option<String> {
         "TWR" => "Tower",
         "APP" => "Approach",
         "DEP" => "Departure",
+        "GND" => "Ground",
+        "DEL" => "Delivery",
         _ => return None,
     };
     let name = crate::party_line::spoken_airport(field).trim();
@@ -757,6 +759,8 @@ pub(crate) fn position_name(tag: &str) -> &'static str {
         "TWR" => "Tower",
         "APP" => "Approach",
         "DEP" => "Departure",
+        "GND" => "Ground",
+        "DEL" => "Delivery",
         "ATIS" => "ATIS",
         _ => "Traffic",
     }

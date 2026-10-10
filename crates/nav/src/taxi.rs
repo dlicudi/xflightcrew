@@ -699,6 +699,49 @@ impl TaxiNet {
         best.map(|(_, lane)| lane)
     }
 
+    /// [`TaxiNet::push_lane`], else a lane straight back off the stand to
+    /// the taxi network behind it: the nearest point of a taxiway (never a
+    /// runway) edge lying within 35 degrees of the tail and 15 to 150 m
+    /// away. Most contact stands draw no lead-in (EGKK: 6 of 193, EGLL 23
+    /// of 278 in the Global Airports apt.dat, 2026-10-10), and a nose-in
+    /// stand is pushed straight back onto its taxilane all the same.
+    /// `None` with neither.
+    pub fn push_lane_or_back(&self, lat: f64, lon: f64, psi_deg: f64) -> Option<Vec<(f64, f64)>> {
+        if let Some(lane) = self.push_lane(lat, lon, psi_deg) {
+            return Some(lane);
+        }
+        let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+        let xy = |p: (f64, f64)| ((p.1 - lon) * m_per_deg_lon, (p.0 - lat) * 111_320.0);
+        let tail = (psi_deg + 180.0).rem_euclid(360.0);
+        let mut best: Option<(f64, (f64, f64))> = None;
+        for e in self.edges.iter().filter(|e| !e.runway) {
+            let (Some(&a), Some(&b)) = (self.nodes.get(&e.a), self.nodes.get(&e.b)) else {
+                continue;
+            };
+            let (a, b) = (xy(a), xy(b));
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len2 = dx * dx + dy * dy;
+            if len2 < 0.25 {
+                continue;
+            }
+            let t = ((-a.0) * dx + (-a.1) * dy) / len2;
+            let t = t.clamp(0.0, 1.0);
+            let (px, py) = (a.0 + t * dx, a.1 + t * dy);
+            let d = px.hypot(py);
+            if !(15.0..=150.0).contains(&d) {
+                continue;
+            }
+            let brg = px.atan2(py).to_degrees().rem_euclid(360.0);
+            if sim::angles::abs_diff_deg(brg, tail) > 35.0 {
+                continue;
+            }
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, (lat + py / 111_320.0, lon + px / m_per_deg_lon)));
+            }
+        }
+        best.map(|(_, foot)| vec![(lat, lon), foot])
+    }
+
 
     /// Is this point on the field's drawn pavement? `None` when the field
     /// draws none, so a caller never reads "no data" as "grass".

@@ -247,10 +247,29 @@ pub fn suggest_call(
         .filter(|d| *d >= 2.0)
         .map(|d| format!("{:.0} miles out, ", d))
         .unwrap_or_default();
+    // Who the next call is for: on the ground the clearance is Delivery's
+    // (else Ground's), the taxi out and in Ground's, where the field has
+    // them (`station::positions`); everything else the tower's. The
+    // service's briefing word picks the "first tune" line.
+    let delivery = active_position(StationSpeaker::Delivery);
+    let ground = active_position(StationSpeaker::Ground);
+    let (clr_word, clr_name) = match (&delivery, &ground) {
+        (Some((n, _)), _) => ("clearance", n.clone()),
+        (None, Some((n, _))) => ("ground", n.clone()),
+        _ => ("tower", format!("{station} Tower")),
+    };
+    let ground_word = if ground.is_some() { "ground" } else { "tower" };
+    let svc = match (state, on_ground) {
+        (None, true) => clr_word,
+        (Some(tower::State::Parked), true)
+        | (Some(tower::State::ClearedToLand), true)
+        | (Some(tower::State::Inbound), true) => ground_word,
+        _ => "tower",
+    };
     let call = match (state, on_ground) {
         // Never talked to this station: the full initial call.
         (None, true) => {
-            format!("{station} Tower, {callsign}{info}, request departure clearance.")
+            format!("{clr_name}, {callsign}{info}, request departure clearance.")
         }
         (None, false) | (Some(tower::State::Parked), false) => {
             format!("{station} Tower, {callsign}, {pos}inbound{info}, request join.")
@@ -305,8 +324,8 @@ pub fn suggest_call(
     // chronological next action — once in contact the tower's own QNH
     // covers you), everything else the frequency check.
     let first = match state {
-        None => atis_first().or_else(|| tune_first("tower")),
-        _ => tune_first("tower"),
+        None => atis_first().or_else(|| tune_first(svc)),
+        _ => tune_first(svc),
     };
     Some(Suggestion {
         first,

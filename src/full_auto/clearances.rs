@@ -160,7 +160,9 @@ pub(crate) async fn get_zone_clearance(
     {
         return;
     }
-    if let Some(khz) = crate::party_line::home_tower_khz() {
+    // The clearance is the CLEARANCE position's: Delivery, else Ground,
+    // else the tower (EGKK lists all three, 2026-10-10).
+    if let Some(khz) = crate::party_line::home_clearance_khz() {
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
     }
     if let Some(dest) = ifr_dest {
@@ -207,6 +209,35 @@ pub(crate) async fn get_zone_clearance(
         radio_readback(rb.trim_end_matches('.').to_string(), true);
         event("clearance_readback", json!({}));
     }
+}
+
+/// Ask Ground for the push where the field has a Ground of its own and a
+/// station answers: "request push back" on Ground's frequency, then a
+/// bounded wait for the approval ("push back approved, facing west"). The
+/// push itself is flown as before whatever the answer (crew RADIO work
+/// only: the frozen push loop is not touched); a push nobody approved is
+/// blackboxed. Returns whether it was approved.
+pub(super) async fn request_push(xp: &XPlaneClient, callsign: &Option<String>) -> bool {
+    if !crate::mode::atc_enabled() {
+        return false;
+    }
+    let Some((_, khz)) = crate::party_line::ground_position() else {
+        return false;
+    };
+    crate::crew_radio::work_position(xp, callsign, Some(khz)).await;
+    radio_out(crate::crew_radio::radio_call(callsign, "request push back"));
+    event("request_push", json!({ "khz": khz }));
+    waiting("the push approval");
+    let approved = wait_until(90.0, 500, || async {
+        crate::party_line::push_approved().is_some()
+    })
+    .await;
+    event(
+        "push_approval",
+        json!({ "approved": approved,
+                "facing": crate::party_line::push_approved().flatten().map(f64::round) }),
+    );
+    approved
 }
 
 /// The zone clearance call from the ramp: "for circuits" on a circuit, so
@@ -270,7 +301,7 @@ pub(super) async fn zone_clearance_from_the_strip(
     {
         return;
     }
-    if let Some(khz) = crate::party_line::home_tower_khz() {
+    if let Some(khz) = crate::party_line::home_clearance_khz() {
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
     }
     let owed_before = crate::party_line::readback_owed();

@@ -14,8 +14,18 @@ impl Station {
         wx: Wx,
     ) -> String {
         self.sync_landing_release();
+        // A call on the wrong aerodrome position's frequency is told where
+        // to call, and nothing else happens (`Station::redirect`).
+        if let Some(line) = self.redirect(service, &intent, ctx) {
+            return line;
+        }
+        self.note_working(service);
+        // "Request push and start" asks for both; "request push back" the
+        // push alone (`Station::push_line`).
+        self.desk.call.push_start = intent == tower::Intent::RequestPushback
+            && transcript.to_lowercase().contains("start");
         let was = self.desk.twr.state;
-        if service == Service::Tower {
+        if service.aerodrome() {
             self.note_departure_intent(&intent, transcript);
         }
         // A zone request from circuit traffic (noted just above, from THIS
@@ -23,7 +33,7 @@ impl Station {
         // never leaves the zone (LEMG 13, sorties 1790590663 and 1790591256,
         // 2026-09-28: "for circuits" got "cleared to leave the Malaga zone").
         let circuit_ctx;
-        let ctx = if service == Service::Tower
+        let ctx = if service.aerodrome()
             && intent == tower::Intent::RequestClearance
             && self.desk.circuits
         {
@@ -46,7 +56,7 @@ impl Station {
         // IFR clearance and then the taxi clearance both said "QNH one zero
         // one seven"). Asked for ("say QNH", a wind check), it is said.
         let qnh_ctx;
-        let ctx = if service == Service::Tower
+        let ctx = if service.aerodrome()
             && !ctx.qnh.is_empty()
             && self.desk.qnh_given.as_deref() == Some(ctx.qnh.as_str())
             && intent != tower::Intent::WindCheck
@@ -66,7 +76,7 @@ impl Station {
         // whoever has the scope.
         let assigned_ctx;
         // A declined circuit is cleared for nothing, so it is given no code.
-        let ctx = if service == Service::Tower
+        let ctx = if service.aerodrome()
             && intent == tower::Intent::RequestClearance
             && !declined
             && self.desk.assigned_squawk.is_none()
@@ -92,7 +102,7 @@ impl Station {
         // the tower asks again.
         let ifr_ctx;
         let ctx = match (&intent, service) {
-            (tower::Intent::RequestIfrClearance { dest: Some(d) }, Service::Tower) => {
+            (tower::Intent::RequestIfrClearance { dest: Some(d) }, s) if s.aerodrome() => {
                 match self.ifr_offer(d, ctx) {
                     Some(offer) => {
                         ifr_ctx = tower::Ctx {
@@ -108,19 +118,24 @@ impl Station {
             _ => ctx,
         };
         let reply = self.respond_inner(transcript, service, intent.clone(), ctx, wx);
-        let reply = if service == Service::Tower {
+        let reply = if service.aerodrome() {
+            self.position_reply(service, &intent, ctx, reply)
+        } else {
+            reply
+        };
+        let reply = if service.aerodrome() {
             self.state_runway_change(&intent, ctx, reply)
         } else {
             reply
         };
-        let reply = if service == Service::Tower {
+        let reply = if service.aerodrome() {
             self.note_pressure_given(ctx, reply)
         } else {
             reply
         };
         // A granted runway request makes that runway the one in use; the
         // taxi (or the join) it bought freezes the pick on it from here.
-        if service == Service::Tower && intent == tower::Intent::RequestRunway {
+        if service.aerodrome() && intent == tower::Intent::RequestRunway {
             if let Some(ident) = self.desk.call.requested_ident.take() {
                 if ctx.runway_refusal.is_none() && self.traffic_may_set_runway() {
                     tracing::info!(runway = %ident, "runway request granted");
@@ -131,7 +146,7 @@ impl Station {
         // A crossing the tower cleared is noted on the strip: the flight's
         // order view reads it, and it stands until the flight is seen off
         // the strip it crossed.
-        if service == Service::Tower && intent == tower::Intent::RequestCrossing {
+        if service.aerodrome() && intent == tower::Intent::RequestCrossing {
             let cleared = ctx.on_ground && ctx.crossing.as_ref().is_some_and(|c| c.1.is_none());
             if let Some(end) = self.desk.call.crossing_ident.take().filter(|_| cleared) {
                 let cell = &self.desk.strip.crossing;
@@ -158,7 +173,7 @@ impl Station {
         // The landing sequence as the tower just said it: a downwind report
         // is told its number (and, behind a named arrival, whom it follows);
         // a flight no longer Inbound has no place in it.
-        if service == Service::Tower {
+        if service.aerodrome() {
             let mut seq = self.desk.strip.sequence.lock().unwrap_or_else(|e| e.into_inner());
             if intent == tower::Intent::ReportDownwind && ctx.sequence_ahead.is_some() {
                 let n = ctx.sequence_ahead.as_ref().map_or(2, |(n, _)| *n);
@@ -178,7 +193,7 @@ impl Station {
         // or elsewhere retires it. A final report onto an occupied runway
         // ("continue approach", tower.rs) arms it, for the monitor's watch
         // to release once the strip clears (`landing_hold_tick`).
-        if service == Service::Tower {
+        if service.aerodrome() {
             if self.desk.twr.state != tower::State::Inbound || intent == tower::Intent::GoAround {
                 *self.desk.strip.landing_hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
@@ -207,7 +222,7 @@ impl Station {
         // first": it is a taxi clearance with a route like any other (#178).
         let taxi_first =
             intent == tower::Intent::RequestTakeoff && was != tower::State::TaxiCleared;
-        if service == Service::Tower
+        if service.aerodrome()
             && (matches!(intent, tower::Intent::RequestTaxi | tower::Intent::RequestRunway)
                 || taxi_first)
             && self.desk.twr.state == tower::State::TaxiCleared
@@ -229,7 +244,7 @@ impl Station {
         // The arrival taxi-in publishes its stand route the same way, so the
         // crew's auto_taxi drives it to parking. `was` is the pre-transition
         // state (a "request taxi" right after landing is an arrival too).
-        if service == Service::Tower
+        if service.aerodrome()
             && (intent == tower::Intent::RequestTaxiIn
                 || (intent == tower::Intent::RequestTaxi && was == tower::State::ClearedToLand))
         {
@@ -256,7 +271,7 @@ impl Station {
         // position, traffic on the runway" at +50 with nothing to release it).
         let runway_start_held =
             was == tower::State::Parked && self.desk.twr.state == tower::State::LinedUp;
-        if service == Service::Tower
+        if service.aerodrome()
             && intent == tower::Intent::RequestTakeoff
             && (matches!(
                 was,
@@ -322,7 +337,7 @@ impl Station {
         // cleared for takeoff" 1.2 s into the resume), a release the main
         // loop has not synced yet, the conditional line-up's condition and
         // the after-departure handoff.
-        if service == Service::Tower
+        if service.aerodrome()
             && intent == tower::Intent::RejectingTakeoff
             && ctx.on_ground
             && matches!(was, tower::State::TakeoffCleared | tower::State::LinedUp)
@@ -338,7 +353,7 @@ impl Station {
         // flight holding short or on the runway WITHOUT a clearance. Any
         // other state (cleared, parked, inbound) or a reject retires it, so
         // it can never replay a clearance nobody is waiting for.
-        if service == Service::Tower
+        if service.aerodrome()
             && (intent == tower::Intent::RejectingTakeoff
                 || !matches!(
                     self.desk.twr.state,
@@ -461,11 +476,11 @@ impl Station {
             return self.cancel_ifr(ctx);
         }
         // A SID amendment is the IFR book's too, and the tower's to give.
-        if intent == tower::Intent::RequestSid && service == Service::Tower {
+        if intent == tower::Intent::RequestSid && service.aerodrome() {
             return self.amend_sid(transcript, ctx);
         }
         match service {
-            Service::Tower => {
+            Service::Tower | Service::Ground | Service::Delivery => {
                 let was = self.desk.twr.state;
                 let going_around = intent == tower::Intent::GoAround;
                 let reply = self.desk.twr.handle(intent.clone(), ctx);
@@ -574,6 +589,7 @@ impl Station {
             | tower::Intent::CancelIfr
             | tower::Intent::RequestSid
             | tower::Intent::RequestStartup
+            | tower::Intent::RequestPushback
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestIfrClearance { .. }
             | tower::Intent::RequestTransit
@@ -1101,6 +1117,7 @@ impl Station {
             | tower::Intent::CancelIfr
             | tower::Intent::RequestSid
             | tower::Intent::RequestStartup
+            | tower::Intent::RequestPushback
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestIfrClearance { .. }
             | tower::Intent::RequestTransit

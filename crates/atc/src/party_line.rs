@@ -36,6 +36,7 @@ use crate::nav;
 use crate::station::{
     ClearanceSnap, ComplianceFlight, Handoff, LandingHold, SquawkWatch, TakeoffHold, VectorPlan,
 };
+use crate::speaker::StationSpeaker;
 use crate::tower;
 
 // ---- published state (world-side writes live in station.rs) ----
@@ -193,6 +194,24 @@ flight_strip! {
             /// after being on it (`station::note_aircraft_state_for`). Read by
             /// a traffic flight's order view (`world::traffic_order`).
             crossing: Mutex<Option<(String, bool)>> = Mutex::new(None),
+            /// The aerodrome position working this flight (Delivery, Ground or
+            /// the Tower: views of one station), as last answered or handed
+            /// to. Ground's handoff at the holding point reads it, and a
+            /// traffic flight's readback goes back to it (the
+            /// ONE-frequency rule: a read back is said on the frequency
+            /// that gave the instruction).
+            working: Mutex<Option<StationSpeaker>> = Mutex::new(None),
+            /// A "contact X on F" an aerodrome position said to this flight
+            /// (Ground at the holding point, the Tower once vacated, a call
+            /// on the wrong position's frequency): the position's name as
+            /// keyed and its frequency, consumed by the crew that works the
+            /// radio, which reads it back and retunes.
+            position_handoff: Mutex<Option<(String, i64)>> = Mutex::new(None),
+            /// Ground approved the push ("push and start approved, facing
+            /// west"): the way the nose will face once pushed, degrees true
+            /// (`None` inside the `Some`: approved without a facing, no drawn
+            /// lane to read one from).
+            push_approved: Mutex<Option<Option<f64>>> = Mutex::new(None),
         },
         /// The station's own worksheets for this flight at this field: reset by
         /// `install`, `uninstall` and `retire_for_new_flight`. `self_taxi` is the
@@ -765,6 +784,53 @@ pub fn line_up_condition_clear() -> Option<bool> {
 /// radio reads it back, retunes, and checks in.
 pub fn take_departure_handoff() -> Option<(String, i64)> {
     lock(&OWN_STRIP.departure_handoff).take()
+}
+
+/// Consume a "contact X on F" an aerodrome position said to us (Ground at
+/// the holding point, the Tower once we vacated, a call on the wrong
+/// position's frequency): the position's name and its frequency in kHz.
+/// The crew that works the radio reads it back and retunes.
+pub fn take_position_handoff() -> Option<(String, i64)> {
+    lock(&OWN_STRIP.position_handoff).take()
+}
+
+/// Ground has approved our push: `Some(facing)` (degrees true, `None`
+/// inside when no facing was given), `None` until it has.
+pub fn push_approved() -> Option<Option<f64>> {
+    *lock(&OWN_STRIP.push_approved)
+}
+
+/// The installed station's own Ground position, where the field publishes
+/// one: its name as keyed and its frequency (kHz). `None` without one (the
+/// tower works the ground) or without a station in reach.
+pub fn ground_position() -> Option<(String, i64)> {
+    if crate::station::station_unavailable() {
+        return None;
+    }
+    crate::station::active_position(StationSpeaker::Ground)
+}
+
+/// The installed station's GROUND position's frequency (kHz): push, start
+/// and taxi. The tower's where the field has no Ground; `None` without a
+/// station in reach.
+pub fn home_ground_khz() -> Option<i64> {
+    if crate::station::station_unavailable() {
+        return None;
+    }
+    crate::station::active_position(StationSpeaker::Ground)
+        .map(|(_, k)| k)
+        .or_else(crate::station::active_tower_khz)
+}
+
+/// The installed station's CLEARANCE position's frequency (kHz): Delivery,
+/// else Ground, else the tower; `None` without a station in reach.
+pub fn home_clearance_khz() -> Option<i64> {
+    if crate::station::station_unavailable() {
+        return None;
+    }
+    crate::station::active_position(StationSpeaker::Delivery)
+        .map(|(_, k)| k)
+        .or_else(home_ground_khz)
 }
 
 /// Consume the enroute handoff the region watch spoke: the tower to call, its

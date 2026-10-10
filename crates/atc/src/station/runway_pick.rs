@@ -34,6 +34,7 @@ impl Station {
             _ => None,
         };
         self.desk.call.crossing_ident = None;
+        self.desk.call.push_facing = None;
     }
 
     /// The caller of the stated runway stands ON that strip, on the ground:

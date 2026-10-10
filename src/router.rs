@@ -212,6 +212,8 @@ pub(crate) fn atc_recall_line(
             let who = match l.speaker {
                 crate::voice::StationSpeaker::Approach => "Approach",
                 crate::voice::StationSpeaker::Departure => "Departure",
+                crate::voice::StationSpeaker::Ground => "Ground",
+                crate::voice::StationSpeaker::Delivery => "Delivery",
                 _ => "Tower",
             };
             format!("{who} said: {}", l.text)

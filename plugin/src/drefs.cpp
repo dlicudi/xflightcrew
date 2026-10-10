@@ -663,11 +663,13 @@ static void WriteAction(void*, void* in, int offset, int len) {
         g_action.len -= 1;
         ambient = true;
     }
-    // A station prefix ("TWR: " / "APP: " / "DEP: " / "ATIS: ") is attribution,
+    // A station prefix ("TWR: " / "GND: " / "APP: " / "ATIS: "...) is attribution,
     // not content: strip it and tag the row with the SPECIFIC position, so the
     // transcript names which controller spoke. Everything else is the crew.
     static const struct { const char* prefix; const char* tag; } kStations[] = {
         {"TWR: ", "TOWER"}, {"APP: ", "APP"}, {"DEP: ", "DEP"}, {"ATIS: ", "ATIS"},
+        // The ground positions (apt.dat 1052/1053): their own chips.
+        {"GND: ", "GROUND"}, {"DEL: ", "DELIVERY"},
         // Party-line traffic: the ghost pilots' side of the frequency. Spelled
         // out on the panel (every other tag is a plain speaker name).
         {"TFC: ", "TRAFFIC"},
