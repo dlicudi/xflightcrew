@@ -886,6 +886,13 @@ pub async fn run(
                 // channels (EGPH 2026-09-20: two "recycle transponder" calls,
                 // nobody answered). Crew hands only; on its own task, since a
                 // stepped knob takes a few hundred milliseconds.
+                // An instrument arrival's approach clearance and its handoff
+                // between approach and the tower: drained every pass, worked
+                // by the crew while full auto flies (`full_auto::arrival_radio`).
+                crate::full_auto::arrival_radio_tick(
+                    &config.xplane_base_url,
+                    crate::full_auto::running() && crate::mode::crew_actuates(),
+                );
                 if let Some(nudge) = crate::party_line::take_squawk_nudge() {
                     if crate::mode::crew_actuates() {
                         let base = config.xplane_base_url.clone();

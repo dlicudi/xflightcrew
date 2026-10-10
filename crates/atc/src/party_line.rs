@@ -34,7 +34,8 @@ use std::time::Instant;
 
 use crate::nav;
 use crate::station::{
-    ClearanceSnap, ComplianceFlight, Handoff, LandingHold, SquawkWatch, TakeoffHold, VectorPlan,
+    ApproachWatch, ClearanceSnap, ComplianceFlight, Handoff, LandingHold, SquawkWatch,
+    TakeoffHold, VectorPlan,
 };
 use crate::tower;
 
@@ -119,6 +120,17 @@ flight_strip! {
             pending_landing_release: Mutex<Option<(String, String)>> = Mutex::new(None),
             /// An armed vectors-to-final plan: the approach controller's worksheet.
             vectors: Mutex<Option<VectorPlan>> = Mutex::new(None),
+            /// An instrument arrival APPROACH cleared on its own navigation
+            /// ("cleared ILS approach runway two six left, report established"),
+            /// watched until it is seen established, when approach hands it to
+            /// the tower even if the pilot never reports (`approach_watch_tick_for`).
+            /// No headings: the crew flies its procedure, the pilot the ILS.
+            approach_watch: Mutex<Option<ApproachWatch>> = Mutex::new(None),
+            /// The approach clearance just given to OUR instrument arrival, in the
+            /// crew's readback words ("descending altitude four thousand feet,
+            /// cleared ILS approach runway two six left"): the crew that works the
+            /// radio reads it back once ([`take_approach_readback`]).
+            approach_readback: Mutex<Option<String>> = Mutex::new(None),
             /// Set when the monitor speaks the released takeoff clearance; the main
             /// loop consumes it and syncs the tower FSM to what was said on frequency.
             pending_takeoff_clearance: Mutex<bool> = Mutex::new(false),
@@ -151,6 +163,13 @@ flight_strip! {
             /// frequency, armed once when the line goes out and consumed by the crew
             /// that works the radio.
             departure_handoff: Mutex<Option<(String, i64)>> = Mutex::new(None),
+            /// An arrival's handoff between approach and the tower: approach
+            /// handing an established instrument arrival to the tower, the tower
+            /// sending an instrument arrival that called it too early (or off a
+            /// missed approach) back to approach. Armed as the line goes out,
+            /// consumed by the crew that works the radio ([`take_arrival_handoff`]):
+            /// read back, retune, call the next unit.
+            arrival_handoff: Mutex<Option<ArrivalHandoff>> = Mutex::new(None),
             /// The zone watch challenged us on the frequency ("aircraft in the Granada
             /// control zone, you are inside controlled airspace without clearance, say
             /// callsign and intentions"): the tower has never heard from this aircraft
@@ -241,6 +260,13 @@ flight_strip! {
             /// [`note_aircraft`]: the go-around judgement's distance and time to the
             /// threshold. Cleared on the ground.
             own_fixes: Mutex<std::collections::VecDeque<(f64, f64, Instant)>> = Mutex::new(std::collections::VecDeque::new()),
+            /// The crew flies a published instrument approach on a plan
+            /// ([`declare_instrument_arrival`]): the station works it as an
+            /// instrument arrival (approach first, the missed approach on a
+            /// go-around) though it holds no IFR clearance and is no airline.
+            /// The FLIGHT's: it is declared before the destination's station is
+            /// installed, so `install` must not reset it.
+            instrument_declared: AtomicBool = AtomicBool::new(false),
         },
         /// The installed station's watches over this flight: reset by `install`
         /// and `uninstall`, never by `retire_for_new_flight` (`go_around_last`
@@ -781,6 +807,70 @@ pub fn take_region_handoff() -> Option<RegionHandoff> {
 /// it came from, and a challenge nobody answered is not kept for a later one.
 pub fn take_zone_challenge() -> bool {
     std::mem::take(&mut *lock(&OWN_STRIP.zone_challenge))
+}
+
+/// An arrival handed between approach and the tower, as the controller
+/// said it: the unit to call ("Gatwick Tower"), its frequency, and what the
+/// crew says on it once tuned.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrivalHandoff {
+    /// The unit, as spoken ("Gatwick Tower", "Gatwick Approach").
+    pub to: String,
+    pub khz: i64,
+    /// To the TOWER (approach handing over an established arrival); false is
+    /// back to APPROACH (called too early, or off a missed approach).
+    pub to_tower: bool,
+    /// Back to approach off a missed approach: the check-in is "missed
+    /// approach", never a fresh inbound.
+    pub missed: bool,
+    /// The runway the arrival is cleared toward, spoken ("two six left").
+    pub runway_spoken: String,
+    /// The approach is an ILS: the tower is told "established ILS runway
+    /// ...", else "final runway ...".
+    pub ils: bool,
+}
+
+/// Consume the arrival handoff a controller just spoke (see
+/// [`ArrivalHandoff`]). Drained by the crew's tick every pass, acted on
+/// only by a crew that works the radio.
+pub fn take_arrival_handoff() -> Option<ArrivalHandoff> {
+    lock(&OWN_STRIP.arrival_handoff).take()
+}
+
+/// Consume approach's clearance to our instrument arrival, in readback
+/// words (see `OWN_STRIP.approach_readback`).
+pub fn take_approach_readback() -> Option<String> {
+    lock(&OWN_STRIP.approach_readback).take()
+}
+
+/// Approach has cleared us on our own navigation and still owes the tower
+/// handoff: our "established" report is approach's to hear.
+pub fn approach_watch_armed() -> bool {
+    lock(&OWN_STRIP.approach_watch).is_some()
+}
+
+/// The crew flies a published approach on its plan: the station works this
+/// flight as an instrument arrival (`OWN_STRIP.instrument_declared`). Set by
+/// the crew's inbound call, the flight's until a new flight or uninstall.
+pub fn declare_instrument_arrival(on: bool) {
+    OWN_STRIP.instrument_declared.store(on, Ordering::SeqCst);
+}
+
+/// Will the station work our flight, under `callsign`, as an INSTRUMENT
+/// arrival (approach first, a missed approach on a go-around): IFR, an
+/// airline, or declared by the crew. The crew asks before choosing whom to
+/// call inbound, so the two sides can never disagree.
+pub fn own_instrument_arrival(callsign: &str) -> bool {
+    crate::station::instrument_arrival(&OWN_STRIP, callsign)
+}
+
+/// The active station's approach frequency, when its field has one and the
+/// station reaches us: where an instrument arrival checks in first.
+pub fn active_approach_khz() -> Option<i64> {
+    if crate::station::station_unavailable() {
+        return None;
+    }
+    crate::station::active_approach_khz()
 }
 
 /// The callsign under approach vectors, if a plan is armed.

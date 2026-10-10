@@ -406,6 +406,17 @@ pub(crate) fn active_tower_khz() -> Option<i64> {
         .map(|(k, _)| *k)
 }
 
+/// The active station's APPROACH frequency, when its field publishes one
+/// (apt.dat 1055): where an instrument arrival checks in before the tower.
+pub(crate) fn active_approach_khz() -> Option<i64> {
+    CONTROLLER_FREQS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(_, s)| matches!(s, StationSpeaker::Approach))
+        .map(|(k, _)| *k)
+}
+
 /// The active station's panel identity — name, field elevation, published
 /// services — for the radio row and the ATC tab. Published by
 /// [`Station::install`], like the rest of the side state.
