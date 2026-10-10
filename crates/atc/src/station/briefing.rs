@@ -103,7 +103,8 @@ pub fn freq_query(t: &str) -> bool {
 
 impl Station {
     /// The spoken frequency briefing: every service this field publishes, plus
-    /// what COM1 is on right now (named when it matches a service). Pure —
+    /// what COM1 is on right now (named when it matches a service), the
+    /// frequencies in the field's dialect ("point" at an FAA field, #263). Pure:
     /// the caller reads COM1 (see [`Station::freq_briefing`]) so this tests
     /// without a simulator.
     pub fn briefing_text(&self, com1_khz: Option<i64>) -> String {
@@ -112,7 +113,7 @@ impl Station {
             .filter_map(|(word, kind)| {
                 self.apt
                     .freq(*kind)
-                    .map(|f| format!("{word} {}", atis::spoken_mhz(f.khz)))
+                    .map(|f| format!("{word} {}", atis::spoken_mhz_in(f.khz, self.dialect)))
             })
             .collect();
         let mut line = if parts.is_empty() {
@@ -145,7 +146,7 @@ impl Station {
                 .copied();
             line.push_str(&match tuned {
                 Some(w) => format!(" Com one is on the {w}."),
-                None => format!(" Com one is on {}.", atis::spoken_mhz(com1)),
+                None => format!(" Com one is on {}.", atis::spoken_mhz_in(com1, self.dialect)),
             });
         }
         line
@@ -187,13 +188,13 @@ impl Station {
         match tuned {
             Some("atis") => format!(
                 "That's the ATIS, it only broadcasts. Call {apt} {word}, {}.",
-                atis::spoken_mhz(khz)
+                atis::spoken_mhz_in(khz, self.dialect)
             ),
             Some(w) if w != word => format!(
                 "Nobody's manning {w} here. Call {apt} {word}, {}.",
-                atis::spoken_mhz(khz)
+                atis::spoken_mhz_in(khz, self.dialect)
             ),
-            _ => format!("Try {apt} {word} on {}.", atis::spoken_mhz(khz)),
+            _ => format!("Try {apt} {word} on {}.", atis::spoken_mhz_in(khz, self.dialect)),
         }
     }
 

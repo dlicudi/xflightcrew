@@ -446,6 +446,17 @@ pub(crate) fn active_approach_khz() -> Option<i64> {
 pub(super) type ActivePanel = (String, f64, Vec<(String, i64)>);
 pub(super) static ACTIVE_PANEL: Mutex<Option<ActivePanel>> = Mutex::new(None);
 
+/// The installed station's phraseology dialect, for the lines spoken
+/// outside a `Station` method (the coach's suggested calls, the off-route
+/// correction): an FAA field's are FAA (#263). Published by
+/// [`Station::install`] with the panel.
+pub(super) static ACTIVE_DIALECT: Mutex<Dialect> = Mutex::new(Dialect::Icao);
+
+/// The installed station's dialect ([`ACTIVE_DIALECT`]).
+pub(super) fn active_dialect() -> Dialect {
+    *ACTIVE_DIALECT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A field's position by its code, from the field directory (any land
 /// field) or the region index: the crew's EFB map draws the plan's origin,
 /// destination and alternate by it. `None` until the index has loaded.

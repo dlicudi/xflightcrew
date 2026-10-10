@@ -242,6 +242,7 @@ fn tuned_station_resolves_controllers_and_the_atis() {
         airport: "Jerez".into(),
         runways: Vec::new(),
         letter: 'A',
+        dialect: Dialect::Icao,
         edition: None,
         last_spoken: None,
     });
@@ -3778,6 +3779,7 @@ fn the_coach_leads_with_the_prerequisite() {
         airport: "Gibraltar".into(),
         runways: Vec::new(),
         letter: 'A',
+        dialect: Dialect::Icao,
         edition: None,
         last_spoken: None,
     });
@@ -3952,6 +3954,7 @@ fn wx(wind_deg: f64, wind_kts: f64, qnh: f64) -> AtisWx {
         visibility_sm: 10.0,
         qnh_hpa: qnh,
         oat_c: 22.0,
+        dewpoint_c: None,
     }
 }
 
@@ -3963,6 +3966,7 @@ fn atis_loops_while_tuned_and_cuts_editions_on_real_change() {
         airport: "Gibraltar".into(),
         runways: Vec::new(),
         letter: 'A',
+        dialect: Dialect::Icao,
         edition: None,
         last_spoken: None,
     });
@@ -5181,6 +5185,7 @@ fn having_the_current_information_skips_the_qnh() {
         airport: "Gibraltar".into(),
         runways: Vec::new(),
         letter: 'A',
+        dialect: Dialect::Icao,
         edition: None,
         last_spoken: None,
     });
@@ -10304,6 +10309,7 @@ fn the_pressure_is_given_once_and_the_atis_named_once() {
         airport: "Gibraltar".into(),
         runways: Vec::new(),
         letter: 'B',
+        dialect: Dialect::Icao,
         edition: Some(atis::Snapshot {
             airport: "Gibraltar".into(),
             zulu_sec: 0.0,
@@ -10313,6 +10319,7 @@ fn the_pressure_is_given_once_and_the_atis_named_once() {
             visibility_sm: 10.0,
             qnh_hpa: 1017.0,
             oat_c: 20.0,
+            dewpoint_c: None,
         }),
         last_spoken: None,
     });
@@ -10508,4 +10515,123 @@ fn real_install_lfpg_off_strip_stand_route_needs_no_crossing() {
     let plan = stand_route_avoiding(&net, &st.apt.runways, lat, lon, None, &far).expect("a route");
     println!("{} {:?} via {:?}", plan.holding_point, plan.crossings, plan.via);
     assert!(plan.crossings.is_empty(), "{:?}", plan.crossings);
+}
+
+/// #263: the COACH speaks the field's dialect, and every FAA suggestion
+/// parses as the ICAO one it replaces (a coached call the tower cannot
+/// hear is the coach's own failure mode): "holding short runway ... at
+/// ...", "inbound for landing", "clear of runway ...", "point" frequencies.
+#[test]
+fn the_coach_speaks_the_fields_dialect() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    *ACTIVE_PANEL.lock().unwrap() = Some((
+        "Boston".into(),
+        20.0,
+        vec![("tower".to_string(), 128_800_i64)],
+    ));
+    *ATIS.lock().unwrap() = None;
+    let cs = "November one seven two Sierra Papa";
+    let snap = |state| ClearanceSnap {
+        state,
+        callsign: cs.into(),
+        runway_ident: "27".into(),
+        pending_readback: None,
+        holds_runway: false,
+    };
+    *OWN_STRIP.taxi_route.lock().unwrap() = Some(TaxiWatch {
+        path: vec![(42.36, -71.0), (42.36, -71.01)],
+        via: "Alpha".into(),
+        seg: vec![("A".into(), false)],
+        holding_point: "A1".into(),
+        lead_on: vec![],
+    });
+    let both = |state: Option<tower::State>, on_ground: bool| {
+        *OWN_STRIP.clearance.lock().unwrap() = state.map(snap);
+        let mut out = Vec::new();
+        for d in [Dialect::Icao, Dialect::Faa] {
+            *ACTIVE_DIALECT.lock().unwrap() = d;
+            let s = suggest_call(cs, on_ground, Some(6.0), Some(121_500)).expect("a suggestion");
+            out.push((s.call.expect("a call"), s.first.unwrap_or_default()));
+        }
+        out
+    };
+    let ready = both(Some(tower::State::TaxiCleared), true);
+    assert!(ready[0].0.contains("holding point Alpha one"), "{:?}", ready[0]);
+    assert_eq!(
+        ready[1].0,
+        format!("{cs}, holding short runway two seven at Alpha one, ready for departure.")
+    );
+    assert!(ready[1].1.contains("one two eight point eight"), "{:?}", ready[1]);
+    assert!(ready[0].1.contains("one two eight decimal eight"), "{:?}", ready[0]);
+    let inbound = both(None, false);
+    assert!(inbound[1].0.contains("inbound for landing"), "{:?}", inbound[1]);
+    assert!(!inbound[1].0.contains("join"), "{:?}", inbound[1]);
+    let vacated = both(Some(tower::State::ClearedToLand), true);
+    assert_eq!(
+        vacated[1].0,
+        format!("{cs}, clear of runway two seven, request taxi to parking.")
+    );
+    for pair in [&ready, &vacated, &inbound] {
+        assert_eq!(
+            tower::parse_intent(&pair[0].0),
+            tower::parse_intent(&pair[1].0),
+            "{pair:?}"
+        );
+    }
+    *ACTIVE_DIALECT.lock().unwrap() = Dialect::Icao;
+    *OWN_STRIP.clearance.lock().unwrap() = None;
+    *OWN_STRIP.taxi_route.lock().unwrap() = None;
+}
+
+/// #263: the off-route correction at an FAA field holds short of the
+/// runway, never "holding point".
+#[test]
+fn the_off_route_correction_holds_short_at_an_faa_field() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.1512, -5.3554));
+    *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+    *ACTIVE_DIALECT.lock().unwrap() = Dialect::Faa;
+    *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
+        state: tower::State::TaxiCleared,
+        callsign: "November one seven two Sierra Papa".into(),
+        runway_ident: "09".into(),
+        pending_readback: None,
+        holds_runway: false,
+    });
+    *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
+    *OWN_STRIP.taxi_route.lock().unwrap() = Some(TaxiWatch {
+        path: vec![(36.1600, -5.3600), (36.1600, -5.3500)],
+        via: "Alpha, Bravo".into(),
+        seg: vec![("A".into(), false)],
+        holding_point: "A1".into(),
+        lead_on: vec![],
+    });
+    let t0 = Instant::now();
+    let sec = std::time::Duration::from_secs;
+    assert!(compliance_tick(36.1600, -5.3600, 15.0, true, 0.0, true, t0).is_none());
+    let call = compliance_tick(36.1580, -5.3550, 15.0, true, 12.0, true, t0 + sec(2))
+        .expect("off-route nudge");
+    assert!(
+        call.line.ends_with("Taxi via Alpha, Bravo, hold short of runway zero niner."),
+        "{}",
+        call.line
+    );
+    assert!(!call.line.contains("holding point"), "{}", call.line);
+    *ACTIVE_DIALECT.lock().unwrap() = Dialect::Icao;
+    *OWN_STRIP.taxi_route.lock().unwrap() = None;
+    *OWN_STRIP.clearance.lock().unwrap() = None;
+    *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    *OWN_STRIP.compliance_flight.lock().unwrap() = ComplianceFlight::NEW;
+    *ACTIVE_FIELD.lock().unwrap() = None;
+}
+
+/// #263: the frequency briefing reads "point" at an FAA field.
+#[test]
+fn the_frequency_briefing_reads_the_fields_dialect() {
+    let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
+    assert!(st.briefing_text(None).contains("decimal"), "{}", st.briefing_text(None));
+    st.set_dialect(Dialect::Faa);
+    let b = st.briefing_text(None);
+    assert!(b.contains("point") && !b.contains("decimal"), "{b}");
 }

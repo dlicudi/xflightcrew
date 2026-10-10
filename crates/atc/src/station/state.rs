@@ -279,6 +279,7 @@ pub(super) struct FieldFacts {
     controller_freqs: Vec<(i64, StationSpeaker)>,
     position_names: Vec<(StationSpeaker, String)>,
     active_panel: Option<ActivePanel>,
+    active_dialect: Dialect,
     active_runways: Vec<nav::Runway>,
     atis: Option<AtisState>,
     compliance: ComplianceState,
@@ -293,6 +294,7 @@ impl FieldFacts {
         "CONTROLLER_FREQS",
         "POSITION_NAMES",
         "ACTIVE_PANEL",
+        "ACTIVE_DIALECT",
         "ACTIVE_RUNWAYS",
         "ATIS",
         "COMPLIANCE",
@@ -306,6 +308,7 @@ impl FieldFacts {
             controller_freqs: Vec::new(),
             position_names: Vec::new(),
             active_panel: None,
+            active_dialect: Dialect::Icao,
             active_runways: Vec::new(),
             atis: None,
             compliance: ComplianceState::NEW,
@@ -340,6 +343,7 @@ impl FieldFacts {
                 airport: st.apt.radio_name(),
                 runways: st.apt.runways.clone(),
                 letter: 'A',
+                dialect: st.dialect,
                 edition: None,
                 last_spoken: None,
             }
@@ -353,6 +357,7 @@ impl FieldFacts {
             controller_freqs,
             position_names: st.position_names(),
             active_panel: Some((st.apt.name.clone(), st.apt.elev_ft, services(&st.apt))),
+            active_dialect: st.dialect,
             active_runways: st.apt.runways.clone(),
             atis,
             // Zone-watch grace on a fresh station: a region handoff says
@@ -375,6 +380,7 @@ impl FieldFacts {
             controller_freqs,
             position_names,
             active_panel,
+            active_dialect,
             active_runways,
             atis,
             compliance,
@@ -384,6 +390,7 @@ impl FieldFacts {
         *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = controller_freqs;
         *POSITION_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = position_names;
         *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) = active_panel;
+        *ACTIVE_DIALECT.lock().unwrap_or_else(|e| e.into_inner()) = active_dialect;
         *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = active_runways;
         *ATIS.lock().unwrap_or_else(|e| e.into_inner()) = atis;
         *COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner()) = compliance;

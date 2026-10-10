@@ -81,9 +81,13 @@ pub(super) struct HarnessScore {
     pub(super) heard: Vec<(crate::voice::StationSpeaker, String, String)>,
     /// The aerodrome positions' handoff lines (`world::traffic_position_tick`).
     pub(super) position_lines: usize,
-    /// When each traffic transmission started (harness seconds), whether
-    /// it was a safety call, and the frequency it was keyed on.
-    pub(super) keyed: Vec<(f64, bool, crate::voice::StationSpeaker)>,
+    /// When each traffic transmission started (fleet seconds), whether
+    /// it was a safety call, the frequency it was keyed on, and when that
+    /// frequency was reckoned clear after it (fleet seconds).
+    pub(super) keyed: Vec<(f64, bool, crate::voice::StationSpeaker, f64)>,
+    /// How long each call (not a safety call) waited for a clear
+    /// frequency, fleet seconds (#260: the radio's pace costs time).
+    pub(super) waits: Vec<f64>,
     pub(super) conflicts: Vec<String>,
     pub(super) oracle: Vec<String>,
     pub(super) unfinished: Vec<String>,
@@ -229,8 +233,18 @@ pub(super) fn fly_field_hours(
         let now = epoch + Duration::from_secs_f64(t);
         let out = link.tick(None, dt, now);
         s.tower_lines += out.tower.len();
-        s.keyed
-            .extend(out.transmissions.iter().map(|tx| (t, tx.safety, tx.on)));
+        let fleet_s = link.fleet().clock.now_s();
+        s.keyed.extend(
+            out.transmissions
+                .iter()
+                .map(|tx| (fleet_s, tx.safety, tx.on, tx.clear_s)),
+        );
+        s.waits.extend(
+            out.transmissions
+                .iter()
+                .filter(|tx| !tx.safety)
+                .map(|tx| tx.waited_s),
+        );
         s.said.extend(out.tower.iter().map(|(_, l)| l.clone()));
         s.said.extend(out.positions.iter().map(|(_, l, _)| l.clone()));
         s.position_lines += out.positions.len();
@@ -654,28 +668,30 @@ fn assert_clean_but_towed(s: &HarnessScore, what: &str) {
 }
 
 /// The frequency was never crowded: no traffic transmission but a safety
-/// call started within [`CALL_GAP_S`] of the one before it.
+/// call keyed before the exchange ahead of it had cleared and the least
+/// gap ([`KEY_GAP_S`]) had run.
 fn assert_paced(s: &HarnessScore, what: &str) {
     if let Some((gap, at)) = crowded(s) {
         panic!("{what}: two transmissions {gap:.2} s apart at {at:.1} s");
     }
 }
 
-/// The first transmission (not a safety call) that started within
-/// [`CALL_GAP_S`] of the one before it ON ITS FREQUENCY: (the gap, when).
-/// Two positions are two frequencies: Ground's taxi call and the Tower's
-/// landing clearance may overlap, as they do.
+/// The first transmission (not a safety call) keyed ON ITS FREQUENCY
+/// before the exchange ahead of it (the call, the controller's beat and
+/// answer) had cleared and [`KEY_GAP_S`]'s least gap had run: (its gap
+/// after the clear, when). Two positions are two frequencies: Ground's taxi
+/// call and the Tower's landing clearance may overlap, as they do.
 fn crowded(s: &HarnessScore) -> Option<(f64, f64)> {
-    let mut last: Vec<(crate::voice::StationSpeaker, f64)> = Vec::new();
-    for &(b, safety, on) in &s.keyed {
-        if let Some(e) = last.iter_mut().find(|(o, _)| *o == on) {
+    let mut clear: Vec<(crate::voice::StationSpeaker, f64)> = Vec::new();
+    for &(b, safety, on, until) in &s.keyed {
+        if let Some(e) = clear.iter_mut().find(|(o, _)| *o == on) {
             let a = e.1;
-            e.1 = b;
-            if !safety && b - a < CALL_GAP_S - 1e-6 {
+            e.1 = a.max(until);
+            if !safety && b - a < KEY_GAP_S.0 - 1e-6 {
                 return Some((b - a, b));
             }
         } else {
-            last.push((on, b));
+            clear.push((on, until));
         }
     }
     None
@@ -784,13 +800,14 @@ fn an_order_maps_onto_the_fleet() {
     assert_eq!(map_order(&ours).follow, None, "ours is no traffic id");
 }
 
-/// THE FREQUENCY'S PACE (the spec's "speech flood" risk): one traffic
-/// transmission started per [`CALL_GAP_S`], the rest waiting in the order
-/// made (a readback first), a call already waiting not queued twice, a
-/// departed flight's calls gone with it, and a safety call (a go-around,
-/// its acknowledgement) never held and never dropped.
+/// THE FREQUENCY'S TURNS (#260): a call keys only once the exchange ahead
+/// of it has cleared (its airtime, the controller's 1 to 3 s beat and
+/// answer) and its own 1 to 4 s gap has run; the rest wait in the order
+/// made (a readback first); a call already waiting is not queued twice, a
+/// departed flight's calls go with it, and a safety call (a go-around, its
+/// acknowledgement) is never held.
 #[test]
-fn the_traffic_frequency_keys_one_call_per_gap_and_never_holds_a_go_around() {
+fn the_traffic_frequency_keys_only_once_it_is_clear_and_never_holds_a_go_around() {
     let mut ob = Outbox::default();
     ob.push(1, Call::Taxi);
     ob.push(2, Call::Ready);
@@ -798,20 +815,44 @@ fn the_traffic_frequency_keys_one_call_per_gap_and_never_holds_a_go_around() {
     ob.push(2, Call::Ready);
     assert_eq!(ob.waiting(), 3, "the same call is not queued twice");
     assert_eq!(ob.due(0.0), vec![(1, Call::Taxi)]);
-    assert!(ob.due(1.0).is_empty(), "inside the gap");
-    // A readback made now goes before the older requests.
+    let tower = crate::voice::StationSpeaker::Tower;
+    let clear = ob.clear_at(tower).unwrap();
+    // "Tower, November one two three, request taxi": 6 words, then the
+    // beat and the reckoned answer.
+    let call = airtime_s("Tower, November one two three, request taxi");
+    assert!(
+        clear >= call + REPLY_BEAT_S.0 + 4.0 && clear <= call + REPLY_BEAT_S.1 + 6.0,
+        "{clear}"
+    );
+    let mut t = 0.25;
+    while t < clear + KEY_GAP_S.0 {
+        assert!(ob.due(t).is_empty(), "keyed into the exchange at {t}");
+        t += 0.25;
+    }
+    // A readback made now goes before the older requests, once clear.
     ob.push(
         4,
         Call::Readback("Cleared to land runway two seven, N4.".into()),
     );
+    let mut keyed = Vec::new();
+    while keyed.is_empty() {
+        keyed = ob.due(t);
+        t += 0.25;
+    }
+    assert!(t - 0.25 <= clear + KEY_GAP_S.1 + 0.25, "{t}");
     assert_eq!(
-        ob.due(CALL_GAP_S),
+        keyed,
         vec![(
             4,
             Call::Readback("Cleared to land runway two seven, N4.".into())
         )]
     );
-    // A go-around keys at once, inside the gap, and the gap runs from it.
+    // A readback is answered with silence: the frequency clears after its
+    // own airtime.
+    let after_rb = ob.clear_at(tower).unwrap();
+    assert!(after_rb - (t - 0.25) < 6.0, "{after_rb} {t}");
+    // A go-around keys at once, inside the exchange, and the next caller
+    // waits it out.
     ob.push(5, Call::GoingAround);
     ob.push(6, Call::Readback("Going around, N6.".into()));
     assert!(is_safety_call(&Call::GoingAround));
@@ -819,20 +860,163 @@ fn the_traffic_frequency_keys_one_call_per_gap_and_never_holds_a_go_around() {
         "Cleared to land, N4.".into()
     )));
     assert_eq!(
-        ob.due(CALL_GAP_S + 0.5),
+        ob.due(t),
         vec![
             (5, Call::GoingAround),
             (6, Call::Readback("Going around, N6.".into()))
         ]
     );
-    assert!(
-        ob.due(2.0 * CALL_GAP_S).is_empty(),
-        "the gap from the go-around"
-    );
+    let after_ga = ob.clear_at(tower).unwrap();
+    assert!(after_ga > t + 4.0, "the go-around's exchange: {after_ga}");
+    assert!(ob.due(after_ga).is_empty(), "the gap after the go-around");
     // A flight that left takes its calls with it; the rest go in order.
     ob.forget(2);
-    assert_eq!(ob.due(2.0 * CALL_GAP_S + 0.5), vec![(3, Call::Downwind)]);
+    assert_eq!(ob.due(after_ga + KEY_GAP_S.1), vec![(3, Call::Downwind)]);
     assert_eq!(ob.waiting(), 0);
+}
+
+/// TWO CALLS NEVER OVERLAP ON ONE FREQUENCY: a crowd of calls on the
+/// Tower and on Ground, stepped at the link's tick: on each frequency every
+/// call keys after the exchange ahead has cleared and at least the least
+/// gap, never more than the longest gap later while one waits; the two
+/// frequencies never wait on each other.
+#[test]
+fn two_traffic_calls_never_overlap_on_one_frequency() {
+    use crate::voice::StationSpeaker as P;
+    let mut ob = Outbox::default();
+    for id in 0..8u32 {
+        ob.push_on(
+            id,
+            Call::Inbound {
+                miles: 8,
+                from: "south".into(),
+            },
+            P::Tower,
+            0.0,
+        );
+        ob.push_on(100 + id, Call::Taxi, P::Ground, 0.0);
+    }
+    let mut keyed: Vec<(f64, Keyed)> = Vec::new();
+    let mut t = 0.0;
+    while t < 400.0 {
+        let air = |_: u32, c: &Call| airtime_s(&c.text("Speedbird one two three", None));
+        for k in ob.due_on(t, air) {
+            keyed.push((t, k));
+        }
+        t += 0.25;
+    }
+    assert_eq!(keyed.len(), 16, "everyone keyed");
+    for on in [P::Tower, P::Ground] {
+        let mine: Vec<&(f64, Keyed)> = keyed.iter().filter(|(_, k)| k.on == on).collect();
+        assert!(mine[0].0 < 0.25, "{on:?} keys at once");
+        for w in mine.windows(2) {
+            let (prev, next) = (&w[0].1, w[1].0);
+            assert!(
+                next >= prev.clear_s + KEY_GAP_S.0 - 1e-9,
+                "{on:?}: keyed at {next} into an exchange clear at {}",
+                prev.clear_s
+            );
+            assert!(
+                next <= prev.clear_s + KEY_GAP_S.1 + 0.25 + 1e-9,
+                "{on:?}: waited past its gap: {next} after {}",
+                prev.clear_s
+            );
+        }
+    }
+    // Ground's first taxi did not wait on the Tower's first inbound.
+    let first = |on: P| keyed.iter().find(|(_, k)| k.on == on).map(|(t, _)| *t);
+    assert_eq!(first(P::Tower), first(P::Ground));
+}
+
+/// OUR PILOT IS NEVER STEPPED ON: while our own transmission is on the
+/// frequency (the link notes it every tick), no traffic call keys there;
+/// after it the tower's beat and a gap run first. Another position's
+/// traffic keys as before.
+#[test]
+fn a_traffic_call_waits_out_our_pilots_transmission() {
+    use crate::voice::StationSpeaker as P;
+    let mut ob = Outbox::default();
+    let air = |_: u32, c: &Call| airtime_s(&c.text("November one", None));
+    let mut t = 0.0;
+    let mut keyed: Vec<(f64, P)> = Vec::new();
+    while t < 60.0 {
+        // The pilot keys on the Tower from 2 to 9 s.
+        if (2.0..9.0).contains(&t) {
+            ob.occupy(P::Tower, t + OWN_TAIL_S);
+        }
+        if (t - 3.0).abs() < 1e-9 {
+            ob.push_on(1, Call::Final, P::Tower, t);
+            ob.push_on(2, Call::Taxi, P::Ground, t);
+        }
+        keyed.extend(ob.due_on(t, air).into_iter().map(|k| (t, k.on)));
+        t += 0.25;
+    }
+    let at = |on: P| {
+        keyed
+            .iter()
+            .find(|(_, o)| *o == on)
+            .map(|(t, _)| *t)
+            .unwrap()
+    };
+    // The last tick held was 8.75 s: clear at 11.75 s, then its gap.
+    assert!(at(P::Tower) >= 8.75 + OWN_TAIL_S, "{}", at(P::Tower));
+    assert!(
+        at(P::Tower) <= 8.75 + OWN_TAIL_S + KEY_GAP_S.1,
+        "{}",
+        at(P::Tower)
+    );
+    assert_eq!(at(P::Ground), 3.0, "Ground's frequency was clear");
+}
+
+/// A QUEUED LINE OVERTAKEN BY EVENTS (#260, t=1791477548): only a
+/// withdrawn clearance overtakes a line; the strip moving on, or closing,
+/// does not; a go-around order is never overtaken by its own go-around.
+#[test]
+fn a_line_is_overtaken_only_by_a_withdrawn_clearance() {
+    use crate::tower::State as S;
+    let mark = |state, runway: &str, go_around| StripMark {
+        state,
+        runway: runway.into(),
+        go_around,
+    };
+    let landing = mark(S::ClearedToLand, "27", false);
+    assert_eq!(
+        overtaken(&landing, Some(&mark(S::Inbound, "27", false))),
+        Some("went_around")
+    );
+    assert_eq!(
+        overtaken(&landing, Some(&mark(S::ClearedToLand, "27", true))),
+        Some("go_around_ordered")
+    );
+    assert_eq!(overtaken(&landing, Some(&landing)), None);
+    assert_eq!(
+        overtaken(&landing, Some(&mark(S::Parked, "27", false))),
+        None,
+        "landed and taxiing in"
+    );
+    assert_eq!(overtaken(&landing, None), None, "handed off and gone");
+    let takeoff = mark(S::TakeoffCleared, "27", false);
+    assert_eq!(
+        overtaken(&takeoff, Some(&mark(S::LinedUp, "27", false))),
+        Some("takeoff_cancelled")
+    );
+    let lined = mark(S::LinedUp, "27", false);
+    assert_eq!(overtaken(&lined, Some(&takeoff)), None, "moving on");
+    assert_eq!(
+        overtaken(&lined, Some(&mark(S::TaxiCleared, "27", false))),
+        Some("line_up_cancelled")
+    );
+    let taxi = mark(S::TaxiCleared, "27", false);
+    assert_eq!(
+        overtaken(&taxi, Some(&mark(S::TaxiCleared, "09", false))),
+        Some("runway_changed")
+    );
+    // The order to go around, aired after the flight acknowledged it.
+    let order = mark(S::ClearedToLand, "27", true);
+    assert_eq!(
+        overtaken(&order, Some(&mark(S::Inbound, "27", false))),
+        None
+    );
 }
 
 /// A FIELD HOUR: the generated schedule at XTST (circuits and ATR 72
@@ -1107,7 +1291,8 @@ fn real_install_traffic_world_sweep_inner() {
             "{icao}: {} scheduled, {} completed, {} calls, {} readbacks ({} accepted), \
              {} conflicts, {} oracle, spacing {}/{}/{} rerouted/towed/held, closest {:.2} of the spacing, \
              {} overlaps, {} go-arounds, runway {:.0} s over {} landings, \
-             final gap {:.1}/{:.1} nm min/median over {}",
+             final gap {:.1}/{:.1} nm min/median over {}, \
+             calls waited {:.1}/{:.1} s median/max",
             s.movements,
             s.completed,
             s.calls,
@@ -1125,7 +1310,9 @@ fn real_install_traffic_world_sweep_inner() {
             s.runway_s.len(),
             min_median(&s.final_gap_nm).0,
             min_median(&s.final_gap_nm).1,
-            s.final_gap_nm.len()
+            s.final_gap_nm.len(),
+            min_median(&s.waits).1,
+            s.waits.iter().copied().fold(0.0, f64::max)
         );
         println!(
             "    departures: {} off a stand parked from the start, {} turned round, {} from nothing; \

@@ -145,6 +145,11 @@ pub fn suggest_call(
     dist_nm: Option<f64>,
     com1_khz: Option<i64>,
 ) -> Option<Suggestion> {
+    // The field's phraseology (#263): an FAA field's coach says "point"
+    // frequencies, "holding short", "inbound for landing", "clear of the
+    // runway", as its controllers do.
+    let dialect = active_dialect();
+    let faa = dialect == Dialect::Faa;
     let (station, services) = {
         let p = ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner());
         let (name, _, svcs) = p.as_ref()?;
@@ -178,7 +183,8 @@ pub fn suggest_call(
     let tune_first = |svc: &str| -> Option<String> {
         let com1 = com1_khz?;
         let (_, khz) = services.iter().find(|(w, _)| w == svc)?;
-        ((com1 - khz).abs() > 5).then(|| format!("First tune {svc}, {}.", atis::spoken_mhz(*khz)))
+        ((com1 - khz).abs() > 5)
+            .then(|| format!("First tune {svc}, {}.", atis::spoken_mhz_in(*khz, dialect)))
     };
     // Approach's side of the picture, airborne only (a plan on the ground is
     // stale — vector_tick clears it on touchdown).
@@ -236,7 +242,7 @@ pub fn suggest_call(
         let a = ATIS.lock().unwrap_or_else(|e| e.into_inner());
         a.as_ref()
             .filter(|a| a.edition.is_none())
-            .map(|a| format!("First copy the ATIS on {}.", atis::spoken_mhz(a.khz)))
+            .map(|a| format!("First copy the ATIS on {}.", atis::spoken_mhz_in(a.khz, dialect)))
     };
     let rwy = clr
         .as_ref()
@@ -271,6 +277,9 @@ pub fn suggest_call(
         (None, true) => {
             format!("{clr_name}, {callsign}{info}, request departure clearance.")
         }
+        (None, false) | (Some(tower::State::Parked), false) if faa => {
+            format!("{station} Tower, {callsign}, {pos}inbound for landing{info}.")
+        }
         (None, false) | (Some(tower::State::Parked), false) => {
             format!("{station} Tower, {callsign}, {pos}inbound{info}, request join.")
         }
@@ -284,6 +293,14 @@ pub fn suggest_call(
                 .as_ref()
                 .map(|r| spoken_taxiway(&r.holding_point));
             match (hp, &rwy) {
+                // FAA (AIM 4-3-14): the hold is the runway's, the taxiway
+                // where it is.
+                (Some(h), Some(r)) if faa => {
+                    format!("{callsign}, holding short runway {r} at {h}, ready for departure.")
+                }
+                (_, Some(r)) if faa => {
+                    format!("{callsign}, holding short runway {r}, ready for departure.")
+                }
                 (Some(h), Some(r)) => {
                     format!("{callsign}, holding point {h}, runway {r}, ready for departure.")
                 }
@@ -316,6 +333,12 @@ pub fn suggest_call(
             None => format!("Cleared to land, {callsign}."),
         },
         // On the ground as an arrival: get off the runway and home.
+        (Some(tower::State::ClearedToLand), true) | (Some(tower::State::Inbound), true) if faa => {
+            match &rwy {
+                Some(r) => format!("{callsign}, clear of runway {r}, request taxi to parking."),
+                None => format!("{callsign}, clear of the runway, request taxi to parking."),
+            }
+        }
         (Some(tower::State::ClearedToLand), true) | (Some(tower::State::Inbound), true) => {
             format!("{callsign}, runway vacated, request taxi to parking.")
         }
