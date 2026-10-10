@@ -436,6 +436,19 @@ pub(super) async fn drive(
     // A join the nose cannot point at is judged once, at the first fix
     // ([`JoinTurn`]).
     let mut join_turn_judged = false;
+    // The traffic guard (`traffic_guard`): our size from the mass the join
+    // turn reads too, the picture read once a second (the sim's TCAS table
+    // is five Web API reads), the hold's state. No picture, no guard.
+    let own_size = OwnSize::from_mtow(
+        xp.get_float(crate::datarefs::ACF_M_MAX_KG)
+            .await
+            .ok()
+            .map(f64::from),
+    );
+    let mut traffic_track = TrafficTrack::default();
+    let mut traffic_seen: Vec<Seen> = Vec::new();
+    let mut traffic_read_at: Option<std::time::Instant> = None;
+    let mut traffic_hold = TrafficHold::default();
     loop {
         // The tick runs to its period, not sleep + work (`DRIVE_TICK_MS`).
         let pacer = sim::state::Pacer::start();
@@ -656,6 +669,47 @@ pub(super) async fn drive(
             // asked for is not a stall.
             progress_hold();
         }
+        // Traffic on the route ahead: stop the taxi gap behind it and wait,
+        // never drive into it, never steer round it. The drive drove into
+        // an AI airliner standing at a holding point, the two aircraft
+        // drawn inside each other (pilot's screenshot, 2026-10-10): it
+        // never read the traffic picture.
+        if traffic_read_at.is_none_or(|t| t.elapsed().as_secs_f64() >= TRAFFIC_READ_S) {
+            traffic_read_at = Some(std::time::Instant::now());
+            let picture = crate::world::targets(xp.view()).await;
+            traffic_seen = traffic_track.update(&picture, clock_s());
+        }
+        let traffic_ahead = route.traffic_ahead(progress, gs_ms, &own_size, &traffic_seen);
+        let (traffic_cap, traffic_ev) = traffic_hold.step(traffic_ahead.as_ref(), clock_s());
+        if let Some(ev) = &traffic_ev {
+            let rec = match ev {
+                HoldEvent::Began {
+                    callsign,
+                    gap_m,
+                    along_m,
+                    crossing,
+                } => serde_json::json!({
+                    "event": "traffic_hold", "callsign": callsign, "gap_m": gap_m,
+                    "along_m": along_m, "crossing": crossing, "progress_m": progress,
+                    "remaining_m": remaining, "gs": gs_ms * MS_TO_KTS}),
+                HoldEvent::Long { callsign, held_s } => serde_json::json!({
+                    "event": "traffic_hold_long", "callsign": callsign, "held_s": held_s}),
+                HoldEvent::Cleared { callsign, held_s } => serde_json::json!({
+                    "event": "traffic_clear", "callsign": callsign, "held_s": held_s,
+                    "progress_m": progress}),
+            };
+            tracing::info!(?ev, "auto taxi: traffic");
+            crate::blackbox::record("autotaxi", rec);
+            if let Some(line) = hold_line(ev) {
+                alert(&voice, Priority::Advisory, line);
+            }
+        }
+        // Slowed or stopped by traffic is no stall: the progress clock and
+        // the stagnation watch both stand aside, however long it takes.
+        let traffic_slowed = traffic_cap.is_some_and(|c| c < TRAFFIC_EXCUSES_BELOW_KTS);
+        if traffic_slowed {
+            progress_hold();
+        }
         DETAIL.set(format!(
             "{} m to go",
             (remaining.max(0.0) / 10.0).round() as i64 * 10
@@ -860,7 +914,7 @@ pub(super) async fn drive(
         // The window covers the governor's ramp to its BREAKAWAY ceiling
         // (`speedhold::taxi_throttle_cap`), about 20 s from idle at its
         // usual step: judged at 20 s the 172 at LIPK was still at 0.35.
-        if !ext_stopped && gs_kts < 0.7 {
+        if !ext_stopped && !traffic_slowed && gs_kts < 0.7 {
             let t0 = *stalled_since.get_or_insert_with(std::time::Instant::now);
             if t0.elapsed().as_secs_f64() > STAGNANT_SECS {
                 let thr_dref = throttle_dataref();
@@ -1060,6 +1114,13 @@ pub(super) async fn drive(
         if let Some(g) = ground_rec {
             drive_rec["gsteer"] = g;
         }
+        // The traffic the guard is keeping behind, while there is any.
+        if let Some(a) = &traffic_ahead {
+            drive_rec["traffic"] = serde_json::json!({
+                "callsign": a.callsign, "along_m": a.along_m, "gap_m": a.gap_m,
+                "stop_in_m": a.stop_in_m, "crossing": a.crossing, "cap": traffic_cap,
+                "held": traffic_hold.holding()});
+        }
         // The tiller as written, where the airframe has one.
         if let Some(c) = tiller.command(steer, gs_kts) {
             drive_rec["tiller"] = serde_json::json!(c);
@@ -1120,6 +1181,11 @@ pub(super) async fn drive(
             // about where the aircraft actually is, and the join cap lets go
             // too early to cover it.
             sched = sched.min(route.pace.track_cap_kts(lateral, err));
+            // The traffic ahead, through the same one writer: held on
+            // TRAFFIC_HOLD_KTS, idle and brakes like every other wait.
+            if let Some(c) = traffic_cap {
+                sched = sched.min(c);
+            }
             if (sched - last_sched).abs() > 0.01 {
                 speedhold::set_taxi_target(sched);
                 last_sched = sched;
