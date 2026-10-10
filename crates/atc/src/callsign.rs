@@ -403,6 +403,16 @@ pub(crate) const TELEPHONY: &[(&str, &str)] = &[
     ("PIA", "Pakistan"),
     ("WJA", "WestJet"),
     ("PGT", "Sunturk"),
+    // Our own traffic's carriers (`traffic::airlines`, 2026-10-10): every
+    // one the tables fly has its telephony here, or the tower reads its
+    // go-around as a circuit's and the frequency misses it.
+    ("TVF", "France Soleil"),
+    ("ITY", "Itarrow"),
+    ("HOP", "Air Hop"),
+    ("IBS", "Iberexpres"),
+    ("NBT", "Norstar"),
+    ("SWA", "Southwest"),
+    ("ASA", "Alaska"),
 ];
 
 /// IATA two-letter prefixes. LiveTraffic's flight ids arrive this way

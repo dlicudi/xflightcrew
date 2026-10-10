@@ -107,6 +107,18 @@ pub(super) struct HarnessScore {
     /// quarter of their two lengths (one driven through another, or two on
     /// one stand). Each pair once per spell.
     pub(super) overlaps: Vec<String>,
+    /// Every aircraft seen, spawned or parked, by its airline's letters
+    /// (`GA` for a registration) and type: the field's carrier and fleet mix.
+    pub(super) mix: BTreeMap<String, usize>,
+    /// Departures released off a stand they stood on from the start, off
+    /// a stand an arrival of the hour turned round on, and spawned there
+    /// from nothing.
+    pub(super) dep_parked: usize,
+    pub(super) dep_turned: usize,
+    pub(super) dep_fresh: usize,
+    /// Arrivals that turned round on their stand (the rest lingered and
+    /// went: `despawns["Parked"]`).
+    pub(super) turned: usize,
 }
 
 /// A station for `icao` from `apt` with its taxi network loaded, installed.
@@ -147,8 +159,21 @@ fn install_apt() -> String {
 pub(super) fn fly_field(
     station: &mut Station,
     field: FieldModel,
+    schedule: Vec<Movement>,
+    max_s: f64,
+) -> HarnessScore {
+    fly_field_hours(station, field, schedule, max_s, false)
+}
+
+/// [`fly_field`], and with `more_hours` the next generated hours too while
+/// `max_s` lasts, as the live link flies them (the world sweep's longer
+/// windows: the turnarounds leave in them).
+pub(super) fn fly_field_hours(
+    station: &mut Station,
+    field: FieldModel,
     mut schedule: Vec<Movement>,
     max_s: f64,
+    more_hours: bool,
 ) -> HarnessScore {
     let name = crate::party_line::spoken_airport(station.airport_name()).to_string();
     let parked = traffic::park_at_start(
@@ -159,6 +184,8 @@ pub(super) fn fly_field(
         &mut schedule,
     );
     schedule.extend(parked);
+    let zulu0 = sweep_ctx(&field).zulu_s;
+    let mut hours: u32 = 1;
     let mut link = Link::new(field, schedule, &name);
     let mut s = HarnessScore {
         movements: link.pending(),
@@ -172,6 +199,10 @@ pub(super) fn fly_field(
     let mut seen_ids: HashSet<u32> = HashSet::new();
     // Every flight given its movement (spawned, or released off its stand).
     let mut flying: HashSet<u32> = HashSet::new();
+    // Who stood parked from the start, and who came in as an arrival: where
+    // a departure's airframe came from.
+    let mut parked_ids: HashSet<u32> = HashSet::new();
+    let mut arrived: HashSet<u32> = HashSet::new();
     let trace = std::env::var("XVL_TRAFFIC_TRACE").is_ok_and(|v| !v.is_empty());
     s.closest_share = f64::INFINITY;
     let mut overlapping: HashSet<(u32, u32)> = HashSet::new();
@@ -188,6 +219,37 @@ pub(super) fn fly_field(
         s.said.extend(out.tower.iter().map(|(_, l)| l.clone()));
         s.spawned
             .extend(out.spawned.iter().map(|(_, cs)| (t, cs.clone())));
+        for (id, _) in out.parked.iter().chain(&out.spawned) {
+            let Some(ac) = link.fleet().get(*id) else {
+                continue;
+            };
+            if !seen_ids.contains(id) {
+                let entry = traffic::wire::roster_entry(ac);
+                let code = if entry.airline.is_empty() {
+                    "GA".to_string()
+                } else {
+                    entry.airline
+                };
+                *s.mix.entry(format!("{code} {}", ac.icao_type)).or_default() += 1;
+            }
+            seen_ids.insert(*id);
+            match ac.plan {
+                traffic::Plan::Arrival { .. } => {
+                    arrived.insert(*id);
+                }
+                traffic::Plan::Departure { .. } if out.spawned.iter().any(|(i, _)| i == id) => {
+                    if arrived.contains(id) {
+                        s.dep_turned += 1;
+                    } else if parked_ids.contains(id) {
+                        s.dep_parked += 1;
+                    } else {
+                        s.dep_fresh += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        parked_ids.extend(out.parked.iter().map(|(id, _)| *id));
         flying.extend(out.spawned.iter().map(|(id, _)| *id));
         s.parked_at_start += out.parked.len();
         for ev in &out.events {
@@ -215,6 +277,12 @@ pub(super) fn fly_field(
                     if let Call::Readback(rb) = call {
                         readbacks.entry(*id).or_default().push(rb.clone());
                     }
+                }
+                // An arrival parked and turned round on its stand: its
+                // flight is done (it lingered and went, before 2026-10-10).
+                Event::TurnedRound { .. } => {
+                    s.completed += 1;
+                    s.turned += 1;
                 }
                 Event::Touchdown { .. } => s.touchdowns += 1,
                 Event::SpacingRerouted { .. }
@@ -299,7 +367,28 @@ pub(super) fn fly_field(
             }
         }
         closeness(&link, t, &mut s, &mut overlapping);
-        if link.pending() == 0 && link.active() == 0 {
+        // A window past the hour flies the next generated hours as the live
+        // link does (`TrafficWorld::tick`): the turnarounds leave in them.
+        let horizon = traffic::schedule::HORIZON_S;
+        if link.pending() == 0
+            && t >= f64::from(hours) * horizon
+            && more_hours
+            && t + horizon / 2.0 < max_s
+        {
+            hours += 1;
+            let zulu = zulu0.map(|z| (z + t) % 86_400.0);
+            let ms = next_hour(
+                link.fleet(),
+                Density::Normal,
+                u64::from(hours) + 2,
+                None,
+                zulu,
+            );
+            s.movements += ms.len();
+            link.add_schedule(ms, link.fleet().clock.now_s());
+        }
+        if link.pending() == 0 && link.active() == 0 && (!more_hours || t + horizon / 2.0 >= max_s)
+        {
             break;
         }
     }
@@ -318,6 +407,34 @@ pub(super) fn fly_field(
     }
     let _ = seen_ids;
     s
+}
+
+/// A field's mix in one line: each carrier's share of every aircraft
+/// seen, then its types, the biggest first.
+fn mix_line(mix: &BTreeMap<String, usize>) -> String {
+    let total: usize = mix.values().sum();
+    let mut by_code: BTreeMap<&str, (usize, Vec<(&str, usize)>)> = BTreeMap::new();
+    for (k, n) in mix {
+        let (code, ty) = k.split_once(' ').unwrap_or((k, ""));
+        let e = by_code.entry(code).or_default();
+        e.0 += n;
+        e.1.push((ty, *n));
+    }
+    let mut rows: Vec<_> = by_code.into_iter().collect();
+    rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    let parts: Vec<String> = rows
+        .into_iter()
+        .map(|(code, (n, mut types))| {
+            types.sort_by(|a, b| b.1.cmp(&a.1));
+            let ts: Vec<String> = types.iter().map(|(t, k)| format!("{t} {k}")).collect();
+            format!(
+                "{code} {:.0}% ({})",
+                100.0 * n as f64 / total.max(1) as f64,
+                ts.join(", ")
+            )
+        })
+        .collect();
+    format!("{total} aircraft: {}", parts.join("; "))
 }
 
 /// Every pair of aircraft on the ground this tick: the closest two
@@ -804,6 +921,7 @@ fn real_install_traffic_world_sweep_inner() {
     let (mut flown, mut spawned, mut calls, mut completed) = (0, 0, 0, 0);
     let (mut overlaps, mut closest, mut go_arounds) = (0, f64::INFINITY, 0);
     let mut dirty: Vec<String> = Vec::new();
+    let mut deps = (0, 0, 0);
     for (icao, a) in fields {
         let net = crate::nav::find_taxi_net(&apt, &icao).ok().flatten();
         let has_stands = net.as_ref().is_some_and(|n| !n.stands.is_empty());
@@ -814,7 +932,8 @@ fn real_install_traffic_world_sweep_inner() {
         };
         let mut st = install(st, &apt, &icao, has_stands);
         let peak = traffic::rate::peak_per_h(&field);
-        let s = fly_field(&mut st, field, schedule, window_s);
+        let more = window_s > traffic::schedule::HORIZON_S;
+        let s = fly_field_hours(&mut st, field, schedule, window_s, more);
         print!("{icao} peak {peak:.0}/h, ");
         println!(
             "{icao}: {} scheduled, {} completed, {} calls, {} readbacks ({} accepted), \
@@ -834,6 +953,21 @@ fn real_install_traffic_world_sweep_inner() {
             s.overlaps.len(),
             s.go_arounds
         );
+        println!(
+            "    departures: {} off a stand parked from the start, {} turned round, {} from nothing; \
+             arrivals: {} turned round, {} lingered and went",
+            s.dep_parked,
+            s.dep_turned,
+            s.dep_fresh,
+            s.turned,
+            s.despawns.get("Parked").copied().unwrap_or(0)
+        );
+        if only.is_some() || ["EGKK", "EGLL", "LXGB", "LEMG"].contains(&icao.as_str()) {
+            println!("    mix: {}", mix_line(&s.mix));
+        }
+        deps.0 += s.dep_parked;
+        deps.1 += s.dep_turned;
+        deps.2 += s.dep_fresh;
         for line in s
             .conflicts
             .iter()
@@ -872,6 +1006,10 @@ fn real_install_traffic_world_sweep_inner() {
          no panic, {} dirty; {overlaps} overlaps, {go_arounds} go-arounds, closest taxiing \
          pair {closest:.2} of its spacing",
         dirty.len()
+    );
+    println!(
+        "departures: {} off a stand parked from the start, {} turned round, {} from nothing",
+        deps.0, deps.1, deps.2
     );
     assert!(flown > 0);
     assert!(dirty.is_empty(), "fields with findings: {dirty:#?}");
@@ -1009,7 +1147,9 @@ fn a_reinstall_inner() {
     let out = link.tick(None, 0.25, epoch + Duration::from_secs_f64(t));
     assert_eq!(out.left_frequency, moving, "the moving left the frequency");
     assert_eq!(link.fleet().aircraft().len(), parked, "the parked stayed");
-    for ac in link.fleet().aircraft() {
+    // A dormant one (turned round on its stand) has said nothing and holds
+    // no strip; every other parked one's reopens.
+    for ac in link.fleet().aircraft().iter().filter(|a| !a.dormant()) {
         assert!(
             crate::world::traffic_order(ac.id).is_some(),
             "a parked aircraft's strip is open again"
@@ -1019,4 +1159,30 @@ fn a_reinstall_inner() {
     let out = link.tick(None, 0.25, epoch + Duration::from_secs_f64(t));
     assert!(out.left_frequency.is_empty(), "said once");
     Station::uninstall();
+}
+
+/// Every carrier our traffic flies (`traffic::airlines`) has its telephony
+/// in the station's table, the same words: the tower reads a call's
+/// telephony to know an airline (its go-around is the missed approach,
+/// never the circuit), and a carrier missing there was a tail number to it.
+#[test]
+fn every_traffic_carrier_has_its_telephony_at_the_station() {
+    for c in traffic::airlines::all_carriers() {
+        let raw = format!("{}123", c.code);
+        let spoken = crate::callsign::spoken_id_with(&raw, &[]);
+        assert!(
+            spoken.starts_with(c.telephony),
+            "{}: the station says {spoken:?}, the traffic {:?}",
+            c.code,
+            c.telephony
+        );
+        assert!(
+            crate::callsign::is_airline_telephony_with(
+                &format!("{} one two three", c.telephony),
+                &[]
+            ),
+            "{}",
+            c.code
+        );
+    }
 }

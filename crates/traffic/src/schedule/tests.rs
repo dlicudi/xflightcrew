@@ -215,7 +215,7 @@ fn a_share_of_the_stands_is_parked_at_the_start() {
                     s.accepts
                 );
                 if cat != "props" {
-                    assert!(fleet_of(&p.callsign[..3]).contains(&p.icao_type.as_str()));
+                    assert!(flies_its_own(&f.icao, &p.callsign, &p.icao_type), "{p:?}");
                 }
                 assert!(p.spawn(1, &f, &ctx).is_ok_and(|a| a.dormant()));
             }
@@ -434,27 +434,61 @@ fn callsigns_are_spoken_the_way_the_region_writes_them() {
     let (cs, spoken) = registration("N", "PA28", &mut r);
     assert!(cs.starts_with('N') && cs.len() == 6, "{cs}");
     assert!(spoken.starts_with("Piper "), "{spoken}");
-    let (cs, spoken, _) = airline("LEMG", "A320", &mut r);
+    let ryr = crate::airlines::carrier_of("LEMG", "RYR1").unwrap();
+    let (cs, spoken) = crate::airlines::flight(&ryr, &mut r);
     assert!(
-        cs.len() >= 6 && spoken.split(' ').count() >= 4,
+        cs.len() == 7 && spoken.starts_with("Ryanair ") && spoken.split(' ').count() == 5,
         "{cs}: {spoken}"
     );
 }
 
+/// The callsign's carrier flies the type, at that field.
+fn flies_its_own(icao: &str, callsign: &str, icao_type: &str) -> bool {
+    crate::airlines::carrier_of(icao, callsign)
+        .is_some_and(|c| c.types.iter().any(|(t, _)| *t == icao_type))
+}
+
 /// The type is the airline's: a Ryanair is a 737, a turboprop a regional
-/// carrier's (a Ryanair A320 drew a Wizz Air livery at LEMG, 2026-10-08).
+/// carrier's (a Ryanair A320 drew a Wizz Air livery at LEMG, 2026-10-08),
+/// and no two aircraft of an hour share a callsign.
 #[test]
 fn every_airline_flies_its_own_type() {
-    let mut r = XorShift64::new(7);
-    for _ in 0..200 {
-        for t in ["A320", "B738", "A319", "AT76"] {
-            let (cs, _, ty) = airline("LEMG", t, &mut r);
-            assert!(fleet_of(&cs[..3]).contains(&ty), "{cs} flies {ty}");
-            if t == "AT76" {
-                assert_eq!(ty, "AT76", "{cs}");
+    let f = ulmm();
+    for seed in 0..10 {
+        let mut ms = generate(&f, Density::Normal, seed, &SpawnCtx::default());
+        let parked = park_at_start(&f, Density::Normal, seed, &SpawnCtx::default(), &mut ms);
+        let mut seen = std::collections::HashSet::new();
+        for m in ms.iter().chain(&parked) {
+            assert!(
+                seen.insert(m.callsign.clone()),
+                "{seed}: {} twice",
+                m.callsign
+            );
+            if m.kind != MovementKind::Circuit
+                && class_for_type(&m.icao_type).0.name != PISTON_SINGLE.name
+            {
+                assert!(
+                    flies_its_own(&f.icao, &m.callsign, &m.icao_type),
+                    "{seed}: {m:?}"
+                );
             }
         }
     }
+}
+
+/// Gibraltar's 1,680 m takes the A320s easyJet and BA fly there (the one
+/// 1,800 m floor for every jet barred them, and nine of nine were Air
+/// Nostrum ATRs); a 1,300 m strip takes no jet, and the A380 only 3,000 m.
+#[test]
+fn a_type_flies_off_its_own_length_of_runway() {
+    for t in ["A320", "A319", "B738"] {
+        assert!(runway_needed_m(t) <= 1680.0, "{t}: {}", runway_needed_m(t));
+    }
+    for t in ["A320", "B738", "E190", "CRJ9"] {
+        assert!(runway_needed_m(t) > 1300.0, "{t}");
+    }
+    assert!(runway_needed_m("AT76") <= 1220.0);
+    assert!(runway_needed_m("A388") >= 3000.0 && runway_needed_m("B77W") > runway_needed_m("A321"));
 }
 
 /// The real Malaga with its CIFP: no circuits (it says 0), IFR both ways.
@@ -627,21 +661,18 @@ fn a_parked_aircraft_fits_its_stand_and_leaves_the_movers_room() {
 #[test]
 fn the_runway_minima_hold_a_good_landing_and_not_a_long_one() {
     use crate::aircraft::{flare_along_m, landing_run_m, FLARE_AGL_FT, LONG_FLARE_M};
-    for (p, floor) in [
-        (&TURBOPROP, TURBOPROP_MIN_RUNWAY_M),
-        (&JET_MED, JET_MIN_RUNWAY_M),
+    for t in [
+        "AT76", "SF34", "A320", "B738", "A319", "E190", "B772", "A388",
     ] {
+        let p = class_for_type(t).0;
         let good = landing_distance_m(p);
-        assert!(good <= runway_needed_m(p, floor), "{}: {good:.0} m", p.name);
+        assert!(good <= runway_needed_m(t), "{t}: {good:.0} m");
     }
     let atr = landing_distance_m(&TURBOPROP);
     assert!(atr < 1220.0, "PABV held a good one, {atr:.0} m");
-    assert!(
-        runway_needed_m(&TURBOPROP, TURBOPROP_MIN_RUNWAY_M) > 1100.0,
-        "not 1,100 m"
-    );
+    assert!(runway_needed_m("AT76") > 1100.0, "not 1,100 m");
     let f = fixtures::xtst_ifr();
-    let needed = runway_needed_m(&TURBOPROP, TURBOPROP_MIN_RUNWAY_M);
+    let needed = runway_needed_m("AT76");
     assert!(
         f.end("27").unwrap().length_m >= needed,
         "XTST's 1,500 m takes the ATR"
@@ -720,4 +751,45 @@ fn no_stream_outruns_the_runway() {
     let (d, a) = crate::rate::rates_at(&f, 100.0, None, 0.0);
     assert_eq!(d, crate::rate::departures_cap_per_h());
     assert_eq!(a, crate::rate::arrivals_cap_per_h());
+}
+
+/// A widebody never stands on a stand drawn over another (apt.dat's
+/// overlapping sets: a 777 and an A320 parked 21 m apart at EGKK, the hour
+/// sweep 2026-10-10), and a widebody stands further from the lanes than a
+/// narrowbody.
+#[test]
+fn a_widebody_needs_a_stand_of_its_own() {
+    let mut f = xnoc_sized('E');
+    let a = f.net.stands[0].clone();
+    assert!(f.room_for(&a, "A320"));
+    let mut over = a.clone();
+    over.name = "over".into();
+    over.lon += 0.0002; // some 14 m east
+    f.net.stands.push(over);
+    let a = f.stand(&a.name).unwrap().clone();
+    assert!(f.room_for(&a, "A320"), "a narrowbody shares a set");
+    assert!(!f.room_for(&a, "B772") && !f.takes(&a, "B772"));
+    assert!(parked_lane_clear_m("B77W") > parked_lane_clear_m("A320"));
+    assert_eq!(parked_lane_clear_m("A320"), PARKED_LANE_CLEAR_M);
+}
+
+/// A turnaround is the type's: a narrowbody 35 to 60 minutes, a turboprop
+/// 25 to 40, a widebody 90 to 150, the A380 two to three hours.
+#[test]
+fn a_turnaround_takes_the_types_own_time() {
+    let mut r = XorShift64::new(2);
+    for _ in 0..200 {
+        let m = |t: &str, r: &mut XorShift64| turnaround_s(t, r) / 60.0;
+        assert!((35.0..=60.0).contains(&m("A320", &mut r)));
+        assert!((25.0..=40.0).contains(&m("AT76", &mut r)));
+        assert!((90.0..=150.0).contains(&m("B772", &mut r)));
+        assert!((120.0..=180.0).contains(&m("A388", &mut r)));
+    }
+    let (cs, spoken) = next_flight("EGKK", "EZY8123", &mut r).unwrap();
+    assert!(cs.starts_with("EZY8") && cs != "EZY8123" && spoken.starts_with("Easy "));
+    assert_eq!(
+        next_flight("EGKK", "GABCD", &mut r),
+        None,
+        "a registration stays"
+    );
 }

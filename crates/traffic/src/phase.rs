@@ -267,6 +267,12 @@ pub enum Event {
     Spawn {
         id: u32,
     },
+    /// A finished arrival (or circuit) parked on its stand and stays there,
+    /// dark, to fly again ([`crate::Fleet::turn_round`]): its flight is
+    /// over (the strip retires) and its airframe is the fleet's.
+    TurnedRound {
+        id: u32,
+    },
     Despawn {
         id: u32,
         reason: Despawn,

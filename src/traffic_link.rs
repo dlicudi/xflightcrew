@@ -176,6 +176,11 @@ pub(crate) struct TickOut {
     pub(crate) events: Vec<Event>,
     /// Movements spawned this tick (id, callsign).
     pub(crate) spawned: Vec<(u32, String)>,
+    /// Of those, the ones that flew off a stand they already stood on (id,
+    /// "parked": from the fleet's start; "turned_round": an arrival of this
+    /// fleet's after its turnaround); the rest appeared on their stand from
+    /// nothing.
+    pub(crate) from_stand: Vec<(u32, &'static str)>,
     /// Aircraft put on their stands parked at the fleet's start (id,
     /// callsign): the field's parked aircraft and the departures waiting.
     pub(crate) parked: Vec<(u32, String)>,
@@ -265,8 +270,11 @@ impl Link {
             })
             .collect();
         due.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+        // An arrival that parks stays and flies again (`Fleet::turn_round`).
+        let mut fleet = Fleet::new(field);
+        fleet.turn_round = true;
         Link {
-            fleet: Fleet::new(field),
+            fleet,
             due,
             next_id: 1,
             tower_name: tower_name.to_string(),
@@ -409,7 +417,9 @@ impl Link {
                     }
                     self.outbox.push(*id, call.clone());
                 }
-                Event::Despawn { id, .. } => {
+                // A flight turned round on its stand is over: its strip
+                // retires; the airframe stays, dormant, for its next flight.
+                Event::Despawn { id, .. } | Event::TurnedRound { id } => {
                     crate::world::retire_traffic(*id);
                     self.outbox.forget(*id);
                 }
@@ -481,6 +491,7 @@ impl Link {
             own,
             occupied: fleet.stands_held(),
             zulu_s: None,
+            parked_airframes: 0,
         };
         for i in 0..self.due.len() {
             if !self.due[i].m.parked_from_start {
@@ -489,6 +500,7 @@ impl Link {
             let c = ctx(&self.fleet);
             if let Ok(ac) = self.due[i].m.park(self.next_id, &self.fleet.field, &c) {
                 let (id, cs) = (ac.id, ac.callsign.clone());
+                crate::world::note_traffic_type(&ac.callsign, &ac.icao_type);
                 if self.fleet.spawn(ac) {
                     self.next_id += 1;
                     self.due[i].held = Some(id);
@@ -500,6 +512,7 @@ impl Link {
             let c = ctx(&self.fleet);
             if let Ok(ac) = m.park(self.next_id, &self.fleet.field, &c) {
                 let (id, cs) = (ac.id, ac.callsign.clone());
+                crate::world::note_traffic_type(&ac.callsign, &ac.icao_type);
                 if self.fleet.spawn(ac) {
                     self.next_id += 1;
                     out.parked.push((id, cs));
@@ -535,6 +548,46 @@ impl Link {
             .collect()
     }
 
+    /// A departure or a circuit flown by a dormant airframe on its stand
+    /// (`Fleet::ready_to_leave`): an airliner for a departure, if the
+    /// runway in use holds its type, a light aircraft for a circuit; not
+    /// one a departure is already waiting on. A turned-round airliner
+    /// leaves as its carrier's next flight (`schedule::next_flight`); one
+    /// parked from the start, or a light aircraft, keeps its callsign.
+    /// (id, callsign, where it came from), or `None`: spawn as before.
+    fn take_parked(&mut self, m: &Movement) -> Option<(u32, String, &'static str)> {
+        if !matches!(m.kind, MovementKind::Departure | MovementKind::Circuit) {
+            return None;
+        }
+        let plan = m.plan(&self.fleet.field).ok()?;
+        let runway_m = self.fleet.field.end(&m.runway)?.length_m;
+        let light = m.kind == MovementKind::Circuit;
+        let held: Vec<u32> = self.due.iter().filter_map(|d| d.held).collect();
+        let fits = |a: &TrafficAircraft| airframe_fits(a, light, runway_m);
+        let id = self.fleet.ready_to_leave(&held, &fits)?;
+        let a = self.fleet.get(id)?;
+        let turned = self.fleet.turned_round(id);
+        let (icao, old_cs) = (self.fleet.field.icao.clone(), a.callsign.clone());
+        let in_use = |cs: &str| self.fleet.aircraft().iter().any(|x| x.callsign == cs);
+        let (cs, spoken) = (0..4)
+            .filter(|_| turned)
+            .filter_map(|k| {
+                traffic::schedule::next_flight(
+                    &icao,
+                    &old_cs,
+                    &mut traffic::XorShift64::new(m.seed ^ k),
+                )
+            })
+            .find(|(cs, _)| !in_use(cs))
+            .unwrap_or_else(|| (a.callsign.clone(), a.spoken.clone()));
+        let icao_type = a.icao_type.clone();
+        if !self.fleet.release_as(id, plan, &cs, &spoken) {
+            return None;
+        }
+        crate::world::note_traffic_type(&cs, &icao_type);
+        Some((id, cs, if turned { "turned_round" } else { "parked" }))
+    }
+
     fn spawn_due(&mut self, own: Option<&OwnState>, out: &mut TickOut) {
         let now_s = self.fleet.clock.now_s();
         // A heartbeat every 30 s of fleet time: the clock, what is due, the tower's runway.
@@ -561,6 +614,7 @@ impl Link {
             // departure spawned on one, and its arrival drove in on top.
             occupied: self.fleet.stands_held(),
             zulu_s: None,
+            parked_airframes: 0,
         };
         let mut later = Vec::new();
         while self.due.first().is_some_and(|d| d.at_s <= now_s) {
@@ -580,10 +634,21 @@ impl Link {
                 let plan = d.m.plan(&self.fleet.field);
                 if let Ok(plan) = plan {
                     if self.fleet.release(id, plan) {
+                        crate::world::note_traffic_type(&d.m.callsign, &d.m.icao_type);
                         out.spawned.push((id, d.m.callsign.clone()));
+                        out.from_stand.push((id, "parked"));
                         continue;
                     }
                 }
+            }
+            // Else an airframe already standing on its stand, ready to fly
+            // again, takes the flight; only with none does one appear on a
+            // free stand from nothing (a field with nobody parked yet, or
+            // every parked airframe still turning round).
+            if let Some((id, cs, from)) = self.take_parked(&d.m) {
+                out.spawned.push((id, cs));
+                out.from_stand.push((id, from));
+                continue;
             }
             let spawned = d.m.spawn(self.next_id, &self.fleet.field, &ctx);
             if let Err(why) = &spawned {
@@ -599,6 +664,7 @@ impl Link {
                 Ok(ac) => {
                     let id = ac.id;
                     let cs = ac.callsign.clone();
+                    crate::world::note_traffic_type(&ac.callsign, &ac.icao_type);
                     if self.fleet.spawn(ac) {
                         self.next_id += 1;
                         out.spawned.push((id, cs));
@@ -1058,13 +1124,41 @@ fn build_link(
 fn generate_for(fleet: &Fleet, hour: u64, own: &OwnState, zulu_s: Option<f64>) -> Vec<Movement> {
     let density = traffic::Density::parse(&crate::settings::live().traffic_density)
         .unwrap_or(traffic::Density::Normal);
+    next_hour(fleet, density, hour, Some((own.lat, own.lon)), zulu_s)
+}
+
+/// The next generated hour at the fleet's field: every stand anybody holds
+/// taken, and as many departures scheduled without a stand of their own
+/// as there are airliners parked on theirs and ready within half the hour
+/// (`SpawnCtx::parked_airframes`): each takes one of those airframes at its
+/// time (`Link::take_parked`) rather than appear out of nothing.
+pub(super) fn next_hour(
+    fleet: &Fleet,
+    density: traffic::Density,
+    hour: u64,
+    own: Option<(f64, f64)>,
+    zulu_s: Option<f64>,
+) -> Vec<Movement> {
+    let by = fleet.clock.now_s() + traffic::schedule::HORIZON_S / 2.0;
+    let parked_airframes = fleet.airframes_ready_by(by, &[], &|a| {
+        traffic::class_for_type(&a.icao_type).0.name != traffic::PISTON_SINGLE.name
+    });
     let ctx = SpawnCtx {
         runway: None,
-        own: Some((own.lat, own.lon)),
+        own,
         occupied: fleet.stands_held(),
         zulu_s,
+        parked_airframes,
     };
     traffic::generate(&fleet.field, density, hour, &ctx)
+}
+
+/// A dormant airframe `a` may fly a circuit (`light`: a light aircraft) or
+/// a departure (an airliner whose type the `runway_m` in use holds,
+/// `schedule::runway_needed_m`).
+fn airframe_fits(a: &TrafficAircraft, light: bool, runway_m: f64) -> bool {
+    let is_light = traffic::class_for_type(&a.icao_type).0.name == traffic::PISTON_SINGLE.name;
+    is_light == light && (light || runway_m >= traffic::schedule::runway_needed_m(&a.icao_type))
 }
 
 /// The sim's zulu time, seconds after midnight; `None` on a failed read
@@ -1081,10 +1175,15 @@ async fn sim_zulu_s(xp: &crate::xplane::XPlaneClient) -> Option<f64> {
 fn record(out: &TickOut, link: &Link) {
     for (id, callsign) in &out.spawned {
         let ac = link.fleet().get(*id);
+        let from = out
+            .from_stand
+            .iter()
+            .find(|(i, _)| i == id)
+            .map_or("new", |(_, f)| *f);
         crate::blackbox::record(
             "traffic",
             serde_json::json!({
-                "event": "spawn", "id": id, "callsign": callsign,
+                "event": "spawn", "id": id, "callsign": callsign, "from": from,
                 "type": ac.map(|a| a.icao_type.clone()),
                 "plan": ac.map(|a| plan_word(&a.plan)),
                 "runway": ac.and_then(|a| a.plan.runway().map(str::to_string)),
@@ -1120,6 +1219,10 @@ fn record(out: &TickOut, link: &Link) {
                     "event": "phase", "id": id,
                     "from": format!("{from:?}"), "to": format!("{to:?}"),
                 }),
+            ),
+            Event::TurnedRound { id } => crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "turned_round", "id": id }),
             ),
             Event::Touchdown { id, along_m, .. } => crate::blackbox::record(
                 "traffic",

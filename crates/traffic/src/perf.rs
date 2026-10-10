@@ -262,6 +262,50 @@ fn type_span_m(icao_type: &str) -> Option<f64> {
     Some(span)
 }
 
+/// The shortest runway `icao_type` is scheduled on, metres: its takeoff
+/// or landing field length at the weights a short sector flies (the
+/// manufacturers' airport planning charts, rounded down to the strips the
+/// types use every day). One floor for every jet was 1,800 m and barred
+/// the A320s easyJet and BA fly into Gibraltar's 1,680 m (2026-10-09); an
+/// A320 or a 737-800 needs about 1,600 m. A type not in the table takes
+/// its class's (a widebody 2,500 m, a medium jet 1,800, a turboprop 1,100,
+/// a light aircraft 600). The schedule also holds the type's good landing
+/// ([`crate::aircraft::landing_distance_m`]) to it, whichever is longer.
+pub fn runway_min_m(icao_type: &str) -> f64 {
+    let t = icao_type.trim().to_ascii_uppercase();
+    match t.as_str() {
+        "SF34" | "D328" | "JS41" => 1000.0,
+        "AT43" | "AT45" | "AT72" | "AT76" => 1100.0,
+        "DH8A" | "DH8B" | "DH8C" | "DH8D" => 1200.0,
+        "E170" | "E175" | "E190" | "E195" | "CRJ7" | "CRJ9" => 1500.0,
+        "A318" | "A319" | "BCS1" | "BCS3" | "B736" | "B737" => 1500.0,
+        "A320" | "A20N" | "B738" | "B38M" => 1600.0,
+        "A321" | "A21N" | "B739" | "B39M" | "B752" | "B753" => 1800.0,
+        "B763" | "B764" | "A332" | "A333" | "A339" => 2400.0,
+        "B788" | "B789" | "B78X" | "A359" | "A35K" | "B772" => 2500.0,
+        "B77W" | "B77L" | "A343" | "A346" | "B744" | "B748" | "MD11" => 2800.0,
+        "A388" => 3000.0,
+        _ => {
+            let p = class_for_type(&t).0;
+            if p.name == JET_HEAVY.name {
+                2500.0
+            } else if p.name == JET_MED.name {
+                1800.0
+            } else if p.name == TURBOPROP.name {
+                1100.0
+            } else {
+                600.0
+            }
+        }
+    }
+}
+
+/// A type's wingspan, metres: its own ([`type_span_m`]), else its class's.
+pub fn span_of(icao_type: &str) -> f64 {
+    let t = icao_type.trim().to_ascii_uppercase();
+    type_span_m(&t).unwrap_or_else(|| class_for_type(&t).0.span_m)
+}
+
 /// The ICAO aerodrome reference code letter for a wingspan: 'A' under
 /// 15 m, 'B' under 24, 'C' under 36, 'D' under 52, 'E' under 65, else 'F'.
 pub fn span_code(span_m: f64) -> char {

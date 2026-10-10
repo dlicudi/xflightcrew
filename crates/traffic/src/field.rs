@@ -161,6 +161,19 @@ impl FieldModel {
         stand_fits(stand, icao_type)
             && !self.parked_only.contains(&stand.name)
             && !self.beside_runway((stand.lat, stand.lon))
+            && self.room_for(stand, icao_type)
+    }
+
+    /// A type wider than code C stands only on a stand no other is drawn
+    /// within [`WIDE_STAND_CLEAR_M`] of: apt.dat draws a widebody's stand
+    /// over two narrowbodies' (EGKK, the hour sweep 2026-10-10: a 777 and
+    /// an A320 parked 21 m apart, each on a free stand by the 20 m rule).
+    pub fn room_for(&self, stand: &Stand, icao_type: &str) -> bool {
+        crate::perf::wingspan_code(icao_type) <= 'C'
+            || self.net.stands.iter().all(|o| {
+                o.name == stand.name
+                    || dist_m((o.lat, o.lon), (stand.lat, stand.lon)) >= WIDE_STAND_CLEAR_M
+            })
     }
 
     /// Parking for a field that publishes no stands (apt.dat 1300): the
@@ -796,6 +809,11 @@ fn unique_stand_names(stands: &mut [Stand]) {
 
 /// An aircraft this close to a stand is on it.
 pub const STAND_TAKEN_M: f64 = 20.0;
+
+/// A stand with another this close is one of an overlapping set
+/// ([`FieldModel::room_for`]), metres: side by side, two narrowbody stands
+/// stand some 45 m apart centre to centre.
+pub const WIDE_STAND_CLEAR_M: f64 = 30.0;
 
 /// A dead-end spur ending this close to a stand is its own lead-in, metres.
 const SPUR_END_M: f64 = 40.0;
