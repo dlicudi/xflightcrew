@@ -72,8 +72,8 @@ of the aircraft's loaded checklist; they do not perform or verify its items.
   you're at, cruise altitude picked over the sim's own terrain, time and fuel
   from the aircraft profile against what's in the tanks, and a refusal when the
   runway there is too short. It briefs the plan first; "load it" puts it in the
-  GPS, and "fly my flight plan" still needs the SimBrief route for now. No
-  SimBrief account, no network.
+  GPS, and "fly my flight plan" can fly either this local plan or a SimBrief
+  route. The local planner needs no account or network.
 
 ### Let it fly
 
@@ -97,9 +97,12 @@ each refuses rather than guesses.
 Real frequencies from `apt.dat`, region-accurate phraseology (ICAO/CAP 413 vs
 FAA), and a controller that sequences you rather than reading a script:
 
-- Clearance, taxi with **named routes** ("taxi to holding point Alpha one via
-  Bravo, Link two seven"), line-up-and-wait, takeoff, circuits, vectors, ILS
-  approaches, landing clearance, taxi in.
+- Separate **Delivery, Ground, Tower and Approach/radar positions** where the
+  airport publishes them, with calls routed to the position on COM1 and
+  frequency-specific handoffs.
+- IFR clearance, pushback, taxi with **named routes** ("taxi to holding point
+  Alpha one via Bravo, Link two seven"), line-up-and-wait, takeoff, circuits,
+  vectors, instrument approaches, landing clearance and taxi in.
 - **Readback enforcement** on the runway-critical items, a runway-in-use that
   can't drift mid-departure, **wake turbulence** separation, and departures
   threaded into gaps in the arrival stream.
@@ -107,6 +110,31 @@ FAA), and a controller that sequences you rather than reading a script:
   the airway from field to field.
 - A **progressive taxi guide** in the copilot's voice: "next left, onto Sierra
   five Whiskey", with runway crossings called.
+
+### Fly alongside local traffic
+
+XVoiceLayer can generate and fly its own deterministic AI traffic instead of
+depending on LiveTraffic. The same tower that controls you controls every
+traffic flight through a separate per-flight strip:
+
+- GA circuits and IFR arrivals and departures, with field-appropriate airline
+  and aircraft mixes, parked-aircraft turnarounds, generated schedules, or a
+  user-supplied YAML schedule.
+- Taxi, line-up, takeoff, climb-out, instrument arrival, missed approach,
+  landing, runway vacation and taxi-in phase machines.
+- Runway occupancy, arrival sequencing, departure gaps, wake-turbulence
+  spacing, speed control, holding/orbits and go-arounds. Your auto-taxi also
+  stops behind or yields to traffic on the ground.
+- Real radio calls and readbacks routed through Delivery, Ground, Tower and
+  Approach. You hear them only when your COM1 is tuned to that frequency.
+- Native rendering through XPMP2 and user-installed CSL models, with animated
+  gear, flaps, lights and engines plus optional TCAS publication.
+
+Set `XCOPILOT_TRAFFIC=ours` to use this fleet, `real` to retain read-only
+narration of X-Plane/LiveTraffic targets, or `off` (the current default). The
+generated fleet is reproducible from its seed and freezes during pause, replay,
+or accelerated simulation time above roughly 1x so its simulation clock cannot
+diverge from ATC's timers.
 
 ### Talk to the cabin
 
@@ -119,7 +147,8 @@ mean it. Sterile-cockpit rules apply.
 A small companion plugin ([plugin/](plugin/)) adds what the Web API can't do: a
 dedicated **push-to-talk** (separate keys for the intercom and the radio), the
 FMS route load, terrain queries, and the control channels the ground automation
-steers through.
+steers through. It also renders XVoiceLayer's traffic via XPMP2 when CSL models
+are installed.
 
 It also draws an in-sim **status panel** — Flight, Transcript, ATC, Route and
 Settings tabs — with the live strip, an automation status well, one-press
@@ -145,10 +174,13 @@ Optional but recommended, for push-to-talk and the panel:
 make -C plugin install
 ```
 
-The aircraft profile is auto-detected from `acf_ICAO`. Profiles ship for the
-Cessna 172SP, Cirrus SR22, Cirrus Vision SF50, Citation X, King Air C90B,
-Lancair Evolution, MD-82, Twin Otter and DC-3, with a built-in fallback for
-anything else.
+The aircraft profile is auto-detected from both `acf_ICAO` and the `.acf` path
+(the stock 737 and Zibo share an ICAO code). Profiles currently ship for the
+Airbus A330-300, Boeing 737-800, Zibo 738, Boeing 747-400, MD-82, Citation X,
+Cirrus Vision SF50, Cessna 172SP, Cirrus SR22, Beechcraft Baron 58, King Air
+C90B, Twin Otter, DC-3, Lancair Evolution, Van's RV-10 and Sikorsky S-76C.
+An unmatched aircraft gets a generic profile derived from its `.acf` rather
+than silently inheriting Cessna limits.
 
 ### Speaking to it
 
@@ -176,12 +208,18 @@ anything else.
 | Commands and conversation | deterministic grammar, curated tools, conversation state |
 | X-Plane read/write | `reqwest` → Web API (`PATCH /api/v1/datarefs/...`) |
 | In-sim capability | native C++ plugin (PTT, panel, FMS, terrain, controls) |
+| Navigation data | `nav` crate (`apt.dat`, fixes, navaids, CIFP, taxi geometry) |
+| ATC world | `atc` crate (stations, positions, strips, sequencing; read-only sim view) |
+| AI traffic | `traffic` crate (schedule, fleet, kinematics, phase machines) |
 | Text-to-speech | in-process ONNX (default), or `piper` / macOS `say` |
 
 Rust, because this is a latency- and audio-sensitive real-time loop. The
-workspace splits the world from the crew: `crates/atc` is the tower and can
-only *read* the sim, `crates/sim` is the shared Web API client, and the copilot
-embeds both. That boundary is compiler-checked, not a convention.
+workspace splits the world from the crew: `crates/nav` owns navigation data and
+geometry, `crates/atc` owns the read-only controller world, `crates/traffic`
+owns the deterministic fleet, and `crates/sim` owns shared simulator plumbing.
+ATC and traffic do not depend on each other; the application joins them, so the
+controller cannot actuate either your aircraft or traffic. These boundaries are
+compiler-checked rather than conventions.
 
 The tool surface is per-airframe: a profile declares which systems exist and
 their limits, and the tool registry is built from it — so a 172 is never
@@ -202,6 +240,15 @@ list. Common knobs:
 | `XCOPILOT_MONITOR` | `true` | background problem callouts |
 | `XCOPILOT_ATC_AIRPORT` | `LXGB` | home field for the tower |
 | `XCOPILOT_SIMBRIEF_ID` | — | your SimBrief username, for flight plans |
+| `XCOPILOT_TRAFFIC` | `off` | `ours`, `real`, or `off` |
+| `XCOPILOT_TRAFFIC_DENSITY` | `normal` | generated fleet: `off`, `light`, or `normal` |
+| `XCOPILOT_TRAFFIC_FILE` | — | optional local YAML schedule instead of generation |
+
+For rendered traffic, install CSL packages and point the X-Plane plugin at
+them with `XCOPILOT_TRAFFIC_CSL`. LiveTraffic commonly owns X-Plane's TCAS
+slots first; disable its AI-slot request (or LiveTraffic itself) if you want
+XVoiceLayer traffic to appear on TCAS. Aircraft still render without TCAS
+ownership.
 
 The `xcopilot/*` datarefs, the `XCOPILOT_*` variables and the `xcopilot.xpl`
 plugin keep the project's old working name on purpose: they are wire contracts
@@ -225,6 +272,30 @@ cargo run -- stt-eval bench/atc_stt_cases.yaml             # spoken-call accurac
 
 Every flight writes `logs/blackbox.jsonl`; `xvl analyze` mines the logs for
 phrasings the deterministic grammar missed.
+
+The ordinary workspace suite is deterministic and runs without X-Plane. It
+covers grammar utterances, safety gates and readbacks, navigation geometry,
+ATC state machines, traffic sorties, packed plugin wire formats, flight-law
+simulations and regressions reconstructed from real blackbox sorties. Ignored
+tests are the explicit boundary: they need an X-Plane installation, its nav
+data, or a running simulator.
+
+## Current scope and limitations
+
+- X-Plane 12 is the only simulator target. Most stock-dataref functions work
+  through its Web API; PTT, panel, FMS injection, terrain/control channels and
+  rendered traffic need the native plugin.
+- The Cessna 172 is the reference airframe. Other profiles expose their
+  declared systems and limits, but do not all have equal live-sortie coverage.
+- The autonomous flying stack is substantial but safety-sensitive. Development
+  is currently focused on the copilot/checklists, ATC and owned traffic;
+  autonomous flight modes receive crash and safety fixes rather than new
+  behaviour while that stack is redesigned around each aircraft's autopilot.
+- Traffic does not fetch online schedules and requires user-installed CSL
+  models for useful rendering. It currently freezes under accelerated time,
+  has no wind triangle, and operates at controlled fields when ATC is enabled.
+- Deterministic language is intentional: unsupported phrasing is refused or
+  logged for a new rule. There is no runtime language-model fallback.
 
 ## Licensing
 
