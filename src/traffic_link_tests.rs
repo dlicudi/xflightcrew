@@ -187,7 +187,7 @@ pub(super) fn fly_field_hours(
     let parked = traffic::park_at_start(
         &field,
         Density::Normal,
-        3,
+        sweep_seed(),
         &sweep_ctx(&field),
         &mut schedule,
     );
@@ -341,7 +341,9 @@ pub(super) fn fly_field_hours(
                             for o in link.fleet().aircraft().iter().filter(|o| {
                                 o.id != *id
                                     && o.kin.on_ground
-                                    && pos.is_some_and(|p| traffic::kin::dist_m(p, o.kin.pos()) < 600.0)
+                                    && pos.is_some_and(|p| {
+                                        traffic::kin::dist_m(p, o.kin.pos()) < 600.0
+                                    })
                             }) {
                                 println!(
                                     "          near: [{}] {} {:?} at {:?}",
@@ -423,12 +425,16 @@ pub(super) fn fly_field_hours(
                 for id in w.split(',').filter_map(|x| x.trim().parse::<u32>().ok()) {
                     if let Some(a) = link.fleet().get(id) {
                         println!(
-                            "WATCH {t:7.1} [{id}] {:?} {:?} {:.1} kt hdg {:.0} free {:?}",
+                            "WATCH {t:7.1} [{id}] {:?} {:?} {:.1} kt hdg {:.0} free {:?} route {} seg {} done {} end {:?}",
                             a.phase,
                             a.kin.pos(),
                             a.kin.gs_kts,
                             a.kin.hdg_deg,
-                            a.spacing.free_m
+                            a.spacing.free_m,
+                            a.route.path.len(),
+                            a.route.follow.seg,
+                            a.route.follow.done,
+                            a.route.path.last()
                         );
                     }
                 }
@@ -690,6 +696,15 @@ fn sweep_ctx(field: &FieldModel) -> SpawnCtx {
         zulu_s,
         ..SpawnCtx::default()
     }
+}
+
+/// The sweep's schedule seed: `XVL_TRAFFIC_SWEEP_SEED`, else 3 (the one
+/// every recorded sweep flew).
+fn sweep_seed() -> u64 {
+    std::env::var("XVL_TRAFFIC_SWEEP_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
 }
 
 /// The world sweep's window at each field: ten minutes of fleet time.
@@ -1037,7 +1052,7 @@ fn real_install_traffic_world_sweep_inner() {
         let net = crate::nav::find_taxi_net(&apt, &icao).ok().flatten();
         let has_stands = net.as_ref().is_some_and(|n| !n.stands.is_empty());
         let field = FieldModel::new(&icao, a.clone(), net).with_cifp(&cifp);
-        let schedule = traffic::generate(&field, Density::Normal, 3, &sweep_ctx(&field));
+        let schedule = traffic::generate(&field, Density::Normal, sweep_seed(), &sweep_ctx(&field));
         let Some(st) = Station::from_airport(a) else {
             continue;
         };
@@ -1072,12 +1087,13 @@ fn real_install_traffic_world_sweep_inner() {
         );
         println!(
             "    departures: {} off a stand parked from the start, {} turned round, {} from nothing; \
-             arrivals: {} turned round, {} lingered and went",
+             arrivals: {} turned round, {} lingered and went; {} on stands at the start",
             s.dep_parked,
             s.dep_turned,
             s.dep_fresh,
             s.turned,
-            s.despawns.get("Parked").copied().unwrap_or(0)
+            s.despawns.get("Parked").copied().unwrap_or(0),
+            s.parked_at_start
         );
         if only.is_some() || ["EGKK", "EGLL", "LXGB", "LEMG"].contains(&icao.as_str()) {
             println!("    mix: {}", mix_line(&s.mix));

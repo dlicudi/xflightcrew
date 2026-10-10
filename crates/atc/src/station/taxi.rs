@@ -129,10 +129,6 @@ pub(super) fn plan_taxi_route_to_stand(
 /// (the traffic crate's own `STAND_TAKEN_M`).
 const STAND_TAKEN_M: f64 = 20.0;
 
-/// A traffic arrival's stand route is planned to at most this many of the
-/// nearest free stands, looking for one with no runway crossing.
-const STAND_TRIES: usize = 8;
-
 /// True heading, for which way is forward off a runway.
 pub(super) const TRUE_PSI: &str = sim::datarefs::TRUE_HEADING_DEG;
 
@@ -198,25 +194,14 @@ pub(super) fn stand_route_avoiding(
             .filter(|s| s.is_suitable() && !taken(s))
             .collect();
         free.sort_by(|a, b| d(a).total_cmp(&d(b)));
-        // A traffic arrival is sent to the nearest free stand it reaches
-        // without crossing a runway, of the nearest few: an A320 vacated
-        // north off LFPG's 09R was sent to w02, whose route crossed back
-        // over it, held short for the rest of the hour under the arrival
-        // stream, and the arrivals behind stopped on top of it (EDDF 07R
-        // the same; the traffic hour sweep, 2026-10-10). Across a runway
-        // only when none of those is reached without.
         let planned_from = |from: (f64, f64), s: &nav::Stand| {
             let mut plan = net.plan_to_stand(from.0, from.1, s)?;
             mark_runway_crossings(&mut plan, runways);
             Some(((*s).clone(), plan))
         };
-        let clear_of = |from: (f64, f64)| {
-            free.iter()
-                .take(STAND_TRIES)
-                .filter_map(|s| planned_from(from, s))
-                .find(|(_, p)| p.crossings.is_empty())
-        };
         let first = free.first().copied()?;
+        let clear_of =
+            |from: (f64, f64)| planned_from(from, first).filter(|(_, p)| p.crossings.is_empty());
         clear_of((slat, slon))
             .or_else(|| {
                 // Off the strip but nearest a network node on it (the route
@@ -225,7 +210,9 @@ pub(super) fn stand_route_avoiding(
                 // short of the runway it had just left): from the nearest
                 // node clear of every strip instead, the drive there first.
                 let off = runways.iter().all(|r| on_runway(r, slat, slon).is_none());
-                let node = off.then(|| node_clear_of_strips(net, runways, slat, slon)).flatten()?;
+                let node = off
+                    .then(|| node_clear_of_strips(net, runways, slat, slon))
+                    .flatten()?;
                 let (stand, mut plan) = clear_of(node)?;
                 plan.path.insert(0, (slat, slon));
                 plan.seg.insert(0, (String::new(), false));

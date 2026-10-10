@@ -908,64 +908,62 @@ fn a_stand_route_avoiding_the_parked_goes_to_the_next_free_stand() {
     assert!(stand_route_avoiding(&net, &[], lat, lon, None, &full).is_none());
 }
 
-/// A traffic arrival is sent to the nearest free stand on its own side of
-/// every runway before one across it (LFPG 09R and EDDF 07R, the traffic
-/// hour sweep 2026-10-10: arrivals sent across the runway they had landed
-/// on held short of it for the rest of the hour).
+/// A traffic arrival stopped off the strip but nearest a network node on
+/// it is routed from the nearest node clear of the strip, not back through
+/// it (LFPG 09R, the traffic hour sweep 2026-10-10: an arrival 66 m off the
+/// runway was routed back up its exit through the strip and held short of
+/// the runway it had just left for the rest of the hour).
 #[test]
-fn a_traffic_stand_route_keeps_to_its_side_of_the_runway() {
+fn a_traffic_stand_route_starts_clear_of_the_strip() {
     let mut nodes = std::collections::HashMap::new();
-    nodes.insert(1, (36.0000, -5.0000));
-    nodes.insert(2, (36.0000, -4.9990));
-    nodes.insert(3, (36.0000, -4.9980));
-    let stand = |name: &str, lon: f64| nav::Stand {
-        lat: 36.0003,
-        lon,
-        heading: 180.0,
-        name: name.into(),
-        kind: "gate".into(),
-        accepts: vec![],
-        width: None,
-    };
-    let edge = |a: i64, b: i64| nav::TaxiEdge {
-        a,
-        b,
-        oneway: false,
-        runway: false,
-        name: "A".into(),
-        zone_of: Vec::new(),
-    };
+    // Node 1 on the runway's strip, node 2 clear of it.
+    nodes.insert(1, (36.0000, -5.00005));
+    nodes.insert(2, (36.0000, -4.9985));
     let net = nav::TaxiNet {
         nodes,
-        edges: vec![edge(1, 2), edge(2, 3)],
-        stands: vec![stand("S1", -4.9996), stand("S2", -4.9980)],
+        edges: vec![nav::TaxiEdge {
+            a: 1,
+            b: 2,
+            oneway: false,
+            runway: false,
+            name: "A".into(),
+            zone_of: Vec::new(),
+        }],
+        stands: vec![nav::Stand {
+            lat: 36.0003,
+            lon: -4.9985,
+            heading: 180.0,
+            name: "S1".into(),
+            kind: "gate".into(),
+            accepts: vec![],
+            width: None,
+        }],
         paint: vec![],
         pavement: vec![],
         stand_lines: vec![],
     };
-    // A runway north-south between S1 and where the arrival stands.
     let runway = nav::Runway {
         ident_a: "18".into(),
         ident_b: "36".into(),
         lat_a: 36.0100,
-        lon_a: -4.9994,
+        lon_a: -5.0000,
         lat_b: 35.9900,
-        lon_b: -4.9994,
+        lon_b: -5.0000,
         width_m: 30.0,
         surface: 1,
     };
-    let (lat, lon) = (36.0000, -4.9990);
-    let far = [(0.0, 0.0)];
-    let no_runway = stand_route_avoiding(&net, &[], lat, lon, None, &far).expect("a route");
-    assert_eq!(no_runway.holding_point, "S1", "the nearest");
     let rw = [runway];
+    // 61 m off the centreline, nearer node 1 (on the strip) than node 2.
+    let (lat, lon) = (36.0000, -4.99935);
+    assert!(on_runway(&rw[0], lat, lon).is_none(), "off the strip");
+    let far = [(0.0, 0.0)];
     let traffic = stand_route_avoiding(&net, &rw, lat, lon, None, &far).expect("a route");
-    assert_eq!(traffic.holding_point, "S2", "the nearest reached without a crossing");
-    assert!(traffic.crossings.is_empty());
-    let full = [(36.0003, -4.9980)];
-    let across = stand_route_avoiding(&net, &rw, lat, lon, None, &full).expect("a route");
-    assert_eq!(across.holding_point, "S1", "across only when nothing else is free");
-    assert!(!across.crossings.is_empty());
+    assert_eq!(traffic.holding_point, "S1");
+    assert!(traffic.crossings.is_empty(), "{:?}", traffic.crossings);
+    assert_eq!(traffic.path.first(), Some(&(lat, lon)), "from where it stands");
+    // Ours plans as it always did.
+    let ours = stand_route_avoiding(&net, &rw, lat, lon, None, &[]).expect("a route");
+    assert_eq!(ours.holding_point, "S1");
 }
 
 /// Our own arrival passes over a stand our own fleet's parked aircraft

@@ -623,12 +623,22 @@ fn a_parked_aircraft_fits_its_stand_and_leaves_the_movers_room() {
             .filter_map(|m| m.stand.as_deref().and_then(|n| f.stand(n)))
             .map(|s| (s.lat, s.lon))
             .collect();
+        let longest = f
+            .airport
+            .runways
+            .iter()
+            .map(|r| r.length_m())
+            .fold(0.0, f64::max);
         let lonely_left = |taken: &[LatLon]| {
             f.net.stands.iter().any(|s| {
                 s.is_suitable()
                     && !stand_taken(s, taken)
                     && !neighbour_taken(s, &movers)
                     && f.lane_clearance_m((s.lat, s.lon)) >= PARKED_LANE_CLEAR_M
+                    && taken
+                        .iter()
+                        .all(|p| dist_m(*p, (s.lat, s.lon)) >= PARK_SET_CLEAR_M)
+                    && parks_something(&f, s, longest)
             })
         };
         let mut taken = movers.clone();
@@ -794,21 +804,31 @@ fn a_turnaround_takes_the_types_own_time() {
     );
 }
 
-/// A runway lies between two points only when the line joining them
-/// crosses its centreline between its ends: what the arrival's own stand
-/// pick keeps to ([`FieldModel::free_stand`], this side first).
+/// No two aircraft stand on stands of one overlapping set at the start
+/// (EGKK, the hour sweep 2026-10-10: departures left through a jet parked
+/// 21 m away on the next stand of the set): every parked aircraft is at
+/// least [`PARK_SET_CLEAR_M`] from every other and from every stand the
+/// hour's flights stand on.
 #[test]
-fn a_runway_between_is_a_crossing_of_its_centreline() {
-    let f = fixtures::xnoc();
-    let e = f.end("12").unwrap();
-    let mid = e.at(e.length_m / 2.0, 0.0);
-    let left = project_m(mid, e.course_deg - 90.0, 300.0);
-    let right = project_m(mid, e.course_deg + 90.0, 300.0);
-    let left2 = project_m(left, e.course_deg, 200.0);
-    assert!(f.runway_between(left, right));
-    assert!(!f.runway_between(left, left2));
-    let beyond = project_m(e.thr, e.course_deg + 180.0, 500.0);
-    let beyond_l = project_m(beyond, e.course_deg - 90.0, 300.0);
-    let beyond_r = project_m(beyond, e.course_deg + 90.0, 300.0);
-    assert!(!f.runway_between(beyond_l, beyond_r), "past its end");
+fn nobody_parks_on_a_stand_of_an_occupied_set() {
+    let f = ulmm();
+    for seed in 0..10 {
+        let mut ms = generate(&f, Density::Normal, seed, &SpawnCtx::default());
+        let parked = park_at_start(&f, Density::Normal, seed, &SpawnCtx::default(), &mut ms);
+        let at = |m: &Movement| {
+            m.stand
+                .as_deref()
+                .and_then(|n| f.stand(n))
+                .map(|s| (s.lat, s.lon))
+        };
+        let movers: Vec<LatLon> = ms.iter().filter_map(at).collect();
+        let mine: Vec<LatLon> = parked.iter().filter_map(at).collect();
+        assert!(!mine.is_empty() || seed > 0, "ULMM parks something");
+        for (k, p) in mine.iter().enumerate() {
+            for q in movers.iter().chain(&mine[..k]) {
+                let d = dist_m(*p, *q);
+                assert!(d >= PARK_SET_CLEAR_M, "{seed}: {d:.0} m");
+            }
+        }
+    }
 }

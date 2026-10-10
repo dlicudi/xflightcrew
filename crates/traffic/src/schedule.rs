@@ -641,6 +641,15 @@ fn bring_first_forward(out: &mut [Movement], rng: &mut XorShift64) {
     }
 }
 
+/// A parked aircraft's stand is at least this far from any stand another
+/// aircraft stands on at the start, centre to centre, metres: a narrowbody's
+/// length less a margin, so no two jets are drawn wing in wing.
+const PARK_SET_CLEAR_M: f64 = 30.0;
+
+/// A jet is parked no nearer a stand a flight of the hour leaves from than
+/// this, metres: two narrowbody stands and their wingtip gaps.
+const JET_BESIDE_MOVER_M: f64 = 80.0;
+
 /// A parked aircraft's stand is at least this far from any lane others
 /// taxi along, metres (half a medium jet's span and a margin).
 const PARKED_LANE_CLEAR_M: f64 = 25.0;
@@ -738,14 +747,42 @@ pub fn park_at_start(
     let mut used: std::collections::HashSet<String> =
         schedule.iter().map(|m| m.callsign.clone()).collect();
     let mut out = Vec::new();
+    let mut held: Vec<LatLon> = taken.clone();
+    let mut in_beside = false;
     while out.len() < n && !(free.is_empty() && beside.is_empty()) {
+        // Beside a stand the hour's flights leave from only for a turboprop
+        // or a light aircraft: a departure leaving its stand passes its
+        // neighbour, and a jet's wing is in its way. EGKK (the hour sweep,
+        // 2026-10-10): with jets where ATRs stood, five departures left
+        // through the jet parked beside them.
         if free.is_empty() {
             std::mem::swap(&mut free, &mut beside);
+            in_beside = true;
         }
         let stand = free.swap_remove(rng.below(free.len() as u64) as usize);
+        // Never on a stand drawn within [`PARK_SET_CLEAR_M`] of one a
+        // flight of the hour stands on, or one already parked on: apt.dat
+        // draws alternative stands over each other ("64L", "64", "64R"),
+        // and at EGKK five departures left their stand through a jet
+        // parked 21 m away on the next one of the set (the hour sweep,
+        // 2026-10-10, the regional ATRs that stood there before being too
+        // short to show it).
+        let at = (stand.lat, stand.lon);
+        if held.iter().any(|p| dist_m(*p, at) < PARK_SET_CLEAR_M) {
+            continue;
+        }
         let Some((carrier, icao_type)) = parked_type(field, stand, longest, &mut rng) else {
             continue;
         };
+        let jet =
+            [crate::perf::JET_MED.name, JET_HEAVY.name].contains(&class_for_type(icao_type).0.name);
+        // ...nor, a jet, within [`JET_BESIDE_MOVER_M`] of one: a departure's
+        // way off its stand runs past the stands either side and beyond
+        // (EGKK, the same sweep: 18.5 m from jets parked two stands away).
+        if jet && (in_beside || movers.iter().any(|m| dist_m(*m, at) < JET_BESIDE_MOVER_M)) {
+            continue;
+        }
+        held.push(at);
         let (callsign, spoken) = match carrier {
             Some(c) => unique_flight(&c, &mut rng, &mut used),
             None => registration(prefix, icao_type, &mut rng),
@@ -815,6 +852,14 @@ fn parked_type(
     let light = ["C172", "C152", "PA28", "SR22"][rng.below(4) as usize];
     ((props || stand.accepts.is_empty()) && stand_width(stand) >= wingspan_code(light))
         .then_some((None, light))
+}
+
+/// Whether [`parked_type`] parks anything at all on `stand` (it draws only
+/// among what would): the test's measure of a stand left empty.
+#[cfg(test)]
+pub(crate) fn parks_something(field: &FieldModel, stand: &Stand, longest_m: f64) -> bool {
+    let mut rng = XorShift64::new(1);
+    (0..64).any(|_| parked_type(field, stand, longest_m, &mut rng).is_some())
 }
 
 /// The carrier and type pairs `field` flies off a runway `runway_m` long
