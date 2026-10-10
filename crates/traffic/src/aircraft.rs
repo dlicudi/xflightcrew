@@ -221,7 +221,7 @@ pub struct TrafficAircraft {
     /// Seconds since it spawned (the readback's clock: phases reset theirs).
     pub(crate) age_s: f64,
     /// Seconds in the current phase.
-    phase_s: f64,
+    pub(crate) phase_s: f64,
     /// Metres the downwind has been extended.
     pub(crate) ext_m: f64,
     /// The flight is flown: parked again, lingering.
@@ -233,8 +233,9 @@ pub struct TrafficAircraft {
     /// The taxi route being driven is the tower's (its cleared route): the
     /// spacing's guard never plans another, the tower watches it.
     tower_route: bool,
-    /// The altitude an arrival came in at.
-    entry_alt_ft: f64,
+    /// The altitude an arrival came in at (after a missed approach, the
+    /// missed approach altitude it climbed to).
+    pub(crate) entry_alt_ft: f64,
     /// Its distance from the ground traffic ahead, set by the fleet each
     /// substep ([`crate::spacing::apply`]); the drive stops short of it.
     pub spacing: GroundSpacing,
@@ -250,7 +251,26 @@ pub struct TrafficAircraft {
     pub(crate) orbits: u32,
     /// The way off the rollout is driving to, planned at touchdown.
     pub(crate) exit: Option<ExitRun>,
+    /// An instrument arrival's calls so far this approach
+    /// ([`crate::arrival`]).
+    pub(crate) ifr_radio: IfrRadio,
+    /// This approach follows a missed approach: its check-in is the
+    /// missed approach's.
+    pub(crate) missed: bool,
     rng: XorShift64,
+}
+
+/// Where an instrument arrival is in its calls: the approach unit's
+/// check-in, the established report that has it handed to the tower,
+/// then the tower's own established call (CAP 413 ch. 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum IfrRadio {
+    #[default]
+    Quiet,
+    CheckedIn,
+    /// Handed to the tower (or no approach unit to work).
+    WithTower,
+    TowerCalled,
 }
 
 impl TrafficAircraft {
@@ -300,6 +320,8 @@ impl TrafficAircraft {
             orbit: None,
             orbits: 0,
             exit: None,
+            ifr_radio: IfrRadio::Quiet,
+            missed: false,
             rng: XorShift64::new(seed),
         }
     }
@@ -357,6 +379,42 @@ impl TrafficAircraft {
         };
         let end = field.end(runway)?;
         let (perf, _) = class_for_type(icao_type);
+        // An airliner is an instrument arrival: out of sight on the far
+        // side of the approach, on the 3 degree profile, at the speed the
+        // schedule gives that far out ([`crate::arrival`]).
+        if crate::arrival::is_instrument(perf) {
+            let draw = XorShift64::new(seed ^ 0x9e37_79b9_7f4a_7c15).next_f64();
+            let entry = crate::arrival::entry_point(&end, *entry, draw);
+            let mut path = crate::arrival::approach_points(&end, entry);
+            let n_in = path.len() - 1;
+            path.extend([end.thr, end.far]);
+            let mut legs = vec![Leg::Inbound; n_in];
+            legs.extend([Leg::Final, Leg::Runway]);
+            let thr_idx = path.len() - 2;
+            let route = Route::new(path, legs, Some(thr_idx));
+            let d = route.dist_to(entry, thr_idx);
+            let alt = (end.elev_ft + TCH_FT + glide_ft(d))
+                .min(end.elev_ft + crate::arrival::ENTRY_MAX_AGL_FT);
+            let mut kin = Kin::parked(entry, alt, bearing(entry, route.path[1]));
+            kin.on_ground = false;
+            kin.gear = if perf.retractable_gear { 0.0 } else { 1.0 };
+            kin.gs_kts = crate::arrival::scheduled_kts(perf, d);
+            kin.lights.nav = true;
+            kin.lights.beacon = true;
+            kin.lights.strobe = true;
+            let mut ac = TrafficAircraft::new(
+                id,
+                callsign,
+                spoken,
+                icao_type,
+                plan,
+                kin,
+                Phase::Arrive,
+                seed,
+            );
+            ac.route = route;
+            return Some(ac);
+        }
         let alt = if *straight_in {
             let d = dist_m(*entry, end.thr);
             (end.elev_ft + TCH_FT + glide_ft(d)).min(end.elev_ft + 3000.0)
@@ -977,8 +1035,11 @@ impl TrafficAircraft {
         let path_to_thr = self.route.thr_idx.map(|i| self.route.dist_to(here, i));
         let glide = path_to_thr.map(|d| elev + TCH_FT + glide_ft(d));
         let past_abeam = end.frame(here).0 < 0.0;
+        let instrument = self.instrument();
 
-        if self.phase == Phase::Arrive {
+        if instrument {
+            self.instrument_calls(field, path_to_thr, events);
+        } else if self.phase == Phase::Arrive {
             let (miles, from) = inbound_position(field, here);
             self.call_once(Call::Inbound { miles, from }, events);
         }
@@ -997,6 +1058,8 @@ impl TrafficAircraft {
             Leg::Upwind | Leg::Runway => {
                 let target = match self.plan {
                     Plan::Departure { .. } => elev + DEPART_CLIMB_AGL_FT,
+                    // The missed approach climbs to its altitude.
+                    _ if instrument => self.entry_alt_ft,
                     _ => pattern_alt,
                 };
                 (target, if agl < 400.0 { p.v2_kts } else { p.climb_kts })
@@ -1019,11 +1082,28 @@ impl TrafficAircraft {
                         },
                         Some(g),
                     ) => g.min(self.entry_alt_ft),
+                    (_, Some(g)) if instrument => g.min(self.entry_alt_ft),
                     _ => pattern_alt,
                 };
                 (a, p.pattern_kts)
             }
             Leg::Outbound | Leg::Taxi => (elev + DEPART_CLIMB_AGL_FT, p.climb_kts.min(250.0)),
+        };
+        // An instrument arrival flies the radar unit's speeds beyond 4 nm,
+        // slowed for its spacing behind the one ahead; below the path it
+        // holds its level until the path comes down to it (the ILS
+        // intercepted from below), never climbs to it.
+        let (alt_target, kts, below_path) = match path_to_thr {
+            Some(d) if instrument && matches!(leg, Leg::Inbound | Leg::Final) => {
+                let below = leg == Leg::Final && self.kin.alt_ft < alt_target - 30.0;
+                let kts = if d > 4.0 * NM {
+                    self.instrument_kts(d, others)
+                } else {
+                    kts
+                };
+                (if below { self.kin.alt_ft } else { alt_target }, kts, below)
+            }
+            _ => (alt_target, kts, false),
         };
         // An orbit for a delay is flown level, at the height it began.
         let orbit_alt = self.orbit_alt();
@@ -1033,7 +1113,7 @@ impl TrafficAircraft {
         // trimmed on the error. A P law alone lags a ramp and arrives high.
         let on_path = matches!(leg, Leg::Downwind | Leg::Base | Leg::Inbound)
             && glide.is_some_and(|g| (g - alt_target).abs() < 1.0);
-        if orbit_alt.is_none() && (landing || leg == Leg::Final || on_path) {
+        if orbit_alt.is_none() && !below_path && (landing || leg == Leg::Final || on_path) {
             let ff = -self.kin.gs_kts * KT_TO_MS * 196.85 * GLIDE_DEG.to_radians().tan();
             let fix = (alt_target - self.kin.alt_ft) * 60.0 / crate::kin::VS_TAU_S;
             self.kin
@@ -1096,8 +1176,13 @@ impl TrafficAircraft {
                 self.start_orbit(end);
             }
         }
-        // A straight-in that cannot fit is given its delay out here.
-        self.delay_if_no_slot(end, others);
+        // A straight-in that cannot fit is given its delay out here; an
+        // instrument arrival only once slowing cannot make its place.
+        if instrument {
+            self.instrument_delay(end, others);
+        } else {
+            self.delay_if_no_slot(end, others);
+        }
 
         let spec = FollowSpec {
             accel_kts_s: 2.0,
@@ -1122,6 +1207,8 @@ impl TrafficAircraft {
                 events,
             ),
             Phase::Climb if leg == Leg::Outbound => self.set_phase(Phase::Leave, events),
+            // Off the missed approach, vectored round: an arrival again.
+            Phase::GoAround if leg == Leg::Inbound => self.set_phase(Phase::Arrive, events),
             Phase::GoAround if leg == Leg::Crosswind => self.set_phase(
                 Phase::Pattern {
                     leg: Leg::Crosswind,
@@ -1150,7 +1237,11 @@ impl TrafficAircraft {
                 if let Some((to, call)) = next {
                     if to != self.phase {
                         self.set_phase(to, events);
-                        self.call_once(call, events);
+                        // An instrument arrival reports established instead
+                        // ([`TrafficAircraft::instrument_calls`]).
+                        if !instrument {
+                            self.call_once(call, events);
+                        }
                     }
                 }
                 if o.go_around && matches!(self.phase, Phase::Pattern { leg: Leg::Base }) {
@@ -1181,9 +1272,30 @@ impl TrafficAircraft {
         }
     }
 
-    /// Climb away on the runway heading and fly the circuit again.
+    /// Climb away on the runway heading and fly the circuit again; an
+    /// instrument arrival flies the missed approach and is vectored round
+    /// for another approach ([`crate::arrival::missed_points`]).
     fn go_around(&mut self, end: &RunwayEnd, events: &mut Vec<Event>) {
         let here = self.kin.pos();
+        if self.instrument() {
+            let mut path = vec![here];
+            path.extend(crate::arrival::missed_points(end));
+            path.extend([end.thr, end.far]);
+            let n = path.len();
+            let mut legs = vec![Leg::Upwind];
+            legs.extend(vec![Leg::Inbound; n - 4]);
+            legs.extend([Leg::Final, Leg::Runway]);
+            self.route = Route::new(path, legs, Some(n - 2));
+            self.entry_alt_ft = crate::arrival::missed_approach_alt_ft(end.elev_ft);
+            self.ifr_radio = IfrRadio::Quiet;
+            self.missed = true;
+            self.orbit = None;
+            self.ext_m = 0.0;
+            self.kin.on_ground = false;
+            self.set_phase(Phase::GoAround, events);
+            self.call_once(Call::GoingAround, events);
+            return;
+        }
         let p = pattern_points(end, self.perf);
         let ahead = end.frame(here).0.max(end.length_m) + 300.0;
         let upwind_end = if end.frame(p.upwind_end).0 > ahead {

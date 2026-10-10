@@ -354,6 +354,13 @@ pub async fn live(xp: SimView<'_>) -> Option<Resolved> {
 /// anything else is spoken NATO-style like a tail number.
 pub(crate) const TELEPHONY: &[(&str, &str)] = &[
     ("IBE", "Iberia"),
+    // Our own traffic's French and Italian airlines (`traffic::schedule`):
+    // unknown here, their go-arounds were told the circuit's words, "climb
+    // to circuit altitude, report downwind" (LFPG, the hour sweep,
+    // 2026-10-10).
+    ("HOP", "Air Hop"),
+    ("TVF", "France Soleil"),
+    ("ITY", "Itarrow"),
     ("BAW", "Speedbird"),
     ("RYR", "Ryanair"),
     ("EZY", "Easy"),
@@ -406,9 +413,6 @@ pub(crate) const TELEPHONY: &[(&str, &str)] = &[
     // Our own traffic's carriers (`traffic::airlines`, 2026-10-10): every
     // one the tables fly has its telephony here, or the tower reads its
     // go-around as a circuit's and the frequency misses it.
-    ("TVF", "France Soleil"),
-    ("ITY", "Itarrow"),
-    ("HOP", "Air Hop"),
     ("IBS", "Iberexpres"),
     ("SWA", "Southwest"),
     ("ASA", "Alaska"),

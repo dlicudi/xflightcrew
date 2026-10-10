@@ -93,6 +93,7 @@ fn call(id: u32, text: &str, state: AircraftState, picture: Vec<TrafficTarget>) 
         text: text.into(),
         state,
         picture,
+        approach: false,
     }
 }
 
@@ -842,6 +843,7 @@ fn a_raw_traffic_callsign_is_answered_by_its_telephony() {
         text: "Gatwick Tower, RYR4521, request taxi".into(),
         state: at_the_hold(),
         picture: Vec::new(),
+        approach: false,
     });
     assert!(
         r.line.starts_with("Ryanair four five two one, "),
@@ -850,4 +852,75 @@ fn a_raw_traffic_callsign_is_answered_by_its_telephony() {
     );
     assert!(!r.line.contains("RYR"), "{}", r.line);
     Station::uninstall();
+}
+
+/// An instrument arrival 9 nm out on 26L's final, 3,000 ft.
+fn on_a_long_final() -> AircraftState {
+    let r = &book_runways()[0];
+    let (lat, lon) = crate::nav::project_latlon(r.lat_b, r.lon_b, r.heading_a_deg(), 9.0);
+    AircraftState::at_position(lat, lon, false, 3000.0)
+}
+
+/// THE ARRIVAL'S FREQUENCIES (CAP 413 ch. 6; the realism review,
+/// 2026-10-10: airliners called the tower ten miles out and were told
+/// "join final"): an instrument arrival checks in with APPROACH and is
+/// cleared for the approach, reports established and is handed to the
+/// tower, then calls the tower established and is cleared to land. Each
+/// answered in its own unit's voice.
+#[test]
+fn an_instrument_arrival_works_approach_then_the_tower() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let mut st = gatwick_live();
+    st.approach_khz = Some(126_825);
+    let cs = "Speedbird one two three";
+    let say = |st: &mut Station, text: &str, approach: bool| {
+        st.answer_traffic(&TrafficCall {
+            id: 7,
+            spoken: cs.into(),
+            text: text.into(),
+            state: on_a_long_final(),
+            picture: Vec::new(),
+            approach,
+        })
+    };
+    let r = say(
+        &mut st,
+        "Gatwick Approach, Speedbird one two three, descending altitude nine thousand feet, inbound",
+        true,
+    );
+    assert_eq!(r.speaker, StationSpeaker::Approach);
+    assert!(
+        r.line
+            .starts_with("Speedbird one two three, Gatwick Approach, descend altitude ")
+            && r.line
+                .contains("approach runway two six left, report established."),
+        "{}",
+        r.line
+    );
+    let r = say(
+        &mut st,
+        "Gatwick Approach, Speedbird one two three, established ILS runway two six left",
+        true,
+    );
+    assert_eq!(r.speaker, StationSpeaker::Approach);
+    assert!(r.line.contains("contact Gatwick Tower on"), "{}", r.line);
+    let r = say(
+        &mut st,
+        "Gatwick Tower, Speedbird one two three, established ILS runway two six left, nine miles",
+        false,
+    );
+    assert_eq!(r.speaker, StationSpeaker::Tower);
+    assert!(r.line.contains("cleared to land"), "{}", r.line);
+    // Off a missed approach: back to approach, vectored for another.
+    let r = say(
+        &mut st,
+        "Gatwick Approach, Speedbird one two three, missed approach, climbing altitude three thousand feet",
+        true,
+    );
+    assert!(
+        r.line.contains("expect vectors for a further") && !r.line.contains("contact"),
+        "{}",
+        r.line
+    );
 }

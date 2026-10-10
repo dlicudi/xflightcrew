@@ -10,6 +10,7 @@
 
 pub mod aircraft;
 pub mod airlines;
+pub mod arrival;
 pub mod clock;
 pub mod field;
 pub mod fleet;
