@@ -169,7 +169,9 @@ pub fn holds_for(call: &CrewCall) -> Holds {
             };
         }
         match (first, second) {
-            ("final", _) => {
+            // "Established ILS runway two six left": the instrument
+            // arrival's final report, true as long as the final is.
+            ("final", _) | ("established", _) => {
                 return Holds::Airborne {
                     max_age_s: 60.0,
                     max_travel_nm: None,
@@ -190,7 +192,7 @@ pub fn holds_for(call: &CrewCall) -> Holds {
                     before_landing: true,
                 }
             }
-            ("going", "around") => {
+            ("going", "around") | ("missed", "approach") => {
                 return Holds::Airborne {
                     max_age_s: 30.0,
                     max_travel_nm: None,

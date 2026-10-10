@@ -175,8 +175,12 @@ pub(super) fn stand_route_avoiding(
         .as_ref()
         .and_then(|(v, _)| v.path.last().copied())
         .unwrap_or((lat, lon));
-    let stand = if occupied.is_empty() {
-        net.nearest_stand(slat, slon)?.clone()
+    let (stand, mut plan) = if occupied.is_empty() {
+        let stand = net.nearest_stand(slat, slon)?.clone();
+        // To the STAND, not to the taxiway node nearest it — see `plan_to_stand`.
+        let mut plan = net.plan_to_stand(slat, slon, &stand)?;
+        mark_runway_crossings(&mut plan, runways);
+        (stand, plan)
     } else {
         let taken = |s: &nav::Stand| {
             occupied
@@ -184,18 +188,39 @@ pub(super) fn stand_route_avoiding(
                 .any(|(a, b)| nav::haversine_nm(s.lat, s.lon, *a, *b) * 1852.0 < STAND_TAKEN_M)
         };
         let d = |s: &nav::Stand| nav::haversine_nm(slat, slon, s.lat, s.lon);
-        net.stands
+        let mut free: Vec<&nav::Stand> = net
+            .stands
             .iter()
             .filter(|s| s.is_suitable() && !taken(s))
-            .min_by(|a, b| d(a).total_cmp(&d(b)))?
-            .clone()
+            .collect();
+        free.sort_by(|a, b| d(a).total_cmp(&d(b)));
+        let planned_from = |from: (f64, f64), s: &nav::Stand| {
+            let mut plan = net.plan_to_stand(from.0, from.1, s)?;
+            mark_runway_crossings(&mut plan, runways);
+            Some(((*s).clone(), plan))
+        };
+        let first = free.first().copied()?;
+        let clear_of =
+            |from: (f64, f64)| planned_from(from, first).filter(|(_, p)| p.crossings.is_empty());
+        clear_of((slat, slon))
+            .or_else(|| {
+                // Off the strip but nearest a network node on it (the route
+                // went back up the exit through the runway's strip: an
+                // arrival 66 m off LFPG's 09R, south of its exit Y3, held
+                // short of the runway it had just left): from the nearest
+                // node clear of every strip instead, the drive there first.
+                let off = runways.iter().all(|r| on_runway(r, slat, slon).is_none());
+                let node = off
+                    .then(|| node_clear_of_strips(net, runways, slat, slon))
+                    .flatten()?;
+                let (stand, mut plan) = clear_of(node)?;
+                plan.path.insert(0, (slat, slon));
+                plan.seg.insert(0, (String::new(), false));
+                Some((stand, plan))
+            })
+            .or_else(|| planned_from((slat, slon), first))?
     };
-    // To the STAND, not to the taxiway node nearest it — see `plan_to_stand`.
-    let mut plan = net.plan_to_stand(slat, slon, &stand)?;
     plan.holding_point = stand.name.clone();
-    // Crossings on the stand route only: the vacate's own runway is the
-    // landing clearance's pavement, not a crossing.
-    mark_runway_crossings(&mut plan, runways);
     if let Some((v, strip)) = vacate {
         sim::blackbox::record(
             "atc",
@@ -209,6 +234,33 @@ pub(super) fn stand_route_avoiding(
     }
     Some(plan)
 }
+
+/// The network node nearest (`lat`, `lon`) that touches a taxiway edge and
+/// lies on no runway strip, within [`CLEAR_NODE_MAX_M`].
+fn node_clear_of_strips(
+    net: &nav::TaxiNet,
+    runways: &[nav::Runway],
+    lat: f64,
+    lon: f64,
+) -> Option<(f64, f64)> {
+    let taxiway: std::collections::HashSet<i64> = net
+        .edges
+        .iter()
+        .filter(|e| !e.runway)
+        .flat_map(|e| [e.a, e.b])
+        .collect();
+    let d = |p: (f64, f64)| nav::haversine_nm(lat, lon, p.0, p.1) * 1852.0;
+    taxiway
+        .iter()
+        .filter_map(|id| net.nodes.get(id).copied())
+        .filter(|p| runways.iter().all(|r| on_runway(r, p.0, p.1).is_none()))
+        .filter(|p| d(*p) < CLEAR_NODE_MAX_M)
+        .min_by(|a, b| d(*a).total_cmp(&d(*b)))
+}
+
+/// The farthest a stand route's start is moved to a node clear of the
+/// runway strips, metres ([`node_clear_of_strips`]).
+const CLEAR_NODE_MAX_M: f64 = 150.0;
 
 /// Plan the drive off `runway` from where the rollout stopped. Reached only
 /// through [`crate::party_line::plan_vacate`] — `TAXI_NET` stays station-private.

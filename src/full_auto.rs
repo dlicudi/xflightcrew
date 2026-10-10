@@ -385,6 +385,10 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
     crate::aircraft::set_takeoff_margin_waived(RUNWAY_WAIVER_PENDING.swap(false, SeqCst));
     ABORT.store(false, SeqCst);
     INBOUND_MADE.store(false, SeqCst);
+    // A new mission's arrival radio: nothing called, nothing declared (the
+    // arrival declares its published approach when it builds it).
+    reset_arrival_radio();
+    crate::party_line::declare_instrument_arrival(false);
     set_arrival_runway(
         match &tools.mission {
             Mission::Flight(r) | Mission::Resume(r) => r.arrival_rwy.clone(),
@@ -719,6 +723,8 @@ mod route;
 pub(crate) use route::*;
 mod arrival;
 pub use arrival::*;
+mod arrival_radio;
+pub use arrival_radio::*;
 mod departure;
 pub use departure::*;
 mod gates;
@@ -754,3 +760,6 @@ mod arrival_watch_tests;
 
 #[cfg(test)]
 mod arrival_repick_tests;
+
+#[cfg(test)]
+mod arrival_radio_tests;

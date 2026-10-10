@@ -422,6 +422,14 @@ pub(super) async fn fly_route(
         }
     }
     set_arrival_runway(built.rwy_id.clone(), "arrival");
+    // A published approach on the plan is an instrument arrival to the
+    // station, whatever the callsign: approach first, the missed approach on
+    // a go-around (`party_line::own_instrument_arrival`). A local plan's
+    // visual final is not.
+    if built.plan.is_some() && route.local_runway.is_none() {
+        crate::party_line::declare_instrument_arrival(true);
+        event("instrument_arrival_declared", json!({ "runway": built.rwy_id }));
+    }
     if route
         .local_runway
         .as_ref()
@@ -738,11 +746,17 @@ pub(super) async fn fly_route(
             );
         }
     }
-    if crate::autoland::established_on_final() && !ABORT.load(SeqCst) {
-        let call = match &landing_rwy {
-            Some(rwy) => format!("final runway {}", crate::crew_radio::spell_runway(&rwy.id)),
-            None => "final".to_string(),
-        };
+    // Approach first: the tower is called on approach's handoff
+    // (`arrival_radio`), and while approach still watches for us the report
+    // is its "established", whose answer is that handoff.
+    let approach_first = APPROACH_FIRST.load(SeqCst);
+    if approach_first && !final_call_owed() && !ABORT.load(SeqCst) {
+        event("final_call_skipped", json!({ "why": "arrival_handoff" }));
+    } else if crate::autoland::established_on_final() && !ABORT.load(SeqCst) {
+        let call = final_call_words(
+            landing_rwy.as_ref().map(|r| r.id.as_str()),
+            approach_first && crate::party_line::approach_watch_armed(),
+        );
         radio_out(crate::crew_radio::radio_call(callsign, &call));
         event(
             "final_call",

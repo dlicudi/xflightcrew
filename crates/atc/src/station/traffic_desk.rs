@@ -249,6 +249,28 @@ impl Station {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .is_some_and(|f| f.ils.iter().any(|i| i.runway == ident));
+        let platform = ((self.apt.elev_ft + 3000.0) / 100.0).round() * 100.0;
+        match self.instrument_approach_words(&intent, ctx, &ctx.runway, ils, platform) {
+            Some(words) => words.line,
+            None => self.respond_approach(intent, ctx, wx),
+        }
+    }
+
+    /// Approach's words to an INSTRUMENT arrival, ours or the traffic's, in
+    /// the field's dialect: the check-in (`RequestLanding`) is cleared for
+    /// the approach on its own navigation, down to `platform_ft`; the
+    /// missed approach's check-in (`GoAround`) is climbed and re-sequenced
+    /// for another. `None` for every other call (`respond_approach` answers
+    /// it). One wording for both, so our arrival and the airliners round it
+    /// are worked alike (the realism review, 2026-10-10).
+    pub(super) fn instrument_approach_words(
+        &self,
+        intent: &tower::Intent,
+        ctx: &tower::Ctx,
+        runway: &str,
+        ils: bool,
+        platform_ft: f64,
+    ) -> Option<ApproachWords> {
         let kind = if ils { "ILS" } else { "straight in" };
         let faa = self.dialect == Dialect::Faa;
         let level = |ft: f64| {
@@ -266,39 +288,54 @@ impl Station {
         let unit = format!("{} Approach", ctx.airport);
         match intent {
             tower::Intent::RequestLanding { .. } => {
-                let platform = ((self.apt.elev_ft + 3000.0) / 100.0).round() * 100.0;
-                let (alt, qnh) = level(platform);
-                if faa {
-                    format!(
-                        "{}, {unit}, descend and maintain {alt}{qnh}, cleared {kind} runway {} \
-                         approach, report established.",
-                        ctx.callsign, ctx.runway
-                    )
+                let (alt, qnh) = level(platform_ft);
+                Some(if faa {
+                    ApproachWords {
+                        line: format!(
+                            "{}, {unit}, descend and maintain {alt}{qnh}, cleared {kind} \
+                             runway {runway} approach, report established.",
+                            ctx.callsign
+                        ),
+                        readback: format!(
+                            "descend and maintain {alt}, cleared {kind} runway {runway} approach"
+                        ),
+                    }
                 } else {
-                    format!(
-                        "{}, {unit}, descend {alt}{qnh}, cleared {kind} approach runway {}, \
-                         report established.",
-                        ctx.callsign, ctx.runway
-                    )
-                }
+                    ApproachWords {
+                        line: format!(
+                            "{}, {unit}, descend {alt}{qnh}, cleared {kind} approach runway \
+                             {runway}, report established.",
+                            ctx.callsign
+                        ),
+                        readback: format!(
+                            "descending {alt}, cleared {kind} approach runway {runway}"
+                        ),
+                    }
+                })
             }
             tower::Intent::GoAround => {
                 let (alt, _) = level(tower::missed_approach_alt_ft(self.apt.elev_ft));
-                if faa {
-                    format!(
-                        "{}, {unit}, roger, climb and maintain {alt}, expect vectors for \
-                         another {kind} runway {} approach, report established.",
-                        ctx.callsign, ctx.runway
-                    )
+                Some(if faa {
+                    ApproachWords {
+                        line: format!(
+                            "{}, {unit}, roger, climb and maintain {alt}, expect vectors for \
+                             another {kind} runway {runway} approach, report established.",
+                            ctx.callsign
+                        ),
+                        readback: format!("climb and maintain {alt}"),
+                    }
                 } else {
-                    format!(
-                        "{}, {unit}, roger, climb {alt}, expect vectors for a further {kind} \
-                         approach runway {}, report established.",
-                        ctx.callsign, ctx.runway
-                    )
-                }
+                    ApproachWords {
+                        line: format!(
+                            "{}, {unit}, roger, climb {alt}, expect vectors for a further {kind} \
+                             approach runway {runway}, report established.",
+                            ctx.callsign
+                        ),
+                        readback: format!("climbing {alt}"),
+                    }
+                })
             }
-            _ => self.respond_approach(intent, ctx, wx),
+            _ => None,
         }
     }
 

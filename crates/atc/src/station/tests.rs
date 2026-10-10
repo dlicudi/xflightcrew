@@ -908,6 +908,64 @@ fn a_stand_route_avoiding_the_parked_goes_to_the_next_free_stand() {
     assert!(stand_route_avoiding(&net, &[], lat, lon, None, &full).is_none());
 }
 
+/// A traffic arrival stopped off the strip but nearest a network node on
+/// it is routed from the nearest node clear of the strip, not back through
+/// it (LFPG 09R, the traffic hour sweep 2026-10-10: an arrival 66 m off the
+/// runway was routed back up its exit through the strip and held short of
+/// the runway it had just left for the rest of the hour).
+#[test]
+fn a_traffic_stand_route_starts_clear_of_the_strip() {
+    let mut nodes = std::collections::HashMap::new();
+    // Node 1 on the runway's strip, node 2 clear of it.
+    nodes.insert(1, (36.0000, -5.00005));
+    nodes.insert(2, (36.0000, -4.9985));
+    let net = nav::TaxiNet {
+        nodes,
+        edges: vec![nav::TaxiEdge {
+            a: 1,
+            b: 2,
+            oneway: false,
+            runway: false,
+            name: "A".into(),
+            zone_of: Vec::new(),
+        }],
+        stands: vec![nav::Stand {
+            lat: 36.0003,
+            lon: -4.9985,
+            heading: 180.0,
+            name: "S1".into(),
+            kind: "gate".into(),
+            accepts: vec![],
+            width: None,
+        }],
+        paint: vec![],
+        pavement: vec![],
+        stand_lines: vec![],
+    };
+    let runway = nav::Runway {
+        ident_a: "18".into(),
+        ident_b: "36".into(),
+        lat_a: 36.0100,
+        lon_a: -5.0000,
+        lat_b: 35.9900,
+        lon_b: -5.0000,
+        width_m: 30.0,
+        surface: 1,
+    };
+    let rw = [runway];
+    // 61 m off the centreline, nearer node 1 (on the strip) than node 2.
+    let (lat, lon) = (36.0000, -4.99935);
+    assert!(on_runway(&rw[0], lat, lon).is_none(), "off the strip");
+    let far = [(0.0, 0.0)];
+    let traffic = stand_route_avoiding(&net, &rw, lat, lon, None, &far).expect("a route");
+    assert_eq!(traffic.holding_point, "S1");
+    assert!(traffic.crossings.is_empty(), "{:?}", traffic.crossings);
+    assert_eq!(traffic.path.first(), Some(&(lat, lon)), "from where it stands");
+    // Ours plans as it always did.
+    let ours = stand_route_avoiding(&net, &rw, lat, lon, None, &[]).expect("a route");
+    assert_eq!(ours.holding_point, "S1");
+}
+
 /// Our own arrival passes over a stand our own fleet's parked aircraft
 /// stands on (#243): the link publishes where they stand, our stand route
 /// (the arrival desk's and the self taxi's) reads it; with no fleet the
@@ -10428,4 +10486,26 @@ fn a_picture_target_s_track_comes_from_its_last_sighting() {
     assert!(advisory_line(&f).contains("westbound, A320, same altitude"), "{}", advisory_line(&f));
     *TRACK_MEMORY.lock().unwrap() = None;
     *TRAFFIC_TYPES.lock().unwrap() = None;
+}
+
+/// LFPG 09R (the traffic hour sweep, 2026-10-10): an arrival stopped 66 m
+/// south of the runway, nearest a node of exit Y3 inside the runway's strip,
+/// was routed back up Y3 through the strip and held short of the runway it
+/// had just left for the rest of the hour. Its stand route now starts from
+/// the nearest node clear of the strip, with no crossing.
+/// `cargo test -p atc --release -- --ignored real_install_lfpg_off_strip --nocapture`
+#[test]
+#[ignore] // needs the real X-Plane install; run with --ignored
+fn real_install_lfpg_off_strip_stand_route_needs_no_crossing() {
+    let apt = crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    if !std::path::Path::new(&apt).exists() {
+        return;
+    }
+    let st = Station::load(&apt, "LFPG").expect("LFPG");
+    let net = nav::find_taxi_net(&apt, "LFPG").unwrap().expect("its network");
+    let (lat, lon) = (49.02153743889608, 2.542026196488463);
+    let far = [(0.0, 0.0)];
+    let plan = stand_route_avoiding(&net, &st.apt.runways, lat, lon, None, &far).expect("a route");
+    println!("{} {:?} via {:?}", plan.holding_point, plan.crossings, plan.via);
+    assert!(plan.crossings.is_empty(), "{:?}", plan.crossings);
 }

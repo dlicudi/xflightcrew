@@ -599,6 +599,8 @@ mod line_up;
 pub use line_up::*;
 mod run;
 pub use run::*;
+mod traffic_guard;
+pub use traffic_guard::*;
 
 /// A castoring nose's yaw on its brakes, for the aligning pivot's tests: the
 /// brake command (signed, + right) reaches the wheel after `delay_s` through a

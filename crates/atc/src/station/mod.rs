@@ -24,7 +24,8 @@ use sim::xplane::SimView;
 // `party_line`'s accessors, never these statics.
 pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
-    AircraftState, FlightId, FlightStrip, IfrFlight, StripRef, ARRIVAL_PIN, GO_AROUND_ORDERS,
+    AircraftState, ArrivalHandoff, FlightId, FlightStrip, IfrFlight, StripRef, ARRIVAL_PIN,
+    GO_AROUND_ORDERS,
     OWN_STRIP, PENDING_STATION, STRIPS, traffic_strip, traffic_strips,
     REGION_HANDOFF,
 };
@@ -240,10 +241,41 @@ struct StripDesk {
     call: CallScratch,
 }
 
+/// The final the runway in use offers an arrival (`Station::final_geometry`):
+/// the runway end, its threshold and course (degrees true), whether it has
+/// an ILS, the intercept platform (ft MSL) and the join distance (nm).
+struct FinalGeometry {
+    ident: String,
+    thr_lat: f64,
+    thr_lon: f64,
+    course_deg: f64,
+    ils: bool,
+    target_alt_ft: f64,
+    join_nm: f64,
+}
+
+/// Approach's words to an instrument arrival (`instrument_approach_words`):
+/// the transmission and the crew's readback of it, without the callsign.
+pub(super) struct ApproachWords {
+    line: String,
+    readback: String,
+}
+
+/// Beyond this from the field an INSTRUMENT arrival calling the tower is
+/// approach's, not yet the tower's: approach hands an established arrival
+/// over at the join, eight to eleven miles out on an ILS (`ils_join_nm` plus
+/// two), so twelve is past any handoff approach would have made.
+pub(super) const TOWER_TAKES_ARRIVAL_NM: f64 = 12.0;
+
 /// Per transmission: what the call being answered stated, consumed by the
 /// pick that answers it.
 #[derive(Default)]
 struct CallScratch {
+    /// How far the caller is from the field, nm, as it keys (`ctx_for_call`;
+    /// `None` when its position did not read). The tower sends an instrument
+    /// arrival that calls it from beyond [`TOWER_TAKES_ARRIVAL_NM`] to
+    /// approach.
+    field_nm: Option<f64>,
     /// The runway the arrival now calling named for itself, consumed by the
     /// pick that answers the call (`note_stated_runway`).
     stated_runway: Option<String>,
@@ -522,6 +554,7 @@ pub use briefing::*;
 pub use coach::*;
 pub use compliance::*;
 pub(crate) use ifr::*;
+pub(crate) use respond::instrument_arrival;
 pub use new_flight::*;
 pub use party_chatter::*;
 pub use positions::*;
@@ -554,6 +587,9 @@ mod tick_tests;
 
 #[cfg(test)]
 mod traffic_tests;
+
+#[cfg(test)]
+mod arrival_tests;
 
 #[cfg(test)]
 mod positions_tests;

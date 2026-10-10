@@ -257,6 +257,16 @@ impl Station {
             .to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
             .any(|w| w == "cleared");
+        // An instrument arrival's first call to approach is its check-in
+        // ("information Bravo, descending flight level eight zero"), never a
+        // readback: it is cleared for the approach (`arrival_check_in`).
+        if !echoes_clearance
+            && intent == tower::Intent::Unknown
+            && self.arrival_check_in(transcript, service, ctx)
+        {
+            let landing = tower::Intent::RequestLanding { touch_and_go: false };
+            return self.respond(transcript, service, landing, ctx, wx);
+        }
         if echoes_clearance || (intent == tower::Intent::Unknown && tower::is_readback(transcript))
         {
             // The position the tower handed us to takes the check-in: a

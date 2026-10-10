@@ -481,9 +481,15 @@ impl Station {
         }
         match service {
             Service::Tower | Service::Ground | Service::Delivery => {
+                if let Some(line) = self.tower_sends_to_approach(&intent, ctx) {
+                    return line;
+                }
                 let was = self.desk.twr.state;
                 let going_around = intent == tower::Intent::GoAround;
                 let reply = self.desk.twr.handle(intent.clone(), ctx);
+                if going_around {
+                    self.missed_approach_handoff(ctx);
+                }
                 // The crew's "going around" after a re-sequenced order is
                 // answered with the runway it is re-sequenced to, once.
                 let reply = match (going_around, self.desk.resequenced.take()) {
@@ -1048,6 +1054,14 @@ impl Station {
     /// The approach controller: vectors to final, or a redirect to the tower
     /// for anything that belongs there.
     pub(super) fn respond_approach(&mut self, intent: tower::Intent, ctx: &tower::Ctx, wx: Wx) -> String {
+        if let Some(line) = self.clear_instrument_approach(&intent, ctx, wx) {
+            return line;
+        }
+        // Our established report hands us to the tower: published for the
+        // crew that works the radio, whichever branch below says it.
+        if intent == tower::Intent::ReportFinal && !ctx.on_ground && !self.desk.strip.is_traffic() {
+            self.publish_tower_handoff(ctx, "reported_established");
+        }
         match intent {
             tower::Intent::RadioCheck => {
                 format!(
@@ -1151,17 +1165,240 @@ impl Station {
         }
     }
 
-    /// Arm the vectors-to-final plan and speak the opening instruction. The
-    /// monitor's tick ([`vector_tick`]) takes it from here.
-    fn arm_vectors(&mut self, ctx: &tower::Ctx, wx: Wx) -> String {
+    /// The tower an arrival is handed to: its name as spoken ("Gatwick
+    /// Tower"), its frequency in the dialect, and in kHz.
+    fn tower_unit(&self, ctx: &tower::Ctx) -> (String, String, i64) {
+        (
+            format!("{} Tower", ctx.airport),
+            atis::spoken_mhz_in(self.tower_khz, self.dialect),
+            self.tower_khz,
+        )
+    }
+
+    /// Approach clears OUR instrument arrival on its own navigation, as it
+    /// clears the airliners round it ([`Station::instrument_approach_words`]):
+    /// the check-in gets the descent to the platform and "cleared ILS
+    /// approach, report established", a missed approach's check-in the climb
+    /// and another approach. No headings: the crew flies its procedure, the
+    /// pilot the ILS. What approach keeps is the watch for "established"
+    /// ([`ApproachWatch`]), so a pilot who never reports is still handed to
+    /// the tower, and the crew's readback words. Until this, an IFR arrival
+    /// was vectored only when it asked, and its inbound call went to the
+    /// tower, which answered "join final, report final" as to a VFR circuit
+    /// (the realism review, 2026-10-10). `None` for anything else: a VFR
+    /// arrival, a touch and go, a call from the ground or a field with no
+    /// runway data keep their old answers.
+    fn clear_instrument_approach(
+        &mut self,
+        intent: &tower::Intent,
+        ctx: &tower::Ctx,
+        wx: Wx,
+    ) -> Option<String> {
+        if self.desk.strip.is_traffic()
+            || ctx.on_ground
+            || !instrument_arrival(&self.desk.strip, &ctx.callsign)
+            || !matches!(
+                intent,
+                tower::Intent::RequestLanding { touch_and_go: false } | tower::Intent::GoAround
+            )
+        {
+            return None;
+        }
+        let geo = self.final_geometry(wx)?;
+        let runway_spoken = atis::spoken_runway(&geo.ident);
+        let words =
+            self.instrument_approach_words(intent, ctx, &runway_spoken, geo.ils, geo.target_alt_ft)?;
+        *self.desk.strip.vectors.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Inbound to the field on the runway approach named: published with
+        // the clearance, so the crew's arrival sets up for THIS runway
+        // (`full_auto::tower_arrival_runway` reads an Inbound clearance's
+        // runway) as it does for the tower's "join final".
+        self.desk.twr.state = tower::State::Inbound;
+        self.desk.twr.expect_touch_and_go(false);
+        *self.desk.strip.approach_watch.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(ApproachWatch {
+                callsign: ctx.callsign.clone(),
+                thr_lat: geo.thr_lat,
+                thr_lon: geo.thr_lon,
+                course_deg: geo.course_deg,
+                target_alt_ft: geo.target_alt_ft,
+                join_nm: geo.join_nm,
+                runway_spoken: runway_spoken.clone(),
+                ils: geo.ils,
+                tower: self.tower_unit(ctx),
+            });
+        *self.desk.strip.approach_readback.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(words.readback);
+        sim::blackbox::record(
+            "atc",
+            serde_json::json!({
+                "event": "approach_cleared", "runway": geo.ident, "ils": geo.ils,
+                "platform_ft": geo.target_alt_ft, "join_nm": (geo.join_nm * 10.0).round() / 10.0,
+                "missed": *intent == tower::Intent::GoAround,
+                "field_nm": self.desk.call.field_nm.map(|d| (d * 10.0).round() / 10.0),
+            }),
+        );
+        Some(words.line)
+    }
+
+    /// Our INSTRUMENT arrival's first call to approach, in check-in words
+    /// ("Gatwick Director, Speedbird one two three, information Bravo,
+    /// descending flight level eight zero"): no intent of its own, and its
+    /// "descending" read as a readback, so it earned silence. It is the
+    /// arrival's check-in while approach has cleared nothing yet: airborne,
+    /// no watch or vectors armed, and not a departure's check-in (the
+    /// handoff after takeoff, `dep_checked_in`).
+    pub(super) fn arrival_check_in(
+        &self,
+        transcript: &str,
+        service: Service,
+        ctx: &tower::Ctx,
+    ) -> bool {
+        let t = transcript.to_lowercase();
+        let word = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
+        service == Service::Approach
+            && !ctx.on_ground
+            && !self.desk.strip.is_traffic()
+            && (word("descending") || word("information") || t.contains("with you"))
+            && !(self.desk.handed_to == Some(Service::Approach) && !self.desk.dep_checked_in)
+            && instrument_arrival(&self.desk.strip, &ctx.callsign)
+            && self.desk.strip.approach_watch.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+            && self.desk.strip.vectors.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+    }
+
+    /// Approach hands our arrival to the tower on its established report:
+    /// the handoff published for the crew ([`ArrivalHandoff`]), the watch
+    /// retired, and (cleared on our own navigation) the landing-clearance
+    /// coach armed as the watch's own handoff arms it.
+    fn publish_tower_handoff(&mut self, ctx: &tower::Ctx, why: &str) {
+        let watch = self
+            .desk
+            .strip
+            .approach_watch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let (runway_spoken, ils) = match &watch {
+            Some(w) => (w.runway_spoken.clone(), w.ils),
+            None => {
+                let ident = self.runway_in_use.clone().unwrap_or_default();
+                let ils = ILS_FACTS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|f| f.ils.iter().any(|i| i.runway == ident));
+                (ctx.runway.clone(), ils)
+            }
+        };
+        let (to, _, khz) = self.tower_unit(ctx);
+        *self.desk.strip.arrival_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(ArrivalHandoff {
+                to,
+                khz,
+                to_tower: true,
+                missed: false,
+                runway_spoken: runway_spoken.clone(),
+                ils,
+            });
+        if watch.is_some() {
+            *self.desk.strip.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(runway_spoken.clone());
+        }
+        sim::blackbox::record(
+            "atc",
+            serde_json::json!({
+                "event": "approach_handoff", "why": why, "to_khz": khz,
+                "runway": runway_spoken, "watched": watch.is_some(),
+                "field_nm": self.desk.call.field_nm.map(|d| (d * 10.0).round() / 10.0),
+            }),
+        );
+    }
+
+    /// The tower hears our INSTRUMENT arrival's inbound call from beyond
+    /// [`TOWER_TAKES_ARRIVAL_NM`] at a field with an approach unit: not yet
+    /// its traffic. "Contact Approach", published for the crew, instead of
+    /// "join final" (the VFR answer, which an IFR arrival 20 miles out has no
+    /// business flying). Inside it, or with no position, the tower takes the
+    /// call as before.
+    fn tower_sends_to_approach(&mut self, intent: &tower::Intent, ctx: &tower::Ctx) -> Option<String> {
+        let khz = self.approach_khz?;
+        if !matches!(intent, tower::Intent::RequestLanding { .. })
+            || ctx.on_ground
+            || self.desk.strip.is_traffic()
+            || !instrument_arrival(&self.desk.strip, &ctx.callsign)
+        {
+            return None;
+        }
+        let nm = self.desk.call.field_nm.filter(|d| *d > TOWER_TAKES_ARRIVAL_NM)?;
+        let to = format!("{} Approach", ctx.airport);
+        let freq = atis::spoken_mhz_in(khz, self.dialect);
+        *self.desk.strip.arrival_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(ArrivalHandoff {
+                to: to.clone(),
+                khz,
+                to_tower: false,
+                missed: false,
+                runway_spoken: ctx.runway.clone(),
+                ils: false,
+            });
+        sim::blackbox::record(
+            "atc",
+            serde_json::json!({
+                "event": "tower_to_approach", "field_nm": (nm * 10.0).round() / 10.0,
+                "to_khz": khz,
+            }),
+        );
+        Some(format!(
+            "{}, {} Tower, contact {to} on {freq}.",
+            ctx.callsign, ctx.airport
+        ))
+    }
+
+    /// Our instrument arrival's go-around, answered by the tower with the
+    /// missed approach and "contact Approach" ([`tower::missed_approach_words`]):
+    /// the handoff published for the crew, which tunes the radar unit and
+    /// checks in for another approach. The approach watch dies with the
+    /// approach it watched.
+    fn missed_approach_handoff(&mut self, ctx: &tower::Ctx) {
+        *self.desk.strip.approach_watch.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if self.desk.strip.is_traffic() || ctx.on_ground {
+            return;
+        }
+        let Some((to, _)) = ctx.missed_approach.as_ref().and_then(|m| m.contact.clone()) else {
+            return;
+        };
+        let Some(khz) = self.approach_khz.or(self.departure_khz) else {
+            return;
+        };
+        *self.desk.strip.arrival_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(ArrivalHandoff {
+                to,
+                khz,
+                to_tower: false,
+                missed: true,
+                runway_spoken: ctx.runway.clone(),
+                ils: false,
+            });
+        sim::blackbox::record(
+            "atc",
+            serde_json::json!({ "event": "missed_approach_handoff", "to_khz": khz }),
+        );
+    }
+
+    /// The final the runway in use offers an arrival: its threshold and
+    /// course, whether it has an ILS, the intercept platform and the join
+    /// distance. `None` with no runway data. Shared by the vectors and the
+    /// instrument arrival's own-navigation clearance, so both name the same
+    /// runway, platform and established gate.
+    fn final_geometry(&mut self, wx: Wx) -> Option<FinalGeometry> {
         // The runway END in use: its threshold is the aim point, its heading
         // the final approach course. Same held pick as every clearance, so
         // vectors and the tower always agree on the runway.
         let ident = self.pick_runway(wx.wind_from_deg, wx.wind_kts);
         if ident.is_empty() {
-            return format!("{}, unable, no runway data.", ctx.callsign);
+            return None;
         }
-        let Some((thr_lat, thr_lon, course_deg)) = self.apt.runways.iter().find_map(|r| {
+        let (thr_lat, thr_lon, course_deg) = self.apt.runways.iter().find_map(|r| {
             if r.ident_a == ident {
                 Some((r.lat_a, r.lon_a, r.heading_a_deg()))
             } else if r.ident_b == ident {
@@ -1169,9 +1406,7 @@ impl Station {
             } else {
                 None
             }
-        }) else {
-            return format!("{}, unable, no runway data.", ctx.callsign);
-        };
+        })?;
         // ILS when the runway has one (background load may still be running:
         // then it's a visual, exactly as before — honest about what's known).
         let facts = ILS_FACTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1195,6 +1430,32 @@ impl Station {
         let join_nm = match &ils_rec {
             Some(rec) => ils_join_nm(target_alt_ft - self.apt.elev_ft, rec.gs_deg.unwrap_or(3.0)),
             None => JOIN_FINAL_NM,
+        };
+        Some(FinalGeometry {
+            ident,
+            thr_lat,
+            thr_lon,
+            course_deg,
+            ils,
+            target_alt_ft,
+            join_nm,
+        })
+    }
+
+    /// Arm the vectors-to-final plan and speak the opening instruction. The
+    /// monitor's tick ([`vector_tick`]) takes it from here.
+    fn arm_vectors(&mut self, ctx: &tower::Ctx, wx: Wx) -> String {
+        let Some(FinalGeometry {
+            ident,
+            thr_lat,
+            thr_lon,
+            course_deg,
+            ils,
+            target_alt_ft,
+            join_nm,
+        }) = self.final_geometry(wx)
+        else {
+            return format!("{}, unable, no runway data.", ctx.callsign);
         };
         let runway_spoken = atis::spoken_runway(&ident);
         *self.desk.strip.vectors.lock().unwrap_or_else(|e| e.into_inner()) = Some(VectorPlan {
@@ -1263,19 +1524,22 @@ impl Station {
 }
 
 /// Is the flight on this strip an INSTRUMENT arrival, whose go-around is
-/// the missed approach: an IFR flight, or an airline (its callsign is an
-/// airline's telephony, [`crate::callsign::is_airline_telephony`]) not
-/// working the circuit. A 737 off the ILS was told "climb to circuit
-/// altitude, report downwind" (the realism review, 2026-10-09).
-pub(super) fn instrument_arrival(strip: &FlightStrip, callsign: &str) -> bool {
+/// the missed approach: an IFR flight, an airline (its callsign is an
+/// airline's telephony, [`crate::callsign::is_airline_telephony`]) or a
+/// crew that declared it flies a published approach on its plan
+/// (`instrument_declared`), not working the circuit. A 737 off the ILS was
+/// told "climb to circuit altitude, report downwind" (the realism review,
+/// 2026-10-09).
+pub(crate) fn instrument_arrival(strip: &FlightStrip, callsign: &str) -> bool {
     if strip.circuits.load(Ordering::SeqCst) {
         return false;
     }
-    strip
-        .ifr_flight
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some()
+    strip.instrument_declared.load(Ordering::SeqCst)
+        || strip
+            .ifr_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
         || crate::callsign::is_airline_telephony(callsign)
 }
 
