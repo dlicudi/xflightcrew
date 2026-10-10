@@ -656,14 +656,26 @@ pub(super) async fn call_inbound(
     // made this call on Carlisle's frequency, where COM1 had sat since the
     // Scottish border, it went into the void marked as made, and Exeter
     // challenged the arrival as an unknown aircraft (2026-09-21).
+    // An instrument arrival at a field with an approach unit checks in with
+    // APPROACH, which clears the approach and hands us to the tower once
+    // established (`arrival_radio`); the tower is called first only by a VFR
+    // arrival or at a field with no approach row. The realism review,
+    // 2026-10-10: our arrival called the tower and was told "join final".
+    let approach = approach_first_khz(
+        swapped,
+        crate::party_line::active_approach_khz(),
+        crate::party_line::own_instrument_arrival(callsign.as_deref().unwrap_or("")),
+    );
+    APPROACH_FIRST.store(approach.is_some(), SeqCst);
+    let call_khz = approach.unwrap_or(khz);
     let tuned = xp
         .get_float(COM1_FREQ_KHZ)
         .await
         .ok()
         .map(|v| v.round() as i64);
-    if !inbound_on_frequency(tuned, khz) {
-        let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
-        event("inbound_retune", json!({ "khz": khz, "was": tuned }));
+    if !inbound_on_frequency(tuned, call_khz) {
+        let _ = xp.set_float(COM1_FREQ_KHZ, call_khz as f64).await;
+        event("inbound_retune", json!({ "khz": call_khz, "was": tuned }));
     }
     // The field's OWN wind before the tower hears us: the station may have
     // become this field a moment ago, and until the monitor's next feed its
@@ -688,7 +700,7 @@ pub(super) async fn call_inbound(
     crate::party_line::pin_arrival_station(Some(khz));
     event(
         "inbound_call",
-        json!({ "khz": khz, "station_swapped": swapped }),
+        json!({ "khz": khz, "station_swapped": swapped, "approach_khz": approach }),
     );
 }
 

@@ -426,7 +426,11 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   `IFR_FLIGHT`); airborne it goes to a radar position (`radar_position`).
 - **The inbound call** goes to the destination's OWN tower (`inbound_due`) or on its challenge;
   `call_inbound` tunes COM1 and arms that station (`station::arm_station_for_freq`). A crossing
-  field's challenge is `zone_challenge`, never "inbound". **"Final" is reported ESTABLISHED on it**
+  field's challenge is `zone_challenge`, never "inbound". **An instrument arrival works APPROACH
+  first** where the field has one (`full_auto::arrival_radio`, `party_line::own_instrument_arrival`):
+  cleared on its own navigation (`Station::clear_instrument_approach`), handed to the tower
+  established (`ApproachWatch`, `take_arrival_handoff`); an early tower call or a go-around goes
+  back to approach. **"Final" is reported ESTABLISHED on it**
   (`autoland::final_report_due`, `established_on_final`), never as autoland takes the arrival.
 - **Top of descent**: only `procedure::planned_tod` is announced; **while a follower flies, the
   plan's ring is silence** (`Snapshot::follower_flying`); only in cruise (`monitor::tod_in_cruise`).

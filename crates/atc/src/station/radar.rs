@@ -263,6 +263,99 @@ pub fn vector_tick(
         ..AircraftState::at_position(lat, lon, on_ground, f64::NAN)
     };
     vector_tick_for(&OWN_STRIP, &state, track_deg, now)
+        .or_else(|| approach_watch_tick_for(&OWN_STRIP, &state, track_deg))
+}
+
+/// Established on the final course, the one test the vectors' handoff and
+/// the approach watch's share. Beyond a mile: inside the join (plus two),
+/// within 15 degrees of the course from the threshold and flying it.
+/// Inside a mile the bearing is too twitchy, so landing intent instead:
+/// below the platform, pointed down the runway (see `vector_tick_for`,
+/// Gibraltar 2026-07-13). Pure.
+pub(super) fn established_on_course(
+    dist_thr_nm: f64,
+    off_course_deg: f64,
+    aligned: bool,
+    alt_ft: f64,
+    target_alt_ft: f64,
+    join_nm: f64,
+) -> bool {
+    if dist_thr_nm >= 1.0 {
+        dist_thr_nm <= join_nm + 2.0 && off_course_deg <= 15.0 && aligned
+    } else {
+        alt_ft < target_alt_ft && off_course_deg <= 45.0 && aligned
+    }
+}
+
+/// Approach's worksheet for an INSTRUMENT arrival it cleared on its own
+/// navigation ([`Station::clear_instrument_approach`]): no headings, only
+/// the watch for the moment it is established, when approach hands it to
+/// the tower. Armed only for our own strip (the traffic flies its own
+/// handoff).
+pub struct ApproachWatch {
+    pub(super) callsign: String,
+    pub(super) thr_lat: f64,
+    pub(super) thr_lon: f64,
+    /// Final approach course, degrees true.
+    pub(super) course_deg: f64,
+    pub(super) target_alt_ft: f64,
+    pub(super) join_nm: f64,
+    pub(super) runway_spoken: String,
+    pub(super) ils: bool,
+    /// The tower handed to: its spoken name ("Gatwick Tower"), its
+    /// frequency spoken in the dialect, and in kHz.
+    pub(super) tower: (String, String, i64),
+}
+
+/// One tick of the approach watch: silence until the flight is seen
+/// established on the final course (the vectors' own test,
+/// [`established_on_course`]), then "contact Tower" once, published for the
+/// crew ([`crate::party_line::take_arrival_handoff`]) and for the
+/// landing-clearance coach. A pilot who never reports established is still
+/// handed over at the join, about eight to eleven miles out on an ILS, where
+/// a real director lets an established arrival go. Landed (or armed on the
+/// ground) is no approach: the watch ends silent.
+pub(super) fn approach_watch_tick_for(
+    flight: &FlightStrip,
+    state: &AircraftState,
+    track_deg: Option<f64>,
+) -> Option<String> {
+    let mut guard = flight.approach_watch.lock().unwrap_or_else(|e| e.into_inner());
+    let w = guard.as_ref()?;
+    if state.on_ground {
+        *guard = None;
+        return None;
+    }
+    let (lat, lon) = state.position()?;
+    let dist_thr = crate::nav::haversine_nm(lat, lon, w.thr_lat, w.thr_lon);
+    let brg_thr = crate::nav::bearing_deg(lat, lon, w.thr_lat, w.thr_lon);
+    let off_course = sim::angles::abs_diff_deg(brg_thr, w.course_deg);
+    let aligned = track_deg.is_none_or(|t| sim::angles::abs_diff_deg(t, w.course_deg) <= 30.0);
+    if !established_on_course(dist_thr, off_course, aligned, state.alt_ft, w.target_alt_ft, w.join_nm)
+    {
+        return None;
+    }
+    let (name, spoken, khz) = w.tower.clone();
+    let line = format!("{}, contact {name} {spoken}.", w.callsign);
+    *flight.arrival_handoff.lock().unwrap_or_else(|e| e.into_inner()) = Some(ArrivalHandoff {
+        to: name,
+        khz,
+        to_tower: true,
+        missed: false,
+        runway_spoken: w.runway_spoken.clone(),
+        ils: w.ils,
+    });
+    *flight.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(w.runway_spoken.clone());
+    sim::blackbox::record(
+        "atc",
+        serde_json::json!({
+            "event": "approach_handoff", "why": "seen_established", "to_khz": khz,
+            "dist_nm": (dist_thr * 10.0).round() / 10.0, "runway": w.runway_spoken,
+        }),
+    );
+    *guard = None;
+    Some(line)
 }
 
 /// [`vector_tick`] for one flight's strip: its vectors plan and its
@@ -302,11 +395,8 @@ pub(super) fn vector_tick_for(
     // (Gibraltar, 2026-07-13). Inside the mile the test is landing intent:
     // below the vector altitude, pointed down the runway, threshold still
     // broadly ahead.
-    let established = if dist_thr >= 1.0 {
-        dist_thr <= plan.join_nm + 2.0 && off_course <= 15.0 && aligned
-    } else {
-        alt_ft < plan.target_alt_ft && off_course <= 45.0 && aligned
-    };
+    let established =
+        established_on_course(dist_thr, off_course, aligned, alt_ft, plan.target_alt_ft, plan.join_nm);
     if established {
         let handoff = plan
             .tower_spoken

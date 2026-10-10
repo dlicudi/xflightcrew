@@ -605,6 +605,12 @@ mod tests {
             // ...and a runway crossing the tower cleared (the 2026-10-08
             // traffic sweep), a strip `facts` cell.
             "CROSSING",
+            // New with our own instrument arrival (2026-10-10): approach's
+            // watch for "established", its clearance's readback and the
+            // approach / tower handoff, strip `facts` cells.
+            "APPROACH_WATCH",
+            "APPROACH_READBACK",
+            "ARRIVAL_HANDOFF",
         ];
         let station_flight = [
             "SQUAWK_WATCH",
@@ -618,7 +624,10 @@ mod tests {
             // cell.
             "CIRCUITS",
         ];
-        let flight_carried = ["IFR_FLIGHT", "REGION_HANDOFF", "ARRIVAL_PIN", "OWN_FIXES"];
+        // INSTRUMENT_DECLARED (2026-10-10): the crew flies a published
+        // approach, declared before the destination's station installs.
+        let flight_carried =
+            ["IFR_FLIGHT", "REGION_HANDOFF", "ARRIVAL_PIN", "OWN_FIXES", "INSTRUMENT_DECLARED"];
         let station_field = [
             "OUT_OF_REACH",
             "GO_AROUND_LAST",
