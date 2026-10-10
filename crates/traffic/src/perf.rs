@@ -52,6 +52,17 @@ pub struct Perf {
     /// The gap kept behind the aircraft ahead on a taxiway, tail to nose,
     /// metres (a jet's is its blast).
     pub taxi_gap_m: f64,
+    /// The speed a rapid (acute) exit is taken at, knots: a square one is
+    /// taken at taxi pace. A jet leaves a rapid exit at 40 to 60 kt, a
+    /// turboprop at 30 to 40, a light aircraft turns off at taxi pace on
+    /// whatever exit it reaches.
+    pub exit_kts: f64,
+    /// The braking a rollout plans its exit on, metres a second squared
+    /// (an autobrake's medium setting for a jet): the first exit past the
+    /// point it brings the aircraft down to the exit's speed is the one
+    /// taken. Under the class's [`Perf::decel_kts_s`], which is the most it
+    /// brakes.
+    pub exit_decel_ms2: f64,
 }
 
 /// A wake turbulence category (ICAO: L, M, H, J).
@@ -100,6 +111,8 @@ pub const PISTON_SINGLE: Perf = Perf {
     span_m: 11.0,
     length_m: 8.3,
     taxi_gap_m: 30.0,
+    exit_kts: 12.0,
+    exit_decel_ms2: 1.5,
 };
 
 /// A King Air or ATR class turboprop.
@@ -126,6 +139,8 @@ pub const TURBOPROP: Perf = Perf {
     span_m: 27.0,
     length_m: 27.0,
     taxi_gap_m: 35.0,
+    exit_kts: 35.0,
+    exit_decel_ms2: 1.5,
 };
 
 /// An A320 or 737 class jet.
@@ -152,6 +167,8 @@ pub const JET_MED: Perf = Perf {
     span_m: 36.0,
     length_m: 38.0,
     taxi_gap_m: 40.0,
+    exit_kts: 50.0,
+    exit_decel_ms2: 1.75,
 };
 
 /// A 777 or A330 class jet.
@@ -178,6 +195,8 @@ pub const JET_HEAVY: Perf = Perf {
     span_m: 65.0,
     length_m: 70.0,
     taxi_gap_m: 50.0,
+    exit_kts: 45.0,
+    exit_decel_ms2: 1.6,
 };
 
 /// The class table and wake category for an ICAO type designator. An

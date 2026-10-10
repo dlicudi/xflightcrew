@@ -1098,6 +1098,7 @@ fn a_stand_route_from_the_runway_starts_with_the_vacate() {
         path: vec![ll(0.0, 0.0), ll(100.0, 0.0), ll(100.0, -60.0)],
         seg: vec![("06/24".into(), true), ("C".into(), false)],
         exit_name: "C".into(),
+        turn_off: None,
     };
     let rest = TaxiRoutePlan {
         via: vec!["C".into(), "D".into()],
@@ -2722,6 +2723,88 @@ fn vacate_net() -> TaxiNet {
     net.edges.push(e(11, 12, "Alpha", false, &[]));
     net.edges.push(e(12, 13, "Alpha", false, &[]));
     net
+}
+
+/// A strip running north with its exits at three angles, for the rollout
+/// at speed: a square link at 400 m, a rapid (30 degree) exit at 900 m, a
+/// square one at 1,300 m and a reverse-angle (110 degree) one at 1,700 m,
+/// all onto a parallel taxiway 150 m east. Nodes 1..6 are the runway.
+fn exits_net() -> TaxiNet {
+    let mut net = TaxiNet::default();
+    for (id, north) in [
+        (1, 0.0),
+        (2, 400.0),
+        (3, 900.0),
+        (4, 1300.0),
+        (5, 1700.0),
+        (6, 2000.0),
+    ] {
+        net.nodes.insert(id, ll(0.0, north));
+    }
+    // The taxiway's nodes: abeam the square link, ahead of the rapid one
+    // (150 m east is 260 m on at 30 degrees), behind the reverse one.
+    for (id, north) in [(12, 400.0), (13, 1160.0), (14, 1300.0), (15, 1645.0)] {
+        net.nodes.insert(id, ll(150.0, north));
+    }
+    let e = |a, b, name: &str, runway, zone: &[&str]| TaxiEdge {
+        a,
+        b,
+        name: name.into(),
+        runway,
+        oneway: false,
+        zone_of: zone.iter().map(|s| s.to_string()).collect(),
+    };
+    for (a, b) in [(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)] {
+        net.edges.push(e(a, b, "36/18", true, &["36", "18"]));
+    }
+    net.edges.push(e(2, 12, "A", false, &[]));
+    net.edges.push(e(3, 13, "R", false, &[]));
+    net.edges.push(e(4, 14, "B", false, &[]));
+    net.edges.push(e(5, 15, "X", false, &[]));
+    net.edges.push(e(12, 13, "Alpha", false, &[]));
+    net.edges.push(e(13, 14, "Alpha", false, &[]));
+    net.edges.push(e(14, 15, "Alpha", false, &[]));
+    net
+}
+
+/// THE ROLLOUT AT SPEED picks its exit as a crew does (EGKK, the hour
+/// sweep, 2026-10-09: every arrival slowed to taxi pace a kilometre in and
+/// drove on down the runway to the nearest exit, 119 s on it): the first
+/// exit past the point its braking makes that exit's speed, a rapid one
+/// preferred, never one it is past the speed for, never a reverse-angle
+/// one; with none, no plan.
+#[test]
+fn a_rollout_at_speed_takes_the_first_exit_it_can_make_rapid_first() {
+    let net = exits_net();
+    let zone = ["36".to_string(), "18".to_string()];
+    let at = ll(0.0, 100.0);
+    let pick = |rapid_from_m: f64, square_from_m: f64| ExitPick {
+        rapid_from_m,
+        square_from_m,
+        rapid_max_deg: 45.0,
+        rapid_bonus_m: 300.0,
+    };
+    let turn_off = |k: Option<&ExitPick>| {
+        net.plan_vacate_picked(at.0, at.1, 0.0, &zone, VACATE_CLEAR_M, k)
+            .and_then(|v| v.turn_off)
+    };
+    // Metres north of the field's origin the exit leaves the runway at.
+    let exit =
+        |k: &ExitPick| turn_off(Some(k)).map(|t| ((t.at.0 - LAT0) * 111_320.0).round() as i64);
+    // Unpicked (the stopped rollout's), the nearest exit ahead: the square
+    // one at 400 m.
+    let near = turn_off(None).expect("an exit ahead");
+    assert!((near.deg - 90.0).abs() < 2.0, "{near:?}");
+    assert_eq!(((near.at.0 - LAT0) * 111_320.0).round() as i64, 400);
+    // Past 400 m before it slows: the rapid exit at 900 m, at 30 degrees.
+    let k = pick(600.0, 700.0);
+    assert_eq!(exit(&k), Some(900));
+    let rapid = turn_off(Some(&k)).unwrap();
+    assert!((rapid.deg - 30.0).abs() < 2.0, "{rapid:?}");
+    // Too fast for the rapid exit (800 m on): the square one at 1,300 m.
+    assert_eq!(exit(&pick(850.0, 1000.0)), Some(1300));
+    // The reverse-angle exit at 1,700 m is never taken at speed.
+    assert_eq!(exit(&pick(1300.0, 1300.0)), None);
 }
 
 /// Vacating is the completion of the landing clearance, not a new
