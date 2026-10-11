@@ -124,6 +124,16 @@ C172's autopilot modes parked through `xvl conform`: FLC, APR, VNAV, which datar
 them and which commands drive them.
 *Done when:* the delay is a blackbox number and the C172's mode table is a probed fact.
 
+**Phase 0 result (2026-10-11, measured live, no logging code added):** a Web API read of
+`xcopilot/position` and a heading-bug write each take 14 ms median (p90 16 ms) at a
+16.7 ms frame: the API answers once per frame. Read, write and the plugin's next frame
+together cost about 50 ms. Waiting for our next tick costs half a tick on average: 100 ms in
+the flare (200 ms tick), 165 to 270 ms elsewhere. The VSI needle the flare read costs about
+1,000 ms. **So the transport is not the problem; the sensor and the tick rate are.**
+Decision: phase 2 first tries the flare in Rust at a faster tick (about 50 ms, one batched
+read) on `local_vy`. The plugin-hosted law (`crates/laws`) is built only if that measurably
+fails. It is the larger change, and less code is a goal.
+
 **Phase 1: the C172 approach on its own autopilot (Rust only).**
 From the final approach fix to the roundout gate the GFC 700 flies APR (ILS, or GPS where
 the procedure gives a glidepath). Speed is the book approach power plus the slow IAS trim.

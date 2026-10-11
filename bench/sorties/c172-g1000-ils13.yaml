@@ -1,0 +1,16 @@
+# Autonomy in layers, phase 1 (docs/tasks/autonomy-layers/DESIGN.md): the
+# G1000 C172 flies LEMG 13's ILS on its own GFC 700 APR, localiser and
+# glideslope, to the roundout gate; today's flare lands it. Check blackbox
+# `ils` `coupling` reaching Coupled, `autoflight` `press` APP once, no HDG
+# or V/S press after the captures, and `autoland` stable at 500 ft.
+#   xvl sortie bench/sorties/c172-g1000-ils13.yaml --check
+#   xvl sortie bench/sorties/c172-g1000-ils13.yaml
+after: stop
+
+cases:
+  - name: C172 G1000 LEMG 13 ILS, 10 nm final, coupled on the GFC 700
+    setup:
+      aircraft: "Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP_G1000.acf"
+      approach: { field: LEMG, runway: 13, final_nm: 10 }
+    traffic: off
+    deadline_min: 15

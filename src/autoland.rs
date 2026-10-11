@@ -326,6 +326,8 @@ use run::*;
 mod approach;
 pub use approach::*;
 mod flare;
+// The flare by attitude, judged by height (docs/tasks/autonomy-layers).
+pub(crate) mod attitude_flare;
 pub use flare::*;
 mod arrest;
 pub use arrest::*;

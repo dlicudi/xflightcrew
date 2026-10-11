@@ -14122,3 +14122,41 @@ threshold and 1,085 m ahead against 792, and the 4.5 ft balk becomes a flare dow
 room for the roll is still a go-around; nothing changes for an airframe without a declared roll.
 Tests: `lxgb09_landing_call_tests`, `the_lxgb_plant_is_fitted_to_its_own_flare`,
 `the_lxgb_float_lands_in_the_touchdown_zone`. Offline only.
+
+## 2026-10-11: autonomy in layers, phase 1 and 2 begun on the G1000 172
+
+Design: `docs/tasks/autonomy-layers/DESIGN.md`. The aircraft's own autopilot flies; we fly only
+what no autopilot can. Reference airframe: `Cessna_172SP_G1000.acf` (GFC 700; the plain
+`Cessna_172SP.acf` carries an S-TEC without FLC or VNAV).
+
+- **Latency, measured live:** a Web API read or write is 14 ms median at a 16.7 ms frame. The
+  flare's delay was the VSI (about 1 s) and the tick (100 ms in the flare), not the transport,
+  so the plugin-hosted law is not built.
+- **The autopilot's own pitch hold is too slow for a flare** (63% of a 3 degree step in 2.3 s,
+  90% in 3.3 s) and the GFC 700 drops out near the stall: probed in the air over the sea
+  (it slowed to 55 kt at fixed power and rolled off; paused and reset on the ground).
+- **Coupled ILS on the 172** (`ils_coupled`, `ils_decouple_agl_ft: 200`): the course source to
+  NAV1 before APR (`ils::course_source_to_nav1`, shared with the pilot-monitoring setup): left
+  on GPS the APR tracked the GPS (sortie 1791735653). The GFC 700 held LEMG 13's localiser 18 to
+  37 m left in a light crosswind and the landing gate went around at 100 ft (1791738327); a Cat
+  I ILS is coupled to its 200 ft decision height, then landed visually (1791739518: our lateral
+  lined up). Open: APR armed only the glideslope whenever pressed with the localiser needle
+  already alive and centred (1791736342, 1791741953); it captured both when pressed with the
+  needles at full scale (1791738327, 1791739518).
+- **The pitch plant is on the tape** (`autoland` `theta`, `alpha`, `q`, `vy_true`,
+  `elev_total`, `tas`, final and flare only). Attitude less alpha is the flight path with no
+  lag: -0.9 deg nose at 1.8 alpha is -300 fpm at 63 kt where `local_vy` read -296 and the VSI
+  -177 (1791739518). The nose answers the elevator in 0.2 to 0.4 s.
+- **Why the 172 flared early:** the 25 ft flare and 50 ft roundout were sized for the VS mode's
+  4.5 s lag, kept after the arrest took the elevator directly; then the arrest flew the VSI a
+  second late into a balloon and a drop (463, 502, 544 fpm).
+- **The attitude flare** (`autoland::attitude_flare`, `flare_elevator: attitude: true`, the 172
+  only): hold the path the aircraft is on, then shrink the sink in proportion to the height
+  left from `gate_ft` = sink x `RESPONSE_S` (3 s; 20 ft at 401 fpm) to -100 at the wheels; the
+  path becomes an attitude (path + slowly filtered alpha + a slow path trim), led by the
+  target's rate; the elevator holds the attitude (one `Gains` set, chosen over half to double
+  the measured authority and a 0.7 to 1.5 s path lag, `attitude_flare_tests`). First flight,
+  1791741953: PASS, 253 fpm, no balloon. Below 8 ft the path stayed -2.0 to -2.5 deg against a
+  command easing to -1.1 while the pull rose 0.12 to 0.27 (ground effect, unmodelled in the
+  test plant): the next step is the plant, from this flight.
+

@@ -2262,9 +2262,10 @@ mod tests {
             !names.iter().any(|x| x.contains("cmd_b")),
             "CMD B is never named"
         );
-        // An airframe that declares nothing flies the stock panel.
+        // An airframe that declares no panel flies the stock one (the 172's
+        // only difference is its coupled ILS, flown on the stock APR).
         let c172 = crate::aircraft::load("cessna_172sp").expect("172 profile");
-        assert_eq!(Panel::from_profile(&c172), Panel::default());
+        assert_eq!(Panel::from_profile(&c172), Panel { coupled_ils: true, ..Panel::default() });
     }
 
     /// Every name the owner and the 737 panel use exists in the installed

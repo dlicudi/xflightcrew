@@ -253,21 +253,12 @@ impl Tool for PrepareIls {
             line = format!("The runway we're cleared for. {line}");
         }
 
-        // The course source: the approach mode follows the HSI, and a panel
-        // left on GPS tracks the GPS whatever NAV1 says.
-        let mut source_fixed = None;
-        if let Ok(src) = ctx.xplane.get_float(ils::HSI_SOURCE).await {
-            if src.round() as i64 != 0 {
-                let _ = crate::autoflight::press(ctx.xplane, crate::autoflight::Button::HsiNav1).await;
-                let now = ctx.xplane.get_float(ils::HSI_SOURCE).await;
-                let ok = now.is_ok_and(|v| v.round() as i64 == 0);
-                source_fixed = Some(ok);
-                line.push_str(if ok {
-                    " Course source to NAV1."
-                } else {
-                    " The course source won't go to NAV1, check it."
-                });
-            }
+        // The course source: the approach mode follows the HSI.
+        let source_fixed = ils::course_source_to_nav1(ctx.xplane).await;
+        match source_fixed {
+            Some(true) => line.push_str(" Course source to NAV1."),
+            Some(false) => line.push_str(" The course source won't go to NAV1, check it."),
+            None => {}
         }
 
         // Minimums from the chart, the missed approach from its legs.

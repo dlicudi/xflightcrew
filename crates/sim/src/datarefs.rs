@@ -182,6 +182,15 @@ pub const INDICATED_AIRSPEED_KTS: &str = "sim/flightmodel/position/indicated_air
 /// Flight-model bank and pitch, degrees (not the `true_` attitude above).
 pub const PHI_DEG: &str = "sim/flightmodel/position/phi";
 pub const THETA_DEG: &str = "sim/flightmodel/position/theta";
+/// Angle of attack, degrees: the nose's attitude less the flight path.
+pub const ALPHA_DEG: &str = "sim/flightmodel/position/alpha";
+/// Body pitch rate, degrees a second.
+pub const PITCH_RATE_DEG_S: &str = "sim/flightmodel/position/Q";
+/// Vertical velocity in the local frame, metres a second, positive up: the
+/// physical rate, not an instrument (the VSI trails it by about a second).
+pub const LOCAL_VY_MS: &str = "sim/flightmodel/position/local_vy";
+/// True airspeed, metres a second.
+pub const TRUE_AIRSPEED_MS: &str = "sim/flightmodel/position/true_airspeed";
 /// Body yaw rate, degrees per second.
 pub const YAW_RATE_DEG_S: &str = "sim/flightmodel/position/R";
 /// Velocity in the local frame, m/s: east (x) and south (z).
