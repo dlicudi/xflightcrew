@@ -41,7 +41,7 @@
             "A330.acf" => "airbus_a330_300",
             "Cessna_CitationX.acf" => "citation_x",
             "S-76C.acf" => "sikorsky_s76c",
-            "Cessna_172SP.acf" => "cessna_172sp",
+            "Cessna_172SP.acf" | "Cessna_172SP_G1000.acf" => "cessna_172sp",
             "N844X.acf" => "lancair_evolution",
             "MD80.acf" => "md82",
             "Baron_58.acf" => "beechcraft_baron_58",

@@ -123,6 +123,7 @@
             balloon_ease_per_s: Some(0.15),
             tau_s: None,
             model: None,
+            attitude: false,
         };
         let g = super::FlareGains::from_profile(Some(p));
         let d = super::FlareGains::default();

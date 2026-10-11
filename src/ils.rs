@@ -457,6 +457,21 @@ fn status_of(captured: bool, armed: bool) -> f64 {
     }
 }
 
+/// The course source to NAV1 before the approach mode is armed: the mode
+/// follows the HSI, and a panel left on GPS tracks the GPS whatever NAV1
+/// says. The G1000 172 armed APR with the source on GPS, sat on the
+/// localiser at -0.10 dots and never captured it (LEMG 13, 2026-10-11).
+/// `None` when it already reads NAV1 or does not read (nothing pressed);
+/// else whether the press read back.
+pub async fn course_source_to_nav1(xp: &dyn crate::xplane::XPlane) -> Option<bool> {
+    let src = xp.get_float(HSI_SOURCE).await.ok()?;
+    if src.round() as i64 == 0 {
+        return None;
+    }
+    let _ = autoflight::press(xp, Button::HsiNav1).await;
+    Some(xp.get_float(HSI_SOURCE).await.is_ok_and(|v| v.round() as i64 == 0))
+}
+
 /// Whether the live airframe may fly an ILS coupled.
 pub fn coupled_allowed() -> bool {
     crate::aircraft::live_profile().is_some_and(|p| p.ils_coupled)

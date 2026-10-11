@@ -2,6 +2,18 @@
 
 use super::*;
 
+/// The pitch plant's reads (`theta`, `alpha`, `q`, `vy_true`, `elev_total`,
+/// `tas` on the autoland tick), in this order: logged, and the attitude
+/// flare's measurements.
+const PITCH_PLANT: [&str; 6] = [
+    sim::datarefs::THETA_DEG,
+    sim::datarefs::ALPHA_DEG,
+    sim::datarefs::PITCH_RATE_DEG_S,
+    sim::datarefs::LOCAL_VY_MS,
+    sim::datarefs::TOTAL_PITCH_RATIO,
+    sim::datarefs::TRUE_AIRSPEED_MS,
+];
+
 pub(super) fn spawn_autoland(launch: AutolandLaunch) {
     let AutolandLaunch {
         base,
@@ -257,6 +269,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             // standing pull must not survive a go-around into the next one.
             let mut flare_pitch =
                 FlarePitch::with_gains(FlareGains::from_profile(crate::aircraft::flare_elevator()));
+            // ...or the arrest by attitude, judged by height, where declared.
+            let attitude_law = crate::aircraft::flare_elevator().filter(|f| f.attitude);
+            let mut attitude_flare = super::attitude_flare::AttitudeFlare::default();
             // ...or, where the airframe declares its elevator's response,
             // the arrest flown on that model (`FlareModel`, the 737).
             let mut flare_model = FlareModel::from_profile(crate::aircraft::flare_elevator());
@@ -439,6 +454,13 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 let af_panel = autoflight::panel();
                 let mut extra_names: Vec<String> = vec![thr_name.clone()];
                 extra_names.extend(af_panel.tick_names());
+                // The pitch plant on the tape, final and flare only: how this
+                // airframe's nose answers the elevator, the data the attitude
+                // flare is built on (docs/tasks/autonomy-layers). Logged only.
+                let panel_n = extra_names.len() - 1;
+                if matches!(last_phase, Some(ApproachPhase::Final | ApproachPhase::Flare)) {
+                    extra_names.extend(PITCH_PLANT.iter().map(|n| n.to_string()));
+                }
                 let extra_refs: Vec<&str> = extra_names.iter().map(String::as_str).collect();
                 // ...and on a landing the autopilot flies (`ap_lands`), its
                 // FMA, second channel and speed window, in the same round.
@@ -464,7 +486,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 let mut extra = extra.into_iter();
                 let mut unread = || Err(anyhow::anyhow!("unread"));
                 let mut throttle_read = Some(extra.next().unwrap_or_else(&mut unread));
-                let panel_reads: Vec<Option<f64>> = extra.map(|r| r.ok()).collect();
+                let mut panel_reads: Vec<Option<f64>> = extra.map(|r| r.ok()).collect();
+                let plant = panel_reads.split_off(panel_n.min(panel_reads.len()));
+                let plant_at = |i: usize| plant.get(i).copied().flatten();
                 let panel_tick = af_panel.tick_from(&panel_reads);
                 // The FMA's captures beside the lamps (`ap_lands`): the
                 // Zibo's APP lamp is lit armed or captured alike.
@@ -2495,7 +2519,33 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // A landing the autopilot flies (`ap_lands`) is its flare:
                 // our column never arrests it (the plugin releases our yoke
                 // channels while CMD is lit anyway).
+                let mut att_out: Option<super::attitude_flare::Out> = None;
                 let flare_elev = match (g.arresting && !ap_flies, vvi, pitch_yielded) {
+                    // The arrest by attitude: the path from the attitude, no
+                    // VSI. No attitude read is no decision (the channel
+                    // expires by itself).
+                    (true, _, false) if attitude_law.is_some() => {
+                        match (plant_at(0), plant_at(1), plant_at(2), plant_at(5)) {
+                            (Some(theta_deg), Some(alpha_deg), Some(q_dps), Some(tas_ms)) => {
+                                let lim = attitude_law.expect("guarded");
+                                let o = attitude_flare.step(
+                                    super::attitude_flare::In {
+                                        radio_ft,
+                                        theta_deg,
+                                        alpha_deg,
+                                        q_dps,
+                                        tas_kts: tas_ms * 1.943_844,
+                                        dt: tick_dt,
+                                    },
+                                    lim.max,
+                                    lim.max_push,
+                                );
+                                att_out = Some(o);
+                                Some(o.elev)
+                            }
+                            _ => None,
+                        }
+                    }
                     // Once the pilot has taken the pitch it stays taken for
                     // this approach — the debounce the taxi and takeoff
                     // channels learned: a latch that re-arms is a fight over
@@ -2543,6 +2593,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     }
                     _ => {
                         flare_pitch.reset();
+                        attitude_flare.reset();
                         if let Some(m) = flare_model.as_mut() {
                             m.reset();
                         }
@@ -2681,6 +2732,12 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     "e_join": energy.map(|(a, ..)| a.join_kts), "e_gate": energy.map(|(.., k)| k),
                     "e_s": energy.map(|(_, s, ..)| s), "e_path": energy.map(|(_, _, p, _)| p),
                     "vs_dial": vs_dial, "vvi": vvi, "vs_fm": vs_fm, "vvi_trend": vvi_trend, "arresting": g.arresting,
+                    "theta": plant_at(0), "alpha": plant_at(1), "q": plant_at(2),
+                    "vy_true": plant_at(3).map(|v| v * 196.850_394), "elev_total": plant_at(4),
+                    "tas": plant_at(5).map(|v| v * 1.943_844),
+                    "att_gate": att_out.map(|o| o.gate_ft), "att_vs_t": att_out.map(|o| o.vs_target_fpm),
+                    "att_gamma": att_out.map(|o| o.gamma_deg), "att_gamma_cmd": att_out.map(|o| o.gamma_cmd_deg),
+                    "att_theta_cmd": att_out.map(|o| o.theta_cmd_deg),
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
                     // The wheels, so a first contact the rollout latch never
                     // saw (a bounce) is on the tape: the scorecard judges it.
@@ -2810,6 +2867,14 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                             &mut coupling_armed_s,
                             tick_dt,
                         );
+                        if out.press_appr {
+                            if let Some(ok) = crate::ils::course_source_to_nav1(&xp).await {
+                                crate::blackbox::record(
+                                    "ils",
+                                    serde_json::json!({"event": "course_source", "to": "nav1", "ok": ok}),
+                                );
+                            }
+                        }
                         if out.press_appr || out.disarm {
                             autoflight::press_logged(
                                 &xp,
