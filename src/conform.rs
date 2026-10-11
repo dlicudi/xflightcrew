@@ -1801,6 +1801,9 @@ pub async fn run_steps(
     let mut yoke_armed = false;
     // Read once, before the first mode row: why the modes cannot be judged.
     let mut modes_blocked: Option<Option<String>> = None;
+    // The stock flight director, raised for the mode rows by this check
+    // (`raise_stock_fd`) and put back at the end only if it was.
+    let mut fd_raised: Option<bool> = None;
     let mut rows = Vec::new();
     for step in steps {
         if !matches!(step, Step::Skip { .. } | Step::Profile) {
@@ -1830,7 +1833,19 @@ pub async fn run_steps(
                 }
                 match modes_blocked.as_ref().and_then(Option::as_ref) {
                     Some(why) => Row::skipped(format!("mcp_mode_{}", m.label), why.clone()),
-                    None => probe_mode(xp, &panel, m, &modes).await,
+                    None => {
+                        if fd_raised.is_none() {
+                            let (raised, row) = raise_stock_fd(xp, &panel).await;
+                            fd_raised = Some(raised);
+                            if let Some(row) = row {
+                                record_row(&p.id, &row);
+                                emit(&row);
+                                rows.push(row);
+                            }
+                        }
+                        let row = probe_mode(xp, &panel, m, &modes).await;
+                        fd_fallback_row(row, fd_raised == Some(true))
+                    }
                 }
             }
             Step::Switch(s, label) => probe_switch(xp, &panel, *s, label).await,
@@ -1880,6 +1895,11 @@ pub async fn run_steps(
         emit(&row);
         rows.push(row);
     }
+    // The flight director this check raised goes back down, whatever
+    // stopped the check (the servos were never in: parked).
+    if fd_raised == Some(true) {
+        let _ = autoflight::press(xp, Button::DisconnectFd).await;
+    }
     // The reversers must end stowed, whatever stopped the check.
     if steps.contains(&Step::Reverse) {
         let deploy = read_array(xp, REVERSER_DEPLOY)
@@ -1891,6 +1911,52 @@ pub async fn run_steps(
         rows.push(row);
     }
     rows
+}
+
+/// A mode already on before its press that a press keeps on, with the
+/// stock director up: the director's fallback mode, not a dead button. The
+/// G1000 172 drops into ALT when V/S comes off, and pressing ALT in ALT
+/// keeps it (2026-10-11). Nothing to judge parked, so SKIPPED, never PASS;
+/// a panel whose director this check did not raise keeps its FAIL (a lit
+/// Boeing mode that will not go out is a fault). Pure.
+fn fd_fallback_row(row: Row, fd_raised: bool) -> Row {
+    if fd_raised && row.verdict == Verdict::Fail && row.detail.starts_with("stayed on after a press") {
+        let detail = "already on before its press (the flight director's fallback mode) and a \
+                      press keeps it on: nothing to judge parked"
+            .to_string();
+        return Row { verdict: Verdict::Skipped, detail, ..row };
+    }
+    row
+}
+
+/// The stock flight director, up before the mode rows. The G1000 172
+/// engaged no mode with it off: HDG, V/S and ALT each "stayed off after a
+/// press" parked, and every one took with it on, FLC and APR included
+/// (2026-10-11). A panel that declares its own FD switch (the Zibo) is left
+/// to its own rows. True when this check raised it, with the row that says
+/// so; a director already up, or one that did not read, raises nothing.
+async fn raise_stock_fd(xp: &dyn XPlane, p: &Panel) -> (bool, Option<Row>) {
+    if p.fd.is_some() {
+        return (false, None);
+    }
+    if !xp.get_float(autoflight::names::FD_MODE).await.is_ok_and(|v| v < 0.5) {
+        return (false, None);
+    }
+    let _ = autoflight::press(xp, Button::FlightDirectorOn).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let up = xp.get_float(autoflight::names::FD_MODE).await.ok();
+    if up.is_some_and(|v| v >= 0.5) {
+        let detail = "raised for the mode rows, put back after".to_string();
+        (true, Some(Row::new("flight_director", (Verdict::Pass, detail), json!({"fd_mode": up}))))
+    } else {
+        (
+            true,
+            Some(Row::fail(
+                "flight_director",
+                format!("did not come up for the mode rows (reads {up:?}); modes may not engage"),
+            )),
+        )
+    }
 }
 
 /// Why the mode rows cannot be judged, or `None` when they can: where the
@@ -2922,5 +2988,22 @@ mod tests {
         assert!(xp.writes_to(PITCH).is_empty());
         assert_eq!(seen, ["parked"]);
         assert_eq!(xp.read_value(crate::tools::PARK_BRAKE), Some(1.0));
+    }
+
+    /// G1000 172, 2026-10-11: with the director up, V/S coming off drops
+    /// into ALT, and pressing ALT keeps it. Not a dead button when this
+    /// check raised the director; still a FAIL when it did not.
+    #[test]
+    fn a_director_fallback_mode_is_skipped_not_failed() {
+        let stuck = || Row::fail(
+            "mcp_mode_altitude_hold",
+            "stayed on after a press (did not take); some modes will not engage on the ground",
+        );
+        let r = fd_fallback_row(stuck(), true);
+        assert_eq!(r.verdict, Verdict::Skipped);
+        assert!(r.detail.contains("fallback"), "{}", r.detail);
+        assert_eq!(fd_fallback_row(stuck(), false).verdict, Verdict::Fail);
+        let dead = Row::fail("mcp_mode_heading", "stayed off after a press (did not take)");
+        assert_eq!(fd_fallback_row(dead, true).verdict, Verdict::Fail);
     }
 }
