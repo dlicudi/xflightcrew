@@ -15,8 +15,9 @@
 //! So: hold the path the aircraft is on until the flare height, then shrink
 //! the sink in proportion to the height left down to the touchdown sink.
 //! The wanted path becomes a nose attitude (the path plus a slowly filtered
-//! angle of attack), and the elevator holds that attitude through the pitch
-//! rate. The flare height is the sink times the time the aircraft needs to
+//! angle of attack), and the elevator holds that attitude: the command's
+//! rate fed forward, on top of what a disturbance observer reads holding the
+//! nose takes (ground effect, the bleeding speed). The flare height is the sink times the time the aircraft needs to
 //! change its path ([`RESPONSE_S`]), not a fixed number of feet: 18 ft for
 //! a 172 at 360 fpm, sinking less with every foot, where the old law asked
 //! for -100 fpm at once from a fixed 25 ft.
@@ -26,8 +27,15 @@
 /// the margin a weak elevator needs (2 s landed a steep arrival at 300 fpm
 /// on half the authority, `attitude_flare_tests`).
 pub const RESPONSE_S: f64 = 3.0;
-/// The sink at the wheels, fpm.
-pub const TOUCHDOWN_VS_FPM: f64 = -100.0;
+/// The hold-off: the sink the flare eases to by [`HOLDOFF_FT`] and holds
+/// to the wheels, fpm. The flare is a round-out THEN a hold-off: the wheels
+/// kept just off, the power at idle, the nose rising as the speed bleeds
+/// until the aircraft settles on its mains. Easing to -100 at the wheels, the
+/// 172 touched flat (1.5 to 1.7 deg nose up) at 62 kt off a 66.5 kt final:
+/// a flare that looked weak (LEMG 13, 1791755237, 1791755825).
+pub const HOLDOFF_VS_FPM: f64 = -70.0;
+/// The height the round-out ends and the hold-off begins, ft.
+pub const HOLDOFF_FT: f64 = 2.0;
 /// Never flare lower than this, ft (a very shallow approach).
 const MIN_GATE_FT: f64 = 6.0;
 /// The loop's numbers: one set for every airframe, chosen to land across
@@ -37,22 +45,29 @@ const MIN_GATE_FT: f64 = 6.0;
 pub struct Gains {
     /// Elevator per degree of attitude error.
     pub k_theta: f64,
-    /// Elevator per deg/s of pitch rate (damping).
+    /// Elevator per deg/s of pitch rate away from the command's own rate
+    /// (damping).
     pub k_q: f64,
-    /// The trim found by the attitude error, elevator per degree-second:
-    /// the pull the bleeding speed needs.
-    pub ki_theta: f64,
     /// How long the path takes to follow the nose, seconds: the attitude
     /// asked leads the path's change by this much.
     pub path_lag_s: f64,
     /// Seconds the aircraft needs to change its path: the flare height is
     /// the sink times this ([`gate_ft`]).
     pub response_s: f64,
+    /// The disturbance observer's time, seconds: the elevator the aircraft
+    /// needs to hold its nose (ground effect, the bleeding speed), read from
+    /// what it holds and how the nose answers.
+    pub dob_tau_s: f64,
+    /// Pitch rate per unit of elevator, deg/s: the 172's measured 32 (LEMG
+    /// 13, 1791739518), tested at half and double. The observer reads with
+    /// it and the command's rate is fed forward through it; with the nose
+    /// steady the observer's estimate is the elevator held, whatever it is.
+    pub b_hat: f64,
 }
 
 impl Default for Gains {
     fn default() -> Self {
-        Gains { k_theta: 0.08, k_q: 0.02, ki_theta: 0.005, path_lag_s: 1.5, response_s: RESPONSE_S }
+        Gains { k_theta: 0.12, k_q: 0.02, path_lag_s: 1.0, response_s: RESPONSE_S, dob_tau_s: 1.0, b_hat: 32.0 }
     }
 }
 
@@ -95,6 +110,8 @@ pub struct AttitudeFlare {
     alpha_f: f64,
     gamma_trim: f64,
     integ: f64,
+    last_elev: f64,
+    last_theta_cmd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,9 +128,9 @@ pub fn gate_ft(vs_fpm: f64, response_s: f64) -> f64 {
 /// The sink wanted at this height: the entry's path above the gate, then in
 /// proportion to the height left down to the touchdown sink. Pure.
 pub fn vs_target_fpm(radio_ft: f64, entry_vs_fpm: f64, gate_ft: f64) -> f64 {
-    let entry = entry_vs_fpm.min(TOUCHDOWN_VS_FPM);
-    let k = (radio_ft / gate_ft).clamp(0.0, 1.0);
-    TOUCHDOWN_VS_FPM + (entry - TOUCHDOWN_VS_FPM) * k
+    let entry = entry_vs_fpm.min(HOLDOFF_VS_FPM);
+    let k = ((radio_ft - HOLDOFF_FT) / (gate_ft - HOLDOFF_FT).max(1.0)).clamp(0.0, 1.0);
+    HOLDOFF_VS_FPM + (entry - HOLDOFF_VS_FPM) * k
 }
 
 impl AttitudeFlare {
@@ -140,9 +157,10 @@ impl AttitudeFlare {
         // wanted sink falls by (entry - touchdown) / gate per foot, and the
         // height falls at the sink. Led, not chased (a lag chain tracking a
         // ramp arrives late by its own lag).
-        let below = i.radio_ft > 0.0 && i.radio_ft < entry.gate_ft;
-        let gamma_rate = if below {
-            let dvs_dt = (entry.vs_fpm.min(TOUCHDOWN_VS_FPM) - TOUCHDOWN_VS_FPM) / entry.gate_ft
+        let rounding_out = i.radio_ft > HOLDOFF_FT && i.radio_ft < entry.gate_ft;
+        let gamma_rate = if rounding_out {
+            let dvs_dt = (entry.vs_fpm.min(HOLDOFF_VS_FPM) - HOLDOFF_VS_FPM)
+                / (entry.gate_ft - HOLDOFF_FT).max(1.0)
                 * (v_fpm * gamma.to_radians().sin() / 60.0);
             (dvs_dt / v_fpm).to_degrees()
         } else {
@@ -154,12 +172,22 @@ impl AttitudeFlare {
             (self.gamma_trim + (gamma_cmd - gamma) * GAMMA_TRIM_PER_S * dt).clamp(-3.0, 3.0);
         let theta_cmd = gamma_cmd + self.alpha_f + self.gamma_trim + g.path_lag_s * gamma_rate;
         let e_theta = theta_cmd - i.theta_deg;
-        let raw = self.integ + g.k_theta * e_theta - g.k_q * (i.q_dps - gamma_rate);
-        let elev = raw.clamp(-push, pull);
-        // No wind-up against a limit: the trim only moves inward there.
-        if raw == elev || (raw > pull && e_theta < 0.0) || (raw < -push && e_theta > 0.0) {
-            self.integ = (self.integ + g.ki_theta * e_theta * dt).clamp(-push, pull);
-        }
+        // The command's own rate (the speed bleeding, alpha rising, the
+        // path easing): fed forward as the elevator that turns the nose at
+        // that rate, so it rises WITH the command. Chased, it lagged 0.8 deg
+        // below 8 ft and the 172 landed at 185 to 199 fpm on a command of
+        // -110 (LEMG 13, 1791755237, 1791755825).
+        let theta_rate = self.last_theta_cmd.map_or(0.0, |p| (theta_cmd - p) / dt);
+        self.last_theta_cmd = Some(theta_cmd);
+        // What holding the nose takes: the elevator held, less what the
+        // nose's rate says it is doing beyond holding. Ground effect and the
+        // bleeding speed show up here within a second; a slow trim could not
+        // find them in the flare's three (226 to 287 fpm, LEMG 2026-10-11).
+        let need = self.last_elev - i.q_dps / g.b_hat;
+        self.integ = (self.integ + (need - self.integ) * (dt / g.dob_tau_s).min(1.0)).clamp(-push, pull);
+        let elev = (self.integ + g.k_theta * e_theta + theta_rate / g.b_hat - g.k_q * (i.q_dps - theta_rate))
+            .clamp(-push, pull);
+        self.last_elev = elev;
         Out {
             elev,
             gate_ft: entry.gate_ft,

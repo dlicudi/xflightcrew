@@ -311,3 +311,19 @@ ils_coupled: true
 # crosswind and the landing gate went around at 100 ft (1791738327).
 # Below 200 ft the copilot's own lateral lines up on the centreline.
 ils_decouple_agl_ft: 200.0
+
+# The rollout's steer from the yaw the 172 actually gives a unit of steer,
+# measured on the rollouts: about 20 deg/s at 16 kt and at 42 kt (the
+# nosewheel and the rudder together; the tyres slip, so the geometry's 131
+# at 40 kt was 6x too high and its gain let the nose drift 24 degrees and
+# the aircraft 52 m off the runway, 1791755237). Closing a heading error in
+# 1.5 s wants 0.033 per degree at any speed, damped on the measured yaw
+# rate; undamped on a 0.38 s tick the default law weaved the nose 10 to 20
+# degrees either side below 45 kt (1791753535).
+rollout_steer:
+  per_deg: 0.033
+  ref_kts: 40.0
+  min_kts: 39.0
+  damp_s: 0.8
+  max_fast: 0.85
+  fast_kts: 50.0

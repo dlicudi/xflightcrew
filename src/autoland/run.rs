@@ -278,6 +278,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let attitude_law = crate::aircraft::flare_elevator().filter(|_| layers);
             let mut attitude_flare = super::attitude_flare::AttitudeFlare::default();
             let mut energy_throttle = super::energy_throttle::EnergyThrottle::default();
+            let mut decel_brake = DecelBrake::default();
             // ...or, where the airframe declares its elevator's response,
             // the arrest flown on that model (`FlareModel`, the 737).
             let mut flare_model = FlareModel::from_profile(crate::aircraft::flare_elevator());
@@ -955,7 +956,16 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
                     let remaining_m = (rwy.length_m + along_m).max(0.0);
                     let target_kts = if vacate_follows { VACATE_HANDOFF_KTS } else { 0.0 };
-                    let brake = rollout_brake_ratio(gs_kts, target_kts, remaining_m);
+                    // A layered airframe brakes on the deceleration it measures,
+                    // lightly, the drag doing the early work (`DecelBrake`).
+                    if airborne {
+                        decel_brake = DecelBrake::default();
+                    }
+                    let brake = if layers {
+                        decel_brake.step(gs_kts, roll_dt, rollout_required_decel(gs_kts, target_kts, remaining_m))
+                    } else {
+                        rollout_brake_ratio(gs_kts, target_kts, remaining_m)
+                    };
                     let brakes = if airborne {
                         RolloutBrakes {
                             sym: 0.0,

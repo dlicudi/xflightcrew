@@ -796,6 +796,50 @@
         assert!(eased > 0.0, "a predicted balloon must not drop the column to neutral");
     }
 
+    /// A 172's rollout from 60 kt on a long runway: the drag (growing with
+    /// the square of the speed) does the early work, the brake comes in
+    /// gently as it fades, the whole near LIGHT_DECEL_MPS2, never the old
+    /// 0.24 from the touch; with too little runway the requirement brakes at
+    /// once.
+    #[test]
+    fn the_rollout_brakes_lightly_on_what_it_measures() {
+        let fly = |remaining_m: f64| {
+            let (mut v, mut x, mut b) = (60.0 / MS_TO_KTS, 0.0, DecelBrake::default());
+            let (mut first, mut peak, mut decels) = (None, 0.0_f64, vec![]);
+            for _ in 0..400 {
+                let gs = v * MS_TO_KTS;
+                if gs < 10.0 {
+                    break;
+                }
+                let brake = b.step(gs, 0.38, rollout_required_decel(gs, 10.0, remaining_m - x));
+                first.get_or_insert(brake);
+                peak = peak.max(brake);
+                let decel = 0.9 * (v / 30.0).powi(2) + brake / BRAKE_RATIO_PER_MPS2;
+                decels.push(decel);
+                v -= decel * 0.38;
+                x += v * 0.38;
+            }
+            (first.unwrap(), peak, decels, x)
+        };
+        let (first, peak, decels, _) = fly(2_500.0);
+        assert!(first < 0.05, "no brake at the touch: {first}");
+        // At the slow end the drag has faded and the brake gives nearly all
+        // of it: still under the old 0.24, and only there.
+        assert!(peak < 0.2, "light: {peak}");
+        let mean = decels.iter().sum::<f64>() / decels.len() as f64;
+        assert!((mean - LIGHT_DECEL_MPS2).abs() < 0.3, "overall {mean:.2}");
+        // A late tick (a 1.2 s gap) is no measurement, never a step.
+        let mut b = DecelBrake::default();
+        let mut brake = 0.0;
+        for k in 0..20 {
+            brake = b.step(55.0 - k as f64 * 0.8, 0.38, 0.0);
+        }
+        let after_gap = b.step(55.0 - 20.0 * 0.8, 1.2, 0.0);
+        assert!((after_gap - brake).abs() < 0.02, "{brake:.2} -> {after_gap:.2}");
+        let (_, peak_short, _, x) = fly(250.0);
+        assert!(peak_short > 0.3 && x < 250.0 * 0.95, "short runway: peak {peak_short:.2}, stopped in {x:.0} m");
+    }
+
     /// LEMG 13 (2026-09-26): the 737 floated from 36 to 19 ft on a flat
     /// -175. Exponential with 4 s, it is the path at the gate, -475 at 20 ft,
     /// -325 at 10, and the touchdown sink at the wheels; undeclared, flat.

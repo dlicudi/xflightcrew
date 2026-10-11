@@ -25,14 +25,61 @@ pub(super) const VACATE_HANDOFF_KTS: f64 = 10.0;
 /// speed the rollout is aiming for — zero for a full stop, taxi pace when a
 /// vacate follows.
 pub(super) fn rollout_brake_ratio(gs_kts: f64, target_kts: f64, remaining_m: f64) -> f64 {
+    let decel = rollout_required_decel(gs_kts, target_kts, remaining_m).max(ROLLOUT_COMFORT_DECEL);
+    (decel * BRAKE_RATIO_PER_MPS2).clamp(0.2, 0.8)
+}
+
+/// What physics requires to be at `target_kts` with 30% of the remaining
+/// runway still in hand, m/s²: the safety term, immune to any comfort
+/// figure. Pure.
+pub(super) fn rollout_required_decel(gs_kts: f64, target_kts: f64, remaining_m: f64) -> f64 {
     let v = (gs_kts.max(0.0)) / MS_TO_KTS;
     let vt = (target_kts.max(0.0)) / MS_TO_KTS;
-    // What physics requires to be at target speed with 30% of the remaining
-    // runway still in hand — the safety term, immune to the comfort figure.
     let usable = (remaining_m * 0.7).max(30.0);
-    let required = ((v * v - vt * vt) / (2.0 * usable)).max(0.0);
-    let decel = required.max(ROLLOUT_COMFORT_DECEL);
-    (decel * BRAKE_RATIO_PER_MPS2).clamp(0.2, 0.8)
+    ((v * v - vt * vt) / (2.0 * usable)).max(0.0)
+}
+
+/// The deceleration a layered airframe's rollout aims for overall, drag and
+/// brakes together, m/s²: a pilot lets the drag do the early work. The
+/// G1000 172 got 0.24 of brake from the touch, 2.4 m/s² in all, and the
+/// pilot called it extreme (LEMG 13, 2026-10-11).
+pub(super) const LIGHT_DECEL_MPS2: f64 = 1.2;
+
+/// The rollout's brake on the deceleration MEASURED (a layered airframe):
+/// only the brake the drag does not already give toward
+/// [`LIGHT_DECEL_MPS2`], found as it goes; the runway's own requirement
+/// (`rollout_required_decel`) is a floor at once. Nothing calibrated: the
+/// brake's effect is read, not assumed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DecelBrake {
+    brake: f64,
+    prev_gs: Option<f64>,
+    decel_f: Option<f64>,
+}
+
+impl DecelBrake {
+    /// The symmetric brake ratio for this tick.
+    pub fn step(&mut self, gs_kts: f64, dt_s: f64, required_mps2: f64) -> f64 {
+        let dt = if dt_s.is_finite() { dt_s.clamp(0.05, 1.0) } else { 0.4 };
+        // A late tick is no measurement: a reading carried over a 1.2 s gap
+        // read as no deceleration and stepped the brake 0.06 to 0.27 at
+        // 40 kt (LEMG 13, 1791755237).
+        if !(dt_s.is_finite() && dt_s <= 0.8) {
+            self.prev_gs = None;
+        }
+        if let Some(prev) = self.prev_gs.filter(|_| gs_kts.is_finite()) {
+            let now = (prev - gs_kts) / dt / MS_TO_KTS;
+            let f = self.decel_f.get_or_insert(now);
+            *f += (now - *f) * (dt / 1.0).min(1.0);
+        }
+        self.prev_gs = gs_kts.is_finite().then_some(gs_kts);
+        let want = required_mps2.max(LIGHT_DECEL_MPS2);
+        if let Some(have) = self.decel_f {
+            self.brake = (self.brake + (want - have) * BRAKE_RATIO_PER_MPS2 * dt).clamp(0.0, 0.8);
+        }
+        let floor = if required_mps2 > LIGHT_DECEL_MPS2 { required_mps2 * BRAKE_RATIO_PER_MPS2 } else { 0.0 };
+        self.brake.max(floor).min(0.8)
+    }
 }
 
 /// The rollout's differential brake on an airframe that steers on its brakes
