@@ -406,6 +406,13 @@ pub struct AircraftProfile {
     /// and VS dial handed over as the localizer and glideslope capture. Off
     /// until a capture has been flown on the type; the copilot's own path
     /// otherwise.
+    /// Flies the layered autonomy (docs/tasks/autonomy-layers): the
+    /// aircraft's own autopilot for the approach, an ILS intercepted level,
+    /// the speed on total energy (`autoland::energy_throttle`), the flare by
+    /// attitude (`autoland::attitude_flare`). An airframe crosses over by
+    /// flying it, never by a fitted number.
+    #[serde(default)]
+    pub layers: bool,
     #[serde(default)]
     pub ils_coupled: bool,
     /// Radio height, feet, below which a coupled ILS is handed back to

@@ -648,7 +648,10 @@
     /// gate and plant, the landing flown at 407: under 300.
     #[test]
     fn the_737_model_flare_lands_every_recorded_gate_under_400() {
-        let limit = crate::scorecard::TOUCHDOWN_MAX_SINK_FPM;
+        // The old law's own standard: the scorecard's limit is 240 since
+        // 2026-10-11, and the 737 is held to it once it flies the layered
+        // flare (docs/tasks/autonomy-layers).
+        let limit = 400.0;
         for (k, fit) in PLANTS.iter().enumerate() {
             for (i, g) in GATES.iter().enumerate() {
                 let l = fly(*g, *fit, Law::Model(model()));

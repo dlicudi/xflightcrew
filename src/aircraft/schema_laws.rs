@@ -509,10 +509,6 @@ pub struct FlareElevatorProfile {
     /// sink the elevator does not explain) instead of the P+D tracker.
     #[serde(default)]
     pub model: Option<FlareModelProfile>,
-    /// The arrest flown by ATTITUDE, judged by height (`autoland::attitude_flare`):
-    /// nothing above fitted, the declared `max` and `max_push` its limits.
-    #[serde(default)]
-    pub attitude: bool,
 }
 
 /// The elevator-to-sink response of an airframe with the servos out, as its

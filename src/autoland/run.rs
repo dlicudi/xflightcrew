@@ -5,6 +5,10 @@ use super::*;
 /// The pitch plant's reads (`theta`, `alpha`, `q`, `vy_true`, `elev_total`,
 /// `tas` on the autoland tick), in this order: logged, and the attitude
 /// flare's measurements.
+/// The fastest an altitude hold returns to its altitude and is still holding
+/// it, fpm (a 172's ALT came back at 900 after the setup's dive).
+const LEVEL_RETURN_MAX_FPM: f64 = 1_000.0;
+
 const PITCH_PLANT: [&str; 6] = [
     sim::datarefs::THETA_DEG,
     sim::datarefs::ALPHA_DEG,
@@ -270,8 +274,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let mut flare_pitch =
                 FlarePitch::with_gains(FlareGains::from_profile(crate::aircraft::flare_elevator()));
             // ...or the arrest by attitude, judged by height, where declared.
-            let attitude_law = crate::aircraft::flare_elevator().filter(|f| f.attitude);
+            let layers = crate::aircraft::live_profile().is_some_and(|p| p.layers);
+            let attitude_law = crate::aircraft::flare_elevator().filter(|_| layers);
             let mut attitude_flare = super::attitude_flare::AttitudeFlare::default();
+            let mut energy_throttle = super::energy_throttle::EnergyThrottle::default();
             // ...or, where the airframe declares its elevator's response,
             // the arrest flown on that model (`FlareModel`, the 737).
             let mut flare_model = FlareModel::from_profile(crate::aircraft::flare_elevator());
@@ -458,7 +464,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // airframe's nose answers the elevator, the data the attitude
                 // flare is built on (docs/tasks/autonomy-layers). Logged only.
                 let panel_n = extra_names.len() - 1;
-                if matches!(last_phase, Some(ApproachPhase::Final | ApproachPhase::Flare)) {
+                // ...and throughout on a layered airframe, whose power is
+                // flown on the true vertical speed (`energy_throttle`).
+                if layers || matches!(last_phase, Some(ApproachPhase::Final | ApproachPhase::Flare)) {
                     extra_names.extend(PITCH_PLANT.iter().map(|n| n.to_string()));
                 }
                 let extra_refs: Vec<&str> = extra_names.iter().map(String::as_str).collect();
@@ -3117,7 +3125,18 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // either way (the write that follows a yield is ignored).
                 let hdg_st = panel_tick.status(&st, F::HdgStatus);
                 let vs_st = panel_tick.status(&st, F::VsStatus);
-                if cpl.own_vertical {
+                // An ILS is intercepted LEVEL: with the approach armed and a live
+                // glideslope above us, ALT holds and the glideslope captures
+                // from below. No VS wheel (LEMG 13, 2026-10-11: it was rewritten
+                // 270 times in 8 minutes, +524 fpm climbing to our own path
+                // under the beam). A dead glideslope or a beam below us keeps
+                // the path's VS.
+                let level_for_gs = layers && matches!(
+                    coupling,
+                    crate::ils::Coupling::Armed | crate::ils::Coupling::LocCaptured
+                ) && !ap_modes.is_some_and(|m| m.gs())
+                    && needles.is_some_and(|n| n.gs_valid && n.vdef.is_some_and(|v| v <= 0.0));
+                if cpl.own_vertical && !level_for_gs {
                     autoflight::stage_dial(&mut writes, Dial::Vs, vs_dial);
                 }
                 let yield_r = match flare_elev {
@@ -3218,7 +3237,13 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     );
                     let want = Want {
                         lateral: Some(if coupled { Lateral::Coupled } else { Lateral::Heading }),
-                        vertical: Some(if coupled { Vertical::Coupled } else { Vertical::Vs }),
+                        vertical: Some(if level_for_gs {
+                            Vertical::Level
+                        } else if coupled {
+                            Vertical::Coupled
+                        } else {
+                            Vertical::Vs
+                        }),
                     };
                     let presses = autoflight::reconcile(
                         want,
@@ -3251,6 +3276,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 prev_ias_t = now;
                 if g.phase != ApproachPhase::Flare || missed.is_some() {
                     flare_power.reset();
+                }
+                if g.phase == ApproachPhase::Flare || missed.is_some() {
+                    energy_throttle.reset();
                 }
                 let mut ballooned = false;
                 let mut power_held = false;
@@ -3348,7 +3376,27 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         &crate::aircraft::flap_limits(),
                         floor,
                     );
-                    let adj = crate::tools::speedhold::throttle_adjust_live(target - ias, trend_kts_s);
+                    // A layered airframe flies its power on total energy: the
+                    // shared governor chased the phugoid in ALT hold (LEMG 13,
+                    // 2026-10-11). No true vertical speed read: the lever stays.
+                    let adj = if layers {
+                        match (thr_now, plant_at(3)) {
+                            (Some(t), Some(vy_ms)) => {
+                                energy_throttle.step(super::energy_throttle::In {
+                                    ias_kts: ias,
+                                    accel_kts_s: trend_kts_s,
+                                    vs_fpm: vy_ms * 196.850_394,
+                                    target_kts: target,
+                                    path_vs_fpm: if level_for_gs { 0.0 } else { g.target_vs_fpm },
+                                    thr_now: t,
+                                    dt: dt_s,
+                                }) - t
+                            }
+                            _ => 0.0,
+                        }
+                    } else {
+                        crate::tools::speedhold::throttle_adjust_live(target - ias, trend_kts_s)
+                    };
                     // In the roundout the lever only ever comes back. The
                     // speed law read the roundout's own deceleration as
                     // "five knots slow" and walked the 737's lever from 0.32
@@ -3554,7 +3602,17 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // no callout. If actual VS diverges hard for ~5 s, re-arm the VS
                 // mode and tell the pilot — this is exactly when a hand on the
                 // yoke matters.
-                let vs_err = vvi.map(|v| v - g.target_vs_fpm);
+                // Level under a live glideslope is held in ALT: judged against
+                // level, and taken back to ALT, never to a VS the intercept
+                // does not want (the first level intercept had the two pressing
+                // against each other, 2026-10-11).
+                // ALT returning to its altitude climbs or descends to it (+900
+                // fpm after the setup's dive, 2026-10-11): that is holding, and
+                // only a rate past `LEVEL_RETURN_MAX_FPM` is a divergence.
+                let held_vs = if level_for_gs { 0.0 } else { g.target_vs_fpm };
+                let vs_err = vvi.map(|v| {
+                    if level_for_gs && v.abs() <= LEVEL_RETURN_MAX_FPM { 0.0 } else { v - held_vs }
+                });
                 // ...and never inside the arrest, where the autopilot has
                 // no vertical to hold: a watchdog re-engaging the servos at
                 // fifty feet would be the fight this change removes.
@@ -3581,8 +3639,15 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                             &xp, &cfg.fd_commands, "autoland", "vs_watchdog", 1,
                         )
                         .await;
-                        autoflight::press_logged(&xp, Button::VerticalSpeed, "autoland_vs_watchdog").await;
-                        announce(vs_not_held_line(g.target_vs_fpm).into(), Priority::Warning);
+                        // ALT pressed while holding toggles it off and the
+                        // re-engage takes a new altitude (2,950 to 2,870 ft,
+                        // 2026-10-11): an engaged ALT is only warned about.
+                        if !level_for_gs {
+                            autoflight::press_logged(&xp, Button::VerticalSpeed, "autoland_vs_watchdog").await;
+                        } else if !ap_modes.is_some_and(|m| m.alt_hold()) {
+                            autoflight::press_logged(&xp, Button::AltitudeHold, "autoland_vs_watchdog").await;
+                        }
+                        announce(vs_not_held_line(held_vs).into(), Priority::Warning);
                     }
                     // Said once and then flown for twenty-two minutes: the
                     // A330 climbed from 1,900 ft to FL350 on a -1,200 fpm

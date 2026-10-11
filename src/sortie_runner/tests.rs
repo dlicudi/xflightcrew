@@ -1452,7 +1452,7 @@ cases:
         );
         assert_eq!(
             row_line(&pass),
-            "PASS LEMG 13, 5 nm final #2: landing pass (sink 222/400 fpm, drift 1.2/5 deg, rollout 0.8/5 m) \
+            "PASS LEMG 13, 5 nm final #2: landing pass (sink 222/240 fpm, drift 1.2/5 deg, rollout 0.8/5 m) \
              in 181 s, sortie 1790600000-approach, 0 interventions"
         );
         let t = table(

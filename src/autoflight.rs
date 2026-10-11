@@ -645,6 +645,9 @@ impl Modes {
     pub fn loc(self) -> bool {
         self.has(Self::LOC)
     }
+    pub fn alt_hold(self) -> bool {
+        self.has(Self::ALT_HOLD)
+    }
     pub fn gs_armed(self) -> bool {
         self.has(Self::GS_ARMED)
     }
@@ -1412,6 +1415,9 @@ pub enum Vertical {
     /// The airframe's glideslope: the VS wheel until it captures, then never
     /// V/S over it.
     Coupled,
+    /// Level in ALT until the glideslope captures from below, as an ILS is
+    /// intercepted: no VS wheel at all. Never over a captured glideslope.
+    Level,
 }
 
 /// A loop's intent for this tick. `None` on an axis: the loop does not want
@@ -1467,6 +1473,11 @@ pub fn reconcile(want: Want, read: ModeRead) -> Vec<Button> {
             let gs_owned = m.is_some_and(|m| m.gs());
             if !gs_owned && m.is_some() && read.vs_status.is_some_and(|s| s <= 0.5) {
                 out.push(Button::VerticalSpeed);
+            }
+        }
+        Some(Vertical::Level) => {
+            if m.is_some_and(|m| !m.gs() && !m.alt_hold()) {
+                out.push(Button::AltitudeHold);
             }
         }
         None => {}
@@ -2443,6 +2454,15 @@ mod tests {
             modes: None,
         };
         assert!(reconcile(own, on).is_empty());
+        // An ILS intercepted level (2026-10-11: the 172 dialled +524 fpm
+        // climbing to its own path under a live glideslope): ALT once, never
+        // over the capture, nothing on an unread bitfield, and no VS.
+        let level = Want { lateral: Some(Lateral::Coupled), vertical: Some(Vertical::Level) };
+        let loc_gs_armed = Modes::LOC | Modes::GS_ARMED;
+        assert_eq!(reconcile(level, read(loc_gs_armed | Modes::VS)), vec![Button::AltitudeHold]);
+        assert!(reconcile(level, read(loc_gs_armed | Modes::ALT_HOLD)).is_empty(), "already level");
+        assert!(reconcile(level, read(2560)).is_empty(), "the glideslope has it");
+        assert!(reconcile(level, unread).is_empty());
         let unread = ModeRead::default();
         assert!(
             reconcile(own, unread).is_empty(),
