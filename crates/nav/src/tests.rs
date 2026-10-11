@@ -3707,6 +3707,7 @@ fn the_radio_name_is_the_tower_rows_own_station_name() {
         transition_level_ft: None,
         allows_circuits: None,
         pattern_sides: Vec::new(),
+        papis: Vec::new(),
     };
     // EGKK, EGLL: apt.dat's tower rows name the station.
     assert_eq!(field("London Gatwick", &["Gatwick Tower"]).radio_name(), "Gatwick");
@@ -3742,6 +3743,7 @@ fn each_ground_position_is_named_by_its_own_row() {
         transition_level_ft: None,
         allows_circuits: None,
         pattern_sides: Vec::new(),
+        papis: Vec::new(),
     };
     use crate::{FREQ_CLEARANCE as DEL, FREQ_GROUND as GND, FREQ_TOWER as TWR};
     let egkk = field(
@@ -3763,4 +3765,30 @@ fn each_ground_position_is_named_by_its_own_row() {
     let sfo = field("San Francisco Intl", &[(DEL, "San Francisco Clearance Delivery")]);
     assert_eq!(sfo.position_name(DEL, "Delivery").as_deref(), Some("San Francisco Clearance"));
     assert_eq!(field("Gibraltar", &[(TWR, "Tower")]).position_name(GND, "Ground"), None);
+}
+
+/// LXGB's PAPIs from the shipped apt.dat (no ILS, no RNAV procedure): 3.00
+/// on both ends, each matched to the end it faces and stands beside, a
+/// lighting object of another type ignored.
+#[test]
+fn a_runway_end_finds_its_own_papi() {
+    let rows = [
+        "21 36.1505388 -5.3566970 3 87.3 3.00",
+        "21 36.1512936 -5.3567490 2 87.3 3.00",
+        "21 36.1517620 -5.3427939 3 267.2 3.00",
+        "21 36.1510705 -5.3427504 2 267.9 3.00",
+        "21 36.1510000 -5.3500000 6 87.3 3.00",
+    ];
+    let papis: Vec<crate::Papi> = rows
+        .iter()
+        .filter_map(|r| crate::parse_papi_row(r.split_whitespace().skip(1)))
+        .collect();
+    assert_eq!(papis.len(), 4, "the type 6 row is no glide slope indicator");
+    let (t09, t27) = ((36.1508156, -5.3596312), (36.1514944, -5.3400082));
+    let c09 = crate::bearing_deg(t09.0, t09.1, t27.0, t27.1);
+    let p09 = crate::papi_for(&papis, t09.0, t09.1, c09).expect("09's");
+    assert!((p09.facing_deg - 87.3).abs() < 0.1 && (p09.angle_deg - 3.0).abs() < 1e-9);
+    let p27 = crate::papi_for(&papis, t27.0, t27.1, (c09 + 180.0) % 360.0).expect("27's");
+    assert!(p27.facing_deg > 260.0, "{p27:?}");
+    assert!(crate::papi_for(&papis, t09.0, t09.1, (c09 + 90.0) % 360.0).is_none(), "a crossing course has none");
 }

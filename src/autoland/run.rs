@@ -135,6 +135,32 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // The run ends with the thread (the lease drops the flag).
                 None => return,
             };
+            // No angle handed down: the runway's own, from its PAPI where it
+            // has one (`nav::papi_for`), the published visual path at a
+            // field with no ILS and no procedure (LXGB's 3.00, both ends).
+            let gp_deg = if hand_down.glidepath.is_none() {
+                let (path, icao) = (apt_dat.clone(), rwy.icao.clone());
+                let (lat, lon, crs) = (rwy.thr_lat, rwy.thr_lon, rwy.course_deg);
+                let papi = tokio::task::spawn_blocking(move || {
+                    crate::nav::find_airport(&path, &icao)
+                        .ok()
+                        .flatten()
+                        .and_then(|a| crate::nav::papi_for(&a.papis, lat, lon, crs))
+                })
+                .await
+                .ok()
+                .flatten();
+                crate::blackbox::record(
+                    "autoland",
+                    serde_json::json!({"event": "papi", "rwy": rwy.id, "angle": papi.map(|p| p.angle_deg)}),
+                );
+                match papi {
+                    Some(p) => arm_glidepath(Some((p.angle_deg, true))),
+                    None => gp_deg,
+                }
+            } else {
+                gp_deg
+            };
             // THE ENERGY PLAN (`approach_energy`): the airframe's own idle
             // deceleration, planned back from this final's gate. `None` on an
             // airframe that declares none: the distance schedule flies.

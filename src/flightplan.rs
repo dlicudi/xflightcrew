@@ -1306,6 +1306,7 @@ mod tests {
             transition_level_ft: None,
             allows_circuits: None,
             pattern_sides: Vec::new(),
+            papis: Vec::new(),
             name: "Flat field".into(),
             elev_ft: 0.0,
             freqs: vec![],
@@ -1495,6 +1496,7 @@ mod tests {
             transition_level_ft: None,
             allows_circuits: None,
             pattern_sides: Vec::new(),
+            papis: Vec::new(),
         }
     }
 

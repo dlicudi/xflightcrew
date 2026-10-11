@@ -24,6 +24,7 @@ fn lemg() -> AirportInfo {
         transition_level_ft: None,
         allows_circuits: None,
         pattern_sides: Vec::new(),
+        papis: Vec::new(),
     }
 }
 

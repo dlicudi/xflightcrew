@@ -107,7 +107,10 @@ flare_power:
   retard_max_per_s: 0.10
 flare_elevator:
   gain: 1.0
-  max: 0.35
+  # The attitude flare's pull limit: it holds the nose angle, so more pull
+  # is no balloon. At 0.35 the last 2 ft sat on the limit with the nose 0.7
+  # deg under its command (LEMG 13, 1791760476, 1791760789).
+  max: 0.5
   max_push: 0.10
   balloon_ease_per_s: 0.15
 

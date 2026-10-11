@@ -3587,6 +3587,7 @@ mod tests {
             transition_level_ft: None,
             allows_circuits: None,
             pattern_sides: Vec::new(),
+            papis: Vec::new(),
             name: "Alzate Brianza".into(),
             elev_ft: 1_258.0,
             runways: vec![crate::nav::Runway {
@@ -3720,6 +3721,7 @@ mod tests {
             transition_level_ft: None,
             allows_circuits: None,
             pattern_sides: Vec::new(),
+            papis: Vec::new(),
             name: "Gibraltar".into(),
             elev_ft: 15.0,
             runways: vec![crate::nav::Runway {
