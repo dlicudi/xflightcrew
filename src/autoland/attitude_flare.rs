@@ -127,10 +127,25 @@ pub fn gate_ft(vs_fpm: f64, response_s: f64) -> f64 {
 
 /// The sink wanted at this height: the entry's path above the gate, then in
 /// proportion to the height left down to the touchdown sink. Pure.
+///
+/// A SMOOTHSTEP in height, not a line: its slope is zero at the gate and at
+/// the hold-off, so the rate fed forward never steps. As a line, the slope
+/// cut to zero at 2 ft, the pull dropped 0.30 to 0.19 in one tick, the nose
+/// pitched down at 1.7 deg/s and the full 0.35 could not lift it again
+/// before the wheels: touched at 3.2 deg nose up against a command of 3.9
+/// (LEMG 13, 1791759560).
 pub fn vs_target_fpm(radio_ft: f64, entry_vs_fpm: f64, gate_ft: f64) -> f64 {
     let entry = entry_vs_fpm.min(HOLDOFF_VS_FPM);
-    let k = ((radio_ft - HOLDOFF_FT) / (gate_ft - HOLDOFF_FT).max(1.0)).clamp(0.0, 1.0);
-    HOLDOFF_VS_FPM + (entry - HOLDOFF_VS_FPM) * k
+    HOLDOFF_VS_FPM + (entry - HOLDOFF_VS_FPM) * smoothstep(rounding_out_k(radio_ft, gate_ft))
+}
+
+/// How far up the round-out the height is: 0 at the hold-off, 1 at the gate.
+fn rounding_out_k(radio_ft: f64, gate_ft: f64) -> f64 {
+    ((radio_ft - HOLDOFF_FT) / (gate_ft - HOLDOFF_FT).max(1.0)).clamp(0.0, 1.0)
+}
+
+fn smoothstep(k: f64) -> f64 {
+    k * k * (3.0 - 2.0 * k)
 }
 
 impl AttitudeFlare {
@@ -157,15 +172,12 @@ impl AttitudeFlare {
         // wanted sink falls by (entry - touchdown) / gate per foot, and the
         // height falls at the sink. Led, not chased (a lag chain tracking a
         // ramp arrives late by its own lag).
-        let rounding_out = i.radio_ft > HOLDOFF_FT && i.radio_ft < entry.gate_ft;
-        let gamma_rate = if rounding_out {
-            let dvs_dt = (entry.vs_fpm.min(HOLDOFF_VS_FPM) - HOLDOFF_VS_FPM)
-                / (entry.gate_ft - HOLDOFF_FT).max(1.0)
-                * (v_fpm * gamma.to_radians().sin() / 60.0);
-            (dvs_dt / v_fpm).to_degrees()
-        } else {
-            0.0
-        };
+        // The target's slope in height (the smoothstep's, zero at both
+        // ends) times the height's own rate: led, not chased.
+        let k = rounding_out_k(i.radio_ft, entry.gate_ft);
+        let dvs_dh = (entry.vs_fpm.min(HOLDOFF_VS_FPM) - HOLDOFF_VS_FPM) * 6.0 * k * (1.0 - k)
+            / (entry.gate_ft - HOLDOFF_FT).max(1.0);
+        let gamma_rate = (dvs_dh * (v_fpm * gamma.to_radians().sin() / 60.0) / v_fpm).to_degrees();
         // The filtered alpha holds the path on the attitude; what the filter
         // misses (the speed bleeding, alpha rising) is trimmed out slowly.
         self.gamma_trim =

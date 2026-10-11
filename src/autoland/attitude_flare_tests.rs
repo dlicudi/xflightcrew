@@ -21,6 +21,8 @@ struct Plant {
 }
 
 const T_Q: f64 = 0.25;
+/// The pull the flare may use: the 172's declared `flare_elevator.max`.
+const PULL: f64 = 0.5;
 /// Ground effect from about half the 172's 36 ft span: a 0.25 pull at the
 /// wheels reproduced the flights' 226 to 287 fpm on the old law.
 const GE_FROM_FT: f64 = 18.0;
@@ -76,7 +78,7 @@ fn fly(mut p: Plant) -> Option<Landing> {
         if t >= next_tick {
             let o = law.step(
                 In { radio_ft: p.h_ft, theta_deg: p.theta, alpha_deg: p.alpha(), q_dps: p.q, tas_kts: p.v_kts, dt: tick },
-                0.35,
+                PULL,
                 0.10,
             );
             min_e = min_e.min(o.elev);
@@ -109,7 +111,10 @@ fn the_flare_height_is_the_sink_times_the_response() {
 fn the_sink_wanted_shrinks_with_the_height_left() {
     assert_eq!(vs_target_fpm(40.0, -360.0, 12.0), -360.0, "above the gate: the path");
     assert_eq!(vs_target_fpm(12.0, -360.0, 12.0), -360.0);
-    assert!((vs_target_fpm(6.0, -360.0, 12.0) + 186.0).abs() < 1e-9);
+    assert!((vs_target_fpm(6.0, -360.0, 12.0) + 172.08).abs() < 1e-9, "smoothstep: {}", vs_target_fpm(6.0, -360.0, 12.0));
+    // No kink at either end: just inside each, the target barely moves.
+    assert!((vs_target_fpm(2.1, -360.0, 12.0) - HOLDOFF_VS_FPM).abs() < 1.0);
+    assert!((vs_target_fpm(11.9, -360.0, 12.0) + 360.0).abs() < 1.0);
     assert_eq!(vs_target_fpm(2.0, -360.0, 12.0), HOLDOFF_VS_FPM, "the hold-off from 2 ft");
     assert_eq!(vs_target_fpm(0.0, -360.0, 12.0), HOLDOFF_VS_FPM);
     assert_eq!(vs_target_fpm(5.0, -50.0, 6.0), HOLDOFF_VS_FPM, "never asks a climb");
@@ -124,7 +129,7 @@ fn the_172_lands_softly_from_its_path() {
     assert!(l.sink_fpm > -200.0 && l.sink_fpm < -40.0, "sink {:.0}", l.sink_fpm);
     assert!(l.balloon_ft < 1.0, "balloon {:.1} ft", l.balloon_ft);
     assert!(l.v_kts > 50.0, "speed {:.1}", l.v_kts);
-    assert!(l.min_elev >= -0.10 && l.max_elev <= 0.35);
+    assert!(l.min_elev >= -0.10 && l.max_elev <= PULL);
     assert!(l.secs < 20.0, "a float of {:.0} s", l.secs);
 }
 

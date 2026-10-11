@@ -14226,3 +14226,21 @@ under 55 kt (1791758534, 1791758911, 1791759234, 1791759560).
   2) and cleared 31 where the field and the real LEMG used 13 (#270). Since: 13 kept every time.
 - Card: a 5 nm final (`bench/sorties/c172-g1000-ils13.yaml`).
 
+### 2026-10-12 (later): the hold-off without a kink, and the runway's own PAPI
+
+- **The hold-off sagged at its own corner.** As a line in height the flare's sink target bent
+  at 2 ft: its slope (fed forward) cut to zero, the pull dropped 0.30 to 0.19 in one tick and
+  the nose pitched down 1.7 deg/s (1791759560). The target is a smoothstep (zero slope at the
+  gate and at the hold-off): the nose now rises all the way down, 3.3 to 4.0 deg over the last
+  3 ft (1791760476, 1791760789: 123 and 140 fpm).
+- **The pull limit was the old law's.** The last 2 ft sat on `flare_elevator.max` 0.35 with the
+  nose under its command; the attitude law holds the nose angle, so the 172 now declares 0.5
+  (the plant band holds at 0.5).
+- **The runway's own path angle** (`nav::Papi`, apt.dat row 21, `nav::papi_for`; blackbox
+  `autoland` `papi`): with no angle handed down, autoland arms the PAPI's. LEMG 13's is 3.20,
+  as its glideslope record (autoland had flown it at 3.0); 12's 3.00; 30 has none (3.0). LXGB's
+  are 3.00 on both ends. First visual approach on it, LEMG 12 from 5 nm (no ILS): 119 fpm, drift
+  0, touched at 4.3 deg nose up and 56 kt (`bench/sorties/c172-g1000-visual12.yaml`).
+- Open: the visual final still moves the VS dial every 4 to 5 s (56 changes in 246 s); a pilot
+  sets a rate once and nudges it.
+

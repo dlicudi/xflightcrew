@@ -125,7 +125,7 @@ pub(super) fn cessna_172sp() -> AircraftProfile {
         flare_elevator: Some(FlareElevatorProfile {
             gain: 1.0,
             trim_gain: 1.0,
-            max: 0.35,
+            max: 0.5,
             max_push: 0.10,
             balloon_ease_per_s: Some(0.15),
             tau_s: None,

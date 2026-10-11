@@ -95,6 +95,50 @@ pub struct AirportInfo {
     /// order, one entry per end: `Some(true)` left, `None` when the flows
     /// disagree. Read through [`AirportInfo::pattern_left`].
     pub pattern_sides: Vec<(String, Option<bool>)>,
+    /// The visual glide slope indicators (row 21: PAPI, VASI), in file order.
+    pub papis: Vec<Papi>,
+}
+
+/// A visual glide slope indicator (apt.dat row 21, a PAPI or a VASI): where
+/// it stands, the landing direction it faces and the path angle it shows.
+/// The runway's own published angle for a visual approach (LXGB's are 3.00
+/// on both ends: no ILS, no RNAV procedure in the data).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Papi {
+    pub lat: f64,
+    pub lon: f64,
+    pub facing_deg: f64,
+    pub angle_deg: f64,
+}
+
+/// One row 21 (fields after the code): a glide slope indicator (types 1 to
+/// 5), never the other lighting objects the row also carries. Pure.
+pub fn parse_papi_row<'a>(mut f: impl Iterator<Item = &'a str>) -> Option<Papi> {
+    let lat: f64 = f.next()?.parse().ok()?;
+    let lon: f64 = f.next()?.parse().ok()?;
+    let kind: u32 = f.next()?.parse().ok()?;
+    let facing_deg: f64 = f.next()?.parse().ok()?;
+    let angle_deg: f64 = f.next()?.parse().ok()?;
+    ((1..=5).contains(&kind) && (1.5..=8.0).contains(&angle_deg))
+        .then_some(Papi { lat, lon, facing_deg: facing_deg.rem_euclid(360.0), angle_deg })
+}
+
+/// The indicator serving the runway end at `thr_lat`/`thr_lon` landing on
+/// `course_deg`: facing that way (within 20 degrees), beside the runway
+/// (within 150 m of the centreline) and down it from the threshold (0 to
+/// 1,500 m); the nearest to the threshold if several. Pure.
+pub fn papi_for(papis: &[Papi], thr_lat: f64, thr_lon: f64, course_deg: f64) -> Option<Papi> {
+    papis
+        .iter()
+        .filter_map(|p| {
+            let facing = ((p.facing_deg - course_deg + 540.0) % 360.0 - 180.0).abs();
+            let d_m = haversine_nm(thr_lat, thr_lon, p.lat, p.lon) * 1_852.0;
+            let rel = (bearing_deg(thr_lat, thr_lon, p.lat, p.lon) - course_deg).to_radians();
+            let (along, across) = (d_m * rel.cos(), d_m * rel.sin());
+            (facing <= 20.0 && across.abs() <= 150.0 && (0.0..=1_500.0).contains(&along)).then_some((along, *p))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, p)| p)
 }
 
 /// A `1302 allows_circuits` value: "0" no, "1" yes, else unknown.
@@ -316,6 +360,7 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
     let mut transition_level_ft = None;
     let mut allows_circuits = None;
     let mut pattern_sides = Vec::new();
+    let mut papis = Vec::new();
     // Reused byte buffer + a cheap prefix test before any splitting: the file is
     // ~400 MB and 13M lines, and a String-per-line scan is unusable in a debug
     // build. Only `1 `/`16 `/`17 ` (headers), `100 ` (runways), and the comm
@@ -327,7 +372,8 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
             break;
         }
         // b'1' covers 1, 16, 17, 100, 1050-1056; b'5' covers legacy 50-56.
-        let interesting = matches!(buf.first(), Some(b'1') | Some(b'5'));
+        // ...and row 21, the glide slope indicators.
+        let interesting = matches!(buf.first(), Some(b'1') | Some(b'5')) || buf.starts_with(b"21 ");
         if !interesting {
             continue;
         }
@@ -363,6 +409,11 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
                 _ => {}
             },
             Some("1101") if in_airport => note_pattern_side(&mut pattern_sides, f),
+            Some("21") if in_airport => {
+                if let Some(p) = parse_papi_row(f) {
+                    papis.push(p);
+                }
+            }
             Some(code) if in_airport => {
                 if let Some(fr) = parse_comm_row(code, f) {
                     freqs.push(fr);
@@ -385,6 +436,7 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
         transition_level_ft,
         allows_circuits,
         pattern_sides,
+        papis,
     }))
 }
 
@@ -467,6 +519,7 @@ pub fn scan_airports(path: &str, mut f: impl FnMut(&str, AirportInfo)) -> Result
                             transition_level_ft: None,
                             allows_circuits: None,
                             pattern_sides: Vec::new(),
+                            papis: Vec::new(),
                         },
                     ));
                 }
