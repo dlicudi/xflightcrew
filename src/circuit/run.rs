@@ -490,12 +490,12 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
             .await;
             return;
         }
-        // ...and the standard pattern is flown only where it clears the
-        // ground itself (#182). Refused both ways in the AIR (the runway's
-        // judgement passed, the probe answered otherwise after the takeoff):
-        // never "your aircraft" at the handoff height, the reversal's hold
-        // instead, climbing clear of the ground ahead on the autopilot.
-        if let Some(line) = refused.as_deref() {
+        // Gibraltar has no rectangular fallback. Its coarse corridor can
+        // answer clear while the actual ground track cuts across the Rock
+        // (1791723511): if the authored bay route cannot be joined, climb and
+        // hold over the safe heading instead. Elsewhere, a refused authored
+        // route may still use a terrain-clear rectangle.
+        if authored_refusal_requires_hold(&rwy.icao) {
             let corridor = [l_facts.terrain_max_ft, r_facts.terrain_max_ft]
                 .into_iter()
                 .chain(leg_max.iter().copied())
@@ -512,7 +512,9 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
                 &xp,
                 &base_url,
                 &voice,
-                &rock_refused_line(line),
+                &refused.as_deref().map(rock_refused_line).unwrap_or_else(|| {
+                    "The Rock route isn't clear from here.".to_string()
+                }),
                 corridor,
                 tpa_msl_ft,
                 rwy_course,
@@ -700,13 +702,33 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
         // Height over the circuit's own path here (#188): the handoff waits
         // for it, and a final still high a mile out is flown around.
         let above_path = above_path_ft(alt_msl_ft, field_elev_ft, a_m, descent_shape.gp_ft_per_nm);
-        // Once only: a second lap as high as the first is the same geometry,
-        // and autoland's own late go-around and reversal take it from there
-        // (blackbox `high_handoff`).
         let high_final = leg == Leg::Final
             && turning_final
-            && high_go_arounds == 0
             && final_high_give_up(above_path, a_m);
+        // Never handed over high, and never lapped for ever: past
+        // MAX_HIGH_GO_AROUNDS the aircraft goes back, loudly.
+        if high_final && high_go_arounds >= MAX_HIGH_GO_AROUNDS {
+            let hold_kts = crate::autoland::hand_back_speed_kts(
+                p_approach_ias,
+                last_flap.unwrap_or(0.0),
+                &crate::aircraft::flap_limits(),
+            );
+            let floor = crate::aircraft::config_floor_kts(last_flap.unwrap_or(0.0));
+            give_up_pattern(
+                &xp,
+                &base_url,
+                &voice,
+                PatternTrip::HighFinals { laps: high_go_arounds },
+                leg,
+                alt_msl_ft,
+                tpa_msl_ft,
+                mag_var,
+                hold_kts,
+                floor,
+            )
+            .await;
+            return;
+        }
         if high_final {
             high_go_arounds += 1;
         }
@@ -806,9 +828,6 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
             .unwrap_or(p_approach_ias);
         let rwy_width_m = crate::runway::runway_width_m(&rwy);
         let landing_limit_m = crate::autoland::landing_xtk_limit_m(rwy_width_m);
-        // On the path too (#188), until the one lap flown around for height
-        // comes back as high: then autoland's own go-around takes it.
-        let high_handoff = high_go_arounds > 0 && final_high_give_up(above_path, a_m);
         if turning_final
             && ready_for_autoland(
                 x_m,
@@ -816,7 +835,7 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
                 hdg_err,
                 handoff_gs,
                 rwy_width_m.map(|_| landing_limit_m),
-                if high_handoff { None } else { above_path },
+                above_path,
             )
         {
             let alt_msl = field_elev_ft + agl_ft;
@@ -870,7 +889,7 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
                     "limit_m": landing_limit_m,
                     "glidepath_deg": descent_shape.glidepath_deg(),
                     "above_path_ft": above_path,
-                    "high_handoff": high_handoff,
+                    "high_handoff": false,
                 }),
             );
             // A path steepened over the ground is autoland's path too (#182),

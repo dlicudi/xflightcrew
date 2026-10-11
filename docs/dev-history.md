@@ -11093,6 +11093,26 @@ Next circuit over raised ground: `circuit` `leg` `descent_fpm` over 500 from abe
 `handoff_autoland` `above_path_ft` under 200 with `high_handoff` false; no `autoland`
 `late_go_around`; `ordered_go_around` `by: crew` only if still high at a mile. Offline only.
 
+### 2026-10-11: a repeated high circuit is still not an approach (safety only)
+
+LXGB 27, C172 sortie `1791723511-full_auto`: the first high final was flown around
+(`high_go_arounds`); the second, as high, took the `high_handoff` valve, which handed autoland the
+final with no path measurement at all, 194.5 ft above the path at 1.64 nm. Autoland was 249 ft
+high at its 500 ft gate and went around. The valve is removed: a high final is the circuit's
+go-around twice (`MAX_HIGH_GO_AROUNDS`), and a third gives the aircraft back through the pattern
+guard (`PatternTrip::HighFinals`, `pattern_guard` `why: high_finals`), never handed over high and
+never lapped for ever.
+
+The same sortie began earlier: the authored Rock route refused itself airborne (`leg 1 needs 601
+ft ... entered at 499 ft`) and `circuit::run` fell back to the rectangle, whose coarse corridor had
+passed while its ground track crossed the Rock. At LXGB the rectangle is no fallback: a refused
+authored route climbs and holds (`authored_refusal_requires_hold`, `hold_clear_of_terrain`).
+
+Merged under the autonomy freeze as safety fixes only. Left on branch `c172-flare-lxgb-circuit`,
+not merged: the handoff seam at 60 ft, the authored route's first waypoint 600 m farther out, and
+the C172 flare on `local_vy` (#268). Tests: `high_finals_give_the_aircraft_back_after_two_laps`,
+`a_rock_refusal_in_the_air_climbs_clear_and_says_the_numbers`. Offline only.
+
 ## 2026-09-29: the A330's CONF 1 clean-up inside its placard (#169)
 
 iMac 2026-09-29, sortie 1790698132-full_auto (A330 LEMG 30 circuit, PASS unattended) still ran

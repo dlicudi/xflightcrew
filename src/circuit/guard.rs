@@ -157,6 +157,9 @@ pub enum PatternTrip {
         ias: f64,
         vs: f64,
     },
+    /// Still high a mile out after `laps` go-arounds for it
+    /// ([`MAX_HIGH_GO_AROUNDS`]): the same geometry again is no circuit.
+    HighFinals { laps: u32 },
 }
 
 impl PatternTrip {
@@ -167,6 +170,7 @@ impl PatternTrip {
             PatternTrip::LegOverdue { .. } => "leg_overdue",
             PatternTrip::ServosOff { .. } => "servos_off",
             PatternTrip::ClimbNotHeld { .. } => "climb_not_held",
+            PatternTrip::HighFinals { .. } => "high_finals",
         }
     }
 
@@ -184,6 +188,10 @@ impl PatternTrip {
             ),
             PatternTrip::ServosOff { .. } => "The autopilot is off. Circuit cancelled.".into(),
             PatternTrip::ClimbNotHeld { why, .. } => format!("{} Circuit cancelled.", why.line()),
+            PatternTrip::HighFinals { laps } => format!(
+                "Circuit abandoned, still too high on final after {} go arounds.",
+                if *laps == 2 { "two".to_string() } else { laps.to_string() }
+            ),
         }
     }
 
@@ -404,7 +412,7 @@ pub(super) async fn give_up_pattern(
         PatternTrip::LegOverdue { secs, limit_s, .. } => (Some(secs), Some(limit_s), None),
         PatternTrip::AbovePattern { above_ft } => (None, None, Some(above_ft)),
         PatternTrip::ServosOff { secs } => (Some(secs), None, None),
-        PatternTrip::ClimbNotHeld { .. } => (None, None, None),
+        PatternTrip::ClimbNotHeld { .. } | PatternTrip::HighFinals { .. } => (None, None, None),
     };
     crate::blackbox::record(
         "circuit",

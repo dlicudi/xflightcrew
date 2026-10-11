@@ -717,6 +717,11 @@ pub const HANDOFF_ABOVE_PATH_FT: f64 = 200.0;
 /// 300 ft on the path, where the normal handoff has long happened (1.5 to 2.2
 /// nm in the LEMG circuits).
 pub const FINAL_HIGH_LAST_M: f64 = M_PER_NM;
+/// The circuit's own go-arounds for a final too high to hand over. One more
+/// such final gives the aircraft back (`PatternTrip::HighFinals`): the
+/// second lap high was the same geometry as the first (1791723511), and
+/// a loop that circles for ever is no circuit.
+pub const MAX_HIGH_GO_AROUNDS: u32 = 2;
 /// The share of the track left a descent is planned on: arrive with a
 /// quarter in hand for the capture's lag and a turn flown wider than drawn.
 pub(super) const DESCENT_PLAN_SHARE: f64 = 0.75;

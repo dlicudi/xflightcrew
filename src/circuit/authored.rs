@@ -364,6 +364,13 @@ pub fn rock_refused_line(rectangle_line: &str) -> String {
     format!("The Rock circuit isn't clear from here. {rectangle_line}")
 }
 
+/// Gibraltar's rectangle is never a fallback for its authored bay route.
+/// Its coarse corridor can look clear while its ground track cuts across the
+/// Rock (1791723511); a refused authored join must climb/hold instead.
+pub(super) fn authored_refusal_requires_hold(icao: &str) -> bool {
+    icao == "LXGB"
+}
+
 /// Height above the field at which the authored circuit switches the landing
 /// and taxi lights off (the rectangle and full auto's flight do it through
 /// the same `lights::after_climb`).
