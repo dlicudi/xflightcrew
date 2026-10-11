@@ -1,6 +1,8 @@
-# Autonomy in layers, phase 1 (docs/tasks/autonomy-layers/DESIGN.md): the
-# G1000 C172 flies LEMG 13's ILS on its own GFC 700 APR, localiser and
-# glideslope, to the roundout gate; today's flare lands it. Check blackbox
+# Autonomy in layers (docs/tasks/autonomy-layers/DESIGN.md): the G1000 C172
+# flies LEMG 13's ILS on its own GFC 700 APR, intercepted level, coupled to
+# 200 ft, then lands on the attitude flare. Not `runway: wind`: it picked 30,
+# which has no ILS. The tower may still move us to 31 on the wind aloft right
+# after the air start (#270). Check blackbox
 # `ils` `coupling` reaching Coupled, `autoflight` `press` APP once, no HDG
 # or V/S press after the captures, and `autoland` stable at 500 ft.
 #   xvl sortie bench/sorties/c172-g1000-ils13.yaml --check
