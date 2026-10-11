@@ -2817,6 +2817,8 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     ),
                     Ordering::SeqCst,
                 );
+                // APR pressed this tick: the tick's mode read is from before it.
+                let mut appr_pressed = false;
                 let needles = ils.as_ref().map(|_| {
                     // From the tick's one read.
                     let (h, v, lv, gv) = (st.get(F::Hdef), st.get(F::Vdef), st.get(F::LocValid), st.get(F::GsValid));
@@ -2867,6 +2869,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                             &mut coupling_armed_s,
                             tick_dt,
                         );
+                        appr_pressed = out.press_appr;
                         if out.press_appr {
                             if let Some(ok) = crate::ils::course_source_to_nav1(&xp).await {
                                 crate::blackbox::record(
@@ -3199,7 +3202,13 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // failed read, and never over what a coupled ILS hands the
                 // airframe (#81: the old presses here dropped the 737's
                 // captured localiser and glideslope at the next tick).
-                if !arrest_hands {
+                // Never on the tick APR was pressed: its read is from before the
+                // press. With the localiser needle alive the GFC 700's APR
+                // captures at once, and HDG pressed on the stale read replaced
+                // the capture, leaving the glideslope armed alone (LEMG 13,
+                // 1791736342 and 1791741953; captured parked on the runway,
+                // nav_status 2 the moment APR was pressed).
+                if !arrest_hands && !appr_pressed {
                     use autoflight::{Lateral, ModeRead, Vertical, Want};
                     let coupled = matches!(
                         coupling,
