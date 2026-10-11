@@ -508,3 +508,17 @@
             assert!(f.max_bank <= MAX_BANK + 0.1);
         }
     }
+
+    /// LXGB 27, 1791723511: the second lap was as high as the first. Past
+    /// MAX_HIGH_GO_AROUNDS the aircraft goes back, said with the count.
+    #[test]
+    fn high_finals_give_the_aircraft_back_after_two_laps() {
+        assert_eq!(MAX_HIGH_GO_AROUNDS, 2);
+        let trip = PatternTrip::HighFinals { laps: MAX_HIGH_GO_AROUNDS };
+        assert_eq!(trip.why(), "high_finals");
+        assert_eq!(
+            trip.words(),
+            "Circuit abandoned, still too high on final after two go arounds."
+        );
+        assert!(!trip.ap_has_no_pitch());
+    }

@@ -15,6 +15,8 @@
     /// is a plain refusal.
     #[test]
     fn a_rock_refusal_in_the_air_climbs_clear_and_says_the_numbers() {
+        assert!(authored_refusal_requires_hold("LXGB"));
+        assert!(!authored_refusal_requires_hold("LEMG"));
         // Ahead probed: the ridge's 1,098 plus 1,000.
         assert_eq!(
             hold_altitude_ft(Some(1098.0), Some(1398.0), 1130.0, 1650.0),
