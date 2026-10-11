@@ -22,6 +22,17 @@
 
 /// A speed error is closed, as energy, over this long, seconds.
 pub const SPEED_CLOSE_S: f64 = 20.0;
+/// ...and a SLOW one over this long: slow is the dangerous side. Closing
+/// 10 kt slow in 20 s asked 125 fpm of energy; full flap on the glideslope
+/// took the G1000 172 from 55 to 45 kt, into the stall and a wing drop
+/// (LEMG 13, 1791757554).
+pub const SPEED_CLOSE_SLOW_S: f64 = 6.0;
+/// Slow by more than this, kt, the slow side's closing applies.
+const SLOW_KTS: f64 = 3.0;
+/// Slow by more than this, kt, the hand moves at [`SLEW_SLOW_PER_S`].
+const URGENT_SLOW_KTS: f64 = 5.0;
+/// The hand's rate when the speed is decaying away, per second.
+pub const SLEW_SLOW_PER_S: f64 = 0.15;
 /// The set power is learnt this slowly, seconds.
 pub const BASE_TAU_S: f64 = 10.0;
 /// Energy rate a whole throttle buys, fpm: idle to full is about 1,400 fpm
@@ -68,11 +79,15 @@ pub fn energy_rate_fpm(ias_kts: f64, accel_kts_s: f64, vs_fpm: f64) -> f64 {
     vs_fpm + ias_kts * FPS_PER_KT * accel_kts_s * FPS_PER_KT / G_FPS2 * 60.0
 }
 
-/// The energy rate that closes `err_kts` of speed in [`SPEED_CLOSE_S`], fpm.
-/// Pure.
+/// The energy rate that closes `err_kts` of speed (positive: slow) in
+/// [`SPEED_CLOSE_S`], or [`SPEED_CLOSE_SLOW_S`] when slow, fpm. Pure.
 pub fn speed_term_fpm(ias_kts: f64, err_kts: f64) -> f64 {
-    (ias_kts * FPS_PER_KT * err_kts * FPS_PER_KT / G_FPS2 / SPEED_CLOSE_S * 60.0)
-        .clamp(-SPEED_TERM_MAX_FPM, SPEED_TERM_MAX_FPM)
+    let (close_s, max) = if err_kts > SLOW_KTS {
+        (SPEED_CLOSE_SLOW_S, 2.0 * SPEED_TERM_MAX_FPM)
+    } else {
+        (SPEED_CLOSE_S, SPEED_TERM_MAX_FPM)
+    };
+    (ias_kts * FPS_PER_KT * err_kts * FPS_PER_KT / G_FPS2 / close_s * 60.0).clamp(-max, max)
 }
 
 impl EnergyThrottle {
@@ -100,7 +115,8 @@ impl EnergyThrottle {
         *base = (*base + path_step / FPM_PER_THROTTLE + raw / FPM_PER_THROTTLE * dt / BASE_TAU_S)
             .clamp(0.0, 1.0);
         let cmd = (*base + err / FPM_PER_THROTTLE).clamp(0.0, 1.0);
-        let step = SLEW_PER_S * dt;
+        let slew = if i.target_kts - i.ias_kts > URGENT_SLOW_KTS { SLEW_SLOW_PER_S } else { SLEW_PER_S };
+        let step = slew * dt;
         cmd.clamp(i.thr_now - step, i.thr_now + step).clamp(0.0, 1.0)
     }
 }

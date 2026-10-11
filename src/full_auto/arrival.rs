@@ -631,7 +631,7 @@ pub(super) struct Arrival {
 /// tower picks its runway from it, never from the air the aircraft is in.
 pub(super) fn publish_field_wind() {
     if let Some((icao, lat, lon)) = crate::party_line::active_icao() {
-        let wind = crate::weather::surface_wind(&crate::config::xplane_root(), &icao);
+        let wind = crate::weather::field_wind(&crate::config::xplane_root(), &icao);
         event("field_wind", json!({ "icao": icao, "wind": wind }));
         crate::party_line::set_surface_wind(lat, lon, wind);
     }

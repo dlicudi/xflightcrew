@@ -1105,7 +1105,7 @@ fn feed_surface_wind() {
         *last = Some((std::time::Instant::now(), icao.clone()));
     }
     tokio::task::spawn_blocking(move || {
-        let wind = crate::weather::surface_wind(&crate::config::xplane_root(), &icao);
+        let wind = crate::weather::field_wind(&crate::config::xplane_root(), &icao);
         crate::party_line::set_surface_wind(lat, lon, wind);
     });
 }

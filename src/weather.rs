@@ -350,11 +350,22 @@ pub fn staleness(modified: SystemTime, now: SystemTime) -> Option<String> {
     })
 }
 
-/// A report's surface wind as (direction true, knots); `None` when the
-/// direction is variable (no runway to face).
+/// A report's surface wind as (direction true, knots). A light variable
+/// wind is CALM, `(0, 0)`: there is no runway to face, so the runway in use
+/// stands. As `None` it sent the tower to the wind at the aircraft, and LEMG
+/// at VRB01KT cleared an arrival on 13's final to 31 on the air at 1,700 ft
+/// (#270, 2026-10-11). `None` only for a strong variable wind, where no
+/// runway is right.
 pub fn wind_of(m: &Metar) -> Option<(f64, f64)> {
-    Some((m.wind_dir? as f64, m.wind_kts as f64))
+    match m.wind_dir {
+        Some(d) => Some((d as f64, m.wind_kts as f64)),
+        None if m.wind_kts <= CALM_VRB_MAX_KTS => Some((0.0, 0.0)),
+        None => None,
+    }
 }
+
+/// A variable wind up to this many knots reads as calm.
+const CALM_VRB_MAX_KTS: u32 = 5;
 
 /// The station's surface wind from the newest METAR on file, or `None`: no
 /// file, no line for the station, a variable wind, or a file older than
@@ -373,6 +384,24 @@ pub fn surface_wind(xplane_root: &str, icao: &str) -> Option<(f64, f64)> {
     }
     let text = std::fs::read_to_string(&path).ok()?;
     wind_of(&parse(line_for(&text, icao)?)?)
+}
+
+/// The field's surface wind for the tower, `(from, kts)`: the sim's own
+/// surface wind for the region (the lowest layer of the wind profile the
+/// monitor already reads, `winds_aloft`), the weather the aircraft is
+/// actually flown in and there without real weather; else the field's
+/// METAR. Only for the field the station is at, near the aircraft: a
+/// destination far away has its METAR alone (`surface_wind`). With neither
+/// published the tower judged an arrival on the air at the aircraft (008 at
+/// 5 kt at 1,700 ft against the field's 157 at 2) and cleared 31 where the
+/// field and the real LEMG used 13 (#270, 2026-10-11).
+pub fn field_wind(xplane_root: &str, icao: &str) -> Option<(f64, f64)> {
+    WINDS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|(_, w)| w.layers.first().map(|&(_, from, kts)| (from, kts)))
+        .or_else(|| surface_wind(xplane_root, icao))
 }
 
 /// The whole answer for one station: reads the newest file, parses the line,
@@ -543,8 +572,12 @@ mod tests {
     fn the_surface_wind_is_the_reports_and_variable_is_none() {
         let m = parse(line_for(FILE, "LXGB").unwrap()).unwrap();
         assert_eq!(wind_of(&m), Some((100.0, 16.0)));
+        // A light variable wind is calm (#270: LEMG VRB01KT); only a strong
+        // one is no answer.
         let vrb = parse("LEMG 121330Z VRB03KT 9999 FEW035 26/18 Q1020").unwrap();
-        assert_eq!(wind_of(&vrb), None);
+        assert_eq!(wind_of(&vrb), Some((0.0, 0.0)));
+        let storm = parse("LEMG 121330Z VRB15G28KT 9999 FEW035 26/18 Q1020").unwrap();
+        assert_eq!(wind_of(&storm), None);
         let calm = parse("LEMG 121330Z 00000KT 9999 FEW035 26/18 Q1020").unwrap();
         assert_eq!(wind_of(&calm), Some((0.0, 0.0)));
     }

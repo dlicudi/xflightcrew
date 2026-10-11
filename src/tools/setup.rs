@@ -941,7 +941,7 @@ impl Tool for SetUpApproach {
         let plan = crate::simbrief::loaded_plan()
             .filter(|p| p.destination.eq_ignore_ascii_case(&icao))
             .and_then(|p| p.procedures.dest_rwy);
-        let wind = crate::weather::surface_wind(&crate::config::xplane_root(), &icao);
+        let wind = crate::weather::field_wind(&crate::config::xplane_root(), &icao);
         let (rwy, source) = match pick_runway(
             &icao,
             &info.runways,
@@ -1371,7 +1371,7 @@ async fn new_flight_radio(xp: &crate::xplane::XPlaneClient, job: &ApproachJob, t
     };
     let _ = xp.set_float(crate::datarefs::COM1_FREQ_KHZ, khz as f64).await;
     if let Some((lat, lon)) = job.field {
-        let wind = crate::weather::surface_wind(&crate::config::xplane_root(), &job.icao);
+        let wind = crate::weather::field_wind(&crate::config::xplane_root(), &job.icao);
         crate::party_line::set_surface_wind(lat, lon, wind);
     }
     // The call belongs to the NEW station: routed a pass early it reaches
