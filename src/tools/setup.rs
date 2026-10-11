@@ -611,6 +611,48 @@ pub fn approach_init_json(acf_rel: &str, airport: &str, runway: &str, final_nm: 
     .to_string()
 }
 
+/// The flight-initialisation JSON for a final ON ITS PATH: the aircraft at
+/// `final_nm` out on the runway's extended centreline, on the 3 degree path
+/// plus the 50 ft threshold crossing, on the runway's course, at the
+/// approach speed (true, ISA), engines running. The sim's own final start
+/// ([`approach_init_json`]) chose the speed and released the G1000 172 at
+/// 21 kt, to dive at 2,000 fpm for the speed it lacked (LEMG 13, 2026-10-11).
+/// `None` when the runway is not in the field's data. Pure.
+pub fn approach_air_init_json(
+    acf_rel: &str,
+    rwy: &crate::nav::Runway,
+    ident: &str,
+    field_elev_ft: f64,
+    final_nm: i64,
+    approach_ias: f64,
+) -> Option<String> {
+    let ((t_lat, t_lon), (o_lat, o_lon)) = if rwy.ident_a.eq_ignore_ascii_case(ident) {
+        ((rwy.lat_a, rwy.lon_a), (rwy.lat_b, rwy.lon_b))
+    } else if rwy.ident_b.eq_ignore_ascii_case(ident) {
+        ((rwy.lat_b, rwy.lon_b), (rwy.lat_a, rwy.lon_a))
+    } else {
+        return None;
+    };
+    let course = crate::nav::bearing_deg(t_lat, t_lon, o_lat, o_lon);
+    let (lat, lon) = crate::nav::project_latlon(t_lat, t_lon, (course + 180.0) % 360.0, final_nm as f64);
+    let alt_ft = field_elev_ft + 50.0 + final_nm as f64 * 6076.12 * 3f64.to_radians().tan();
+    let tas = crate::tools::setup_enroute::tas_kts(approach_ias, alt_ft);
+    Some(
+        json!({
+            "aircraft": { "path": acf_rel },
+            "lle_air_start": {
+                "latitude": lat,
+                "longitude": lon,
+                "elevation_in_meters": (alt_ft * 0.3048 * 10.0).round() / 10.0,
+                "heading_true": (course * 10.0).round() / 10.0,
+                "speed_in_meters_per_second": (tas * 0.514_444 * 10.0).round() / 10.0,
+            },
+            "engine_status": { "all_engines": { "running": true } },
+        })
+        .to_string(),
+    )
+}
+
 /// Why X-Plane refused an initialisation, in words (`XPLMInitResult`,
 /// XPLMPlanes.h). Pure.
 pub fn init_refusal(code: i64, icao: &str, runway: &str) -> String {
@@ -911,7 +953,16 @@ impl Tool for SetUpApproach {
             Ok(x) => x,
             Err(line) => return Ok(line),
         };
-        let body = approach_init_json(&acf, &icao, &rwy, final_nm);
+        // On the path at the approach speed where the runway and the speed
+        // are known; else the sim's own final start.
+        let body = self
+            .land
+            .as_ref()
+            .zip(info.runways.iter().find(|r| {
+                r.ident_a.eq_ignore_ascii_case(&rwy) || r.ident_b.eq_ignore_ascii_case(&rwy)
+            }))
+            .and_then(|((_, ias), r)| approach_air_init_json(&acf, r, &rwy, info.elev_ft, final_nm, *ias))
+            .unwrap_or_else(|| approach_init_json(&acf, &icao, &rwy, final_nm));
         crate::blackbox::record(
             "setup",
             json!({ "event": "approach_init", "acf": acf, "airport": icao, "runway": rwy,
@@ -1443,6 +1494,39 @@ mod tests {
         assert!(!new_flight_began(&InitOutcome::Done(3)));
         assert!(!new_flight_began(&InitOutcome::Unreachable));
         assert!(!new_flight_began(&InitOutcome::NoBaseline));
+    }
+
+    /// LEMG 13 from apt.dat: 10 nm out on the reciprocal of the runway's
+    /// course, 3 degrees above the 50 ft crossing, at the approach speed.
+    #[test]
+    fn the_air_start_is_on_the_path_at_the_approach_speed() {
+        let rwy = crate::nav::Runway {
+            ident_a: "13".into(),
+            ident_b: "31".into(),
+            lat_a: 36.6845573,
+            lon_a: -4.5126253,
+            lat_b: 36.6654027,
+            lon_b: -4.4858140,
+            width_m: 45.0,
+            surface: 1,
+        };
+        let body = approach_air_init_json("Aircraft/x.acf", &rwy, "13", 52.0, 10, 65.0).unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let s = &v["lle_air_start"];
+        let hdg = s["heading_true"].as_f64().unwrap();
+        assert!((hdg - 131.7).abs() < 0.2, "{hdg}");
+        let alt_ft = s["elevation_in_meters"].as_f64().unwrap() / 0.3048;
+        assert!((alt_ft - (52.0 + 50.0 + 3_184.0)).abs() < 5.0, "{alt_ft}");
+        let back = crate::nav::bearing_deg(
+            s["latitude"].as_f64().unwrap(),
+            s["longitude"].as_f64().unwrap(),
+            rwy.lat_a,
+            rwy.lon_a,
+        );
+        assert!((back - hdg).abs() < 0.3, "on the extended centreline: {back}");
+        let kts = s["speed_in_meters_per_second"].as_f64().unwrap() / 0.514_444;
+        assert!(kts > 65.0 && kts < 70.0, "true speed {kts}");
+        assert!(approach_air_init_json("Aircraft/x.acf", &rwy, "09", 52.0, 10, 65.0).is_none());
     }
 
     #[test]

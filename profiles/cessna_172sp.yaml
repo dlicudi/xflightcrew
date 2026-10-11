@@ -110,10 +110,6 @@ flare_elevator:
   max: 0.35
   max_push: 0.10
   balloon_ease_per_s: 0.15
-  # The arrest by attitude, judged by height (docs/tasks/autonomy-layers,
-  # phase 2): the path from attitude less alpha, no VSI, no fitted gain.
-  # Unflown: blackbox autoland att_* on the arrest ticks.
-  attitude: true
 
 # EGBS Bravo, 2026-10-02: full linked-nosewheel steering produced about
 # 10 deg/s near 4 kt. Candidate limit for the corner-speed schedule following
@@ -306,6 +302,9 @@ lights:
 # 2026-10-11: with the flight director up, `approach` arms the glideslope.
 # Unflown: blackbox `ils` `coupling` Off to Coupled, `autoflight` `press`
 # APP once, no HDG or V/S press after the captures, the stable gate passed.
+# The layered autonomy (docs/tasks/autonomy-layers): the reference airframe.
+# Flare by attitude flown 7 times on LEMG 13 (243 to 287 fpm, 2026-10-11).
+layers: true
 ils_coupled: true
 # A coupled Cat I ILS is flown to its decision height, then landed visually:
 # the GFC 700 tracked LEMG 13's localiser 18 to 37 m left in a light

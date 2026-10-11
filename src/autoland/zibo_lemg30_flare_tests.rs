@@ -417,7 +417,6 @@ fn as_flown_elevator() -> FlareElevatorProfile {
         balloon_ease_per_s: Some(0.15),
         tau_s: Some(5.5),
         model: None,
-        attitude: false,
     }
 }
 fn as_flown_power() -> FlarePowerProfile {

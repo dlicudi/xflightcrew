@@ -77,8 +77,11 @@ pub const LINEUP_MAX_ERR_DEG: f64 = 3.0;
 pub const LINEUP_MAX_XTK_M: f64 = 2.0;
 /// Takeoff roll: most off the centreline.
 pub const ROLL_MAX_XTK_M: f64 = 5.0;
-/// Touchdown: firmer than this fails; crabbed more than this fails.
-pub const TOUCHDOWN_MAX_SINK_FPM: f64 = 400.0;
+/// Touchdown: firmer than this fails; crabbed more than this fails. 240 fpm
+/// is where firm becomes hard (the pilot's bands, 2026-10-11: 60 to 120
+/// normal, 100 to 180 the sweet spot, over 240 firm to hard, over 360 gear
+/// stress); 400 passed landings a pilot would call hard.
+pub const TOUCHDOWN_MAX_SINK_FPM: f64 = 240.0;
 pub const TOUCHDOWN_MAX_DRIFT_DEG: f64 = 5.0;
 /// The first contact is judged, not the one the state record happens to
 /// catch. The 1 Hz `state` sample never saw the wheels on LEMG 13
@@ -1779,7 +1782,8 @@ mod tests {
         let l = out.iter().find(|v| v["stage"] == "landing").unwrap();
         assert!(l["bounce_ft"].is_null(), "{l}");
         assert_eq!(l["sink_fpm"], 262.0, "{l}");
-        assert_eq!(l["pass"], true, "{l}");
+        // Not a bounce: judged on its sink alone (firm since the limit is 240).
+        assert_eq!(l["pass"], 262.0 <= TOUCHDOWN_MAX_SINK_FPM, "{l}");
     }
 
     /// The offline twin of the monitor's rule: a `yoke_under_ap` inside the

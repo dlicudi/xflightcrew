@@ -14160,3 +14160,36 @@ what no autopilot can. Reference airframe: `Cessna_172SP_G1000.acf` (GFC 700; th
   command easing to -1.1 while the pull rose 0.12 to 0.27 (ground effect, unmodelled in the
   test plant): the next step is the plant, from this flight.
 
+### 2026-10-11 (later): the 172's approach as a pilot flies it, and a 240 fpm limit
+
+- **APR's stale read:** with the localiser needle alive the GFC 700's APR captures at once
+  (`nav_status` 2 parked on LEMG 13), and the mode housekeeping, acting on the tick's read from
+  before the press, pressed HDG over the capture (1791736342, 1791741953). It now waits one tick
+  after the press. Flown three times since: captured each time.
+- **VS rewritten 270 times in eight minutes** on one approach, +524 fpm climbing to our own path
+  under the beam. A layered airframe now intercepts an ILS LEVEL (`autoflight::Vertical::Level`,
+  ALT once, no VS wheel) under a live glideslope; the glideslope captured from level at 1,800 ft.
+- **The shared speed governor pumped the phugoid in ALT hold:** it led the airspeed's trend and
+  walked the lever 0.13 to 1.0 in phase with a -2,300 to +750 fpm swing. A layered airframe flies
+  its approach power on total energy (`autoland::energy_throttle`: the energy rate vertical speed
+  plus speed x acceleration / g, which a phugoid holds still; the set power learnt slowly and
+  stepped by a new path's energy; the hand at 0.05 a second). Flown: the swing damped, the
+  glideslope at -370 to -420 fpm on a lever moving 0.26 to 0.39, landed at 226 fpm (1791748727).
+- **The VS watchdog under a level intercept** judges against level, lets an engaged ALT return to
+  its altitude at up to 1,000 fpm (`LEVEL_RETURN_MAX_FPM`; it climbed back at 900 after the
+  setup's dive) and never presses ALT over an engaged one (it toggled the hold, and the re-engage
+  took 2,870 ft for 2,950).
+- **One switch,** `layers` on the profile (the 172 only), selects all of it; it replaced
+  `flare_elevator.attitude`.
+- **The approach setup starts the aircraft on its path at its approach speed**
+  (`setup::approach_air_init_json`, `lle_air_start`): the sim's own final start released the
+  G1000 172 at 21 kt and it dived at 2,000 fpm for the speed. Still a dip to -1,200 fpm in the
+  first seconds (the trim, unproven).
+- **The scorecard's touchdown limit is 240 fpm** (`TOUCHDOWN_MAX_SINK_FPM`), where firm becomes
+  hard (pilot's bands: 100 to 180 the sweet spot); 400 passed hard landings. The 737's old flare
+  law's own plant test keeps its 400 until it crosses over. First landing under the new limit:
+  198 fpm, a visual approach to 30 on our own path (1791750752).
+- Open: #270 (the tower refuses a stated runway on the wind aloft right after an air start); the
+  flare is still firm (198 to 287 fpm): below 8 ft the path stays near -2 degrees against a
+  command easing to -1 (ground effect, not in the test plant).
+

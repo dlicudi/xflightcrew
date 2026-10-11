@@ -328,6 +328,8 @@ pub use approach::*;
 mod flare;
 // The flare by attitude, judged by height (docs/tasks/autonomy-layers).
 pub(crate) mod attitude_flare;
+// The approach's power on total energy (docs/tasks/autonomy-layers).
+pub(crate) mod energy_throttle;
 pub use flare::*;
 mod arrest;
 pub use arrest::*;
