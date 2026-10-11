@@ -14193,3 +14193,36 @@ what no autopilot can. Reference airframe: `Cessna_172SP_G1000.acf` (GFC 700; th
   flare is still firm (198 to 287 fpm): below 8 ft the path stays near -2 degrees against a
   command easing to -1 (ground effect, not in the test plant).
 
+### 2026-10-12: the 172 lands in the sweet spot (landing v2)
+
+Flown on LEMG 13's ILS from a 5 nm final, four in a row: 161, 122, 107, 115 fpm (the pilot's
+bands: 100 to 180 the sweet spot), drift 0.1 to 0.2 degrees, the rollout 1.4 to 3.7 m off the
+centreline with its heading inside 2.6 degrees and the brakes at most 0.14, the approach never
+under 55 kt (1791758534, 1791758911, 1791759234, 1791759560).
+
+- **The flare: tracking, not too little flare.** At 0.5 ft the law commanded -0.97 deg (about
+  -110 fpm) and the aircraft flew -1.6 (-180): the nose 0.8 deg behind a rising command below
+  8 ft. A disturbance observer (`attitude_flare`, `dob_tau_s`, `b_hat` the measured 32 deg/s per
+  unit) finds what holding the nose takes (ground effect, the bleeding speed) within a second,
+  and the command's own rate is fed forward through the same authority. The test plant gained
+  ground effect (a 0.25 pull at the wheels reproduced the flights' 226 to 287 fpm on the old
+  law); across the authority 50% either side of 32, 99 to 154 fpm on a 3 degree path. Starting
+  the flare earlier (3.5 s) was tried and rejected: the plant landed a strong-elevator,
+  strong-ground-effect case at 353.
+- **The hold-off:** the sink eases to -70 fpm by 2 ft and holds (`HOLDOFF_VS_FPM`,
+  `HOLDOFF_FT`): touchdowns were flat, 1.5 to 1.7 deg nose up at 62 kt; now 3.2 deg at 57.5 kt.
+  Still 0.7 deg under the command at the wheels.
+- **Slow is the dangerous side** (`energy_throttle`, `SPEED_CLOSE_SLOW_S` 6 s,
+  `SLEW_SLOW_PER_S`): full flap on the glideslope bled the 172 from 55 to 45 kt on the 20 s
+  close, into the stall, a wing drop and a 45 degree bank; the recovery took it (1791757554).
+- **The rollout:** brakes on the deceleration measured, 1.2 m/s2 overall (`DecelBrake`,
+  `LIGHT_DECEL_MPS2`; 0.24 from the touch was "extreme"), a late tick no measurement; the
+  172's `rollout_steer` from its measured yaw response, 20 deg/s per unit. The nosewheel
+  geometry's 131 deg/s at 40 kt (10 degrees, 5.2 ft) was 6x too high and ran the aircraft 52 m
+  off the runway (1791755237): measured, not derived.
+- **The tower's wind is the field's** (`weather::field_wind`): the sim's own surface layer, else
+  the METAR, and a light VRB wind is calm. With LEMG at VRB01KT nothing was published and the
+  tower took the wind aloft at the aircraft (008 at 5 kt at 1,700 ft against the surface 157 at
+  2) and cleared 31 where the field and the real LEMG used 13 (#270). Since: 13 kept every time.
+- Card: a 5 nm final (`bench/sorties/c172-g1000-ils13.yaml`).
+
