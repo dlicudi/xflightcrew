@@ -22,6 +22,7 @@ pub(super) fn gatwick() -> Station {
             transition_level_ft: None,
             allows_circuits: None,
             pattern_sides: Vec::new(),
+            papis: Vec::new(),
             name: "Gatwick".into(),
             elev_ft: 200.0,
             runways: book_runways(),
