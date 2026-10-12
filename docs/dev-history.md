@@ -14287,3 +14287,12 @@ nose holds its command within 0.1 to 0.3 deg.
   comes first.
 - The sortie watcher waited on `pgrep -f "xvl sortie"`, which matched its own command line:
   wait on the sortie's pid.
+
+### 2026-10-12: the Lancair Evolution crosses to layers
+
+117 then 86 fpm on LEMG 13 from 5 nm, drift under 2.1 deg, the centreline within 1.7 m, no
+intervention (1791801818, 1791802111; `bench/sorties/evolution-lemg.yaml`), no ground pull
+declared: the path closed on its command to 0.1 deg by the wheels. Its old fitted flare
+model (issue #196) and its tests and LILB recordings are gone, and with them the last users
+of the SR22 bounce file's plant: `lemg13_sr22_bounce_tests` is deleted, its one live test
+(`TouchHold`) moved beside `TouchHold` in `autoland::rollout`.
