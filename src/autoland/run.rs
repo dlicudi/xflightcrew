@@ -6,16 +6,23 @@ use super::*;
 /// it, fpm (a 172's ALT came back at 900 after the setup's dive).
 const LEVEL_RETURN_MAX_FPM: f64 = 1_000.0;
 
-/// The pitch plant's reads (`theta`, `alpha`, `q`, `vy_true`, `elev_total`,
-/// `tas` on the autoland tick), in this order: logged, and the attitude
-/// law's measurements.
-const PITCH_PLANT: [&str; 6] = [
+/// The plant's reads (`theta`, `alpha`, `q`, `vy_true`, `elev_total`, `tas`,
+/// `ail_total`, `rud_total`, `beta` on the autoland tick), in this order:
+/// logged, and the attitude law's measurements.
+const PITCH_PLANT: [&str; 9] = [
     sim::datarefs::THETA_DEG,
     sim::datarefs::ALPHA_DEG,
     sim::datarefs::PITCH_RATE_DEG_S,
     sim::datarefs::LOCAL_VY_MS,
     sim::datarefs::TOTAL_PITCH_RATIO,
     sim::datarefs::TRUE_AIRSPEED_MS,
+    // The lateral plant (2026-10-12): the ailerons and rudder the
+    // autopilot or our hands give, and the sideslip, so the roll response
+    // can be read while the autopilot flies and a rudder law designed on
+    // data (the tapes have none airborne).
+    sim::datarefs::TOTAL_ROLL_RATIO,
+    sim::datarefs::TOTAL_HEADING_RATIO,
+    sim::datarefs::SIDESLIP_DEG,
 ];
 
 pub(super) fn spawn_autoland(launch: AutolandLaunch) {
@@ -2633,6 +2640,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     "theta": plant_at(0), "alpha": plant_at(1), "q": plant_at(2),
                     "vy_true": plant_at(3).map(|v| v * 196.850_394), "elev_total": plant_at(4),
                     "tas": plant_at(5).map(|v| v * 1.943_844),
+                    "ail_total": plant_at(6), "rud_total": plant_at(7), "beta": plant_at(8),
                     "att_gate": att_out.map(|o| o.gate_ft), "att_vs_t": att_out.map(|o| o.vs_target_fpm),
                     "att_gamma": att_out.map(|o| o.gamma_deg), "att_gamma_cmd": att_out.map(|o| o.gamma_cmd_deg),
                     "att_theta_cmd": att_out.map(|o| o.theta_cmd_deg),
