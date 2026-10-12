@@ -240,19 +240,21 @@ fn the_zibo_heading_fit_flies_the_recorded_windows() {
     );
 }
 
-/// The final's one law (`FinalLateral`) on the fitted Zibo, its response
-/// time measured over the final's first 90 s. The pursuit it replaced parked
-/// 3.8 to 7.0 m off inside 1.5 nm with the window still (a degree of cut is
-/// 36 m and the window takes whole degrees), and with the heading mode
-/// settling a degree off its window and back over 50 s (the recorded
-/// finals' heading less window: 0.6 to 1.0 degrees rms over 20 s) weaved 18
-/// to 28 m, 9 of 24 going around: the flights' 16 to 34 m and their
-/// go-arounds; the declared track law after it held 1.4 to 3.3 m and 6 to
-/// 11. Here: no balk, 1.0 to 4.1 m inside 1.5 nm with the window still
-/// (the yaw included), 7.3 to 10.4 against the wandering heading.
+/// The final as a pilot sets it on the fitted Zibo (2026-10-12): the knob in
+/// whole degrees no oftener than every ten seconds above minimums, hand
+/// flown below them. The pursuit it replaced parked 3.8 to 7.0 m off inside
+/// 1.5 nm with the window still and weaved 18 to 28 m with the heading mode
+/// settling a degree off its window and back over 50 s, 9 of 24 going
+/// around (the flights' 16 to 34 m and their go-arounds); the one law
+/// after it (`FinalLateral`, a quarter degree every second) held 1.0 to 4.1
+/// and 7.3 to 10.4. Here, with the window still: no balk, 2 to 7 m inside
+/// 1.5 nm, the gate on the line, the knob set every 15 to 60 s. With the
+/// heading wandering: 13 to 33 m inside 1.5 nm, the gate on the line, and
+/// one of 24 sent round below the floor 33 m off at 319 ft, the gate's call.
 #[test]
 fn the_zibo_final_holds_the_line() {
     let rwy = lemg("30");
+    let mut balks = 0;
     for (x0, wf, wk) in starts(&rwy) {
         for wobble in [None, Some((1.3, 9.0))] {
             let mut jet = zibo(&rwy, 5.0 * M_PER_NM, x0, wf, wk);
@@ -260,31 +262,34 @@ fn the_zibo_final_holds_the_line() {
             let f = fly(&mut jet, &rwy);
             let case = format!("{x0} m, {wk} kt from {wf:.0}, wobble {wobble:?}");
             assert!(f.balk.is_none(), "{case}: {f:?}");
-            assert!(f.worst_in_1_5_m < 5.0, "{case}: {f:?}");
-            assert!(f.gate_xtk_m.abs() < 5.0, "{case}: {f:?}");
-            // No growing oscillation: the last mile and a half's peaks are
-            // no bigger than the first's.
-            let early = f.halves[..3].iter().cloned().fold(0.0, f64::max);
-            let late = f.halves[3..].iter().cloned().fold(0.0, f64::max);
-            assert!(late <= early + 1.0, "{case}: {f:?}");
+            assert!(f.worst_in_1_5_m < 8.0, "{case}: {f:?}");
+            assert!(f.gate_xtk_m.abs() < 1.0, "{case}: {f:?}");
             assert!(f.worst_bank_deg < 6.0, "{case}: {f:?}");
+            assert!(f.moves <= 9, "{case}: {f:?}");
         }
         for phase in [0.0, 1.6, 3.2, 4.7] {
             let mut jet = zibo(&rwy, 5.0 * M_PER_NM, x0, wf, wk);
             jet.ap_offset = Some((1.1, 50.0, phase));
             let f = fly(&mut jet, &rwy);
-            assert!(f.balk.is_none(), "{f:?}");
-            assert!(f.worst_in_1_5_m < 12.0, "{f:?}");
+            match f.balk {
+                Some((why, ..)) => {
+                    assert_eq!(why, "unstabilised_below_floor", "{f:?}");
+                    balks += 1;
+                }
+                None => assert!(f.gate_xtk_m.abs() < 2.0 && f.worst_in_1_5_m < 35.0, "{f:?}"),
+            }
         }
     }
+    assert!(balks <= 1, "{balks} of 24 wandering finals went round");
 }
 
 /// The fourth approach as it began its final (sortie 1791381498-full_auto,
 /// 14:18:27Z): 32 m left at 5.49 nm, heading 298.6 and tracking 297.2 (a
 /// 3 kt wind from the right), 136 kt. On the pursuit, with the heading
 /// wandering a degree, it wove 19 m inside 1.5 nm (flown: +18 at 3.5 nm,
-/// -5 at 2, +16 at 1, -20 at 0.31 and the go-around). On the final's one
-/// law: 9.1 m wandering, 1.6 with the heading on its window.
+/// -5 at 2, +16 at 1, -20 at 0.31 and the go-around). As a pilot sets it:
+/// 38 m at 1.5 nm wandering, 10 m by 1 nm and the gate on the line hand
+/// flown; with the heading on its window, inside 8 m.
 #[test]
 fn the_fourth_approach_replayed() {
     let rwy = lemg("30");
@@ -298,7 +303,7 @@ fn the_fourth_approach_replayed() {
         fly(&mut jet, &rwy)
     };
     let f = fly_from(true);
-    assert!(f.balk.is_none() && f.worst_in_1_5_m < 10.0, "{f:?}");
+    assert!(f.balk.is_none() && f.worst_in_1_5_m < 40.0 && f.halves[4] < 12.0 && f.gate_xtk_m.abs() < 1.0, "{f:?}");
     let f = fly_from(false);
-    assert!(f.balk.is_none() && f.worst_in_1_5_m < 5.0, "{f:?}");
+    assert!(f.balk.is_none() && f.worst_in_1_5_m < 8.0 && f.gate_xtk_m.abs() < 1.0, "{f:?}");
 }

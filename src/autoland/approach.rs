@@ -92,9 +92,10 @@ pub fn clearance_differs(planned_id: &str, cleared_id: &str) -> bool {
 /// swing with a ~13 s period at the numbers, a standing 35 m offset the
 /// short-final law could not close, and the lateral balk gate at 74 ft.
 /// At 15 s the 13 s swing comes through at about a seventh of its amplitude.
-/// 5 s since the final's one lateral law (2026-10-12, `FinalLateral`): its
-/// lead on the drift and its integral answer what the crab misses, and a
-/// 15 s crab held the wind of half a minute before through a shear. On the
+/// 5 s since 2026-10-12 (for `FinalLateral`, a lead on the drift and an
+/// integral answering what the crab misses; a 15 s crab held the wind of
+/// half a minute before through a shear). The final's heading now takes it
+/// in whole degrees (`FinalHeading`), its standing error learnt. On the
 /// fitted plants under the 60 recorded finals, 15 s to 5 s took the replays
 /// within 5 m at 50 ft from 56 to 59 and a 15 to 0 kt shear from 46 to 49.
 pub const CRAB_TAU_S: f64 = 5.0;
@@ -367,13 +368,25 @@ pub fn stabilised_xtk(xtk_nm: f64, along_nm: f64) -> bool {
     crate::circuit::interceptable(xtk_nm * M_PER_NM, along_nm * M_PER_NM)
 }
 
-/// Will the final's pursuit have the offset inside `limit_m` by the
-/// threshold ([`crate::reversal::predicted_residual_m`], the stabilised
-/// gate's own time model)? The question below the terrain floor, where
-/// "interceptable" is true of any offset a landing could still be saved from
-/// and of many it could not.
-pub fn lands_on_the_pavement(xtk_nm: f64, along_nm: f64, gs_kts: f64, limit_m: f64) -> bool {
-    crate::reversal::predicted_residual_m(xtk_nm, along_nm, gs_kts) <= limit_m
+/// Will the final have the offset inside `limit_m` by the threshold? The
+/// question below the terrain floor, where "interceptable" is true of any
+/// offset a landing could still be saved from and of many it could not.
+/// Above the visual minimums the time model is the stabilised gate's own
+/// ([`crate::reversal::predicted_residual_m`]): 98 m off at 470 ft is a
+/// go-around however the last 300 ft could be flown. Below them the final
+/// is hand flown (2026-10-12), closing at up to 2.5 m/s with the last 10 m
+/// over 4 s (`pilot::line`): on the gate's model a whole-degree final 31 m
+/// off at 297 ft balked that the bank lands on the line
+/// (`lemg30_zibo_final_tests`). Pure.
+pub fn lands_on_the_pavement(xtk_nm: f64, along_nm: f64, gs_kts: f64, radio_ft: f64, limit_m: f64) -> bool {
+    if radio_ft > VISUAL_MINIMUMS_FT {
+        return crate::reversal::predicted_residual_m(xtk_nm, along_nm, gs_kts) <= limit_m;
+    }
+    let t = along_nm.max(0.0) * M_PER_NM / (gs_kts * 0.514_444).max(20.0);
+    let x = xtk_nm.abs() * M_PER_NM;
+    let linear_s = (x - 10.0).max(0.0) / 2.5;
+    let residual = if t < linear_s { x - 2.5 * t } else { x.min(10.0) * (-(t - linear_s) / 4.0).exp() };
+    residual <= limit_m
 }
 /// Airspeed this far below the approach speed triggers speed protection (nose
 /// down to regain it), before the decay reaches a stall and disconnects the AP.

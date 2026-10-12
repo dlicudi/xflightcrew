@@ -383,41 +383,6 @@ const FINE_BUG_DEG: f64 = 3.0;
 /// ...and below this it is left alone.
 const FINE_BUG_MIN_DEG: f64 = 0.2;
 
-/// What [`drive_heading_bug_step`] would do from a bug already read.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BugStep {
-    /// Within a fifth of a degree: the knob is left alone.
-    Leave,
-    /// Set to this value (a fine correction, or the target when the bug
-    /// was unread): one write, which can ride the tick's write round.
-    Set(f64),
-    /// A change past [`FINE_BUG_DEG`]: pressed, through
-    /// [`drive_heading_bug_step`] itself.
-    Drive,
-}
-
-/// [`drive_heading_bug_step`]'s first decision from the bug a tick has
-/// ALREADY read (`sim::state` carries it), so a loop that steers the knob
-/// every tick pays no read of its own and its fine correction goes out with
-/// the tick's other writes: the short final and the flare set the bug every
-/// tick, three rounds of requests (read, write, read back) where one write
-/// does (iMac 2026-09-30, a round is a frame, 50 ms at 20 fps). Pure.
-pub fn bug_step_from(start: Option<f64>, target: f64) -> BugStep {
-    let target = target.rem_euclid(360.0);
-    let Some(start) = start.filter(|v| v.is_finite()) else {
-        return BugStep::Set(target);
-    };
-    let full = crate::angles::signed_diff_deg(target, start);
-    if full.abs() < FINE_BUG_DEG {
-        if full.abs() >= FINE_BUG_MIN_DEG {
-            let fine = ((start + full) * 10.0).round() / 10.0;
-            return BugStep::Set(fine.rem_euclid(360.0));
-        }
-        return BugStep::Leave;
-    }
-    BugStep::Drive
-}
-
 pub async fn drive_heading_bug_step(
     xp: &dyn crate::xplane::XPlane,
     target: f64,

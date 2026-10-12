@@ -2,20 +2,27 @@
 
 use super::*;
 
-/// The pitch plant's reads (`theta`, `alpha`, `q`, `vy_true`, `elev_total`,
-/// `tas` on the autoland tick), in this order: logged, and the attitude
-/// flare's measurements.
 /// The fastest an altitude hold returns to its altitude and is still holding
 /// it, fpm (a 172's ALT came back at 900 after the setup's dive).
 const LEVEL_RETURN_MAX_FPM: f64 = 1_000.0;
 
-const PITCH_PLANT: [&str; 6] = [
+/// The plant's reads (`theta`, `alpha`, `q`, `vy_true`, `elev_total`, `tas`,
+/// `ail_total`, `rud_total`, `beta` on the autoland tick), in this order:
+/// logged, and the attitude law's measurements.
+const PITCH_PLANT: [&str; 9] = [
     sim::datarefs::THETA_DEG,
     sim::datarefs::ALPHA_DEG,
     sim::datarefs::PITCH_RATE_DEG_S,
     sim::datarefs::LOCAL_VY_MS,
     sim::datarefs::TOTAL_PITCH_RATIO,
     sim::datarefs::TRUE_AIRSPEED_MS,
+    // The lateral plant (2026-10-12): the ailerons and rudder the
+    // autopilot or our hands give, and the sideslip, so the roll response
+    // can be read while the autopilot flies and a rudder law designed on
+    // data (the tapes have none airborne).
+    sim::datarefs::TOTAL_ROLL_RATIO,
+    sim::datarefs::TOTAL_HEADING_RATIO,
+    sim::datarefs::SIDESLIP_DEG,
 ];
 
 pub(super) fn spawn_autoland(launch: AutolandLaunch) {
@@ -298,8 +305,8 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             // The arrest by attitude, judged by height: the airframe's
             // declared limits and ground pull, else the defaults.
             let attitude_law = crate::aircraft::flare_elevator().unwrap_or_default();
-            let mut attitude_flare = super::attitude_flare::AttitudeFlare::default();
-            let mut energy_throttle = super::energy_throttle::EnergyThrottle::default();
+            let mut attitude_flare = crate::pilot::attitude::AttitudeFlare::default();
+            let mut energy_throttle = crate::pilot::energy::EnergyThrottle::default();
             let mut decel_brake = DecelBrake::default();
             let mut path_nudge = super::path_nudge::PathNudge::default();
             let path_clock = std::time::Instant::now();
@@ -313,28 +320,22 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             // The roundout gate's go/no-go for this approach (`landing_call`).
             let mut landing_called: Option<LandingCall> = None;
             let mut pitch_yielded = false;
-            // The arrest has the servos (see `arrest_hands_step`); the
-            // wings-level law that holds the track while it does; the
-            // pilot has taken the roll for this approach.
+            // The hand-flown segment has the servos, from minimums to the
+            // wheels (`arrest_hands_step`); the roundout has begun under it
+            // (`hold_roundout` keeps it); the ailerons on the bank
+            // (`pilot::bank`, its roll response measured as it flies).
             let mut arrest_hands = false;
+            let mut roundout_taken = false;
             // This tick's arrest is only `hold_roundout`'s (a balloon over
             // the band), for the blackbox's `roundout_held` edges.
             let mut roundout_held = false;
-            let mut wings = arrest_wings();
-            // The final's lateral (`FinalLateral`) on the heading mode's
-            // response time, measured on the intercept and the first 90 s
-            // of the first final (`ResponseTime`): when that final began,
-            // when this one did, and whether this one's `lateral_tr` is on
-            // the tape.
-            let mut final_lateral = FinalLateral::default();
-            let mut response = ResponseTime::default();
-            let mut first_final_at: Option<std::time::Instant> = None;
-            let mut final_at: Option<std::time::Instant> = None;
-            let mut tr_recorded = false;
+            let mut bank_hold = crate::pilot::bank::BankHold::default();
+            // The final's heading above minimums, the autopilot's standing
+            // error learnt as it flies (`FinalHeading`).
+            let mut final_heading = FinalHeading::default();
             let mut arrest_rate = crate::autotakeoff::XtkRate::default();
             let mut arrest_prev_xtk: Option<f64> = None;
             let mut roll_yielded = false;
-            let mut last_arresting = false;
             // Airspeed history for the throttle governor's derivative term — the
             // anti-stall reflex needs the TREND (kts/sec), not just the error.
             let mut prev_ias: Option<f64> = None;
@@ -894,14 +895,13 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         roll_law.step(err, roll_dt, gs_kts, 0.0)
                     };
                     let track_roll = hpath_r.as_ref().ok().copied();
-                    let side_roll = side_velocity_m_s(track_roll, rwy.course_deg, gs_kts)
+                    let side_roll = crate::pilot::line::side_velocity_m_s(track_roll, rwy.course_deg, gs_kts)
                         .unwrap_or(xtk_rate);
                     let phi_roll = phi_r.as_ref().ok().copied();
-                    let air_bank_tgt = phi_roll.map(|phi| {
-                        arrest_bank_target(xtk_m, side_roll, wings.predicted(phi), radio_ft)
-                    });
+                    let air_bank_tgt =
+                        phi_roll.map(|phi| crate::pilot::line::bank_for_line(xtk_m, side_roll, phi, radio_ft));
                     let air_ail = match (airborne && arrest_hands && !roll_yielded, phi_roll, air_bank_tgt) {
-                        (true, Some(phi), Some(tgt)) => Some(wings.step(phi, tgt, roll_dt)),
+                        (true, Some(phi), Some(tgt)) => Some(bank_hold.step(phi, tgt, roll_dt)),
                         _ => None,
                     };
                     // Queued: the rollout's writes go out in one round below.
@@ -1150,12 +1150,12 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // guidance turns back to the FAP immediately, which is a killer
                 // at 50 ft (see [`GoAroundLatch`]).
                 let along_nm = along_track_nm(lat, lon, &rwy);
-                // The arrest keeps the servos it took (`hold_roundout`): a
+                // A roundout begun keeps the arrest (`hold_roundout`): a
                 // roundout balloon over the band is still the landing, or a
                 // balked one, never the autopilot's descent again.
                 let held = hold_roundout(
                     raw,
-                    arrest_hands,
+                    roundout_taken,
                     radio_ft,
                     gs_kts,
                     rwy.length_m + along_nm.min(0.0) * M_PER_NM,
@@ -1880,7 +1880,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                            "why": w.why, "called_radio": radio_ft,
                                            "low_ft": w.low_ft, "touched": w.touched,
                                            "xtk_m": xtk_now * M_PER_NM,
-                                           "dist": raw.dist_nm, "lat_i_m": final_lateral.i_m()}),
+                                           "dist": raw.dist_nm}),
                     );
                 }
                 // Back on final after a missed approach: report it. The first
@@ -2309,6 +2309,20 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         crate::ils::Coupling::LocCaptured | crate::ils::Coupling::Coupled
                     );
                 let g = g;
+                // MINIMUMS (2026-10-12): above them the autopilot flies the
+                // final in the modes built for it; from them it is hand flown
+                // to the wheels as ONE segment, servos out (`crate::pilot`).
+                // Once taken it is held to the wheels or a go-around.
+                let minimums = minimums_ft(
+                    matches!(coupling, crate::ils::Coupling::LocCaptured | crate::ils::Coupling::Coupled),
+                    crate::aircraft::live_profile().and_then(|p| p.ils_decouple_agl_ft),
+                );
+                let hand_flown = !ap_flies
+                    && (g.arresting
+                        || (g.phase == ApproachPhase::Final
+                            && pattern.is_none()
+                            && !ga
+                            && (arrest_hands || (radio_ft > 0.0 && radio_ft < minimums))));
                 let outbound = hold.is_some()
                     || pattern.is_some_and(|(_, leg, _)| leg != crate::reversal::Leg::Inbound);
                 let phase_word = match g.phase {
@@ -2413,7 +2427,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // over the runway (LEMG 12, 1791807406). Handed back, it is set
                 // afresh to the path's rate.
                 let nudged = (g.phase == ApproachPhase::Final
-                    && !g.arresting
+                    && !hand_flown
                     && !ap_modes.is_some_and(|m| m.gs()))
                 .then(|| {
                     let path_fpm = -(gs_kts / 60.0) * gp_ft_per_nm();
@@ -2427,12 +2441,12 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     (None, Some(v)) => vs_dial_fpm(g.target_vs_fpm, v, vvi_trend, g.arresting, arrest_lead),
                     (None, None) => g.target_vs_fpm,
                 };
-                // The servos' pitch AUTHORITY (#181): the arrest takes the
-                // servos out, so the check ends there; before it, a dial the
-                // autopilot's elevator does not fly is hand flown level by
-                // the recovery and the approach abandoned.
-                if g.arresting || !engage.confirmed() || es.hold {
-                    if g.arresting {
+                // The servos' pitch AUTHORITY (#181): the hand-flown segment
+                // takes the servos out, so the check ends there; before it, a
+                // dial the autopilot's elevator does not fly is hand flown
+                // level by the recovery and the approach abandoned.
+                if hand_flown || !engage.confirmed() || es.hold {
+                    if hand_flown {
                         crate::climb_watch::disarm_authority();
                         authority_owed = false;
                     }
@@ -2466,16 +2480,16 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     );
                     break;
                 }
-                // THE ARREST FLIES THE ELEVATOR, not the autopilot's VS dial.
-                // Only while actually arresting, and only with its
-                // measurements in hand: anywhere else the dial is right and
-                // proven. The channel is a 1 s expiring heartbeat, so simply
-                // ceasing to write it hands the pitch back by itself.
+                // THE HAND-FLOWN SEGMENT FLIES THE ELEVATOR, from minimums: the
+                // glidepath held by attitude, then the flare from it (`pilot::
+                // attitude`), only with its measurements in hand. Above
+                // minimums the autopilot flies it. The channel is a 1 s
+                // expiring heartbeat: ceasing to write it hands the pitch back.
                 // A landing the autopilot flies (`ap_lands`) is its flare:
                 // our column never arrests it (the plugin releases our yoke
                 // channels while CMD is lit anyway).
-                let mut att_out: Option<super::attitude_flare::Out> = None;
-                let flare_elev = match (g.arresting && !ap_flies, vvi, pitch_yielded) {
+                let mut att_out: Option<crate::pilot::attitude::Out> = None;
+                let flare_elev = match (hand_flown, vvi, pitch_yielded) {
                     // The arrest by attitude: the path from the attitude, no
                     // VSI. No attitude read is no decision (the channel
                     // expires by itself).
@@ -2483,7 +2497,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         match (plant_at(0), plant_at(1), plant_at(2), plant_at(5)) {
                             (Some(theta_deg), Some(alpha_deg), Some(q_dps), Some(tas_ms)) => {
                                 let o = attitude_flare.step(
-                                    super::attitude_flare::In {
+                                    crate::pilot::attitude::In {
                                         radio_ft,
                                         theta_deg,
                                         alpha_deg,
@@ -2491,6 +2505,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                         tas_kts: tas_ms * 1.943_844,
                                         dt: tick_dt,
                                         ground_pull: attitude_law.ground_pull,
+                                        path: (g.phase == ApproachPhase::Final).then(|| crate::pilot::attitude::Path {
+                                            vs_fpm: -(gs_kts / 60.0) * gp_ft_per_nm(),
+                                            above_ft: alt - g.glidepath_alt_ft,
+                                        }),
                                     },
                                     attitude_law.max,
                                     attitude_law.max_push,
@@ -2522,77 +2540,40 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // VS dial's own slow shape exactly as it had before the
                 // elevator law existed (every 737 landing since it shipped
                 // shows the same). The channel is proven with the servos
-                // OFF - the takeoff rotates on it - so the roundout gate is
-                // where the autopilot comes off: pitch on the elevator
-                // channel, the runway track on the roll channel (the
-                // takeoff's wings-level law, banking toward the crabbed
-                // heading), the power on the governor. Only a go-around
-                // hands the servos back and re-engages the modes (a balloon
-                // over the band stays the arrest, `hold_roundout`); the
-                // rollout latch finds them already off.
-                // THE FINAL'S LATERAL, one law from the start of the final
-                // to the arrest (`FinalLateral`, 2026-10-12): the offset
-                // closed over the heading mode's response time, led on the
-                // drift over the ground, an integral for what the autopilot
-                // holds off its bug, and the crab. It replaced the pursuit,
-                // the short final's switch at 0.3 nm (a 2 to 6 degree jump
-                // and a 6 s closure against a 5 to 6 s response: the SR22,
-                // 1791810954, and the 172, 1791808122, went round
-                // `off_centreline_low`) and the declared track law. The
-                // arrest's own lateral, the flare and the rollout follow.
+                // OFF - the takeoff rotates on it - so minimums are where the
+                // autopilot comes off: pitch on the elevator channel, the
+                // centreline on the roll channel, the power on the energy
+                // throttle. Only a go-around hands the servos back and
+                // re-engages the modes (a balloon over the band stays the
+                // arrest, `hold_roundout`); the rollout latch finds them off.
+                // ABOVE MINIMUMS the final's heading is SET as a pilot sets it
+                // (`FinalHeading`, whole degrees, `AUTOLAND_FINAL_DEADBAND`):
+                // the knob had moved a quarter degree every second
+                // (`FinalLateral`) and rocked the Evolution +-14 degrees of
+                // bank (1791826866).
                 let track_now = hpath_r.as_ref().ok().copied();
-                let in_final = g.phase == ApproachPhase::Final && !g.arresting;
-                if in_final && final_at.is_none() {
-                    final_at = Some(std::time::Instant::now());
-                    first_final_at.get_or_insert_with(std::time::Instant::now);
-                    tr_recorded = false;
-                }
-                let final_s = final_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
-                if final_at.is_some() && !tr_recorded && (!in_final || final_s >= TR_FINAL_WINDOW_S) {
-                    tr_recorded = true;
-                    crate::blackbox::record(
-                        "autoland",
-                        serde_json::json!({"event": "lateral_tr", "t_r": response.t_r(),
-                            "measured": response.measured(), "samples": response.samples(),
-                            "final_s": final_s, "radio": radio_ft}),
-                    );
-                }
                 let crabbed_true = match g.phase {
-                    ApproachPhase::Final if in_final && ap_has_loc => {
+                    ApproachPhase::Final if !hand_flown && ap_has_loc => {
                         (rwy.course_deg + crab).rem_euclid(360.0)
                     }
-                    ApproachPhase::Final if in_final => {
-                        match side_velocity_m_s(track_now, rwy.course_deg, gs_kts) {
-                            Some(side) => final_lateral.bug_true(
-                                xtk_now * M_PER_NM,
-                                side,
-                                gs_kts,
-                                rwy.course_deg,
-                                crab,
-                                response.t_r(),
-                                tick_dt,
-                            ),
-                            None => final_lateral.held(rwy.course_deg, crab),
-                        }
+                    ApproachPhase::Final if !hand_flown => {
+                        final_heading.heading_true(xtk_now * M_PER_NM, gs_kts, rwy.course_deg, crab)
                     }
                     ApproachPhase::Final | ApproachPhase::Flare => {
                         (g.target_heading_deg + crab).rem_euclid(360.0)
                     }
-                    ApproachPhase::Intercept => {
-                        final_lateral.reset();
-                        final_at = None;
-                        g.target_heading_deg
-                    }
+                    ApproachPhase::Intercept => g.target_heading_deg,
                 };
-                match arrest_hands_step(arrest_hands, g.arresting && !ap_flies) {
+                match arrest_hands_step(arrest_hands, hand_flown) {
                     ArrestHands::Take => {
                         let ok = autoflight::press(&xp, Button::Disconnect).await.is_ok();
                         arrest_hands = true;
-                        wings = arrest_wings();
+                        bank_hold = crate::pilot::bank::BankHold::default();
                         crate::blackbox::record(
                             "autoland",
                             serde_json::json!({
                                 "event": "arrest_hands", "taken": true, "ok": ok, "radio": radio_ft,
+                                "minimums": minimums, "arresting": g.arresting,
                             }),
                         );
                     }
@@ -2614,6 +2595,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         .await;
                         let _ = autoflight::set_dial(&xp, Dial::Vs, vs_dial).await;
                         arrest_hands = false;
+                        roundout_taken = false;
                         crate::blackbox::record(
                             "autoland",
                             serde_json::json!({"event": "arrest_hands", "taken": false, "ok": ok, "radio": radio_ft}),
@@ -2621,30 +2603,25 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     }
                     ArrestHands::Off | ArrestHands::Keep => {}
                 }
-                // The wings while the arrest has the servos: a bank that
-                // closes the centreline by the TRACK over the runway (see
-                // `arrest_bank_target`), the sim's ground track against the
-                // course, the smoothed cross-track rate when no track was
-                // read. No bank read is no command (the channel expires).
-                // The approach's pursuit aimed far down the runway (9 m right
-                // at 55 ft, 16 m left at the wheels), and the rollout's
-                // heading law after it closed in nine seconds what the flare
-                // has eight for (LEMG 13, 2026-09-26).
+                roundout_taken |= arrest_hands && g.arresting;
+                // The wings while the segment has the servos: the bank that
+                // closes the painted centreline by the TRACK (`pilot::line`;
+                // the coupled 172 held its localiser 8 to 23 m off it at
+                // minimums), the sim's ground track against the course, the
+                // smoothed cross-track rate when no track was read, flown on
+                // the ailerons (`pilot::bank`). No bank read is no command.
                 let xtk_m_now = xtk_now * M_PER_NM;
                 let arrest_rate_now = arrest_rate.update(
                     arrest_prev_xtk.map_or(0.0, |p: f64| (xtk_m_now - p) / tick_dt.max(0.05)),
                     tick_dt.max(0.05),
                 );
                 arrest_prev_xtk = Some(xtk_m_now);
-                let side_now = side_velocity_m_s(track_now, rwy.course_deg, gs_kts)
+                let side_now = crate::pilot::line::side_velocity_m_s(track_now, rwy.course_deg, gs_kts)
                     .unwrap_or(arrest_rate_now);
                 let phi_now = phi_r.as_ref().ok().copied().unwrap_or(0.0);
-                // The bank the ailerons already written will make: on a
-                // roll-rate plant the reading is a dead time late.
-                let bank_tgt =
-                    arrest_bank_target(xtk_m_now, side_now, wings.predicted(phi_now), radio_ft);
+                let bank_tgt = crate::pilot::line::bank_for_line(xtk_m_now, side_now, phi_now, radio_ft);
                 let flare_ail = match (arrest_hands, phi_r.as_ref().ok().copied(), roll_yielded) {
-                    (true, Some(phi), false) => Some(wings.step(phi, bank_tgt, tick_dt)),
+                    (true, Some(phi), false) => Some(bank_hold.step(phi, bank_tgt, tick_dt)),
                     _ => None,
                 };
                 TRACKING_ERROR.set_in(flight, xtk_now * M_PER_NM);
@@ -2663,6 +2640,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     "theta": plant_at(0), "alpha": plant_at(1), "q": plant_at(2),
                     "vy_true": plant_at(3).map(|v| v * 196.850_394), "elev_total": plant_at(4),
                     "tas": plant_at(5).map(|v| v * 1.943_844),
+                    "ail_total": plant_at(6), "rud_total": plant_at(7), "beta": plant_at(8),
                     "att_gate": att_out.map(|o| o.gate_ft), "att_vs_t": att_out.map(|o| o.vs_target_fpm),
                     "att_gamma": att_out.map(|o| o.gamma_deg), "att_gamma_cmd": att_out.map(|o| o.gamma_cmd_deg),
                     "att_theta_cmd": att_out.map(|o| o.theta_cmd_deg),
@@ -2671,7 +2649,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     // saw (a bounce) is on the tape: the scorecard judges it.
                     "ground": on_ground > 0.5,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
-                    "lat_i_m": final_lateral.i_m(), "t_r": response.t_r(), "xtk_m": xtk_now * M_PER_NM,
+                    "xtk_m": xtk_now * M_PER_NM, "minimums": minimums, "hdg_bias": final_heading.bias_deg(),
+                    // The roll response the segment has measured (`pilot::bank`).
+                    "kp": arrest_hands.then(|| bank_hold.kp()),
                     // "plugin": one frame's position; "split": an older
                     // plugin's separate reads (#157).
                     "pos": pos_source,
@@ -2767,7 +2747,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                             crate::ils::CouplingIn {
                                 allowed: coupled_ok,
                                 inbound: !ga && hold.is_none() && inbound_leg && (on_final || toward_loc),
-                                arresting: g.arresting,
+                                arresting: g.arresting || hand_flown,
                                 leaving: ga || hold.is_some() || !inbound_leg,
                                 dist_nm: g.dist_nm,
                                 needles: n,
@@ -2875,9 +2855,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                     cpl.own_lateral = true;
                                     cpl.own_vertical = true;
                                 }
-                                // Our final begins fresh: the integral learnt
-                                // nothing of ours while the localiser flew.
-                                final_lateral.reset();
                             }
                             crate::ap_lands::Fallback::GoAround(_) => {
                                 runtime.go_around.order(on_ground > 0.5);
@@ -2976,9 +2953,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 }
                 let cpl = cpl;
                 // The knob: once per phase or pattern leg and corrected past a
-                // deadband (`bug_knob`), the final's down to the arrest; the
-                // arrest and the flare steer it every tick.
-                let knob = bug_knob(g.phase, g.arresting, pattern.map(|(_, l, _)| l), missed);
+                // deadband (`bug_knob`), the final's in whole degrees down to
+                // minimums; hand flown below them, the bug is left alone.
+                let knob = bug_knob(g.phase, g.arresting || hand_flown, pattern.map(|(_, l, _)| l), missed);
                 let knob_set = match (cpl.own_lateral, knob) {
                     (false, _) => {
                         bug_hold.reset();
@@ -3008,32 +2985,29 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                     360.0,
                                 )
                             }
+                            // The final's heading in whole degrees, as set.
+                            _ if g.phase == ApproachPhase::Final => mag_hdg.round(),
                             _ => mag_hdg,
                         };
                         bug_hold.decide(key, want, knob_t0.elapsed().as_secs_f64(), db)
                     }
                     (true, None) => {
                         bug_hold.reset();
-                        Some(mag_hdg)
+                        None
                     }
                 };
-                // How the heading mode answers the knob as it stands, for the
-                // final's response time (`ResponseTime`): on our own lateral,
-                // on the intercept and the first final's first 90 s, above
-                // 300 ft, the servos the autopilot's.
-                let knob_true = match knob {
-                    Some(_) => bug_hold.set(),
-                    None => Some(mag_hdg),
+                // What the autopilot holds off the final's setting, once it
+                // has settled on it (`FinalHeading`).
+                if cpl.own_lateral && matches!(knob, Some((2, _))) {
+                    final_heading.learn(
+                        psi_r.as_ref().ok().copied(),
+                        bug_hold.set().map(|m| mag_to_true(m, var)),
+                        bug_hold
+                            .since_write_s(knob_t0.elapsed().as_secs_f64())
+                            .is_some_and(|s| s >= FINAL_SETTLE_S),
+                        tick_dt,
+                    );
                 }
-                .filter(|_| cpl.own_lateral)
-                .map(|m| mag_to_true(m, var));
-                let evidence = cpl.own_lateral
-                    && !arrest_hands
-                    && on_ground < 0.5
-                    && radio_ft > TR_MIN_RADIO_FT
-                    && (g.phase == ApproachPhase::Intercept || in_final)
-                    && first_final_at.is_none_or(|t| t.elapsed().as_secs_f64() < TR_FINAL_WINDOW_S);
-                response.feed(knob_true, psi_r.as_ref().ok().copied(), track_now, tick_dt, evidence);
                 // The mode lights and the yields come from the tick's one
                 // read; the VS dial, the column, the ailerons and a fine bug
                 // correction are QUEUED and go out with the lever in the
@@ -3055,7 +3029,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     crate::ils::Coupling::Armed | crate::ils::Coupling::LocCaptured
                 ) && !ap_modes.is_some_and(|m| m.gs())
                     && needles.is_some_and(|n| n.gs_valid && n.vdef.is_some_and(|v| v <= 0.0));
-                if cpl.own_vertical && !level_for_gs {
+                if cpl.own_vertical && !level_for_gs && !arrest_hands {
                     autoflight::stage_dial(&mut writes, Dial::Vs, vs_dial);
                 }
                 let yield_r = match flare_elev {
@@ -3075,25 +3049,8 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     None => Ok(0.0),
                 };
                 // A keyed setting (once per phase or leg) is driven and READ
-                // BACK as before, beside the write round; the every-tick
-                // steering of the arrest and the flare is one queued
-                // write from the bug the tick read (`bug_step_from`), pressed
-                // only past three degrees.
-                let bug_drive = match (knob, knob_set) {
-                    (Some(_), Some(h)) => Some(h),
-                    (None, Some(h)) => {
-                        use crate::tools::autopilot::{bug_step_from, BugStep};
-                        match bug_step_from(st.opt(F::Bug), h) {
-                            BugStep::Leave => None,
-                            BugStep::Set(v) => {
-                                autoflight::stage_dial(&mut writes, Dial::HeadingBug, v);
-                                None
-                            }
-                            BugStep::Drive => Some(h),
-                        }
-                    }
-                    (_, None) => None,
-                };
+                // BACK beside the write round.
+                let bug_drive = knob.and(knob_set);
                 // The pilot pulled or pushed: the plugin has already dropped
                 // the override this frame. Stop commanding and let the dial
                 // fly what is left — the VS path is still running underneath.
@@ -3290,7 +3247,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     // vertical speed read: the lever stays.
                     let adj = match (thr_now, plant_at(3)) {
                             (Some(t), Some(vy_ms)) => {
-                                energy_throttle.step(super::energy_throttle::In {
+                                energy_throttle.step(crate::pilot::energy::In {
                                     ias_kts: ias,
                                     accel_kts_s: trend_kts_s,
                                     vs_fpm: vy_ms * 196.850_394,
@@ -3302,7 +3259,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                     // RV-10 held 98 kt against 80, 1791803684); the
                                     // dial read -150 under a captured -400 path (the
                                     // 172 ran to 80 kt against 65, 1791806643).
-                                    path_vs_fpm: if level_for_gs {
+                                    // Hand flown, the path the attitude law asks.
+                                    path_vs_fpm: if let Some(o) = att_out {
+                                        o.vs_target_fpm
+                                    } else if level_for_gs {
                                         0.0
                                     } else if ap_modes.is_some_and(|m| m.gs()) {
                                         -(gs_kts / 60.0) * gp_ft_per_nm()
@@ -3535,7 +3495,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // ...nor before the engage is confirmed: `ApEngage` owns the
                 // press until then, and the aircraft is held level meanwhile.
                 let not_held = g.phase != ApproachPhase::Flare
-                    && !g.arresting
+                    && !hand_flown
                     && engage.confirmed()
                     // A captured glideslope is the airframe's vertical, not our dial.
                     && cpl.own_vertical
@@ -3636,7 +3596,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 if last_phase != Some(g.phase) {
                     let prev = last_phase;
                     last_phase = Some(g.phase);
-                    last_arresting = g.arresting;
                     // The landing light for the landing, at the final: the
                     // exterior-lights rule lights it lined up and puts it out
                     // at the vacate, and nothing lit it for the ARRIVAL. The
@@ -3693,7 +3652,8 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
 
                 // (Touchdown + rollout-to-stop is handled at the top of the loop,
                 // latched by `rolling_out`, before the approach guidance.)
-                pacer.wait(std::time::Duration::from_millis(tick_ms(last_phase, last_arresting))).await;
+                // The flare's tick from minimums: the segment is hand flown.
+                pacer.wait(std::time::Duration::from_millis(tick_ms(last_phase, g.arresting || arrest_hands))).await;
             }
             // A newer loop (the clearance re-arm above, or any later arm) has
             // already set ACTIVE for itself; clearing it here would report

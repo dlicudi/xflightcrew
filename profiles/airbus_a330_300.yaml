@@ -353,13 +353,6 @@ arrest_lead:
 flare_elevator:
   max: 0.4
   max_push: 0.3
-# The arrest's wings on the sidestick's roll rate (#180): 11 to 13 deg/s per
-# unit after 0.25 to 0.37 s (the same four arrests, 0.04 to 0.8 degree rms).
-# The stiff law rang +/-2 to 4 degrees at 1.5 to 2 s through that delay.
-arrest_roll:
-  deg_s_per_unit: 13.0
-  dead_s: 0.45
-  close_s: 0.6
 # The circuit's final leads its offset by this many seconds of the ground
 # track (#189): the heading mode rolls at about 3 deg/s through a 2 s lag and
 # flies the bug two ticks late (fitted to the LEMG 30 circuits of 2026-09-29,

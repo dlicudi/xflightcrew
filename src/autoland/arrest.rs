@@ -3,10 +3,30 @@
 
 use super::*;
 
-/// Who has the servos this tick. The arrest flies the channels with the
-/// autopilot's servos OFF (the pitch servo writes the yoke back over the
-/// channel otherwise; LFPG 09R, 2026-09-22), takes them at the roundout
-/// gate and hands them back only the tick the arrest ends in a go-around
+/// A Cat I ILS's decision height, ft: a coupled final is the autopilot's
+/// down to it unless the profile declares its own (`ils_decouple_agl_ft`).
+pub const DECISION_HEIGHT_FT: f64 = 200.0;
+/// A final on our own heading and path (visual, non-precision), ft: an
+/// LNAV MDA is 300 to 500 ft over the field, and from 300 ft a 140 kt jet
+/// still has 24 s to the wheels, three times what the bank needs to close
+/// the 18 m a whole-degree heading leaves (`final_heading_tests`).
+pub const VISUAL_MINIMUMS_FT: f64 = 300.0;
+
+/// Minimums for this final: from them it is hand flown to the wheels.
+/// Pure.
+pub fn minimums_ft(coupled: bool, decouple_agl_ft: Option<f64>) -> f64 {
+    if coupled {
+        decouple_agl_ft.filter(|h| h.is_finite() && *h > 0.0).unwrap_or(DECISION_HEIGHT_FT)
+    } else {
+        VISUAL_MINIMUMS_FT
+    }
+}
+
+/// Who has the servos this tick. The hand-flown segment flies the channels
+/// with the autopilot's servos OFF (the pitch servo writes the yoke back over
+/// the channel otherwise; LFPG 09R, 2026-09-22), takes them at minimums
+/// (2026-10-12; it was the roundout gate) and hands them back only the tick
+/// the segment ends in a go-around
 /// (a balk, the missed approach, a pattern): a balloon back over the band
 /// is still the arrest ([`hold_roundout`]; LEMG 12, 2026-09-28, handed back
 /// at 50.5 ft and dived to -814 fpm). The rollout latch never reaches this decision:
@@ -30,97 +50,6 @@ pub fn arrest_hands_step(taken: bool, arresting: bool) -> ArrestHands {
         (true, true) => ArrestHands::Keep,
         (true, false) => ArrestHands::Return,
     }
-}
-
-/// The closure the arrest asks for: the offset over this many seconds.
-pub(super) const ARREST_CLOSE_S: f64 = 4.0;
-/// ...and never faster than this sideways, m/s.
-pub(super) const ARREST_CLOSE_MAX_M_S: f64 = 2.5;
-/// How quickly a sideways-velocity error is taken out by the bank, seconds.
-pub(super) const ARREST_VEL_TAU_S: f64 = 1.5;
-/// The steepest bank over the runway, degrees, tapering toward the wheels.
-pub(super) const ARREST_BANK_MAX_DEG: f64 = 5.0;
-pub(super) const ARREST_BANK_WHEELS_DEG: f64 = 2.0;
-pub(super) const G_M_S2: f64 = 9.81;
-/// The sideways deceleration the closure is sized to be stopped by, m/s^2:
-/// well inside the 0.5 a 3-degree bank gives, since the bank takes seconds
-/// to get there.
-pub(super) const ARREST_STOP_M_S2: f64 = 0.2;
-/// How far ahead the current bank's push on the drift is counted, seconds:
-/// the 737's roll lag at the arrest's aileron (LEMG 13, 2026-09-26).
-pub(super) const ARREST_BANK_LEAD_S: f64 = 1.0;
-/// Bank error for full aileron in the arrest (see `WingsLevel::stiff`).
-pub(crate) const ARREST_FULL_AIL_BANK_DEG: f64 = 6.0;
-
-/// The roll loop the arrest flies its bank target through: the airframe's
-/// declared roll-rate plant (`arrest_roll:`, the A330), else the stiff law.
-pub(crate) fn arrest_wings() -> crate::autotakeoff::WingsLevel {
-    match crate::aircraft::arrest_roll() {
-        Some(p) => crate::autotakeoff::WingsLevel::rate_plant(p),
-        None => crate::autotakeoff::WingsLevel::stiff(ARREST_FULL_AIL_BANK_DEG),
-    }
-}
-
-/// The bank the arrest flies with the servos out, from the centreline offset
-/// (`xtk_m`, right positive) and the SIDEWAYS VELOCITY over the runway
-/// (`side_m_s`, right positive: the ground track's angle off the course
-/// times the groundspeed). A velocity loop inside a position loop: the offset
-/// asks for a closure rate, the bank takes out the difference.
-///
-/// It flew a HEADING (the rollout's centreline law plus the crab), and over
-/// the runway a heading is the wrong thing to fly. The rollout law is sized
-/// for a closure time of about nine seconds at 140 kt, longer than the whole
-/// arrest; and the 737's nose did not follow its bank: LEMG 13 (2026-09-26,
-/// 17:43Z) went into the gate 3.9 m right and crossing left at 2.3 m/s, the
-/// bank built to 4.6 degrees right while the heading fell from 130.5 to
-/// 129.1, the track came right only 1 degree, and it touched down 15.3 m
-/// left and rolled out 16.8 m left. The same crossing flew four landings in
-/// a row (100 ft to the wheels: +5.6 to -11.9, +5.9 to -14.7, +13.0 to
-/// -5.6, +7.2 to -10.4). The track is what moves the aircraft over the
-/// paint, so the track is what this closes.
-///
-/// The closure goes to ZERO at the centreline and the bank's lag is led.
-/// LEMG 13 (2026-09-26, 20:17Z) went into the gate 11.9 m right: the old
-/// capped rate (the offset over 4 s, at most 2.5 m/s) built the drift to
-/// 2.65 m/s, the bank target reversed at 42 ft but the 737 rolls at about
-/// 2 deg/s on the aileron `WingsLevel` gives it, so the bank only crossed
-/// wings level 2 s later with the aircraft still 2.4 m right at 2.65 m/s;
-/// the shrinking cap then allowed 3 degrees to stop that, and it touched
-/// down 6.5 m left. So the wanted rate is also what a gentle deceleration
-/// ([`ARREST_STOP_M_S2`]) can take off in the offset left, and the drift
-/// the bank is judged against is the one the CURRENT bank will have made
-/// [`ARREST_BANK_LEAD_S`] from now.
-pub fn arrest_bank_target(xtk_m: f64, side_m_s: f64, phi_deg: f64, radio_ft: f64) -> f64 {
-    if !xtk_m.is_finite() || !side_m_s.is_finite() {
-        return 0.0;
-    }
-    let phi = if phi_deg.is_finite() { phi_deg.clamp(-30.0, 30.0) } else { 0.0 };
-    let off = xtk_m.abs();
-    let rate = (off / ARREST_CLOSE_S)
-        .min((2.0 * ARREST_STOP_M_S2 * off).sqrt())
-        .min(ARREST_CLOSE_MAX_M_S);
-    let want = -xtk_m.signum() * rate;
-    let side_ahead = side_m_s + G_M_S2 * phi.to_radians().tan() * ARREST_BANK_LEAD_S;
-    let bank = ((want - side_ahead) / (G_M_S2 * ARREST_VEL_TAU_S)).atan().to_degrees();
-    let cap = if radio_ft.is_finite() {
-        (ARREST_BANK_WHEELS_DEG + radio_ft.max(0.0) / 10.0).min(ARREST_BANK_MAX_DEG)
-    } else {
-        ARREST_BANK_WHEELS_DEG
-    };
-    bank.clamp(-cap, cap)
-}
-
-/// The sideways velocity over the runway, m/s right positive, from the sim's
-/// ground track (`hpath`, true) against the runway course (true). `None`
-/// without a track read: no measurement, and the caller falls back to the
-/// smoothed cross-track rate.
-pub fn side_velocity_m_s(track_true: Option<f64>, course_true: f64, gs_kts: f64) -> Option<f64> {
-    let trk = track_true.filter(|t| t.is_finite())?;
-    if !gs_kts.is_finite() {
-        return None;
-    }
-    let off = crate::angles::signed_diff_deg(trk, course_true).to_radians();
-    Some(gs_kts * 0.514_444 * off.sin())
 }
 
 /// Outside a landing arrest (`arresting` false) the dial is the target, as it

@@ -155,12 +155,9 @@
     /// The handoff as it flew (43 m off, coming back at 3.6 degrees), given
     /// to autoland's final: with the old track trim, which learnt the
     /// roll-out, it parked 16 m left and went around `off_centreline_low` at
-    /// 99 ft (recorded: 99 ft, 15.2 m). On the final's one law
-    /// (`FinalLateral`) it never balks and keeps inside the landing limit;
-    /// the gate at 5.5 to 6.3 m right: closing 45 m from 2.3 nm winds the
-    /// integral to its 8 m, the line is crossed by 5 m, and over the last
-    /// mile the integral unwinds slower than the knob's quarter degree
-    /// asks to be moved (the old trim's law reached it within 5).
+    /// 99 ft (recorded: 99 ft, 15.2 m). As the final is now flown (whole
+    /// degrees above minimums, hand flown below, 2026-10-12) it never balks,
+    /// keeps inside the landing limit and reaches the gate on the line.
     #[test]
     fn the_recorded_handoff_reaches_the_gate_on_the_line() {
         let rwy = lemg("30");
@@ -170,7 +167,7 @@
             let mut lp = FinalLoop::new(Some(LEMG_WIDTH_M)).held();
             let f = fly_final(&mut jet, &mut lp, &rwy, 0.45);
             assert!(f.balk.is_none(), "dt {dt}: {f:?}");
-            assert!(f.gate_xtk_m.abs() < 7.0 && f.worst_low_xtk_m < limit, "dt {dt}: {f:?}");
+            assert!(f.gate_xtk_m.abs() < 2.0 && f.worst_low_xtk_m < limit, "dt {dt}: {f:?}");
         }
     }
 

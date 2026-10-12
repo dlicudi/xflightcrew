@@ -91,9 +91,6 @@ pub struct AircraftProfile {
     /// The rotation's elevator on the wheels, when fitted.
     #[serde(default)]
     pub rotate_elevator: Option<RotateElevatorProfile>,
-    /// The bank's answer to the roll channel in the arrest, when fitted.
-    #[serde(default)]
-    pub arrest_roll: Option<ArrestRollProfile>,
     /// The yaw plant of a free castoring nose (`ground_steer`), when fitted.
     #[serde(default)]
     pub ground_plant: Option<GroundPlantProfile>,

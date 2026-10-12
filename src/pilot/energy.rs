@@ -122,5 +122,5 @@ impl EnergyThrottle {
 }
 
 #[cfg(test)]
-#[path = "energy_throttle_tests.rs"]
+#[path = "energy_tests.rs"]
 mod tests;

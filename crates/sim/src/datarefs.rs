@@ -127,6 +127,11 @@ pub const TCAS_VS_FPM: &str = "sim/cockpit2/tcas/targets/position/vertical_speed
 pub const SERVO_PITCH_RATIO: &str = "sim/joystick/servo_pitch_ratio";
 /// The column the flight model gets: yoke, servo and stability summed.
 pub const TOTAL_PITCH_RATIO: &str = "sim/cockpit2/controls/total_pitch_ratio";
+/// ...and in roll and yaw: the ailerons and the rudder the flight model gets.
+pub const TOTAL_ROLL_RATIO: &str = "sim/cockpit2/controls/total_roll_ratio";
+pub const TOTAL_HEADING_RATIO: &str = "sim/cockpit2/controls/total_heading_ratio";
+/// The sideslip, degrees (the nose relative to the flown path).
+pub const SIDESLIP_DEG: &str = "sim/flightmodel/position/beta";
 /// The elevator SURFACE per wing, degrees, trailing edge down positive
 /// (reduced by [`elevator_surface_deg`]).
 pub const ELEVATOR1_DEG: &str = "sim/flightmodel2/wing/elevator1_deg";

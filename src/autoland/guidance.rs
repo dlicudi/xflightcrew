@@ -7,19 +7,80 @@ use super::*;
 /// correction at most every five seconds.
 pub const AUTOLAND_INTERCEPT_DEADBAND: crate::heading_bug::BugDeadband =
     crate::heading_bug::BugDeadband { deg: 2.0, every_s: 5.0 };
-/// The final, down to the arrest: a quarter degree at most every second.
-/// It was half a degree every two seconds (a degree every three left the
-/// fitted 737 9.8 m off at the roundout gate from a 30 m LEMG 13 handover),
-/// and with the pursuit's 0.6 nm lead that weaved 7 to 12 m; on the plants
-/// fitted to the 60 recorded finals of 2026-10-12 the final's one law
-/// (`FinalLateral`) holds its 5 m on this knob (`final_lateral_tests`).
+/// The final above minimums, as a pilot sets the heading: a whole degree,
+/// re-set no oftener than every ten seconds (a correction of five degrees or
+/// more is a turn, set at once). The knob had moved a quarter degree every
+/// second (`FinalLateral`, 2026-10-12), about 24 times a minute, and rocked
+/// the Evolution's heading mode +-14 degrees of bank on a 10 s period
+/// (1791826866); its fitted plant, with the adverse yaw the heading carries,
+/// rings the same way (`final_heading_tests`).
 pub const AUTOLAND_FINAL_DEADBAND: crate::heading_bug::BugDeadband =
-    crate::heading_bug::BugDeadband { deg: 0.25, every_s: 1.0 };
+    crate::heading_bug::BugDeadband { deg: 1.0, every_s: 10.0 };
+
+/// The final's offset is closed over this long above minimums, s: the
+/// setting is held for ten seconds, so the loop it closes must be slower
+/// than that; on the fitted heading modes 20 s brings a final from 80 m off
+/// to inside 18 m by minimums, calm or 15 kt across (`final_heading_tests`).
+pub const FINAL_CLOSE_S: f64 = 20.0;
+
+/// The autopilot's standing error is read this long after a setting, s
+/// (the slowest fitted heading mode settles in about 7.5).
+pub const FINAL_SETTLE_S: f64 = 8.0;
+/// ...and learnt over this long, s.
+const FINAL_BIAS_TAU_S: f64 = 20.0;
+/// ...never more than this, degrees.
+const FINAL_BIAS_MAX_DEG: f64 = 5.0;
+
+/// The heading a pilot sets on the final above minimums: the course, the
+/// wind's crab, a cut that closes the offset over [`FINAL_CLOSE_S`] at the
+/// groundspeed (within 30 degrees), less what the autopilot holds off its
+/// setting ("set 130, it holds 128: set 132"). The 172's autopilot settled
+/// 1.1 to 1.9 degrees left of its bug on LEMG 13 (2026-09-12) and parked 33
+/// to 37 m off; on the fitted heading modes with 2 degrees of it the final
+/// reaches minimums inside 18 m learnt (`final_heading_tests`), up to 50 m
+/// unlearnt. Pure.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FinalHeading {
+    bias_deg: f64,
+}
+
+impl FinalHeading {
+    /// One tick on the final: the heading held (true) against the setting
+    /// it was given (true), once that setting has had [`FINAL_SETTLE_S`].
+    pub fn learn(&mut self, psi_true: Option<f64>, set_true: Option<f64>, settled: bool, dt: f64) {
+        if let (Some(psi), Some(set), true) = (psi_true, set_true, settled) {
+            let held_off = crate::angles::signed_diff_deg(psi, set);
+            if held_off.is_finite() && dt.is_finite() && dt > 0.0 {
+                self.bias_deg = (self.bias_deg + (held_off - self.bias_deg) * (dt / FINAL_BIAS_TAU_S).min(1.0))
+                    .clamp(-FINAL_BIAS_MAX_DEG, FINAL_BIAS_MAX_DEG);
+            }
+        }
+    }
+
+    /// The heading to set (true): `xtk_m` right positive, the crab heading
+    /// less track. The knob takes it in whole degrees
+    /// ([`AUTOLAND_FINAL_DEADBAND`]).
+    pub fn heading_true(&self, xtk_m: f64, gs_kts: f64, course_deg: f64, crab_deg: f64) -> f64 {
+        let v = (gs_kts * 0.514_444).max(30.0);
+        let cut = if xtk_m.is_finite() {
+            -(xtk_m / (v * FINAL_CLOSE_S)).atan().to_degrees().clamp(-30.0, 30.0)
+        } else {
+            0.0
+        };
+        (course_deg + cut + crab_deg - self.bias_deg).rem_euclid(360.0)
+    }
+
+    /// The autopilot's standing error learnt so far, degrees.
+    pub fn bias_deg(&self) -> f64 {
+        self.bias_deg
+    }
+}
 
 /// How autoland's heading knob is set this tick (issue #93): the key and
-/// deadband for [`crate::heading_bug::BugHold`], or `None` to steer it every
-/// tick (the arrest and the flare). A pattern's legs and each missed
-/// approach stage are their own keys, so a new leg is set at once. Pure.
+/// deadband for [`crate::heading_bug::BugHold`], or `None` to leave it
+/// alone (the flare and the hand-flown segment: the autopilot is off). A
+/// pattern's legs and each missed approach stage are their own keys, so a
+/// new leg is set at once. Pure.
 pub fn bug_knob(
     phase: ApproachPhase,
     arresting: bool,
@@ -259,12 +320,12 @@ pub fn wheels_need_m(landing_m: Option<f64>, roll_m: Option<f64>) -> f64 {
 pub(super) const FLARE_BLEED_KTS_S: f64 = 2.0;
 
 /// Seconds from `radio_ft` to the wheels on the flare the law FLIES
-/// ([`super::attitude_flare`]): the path's sink (at this groundspeed) down
+/// ([`crate::pilot::attitude`]): the path's sink (at this groundspeed) down
 /// to its flare height, then its round-out and hold-off
 /// (`attitude_flare::vs_target_fpm`), summed over the height. `None` for a
 /// measurement that is not one. Pure.
 pub fn flare_time_s(radio_ft: f64, gs_kts: f64) -> Option<f64> {
-    use super::attitude_flare as af;
+    use crate::pilot::attitude as af;
     if !radio_ft.is_finite() || !gs_kts.is_finite() || gs_kts <= 0.0 {
         return None;
     }
@@ -651,7 +712,8 @@ pub fn guidance_on(
         )
     } else {
         // On final the heading is the runway course: the loop adds the
-        // final's cut to it (`FinalLateral`, 2026-10-12), where this branch
+        // final's cut to it above minimums (`final_heading_true`) and the
+        // hand-flown segment its bank below (`pilot::line`), where this branch
         // flew a fixed-lead pursuit (`pursuit_aim_nm`, its history in
         // docs/dev-history.md) and 80 degrees per nm inside 0.3 nm.
         if radio_alt_ft < 100.0 && dist_nm < 0.6 && xtk.abs() > landing_xtk_nm {
@@ -694,12 +756,12 @@ pub fn guidance_on(
             && (STABILISED_MIN_ALONG_NM..FAP_NM).contains(&along_nm)
             && !(stabilised_xtk(xtk, along_nm)
                 && (width_m.is_none()
-                    || lands_on_the_pavement(xtk, along_nm, gs_kts, landing_xtk_nm * M_PER_NM)))
+                    || lands_on_the_pavement(xtk, along_nm, gs_kts, radio_alt_ft, landing_xtk_nm * M_PER_NM)))
         {
             // ...and "interceptable" is not stabilised either: a 35 degree
             // cut reaches 50 m from anywhere, and the 737 rode 30 to 50 m
             // beside a 45 m strip from 500 ft to the wheels (LEMG 13,
-            // 2026-09-28). Below the floor the pursuit's own TIME must bring
+            // 2026-09-28). Below the floor the final's own TIME must bring
             // the offset onto the pavement by the threshold.
             // Below the terrain floor and not laterally stabilised: a balk
             // with height in hand. That flare gate above was the ONLY lateral

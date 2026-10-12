@@ -69,6 +69,9 @@
         /// The heading mode settling off its window, degrees, seconds and
         /// radians (amplitude, period, phase): `None`, on it.
         pub ap_offset: Option<(f64, f64, f64)>,
+        /// Hand flown from minimums: the bank asked of the ailerons, which
+        /// the jet then flies in place of its heading mode.
+        pub bank_cmd: Option<f64>,
         t: f64,
         queued: std::collections::VecDeque<f64>,
     }
@@ -132,6 +135,7 @@
                 var_deg: 0.0,
                 yaw_wobble: None,
                 ap_offset: None,
+                bank_cmd: None,
                 t: 0.0,
                 queued: std::collections::VecDeque::new(),
             }
@@ -193,8 +197,15 @@
             let n = 20;
             let h = dt / n as f64;
             for _ in 0..n {
-                let err = crate::angles::signed_diff_deg(applied, self.nose()) + self.offset();
-                self.phi += f.roll_rate(err, self.phi) * h;
+                match self.bank_cmd {
+                    // Hand flown: the bank on the ailerons (`pilot::bank`),
+                    // closed over its second at up to 10 degrees a second.
+                    Some(b) => self.phi += ((b - self.phi) / 1.0).clamp(-10.0, 10.0) * h,
+                    None => {
+                        let err = crate::angles::signed_diff_deg(applied, self.nose()) + self.offset();
+                        self.phi += f.roll_rate(err, self.phi) * h;
+                    }
+                }
                 self.t += h;
                 let rate = (9.81 * self.phi.to_radians().tan() / self.tas_mps).to_degrees();
                 self.psi = (self.psi + rate * h).rem_euclid(360.0);
@@ -212,13 +223,13 @@
     }
 
     /// The autoland loop's lateral answer, composed as the loop composes it:
-    /// guidance on the runway's width, the crab filter, the final's one law
-    /// (`FinalLateral`) on the response time measured over the final's first
-    /// 90 s (`ResponseTime`). The vertical is flown exactly on the path.
+    /// guidance on the runway's width, the crab filter, the final's heading
+    /// above minimums (`FinalHeading`, the autopilot's standing error
+    /// learnt), and from the visual minimums the hand-flown bank on the
+    /// centreline (`pilot::line`). The vertical is flown exactly on the path.
     pub struct FinalLoop {
         pub crab: CrabFilter,
-        pub lateral: FinalLateral,
-        pub response: ResponseTime,
+        pub heading: FinalHeading,
         pub width_m: Option<f64>,
         /// The knob as the loop sets it (`bug_knob`), when held; the knob
         /// the aircraft flies, how many times it moved (0.2 degrees, the
@@ -229,22 +240,21 @@
         pub knob_db: Option<crate::heading_bug::BugDeadband>,
         pub moves: u32,
         pub t: f64,
-        final_t0: Option<f64>,
+        bug: Option<f64>,
     }
 
     impl FinalLoop {
         pub fn new(width_m: Option<f64>) -> Self {
             Self {
                 crab: CrabFilter::new(),
-                lateral: FinalLateral::default(),
-                response: ResponseTime::default(),
+                heading: FinalHeading::default(),
                 width_m,
                 knob: None,
                 knob_at: None,
                 knob_db: None,
                 moves: 0,
                 t: 0.0,
-                final_t0: None,
+                bug: None,
             }
         }
 
@@ -254,8 +264,9 @@
             self
         }
 
-        /// One tick: the bug (true) and the guidance behind it.
-        pub fn step(&mut self, jet: &Jet, rwy: &Runway, dt: f64) -> (f64, Guidance) {
+        /// One tick: the bug (true) and the guidance behind it; from
+        /// minimums the jet's bank instead (`Jet::bank_cmd`).
+        pub fn step(&mut self, jet: &mut Jet, rwy: &Runway, dt: f64) -> (f64, Guidance) {
             let (psi, trk, gs) = (jet.nose(), jet.track(), jet.gs_kts());
             let crab = self.crab.update(CrabFilter::raw(Some(psi), Some(trk)), dt);
             let dist = haversine_nm(jet.lat, jet.lon, rwy.thr_lat, rwy.thr_lon);
@@ -273,26 +284,33 @@
                 0.0,
                 self.width_m,
             );
-            let in_final = g.phase == ApproachPhase::Final && !g.arresting;
+            let xtk_m = cross_track_nm(jet.lat, jet.lon, rwy) * M_PER_NM;
+            let hand = g.arresting
+                || (g.phase == ApproachPhase::Final && alt - rwy.elev_ft < VISUAL_MINIMUMS_FT);
+            jet.bank_cmd = hand.then(|| {
+                let side = crate::pilot::line::side_velocity_m_s(Some(trk), rwy.course_deg, gs).unwrap_or(0.0);
+                crate::pilot::line::bank_for_line(xtk_m, side, jet.phi, alt - rwy.elev_ft)
+            });
+            self.t += dt;
+            if hand {
+                return (self.bug.unwrap_or(rwy.course_deg), g);
+            }
             let bug = match g.phase {
-                ApproachPhase::Final if in_final => {
-                    let xtk_m = cross_track_nm(jet.lat, jet.lon, rwy) * M_PER_NM;
-                    let side = side_velocity_m_s(Some(trk), rwy.course_deg, gs).unwrap_or(0.0);
-                    self.final_t0.get_or_insert(self.t);
-                    self.lateral
-                        .bug_true(xtk_m, side, gs, rwy.course_deg, crab, self.response.t_r(), dt)
-                }
-                ApproachPhase::Intercept => {
-                    self.lateral.reset();
-                    g.target_heading_deg
-                }
-                _ => g.target_heading_deg + crab,
+                ApproachPhase::Final => self.heading.heading_true(xtk_m, gs, rwy.course_deg, crab),
+                ApproachPhase::Intercept => g.target_heading_deg,
+                ApproachPhase::Flare => g.target_heading_deg + crab,
             };
             let mut bug = bug.rem_euclid(360.0);
             if let Some(k) = self.knob.as_mut() {
                 match bug_knob(g.phase, g.arresting, None, None) {
                     Some((key, db)) => {
-                        let wrote = k.decide(key, bug, self.t, self.knob_db.unwrap_or(db));
+                        // The final in whole degrees (magnetic), as set.
+                        let want = if key == 2 {
+                            ((bug - jet.var_deg).round() + jet.var_deg).rem_euclid(360.0)
+                        } else {
+                            bug
+                        };
+                        let wrote = k.decide(key, want, self.t, self.knob_db.unwrap_or(db));
                         // A window in whole steps reads back the write
                         // rounded, and the knob remembers what it reads
                         // (`BugHold::took`), as the loop's does.
@@ -300,15 +318,14 @@
                             k.took(Some(jet.windowed(w)));
                         }
                         bug = k.set().unwrap_or(bug);
+                        if key == 2 {
+                            let settled = k.since_write_s(self.t).is_some_and(|s| s >= FINAL_SETTLE_S);
+                            self.heading.learn(Some(psi), Some(jet.windowed(bug)), settled, dt);
+                        }
                     }
                     None => k.reset(),
                 }
             }
-            let evidence = in_final
-                && self.final_t0.is_some_and(|t0| self.t - t0 < TR_FINAL_WINDOW_S)
-                && alt - rwy.elev_ft > TR_MIN_RADIO_FT;
-            self.response.feed(Some(jet.windowed(bug)), Some(psi), Some(trk), dt, evidence);
-            self.t += dt;
             if self
                 .knob_at
                 .is_none_or(|a| crate::angles::abs_diff_deg(bug, a) >= 0.2)
@@ -316,6 +333,7 @@
                 self.moves += 1;
                 self.knob_at = Some(bug);
             }
+            self.bug = Some(bug);
             (bug, g)
         }
     }

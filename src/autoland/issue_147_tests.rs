@@ -187,10 +187,9 @@
     /// 1.8 nm, still rolling out of the circuit's intercept (heading 299 for
     /// a 311.7 runway, 15 degrees of bank). The old track trim learnt the
     /// roll-out as a bias (+0.78 recorded) and the final sat 30 to 32 m right
-    /// from 1.4 nm to 0.3 with the autopilot on its bug. The final's one law
-    /// (`FinalLateral`) learns nothing from a roll-out: its integral is of
-    /// the offset, bounded at 8 m. Replayed: inside the landing limit by
-    /// 0.5 nm.
+    /// from 1.4 nm to 0.3 with the autopilot on its bug. The final's heading
+    /// (`FinalHeading`) learns only a SETTLED heading's error, never a
+    /// roll-out. Replayed: inside the landing limit by 0.5 nm.
     #[test]
     fn the_final_closes_from_the_handoffs_roll_out() {
         let rwy = lemg("31");
@@ -201,7 +200,7 @@
         let mut lp = FinalLoop::new(None);
         let mut at_half = f64::NAN;
         for _ in 0..1000 {
-            let (bug, g) = lp.step(&jet, &rwy, 0.35);
+            let (bug, g) = lp.step(&mut jet, &rwy, 0.35);
             if g.dist_nm < 0.5 {
                 at_half = cross_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
                 break;
@@ -214,16 +213,15 @@
         );
     }
 
-    /// Issue #93: autoland's final with the knob set as a pilot sets it (a
-    /// quarter degree at most every second, down to the arrest) holds the
-    /// line the every-tick knob held, from the LEMG 31 handover and offsets
-    /// either side of 13 in four winds: no balk, the roundout gate within
-    /// 2 m of it, the worst offset below 500 ft within 3 m of it or inside
-    /// the landing limit (the plant has no gusts, so the knob's moves are
-    /// counted on the recordings: `the_recorded_finals_move_the_knob_less`).
+    /// Issues #93 and 2026-10-12: autoland's final with the knob set as a
+    /// pilot sets it (whole degrees, no oftener than every ten seconds, down
+    /// to minimums; hand flown from them) from the LEMG 31 handover and
+    /// offsets either side of 13 in four winds: no balk, the roundout gate on
+    /// the line, and the knob moved a few times a minute. Above minimums the
+    /// whole degree leaves more than the every-tick knob did (the LEMG 31
+    /// handover 28 m below 500 ft against 10); below them the bank takes it.
     #[test]
     fn the_final_on_a_held_knob_keeps_the_line() {
-        let limit = landing_xtk_limit_m(Some(LEMG_WIDTH_M));
         // (runway, along m, xtk m, heading true, IAS, wind from, m/s)
         let starts = [
             ("31", 3392.9, 103.1, 299.4, 149.0, 106.0, 3.0),
@@ -233,36 +231,19 @@
         ];
         for (id, along, xtk, psi, ias, wf, wm) in starts {
             let rwy = lemg(id);
-            let fly = |held: bool| {
-                let (lat, lon) = at(&rwy, along, xtk);
-                let mut jet = Jet::new(lat, lon, psi, ias);
-                jet.wind_to_deg = (wf + 180.0_f64).rem_euclid(360.0);
-                jet.wind_mps = wm;
-                let lp = FinalLoop::new(Some(LEMG_WIDTH_M));
-                let mut lp = if held { lp.held() } else { lp };
-                let f = fly_final(&mut jet, &mut lp, &rwy, 0.35);
-                (f, lp.moves)
-            };
-            let (free, free_moves) = fly(false);
-            let (f, moves) = fly(true);
-            assert!(f.balk.is_none() && free.balk.is_none(), "{id} {along} {xtk}: {f:?}");
-            // Within 2 m of the every-tick knob or 5 m of the line: the
-            // trim that learns no roll-out (#189) left the free knob 0.1 m
-            // at the gate from LEMG 31 where the held one keeps 3.2.
-            assert!(
-                f.gate_xtk_m.abs() <= (free.gate_xtk_m.abs() + 2.0).max(5.0)
-                    && f.worst_low_xtk_m <= (free.worst_low_xtk_m + 3.0).max(limit),
-                "{id} {along} {xtk}: {f:?} against {free:?}"
-            );
-            // The knob moves no more than the every-tick one would, or a
-            // handful of times: with no roll-out learnt (#189) the free bug
-            // barely moves in this still air (5 moves from 13 3700 30,
-            // against the held knob's 8).
-            assert!(moves <= free_moves.max(10), "{id}: {moves} against {free_moves}");
+            let (lat, lon) = at(&rwy, along, xtk);
+            let mut jet = Jet::new(lat, lon, psi, ias);
+            jet.wind_to_deg = (wf + 180.0_f64).rem_euclid(360.0);
+            jet.wind_mps = wm;
+            let mut lp = FinalLoop::new(Some(LEMG_WIDTH_M)).held();
+            let f = fly_final(&mut jet, &mut lp, &rwy, 0.35);
+            assert!(f.balk.is_none() && f.gate_xtk_m.abs() < 2.0, "{id} {along} {xtk}: {f:?}");
+            let per_min = f64::from(lp.moves) / (lp.t / 60.0);
+            assert!(per_min <= 6.5, "{id}: {} moves in {:.0} s", lp.moves, lp.t);
         }
     }
 
-    /// The knob's keys: the arrest and the flare steer every tick; a
+    /// The knob's keys: the hand-flown segment and the flare leave it; a
     /// pattern leg, a missed approach stage, the final and an intercept are
     /// each set once and corrected past their deadband.
     #[test]

@@ -26,7 +26,6 @@ use crate::autotakeoff::{
     STEER_TRIM_ERR_CLAMP_DEG,
     STEER_TRIM_MAX,
     STEER_TRIM_RATE,
-    STIFF_TUNED_TICK_S,
     TRIM_MIN_GS_KTS,
     TRIM_SCALE_FROM_KTS,
     XTK_GAIN_DEG_PER_M,
@@ -803,85 +802,15 @@ impl RollSteer {
 pub struct WingsLevel {
     out: f64,
     prev_bank: Option<f64>,
-    /// Bank error for full aileron, degrees; `None` is [`AIL_FULL_BANK_DEG`].
-    full_bank_deg: Option<f64>,
-    /// A declared roll-rate plant (`arrest_roll:`): the law flies the bank
-    /// its written ailerons will make, not the one read.
-    plant: Option<crate::aircraft::ArrestRollProfile>,
-    /// The ailerons written inside the plant's dead time: (age s, aileron,
-    /// seconds it was held).
-    pipe: std::collections::VecDeque<(f64, f64, f64)>,
 }
 
 impl WingsLevel {
-    /// A stiffer loop: full aileron at `full_bank_deg` of bank error. The
-    /// climb-out's 15 degrees is a gentle track-keeper; over the runway the
-    /// landing arrest needs the bank to arrive in about a second, and at 15
-    /// the 737 rolled at 2 deg/s on 0.17 of aileron (LEMG 13, 2026-09-26).
-    pub fn stiff(full_bank_deg: f64) -> Self {
-        Self {
-            full_bank_deg: Some(full_bank_deg.clamp(2.0, AIL_FULL_BANK_DEG)),
-            ..Self::default()
-        }
-    }
-
-    /// On a ROLL-RATE plant (an Airbus's sidestick, `arrest_roll:`): the
-    /// aileron that closes the bank the ailerons already written WILL make
-    /// on the target over the profile's `close_s`. The stiff law, led only
-    /// by the bank's measured rate, rang on the A330 through its dead time
-    /// (+/-2 to 4 degrees at 1.5 to 2 s, LEMG 30, 2026-09-28).
-    pub fn rate_plant(p: crate::aircraft::ArrestRollProfile) -> Self {
-        Self {
-            plant: Some(p),
-            ..Self::default()
-        }
-    }
-
-    /// The bank the ailerons already written will have made once they have
-    /// all arrived, degrees: the reading on a stiff law.
-    pub fn predicted(&self, bank_deg: f64) -> f64 {
-        match self.plant {
-            Some(p) => {
-                bank_deg
-                    + self.pipe.iter().map(|(_, a, held)| p.deg_s_per_unit * a * held).sum::<f64>()
-            }
-            None => bank_deg,
-        }
-    }
-
     pub fn step(&mut self, bank_deg: f64, target_deg: f64, dt_s: f64) -> f64 {
         let dt = dt_s.clamp(0.05, 1.0);
-        if let Some(p) = self.plant {
-            // The last write has been held this tick; what has aged past
-            // the dead time is in the reading already.
-            if let Some(last) = self.pipe.back_mut() {
-                last.2 = dt;
-            }
-            for e in self.pipe.iter_mut() {
-                e.0 += dt;
-            }
-            self.pipe.retain(|e| e.0 < p.dead_s + 1e-9);
-            let pred = self.predicted(bank_deg);
-            let want =
-                ((target_deg - pred) / (p.deg_s_per_unit * p.close_s)).clamp(-AIL_MAX, AIL_MAX);
-            self.out = slew(self.out, want, AIL_SLEW_PER_S * dt);
-            self.prev_bank = Some(bank_deg);
-            self.pipe.push_back((0.0, self.out, 0.0));
-            return self.out;
-        }
         let rate = self.prev_bank.map_or(0.0, |p| (bank_deg - p) / dt);
         self.prev_bank = Some(bank_deg);
         let err = target_deg - bank_deg - AIL_LEAD_S * rate;
-        // The stiff law's gain was set on a 0.25 to 0.3 s tick, and the
-        // tick is the loop's delay: at the iMac's 0.4 to 0.44 s (19 fps) the
-        // 737's arrest rang +/-5 degrees on the aileron's stops through the
-        // flare and touched down banked 9.9 (EGKK 08R 1790687142,
-        // 2026-09-29). A slower tick softens it in proportion.
-        let full = match self.full_bank_deg {
-            Some(f) => f * (dt / STIFF_TUNED_TICK_S).max(1.0),
-            None => AIL_FULL_BANK_DEG,
-        };
-        let want = (err / full).clamp(-1.0, 1.0) * AIL_MAX;
+        let want = (err / AIL_FULL_BANK_DEG).clamp(-1.0, 1.0) * AIL_MAX;
         self.out = slew(self.out, want, AIL_SLEW_PER_S * dt);
         self.out
     }
