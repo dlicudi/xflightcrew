@@ -339,11 +339,12 @@ fn the_fourth_approach_replayed_on_the_track_law() {
     );
 }
 
-/// The law is the Zibo's alone, and silent it is the pursuit: every other
-/// profile flies the heading the guidance gives, and so does the Zibo
-/// outside its final, on the short final and in a failed track read.
+/// The law is declared only where an airframe's heading response was
+/// measured (the Zibo, the SR22), and silent it is the pursuit: every other
+/// profile flies the heading the guidance gives, and so does a declaring
+/// airframe outside its final and in a failed track read.
 #[test]
-fn only_the_zibo_flies_its_final_on_a_track_law() {
+fn only_a_measured_airframe_flies_its_final_on_a_track_law() {
     let law = zibo_law();
     assert_eq!(
         law,
@@ -358,7 +359,7 @@ fn only_the_zibo_flies_its_final_on_a_track_law() {
         let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        if path.extension().is_none_or(|x| x != "yaml") || id == "zibo_738" {
+        if path.extension().is_none_or(|x| x != "yaml") || id == "zibo_738" || id == "cirrus_sr22" {
             continue;
         }
         let p = crate::aircraft::load(id).expect(id);
