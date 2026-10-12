@@ -74,9 +74,13 @@ impl Default for Gains {
 /// The angle of attack is filtered this slowly, seconds: the nose's own
 /// short-period swing in alpha must not feed back into the attitude asked.
 const ALPHA_TAU_S: f64 = 1.5;
-/// The path error is trimmed out of the attitude this slowly, deg per
-/// second per deg of error.
-const GAMMA_TRIM_PER_S: f64 = 0.5;
+/// The path error is trimmed out of the attitude this fast, deg per second
+/// per deg of error: settled inside a third of [`RESPONSE_S`]. At 0.5 the
+/// trim, a type-1 loop facing the ramp of a bleeding speed and the power
+/// coming off (alpha rising 0.4 to 1.0 deg/s in the last 10 ft on five
+/// airframes' fitted plants, 2026-10-12), left the path 0.8 to 2 deg under
+/// its command: the windy evening's 202 to 274 fpm.
+const GAMMA_TRIM_PER_S: f64 = 1.0;
 /// Knots to feet a minute.
 const FPM_PER_KT: f64 = 101.268_591;
 
@@ -181,14 +185,7 @@ impl AttitudeFlare {
         });
         self.alpha_f += (i.alpha_deg - self.alpha_f) * (dt / ALPHA_TAU_S).min(1.0);
         let vs_t = vs_target_fpm(i.radio_ft, entry.vs_fpm, entry.gate_ft);
-        // Above the gate, never steeper than the path flown (nor a climb):
-        // holding the entry path, the SR22 pushed a gust's -1.0 deg back
-        // toward -2.95, the nose to -7.8 on the push limit, and met the
-        // runway at 441 fpm (LEMG 13, 1791813026). Below it the round-out
-        // is the plan's: held there too, a nose rising into the flare locks
-        // in its own overshoot and floats.
-        let planned = (vs_t / v_fpm).clamp(-1.0, 1.0).asin().to_degrees();
-        let gamma_cmd = if i.radio_ft > entry.gate_ft { planned.max(gamma.min(0.0)) } else { planned };
+        let gamma_cmd = (vs_t / v_fpm).clamp(-1.0, 1.0).asin().to_degrees();
         // The target moves with the height, predictably: below the gate the
         // wanted sink falls by (entry - touchdown) / gate per foot, and the
         // height falls at the sink. Led, not chased (a lag chain tracking a
@@ -200,9 +197,13 @@ impl AttitudeFlare {
             / (entry.gate_ft - HOLDOFF_FT).max(1.0);
         let gamma_rate = (dvs_dh * (v_fpm * gamma.to_radians().sin() / 60.0) / v_fpm).to_degrees();
         // The filtered alpha holds the path on the attitude; what the filter
-        // misses (the speed bleeding, alpha rising) is trimmed out slowly.
+        // misses in a flare (the speed bleeding, the power coming off) only
+        // ever asks for more nose, so the trim never goes below zero: a gust
+        // that shallowed the path wound it down, and its unwinding pushed
+        // the SR22 to -7.8 deg and the runway at 441 fpm (LEMG 13,
+        // 1791813026), the Evolution's -0.71 deg into its sag (1791815852).
         self.gamma_trim =
-            (self.gamma_trim + (gamma_cmd - gamma) * GAMMA_TRIM_PER_S * dt).clamp(-3.0, 3.0);
+            (self.gamma_trim + (gamma_cmd - gamma) * GAMMA_TRIM_PER_S * dt).clamp(0.0, 3.0);
         let theta_cmd = gamma_cmd + self.alpha_f + self.gamma_trim + g.path_lag_s * gamma_rate;
         let e_theta = theta_cmd - i.theta_deg;
         // The command's own rate (the speed bleeding, alpha rising, the
