@@ -93,9 +93,13 @@
 
     /// Issue #93: those approaches' bugs replayed through the knob autoland
     /// now sets (`bug_knob`): the knob moved (0.2 degrees or more, the least
-    /// `drive_heading_bug_step` writes) at most half as often outside the
-    /// short final and the flare (which still steer every tick), and always
-    /// within a turn's steering of the law's own bug: 21 moves against 76.
+    /// `drive_heading_bug_step` writes) less often than the law's bug in
+    /// every approach and two thirds as often in all, down to the arrest
+    /// (the arrest and the flare still steer every tick), and always within
+    /// a turn's steering of the law's own bug. On the final's quarter degree
+    /// a second (2026-10-12; the last 0.3 nm no longer steered every tick):
+    /// 47 moves against 93, where half a degree every two seconds outside
+    /// the short final made 21 against 76.
     #[test]
     fn the_recorded_finals_move_the_knob_less() {
         let moved = |a: Option<f64>, b: f64| {
@@ -124,7 +128,7 @@
                     Some("Final") => super::ApproachPhase::Final,
                     _ => super::ApproachPhase::Intercept,
                 };
-                let short = k["short_final"] == true || k["arresting"] == true;
+                let short = k["arresting"] == true;
                 let leg = match k["leg"].as_str() {
                     Some("outbound") => Some(crate::reversal::Leg::Outbound),
                     Some("base") => Some(crate::reversal::Leg::Base),
@@ -158,9 +162,9 @@
                     held_at = Some(knob);
                 }
             }
-            assert!(held * 2 <= free, "{s}: {held} moves against {free}");
+            assert!(held < free, "{s}: {held} moves against {free}");
             free_all += free;
             held_all += held;
         }
-        assert!(held_all * 3 <= free_all, "{held_all} moves against {free_all}");
+        assert!(held_all * 3 <= free_all * 2, "{held_all} moves against {free_all}");
     }

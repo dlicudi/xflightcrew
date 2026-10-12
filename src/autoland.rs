@@ -381,7 +381,7 @@ mod issue_147_tests;
 
 /// LEMG 30, the Zibo 737's finals of 2026-10-07: its heading select fitted
 /// to the recorded windows, its whole-degree window, and the final flown on
-/// the pursuit (weaving) and on its declared track law (`final_track:`).
+/// the final's one lateral law (`FinalLateral`).
 #[cfg(test)]
 mod lemg30_zibo_final_tests;
 

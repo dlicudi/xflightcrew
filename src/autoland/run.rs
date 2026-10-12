@@ -321,7 +321,16 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             // the band), for the blackbox's `roundout_held` edges.
             let mut roundout_held = false;
             let mut wings = arrest_wings();
-            let mut short_final: Option<ShortFinal> = None;
+            // The final's lateral (`FinalLateral`) on the heading mode's
+            // response time, measured on the intercept and the first 90 s
+            // of the first final (`ResponseTime`): when that final began,
+            // when this one did, and whether this one's `lateral_tr` is on
+            // the tape.
+            let mut final_lateral = FinalLateral::default();
+            let mut response = ResponseTime::default();
+            let mut first_final_at: Option<std::time::Instant> = None;
+            let mut final_at: Option<std::time::Instant> = None;
+            let mut tr_recorded = false;
             let mut arrest_rate = crate::autotakeoff::XtkRate::default();
             let mut arrest_prev_xtk: Option<f64> = None;
             let mut roll_yielded = false;
@@ -336,12 +345,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let mut xtk_rate: f64 = 0.0;
             // Wind crab, low-passed — see [`CrabFilter`] for the hunt it ends.
             let mut crab_filter = CrabFilter::new();
-            // Integral trim on the final's track error — see [`TrackTrim`]
-            // for the standing 35 m the crab loop could not see.
-            let mut track_trim = TrackTrim::new();
-            // The final's track law, where the airframe declares one (see
-            // [`final_track_heading`]); read once, as the arm's airframe.
-            let final_track_law = crate::aircraft::final_track();
             // Rollout: latched at touchdown, then brakes down — to a full stop,
             // or to taxi pace when a vacate drive follows. The takeoff roll law
             // (P + trim, tested) holds the centreline through the plugin steer
@@ -1877,7 +1880,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                            "why": w.why, "called_radio": radio_ft,
                                            "low_ft": w.low_ft, "touched": w.touched,
                                            "xtk_m": xtk_now * M_PER_NM,
-                                           "dist": raw.dist_nm, "trim": track_trim.value()}),
+                                           "dist": raw.dist_nm, "lat_i_m": final_lateral.i_m()}),
                     );
                 }
                 // Back on final after a missed approach: report it. The first
@@ -2296,35 +2299,18 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     // afresh.
                     None => energy_cap = None,
                 }
-                // The final on the airframe's declared track law, where it
-                // has one (`final_track:`): the trim below learns against it.
-                // Bypassed while the airframe's own localiser has the final
-                // on a landing its autopilot flies (`ap_lands`): the law is
-                // that path's own-law fallback, never a second lateral.
+                // The final's lateral law stands aside while the airframe's
+                // own localiser has the final on a landing its autopilot
+                // flies (`ap_lands`): the law is that path's own-law
+                // fallback, never a second lateral.
                 let ap_has_loc = lands.is_some()
                     && matches!(
                         coupling,
                         crate::ils::Coupling::LocCaptured | crate::ils::Coupling::Coupled
                     );
-                if !ap_has_loc {
-                    g.target_heading_deg = final_track_heading(
-                        &g,
-                        rwy.course_deg,
-                        xtk_now * M_PER_NM,
-                        hpath_r.as_ref().ok().copied(),
-                        gs_kts,
-                        final_track_law,
-                    );
-                }
                 let g = g;
                 let outbound = hold.is_some()
                     || pattern.is_some_and(|(_, leg, _)| leg != crate::reversal::Leg::Inbound);
-                let trim = track_trim.update(
-                    g.phase,
-                    g.target_heading_deg,
-                    hpath_r.as_ref().ok().copied(),
-                    dt_s.clamp(0.0, 3.0),
-                );
                 let phase_word = match g.phase {
                     ApproachPhase::Intercept => "INTERCEPT",
                     ApproachPhase::Final => "FINAL",
@@ -2544,30 +2530,57 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // hands the servos back and re-engages the modes (a balloon
                 // over the band stays the arrest, `hold_roundout`); the
                 // rollout latch finds them already off.
-                // The last 0.3 nm of the final: the centreline closed in
-                // seconds, damped on the drift over the ground (see
-                // `short_final_cut_deg`), where the old 80 deg/nm let 1 degree
-                // of track build 9 m from 170 ft to the gate.
-                let off_course = |a: f64| crate::angles::signed_diff_deg(a, rwy.course_deg);
-                let track_off = hpath_r.as_ref().ok().copied().map(off_course);
-                let in_short_final = g.phase == ApproachPhase::Final
-                    && g.dist_nm <= SHORT_FINAL_NM
-                    && !g.arresting;
-                let crabbed_true = match (g.phase, in_short_final, track_off) {
-                    (ApproachPhase::Final, true, Some(to)) => {
-                        let pursuit_bug = g.target_heading_deg + crab + trim;
-                        let sf = short_final
-                            .get_or_insert_with(|| ShortFinal::new(off_course(pursuit_bug), to).on(final_track_law));
-                        (rwy.course_deg
-                            + sf.step(xtk_now * M_PER_NM, to, gs_kts, tick_dt, phi_r.as_ref().ok().copied()))
-                            .rem_euclid(360.0)
+                // THE FINAL'S LATERAL, one law from the start of the final
+                // to the arrest (`FinalLateral`, 2026-10-12): the offset
+                // closed over the heading mode's response time, led on the
+                // drift over the ground, an integral for what the autopilot
+                // holds off its bug, and the crab. It replaced the pursuit,
+                // the short final's switch at 0.3 nm (a 2 to 6 degree jump
+                // and a 6 s closure against a 5 to 6 s response: the SR22,
+                // 1791810954, and the 172, 1791808122, went round
+                // `off_centreline_low`) and the declared track law. The
+                // arrest's own lateral, the flare and the rollout follow.
+                let track_now = hpath_r.as_ref().ok().copied();
+                let in_final = g.phase == ApproachPhase::Final && !g.arresting;
+                if in_final && final_at.is_none() {
+                    final_at = Some(std::time::Instant::now());
+                    first_final_at.get_or_insert_with(std::time::Instant::now);
+                    tr_recorded = false;
+                }
+                let final_s = final_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                if final_at.is_some() && !tr_recorded && (!in_final || final_s >= TR_FINAL_WINDOW_S) {
+                    tr_recorded = true;
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "lateral_tr", "t_r": response.t_r(),
+                            "measured": response.measured(), "samples": response.samples(),
+                            "final_s": final_s, "radio": radio_ft}),
+                    );
+                }
+                let crabbed_true = match g.phase {
+                    ApproachPhase::Final if in_final && ap_has_loc => {
+                        (rwy.course_deg + crab).rem_euclid(360.0)
                     }
-                    (ApproachPhase::Final | ApproachPhase::Flare, ..) => {
-                        short_final = None;
-                        (g.target_heading_deg + crab + trim).rem_euclid(360.0)
+                    ApproachPhase::Final if in_final => {
+                        match side_velocity_m_s(track_now, rwy.course_deg, gs_kts) {
+                            Some(side) => final_lateral.bug_true(
+                                xtk_now * M_PER_NM,
+                                side,
+                                gs_kts,
+                                rwy.course_deg,
+                                crab,
+                                response.t_r(),
+                                tick_dt,
+                            ),
+                            None => final_lateral.held(rwy.course_deg, crab),
+                        }
                     }
-                    (ApproachPhase::Intercept, ..) => {
-                        short_final = None;
+                    ApproachPhase::Final | ApproachPhase::Flare => {
+                        (g.target_heading_deg + crab).rem_euclid(360.0)
+                    }
+                    ApproachPhase::Intercept => {
+                        final_lateral.reset();
+                        final_at = None;
                         g.target_heading_deg
                     }
                 };
@@ -2623,7 +2636,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     tick_dt.max(0.05),
                 );
                 arrest_prev_xtk = Some(xtk_m_now);
-                let track_now = hpath_r.as_ref().ok().copied();
                 let side_now = side_velocity_m_s(track_now, rwy.course_deg, gs_kts)
                     .unwrap_or(arrest_rate_now);
                 let phi_now = phi_r.as_ref().ok().copied().unwrap_or(0.0);
@@ -2659,7 +2671,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     // saw (a bounce) is on the tape: the scorecard judges it.
                     "ground": on_ground > 0.5,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
-                    "trim": trim, "xtk_m": xtk_now * M_PER_NM,
+                    "lat_i_m": final_lateral.i_m(), "t_r": response.t_r(), "xtk_m": xtk_now * M_PER_NM,
                     // "plugin": one frame's position; "split": an older
                     // plugin's separate reads (#157).
                     "pos": pos_source,
@@ -2670,7 +2682,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     "lever": last_lever,
                     "phi": phi_r.as_ref().ok().copied(),
                     "psi": psi_r.as_ref().ok().copied(), "bug_true": crabbed_true,
-                    "short_final": short_final.is_some(),
                     // The arrest's lateral: the track it closes on, the
                     // sideways velocity and the bank it asked for.
                     "trk": track_now, "side_m_s": side_now,
@@ -2864,9 +2875,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                     cpl.own_lateral = true;
                                     cpl.own_vertical = true;
                                 }
-                                // Our final begins fresh: the trim learnt
+                                // Our final begins fresh: the integral learnt
                                 // nothing of ours while the localiser flew.
-                                track_trim = TrackTrim::new();
+                                final_lateral.reset();
                             }
                             crate::ap_lands::Fallback::GoAround(_) => {
                                 runtime.go_around.order(on_ground > 0.5);
@@ -2965,14 +2976,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 }
                 let cpl = cpl;
                 // The knob: once per phase or pattern leg and corrected past a
-                // deadband (`bug_knob`); the short final and the flare steer
-                // it every tick, as before.
-                let knob = bug_knob(
-                    g.phase,
-                    in_short_final || g.arresting,
-                    pattern.map(|(_, l, _)| l),
-                    missed,
-                );
+                // deadband (`bug_knob`), the final's down to the arrest; the
+                // arrest and the flare steer it every tick.
+                let knob = bug_knob(g.phase, g.arresting, pattern.map(|(_, l, _)| l), missed);
                 let knob_set = match (cpl.own_lateral, knob) {
                     (false, _) => {
                         bug_hold.reset();
@@ -3011,6 +3017,23 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         Some(mag_hdg)
                     }
                 };
+                // How the heading mode answers the knob as it stands, for the
+                // final's response time (`ResponseTime`): on our own lateral,
+                // on the intercept and the first final's first 90 s, above
+                // 300 ft, the servos the autopilot's.
+                let knob_true = match knob {
+                    Some(_) => bug_hold.set(),
+                    None => Some(mag_hdg),
+                }
+                .filter(|_| cpl.own_lateral)
+                .map(|m| mag_to_true(m, var));
+                let evidence = cpl.own_lateral
+                    && !arrest_hands
+                    && on_ground < 0.5
+                    && radio_ft > TR_MIN_RADIO_FT
+                    && (g.phase == ApproachPhase::Intercept || in_final)
+                    && first_final_at.is_none_or(|t| t.elapsed().as_secs_f64() < TR_FINAL_WINDOW_S);
+                response.feed(knob_true, psi_r.as_ref().ok().copied(), track_now, tick_dt, evidence);
                 // The mode lights and the yields come from the tick's one
                 // read; the VS dial, the column, the ailerons and a fine bug
                 // correction are QUEUED and go out with the lever in the
@@ -3053,7 +3076,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 };
                 // A keyed setting (once per phase or leg) is driven and READ
                 // BACK as before, beside the write round; the every-tick
-                // steering of the short final and the flare is one queued
+                // steering of the arrest and the flare is one queued
                 // write from the bug the tick read (`bug_step_from`), pressed
                 // only past three degrees.
                 let bug_drive = match (knob, knob_set) {

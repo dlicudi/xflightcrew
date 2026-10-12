@@ -212,17 +212,14 @@
     }
 
     /// The autoland loop's lateral answer, composed as the loop composes it:
-    /// guidance on the runway's width, the crab filter, the track trim (its
-    /// turn cap given, so the replays can fly the old one), the short final
-    /// inside [`SHORT_FINAL_NM`]. The vertical is flown exactly on the path.
+    /// guidance on the runway's width, the crab filter, the final's one law
+    /// (`FinalLateral`) on the response time measured over the final's first
+    /// 90 s (`ResponseTime`). The vertical is flown exactly on the path.
     pub struct FinalLoop {
         pub crab: CrabFilter,
-        pub trim: TrackTrim,
-        pub short_final: Option<ShortFinal>,
+        pub lateral: FinalLateral,
+        pub response: ResponseTime,
         pub width_m: Option<f64>,
-        pub trim_cap_deg: f64,
-        /// The trim's steady-track gate (`None`: the old cap alone).
-        pub trim_steady_dps: Option<f64>,
         /// The knob as the loop sets it (`bug_knob`), when held; the knob
         /// the aircraft flies, how many times it moved (0.2 degrees, the
         /// least `drive_heading_bug_step` writes) and the loop's clock.
@@ -232,26 +229,22 @@
         pub knob_db: Option<crate::heading_bug::BugDeadband>,
         pub moves: u32,
         pub t: f64,
-        /// The airframe's final track law (`final_track:`), as the loop
-        /// composes it ([`final_track_heading`]); `None`, the pursuit.
-        pub final_track: Option<crate::aircraft::FinalTrackProfile>,
+        final_t0: Option<f64>,
     }
 
     impl FinalLoop {
-        pub fn new(width_m: Option<f64>, trim_cap_deg: f64) -> Self {
+        pub fn new(width_m: Option<f64>) -> Self {
             Self {
                 crab: CrabFilter::new(),
-                trim: TrackTrim::new(),
-                short_final: None,
+                lateral: FinalLateral::default(),
+                response: ResponseTime::default(),
                 width_m,
-                trim_cap_deg,
-                trim_steady_dps: Some(TRACK_TRIM_STEADY_DPS),
                 knob: None,
                 knob_at: None,
                 knob_db: None,
                 moves: 0,
                 t: 0.0,
-                final_track: None,
+                final_t0: None,
             }
         }
 
@@ -267,7 +260,7 @@
             let crab = self.crab.update(CrabFilter::raw(Some(psi), Some(trk)), dt);
             let dist = haversine_nm(jet.lat, jet.lon, rwy.thr_lat, rwy.thr_lon);
             let alt = rwy.elev_ft + (dist + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
-            let mut g = guidance_on(
+            let g = guidance_on(
                 jet.lat,
                 jet.lon,
                 alt,
@@ -280,48 +273,24 @@
                 0.0,
                 self.width_m,
             );
-            g.target_heading_deg = final_track_heading(
-                &g,
-                rwy.course_deg,
-                cross_track_nm(jet.lat, jet.lon, rwy) * M_PER_NM,
-                Some(trk),
-                gs,
-                self.final_track,
-            );
-            let trim = self.trim.update_gated(
-                g.phase,
-                g.target_heading_deg,
-                Some(trk),
-                dt,
-                self.trim_cap_deg,
-                self.trim_steady_dps,
-            );
-            let off = |a: f64| crate::angles::signed_diff_deg(a, rwy.course_deg);
-            let in_short =
-                g.phase == ApproachPhase::Final && g.dist_nm <= SHORT_FINAL_NM && !g.arresting;
+            let in_final = g.phase == ApproachPhase::Final && !g.arresting;
             let bug = match g.phase {
-                ApproachPhase::Final if in_short => {
+                ApproachPhase::Final if in_final => {
                     let xtk_m = cross_track_nm(jet.lat, jet.lon, rwy) * M_PER_NM;
-                    let pursuit = g.target_heading_deg + crab + trim;
-                    let sf = self
-                        .short_final
-                        .get_or_insert_with(|| ShortFinal::new(off(pursuit), off(trk)));
-                    rwy.course_deg + sf.step(xtk_m, off(trk), gs, dt, Some(jet.phi))
+                    let side = side_velocity_m_s(Some(trk), rwy.course_deg, gs).unwrap_or(0.0);
+                    self.final_t0.get_or_insert(self.t);
+                    self.lateral
+                        .bug_true(xtk_m, side, gs, rwy.course_deg, crab, self.response.t_r(), dt)
                 }
                 ApproachPhase::Intercept => {
-                    self.short_final = None;
+                    self.lateral.reset();
                     g.target_heading_deg
                 }
-                _ => {
-                    self.short_final = None;
-                    g.target_heading_deg + crab + trim
-                }
+                _ => g.target_heading_deg + crab,
             };
-            self.t += dt;
-            let short = in_short || g.arresting;
             let mut bug = bug.rem_euclid(360.0);
             if let Some(k) = self.knob.as_mut() {
-                match bug_knob(g.phase, short, None, None) {
+                match bug_knob(g.phase, g.arresting, None, None) {
                     Some((key, db)) => {
                         let wrote = k.decide(key, bug, self.t, self.knob_db.unwrap_or(db));
                         // A window in whole steps reads back the write
@@ -335,6 +304,11 @@
                     None => k.reset(),
                 }
             }
+            let evidence = in_final
+                && self.final_t0.is_some_and(|t0| self.t - t0 < TR_FINAL_WINDOW_S)
+                && alt - rwy.elev_ft > TR_MIN_RADIO_FT;
+            self.response.feed(Some(jet.windowed(bug)), Some(psi), Some(trk), dt, evidence);
+            self.t += dt;
             if self
                 .knob_at
                 .is_none_or(|a| crate::angles::abs_diff_deg(bug, a) >= 0.2)
@@ -348,7 +322,7 @@
 
     /// What a flown final came to: the offset at the roundout gate (the last
     /// tick above 80 ft on the path), the worst offset below 500 ft, the
-    /// worst bank on the short final, and the first balk (why, radio, xtk).
+    /// worst bank on the last 0.3 nm, and the first balk (why, radio, xtk).
     #[derive(Debug, Default)]
     pub struct Flown {
         pub gate_xtk_m: f64,
@@ -376,7 +350,7 @@
             if radio < 500.0 {
                 out.worst_low_xtk_m = out.worst_low_xtk_m.max(xtk_m.abs());
             }
-            if g.dist_nm <= SHORT_FINAL_NM {
+            if g.dist_nm <= 0.3 {
                 out.worst_short_bank_deg = out.worst_short_bank_deg.max(jet.phi.abs());
             }
             jet.step(bug, dt);

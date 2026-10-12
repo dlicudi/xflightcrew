@@ -98,79 +98,6 @@
         assert!(wheels > LEMG_WIDTH_M / 2.0 + 10.0, "{wheels:.1}");
     }
 
-    /// The old short-final learner, as it flew (a 2 s low-pass of the track
-    /// against the last bug, clamped at 5 degrees, no gate).
-    struct OldShortFinal {
-        bias_deg: f64,
-        prev_bug_deg: f64,
-    }
-
-    impl OldShortFinal {
-        fn step(&mut self, xtk_m: f64, track_off_deg: f64, gs_kts: f64, dt: f64) -> f64 {
-            let e = track_off_deg - self.prev_bug_deg;
-            let a = (dt / SHORT_FINAL_BIAS_TAU_S).min(1.0);
-            self.bias_deg = (self.bias_deg + (e - self.bias_deg) * a).clamp(-5.0, 5.0);
-            let side = gs_kts * 0.514_444 * track_off_deg.to_radians().sin();
-            let bug = short_final_cut_deg(xtk_m, side, gs_kts) - self.bias_deg;
-            self.prev_bug_deg = bug;
-            bug
-        }
-    }
-
-    /// LEMG 13 (sortie 1790591256-full_auto): the short final began at
-    /// 0.29 nm, 31.8 m left, heading 129.4 and tracking 130.3, the pursuit's
-    /// bug 0.33 left of the runway. The old learner took the autopilot's lag
-    /// for a bias: the bug ran to 8 degrees right in two seconds and the 737
-    /// banked 16 at 90 ft (13.6 in the plant), and it was still turning onto
-    /// the line at the gate. Replayed against the fitted 737, 0.4 s ticks.
-    #[test]
-    fn the_short_final_learns_no_bias_from_its_own_turn() {
-        let rwy = lemg("13");
-        let off = |a: f64| crate::angles::signed_diff_deg(a, rwy.course_deg);
-        let fly = |old: bool| -> (f64, f64, f64) {
-            let (lat, lon) = at(&rwy, 0.29 * M_PER_NM, -31.8);
-            let mut jet = Jet::new(lat, lon, 129.4, 146.0);
-            jet.wind_mps = 2.5;
-            jet.phi = -0.4;
-            let entry_bug = -0.33;
-            let mut o = OldShortFinal {
-                bias_deg: (off(jet.track()) - entry_bug).clamp(-5.0, 5.0),
-                prev_bug_deg: entry_bug,
-            };
-            let mut n = ShortFinal::new(entry_bug, off(jet.track()));
-            let (mut worst_bug, mut worst_bank) = (0.0_f64, 0.0_f64);
-            let dt = 0.4;
-            // To the roundout gate: 80 ft is about 220 m short at 146 kt.
-            while along_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM > 220.0 {
-                let x = cross_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
-                let b = if old {
-                    o.step(x, off(jet.track()), jet.gs_kts(), dt)
-                } else {
-                    n.step(x, off(jet.track()), jet.gs_kts(), dt, Some(jet.phi))
-                };
-                worst_bug = worst_bug.max(b.abs());
-                worst_bank = worst_bank.max(jet.phi.abs());
-                jet.step(rwy.course_deg + b, dt);
-            }
-            (worst_bug, worst_bank, n.bias_deg)
-        };
-        let (old_bug, old_bank, _) = fly(true);
-        let (bug, bank, bias) = fly(false);
-        assert!(
-            old_bug > 7.5 && old_bank > 12.0,
-            "the replay winds up: bug {old_bug:.1}, bank {old_bank:.1}"
-        );
-        assert!(
-            bug <= SHORT_FINAL_MAX_CUT_DEG + SHORT_FINAL_MAX_BIAS_DEG + 1e-9,
-            "the bug stays inside cut plus bias: {bug:.1}"
-        );
-        assert!(bias.abs() <= SHORT_FINAL_MAX_BIAS_DEG, "{bias:.2}");
-        assert!(
-            bank < 10.0 && bank < old_bank - 3.0,
-            "bank {bank:.1} against {old_bank:.1}"
-        );
-    }
-
     /// The same final's positions, judged by the gates on LEMG's 45 m
     /// pavement: at the handoff (98 m off at 1.9 nm, 471 ft) the pursuit's
     /// own time model leaves 20 m at the threshold, 5 m past the landing
@@ -258,49 +185,37 @@
 
     /// LEMG 31 (sortie 1790584715-full_auto): handed over 103 m right at
     /// 1.8 nm, still rolling out of the circuit's intercept (heading 299 for
-    /// a 311.7 runway, 15 degrees of bank). The trim learnt the roll-out as a
-    /// bias (+0.78 recorded) and the final sat 30 to 32 m right from 1.4 nm
-    /// to 0.3 with the autopilot on its bug. Replayed: the old 10 degree cap
-    /// parks it there; the 3 degree cap learns a fraction and closes.
+    /// a 311.7 runway, 15 degrees of bank). The old track trim learnt the
+    /// roll-out as a bias (+0.78 recorded) and the final sat 30 to 32 m right
+    /// from 1.4 nm to 0.3 with the autopilot on its bug. The final's one law
+    /// (`FinalLateral`) learns nothing from a roll-out: its integral is of
+    /// the offset, bounded at 8 m. Replayed: inside the landing limit by
+    /// 0.5 nm.
     #[test]
-    fn the_track_trim_learns_no_bias_from_the_handoffs_roll_out() {
+    fn the_final_closes_from_the_handoffs_roll_out() {
         let rwy = lemg("31");
-        let fly = |cap: f64, gate: Option<f64>| -> (f64, f64) {
-            let (lat, lon) = at(&rwy, 3392.9, 103.1);
-            let mut jet = Jet::new(lat, lon, 299.4, 149.0);
-            jet.wind_mps = 3.0;
-            jet.phi = 14.8;
-            let mut lp = FinalLoop::new(None, cap);
-            lp.trim_steady_dps = gate;
-            let mut at_half = f64::NAN;
-            let mut worst_trim = 0.0_f64;
-            for _ in 0..1000 {
-                let (bug, g) = lp.step(&jet, &rwy, 0.35);
-                if g.dist_nm < 0.5 {
-                    at_half = cross_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
-                    break;
-                }
-                worst_trim = worst_trim.max(lp.trim.value().abs());
-                jet.step(bug, 0.35);
+        let (lat, lon) = at(&rwy, 3392.9, 103.1);
+        let mut jet = Jet::new(lat, lon, 299.4, 149.0);
+        jet.wind_mps = 3.0;
+        jet.phi = 14.8;
+        let mut lp = FinalLoop::new(None);
+        let mut at_half = f64::NAN;
+        for _ in 0..1000 {
+            let (bug, g) = lp.step(&jet, &rwy, 0.35);
+            if g.dist_nm < 0.5 {
+                at_half = cross_track_nm(jet.lat, jet.lon, &rwy) * M_PER_NM;
+                break;
             }
-            (at_half, worst_trim)
-        };
-        let (old_x, old_trim) = fly(10.0, None);
-        let (x, trim) = fly(TRACK_TRIM_ERR_CAP_DEG, Some(TRACK_TRIM_STEADY_DPS));
+            jet.step(bug, 0.35);
+        }
         assert!(
-            (25.0..40.0).contains(&old_x),
-            "the replay parks as it flew: {old_x:.1} m at 0.5 nm"
+            at_half.abs() < landing_xtk_limit_m(Some(LEMG_WIDTH_M)),
+            "{at_half:.1} m at 0.5 nm"
         );
-        assert!(old_trim > 0.9, "and learns the roll-out: {old_trim:.2}");
-        assert!(
-            x.abs() < landing_xtk_limit_m(Some(LEMG_WIDTH_M)),
-            "{x:.1} m at 0.5 nm"
-        );
-        assert!(trim < 0.5, "{trim:.2}");
     }
 
-    /// Issue #93: autoland's final with the knob set as a pilot sets it (half
-    /// a degree at most every two seconds outside the short final) holds the
+    /// Issue #93: autoland's final with the knob set as a pilot sets it (a
+    /// quarter degree at most every second, down to the arrest) holds the
     /// line the every-tick knob held, from the LEMG 31 handover and offsets
     /// either side of 13 in four winds: no balk, the roundout gate within
     /// 2 m of it, the worst offset below 500 ft within 3 m of it or inside
@@ -323,7 +238,7 @@
                 let mut jet = Jet::new(lat, lon, psi, ias);
                 jet.wind_to_deg = (wf + 180.0_f64).rem_euclid(360.0);
                 jet.wind_mps = wm;
-                let lp = FinalLoop::new(Some(LEMG_WIDTH_M), TRACK_TRIM_ERR_CAP_DEG);
+                let lp = FinalLoop::new(Some(LEMG_WIDTH_M));
                 let mut lp = if held { lp.held() } else { lp };
                 let f = fly_final(&mut jet, &mut lp, &rwy, 0.35);
                 (f, lp.moves)
@@ -347,7 +262,7 @@
         }
     }
 
-    /// The knob's keys: the short final and the flare steer every tick; a
+    /// The knob's keys: the arrest and the flare steer every tick; a
     /// pattern leg, a missed approach stage, the final and an intercept are
     /// each set once and corrected past their deadband.
     #[test]

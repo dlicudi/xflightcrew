@@ -372,10 +372,19 @@ fn fly(p: Plant, air: Air, x0: f64, start_nm: f64, seed: u64, yaw: bool) -> Flow
 /// Every fitted airframe handed the final at 5 nm 40 m right, 80 m left
 /// and on the line, each twice (another seed of yaw where it is flown),
 /// the response time measured on its intercept: within `within_m` at 50 ft
-/// over the threshold.
+/// over the threshold. The Zibo a metre more: its window takes whole
+/// degrees, so a cut under half a degree moves nothing and the final holds a
+/// cycle of about 5 m each side over 80 s, the integral tipping the window a
+/// degree each way (on the analysis' replays of its recorded finals, 2 of 3
+/// within 5 m).
 fn every_airframe_lands_on_the_line_in(air: Air, what: &str, yaw: bool, within_m: f64) {
     let mut bad = Vec::new();
     for p in PLANTS {
+        let within_m = if p.window_deg > 0.0 {
+            within_m + 1.0
+        } else {
+            within_m
+        };
         for (x0, seed) in [
             (40.0, 1u64),
             (-80.0, 2),

@@ -125,7 +125,7 @@
             assert!(f.a_m.abs() > 3700.0, "dt {dt}: {f:?}");
             let flown = fly_final(
                 &mut jet,
-                &mut FinalLoop::new(Some(LEMG_WIDTH_M), 3.0).held(),
+                &mut FinalLoop::new(Some(LEMG_WIDTH_M)).held(),
                 &rwy,
                 0.45,
             );
@@ -153,28 +153,24 @@
     }
 
     /// The handoff as it flew (43 m off, coming back at 3.6 degrees), given
-    /// to autoland's final: with the old trim, which learnt the roll-out, it
-    /// parks 16 m left and goes around `off_centreline_low` at 99 ft, as the
-    /// sortie did (recorded: 99 ft, 15.2 m); with the trim learning only a
-    /// settled track it reaches the roundout gate within 5 m at every tick.
+    /// to autoland's final: with the old track trim, which learnt the
+    /// roll-out, it parked 16 m left and went around `off_centreline_low` at
+    /// 99 ft (recorded: 99 ft, 15.2 m). On the final's one law
+    /// (`FinalLateral`) it never balks and keeps inside the landing limit;
+    /// the gate at 5.5 to 6.3 m right: closing 45 m from 2.3 nm winds the
+    /// integral to its 8 m, the line is crossed by 5 m, and over the last
+    /// mile the integral unwinds slower than the knob's quarter degree
+    /// asks to be moved (the old trim's law reached it within 5).
     #[test]
-    fn the_recorded_handoff_went_around_on_a_learnt_roll_out() {
+    fn the_recorded_handoff_reaches_the_gate_on_the_line() {
         let rwy = lemg("30");
         let limit = landing_xtk_limit_m(Some(LEMG_WIDTH_M));
-        let final_of = |dt: f64, gate: Option<f64>| {
-            let (_, mut jet) = fly(A330_HEADING, false, dt);
-            let mut lp = FinalLoop::new(Some(LEMG_WIDTH_M), 3.0).held();
-            lp.trim_steady_dps = gate;
-            fly_final(&mut jet, &mut lp, &rwy, 0.45)
-        };
-        let old = final_of(0.7, None);
-        let (why, radio, xtk) = old.balk.expect("the old trim balks");
-        assert_eq!(why, "off_centreline_low", "{old:?}");
-        assert!((90.0..110.0).contains(&radio) && xtk < -limit, "{old:?}");
         for dt in [0.6, 0.7, 0.8] {
-            let f = final_of(dt, Some(crate::autoland::TRACK_TRIM_STEADY_DPS));
+            let (_, mut jet) = fly(A330_HEADING, false, dt);
+            let mut lp = FinalLoop::new(Some(LEMG_WIDTH_M)).held();
+            let f = fly_final(&mut jet, &mut lp, &rwy, 0.45);
             assert!(f.balk.is_none(), "dt {dt}: {f:?}");
-            assert!(f.gate_xtk_m.abs() < 5.0 && f.worst_low_xtk_m < limit, "dt {dt}: {f:?}");
+            assert!(f.gate_xtk_m.abs() < 7.0 && f.worst_low_xtk_m < limit, "dt {dt}: {f:?}");
         }
     }
 
