@@ -14359,3 +14359,20 @@ to the threshold, 1791808122). The ILS reference after it: 136 fpm (1791808787).
   SR22 (the load reset it). No mask record of ours today. The SR22's climb checklist turns it
   on passing 10,000 ft (right for an unpressurised SR22). The SF50 checklist has no oxygen or
   pressurisation items at all (transcribed from image pages): a gap to fill.
+
+### 2026-10-12 (later): one track law to the arrest; the flare never pushes a gust back down
+
+- **The short final flies the airframe's declared track law** (`final_track:`; one closure
+  shape, `arrest::closure_cut_deg`) down to the arrest, where it had switched at 0.3 nm to a
+  fixed 6 s closure, 3 s lead. A light autopilot's heading answers about 2 s late and then
+  over a 4 s roll lag (the SR22, a 4.6 deg bug step at 150 ft, 1791810954: the Zibo's
+  answer), so a 6 s closure rang it from 9 m right to 19 m left in 15 s and the gate went
+  round at 56 ft. The SR22 declares the Zibo's 12 s / 10 s; undeclared airframes are as
+  before.
+- **Above its gate the attitude flare never asks for a steeper path than the one flown**, nor
+  a climb: holding the entry path (-2.95 deg), it pushed a gust's -1.0 deg back down, the
+  nose to -7.8 on the push limit for 14 ft, and the SR22 met the runway at 441 fpm
+  (1791813026). Below the gate the round-out stays the plan's (held there too, a nose rising
+  into the flare locked in its own overshoot and floated on the plant).
+- Flown: the SR22 133 and 133 fpm, 1.3 and 1.1 m, in a 130/9 wind (1791814190, 1791814508);
+  the C172 ILS reference 157 fpm, 1.7 m (1791814879).
