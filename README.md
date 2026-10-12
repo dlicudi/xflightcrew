@@ -1,8 +1,8 @@
-# XVoiceLayer
+# XFlightCrew
 
-**The voice layer for X-Plane 12: copilot, ATC and cabin crew. Entirely local.**
+**Your flight crew for X-Plane 12: copilot, ATC and cabin crew. Entirely local.**
 
-You are one pilot in the cockpit. XVoiceLayer is everyone else: the **copilot**
+You are one pilot in the cockpit. XFlightCrew is everyone else: the **copilot**
 in the other seat who works the panel and can fly the aircraft, the **tower** on
 the radio, and the **cabin crew** down the back. Three voices, one microphone,
 and nothing leaves your machine.
@@ -14,8 +14,10 @@ combinations, and no connection to anything.
 🎙️  "flaps ten"  →  whisper (STT)  →  deterministic grammar  →  curated tool + readback  →  TTS
 ```
 
-Named after [XEarthLayer](https://github.com/samsoir/xearthlayer), which layers
-in what you *see*; this layers in what you *hear*.
+[xflightcrew.com](https://xflightcrew.com)
+
+Formerly XVoiceLayer. Until the rename is complete, the binary is still `xvl`
+and the repository `xvoicelayer`.
 
 ## What it's for
 
@@ -123,7 +125,7 @@ FAA), and a controller that sequences you rather than reading a script:
 
 ### Fly alongside local traffic
 
-XVoiceLayer can generate and fly its own deterministic AI traffic instead of
+XFlightCrew can generate and fly its own deterministic AI traffic instead of
 depending on LiveTraffic. The same tower that controls you controls every
 traffic flight through a separate per-flight strip:
 
@@ -157,7 +159,7 @@ mean it. Sterile-cockpit rules apply.
 A small companion plugin ([plugin/](plugin/)) adds what the Web API can't do: a
 dedicated **push-to-talk** (separate keys for the intercom and the radio), the
 FMS route load, terrain queries, and the control channels the ground automation
-steers through. It also renders XVoiceLayer's traffic via XPMP2 when CSL models
+steers through. It also renders XFlightCrew's traffic via XPMP2 when CSL models
 are installed.
 
 It also draws an in-sim **status panel** (Flight, Transcript, ATC, Route and
@@ -270,7 +272,7 @@ list. Common knobs:
 For rendered traffic, install CSL packages and point the X-Plane plugin at
 them with `XCOPILOT_TRAFFIC_CSL`. LiveTraffic commonly owns X-Plane's TCAS
 slots first; disable its AI-slot request (or LiveTraffic itself) if you want
-XVoiceLayer traffic to appear on TCAS. Aircraft still render without TCAS
+XFlightCrew traffic to appear on TCAS. Aircraft still render without TCAS
 ownership.
 
 The `xcopilot/*` datarefs, the `XCOPILOT_*` variables and the `xcopilot.xpl`
