@@ -1,4 +1,4 @@
-//! The approach laws: clearance helpers, the crab and track trims, the
+//! The approach laws: clearance helpers, the crab filter, the
 //! glidepath, speed, flap and power on the approach, the live terrain floor.
 
 use super::*;
@@ -92,7 +92,12 @@ pub fn clearance_differs(planned_id: &str, cleared_id: &str) -> bool {
 /// swing with a ~13 s period at the numbers, a standing 35 m offset the
 /// short-final law could not close, and the lateral balk gate at 74 ft.
 /// At 15 s the 13 s swing comes through at about a seventh of its amplitude.
-pub const CRAB_TAU_S: f64 = 15.0;
+/// 5 s since the final's one lateral law (2026-10-12, `FinalLateral`): its
+/// lead on the drift and its integral answer what the crab misses, and a
+/// 15 s crab held the wind of half a minute before through a shear. On the
+/// fitted plants under the 60 recorded finals, 15 s to 5 s took the replays
+/// within 5 m at 50 ft from 56 to 59 and a 15 to 0 kt shear from 46 to 49.
+pub const CRAB_TAU_S: f64 = 5.0;
 
 /// The wind crab actually commanded: heading minus ground track, low-passed
 /// with [`CRAB_TAU_S`]. Fed EVERY tick (intercept included) so it is settled
@@ -132,183 +137,6 @@ impl CrabFilter {
             }
             (None, e) => e.unwrap_or(0.0),
         }
-    }
-}
-
-/// Time constant (s) of the final's track-error trim: how long a steady
-/// difference between the track the final asks for and the track flown takes
-/// to be integrated out. Slow against the autopilot's heading response (a few
-/// seconds) and the crab filter (15 s), so the three never chase each other.
-pub const TRACK_TRIM_TAU_S: f64 = 30.0;
-/// The most trim the integrator may carry, degrees. A bias bigger than this
-/// is a broken autopilot, not something to trim.
-pub const TRACK_TRIM_MAX_DEG: f64 = 5.0;
-/// A track error beyond this is a turn in progress, not a bias: not integrated.
-/// It was 10, and a handoff still converging is a turn in progress: LEMG 31
-/// (sortie 1790584715-full_auto, 2026-09-28) the 737 came off the circuit's
-/// intercept tracking 303 to 309 for a 311.7 runway, the trim learnt +0.78
-/// degrees from those six seconds of roll-out, and with the autopilot
-/// flying its bug to a tenth of a degree the final then sat 30 to 32 m right
-/// of the centreline from 1.4 nm to 0.3, the trim cancelling the pursuit's
-/// 0.75 degree cut; LEMG 13 (1790591256) learnt -0.57 the same way and sat
-/// 50 m left. The biases it exists for were 1.1 to 1.9 degrees.
-pub(super) const TRACK_TRIM_ERR_CAP_DEG: f64 = 3.0;
-/// A bias is learnt only from a track that has been STEADY this long, s:
-/// turning under [`TRACK_TRIM_STEADY_DPS`] (smoothed over
-/// [`TRACK_TRIM_RATE_TAU_S`]) for [`TRACK_TRIM_SETTLE_S`]. The 3 degree cap
-/// above still let the last three degrees of every circuit's roll-out in:
-/// LEMG 30 A330 (sortie 1790710769-full_auto, 2026-09-29) was handed over
-/// tracking 3.6 degrees off, flew straight on for a second and a half, then
-/// rolled out at 0.2 to 0.65 degrees a second; the trim learnt -0.51 in ten
-/// seconds with no bias in the air (calm, the aircraft on its bug), and the
-/// final that had reached 4.4 m sat 0.3 to 0.5 degrees left of the course,
-/// 17 m off at 0.3 nm, and went around at 99 ft (`off_centreline_low`). The
-/// other three circuits flown that evening learnt 0.37 to 0.61 the same way
-/// and drifted 6 to 14 m. Settled finals turn under 0.1 degrees a second
-/// (p90 0.02 to 0.09 over the four); the biases this exists for held for
-/// whole finals. 0.15 and 5 s passed the replays too, and left the replayed
-/// crosswind finals (`the_final_on_a_held_knob_keeps_the_line`) 0.4 m
-/// further off at the gate.
-pub const TRACK_TRIM_STEADY_DPS: f64 = 0.25;
-/// Time constant of the smoothing on that track rate, s: a gust's single
-/// tick is not a turn, eight seconds of roll-out are.
-pub(super) const TRACK_TRIM_RATE_TAU_S: f64 = 1.5;
-/// ...and how long the track must have been steady, s: the handoff's own
-/// straight second or two before autoland's first bank is not a bias.
-pub const TRACK_TRIM_SETTLE_S: f64 = 3.0;
-
-/// Integral trim on the final's TRACK error, in degrees added to the heading
-/// bug alongside the wind crab.
-///
-/// The crab loop commands a heading whose track aligns with the runway by
-/// measuring heading minus track — the wind. It cannot see a bias that sits
-/// between the BUG and the heading: an autopilot that settles two degrees
-/// left of its bug produces a track two degrees left of the one asked for,
-/// and both proportional laws on final (the fixed-lead pursuit, then the
-/// 80°/nm short-final cut) only ever ask for a cut, so they equilibrate
-/// where the cut equals the bias — 0.6 nm of lead times tan 2° is 39 m,
-/// 2°/80 is 46 m. LEMG 13, 2026-09-12: the 172's heading sat 1.1° left of
-/// the bug through the whole intercept with no crab in the loop and 1.9°
-/// left down both finals, the position 33 to 37 m left of the centreline
-/// from 1.3 km out, steady, in both approaches, and the lateral gate under
-/// 100 ft (37 m) balked both at 74 and 40 ft. Two go-arounds; the pilot
-/// landed by hand. This integrates the difference between the track the
-/// guidance wants and the track flown, so whatever the cause of the bias
-/// (autopilot law, servo trim, a variation error), the final converges on
-/// the centreline instead of parking beside it. Final only; held through
-/// the flare; reset on anything else so a missed approach never carries a
-/// stale correction into the next attempt.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TrackTrim {
-    pub(super) deg: f64,
-    /// The last track read on final, the smoothed rate it turns at (`None`
-    /// until two reads have measured one) and how long it has been steady.
-    pub(super) last_trk: Option<f64>,
-    pub(super) rate_dps: Option<f64>,
-    pub(super) steady_s: f64,
-}
-
-impl TrackTrim {
-    pub const fn new() -> Self {
-        Self { deg: 0.0, last_trk: None, rate_dps: None, steady_s: 0.0 }
-    }
-
-    /// Has the track been steady (under `steady_dps`) long enough to learn a
-    /// bias from? Measures the rate from the read before; the first read
-    /// measures nothing.
-    pub(super) fn settled(&mut self, h: f64, dt_s: f64, steady_dps: f64) -> bool {
-        let prev = self.last_trk.replace(h);
-        let Some(p) = prev.filter(|_| dt_s > 1e-3) else {
-            self.steady_s = 0.0;
-            return false;
-        };
-        let raw = crate::angles::signed_diff_deg(h, p) / dt_s;
-        let r = match self.rate_dps {
-            Some(r) => r + (dt_s / TRACK_TRIM_RATE_TAU_S).clamp(0.0, 1.0) * (raw - r),
-            None => raw,
-        };
-        self.rate_dps = Some(r);
-        if r.abs() <= steady_dps {
-            self.steady_s += dt_s;
-        } else {
-            self.steady_s = 0.0;
-        }
-        self.steady_s >= TRACK_TRIM_SETTLE_S
-    }
-
-    /// Advance by one tick: `wanted_track_deg` is the guidance heading on
-    /// final (the runway course plus the cut, i.e. the TRACK it wants),
-    /// `hpath_true` the sim's ground track. Returns the trim to add.
-    pub fn update(
-        &mut self,
-        phase: ApproachPhase,
-        wanted_track_deg: f64,
-        hpath_true: Option<f64>,
-        dt_s: f64,
-    ) -> f64 {
-        self.update_capped(
-            phase,
-            wanted_track_deg,
-            hpath_true,
-            dt_s,
-            TRACK_TRIM_ERR_CAP_DEG,
-        )
-    }
-
-    /// [`TrackTrim::update`] with the turn-in-progress cap given (the replay
-    /// tests fly the old 10 degrees against the new).
-    pub(crate) fn update_capped(
-        &mut self,
-        phase: ApproachPhase,
-        wanted_track_deg: f64,
-        hpath_true: Option<f64>,
-        dt_s: f64,
-        cap_deg: f64,
-    ) -> f64 {
-        self.update_gated(
-            phase,
-            wanted_track_deg,
-            hpath_true,
-            dt_s,
-            cap_deg,
-            Some(TRACK_TRIM_STEADY_DPS),
-        )
-    }
-
-    /// ...and the steady-track gate given (`None`: the old rule, the cap
-    /// alone, for the replays of what flew).
-    pub(crate) fn update_gated(
-        &mut self,
-        phase: ApproachPhase,
-        wanted_track_deg: f64,
-        hpath_true: Option<f64>,
-        dt_s: f64,
-        cap_deg: f64,
-        steady_dps: Option<f64>,
-    ) -> f64 {
-        match phase {
-            ApproachPhase::Final => {
-                if let Some(h) = hpath_true {
-                    let err = crate::angles::signed_diff_deg(wanted_track_deg, h);
-                    let steady = match steady_dps {
-                        Some(r) => self.settled(h, dt_s, r),
-                        None => true,
-                    };
-                    if err.abs() <= cap_deg && steady {
-                        self.deg = (self.deg + err * dt_s / TRACK_TRIM_TAU_S)
-                            .clamp(-TRACK_TRIM_MAX_DEG, TRACK_TRIM_MAX_DEG);
-                    }
-                }
-            }
-            ApproachPhase::Flare => {}
-            ApproachPhase::Intercept => *self = Self::new(),
-        }
-        self.deg
-    }
-
-    /// The trim currently applied.
-    pub fn value(&self) -> f64 {
-        self.deg
     }
 }
 

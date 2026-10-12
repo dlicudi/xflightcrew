@@ -203,7 +203,7 @@
         );
         let f: Flown = fly_final(
             &mut jet,
-            &mut FinalLoop::new(Some(LEMG_WIDTH_M), 3.0),
+            &mut FinalLoop::new(Some(LEMG_WIDTH_M)),
             &rwy,
             0.35,
         );
@@ -222,7 +222,7 @@
         assert!(new.residual_m <= limit && new.a_m.abs() > 3700.0, "{new:?}");
         let f = fly_final(
             &mut jet,
-            &mut FinalLoop::new(Some(LEMG_WIDTH_M), 3.0),
+            &mut FinalLoop::new(Some(LEMG_WIDTH_M)),
             &rwy,
             0.35,
         );
@@ -251,7 +251,7 @@
             );
             let f = fly_final(
                 &mut jet,
-                &mut FinalLoop::new(Some(LEMG_WIDTH_M), 3.0),
+                &mut FinalLoop::new(Some(LEMG_WIDTH_M)),
                 &lemg("13"),
                 0.35,
             );
@@ -307,7 +307,7 @@
             );
             let f = fly_final(
                 &mut jet,
-                &mut FinalLoop::new(Some(LEMG_WIDTH_M), 3.0),
+                &mut FinalLoop::new(Some(LEMG_WIDTH_M)),
                 &rwy,
                 0.35,
             );

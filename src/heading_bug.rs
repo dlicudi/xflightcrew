@@ -383,7 +383,7 @@ mod tests {
         ("hover", "cruise_modes", 1, "the hand-back's cruise modes on the heading of the moment (the nose)"),
         ("heli_route", "fly", 3, "the departure's hand-over and the go-around on the course flown (the nose); the cruise steer is bug_toward's output"),
         ("tools/setup_enroute", "engage", 2, "setup: the placement puts the nose on this track wings level before live flight"),
-        ("autoland", "spawn_autoland", 2, "the keyed knob is bug_toward through BugHold; the per-tick steer only on the aligned short final and flare"),
+        ("autoland", "spawn_autoland", 2, "the keyed knob is bug_toward through BugHold; the per-tick steer only in the arrest and the flare"),
         ("autotakeoff", "fly", 1, "setup: the runway heading preset on the brakes before the roll"),
         ("tools/autopilot", "execute", 1, "the pilot's own heading selection"),
         ("tools/recover", "hold_heading_and_altitude", 1, "the recovery's hold on the heading of the moment (the nose)"),

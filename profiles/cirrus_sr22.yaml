@@ -299,14 +299,3 @@ locations:
   alternator switches: "on the left bolster switch panel, next to the battery switches"
   starter key: "leftmost on the bolster switch panel, the rotary magneto and start key"
   flaps: "the flap switch on the centre console, with UP, 50 percent and 100 percent detents"
-
-# The final's track law on its own heading response (`autoland::
-# final_track_cut_deg`), down to the arrest. Measured on LEMG 13 in a 150/10
-# wind (1791810954): a 4.6 degree bug step at 150 ft moved the track about
-# 2 s later and took about 4 s more to arrive, overshooting: the Zibo's
-# answer (2 s late, a 4 s roll lag), whose 12 s closure and 10 s lead held it
-# 6 to 11 m where faster laws rang. On the shared 6 s short final it swung
-# from 9 m right to 19 m left in 15 s and went round at 56 ft.
-final_track:
-  close_s: 12.0
-  lead_s: 10.0

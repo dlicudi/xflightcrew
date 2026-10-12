@@ -187,13 +187,6 @@ pub struct AircraftProfile {
     /// A330 ran 66 to 67 m through at LEMG 30 (2026-09-29, #189).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_final_lead_s: Option<f64>,
-    /// Autoland's final flown as a track closure (`autoland::final_track_cut_deg`)
-    /// instead of the fixed-lead pursuit, for an autopilot whose heading
-    /// answers its bug slowly and in whole degrees. Silent: the pursuit every
-    /// airframe has flown. The Zibo 737 wove 30 m either side of the
-    /// centreline at LEMG 30 (2026-10-07).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_track: Option<FinalTrackProfile>,
     /// Path to an XChecklist file to interpret (relative to the working dir),
     /// or `acf:<file>` for a file the aircraft ships in its own folder (the
     /// Zibo's `clist.txt`: not ours to copy into this repo), resolved against

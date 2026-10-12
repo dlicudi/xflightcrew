@@ -1618,8 +1618,7 @@ mod tests {
                     Some(r) => (crate::autoland::ApproachPhase::Intercept, Some(r.leg)),
                     None => (crate::autoland::ApproachPhase::Final, None),
                 };
-                let short = rev.is_none() && along <= crate::autoland::SHORT_FINAL_NM;
-                match crate::autoland::bug_knob(phase, short, leg, None) {
+                match crate::autoland::bug_knob(phase, false, leg, None) {
                     Some((key, db)) => {
                         hold.decide(key, bug, t, db);
                         bug = hold.set().unwrap_or(bug);

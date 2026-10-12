@@ -7,24 +7,26 @@ use super::*;
 /// correction at most every five seconds.
 pub const AUTOLAND_INTERCEPT_DEADBAND: crate::heading_bug::BugDeadband =
     crate::heading_bug::BugDeadband { deg: 2.0, every_s: 5.0 };
-/// The final outside [`SHORT_FINAL_NM`]: half a degree at most every two
-/// seconds (a degree every three left the fitted 737 9.8 m off at the
-/// roundout gate from a 30 m LEMG 13 handover, against 3.9 every tick).
+/// The final, down to the arrest: a quarter degree at most every second.
+/// It was half a degree every two seconds (a degree every three left the
+/// fitted 737 9.8 m off at the roundout gate from a 30 m LEMG 13 handover),
+/// and with the pursuit's 0.6 nm lead that weaved 7 to 12 m; on the plants
+/// fitted to the 60 recorded finals of 2026-10-12 the final's one law
+/// (`FinalLateral`) holds its 5 m on this knob (`final_lateral_tests`).
 pub const AUTOLAND_FINAL_DEADBAND: crate::heading_bug::BugDeadband =
-    crate::heading_bug::BugDeadband { deg: 0.5, every_s: 2.0 };
+    crate::heading_bug::BugDeadband { deg: 0.25, every_s: 1.0 };
 
 /// How autoland's heading knob is set this tick (issue #93): the key and
 /// deadband for [`crate::heading_bug::BugHold`], or `None` to steer it every
-/// tick as before (the short final and the flare, where the last 0.3 nm
-/// closes the centreline in seconds). A pattern's legs and each missed
+/// tick (the arrest and the flare). A pattern's legs and each missed
 /// approach stage are their own keys, so a new leg is set at once. Pure.
 pub fn bug_knob(
     phase: ApproachPhase,
-    short_final: bool,
+    arresting: bool,
     pattern_leg: Option<crate::reversal::Leg>,
     missed: Option<MissedStage>,
 ) -> Option<(u32, crate::heading_bug::BugDeadband)> {
-    match (phase, short_final, pattern_leg, missed) {
+    match (phase, arresting, pattern_leg, missed) {
         (ApproachPhase::Flare, ..) | (_, true, ..) => None,
         (_, _, Some(leg), _) => Some((10 + leg as u32, AUTOLAND_INTERCEPT_DEADBAND)),
         (_, _, None, Some(stage)) => Some((20 + stage as u32, AUTOLAND_INTERCEPT_DEADBAND)),
@@ -648,42 +650,10 @@ pub fn guidance_on(
             bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon),
         )
     } else {
-        // On final: PURSUE a point ON the centreline halfway to the threshold
-        // instead of P-correcting the offset. Offset-proportional gains kept
-        // failing by geometry: 80°/nm commanded all of 7° of cut at 0.09 nm
-        // off — mathematically unable to centre in the distance remaining,
-        // and the aircraft crossed 150 ft still 145 m left (2026-07-24; same
-        // family as the 120 m/2026-07-14 and 55 m/2026-07-22 misses at lower
-        // gains). Aiming at the centreline point makes the cut DISTANCE-
-        // aware: atan(offset / distance-to-aim) — gentle far out, up to a
-        // 35° intercept when close and offset, rolling out on the line as
-        // the pursuit point recedes.
-        // Inside ~550 m the halfway aim point would fall BEHIND the aircraft
-        // (the 0.25 nm floor exceeded the distance) and the bearing flipped
-        // the cut ±35° at 100 ft over the numbers (2026-07-24). Short final
-        // uses small course-referenced corrections only — offsets there are
-        // either small or the balk gate's problem.
-        // FIXED-lead pursuit, not half-the-remaining-distance. With the aim at
-        // d/2 the cut angle decays only LINEARLY with distance (offset falls
-        // as d², cut ~ offset/d ~ d), so the aircraft rode the WHOLE final at
-        // an angle and only rolled out at the flare — measured at EGSS 22:
-        // final began 5.4 nm out with a 28° cut, still 20° at 3 nm, 9° at
-        // 1.9, 5° inside a mile, aligned at 0.13 nm, i.e. over the numbers
-        // ("never in line with the runway, always at an angle", 2026-07-28).
-        // A fixed lead makes the convergence exponential in TIME instead:
-        // hard correction early, established miles out, then a tracked,
-        // wings-level final — which is what "stabilised approach" means.
-        // ~30 s of travel, floored so a slow single still aims somewhere and
-        // capped so the far-out cut stays flyable.
-        let cut = if dist_nm > 0.30 {
-            let along = along_track_nm(cur_lat, cur_lon, rwy);
-            let aim_nm = pursuit_aim_nm(along, gs_kts, rwy.length_m);
-            let (alat, alon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, aim_nm);
-            let brg = bearing_deg(cur_lat, cur_lon, alat, alon);
-            crate::angles::signed_diff_deg(brg, rwy.course_deg).clamp(-35.0, 35.0)
-        } else {
-            (-xtk * 80.0).clamp(-8.0, 8.0)
-        };
+        // On final the heading is the runway course: the loop adds the
+        // final's cut to it (`FinalLateral`, 2026-10-12), where this branch
+        // flew a fixed-lead pursuit (`pursuit_aim_nm`, its history in
+        // docs/dev-history.md) and 80 degrees per nm inside 0.3 nm.
         if radio_alt_ft < 100.0 && dist_nm < 0.6 && xtk.abs() > landing_xtk_nm {
             // Not going to make the pavement: balk NOW, with height to work
             // with. The 22 ft flare-gate balk arrested nothing — the aircraft
@@ -744,7 +714,7 @@ pub fn guidance_on(
         } else {
             (
                 ApproachPhase::Final,
-                (rwy.course_deg + cut).rem_euclid(360.0),
+                rwy.course_deg,
             )
         }
     };

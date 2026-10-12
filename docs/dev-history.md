@@ -14412,3 +14412,79 @@ on every airframe; one that declares no `flare_elevator:` flies its defaults (pu
   on its air start, see above). The jets' power on final is now the energy throttle under their
   `approach_thrust_min` floor; an engaged A/T is still taken out to ARM (`ThrustWatch`), and the
   A330's `speed_governor:` no longer flies autoland's final.
+
+### 2026-10-12: one lateral law for the final
+
+The final's lateral was three laws handing over to each other: the fixed-lead pursuit (0.6 nm,
+a degree of cut for 36 m at 135 kt) with the track trim, the short final's 6 s closure and
+bias learner from 0.3 nm, and on the SR22 and the Zibo the declared track law (`final_track:`).
+Analysed on 60 recorded finals on seven airframes (the 172 27, the SR22 14, the Evolution 6,
+the Baron 4, the King Air 3, the SF50 3, the Zibo's LEMG 30 finals): the switch at 0.3 nm
+jumped the bug 2 to 6 degrees and its 6 s closure ran against a 5 to 6 s heading response (the
+SR22 1791810954 and the 172 1791808122 went round `off_centreline_low`); the learner's
+2.5 degree clamp had to carry the whole crab, so in a 15 kt crosswind 4 of the 60 replayed
+finals passed; the pursuit's lead on the half-degree knob weaved 7 to 12 m.
+
+- **One plant fits every airframe**: the heading mode banks K x lowpass(bug less heading) plus
+  a standing bias, through a roll lag; the track turns at g tan(bank) / TAS; the heading carries
+  a yaw the track does not. Fitted by least squares on the bank over 40-tick windows, the
+  recorded knob (`heading_set`) as input:
+
+  | airframe | K | roll lag s | filter s | bias deg | delay, window | t_r (step) s | t_r in flight s | yaw rms deg |
+  |---|---|---|---|---|---|---|---|---|
+  | C172 | 0.57 | 1.43 | 0.37 | -0.10 | none | 6.0 | 6.9 | 0.37 |
+  | SR22 | 0.76 | 1.26 | 0.95 | -0.20 | none | 5.3 | 5.2 | 0.37 |
+  | King Air C90B | 2.50 | 1.69 | 0.35 | -0.61 | none | 2.2 | 3.9 | 0.22 |
+  | Evolution | 2.09 | 1.14 | 0.53 | -0.53 | none | 2.4 | 3.2 | 1.52 |
+  | Baron 58 | 1.00 | 0.92 | 0.61 | -0.24 | none | 5.1 | 7.7 | 0.60 |
+  | SF50 | 2.04 | 1.19 | 0.65 | -0.56 | none | 2.1 | 3.6 | 1.08 |
+  | Zibo 737 | 1.08 | 4.59 | 1.26 | 0.10 | 1 s, 1 degree | 7.5 | 10 on its plant | 0.49 |
+
+  t_r is the integral of what is left of a 2.4 degree knob step; in flight it reads longer (the
+  yaw is error the track never answers), the medians of the recorded finals above.
+- **The law** (`autoland::FinalLateral`): bug = course + cut + crab, the cut
+  -atan((x + side x t_r + I) / (v t_r)) within 30 degrees, I the offset integrated over 4 t_r
+  within 8 m, v the groundspeed (30 m/s at least), the crab low-passed over 5 s (was 15). t_r
+  is measured in flight (`ResponseTime`): the knob less heading low-passed over 1.5 s, under
+  10 degrees, against the track's rate, sum(e e) / sum(e rate), on the intercept and the first
+  90 s of the first final above 300 ft, 40 ticks at least, within 3 to 10 s, else 6. From the
+  start of the final to the arrest; the knob a quarter degree at most every second (was half a
+  degree every two, and every tick inside 0.3 nm). The arrest's lateral, the flare's and the
+  rollout are untouched; an airframe whose own localiser lands it (`ap_lands`) is flown course
+  plus crab under it (the bug is not its input there).
+- On the analysis' replays (the fitted plants under the recorded finals, within 5 m at 50 ft and
+  no balk): the old laws 49 of 60 as recorded, 59 calm, 4 in a 15 kt crosswind, 57 in a 15 to 0
+  shear, 40 in gusts half again; the one law 58, 59, 58, 49 in gusts half again. The crab at
+  5 s against 15 on the same law: 59 against 56 recorded, 49 against 46 in the shear.
+- **The tests** (`final_lateral_tests`): the seven plants, each handed the final at 5 nm 40 m
+  right, 80 m left and on the line, t_r measured on an intercept first: worst at 50 ft calm 0.4
+  m, in a 15 kt crosswind 0.5, in a 15 to 0 kt shear 0.1, with the recorded yaw 4.4 (the
+  Evolution), all but the Zibo; the Zibo 5.3, 2.0, 3.6 and 3.8 (its whole-degree window holds a
+  cycle of about 5 m each side over 80 s; pinned a metre wider). The estimate on the plants: the
+  172 5.9 s, the SR22 5.4, the Baron 4.9, the three fast ones the 3 s floor, the Zibo the 10 s
+  ceiling. The knob never moves within a second of its last move nor by less than a quarter
+  degree.
+- **Gone**: `ShortFinal` and its bias learner, `SHORT_FINAL_*`, `short_final_cut_deg`,
+  `closure_cut_deg`, `final_track_cut_deg`, `final_track_heading`, `FINAL_TRACK_MAX_CUT_DEG`,
+  `FinalTrackProfile` and the SR22's and Zibo's `final_track:` blocks, `TrackTrim` and its
+  constants, the guidance's pursuit and 80 degrees per nm on the final (its heading on Final
+  is the course; the loop adds the cut), and the tests that pinned only those
+  (`the_short_final_learns_no_bias_from_its_own_turn`,
+  `the_short_final_holds_the_centreline_to_the_gate`, the track trim's four, the pursuit's
+  two on the final, `only_a_measured_airframe_flies_its_final_on_a_track_law`). The replays that
+  fly a final (`lemg_replay::FinalLoop`, the LEMG 13/31 and A330 circuit handoffs, the Zibo's
+  LEMG 30 finals) now fly the one law. No bench recording was read only by them.
+- **Kept, shared**: `pursuit_aim_nm` (the reversal's own prediction of the final), the gates
+  that model the final's convergence in time (`lands_on_the_pavement`, `stabilisable`,
+  `predicted_residual_m`: they still model the pursuit), the flare's guidance steer, and
+  `CrabFilter` (now 5 s), fed every tick.
+- Different from the replays: the A330's recorded LEMG 30 handoff (43 m off at 2.3 nm, coming
+  back at 3.6 degrees) reaches the gate 5.5 to 6.3 m right where the track trim's law made 5:
+  the 45 m closure winds the integral to its 8 m, the line is crossed by 5 m and over the last
+  mile the integral unwinds slower than a quarter degree asks to move the knob. No balk, inside
+  the landing limit. The Zibo's LEMG 30 finals: 1.0 to 4.1 m inside 1.5 nm on its window (the
+  track law 1.4 to 3.3), 7.3 to 10.4 against the wandering heading (6 to 11).
+- **UNFLOWN.** Check on the next finals: `autoland` `lateral_tr` (once a final: `t_r`,
+  `measured`, `samples`), the ticks' `t_r`, `lat_i_m`, `xtk_m` and `bug_true` against `psi`,
+  `trk` and `phi`, `heading_set` no oftener than a second, and no `going_around`
+  `off_centreline_low`.

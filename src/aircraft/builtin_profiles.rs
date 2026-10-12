@@ -253,7 +253,6 @@ pub(super) fn cessna_172sp() -> AircraftProfile {
         pitch_authority_down: None,
         climb_pitch_max_deg: None,
         circuit_final_lead_s: None,
-        final_track: None,
         // Reference figures from the X-Plane C172 Pilot's Operating Manual.
         reference: Some(ReferenceProfile {
             kind: Some("single-engine aircraft".into()),
@@ -667,7 +666,6 @@ pub(super) fn cirrus_sr22() -> AircraftProfile {
         pitch_authority_down: None,
         climb_pitch_max_deg: None,
         circuit_final_lead_s: None,
-        final_track: None,
         // Reference figures from the X-Plane Cirrus SR22 Pilot's Operating Manual
         // (the modeled aircraft is the turbo TSIO-550-K, ceiling 25,000 ft).
         reference: Some(ReferenceProfile {

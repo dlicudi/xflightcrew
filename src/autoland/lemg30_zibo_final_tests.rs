@@ -1,6 +1,5 @@
 use super::lemg_replay::*;
 use super::*;
-use crate::aircraft::FinalTrackProfile;
 
 /// The recorded LEMG 30 ticks and windows (see the file's own note).
 const BENCH: &str = include_str!(concat!(
@@ -120,7 +119,7 @@ fn replay_rms(fit: HeadingFit, pick: impl Fn(&Tick) -> bool) -> (f64, f64, usize
 }
 
 fn finals(t: &Tick) -> bool {
-    t.final_phase && t.dist > SHORT_FINAL_NM
+    t.final_phase && t.dist > 0.3
 }
 
 fn turns(t: &Tick) -> bool {
@@ -163,9 +162,8 @@ struct ZiboFinal {
     moves: u32,
 }
 
-fn fly(jet: &mut Jet, law: Option<FinalTrackProfile>, rwy: &Runway) -> ZiboFinal {
-    let mut lp = FinalLoop::new(Some(LEMG_WIDTH_M), TRACK_TRIM_ERR_CAP_DEG).held();
-    lp.final_track = law;
+fn fly(jet: &mut Jet, rwy: &Runway) -> ZiboFinal {
+    let mut lp = FinalLoop::new(Some(LEMG_WIDTH_M)).held();
     let mut out = ZiboFinal {
         halves: vec![0.0; 6],
         ..Default::default()
@@ -195,13 +193,6 @@ fn fly(jet: &mut Jet, law: Option<FinalTrackProfile>, rwy: &Runway) -> ZiboFinal
     }
     out.moves = lp.moves;
     out
-}
-
-fn zibo_law() -> FinalTrackProfile {
-    crate::aircraft::load("zibo_738")
-        .and_then(|p| p.final_track)
-        .and_then(FinalTrackProfile::valid)
-        .expect("the Zibo declares its final's track law")
 }
 
 /// The six finals of the brief: 30 m either side at 5 nm, calm and 10 kt
@@ -249,28 +240,24 @@ fn the_zibo_heading_fit_flies_the_recorded_windows() {
     );
 }
 
-/// Before: the pursuit on the fitted Zibo. A degree of cut is 36 m of
-/// offset and the window takes whole degrees, so it parks off the line
-/// with the window still: 3.8 to 7.0 m inside 1.5 nm, over 5 in four of
-/// the six finals. With the heading mode settling a degree off its window
-/// and back over 50 s (what the recorded finals' heading less window shows:
-/// 0.6 to 1.0 degrees rms over 20 s) it weaves 18 to 28 m, and 9 of the 24
-/// go around `unstabilised_below_floor` or `off_centreline_low`: the
-/// flights' 16 to 34 m and their go-arounds (the Intercept the fourth
-/// approach dropped to at 0.31 nm WAS its go-around). After: the track law
-/// holds every final inside 5 m from 1.5 nm (1.4 to 3.3), within 3 m at the
-/// roundout gate, never balks, and against the same wandering heading
-/// keeps 6 to 11 m, never balking.
+/// The final's one law (`FinalLateral`) on the fitted Zibo, its response
+/// time measured over the final's first 90 s. The pursuit it replaced parked
+/// 3.8 to 7.0 m off inside 1.5 nm with the window still (a degree of cut is
+/// 36 m and the window takes whole degrees), and with the heading mode
+/// settling a degree off its window and back over 50 s (the recorded
+/// finals' heading less window: 0.6 to 1.0 degrees rms over 20 s) weaved 18
+/// to 28 m, 9 of 24 going around: the flights' 16 to 34 m and their
+/// go-arounds; the declared track law after it held 1.4 to 3.3 m and 6 to
+/// 11. Here: no balk, 1.0 to 4.1 m inside 1.5 nm with the window still
+/// (the yaw included), 7.3 to 10.4 against the wandering heading.
 #[test]
-fn the_zibo_final_holds_the_line_on_its_track_law() {
+fn the_zibo_final_holds_the_line() {
     let rwy = lemg("30");
-    let law = Some(zibo_law());
-    let mut pursuit_over_5 = 0;
     for (x0, wf, wk) in starts(&rwy) {
         for wobble in [None, Some((1.3, 9.0))] {
             let mut jet = zibo(&rwy, 5.0 * M_PER_NM, x0, wf, wk);
             jet.yaw_wobble = wobble;
-            let f = fly(&mut jet, law, &rwy);
+            let f = fly(&mut jet, &rwy);
             let case = format!("{x0} m, {wk} kt from {wf:.0}, wobble {wobble:?}");
             assert!(f.balk.is_none(), "{case}: {f:?}");
             assert!(f.worst_in_1_5_m < 5.0, "{case}: {f:?}");
@@ -281,182 +268,37 @@ fn the_zibo_final_holds_the_line_on_its_track_law() {
             let late = f.halves[3..].iter().cloned().fold(0.0, f64::max);
             assert!(late <= early + 1.0, "{case}: {f:?}");
             assert!(f.worst_bank_deg < 6.0, "{case}: {f:?}");
-            if wobble.is_some() {
-                let mut jet = zibo(&rwy, 5.0 * M_PER_NM, x0, wf, wk);
-                let p = fly(&mut jet, None, &rwy);
-                if p.worst_in_1_5_m > 5.0 {
-                    pursuit_over_5 += 1;
-                }
-            }
         }
         for phase in [0.0, 1.6, 3.2, 4.7] {
-            let wander = |law| {
-                let mut jet = zibo(&rwy, 5.0 * M_PER_NM, x0, wf, wk);
-                jet.ap_offset = Some((1.1, 50.0, phase));
-                fly(&mut jet, law, &rwy)
-            };
-            let (p, f) = (wander(None), wander(law));
-            assert!(p.worst_in_1_5_m > 12.0, "the pursuit weaves: {p:?}");
+            let mut jet = zibo(&rwy, 5.0 * M_PER_NM, x0, wf, wk);
+            jet.ap_offset = Some((1.1, 50.0, phase));
+            let f = fly(&mut jet, &rwy);
             assert!(f.balk.is_none(), "{f:?}");
-            assert!(
-                f.worst_in_1_5_m < 12.0 && f.worst_in_1_5_m < 0.6 * p.worst_in_1_5_m,
-                "{f:?} against {p:?}"
-            );
+            assert!(f.worst_in_1_5_m < 12.0, "{f:?}");
         }
     }
-    assert!(
-        pursuit_over_5 >= 3,
-        "the pursuit parks off the line: {pursuit_over_5}"
-    );
 }
 
 /// The fourth approach as it began its final (sortie 1791381498-full_auto,
 /// 14:18:27Z): 32 m left at 5.49 nm, heading 298.6 and tracking 297.2 (a
 /// 3 kt wind from the right), 136 kt. On the pursuit, with the heading
-/// wandering a degree, it weaves 19 m inside 1.5 nm (flown: +18 at 3.5 nm,
-/// -5 at 2, +16 at 1, -20 at 0.31 and the go-around); on the track law 9 m.
-/// With the heading on its window, 1.1 m against the pursuit's 2.8.
+/// wandering a degree, it wove 19 m inside 1.5 nm (flown: +18 at 3.5 nm,
+/// -5 at 2, +16 at 1, -20 at 0.31 and the go-around). On the final's one
+/// law: 9.1 m wandering, 1.6 with the heading on its window.
 #[test]
-fn the_fourth_approach_replayed_on_the_track_law() {
+fn the_fourth_approach_replayed() {
     let rwy = lemg("30");
-    let fly_from = |law, wander: bool| {
+    let fly_from = |wander: bool| {
         let mut jet = zibo(&rwy, 5.49 * M_PER_NM, -32.1, rwy.course_deg + 90.0, 3.3);
         jet.psi = 298.6;
         jet.tas_mps = 136.0 * 0.514_444;
         if wander {
             jet.ap_offset = Some((1.1, 50.0, 0.0));
         }
-        fly(&mut jet, law, &rwy)
+        fly(&mut jet, &rwy)
     };
-    let law = Some(zibo_law());
-    let (p, f) = (fly_from(None, true), fly_from(law, true));
-    assert!(p.worst_in_1_5_m > 15.0, "{p:?}");
+    let f = fly_from(true);
     assert!(f.balk.is_none() && f.worst_in_1_5_m < 10.0, "{f:?}");
-    let (p, f) = (fly_from(None, false), fly_from(law, false));
-    assert!(
-        f.balk.is_none() && f.worst_in_1_5_m < 5.0,
-        "{f:?} against {p:?}"
-    );
-}
-
-/// The law is declared only where an airframe's heading response was
-/// measured (the Zibo, the SR22), and silent it is the pursuit: every other
-/// profile flies the heading the guidance gives, and so does a declaring
-/// airframe outside its final and in a failed track read.
-#[test]
-fn only_a_measured_airframe_flies_its_final_on_a_track_law() {
-    let law = zibo_law();
-    assert_eq!(
-        law,
-        FinalTrackProfile {
-            close_s: 12.0,
-            lead_s: 10.0
-        }
-    );
-    let mut others = 0;
-    for e in std::fs::read_dir("profiles").expect("profiles/").flatten() {
-        let path = e.path();
-        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if path.extension().is_none_or(|x| x != "yaml") || id == "zibo_738" || id == "cirrus_sr22" {
-            continue;
-        }
-        let p = crate::aircraft::load(id).expect(id);
-        assert_eq!(p.final_track, None, "{id}");
-        others += 1;
-    }
-    assert!(others > 5, "{others}");
-    assert!(FinalTrackProfile {
-        close_s: 0.5,
-        lead_s: 10.0
-    }
-    .valid()
-    .is_none());
-    assert!(FinalTrackProfile {
-        close_s: 12.0,
-        lead_s: -1.0
-    }
-    .valid()
-    .is_none());
-    let rwy = lemg("30");
-    let (lat, lon) = at(&rwy, 3.0 * M_PER_NM, 20.0);
-    let alt = rwy.elev_ft + (3.0 + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
-    let g = guidance_on(
-        lat,
-        lon,
-        alt,
-        alt - rwy.elev_ft,
-        135.0,
-        135.0,
-        &rwy,
-        135.0,
-        25.0,
-        0.0,
-        Some(LEMG_WIDTH_M),
-    );
-    assert_eq!(g.phase, ApproachPhase::Final);
-    let trk = Some(rwy.course_deg);
-    let x = 20.0;
-    assert_eq!(
-        final_track_heading(&g, rwy.course_deg, x, trk, 135.0, None),
-        g.target_heading_deg
-    );
-    assert_eq!(
-        final_track_heading(&g, rwy.course_deg, x, None, 135.0, Some(law)),
-        g.target_heading_deg
-    );
-    let short = Guidance {
-        dist_nm: SHORT_FINAL_NM,
-        ..g
-    };
-    assert_eq!(
-        final_track_heading(&short, rwy.course_deg, x, trk, 135.0, Some(law)),
-        short.target_heading_deg
-    );
-    let flare = Guidance {
-        arresting: true,
-        ..g
-    };
-    assert_eq!(
-        final_track_heading(&flare, rwy.course_deg, x, trk, 135.0, Some(law)),
-        flare.target_heading_deg
-    );
-    let away = Guidance {
-        phase: ApproachPhase::Intercept,
-        ..g
-    };
-    assert_eq!(
-        final_track_heading(&away, rwy.course_deg, x, trk, 135.0, Some(law)),
-        away.target_heading_deg
-    );
-    // 20 m right, tracking the course: a degree and a third left, where
-    // the pursuit asks half a degree.
-    let h = final_track_heading(&g, rwy.course_deg, x, trk, 135.0, Some(law));
-    let cut = crate::angles::signed_diff_deg(h, rwy.course_deg);
-    let pursuit = crate::angles::signed_diff_deg(g.target_heading_deg, rwy.course_deg);
-    assert!(
-        (-1.5..-1.2).contains(&cut) && (-0.7..-0.4).contains(&pursuit),
-        "{cut} {pursuit}"
-    );
-    // Drifting back at a degree of track (1.2 m/s), the lead counts 12 of
-    // the 20 m as closed already: half a degree.
-    let back = final_track_heading(
-        &g,
-        rwy.course_deg,
-        x,
-        Some(rwy.course_deg - 1.0),
-        135.0,
-        Some(law),
-    );
-    assert!(
-        (-0.7..-0.4).contains(&crate::angles::signed_diff_deg(back, rwy.course_deg)),
-        "{back}"
-    );
-    // Capped at 5 degrees, or the pursuit's own cut when that is bigger.
-    assert_eq!(
-        final_track_cut_deg(400.0, 0.0, 135.0, law, -1.0),
-        -FINAL_TRACK_MAX_CUT_DEG
-    );
-    assert_eq!(final_track_cut_deg(400.0, 0.0, 135.0, law, -8.0), -8.0);
+    let f = fly_from(false);
+    assert!(f.balk.is_none() && f.worst_in_1_5_m < 5.0, "{f:?}");
 }
