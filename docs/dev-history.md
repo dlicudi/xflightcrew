@@ -14304,3 +14304,22 @@ deg under its command as the pull rose 0.13 to 0.40 below 9 ft (1791802802), the
 measured ground pull (0.3) 76 and 119 fpm, drift under 2 deg, the centreline within 2.6 m
 (1791803088, 1791803366; `bench/sorties/baron-lemg.yaml`). Every low wing so far (SR22,
 King Air, Baron) needed its ground pull declared; the Evolution did not.
+
+### 2026-10-12: the SF50 crosses to layers; one path for the layered throttle; the RV-10 parked
+
+- **The SF50**: 68 and 95 fpm on LEMG 13 from 5 nm, drift under 2 deg, the centreline within
+  1.3 m (1791805150, 1791805443; `bench/sorties/sf50-lemg.yaml`), no ground pull declared. Its
+  fitted model (#163) and `lemg12_sf50_balloon_tests` are gone.
+- **The energy throttle's path is the dial the autopilot was told to fly** (`vs_dial`), not
+  the guidance's own VS: on the RV-10 the guidance read 0 while the nudged dial said -500,
+  so the throttle budgeted for level flight and held 98 kt against 80 for a minute; no
+  landing flap, and the stable gate sent it round (1791803684). On the dial: 82 kt.
+- **The RV-10 is parked on its old flare** (no fitted block to delete): its air start dives
+  (100 ft lost, 25 kt gained), so the final begins about 200 ft under the path, and its
+  autopilot climbed at +211 fpm on a -150 dial as the power came up (its xlua overrides the
+  AP knob): an autopilot to probe (`xvl conform`) before it can cross (1791804448: two
+  go-arounds, both the gate's right calls).
+- **The SF50's breathing sound**: `o2_valve_on` (the masks, per `sf50_oxygen.lua`) read 1 on
+  the ground after a layered sortie with the cabin at sea level and no `cabin_air` `masks`
+  record: nothing of ours wrote it, and written 0 it stayed 0. Suspected: the sim's own
+  engines-running air start. To confirm at the next air start.

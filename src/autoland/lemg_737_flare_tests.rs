@@ -791,17 +791,15 @@
         assert_eq!(s.last_key, Some(RetardKey::Slow));
     }
 
-    /// Only an airframe that declares a model flies it (the 737, and the
-    /// SF50 since LEMG 12, issue #163); a block without one keeps the
-    /// tracker (and a bad model is dropped, never the rest of the block).
+    /// Only an airframe that declares a model flies it (the 737); a block
+    /// without one keeps the tracker (and a bad model is dropped, never the
+    /// rest of the block).
     #[test]
     fn only_a_declared_model_flies_the_model_flare() {
         assert!(FlareModel::from_profile(profile_737().flare_elevator).is_some());
-        let sf50 = crate::aircraft::load("cirrus_vision_sf50").expect("sf50");
-        assert!(FlareModel::from_profile(sf50.flare_elevator).is_some());
         let tracker_only = crate::aircraft::FlareElevatorProfile {
             model: None,
-            ..sf50.flare_elevator.expect("the SF50's block")
+            ..profile_737().flare_elevator.expect("the 737's block")
         };
         assert!(FlareModel::from_profile(Some(tracker_only)).is_none());
         assert!(FlareModel::from_profile(None).is_none());
