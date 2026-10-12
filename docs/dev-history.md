@@ -14252,7 +14252,7 @@ wind on 30, its nose held flat in the last 5 ft while the pull rose 0.33 to 0.61
 wing's ground effect, bigger than the observer finds in time). Its MEASURED ground pull
 (`flare_elevator.ground_pull` 0.5, fed forward along `attitude_flare::ground_shape`, the
 observer reading only what is left) lands it at 174 and 123 fpm, nose up 1.6 to 2.2 deg
-(1791794303, 1791794608 approx; runways 30 and 12 into wind). The plant gained the declared
+(1791796805 on 30, 1791797100 on 12, into wind). The plant gained the declared
 pull and a per-case pull limit; declaring it 50% off still lands under 240.
 
 - `flare_elevator.max` may be up to 1.0 (the attitude flare's limit is the stop); a declared
