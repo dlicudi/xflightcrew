@@ -420,14 +420,10 @@ takeoff_power:
   torque_ftlb: 1250.0
   until_kias: 150.0
 
-# The layered autonomy (docs/tasks/autonomy-layers): the attitude flare,
-# the energy throttle and the measured rollout brake, no fitted law. On
-# its old fitted flare model (issue #196, history in docs/dev-history.md)
-# it touched at 392 fpm on the tracker before it; on layers 117 and 86
-# (LEMG 13, 1791801818, 1791802111), no ground pull needed.
-layers: true
+# The attitude flare: 117 and 86 fpm (LEMG 13, 1791801818, 1791802111),
+# no ground pull needed (the old fitted flare's history, issue #196, is in
+# docs/dev-history.md).
 flare_elevator:
-  gain: 1.0
   # The attitude flare's pull limit: it holds the nose angle, the limit is
   # the stop.
   max: 0.8

@@ -247,13 +247,9 @@ lights:
 # `checklist_map` block and no `locations` — cockpit geography is answered from
 # a verified layout or not at all, never guessed.
 
-# The layered autonomy (docs/tasks/autonomy-layers): the attitude flare,
-# the energy throttle and the measured rollout brake, no fitted law: 186
-# fpm, then with its ground pull 76 and 119 (LEMG 13, 1791802802,
-# 1791803088, 1791803366).
-layers: true
+# The attitude flare: 186 fpm, then with its ground pull 76 and 119
+# (LEMG 13, 1791802802, 1791803088, 1791803366).
 flare_elevator:
-  gain: 1.0
   # The attitude flare's pull limit: it holds the nose angle, the limit is
   # the stop.
   max: 0.8

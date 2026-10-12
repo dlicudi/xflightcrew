@@ -115,62 +115,14 @@ flare_power:
 roll_rudder:
   yaw_dps: 11.5
   at_kts: 80.0
-# The flare's elevator: the default 0.35 of pull ran out with the nose at 1
-# degree at LEMG 13 (a 737 lands at 4 to 6, strikes its tail near 11).
+# The attitude flare's limits: the default 0.35 of pull ran out with the
+# nose at 1 degree at LEMG 13 (a 737 lands at 4 to 6, strikes its tail near
+# 11), and pull-only. The old fitted flare model and its replays are in
+# docs/dev-history.md (2026-09-26 to 2026-10-06). Unflown on the attitude
+# flare.
 flare_elevator:
-  # Softer and pull-only: at gain 1.0 the arrest took the sink from -758 to
-  # -156 in under three seconds, overshot its -460, PUSHED to -0.1 at 43 ft,
-  # and the nose-down sink reached -775 against full pull (LEMG 13,
-  # 2026-09-26, -769 fpm at the wheels).
-  gain: 0.6
   max: 0.45
   max_push: 0.0
-  # Exponential flare: the sink target falls with the height, so the
-  # arrest keeps descending instead of floating. The flat -175 floated LEMG
-  # 13 from 36 to 19 ft (2026-09-26). To 150 fpm at the wheels (the model
-  # below), taken at the height predicted at the model's horizon. 5.5 s,
-  # not 6: the target is 150 fpm plus 60 / tau a foot, so from 20 ft the
-  # 6 s flare is 5 s to the wheels, and LXGB 09 (2026-10-06, wet, rough
-  # air) touched 631 m past a 1,627 m runway's threshold. Replayed through
-  # that flare's own fit (5,500 fpm, 1.35 s) and air: 6 s floats past 700
-  # m, 5.5 s with the float's 0.08 lands at 477 m and 101 fpm, inside the
-  # first third; the sixteen LEMG 13 flares 244 mean, 289 worst (277 at
-  # 6 s), the 2026-09-26 gates through every plant 339 worst (316), EGBB
-  # 15 310 (318).
-  tau_s: 5.5
-  # A bounce eases the pull, never drops it: dropped to neutral, the nose
-  # came down and the 737 met the runway again (LEMG circuit, 2026-09-26).
-  balloon_ease_per_s: 0.15
-  # How the sink answers the column with the servos out, fitted to the
-  # seven LEMG flares of 2026-09-26 (six on 13, one on 12; the elevator
-  # written against the sink that followed, 35 fpm rms): 4,970 fpm of
-  # standing sink change per unit of pull through lags of 0.84 and 3.1 s
-  # after 1.35 s of dead time, and the aircraft's own nose-down near the
-  # runway, 405 fpm of sink at the wheels growing from 43 ft. Per flare
-  # the gain ran 4,020 to 6,430 and the dead time 1.16 to 2.17 s; the LEMG
-  # 12 flare was the weak slow end (4,021, 1.77). Declared, the whole
-  # arrest from the roundout gate is flown on this model (autoland::
-  # FlareModel, a prediction to the horizon) instead of the tracker above;
-  # gain and trim are then unused. The flare holds the column the model's
-  # own way: a near-level float never takes it forward, and in rough air
-  # (autoland::FinalAir, the final's sink straying over 40 fpm rms) nothing
-  # but a climb does (LEMG 13, 2026-09-28: 422 fpm in gusts after the
-  # prediction eased 0.39 to 0.08 into a float). The law's gain is 3,500 on
-  # purpose, under every flare's own: it pulls for the weakest.
-  # Replayed from all seven recorded gates through each flare's own plant
-  # (49 landings): 181 to 310 fpm, no balloon; LEMG 12's own gate and plant
-  # 248 (the first model law, 408 there, flew 407). VERIFY: autoland ticks
-  # carry flare_target, flare_ahead, flare_unexplained to the wheels.
-  model:
-    fpm_per_elevator: 3500.0
-    lag_s: 0.84
-    lag2_s: 3.1
-    dead_s: 1.5
-    ground_fpm: 405.0
-    ground_ft: 43.0
-    horizon_s: 2.5
-    touchdown_fpm: 150.0
-    observer_s: 0.3
 # How the landing arrest leads THIS autopilot. The 172's law (gain 2, dial
 # cap +300, no trend term) was fitted to a first-order 4.5 s lag; this
 # aircraft's VS mode, fitted to the EGCC 23L tick log (2026-09-19), is two

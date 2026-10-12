@@ -126,19 +126,12 @@ flaps:
     - { label: "50", spoken: fifty percent, ratio: 0.5, vfe_kts: 150.0 }
     - { label: full, spoken: full,          ratio: 1.0, vfe_kts: 110.0 }
 
-# THE LANDING: the layered autonomy (docs/tasks/autonomy-layers): the
-# attitude flare, the power on total energy, the light rollout brake, the VS
-# set once and nudged on its own path. No fitted law: its elevator answers
-# about 25 deg/s per unit, inside the band the flare is tested over, and
-# its low wing's ground effect is MEASURED (`ground_pull`). On its old fitted
-# flare model (6,000 fpm per unit, 1.4 s lags, a 7 s exponential: issue
-# #166, its history in docs/dev-history.md) it touched at 400 to 452 fpm on
-# LEMG; on layers 174 and 123 (2026-10-12). The touch hold and the lever's
-# walk off in the flare (`flare_power`) stand under either.
-layers: true
-
+# THE LANDING: the attitude flare (docs/tasks/autonomy-layers). Its
+# elevator answers about 25 deg/s per unit, inside the band the flare is
+# tested over, and its low wing's ground effect is MEASURED (`ground_pull`):
+# 174 and 123 fpm (2026-10-12; the old fitted flare's history is in
+# docs/dev-history.md).
 flare_elevator:
-  gain: 1.0
   # The attitude flare's pull limit: the low wing's ground effect held the
   # nose at 0.3 deg under a 1.2 to 1.6 command with the pull on 0.5 from
   # 3 ft (LEMG 13, 1791792245). The law holds the nose angle; the limit is

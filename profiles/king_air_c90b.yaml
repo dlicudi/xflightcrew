@@ -271,14 +271,10 @@ reference:
 # degrees and flew 22.4 with the law pinned at its limit. VERIFY.
 pitch_authority_down: 0.25
 
-# The layered autonomy (docs/tasks/autonomy-layers): the attitude flare,
-# the energy throttle and the measured rollout brake, no fitted law. On
-# its old fitted flare model (issues #197, #202, history in
-# docs/dev-history.md) it touched at 29 to 641 fpm and once left the
-# runway; on layers 203 and 202 (LEMG 13, 1791799361, 1791800024).
-layers: true
+# The attitude flare: 203 and 202 fpm (LEMG 13, 1791799361, 1791800024;
+# the old fitted flare's history, issues #197 and #202, is in
+# docs/dev-history.md).
 flare_elevator:
-  gain: 1.0
   # The attitude flare's pull limit: it holds the nose angle, the limit is
   # the stop (the SR22's 0.8).
   max: 0.8

@@ -416,16 +416,10 @@ cabin_air:
 # The flare's power leaves over about three and a half seconds, paused
 # while the sink is over 300 fpm (`flare_power`): the engine sits high on
 # the tail, so the lever is a pitch input too (EDLP 24, 2026-09-24). On
-# the tracker it met LEMG 12 at -814 fpm, then flew a fitted model (issue
-# #163, history in docs/dev-history.md); on layers 68 and 95 (LEMG 13,
-# 1791805150, 1791805443), no ground pull needed.
-#
-# The layered autonomy (docs/tasks/autonomy-layers): the attitude flare,
-# the energy throttle and the measured rollout brake, no fitted law.
-layers: true
+# the attitude flare 68 and 95 fpm (LEMG 13, 1791805150, 1791805443), no
+# ground pull needed (the old fitted flare's history, issue #163, is in
+# docs/dev-history.md).
 flare_elevator:
-  gain: 0.5
-  trim_gain: 3.0
   # The attitude flare's pull limit: it holds the nose angle, the limit is
   # the stop.
   max: 0.8
