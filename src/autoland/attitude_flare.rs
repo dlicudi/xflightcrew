@@ -181,7 +181,14 @@ impl AttitudeFlare {
         });
         self.alpha_f += (i.alpha_deg - self.alpha_f) * (dt / ALPHA_TAU_S).min(1.0);
         let vs_t = vs_target_fpm(i.radio_ft, entry.vs_fpm, entry.gate_ft);
-        let gamma_cmd = (vs_t / v_fpm).clamp(-1.0, 1.0).asin().to_degrees();
+        // Above the gate, never steeper than the path flown (nor a climb):
+        // holding the entry path, the SR22 pushed a gust's -1.0 deg back
+        // toward -2.95, the nose to -7.8 on the push limit, and met the
+        // runway at 441 fpm (LEMG 13, 1791813026). Below it the round-out
+        // is the plan's: held there too, a nose rising into the flare locks
+        // in its own overshoot and floats.
+        let planned = (vs_t / v_fpm).clamp(-1.0, 1.0).asin().to_degrees();
+        let gamma_cmd = if i.radio_ft > entry.gate_ft { planned.max(gamma.min(0.0)) } else { planned };
         // The target moves with the height, predictably: below the gate the
         // wanted sink falls by (entry - touchdown) / gate per foot, and the
         // height falls at the sink. Led, not chased (a lag chain tracking a

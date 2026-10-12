@@ -188,3 +188,39 @@ fn a_measured_ground_pull_lands_a_low_wing_soft() {
         }
     }
 }
+
+/// A gust that shallows the path in the arrest is never pushed back down to
+/// the entry path: the SR22 entered at -460 fpm, a gust at 29 ft took it to
+/// -1.0 deg, and the law pushed the nose to -7.8 deg on its push limit for
+/// 14 ft, diving it to -544 fpm and onto the runway at 441 (LEMG 13,
+/// 1791813026). Above the gate the path flown stands; below it the
+/// round-out is the plan's.
+#[test]
+fn a_gust_that_shallows_the_path_is_never_pushed_back_down() {
+    for b in [22.0, 32.0, 46.0] {
+        let mut p = Plant::new(b, 1.0, -3.0, 48.0);
+        let mut law = AttitudeFlare::default();
+        let (dt, mut t, mut gusted, mut min_after) = (0.2, 0.0, false, f64::MAX);
+        while p.h_ft > 0.0 && t < 40.0 {
+            if !gusted && p.h_ft < 30.0 {
+                p.gamma = -1.0;
+                p.theta = p.gamma + ALPHA0;
+                gusted = true;
+            }
+            let o = law.step(
+                In { radio_ft: p.h_ft, theta_deg: p.theta, alpha_deg: p.alpha(), q_dps: p.q, tas_kts: p.v_kts, dt, ground_pull: 0.0 },
+                PULL,
+                0.10,
+            );
+            if gusted && p.h_ft > o.gate_ft {
+                min_after = min_after.min(o.gamma_cmd_deg - p.gamma.min(0.0));
+            }
+            for _ in 0..20 {
+                p.step(o.elev, dt / 20.0);
+            }
+            t += dt;
+        }
+        assert!(min_after > -0.01, "b {b}: asked {min_after:.2} deg steeper than flown");
+        assert!(-p.vs_fpm() < 200.0, "b {b}: {:.0} fpm", -p.vs_fpm());
+    }
+}
