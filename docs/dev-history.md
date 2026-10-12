@@ -14376,3 +14376,39 @@ to the threshold, 1791808122). The ILS reference after it: 136 fpm (1791808787).
   into the flare locked in its own overshoot and floated on the plant).
 - Flown: the SR22 133 and 133 fpm, 1.3 and 1.1 m, in a 130/9 wind (1791814190, 1791814508);
   the C172 ILS reference 157 fpm, 1.7 m (1791814879).
+
+### 2026-10-12: the old flare law is deleted
+
+The layered law is the only autoland law for every fixed-wing airframe (pilot, 2026-10-12): the
+`layers` profile switch is gone, and what it selected is unconditional. The attitude flare runs
+on every airframe; one that declares no `flare_elevator:` flies its defaults (pull 0.35, push
+0.10, no ground pull: the old law's own limits).
+
+- **Gone:** the fitted model flare (`FlareModel`, `flare_elevator.model` and every key in it,
+  the rate plant and the rough-air hold), the P+D tracker flare (the ratchet, the balloon ease,
+  `gain`, `trim_gain`, `balloon_ease_per_s`), the exponential flare target (`tau_s`), the final's
+  air measure (`FinalAir`), the hold-off's touch hold (`TouchHold`: only a `model.hold_off_ft`
+  armed it, and no profile declared one since the SR22 crossed), the fixed-ratio rollout brake
+  (`rollout_brake_ratio`: every airframe brakes on the deceleration it measures, `DecelBrake`),
+  and the shared speed governor on autoland's final (every airframe flies its approach power on
+  `energy_throttle`). Gone with them: the tests and plants that pinned only those laws
+  (`lemg_737_flare_tests`, `lemg13_sr22_flare_tests`, the model parts of the A330 and Zibo
+  files) and the recordings only they read (`bench/landings/egbb15_rough_float.jsonl`,
+  `lemg13_calm_flares.jsonl`, `lemg13_gusty_flares.jsonl`). The profiles' narrative of the old
+  fits went with their keys; it is in git at fe76d97 and in the entries above.
+- **Kept, shared:** the level hold until the autopilot is confirmed (the old tracker's free
+  half, now `LevelHold`), `arrest_lead` and `vs_dial_fpm` (the energy throttle pays for the led
+  dial in the roundout), `flare_power`, `balloon_power`, `short_final_power_held`,
+  `roundout_float_lever`, the floors, `landing_call`, `commit_flare`, `hold_roundout`, the
+  arrest's wings, `ap_lands`.
+- **The go/no-go now predicts the flare that is flown** (`flare_time_s`): the path's sink to the
+  attitude flare's height, then its round-out and hold-off, where it predicted the old law's
+  exponential. Longer in the air: LXGB 09's gate on the 737 still LANDs, 923 m in with 840 m
+  ahead against the roll's 792 (the exponential said 400 to 800 m in); the Zibo's six LEMG 30
+  gates 844 to 1,129 m in, all LAND.
+- **Unflown on the layered law:** the stock 737, the Zibo (its own flare, when `autopilot_lands`
+  is not flying it), the A330 (a rate plant: its declared push 0.3 is now the attitude flare's
+  push limit), the Citation X, the MD-82, the 747, the DC-3, the Twin Otter and the RV-10 (parked
+  on its air start, see above). The jets' power on final is now the energy throttle under their
+  `approach_thrust_min` floor; an engaged A/T is still taken out to ARM (`ThrustWatch`), and the
+  A330's `speed_governor:` no longer flies autoland's final.
