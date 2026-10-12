@@ -403,28 +403,6 @@ mod lemg30_zibo_final_tests;
 #[cfg(test)]
 mod edlp_go_around_tests;
 
-/// Issue #163: LEMG 12, the SF50 (sortie 1790611629, 2026-09-28), in rough
-/// air (the final's stray 42 fpm rms). The arrest took the servos at 51 ft,
-/// its roundout pulled 0.19 into a +263 fpm balloon and pushed -0.05 through
-/// it, handed the servos back at 50.5 ft (the band's top, 50 ft, from the
-/// radio height alone), the autopilot flew its -445 fpm dial for 1.2 s with
-/// the lever walked 0.16 to 0.27, the arrest took them again at 48.4 ft with
-/// the sink rebuilding, and the wheels met the runway at -814 fpm.
-///
-/// The plant is the SF50's elevator with the servos out, in the form of
-/// [`FlareModel`]: a standing change of sink per unit of pull through two
-/// lags after a dead time, fitted to the three clean SF50 arrests on record
-/// (ETND 26 2026-09-23, EDLP 24's balked balloon 2026-09-24, and this
-/// roundout), each flare's own plant and the one fitted to all three. On
-/// top of it, what the model does not carry: the speed bleeds 1.71 kt/s
-/// less 1.29 kt/s per 1,000 fpm of climb (fitted to the same four SF50
-/// arrests' ticks), under the 67 kt Vso the wing gives the sink 800 fpm a
-/// second (the sink's own answer to the speed is inside the fit: a fit
-/// with 63 fpm a knot on top chose none), and rough air is a random
-/// vertical gust (an Ornstein-Uhlenbeck sink, 1.5 s). The plugin's pitch
-/// channel and the loop's tick (0.35 s) are inside the dead time.
-#[cfg(test)]
-mod lemg12_sf50_balloon_tests;
 
 /// Issue #166: LEMG 13, the SR22 (sortie 1790619465-approach, 2026-09-28),
 /// 4.7 kt of wind from 145, the final's air 20 fpm rms (smooth). The arrest
@@ -460,43 +438,6 @@ mod lemg12_sf50_balloon_tests;
 #[cfg(test)]
 mod lemg13_sr22_flare_tests;
 
-/// Issue #166, the BOUNCE: LEMG 13, the SR22 on the iMac (a 0.4 to 0.46 s
-/// loop), three 5 nm finals at the POH's 80 kt on 2026-09-29 (sorties
-/// 1790701546, 1790702352, 1790702623), the final's air 42 to 45 fpm rms.
-/// Each flew the jets' firm-touchdown flare to the wheels: the target a sink
-/// of 107 fpm at the runway, the lever held at approach power to a second
-/// from the wheels, the IAS 80 to 81 all the way down, first contact at 207
-/// to 215 fpm with 0.10 of pull on the column. Each then flew: the ratchet
-/// held the 0.10 as it came back up, the balloon ease let it go to neutral,
-/// the balloon's approach thrust (0.265) came back at 3 to 4 ft, and the
-/// wheels met again with the pull the flare had rebuilt on the way down:
-/// 4.5 to 4.9 ft, then 4.9 to 6.0, then 9.9 ft after the rollout latched on
-/// a 0.115 pull at 75 kt. At neutral and idle the hops went on to 55 to 60 kt.
-///
-/// The plant: the standing-sink elevator of [`FlareModel`] refitted to the
-/// three 80 kt flares, carried to the ground by the vertical speed through a
-/// lag of its own (the lift the pull adds is an ACCELERATION: a hop needs an
-/// aircraft that can move faster than its standing sink), the tail's ground
-/// effect sinking it from 40 ft, the gear a soft spring and damper, and the
-/// mains' contact pitching the nose up (a climb tendency in proportion to the
-/// sink met up to 369 fpm, scaled by the dynamic pressure, decaying; unbound
-/// it ran away), the gear bottoming at 0.4 ft. Fitted open loop, the column
-/// and lever as written, to the three flares' sink before contact and their
-/// first six hops after it. A fit is only as good as the model it fits: the
-/// elevator's authority on the wheels and the pitch the gear makes are not
-/// measured (no attitude in the autoland ticks), only their sum.
-///
-/// What it says: the flare as flown bounces 3.8 to 5.9 ft in every plant,
-/// as it did in the sim. The hold-off (`hold_off_ft` 2 ft, `touchdown_fpm`
-/// 50, `tau_s` 7, the speed's bleed led (`fpm_per_kt`), the lever to idle
-/// from 20 ft, `TouchHold` from the first contact) touches once at 124 fpm
-/// or less at 64 to 69 kt, the hop at most 1.2 ft. The sim decides: VERIFY
-/// on the next SR22 landings `touch_hold` (held pull, at, ias), the ticks'
-/// `touch_hold` and `flare_ask` below 20 ft, the `power` events' `retard`
-/// (float or timed from 20 ft, then `touched`), `bounce` events (none, or one
-/// spell under 1.5 ft), the landing's `sink_fpm` and `bounce_ft`.
-#[cfg(test)]
-mod lemg13_sr22_bounce_tests;
 
 /// Issue #166, the rollout: LEMG 13, the SR22 (sortie 1790619465-approach,
 /// 2026-09-28), both brakes at 0.24 and the rudder alone steering. The

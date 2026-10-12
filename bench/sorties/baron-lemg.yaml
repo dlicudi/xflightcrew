@@ -1,0 +1,14 @@
+# The Beechcraft Baron 58 on LEMG from a 5 nm final, on whatever laws its profile flies
+# (the baseline before it crosses to `layers`, docs/tasks/autonomy-layers):
+# the pitch plant on the tape (`autoland` theta, alpha, q, elev_total, tas)
+# measures its elevator authority for the attitude flare.
+#   xvl sortie bench/sorties/baron-lemg.yaml
+after: stop
+
+cases:
+  - name: Baron LEMG into wind, 5 nm final
+    setup:
+      aircraft: "Aircraft/Laminar Research/Beechcraft Baron 58/Baron_58.acf"
+      approach: { field: LEMG, runway: wind, final_nm: 5 }
+    traffic: off
+    deadline_min: 10

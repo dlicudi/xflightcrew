@@ -3436,7 +3436,12 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                     accel_kts_s: trend_kts_s,
                                     vs_fpm: vy_ms * 196.850_394,
                                     target_kts: target,
-                                    path_vs_fpm: if level_for_gs { 0.0 } else { g.target_vs_fpm },
+                                    // The path paid for is the one the autopilot
+                                    // was TOLD to fly: the guidance's own VS read 0
+                                    // while the nudged dial said -500, and the RV-10
+                                    // held 98 kt against 80 for a minute, no landing
+                                    // flap, sent round by the gate (1791803684).
+                                    path_vs_fpm: if level_for_gs { 0.0 } else { vs_dial },
                                     thr_now: t,
                                     dt: dt_s,
                                 }) - t

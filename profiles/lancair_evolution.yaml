@@ -420,81 +420,18 @@ takeoff_power:
   torque_ftlb: 1250.0
   until_kias: 150.0
 
-# The flare (issue #196; LILB 03 on the iMac, 2026-09-30, sortie
-# 1790740292-full_auto, the one autoland it has flown): on the jets' default
-# tracker it touched at 392 fpm on the gauge. The pilot's VSI gauge the laws
-# read lags the flight path by about a second on this airframe, so at 9 ft,
-# level for a second, the gauge still read -386 to -82 and the tracker's
-# balloon lead let its whole 0.35 of pull go at once; the height then fell at
-# 800 fpm or more onto the runway. At 24 ft the same let-go and the balloon's
-# approach thrust had carried it back up to 32 ft. The flare flown on a
-# model instead (the SF50's and the SR22's law):
-#   * the model fitted to that flare's gauge (6,450 fpm per unit through
-#     1.3 s lags after 0.67 s: the path's 1.5 s and the gauge's 1 s are in
-#     the lags), no tail effect, 150 fpm of sink per knot the speed bleeds;
-#   * the exponential flare to 200 fpm on a 3 s constant, the pull up to 0.5,
-#     a balloon eased at 0.15 a second, never dropped;
-#   * NO hold-off: from the POM's 90 kt final a float to the stall ran 800 to
-#     940 m past the gate on the plant, and LILB is 601 m;
-#   * the lever off from 20 ft at up to 0.1 a second.
-# On the first fit's plants (0.7 ft, 43 fpm rms; the gauge and the
-# path 20 % either way, the dead time 0.1 s either way, with and without the
-# wing's cushion) the tracker as flown meets the runway at 260 to 1,020 fpm
-# (950 on the fit); this, from five 90 kt gates, calm and rough, touches
-# once under 140 fpm on the path and the gauge, under 1 ft after it, no
-# more than 575 m past the gate (`lilb03_evolution` tests).
-# VERIFY: blackbox `flare_ask`, `flare_target`, `flare_elev` and `vvi` from
-# `arrest_hands` to the wheels (the pull eased, never dropped from 0.3 to 0
-# in a tick), the `power` events' `retard` from 20 ft and no `balloon`, the
-# `committed_flare` `remaining_m`, `bounce` events, and the landing's
-# `sink_fpm` (under 250) and `bounce_ft` (under 1.5).
-# THE MODEL REFITTED (issue #196's landing; LILB, sorties
-# 1790781114-full_auto and 1790793076-full_auto): flown on the model above,
-# 1790793076 came into it at 339 fpm and 53 ft against a target of 500 (the
-# path's), held neutral while the sink built to 454 at 28 ft, pulled 0.14 to
-# 0.18 from 24 ft, and the sink still grew to 595 at 13 ft: 584 at the
-# wheels; 1790781114, which still pushed, 570. The one-flare plant above
-# lands that flare as flown at under 100 fpm and cannot follow 1790781114 at
-# all. Refitted to all three flares (radio 1.2 to 1.9 ft rms, gauge 40 to 55
-# fpm), the aircraft sinks harder near the runway than the elevator and the
-# speed explain, 920 fpm at the wheels growing from 22 ft, behind the path's
-# own 1.06 s and the gauge's 0.61 s, while the elevator arrives through
-# 0.35 s of dead time and two 0.49 s lags: on that plant the flare as flown
-# meets the runway at over 400 fpm, as the sim did. So the model is the
-# refit: the elevator's dead time and lags are its dead time (1.3 s), the
-# path and the gauge its two lags (1.1 and 0.6 s, which the ground term
-# rides, as it does on the aircraft), 6,790 fpm a unit, 105 a knot, and the
-# refit's ground. Carried in the old lags (2.6 s) the ground arrived a
-# second late in the prediction, and the plants landed 15 to 470 fpm
-# whatever the target. The time constant alone is not the fault: on a 3, 5
-# or 8 s constant the flare as flown still meets the refit at 574 fpm or
-# more. With the refit model, a 5 s constant to 100 fpm is the flare whose
-# worst neighbour stays inside 250 (a 3 s one to 100: 257; to 150: 314).
-# From seven gates (the three recorded, four neighbours) on the refit and
-# its neighbours (the dead time 0.1 s, the path and the gauge 20 %, the
-# ground 15 % either way), calm and rough: 85 to 242 fpm on the path and the
-# gauge, at most 1.7 ft after, at most 692 m past the gate
-# (`lilb03_evolution`).
-# VERIFY #196: `flare_elev` off neutral by 40 ft (it held 0.00 to 28), the
-# sink's peak above 30 ft (on the plant 524 at 33 ft, then 305 at 20 ft and
-# 130 at the wheels), `vvi` under 250 the tick before the wheels,
-# `committed_flare` `remaining_m`, the landing's `sink_fpm` 60 to 250 and
-# `bounce_ft` under 2.
+# The layered autonomy (docs/tasks/autonomy-layers): the attitude flare,
+# the energy throttle and the measured rollout brake, no fitted law. On
+# its old fitted flare model (issue #196, history in docs/dev-history.md)
+# it touched at 392 fpm on the tracker before it; on layers 117 and 86
+# (LEMG 13, 1791801818, 1791802111), no ground pull needed.
+layers: true
 flare_elevator:
   gain: 1.0
-  max: 0.5
+  # The attitude flare's pull limit: it holds the nose angle, the limit is
+  # the stop.
+  max: 0.8
   max_push: 0.05
-  balloon_ease_per_s: 0.15
-  tau_s: 5.0
-  model:
-    fpm_per_elevator: 6794.0
-    lag_s: 0.6
-    lag2_s: 1.1
-    dead_s: 1.3
-    ground_fpm: 920.0
-    ground_ft: 21.9
-    touchdown_fpm: 100.0
-    fpm_per_kt: 105.0
 flare_power:
   reduction_per_second: 0.1
   retard_max_per_s: 0.1

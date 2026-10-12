@@ -767,3 +767,30 @@ impl UnclearedWatch {
         None
     }
 }
+
+#[cfg(test)]
+mod touch_hold_tests {
+    use super::*;
+
+    /// Held on: the pull it touched with, never more and never less, the
+    /// lever closed; let go only on the wheels below the release speed.
+    #[test]
+    fn touch_hold_keeps_the_pull_it_touched_with() {
+        let mut t = TouchHold::default();
+        assert!(!t.note(false, Some(0.3)), "no contact");
+        assert_eq!(t.elev(70.0, false, 0.45), None, "nothing held before a contact");
+        assert!(t.note(true, Some(0.31)));
+        assert!(!t.note(true, Some(0.5)), "the first contact's pull, once");
+        assert_eq!(t.elev(66.0, true, 0.45), Some(0.31));
+        assert_eq!(t.elev(64.0, false, 0.45), Some(0.31), "a hop keeps it");
+        let e = t.elev(40.0, true, 1.0).unwrap();
+        assert!((e - (0.31 - TOUCH_HOLD_EASE_PER_S)).abs() < 1e-9, "{e}");
+        for _ in 0..20 {
+            t.elev(30.0, true, 1.0);
+        }
+        assert_eq!(t.elev(30.0, true, 1.0), None, "let go at neutral");
+        let mut push = TouchHold::default();
+        push.note(true, Some(-0.04));
+        assert_eq!(push.elev(70.0, true, 0.45), Some(0.0), "never a push");
+    }
+}
