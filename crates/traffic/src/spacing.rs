@@ -914,10 +914,17 @@ pub fn apply(
         // Nor one that stands waiting on this one: two each stopped for the
         // other never move (USRK, the hour sweep, 2026-10-09: an arrival
         // for the stand a departure had just left, nose to its side).
+        // And one whose ways round have not moved it: still for twice the
+        // guard's patience, its plans have failed, whatever they say. LEMG
+        // (2026-10-12): an arrival taxiing in met two departures nose to
+        // nose, planned round one, then the other, every 90 s for ten
+        // minutes, each plan clearing its "no way", and neither departure
+        // could ever have it towed; three more and our own queued behind.
         let me = Blocker::Traffic(fleet[i].id);
         let towable = ob.idx.filter(|&j| {
             let b = &fleet[j];
             b.phase == Phase::Parked
+                || b.spacing.still_s >= 2.0 * STUCK_S
                 || (b.spacing.still_s >= STUCK_S
                     && (ways[j].is_none()
                         || b.spacing.no_way.is_some()
