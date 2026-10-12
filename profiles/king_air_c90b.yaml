@@ -271,76 +271,23 @@ reference:
 # degrees and flew 22.4 with the law pinned at its limit. VERIFY.
 pitch_authority_down: 0.25
 
-# THE FLARE (issue #197; LEMG 13 from 4 nm on the iMac, 2026-09-30,
-# sorties 1790757702, 1790758429, 1790758604): flown on the jets' default
-# tracker, each arrest took the servos at 59 to 61 ft sinking 640 to 700 fpm
-# at 110 to 114 KIAS, pulled 0.23 to 0.35 and ballooned (61 ft level; then
-# 17.5 to 39 ft on the balloon's approach thrust), was let go to neutral,
-# and the sink it rebuilt met the runway at 730 to 960 fpm on the gauge a
-# tick before the wheels (the scorer read 256 to 518 from its 3 s samples
-# after the contact). Fitted to the three flares with the servos out (radio
-# 1.9 to 2.3 ft rms, gauge 50 to 56 fpm rms): 9,500 to 9,700 fpm of standing
-# sink per unit of pull after 0.8 s of dead time, through the path's 2.3 to
-# 2.6 s and the gauge's 0.9 s, and 100 to 118 fpm of sink per knot the speed
-# loses; the tail's ground effect is 323 fpm from 40 ft with the lever on a
-# 4 s spool, none with it on 2 s (the lever's own sink is not in these
-# flares). The model below is the first fit; the plants it is flown against
-# are the second and its neighbours. So the flare is flown on the model (the
-# SF50's, SR22's and Evolution's law):
-#   * the exponential flare to `touchdown_fpm`, the pull up to 0.5, a
-#     balloon eased at 0.15 a second, never dropped;
-#   * the lever off from 20 ft at up to 0.1 a second.
-# On the first fit's plants (the tracker as flown meets the
-# runway at 240 to 1,400 fpm on them), from six 106 to 114 kt gates, calm and
-# rough: every contact under 135 fpm on the path and 125 on the gauge, 86 kt
-# or faster, no longer a float than the flares as flown
-# (`autoland::lemg13_sr22_bounce_tests::lemg13_king_air`).
-# VERIFY: blackbox `flare_ask`, `flare_target`, `flare_elev` and `vvi` from
-# `arrest_hands` to the wheels (no pull dropped from 0.3 to 0 in a tick), the
-# `power` events' `retard` from 20 ft and no `balloon`, and the landing's
-# `sink_fpm` (under 250) with the `rollout` ticks' first `psi` swing (the
-# contact's kick was the hard landing's).
-# THE SINK NEAR THE GROUND (issue #202; d26a65d, LEMG 13, sorties
-# 1790798381, 1790798581, 1790798781): flown on the model above, the sink
-# came to 140 to 176 fpm by 15 ft and rebuilt to 322 to 371 on the gauge at
-# the wheels while the pull rose from 0.10 to 0.31 (of 0.5), the model's
-# unexplained sink growing from -670 to -1,435. The plant the flare was
-# tested on replayed the tracker's flares but not these: their last two
-# seconds miss by 79 to 88 fpm rms, and closed loop it landed this flare at
-# 121 fpm or less. Refitted to all six flares, the aircraft sinks harder
-# near the runway than the elevator and the speed explain: 1,416 fpm at the
-# wheels growing from 9.3 ft (the last two seconds then replay at 19 to 30;
-# a lever's own sink or an elevator weaker with the speed, fitted instead,
-# leave 51 to 53), and on that plant the flare as flown meets the runway at
-# 301 to 310 on the gauge, as the sim did (322 to 371). The model's ground
-# term was the first fit's 320 from 40 ft, so the sink came a lag too late
-# to answer; it now carries the refit's. The time constant is not the
-# fault: on a 3, 5 or 8 s constant the flare as flown still meets the refit
-# at 451 fpm or more. With the ground term, from nine gates (the six
-# recorded, three neighbours) on the refit and its neighbours (the dead
-# time 0.1 s, the path 10 %, the gauge 20 %, the ground 15 % either way),
-# calm and rough: 89 to 247 fpm on the path and the gauge, at most 1,028 m
-# from the gate (`lemg13_king_air`).
-# VERIFY #202: below 20 ft the `vvi` never rebuilds more than 100 fpm past
-# its minimum (it went 140 to 176, then 322 to 371), `flare_elev` keeps
-# rising through the last 10 ft to about 0.3 at the wheels (on the plant:
-# 0.13 at 10 ft, 0.34 at the wheels, the sink 105 to 150 from 7 ft), and the
-# landing's `sink_fpm` is 60 to 250 with no `bounce`.
+# The layered autonomy (docs/tasks/autonomy-layers): the attitude flare,
+# the energy throttle and the measured rollout brake, no fitted law. On
+# its old fitted flare model (issues #197, #202, history in
+# docs/dev-history.md) it touched at 29 to 641 fpm and once left the
+# runway; on layers 203 and 202 (LEMG 13, 1791799361, 1791800024).
+layers: true
 flare_elevator:
   gain: 1.0
-  max: 0.5
+  # The attitude flare's pull limit: it holds the nose angle, the limit is
+  # the stop (the SR22's 0.8).
+  max: 0.8
+  # Its low wing's ground effect, measured: the pull went from 0.13 at
+  # 12 ft to 0.37 at the wheels with the nose 0.5 deg under its command and
+  # the sink held near 230 fpm (LEMG 13, 1791799361: 203 fpm). Fed forward
+  # along the ground effect's shape (`attitude_flare::ground_shape`).
+  ground_pull: 0.25
   max_push: 0.05
-  balloon_ease_per_s: 0.15
-  tau_s: 3.0
-  model:
-    fpm_per_elevator: 9500.0
-    lag_s: 2.3
-    lag2_s: 1.0
-    dead_s: 0.8
-    ground_fpm: 1416.0
-    ground_ft: 9.3
-    touchdown_fpm: 150.0
-    fpm_per_kt: 100.0
 flare_power:
   reduction_per_second: 0.1
   retard_max_per_s: 0.1

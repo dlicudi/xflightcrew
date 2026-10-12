@@ -14264,3 +14264,26 @@ pull and a per-case pull limit; declaring it 50% off still lands under 240.
   no auto-start): turned off with `LiveTraffic/Aircrafts/Display`; flight loads since have not
   brought it back.
 
+
+### 2026-10-12: the King Air C90B crosses to layers
+
+The King Air flies the layered autonomy: 203 then 202 fpm on LEMG 13 from 5 nm, drift under
+0.5 deg, the centreline within 3.1 m, no intervention (1791799361, 1791800024;
+`bench/sorties/c90b-lemg.yaml`). Its old fitted flare model (issues #197, #202) had touched
+at 29 to 641 fpm and once left the runway; the model, its `tau_s` and `balloon_ease_per_s`,
+and the tests that pinned them are gone. Its low wing's ground pull is measured, 0.25 (the
+pull 0.13 at 12 ft to 0.37 at the wheels, the nose 0.5 deg under its command): with it the
+nose holds its command within 0.1 to 0.3 deg.
+
+- Open, for every airframe: the last 10 ft held 150 to 175 fpm against the -70 asked. The
+  power coming off (`flare_power`'s retard, the props' slipstream leaving the wing) took
+  alpha 1.2 to 5.0 deg where the speed alone asked about 1.5; the attitude law's 1.5 s alpha
+  filter sat 1 deg behind that ramp and its path trim had caught half of it, so the path ran
+  0.5 deg under its command to the wheels (the law's own filter and trim, rebuilt from the
+  tape, reproduce its command within 0.05 deg). Tried and rejected: a rate-tracking alpha
+  (ballooned on the flare's own rotation) and the alpha the wing needs, alpha less the path
+  lag times the path's rate (broke where the real path lag is not the assumed 1 s). The
+  test plant does not reproduce the sag (its lift does not leave with the power): that plant
+  comes first.
+- The sortie watcher waited on `pgrep -f "xvl sortie"`, which matched its own command line:
+  wait on the sortie's pid.
