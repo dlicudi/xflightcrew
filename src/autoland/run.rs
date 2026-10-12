@@ -2477,7 +2477,16 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 let arrest_lead = crate::aircraft::arrest_lead();
                 // A layered airframe's final on its own path: the VS set once to
                 // the path's rate and nudged, as a pilot flies it (`path_nudge`).
-                let nudged = (layers && g.phase == ApproachPhase::Final && !g.arresting).then(|| {
+                // Not while the autopilot flies a captured glidepath: the dial is
+                // not its input then, and nudged against our own path it walked to
+                // -50 under a GPS path; handed back at 200 ft, the 172 levelled
+                // over the runway (LEMG 12, 1791807406). Handed back, it is set
+                // afresh to the path's rate.
+                let nudged = (layers
+                    && g.phase == ApproachPhase::Final
+                    && !g.arresting
+                    && !ap_modes.is_some_and(|m| m.gs()))
+                .then(|| {
                     let path_fpm = -(gs_kts / 60.0) * gp_ft_per_nm();
                     path_nudge.step(path_fpm, alt - raw.glidepath_alt_ft, path_clock.elapsed().as_secs_f64())
                 });
@@ -3437,11 +3446,19 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                     vs_fpm: vy_ms * 196.850_394,
                                     target_kts: target,
                                     // The path paid for is the one the autopilot
-                                    // was TOLD to fly: the guidance's own VS read 0
-                                    // while the nudged dial said -500, and the RV-10
-                                    // held 98 kt against 80 for a minute, no landing
-                                    // flap, sent round by the gate (1791803684).
-                                    path_vs_fpm: if level_for_gs { 0.0 } else { vs_dial },
+                                    // FLIES, by its own mode: a captured glidepath
+                                    // at the path's rate, else our dial. The
+                                    // guidance's VS read 0 under a -500 dial (the
+                                    // RV-10 held 98 kt against 80, 1791803684); the
+                                    // dial read -150 under a captured -400 path (the
+                                    // 172 ran to 80 kt against 65, 1791806643).
+                                    path_vs_fpm: if level_for_gs {
+                                        0.0
+                                    } else if ap_modes.is_some_and(|m| m.gs()) {
+                                        -(gs_kts / 60.0) * gp_ft_per_nm()
+                                    } else {
+                                        vs_dial
+                                    },
                                     thr_now: t,
                                     dt: dt_s,
                                 }) - t
