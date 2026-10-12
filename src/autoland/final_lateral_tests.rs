@@ -431,12 +431,13 @@ fn every_fitted_airframe_lands_on_the_line_in_a_15_to_0_kt_shear() {
 
 /// With the yaw the heading carried on the recorded finals (the Evolution
 /// 1.5 degrees rms, the SF50 1.1), which the autopilot banks against and
-/// the estimate reads as error never answered: within 8 m (the Evolution
-/// 6.7 m at worst, the Zibo 5.8; the analysis' replays of the recorded
-/// finals, their own yaw included, kept 58 of 60 within 5 m).
+/// the estimate reads as error never answered: still within 5 m (the
+/// Evolution 4.4 at worst, the SF50 3.5; on the half degree every two
+/// seconds the Evolution was 6.7 m off; the analysis' replays of the
+/// recorded finals, their own yaw included, kept 58 of 60 within 5 m).
 #[test]
-fn every_fitted_airframe_lands_near_the_line_with_its_recorded_yaw() {
-    every_airframe_lands_on_the_line_in(CALM, "calm, yaw", true, 8.0);
+fn every_fitted_airframe_lands_on_the_line_with_its_recorded_yaw() {
+    every_airframe_lands_on_the_line_in(CALM, "calm, yaw", true, 5.0);
 }
 
 /// The knob is set as a pilot sets it: no oftener than every second and
@@ -470,7 +471,10 @@ fn the_knob_moves_no_oftener_than_a_second_and_never_by_less_than_a_quarter_degr
 /// The response time measured in flight, on the intercept and the first
 /// 90 s of the final, recovers the plant's: within the estimate's bounds and
 /// within what the yaw lends it (the heading's yaw reads as error the track
-/// never answers: in flight 3.9 s on the King Air against its 2.2).
+/// never answers: in flight 3.9 s on the King Air against its 2.2). The
+/// three fast ones read the floor, 3 s; the Zibo its ceiling, 10 s against
+/// 7.5 (its 1 s delay and whole-degree window read as a slower answer: on
+/// 7.5 the analysis left it 7 to 11 m off from 120 m, on 10 within 5).
 #[test]
 fn the_response_time_measured_in_flight_recovers_each_plants() {
     for p in PLANTS {
