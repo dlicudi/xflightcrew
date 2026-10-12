@@ -2705,7 +2705,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     (ApproachPhase::Final, true, Some(to)) => {
                         let pursuit_bug = g.target_heading_deg + crab + trim;
                         let sf = short_final
-                            .get_or_insert_with(|| ShortFinal::new(off_course(pursuit_bug), to));
+                            .get_or_insert_with(|| ShortFinal::new(off_course(pursuit_bug), to).on(final_track_law));
                         (rwy.course_deg
                             + sf.step(xtk_now * M_PER_NM, to, gs_kts, tick_dt, phi_r.as_ref().ok().copied()))
                             .rem_euclid(360.0)

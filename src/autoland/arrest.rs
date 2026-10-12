@@ -61,10 +61,16 @@ pub fn short_final_cut_deg(xtk_m: f64, side_m_s: f64, gs_kts: f64) -> f64 {
     if !xtk_m.is_finite() || !side_m_s.is_finite() {
         return 0.0;
     }
+    closure_cut_deg(xtk_m, side_m_s, gs_kts, SHORT_FINAL_CLOSE_S, SHORT_FINAL_LEAD_S, SHORT_FINAL_MAX_CUT_DEG)
+}
+
+/// The cut that closes the offset, judged `lead_s` ahead on the drift, over
+/// `close_s`, within `cap` degrees: the short final's and the declared
+/// track law's one shape. Pure.
+fn closure_cut_deg(xtk_m: f64, side_m_s: f64, gs_kts: f64, close_s: f64, lead_s: f64, cap: f64) -> f64 {
     let v = (if gs_kts.is_finite() { gs_kts } else { 0.0 } * 0.514_444).max(30.0);
-    let ahead = xtk_m + side_m_s * SHORT_FINAL_LEAD_S;
-    (-(ahead / (v * SHORT_FINAL_CLOSE_S)).atan().to_degrees())
-        .clamp(-SHORT_FINAL_MAX_CUT_DEG, SHORT_FINAL_MAX_CUT_DEG)
+    let ahead = xtk_m + side_m_s * lead_s;
+    (-(ahead / (v * close_s)).atan().to_degrees()).clamp(-cap, cap)
 }
 
 /// The declared track law's smallest cap on its cut, degrees: the pursuit's
@@ -105,14 +111,12 @@ pub fn final_track_cut_deg(
     if !xtk_m.is_finite() || !side_m_s.is_finite() {
         return pursuit_cut_deg;
     }
-    let v = (if gs_kts.is_finite() { gs_kts } else { 0.0 } * 0.514_444).max(30.0);
-    let ahead = xtk_m + side_m_s * p.lead_s;
     let cap = if pursuit_cut_deg.is_finite() {
         FINAL_TRACK_MAX_CUT_DEG.max(pursuit_cut_deg.abs())
     } else {
         FINAL_TRACK_MAX_CUT_DEG
     };
-    (-(ahead / (v * p.close_s)).atan().to_degrees()).clamp(-cap, cap)
+    closure_cut_deg(xtk_m, side_m_s, gs_kts, p.close_s, p.lead_s, cap)
 }
 
 /// The heading the final asks for (true), the guidance's own unless the
@@ -172,6 +176,13 @@ pub(super) const SHORT_FINAL_BIAS_TAU_S: f64 = 2.0;
 pub struct ShortFinal {
     pub(super) bias_deg: f64,
     pub(super) prev_bug_deg: f64,
+    /// The airframe's declared track law (`final_track:`), flown on its own
+    /// times down to the arrest: the fixed 6 s closure is faster than a
+    /// light autopilot's heading answers (about 2 s late, then a 4 s roll
+    /// lag) and rang the SR22 from 9 m right to 19 m left in 15 s in a
+    /// 150/10 wind (LEMG 13, 1791810954), the declared law handing over to
+    /// it at 0.3 nm.
+    pub(super) track: Option<crate::aircraft::FinalTrackProfile>,
 }
 
 /// The most bias the short final carries, degrees.
@@ -194,7 +205,13 @@ impl ShortFinal {
                 0.0
             },
             prev_bug_deg: entry_bug_off_deg,
+            track: None,
         }
+    }
+
+    /// Flown on the airframe's declared track law, where it has one.
+    pub fn on(self, track: Option<crate::aircraft::FinalTrackProfile>) -> Self {
+        Self { track, ..self }
     }
 
     /// One tick: the bug offset from the course, degrees. `bank_deg` is the
@@ -221,7 +238,11 @@ impl ShortFinal {
         }
         let v = (gs_kts.max(0.0) * 0.514_444).max(30.0);
         let side = v * track_off_deg.to_radians().sin();
-        let bug = short_final_cut_deg(xtk_m, side, gs_kts) - self.bias_deg;
+        let cut = match self.track {
+            Some(p) => closure_cut_deg(xtk_m, side, gs_kts, p.close_s, p.lead_s, SHORT_FINAL_MAX_CUT_DEG),
+            None => short_final_cut_deg(xtk_m, side, gs_kts),
+        };
+        let bug = cut - self.bias_deg;
         self.prev_bug_deg = bug;
         bug
     }
