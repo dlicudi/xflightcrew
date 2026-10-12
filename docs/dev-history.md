@@ -14488,3 +14488,96 @@ finals passed; the pursuit's lead on the half-degree knob weaved 7 to 12 m.
   `measured`, `samples`), the ticks' `t_r`, `lat_i_m`, `xtk_m` and `bug_true` against `psi`,
   `trk` and `phi`, `heading_set` no oftener than a second, and no `going_around`
   `off_centreline_low`.
+
+### 2026-10-12: the final is flown as a pilot: the autopilot above minimums, hand flown below
+
+The pilot, on the one lateral law above: "We need a capable pilot, not patch-up AI slop." Its
+knob moved a quarter degree every second, about 24 times a minute (147 settings in 202 s on
+1791826866), and rocked the Lancair Evolution +-14 degrees of bank on a 10 s period. Now a
+pilot's final: the autopilot flies it in the modes built for it down to minimums, and from
+minimums it is hand flown to the wheels as one segment, all three controls ours.
+
+- **The heading mode's overshoot.** Refitted on tonight's finals with the heading the
+  autopilot READS (the track plus a yaw): on the Evolution the yaw follows the roll rate and
+  the bank (adverse yaw and the turn's sideslip, -0.18 deg per deg/s and -0.19 per degree,
+  R2 0.54), and the bank answers second order (wn 1.10, z 0.71: R2 0.985 against 0.982). On
+  that plant the quarter-degree knob rings at 26 degrees of bank; the first-order plant had
+  hidden it (its yaw was noise).
+- **Above minimums the heading is SET** (`autoland::FinalHeading`): the course, the crab and a
+  cut closing the offset over 20 s (`FINAL_CLOSE_S`), less the autopilot's standing error
+  learnt once a setting has settled 8 s ("set 130, it holds 128: set 132"), in whole degrees,
+  no oftener than every ten seconds (`AUTOLAND_FINAL_DEADBAND`, a turn of 5 or more at once).
+  Chosen on the fitted heading modes over a grid of closure, cadence, hysteresis and lead
+  (scratch `handfly/above_grid.py`); the learnt error took the worst offset at minimums with
+  2 degrees of autopilot bias from 50 m to 10 (`above_bias.py`). A coupled ILS's localiser
+  (`ils_coupled`) is unchanged; a GPS approach mode is not used yet.
+- **Minimums** (`autoland::minimums_ft`): a coupled ILS's decision height, the profile's
+  `ils_decouple_agl_ft` (the 172 200, the stock 737 500) or 200 ft; a final on our own
+  heading and path 300 ft (an LNAV MDA is 300 to 500 over the field; from 300 ft a 140 kt
+  jet has 24 s to the wheels, three times what the bank needs to close the 18 m a whole
+  degree leaves). The hand-flown segment is taken there (`arrest_hands_step`, the servos out)
+  and held to the wheels or a go-around; the coupling's own decouple stands aside for it.
+  The tick is the flare's 0.2 s from minimums; no VS dial, bug or mode press while it flies.
+- **The pilot** (`src/pilot`), one controller for any phase, its first user the final:
+  - `attitude`: the attitude flare, handed a `Path` (the glidepath's sink, the height off
+    it), holds the path from minimums, rejoining it over 15 s (300 fpm at most, faded out
+    from 100 to 50 ft), and flares from it: one law from minimums to the wheels.
+  - `bank`: ailerons to bank. The servos-out arrests fit ONE shape on six airframes (59
+    landings, R2 0.91 to 0.99): `p' = (Kp (a - a0) - p) / tau` with Kp 11.8 to 19.2 deg/s per
+    unit, tau 0.3 to 0.6 s, delay 0 to 0.15 s, a0 -0.06 to 0.01 (a spiral term changed Kp
+    under 20%, left out; `handfly/roll_fit.py`). The roll RATE asked closes the bank error
+    over 0.7 s from where the bank will be once the aileron in flight arrives; the aileron
+    is that rate over the MEASURED Kp (`RollResponse`: the aileron low-passed over 0.45 s
+    against the bank's rate, the delay picked among 0 to 3 ticks by correlation, drawn to
+    16 until 10 ticks; on the recorded arrests 5 s of it read 15 to 21 where the fits said
+    12 to 19), plus a trim the bank error integrates near the target. A disturbance
+    observer was tried for the trim and wound the wrong way through a delayed roll-in (the
+    A330's floated gate went 14 m past the line); the tuning was swept on all six plants
+    and the A330's gates.
+  - `line`: the arrest's bank target, the centreline by the TRACK (the crab comes out of
+    it), its velocity loop 1.0 s (was 1.5) and the bank 2 + h/5 degrees, at most 5, 3 at the
+    wheels (was 2 + h/10 and 2: in 1 kt gusts the last feet drifted 0.4 m less).
+  - `energy`: the energy throttle, unchanged, paying for the attitude law's path.
+- **The fitted plants, one module** (`pilot::plants_tests`): the five pitch fits, the SF50's
+  fitted the same way tonight (three flares, 0.21 deg rms), the six roll fits. From 200 and
+  300 ft, 23 m either side, 8, on the line, calm and 15 kt either side: every airframe within
+  1.6 m at the wheels, 81 to 119 fpm (scored at most 160), no balloon, bank at most 5.8. In
+  1 kt gusts (sd over 2 s; the gustiest final tonight read 2.7 with the autopilot's yaw,
+  most under 1) within 3.0 m (the SF50 2.95, the C172 0.41); off the path by 25 ft and out
+  of trim by 0.05 at the disconnect, on the line and 81 to 131 fpm; the roll at half and
+  twice its Kp, twice its tau or 0.3 s late, within 1.7 m. The A330's four recorded gates
+  (#180) on its rate plant: within 1 m at the wheels where the declared plant flew them,
+  the floated gate 8 to 13 m past the line (the declared law 7.2 to 12.9, the stiff 8.3 to
+  13.5 on the same plants).
+- **Above minimums on the fitted heading modes** (`autoland::final_heading_tests`), from 40
+  right, 80 left and on the line, calm, 15 kt across and 1 kt gusts, the mode 2 degrees off
+  its knob either way: at 300 ft within 18 m (the SR22 8.5, the King Air 17: a whole degree
+  is a metre a second at 110 kt), the knob set at most six times a minute (calm 0.4 to 2).
+  The old law on the same Evolution: 26 degrees of bank, 54 settings a minute.
+- **The pavement check below minimums** (`lands_on_the_pavement`) models the hand-flown
+  bank (2.5 m/s, the last 10 m over 4 s); above them still the stabilised gate's pursuit
+  model (98 m off at 470 ft stays a go-around).
+- **Gone:** `FinalLateral` and `ResponseTime` and their 581 lines of tests, the `lateral_tr`
+  record and the ticks' `t_r` and `lat_i_m`, the arrest's own lateral (`arrest_bank_target`,
+  `arrest_wings`, its tests), the A330's declared `arrest_roll:` and `ArrestRollProfile`,
+  `WingsLevel`'s stiff and rate-plant laws, the every-tick bug step (`bug_step_from`,
+  `BugStep`). Replays that flew FinalLateral (`lemg_replay::FinalLoop`, the LEMG 13/31, A330
+  and Zibo finals) fly the new final; the Zibo with its heading wandering a degree over 50 s
+  reaches 1.5 nm 13 to 33 m off (FinalLateral 7 to 10) and one of 24 goes round
+  `unstabilised_below_floor` at 319 ft, the gate's call; the rest land on the line.
+- **Not done, and why:** the rudder (coordination, the decrab): no tape tonight has an
+  airborne rudder, so autoland now tapes `ail_total`, `rud_total` and `beta` every tick. The
+  flare's power stays `flare_power`: the approach's energy against the lever
+  (`handfly/energy_fit.py`) extrapolated to idle disagrees with the flares' measured idle
+  deceleration by up to twice (Evolution 5.7 against 2.9 kt/s, R2 0.07 on the Baron, 0.38 on
+  the 172: the flap moving on the final), so a retard planned on it would be planned on
+  noise. The pitch response stays the attitude law's `b_hat`: the autopilot-flown finals'
+  q against `elev_total` gave nothing (closed loop, the trim). `ground_pull` is still
+  declared per airframe.
+- **UNFLOWN.** Check on the next finals: `heading_set` at most every 10 s in whole degrees,
+  the ticks' `hdg_bias` settling within a few finals; `arrest_hands` `taken` with its
+  `minimums` (300 visual, 200 on the 172's ILS) and `arresting` false; from there `hands`,
+  `flare_ail`, `kp` (the fits: 12 to 19), `phi` inside 6 degrees, `xtk_m` closing; `att_vs_t`
+  on the path and `att_gamma` following it from minimums; no `vs_dial` or `heading_set`
+  under `hands`; the touchdown sink and the rollout's offset; and no `going_around`
+  `off_centreline_low` or `unstabilised_below_floor`.
