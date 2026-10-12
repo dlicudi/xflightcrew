@@ -222,6 +222,13 @@ impl AttitudeFlare {
             entry = Entry { vs_fpm: p.vs_fpm, gate_ft: gate_ft(p.vs_fpm, g.response_s) };
             self.entry = Some(entry);
         }
+        // The push limit is the FLARE's (forward column a few feet up is a
+        // nosewheel landing); a path above the gate is flown with the
+        // elevator both ways, as a pilot flies it. Held to the 737's flare
+        // limit of no push from minimums, the nose rose from -5.2 to -2.6
+        // deg against a command of -5.1, the sink fell 950 to 410 fpm and
+        // the gate sent it round high (LEMG 13, 1791838756).
+        let push = if i.radio_ft > entry.gate_ft { push.max(pull) } else { push };
         self.alpha_f += (i.alpha_deg - self.alpha_f) * (dt / ALPHA_TAU_S).min(1.0);
         let vs_t = match i.path {
             Some(p) if i.radio_ft > entry.gate_ft => path_vs_fpm(p, i.radio_ft),
