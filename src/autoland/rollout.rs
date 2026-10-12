@@ -1,33 +1,16 @@
-//! The rollout: brakes and steering to the vacate speed, the bounce and touch
-//! holds, wheels-on, the balk call and the uncleared-landing watch.
+//! The rollout: brakes and steering to the vacate speed, the bounce hold,
+//! wheels-on, the balk call and the uncleared-landing watch.
 
 use super::*;
 
-/// The deceleration a rollout aims for when the runway leaves the choice open,
-/// m/s². A flat 0.45 brake ratio measured ~3.3 m/s² on the Baron — maximum
-/// autobrake territory, applied from touchdown speed to a dead stop, and the
-/// pilot called it "brakes really really hard" (EGHI, 2026-08-02). Real
-/// autobrake LOW is ~1.2-1.8; this errs on the firm side of comfortable
-/// because the distance term below, not this figure, is what guarantees the
-/// stop.
-pub(super) const ROLLOUT_COMFORT_DECEL: f64 = 1.6;
-/// Brake ratio per m/s² of wanted deceleration — calibrated from the same
-/// measurement (0.45 ratio ≈ 3.3 m/s² including aero drag, so the wheel share
-/// is a little under that).
+/// Brake ratio per m/s² of wanted deceleration: a flat 0.45 measured about
+/// 3.3 m/s² on the Baron, aero drag included, so the wheel share is a little
+/// under that (EGHI, 2026-08-02).
 pub(super) const BRAKE_RATIO_PER_MPS2: f64 = 0.15;
 /// The rollout hands off to a following vacate at or below this groundspeed —
 /// taxi pace, never a stop. Stopping dead on an active runway and then
 /// re-accelerating to leave it was neither procedure nor comfortable.
 pub(super) const VACATE_HANDOFF_KTS: f64 = 10.0;
-
-/// Brake ratio for the rollout: a comfortable deceleration, unless stopping
-/// within the pavement actually remaining demands more. `target_kts` is the
-/// speed the rollout is aiming for — zero for a full stop, taxi pace when a
-/// vacate follows.
-pub(super) fn rollout_brake_ratio(gs_kts: f64, target_kts: f64, remaining_m: f64) -> f64 {
-    let decel = rollout_required_decel(gs_kts, target_kts, remaining_m).max(ROLLOUT_COMFORT_DECEL);
-    (decel * BRAKE_RATIO_PER_MPS2).clamp(0.2, 0.8)
-}
 
 /// What physics requires to be at `target_kts` with 30% of the remaining
 /// runway still in hand, m/s²: the safety term, immune to any comfort
@@ -39,13 +22,13 @@ pub(super) fn rollout_required_decel(gs_kts: f64, target_kts: f64, remaining_m: 
     ((v * v - vt * vt) / (2.0 * usable)).max(0.0)
 }
 
-/// The deceleration a layered airframe's rollout aims for overall, drag and
+/// The deceleration a rollout aims for overall, drag and
 /// brakes together, m/s²: a pilot lets the drag do the early work. The
 /// G1000 172 got 0.24 of brake from the touch, 2.4 m/s² in all, and the
 /// pilot called it extreme (LEMG 13, 2026-10-11).
 pub(super) const LIGHT_DECEL_MPS2: f64 = 1.2;
 
-/// The rollout's brake on the deceleration MEASURED (a layered airframe):
+/// The rollout's brake on the deceleration MEASURED:
 /// only the brake the drag does not already give toward
 /// [`LIGHT_DECEL_MPS2`], found as it goes; the runway's own requirement
 /// (`rollout_required_decel`) is a floor at once. Nothing calibrated: the
@@ -390,83 +373,6 @@ impl BounceHold {
     }
 }
 
-/// A light single HELD ON after its first contact (a hold-off flare,
-/// `flare_elevator.model.hold_off_ft`, issue #166). From the first tick the
-/// wheels read on, or the radio under [`TOUCH_RADIO_FT`], the column holds
-/// the pull it touched with: never more (a pull added on the wheels lifts a
-/// wing that still flies back off) and never less (no push, and no let-go:
-/// the flare's balloon ease and the rollout's expiring channel took the
-/// SR22's 0.10 to neutral within a second, and at 75 to 80 kt neutral
-/// floated it 3 to 10 ft; LEMG 13 1790702352, 1790702623, 2026-09-29), with
-/// the lever closed (never the balloon's approach thrust: each of those hops
-/// had it back at 0.265). It lets go only on the wheels, slower than
-/// [`TOUCH_HOLD_RELEASE_KTS`], easing to neutral at
-/// [`TOUCH_HOLD_EASE_PER_S`]. A go-around forgets it. Pure.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TouchHold {
-    pub(super) held: Option<f64>,
-    pub(super) released: bool,
-}
-
-/// Under this radio height a hold-off is on the runway, ft: at rest the
-/// SR22's radio reads 0.1 to 0.2, and a contact between two 0.45 s ticks
-/// was read at 0.3 ft on its way back up with no wheels flag (1790702352).
-pub const TOUCH_RADIO_FT: f64 = 0.5;
-/// The held pull goes on the wheels below this groundspeed, kt: the hops of
-/// the four iMac SR22 rollouts died out between 54 and 60 kt.
-pub const TOUCH_HOLD_RELEASE_KTS: f64 = 45.0;
-/// ...eased to neutral this fast, elevator per second.
-pub const TOUCH_HOLD_EASE_PER_S: f64 = 0.05;
-
-impl TouchHold {
-    /// This tick's contact (`on_wheels`, or the radio under
-    /// [`TOUCH_RADIO_FT`]) with the elevator last written; true on the
-    /// first one, which takes that pull (a push is taken as neutral).
-    pub fn note(&mut self, contact: bool, written: Option<f64>) -> bool {
-        if self.held.is_some() || !contact {
-            return false;
-        }
-        self.held = Some(written.filter(|e| e.is_finite()).unwrap_or(0.0).max(0.0));
-        true
-    }
-
-    /// The wheels have touched this approach.
-    pub fn touched(&self) -> bool {
-        self.held.is_some()
-    }
-
-    /// The pull held, for the blackbox.
-    pub fn held(&self) -> Option<f64> {
-        self.held
-    }
-
-    /// The column this tick: the pull held; on the wheels below the release
-    /// speed eased toward neutral; `None` once let go (the channel expires
-    /// by itself) or before any contact.
-    pub fn elev(&mut self, gs_kts: f64, on_wheels: bool, dt: f64) -> Option<f64> {
-        let h = self.held?;
-        if self.released {
-            return None;
-        }
-        if on_wheels && gs_kts.is_finite() && gs_kts < TOUCH_HOLD_RELEASE_KTS {
-            let next = h - TOUCH_HOLD_EASE_PER_S * dt.clamp(0.0, 1.0);
-            if next <= 0.0 {
-                self.released = true;
-                self.held = Some(0.0);
-                return Some(0.0);
-            }
-            self.held = Some(next);
-            return Some(next);
-        }
-        Some(h)
-    }
-
-    /// A go-around: the next approach starts free.
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
 /// Whether the live airframe steers on its brakes (the takeoff's own test).
 pub(super) fn rollout_brake_steers() -> bool {
     crate::aircraft::nose_castors()
@@ -765,32 +671,5 @@ impl UnclearedWatch {
             return Some(UnclearedStep::Ask);
         }
         None
-    }
-}
-
-#[cfg(test)]
-mod touch_hold_tests {
-    use super::*;
-
-    /// Held on: the pull it touched with, never more and never less, the
-    /// lever closed; let go only on the wheels below the release speed.
-    #[test]
-    fn touch_hold_keeps_the_pull_it_touched_with() {
-        let mut t = TouchHold::default();
-        assert!(!t.note(false, Some(0.3)), "no contact");
-        assert_eq!(t.elev(70.0, false, 0.45), None, "nothing held before a contact");
-        assert!(t.note(true, Some(0.31)));
-        assert!(!t.note(true, Some(0.5)), "the first contact's pull, once");
-        assert_eq!(t.elev(66.0, true, 0.45), Some(0.31));
-        assert_eq!(t.elev(64.0, false, 0.45), Some(0.31), "a hop keeps it");
-        let e = t.elev(40.0, true, 1.0).unwrap();
-        assert!((e - (0.31 - TOUCH_HOLD_EASE_PER_S)).abs() < 1e-9, "{e}");
-        for _ in 0..20 {
-            t.elev(30.0, true, 1.0);
-        }
-        assert_eq!(t.elev(30.0, true, 1.0), None, "let go at neutral");
-        let mut push = TouchHold::default();
-        push.note(true, Some(-0.04));
-        assert_eq!(push.elev(70.0, true, 0.45), Some(0.0), "never a push");
     }
 }

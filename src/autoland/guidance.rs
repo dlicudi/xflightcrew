@@ -175,7 +175,7 @@ pub fn hold_flare(
     let (_, flare_vs) = arrest_targets_fpm(nominal_vs);
     Guidance {
         phase: ApproachPhase::Flare,
-        target_vs_fpm: flare_target_fpm(radio_ft, flare_vs, nominal_vs),
+        target_vs_fpm: flare_vs,
         arresting: true,
         ..g
     }
@@ -256,42 +256,29 @@ pub fn wheels_need_m(landing_m: Option<f64>, roll_m: Option<f64>) -> f64 {
 /// a thousand feet of float for ten knots at 140).
 pub(super) const FLARE_BLEED_KTS_S: f64 = 2.0;
 
-/// Seconds from `radio_ft` to the wheels on the flare the law FLIES: the
-/// path's sink (at this groundspeed) down to the height where the
-/// exponential asks less, then the exponential `touchdown + 60 h / tau` to
-/// the runway (`flare_target_with`'s shape), so `tau ln((h + h_f) / h_f)`
-/// with `h_f = touchdown x tau / 60`. Without a time constant the flat
-/// flare: the roundout's sink to the flare gate, the flare's below it.
-/// `None` for a measurement that is not one. Pure.
-pub fn flare_time_s(
-    radio_ft: f64,
-    gs_kts: f64,
-    tau_s: Option<f64>,
-    touchdown_fpm: Option<f64>,
-) -> Option<f64> {
+/// Seconds from `radio_ft` to the wheels on the flare the law FLIES
+/// ([`super::attitude_flare`]): the path's sink (at this groundspeed) down
+/// to its flare height, then its round-out and hold-off
+/// (`attitude_flare::vs_target_fpm`), summed over the height. `None` for a
+/// measurement that is not one. Pure.
+pub fn flare_time_s(radio_ft: f64, gs_kts: f64) -> Option<f64> {
+    use super::attitude_flare as af;
     if !radio_ft.is_finite() || !gs_kts.is_finite() || gs_kts <= 0.0 {
         return None;
     }
     let h = radio_ft.max(0.0);
-    let nominal = (gs_kts / 60.0) * gp_ft_per_nm();
-    let (roundout_vs, flare_vs) = arrest_targets_fpm(-nominal);
-    match tau_s.filter(|t| t.is_finite() && *t > 0.5) {
-        Some(tau) => {
-            let td = touchdown_fpm
-                .filter(|t| t.is_finite() && *t > 0.0)
-                .unwrap_or(-flare_vs)
-                .min(nominal);
-            let h_x = (nominal - td) * tau / 60.0;
-            let h_f = td * tau / 60.0;
-            let on_path = (h - h_x).max(0.0) / nominal * 60.0;
-            Some(on_path + tau * ((h.min(h_x) + h_f) / h_f).ln())
-        }
-        None => {
-            let (flare_ft, _) = arrest_gates_ft(25.0, gs_kts);
-            let above = (h - flare_ft).max(0.0) / -roundout_vs * 60.0;
-            Some(above + h.min(flare_ft) / -flare_vs * 60.0)
-        }
-    }
+    let path_vs = -(gs_kts / 60.0) * gp_ft_per_nm();
+    let gate = af::gate_ft(path_vs, af::RESPONSE_S);
+    let above = (h - gate).max(0.0) / -path_vs * 60.0;
+    // The round-out, in tenth-of-a-foot steps at each step's middle.
+    const STEP_FT: f64 = 0.1;
+    let below = h.min(gate);
+    let n = (below / STEP_FT).ceil() as usize;
+    let step = if n > 0 { below / n as f64 } else { 0.0 };
+    let flare: f64 = (0..n)
+        .map(|i| step / -af::vs_target_fpm((i as f64 + 0.5) * step, path_vs, gate) * 60.0)
+        .sum();
+    Some(above + flare)
 }
 
 /// The go/no-go at the roundout gate (see [`landing_call`]).
@@ -327,7 +314,6 @@ pub struct LandingCall {
 /// 1,085 m predicted ahead against 792. `along_m` is the signed along-track
 /// to the threshold (positive on the approach side), `length_m` the strip.
 /// `None` when a measurement is missing (no guessed decision). Pure.
-#[allow(clippy::too_many_arguments)]
 pub fn landing_call(
     along_m: f64,
     length_m: f64,
@@ -335,14 +321,12 @@ pub fn landing_call(
     gs_kts: f64,
     ias_kts: Option<f64>,
     approach_ias: f64,
-    tau_s: Option<f64>,
-    touchdown_fpm: Option<f64>,
     need_m: f64,
 ) -> Option<LandingCall> {
     if !along_m.is_finite() || !length_m.is_finite() || !need_m.is_finite() {
         return None;
     }
-    let flare_s = flare_time_s(radio_ft, gs_kts, tau_s, touchdown_fpm)?;
+    let flare_s = flare_time_s(radio_ft, gs_kts)?;
     let excess_kts = match ias_kts {
         Some(v) if v.is_finite() && approach_ias.is_finite() => (v - approach_ias).max(0.0),
         _ => 0.0,
@@ -453,7 +437,7 @@ pub fn commit_flare_latched(
         target_vs_fpm: if radio_ft > band_ft {
             roundout_vs
         } else {
-            flare_target_fpm(radio_ft, flare_vs, nominal_vs)
+            flare_vs
         },
         balk: None,
         arresting: true,
@@ -840,8 +824,8 @@ pub fn guidance_on(
     // What the vertical path asks for, computed first so the speed-protection
     // branch below can be measured against it.
     let path_vs = match phase {
-        // Arrest the descent near the ground: exponentially (`flare_target_fpm`).
-        ApproachPhase::Flare => flare_target_fpm(radio_alt_ft, flare_vs, nominal_vs),
+        // Arrest the descent near the ground.
+        ApproachPhase::Flare => flare_vs,
         // Below the floor without the surplus to climb: hold level while the
         // throttle bonus rebuilds it — NEVER track the glidepath down. The
         // glidepath altitude is distance-symmetric, so a rejoin on the wrong

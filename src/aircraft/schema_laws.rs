@@ -477,38 +477,17 @@ pub struct PanelSwitch {
     pub position: String,
 }
 
-/// The flare's ELEVATOR law for this airframe (`autoland::FlareGains`): the
-/// default was fitted to the 172 and the 737. The SF50 answers the column
-/// about twice as hard and needs a standing pull at a flare's speed: on the
-/// default 0.18 took -572 fpm to +36 in two seconds, 0.35 ballooned it, and
-/// the release to neutral sank it at -590 onto the runway (EDLP 24,
-/// 2026-09-24).
+/// The attitude flare's elevator limits for this airframe
+/// (`autoland::attitude_flare`), and the pull its ground effect takes. An
+/// airframe that declares none flies the defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FlareElevatorProfile {
-    /// Scale on the law's P and D terms.
-    pub gain: f64,
-    /// Scale on its integrator (the standing pull it finds).
-    #[serde(default = "one")]
-    pub trim_gain: f64,
     /// Most pull the flare may command.
+    #[serde(default = "default_flare_max")]
     pub max: f64,
     /// Most push, as a positive number.
     #[serde(default = "default_max_push")]
     pub max_push: f64,
-    /// A balloon eases the held pull at most this fast, elevator per second.
-    #[serde(default)]
-    pub balloon_ease_per_s: Option<f64>,
-    /// An EXPONENTIAL flare's time constant, seconds (`autoland::flare_target_fpm`):
-    /// the sink target falls with the height instead of holding flat from
-    /// the gate. Only for an airframe whose flare is flown on the elevator.
-    #[serde(default)]
-    pub tau_s: Option<f64>,
-    /// How THIS airframe's sink answers the elevator, fitted to its own
-    /// flares (`autoland::FlareModel`). Declared, the whole arrest is flown
-    /// on the model (the elevator that HOLDS the sink wanted, against the
-    /// sink the elevator does not explain) instead of the P+D tracker.
-    #[serde(default)]
-    pub model: Option<FlareModelProfile>,
     /// The extra pull this airframe's ground effect takes at the wheels,
     /// MEASURED on its own flares (`autoland::attitude_flare` feeds it
     /// forward along the ground effect's shape); 0 for an airframe whose
@@ -519,105 +498,18 @@ pub struct FlareElevatorProfile {
     pub ground_pull: f64,
 }
 
-/// The elevator-to-sink response of an airframe with the servos out, as its
-/// own flares recorded it, and what the flare law does with it
-/// (`autoland::FlareModel`). A standing pull holds a standing change of sink
-/// (`fpm_per_elevator`) arriving through two lags (`lag_s`, `lag2_s`) after a
-/// dead time (`dead_s`); near the runway the aircraft pitches down by itself
-/// (the tail's ground effect), worth `ground_fpm` of sink at the wheels and
-/// growing linearly from `ground_ft`. Fitted to the 737's seven LEMG flares
-/// of 2026-09-26 (six on 13, one on 12; 35 fpm rms): 4,970 fpm, 0.84 and
-/// 3.1 s, 1.35 s of dead time, 405 fpm of ground effect from 43 ft. The
-/// first fit (2,600 fpm, two 1 s lags, 1.8 s, no ground term) landed every
-/// recorded gate soft on paper and the LEMG 12 flare at 407.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct FlareModelProfile {
-    /// Standing change of sink per unit of elevator, fpm.
-    pub fpm_per_elevator: f64,
-    /// The first lag, seconds.
-    pub lag_s: f64,
-    /// The second lag, seconds (absent: the first again).
-    #[serde(default)]
-    pub lag2_s: Option<f64>,
-    /// The dead time, seconds.
-    pub dead_s: f64,
-    /// The sink the ground adds at the wheels, fpm (0: none modelled).
-    #[serde(default)]
-    pub ground_fpm: f64,
-    /// ...growing linearly from this height, ft.
-    #[serde(default = "default_model_ground_ft")]
-    pub ground_ft: f64,
-    /// The law asks the MODEL's sink this far ahead to be the flare's target
-    /// at the height the aircraft will have then, seconds (absent: the dead
-    /// time plus one).
-    #[serde(default)]
-    pub horizon_s: Option<f64>,
-    /// The sink the flare's target arrives at on the runway, fpm (positive;
-    /// absent: the arrest's own quarter of the path sink).
-    #[serde(default)]
-    pub touchdown_fpm: Option<f64>,
-    /// Smoothing on the unexplained sink, seconds.
-    #[serde(default = "default_model_observer_s")]
-    pub observer_s: f64,
-    /// In rough air the flare's pull only comes back (absent: yes, the
-    /// 737's LEMG 13 downdraft). `false` flies the prediction in any air: a
-    /// strong elevator whose held pull becomes a float bleeds the speed of
-    /// a slow wing into the ground (the SF50, issue #163).
-    #[serde(default)]
-    pub rough_hold: Option<bool>,
-    /// A RATE plant: the elevator asks a rate of change of sink, and a
-    /// neutral column HOLDS the sink it has (an Airbus's fly-by-wire normal
-    /// law: the A330's sidestick). `fpm_per_elevator` is then fpm per
-    /// SECOND per unit, `ground_fpm` fpm per second at the wheels, and the
-    /// flare may push (to `max_push`): a float or a balloon is ended forward,
-    /// since neutral holds it. Absent: the standing-sink plant.
-    #[serde(default)]
-    pub rate: bool,
-    /// A light single's HOLD-OFF flare (the SR22, issue #166), ft: the
-    /// exponential flare levels at this height over the runway instead of
-    /// flying to it, then settles at `touchdown_fpm` while the idle wing
-    /// bleeds its speed, so the wheels come down on the SPEED, near the
-    /// stall, not on a sink; and from the first contact the column holds the
-    /// pull it touched with, never more and never less, the lever closed
-    /// (`autoland::TouchHold`). Absent: the jets' firm-touchdown flare. The
-    /// SR22 flew that to the wheels at its approach speed (80 kt, 215 fpm)
-    /// and every landing hopped 4 to 10 ft (LEMG 13, 2026-09-29).
-    #[serde(default)]
-    pub hold_off_ft: Option<f64>,
-    /// fpm of sink per knot the speed loses (positive): the prediction
-    /// carries the airspeed's trend ahead as sink, so a hold-off at idle
-    /// pulls for the knots still to bleed instead of a tick late for each
-    /// (`autoland::FlareModel::note_speed`). Absent: the speed is only what
-    /// the model does not explain. The SR22: 115 fpm a knot at idle with
-    /// full flap (LEMG 13 sortie 1790619465, 2026-09-28).
-    #[serde(default)]
-    pub fpm_per_kt: Option<f64>,
-}
-
-pub(super) fn default_model_ground_ft() -> f64 {
-    40.0
-}
-pub(super) fn default_model_observer_s() -> f64 {
-    0.3
-}
-
-impl FlareModelProfile {
-    pub fn valid(self) -> Option<Self> {
-        ((500.0..=10_000.0).contains(&self.fpm_per_elevator)
-            && (0.1..=5.0).contains(&self.lag_s)
-            && self.lag2_s.is_none_or(|l| (0.1..=8.0).contains(&l))
-            && (0.0..=4.0).contains(&self.dead_s)
-            && (0.0..=1500.0).contains(&self.ground_fpm)
-            && (5.0..=150.0).contains(&self.ground_ft)
-            && self.horizon_s.is_none_or(|h| (0.3..=8.0).contains(&h))
-            && self
-                .touchdown_fpm
-                .is_none_or(|t| (20.0..=400.0).contains(&t))
-            && self.hold_off_ft.is_none_or(|h| (0.5..=5.0).contains(&h))
-            && self.fpm_per_kt.is_none_or(|k| (0.0..=400.0).contains(&k))
-            && (0.05..=3.0).contains(&self.observer_s))
-        .then_some(self)
+impl Default for FlareElevatorProfile {
+    fn default() -> Self {
+        Self {
+            max: default_flare_max(),
+            max_push: default_max_push(),
+            ground_pull: 0.0,
+        }
     }
+}
+
+pub(super) fn default_flare_max() -> f64 {
+    0.35
 }
 
 pub(super) fn default_max_push() -> f64 {
@@ -1052,21 +944,11 @@ impl RollRudderProfile {
 impl FlareElevatorProfile {
     /// Used only when every number is a sane one.
     pub fn valid(self) -> Option<Self> {
-        ((0.1..=3.0).contains(&self.gain)
-            && (0.0..=10.0).contains(&self.trim_gain)
-            // Up to the stop: the attitude flare holds the nose angle, so
-            // its limit is the elevator's travel, not a balloon guard. At
-            // 0.6 the SR22's 0.8 dropped the whole block and the old law
-            // flew it in silence (452 fpm, LEMG 13, 1791792579).
-            && (0.05..=1.0).contains(&self.max)
-            && (0.0..=0.3).contains(&self.max_push)
-            && self
-                .balloon_ease_per_s
-                .is_none_or(|r| r.is_finite() && r > 0.0))
-        .then_some(Self {
-            model: self.model.and_then(FlareModelProfile::valid),
-            ..self
-        })
+        // Up to the stop: the attitude flare holds the nose angle, so
+        // its limit is the elevator's travel, not a balloon guard. At
+        // 0.6 the SR22's 0.8 dropped the whole block and the old law
+        // flew it in silence (452 fpm, LEMG 13, 1791792579).
+        ((0.05..=1.0).contains(&self.max) && (0.0..=0.3).contains(&self.max_push)).then_some(self)
     }
 }
 

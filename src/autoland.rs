@@ -286,23 +286,18 @@ pub use crate::ap_engage::{ApEngage, EngageStep};
 pub use crate::ap_engage::ENGAGE_GIVE_UP_S;
 
 /// The elevator law that holds the aircraft LEVEL until the autopilot is
-/// confirmed: the flare's free tracker ([`FlarePitch`] outside the
-/// ratchet) at two thirds of its default gain and a wider pull. Not the
-/// airframe's flare numbers: those are sized for the last forty feet (the
-/// 737's is pull-only to 0.45), and the recorded new-flight start at LEMG 13
+/// confirmed ([`LevelHold`]). The recorded new-flight start at LEMG 13
 /// needs about 0.7 of standing pull to hold level (fitted to 1790587073:
 /// -900 fpm at the start plus 0.54 of nose-down mistrim through the 737's
-/// flare plant, 112 fpm rms). Swept against that plant and the LEMG 12 and
-/// fastest flare plants at the loop's 0.6 s tick: the least height lost
-/// with the least ringing.
-pub fn engage_hold_gains() -> FlareGains {
-    FlareGains {
+/// pitch plant, 112 fpm rms). Swept against that plant at the loop's 0.6 s
+/// tick: the least height lost with the least ringing.
+pub fn engage_hold_gains() -> LevelHoldGains {
+    LevelHoldGains {
         p: 0.04,
         d: 0.05,
         trim_rate: 0.015,
         max: 0.8,
         min: -0.2,
-        balloon_ease_per_s: None,
     }
 }
 
@@ -357,22 +352,10 @@ mod glidepath_gain_tests;
 #[cfg(test)]
 mod approach_power_floor_tests;
 
-/// The 737's flare against a plant FITTED to its own flares: the seven LEMG
-/// landings of 2026-09-26 (six on 13, then 12 with the first model law),
-/// the elevator written against the sink that followed, 35 fpm rms over
-/// all seven arrests from the gate to the wheels. A standing pull holds a
-/// standing sink change of 4,970 fpm per unit through lags of 0.84 and
-/// 3.09 s after 1.35 s of dead time; the aircraft pitches down by itself
-/// over the last 43 ft (405 fpm at the wheels, the tail's ground effect);
-/// the sink follows the speed at 63 fpm a knot, and the speed follows the
-/// lever, the pull and the sink (-1.08 + 2.99 lever - 2.05 pull - 0.40 per
-/// 1,000 fpm of sink, kt/s, fitted to the same ticks). Fitted flare by
-/// flare the gain ran 4,020 to 6,430 and the dead time 1.16 to 2.17 s, so
-/// every landing is flown against every flare's own plant. The first fit
-/// (2,600 fpm, two 1 s lags, 1.8 s, no ground) landed every gate soft and
-/// was wrong: LEMG 12 flew its law to 407.
+/// The 737's flare retard keys (`flare_power`) on its own numbers, and the
+/// heading knob its LEMG 13 finals of 2026-09-28 set.
 #[cfg(test)]
-mod lemg_737_flare_tests;
+mod lemg_737_retard_tests;
 
 #[cfg(test)]
 mod ap_engage_tests;
@@ -402,41 +385,6 @@ mod lemg30_zibo_final_tests;
 /// Issue #77: EDLP 24, the SF50's balked balloon of 2026-09-24, replayed.
 #[cfg(test)]
 mod edlp_go_around_tests;
-
-
-/// Issue #166: LEMG 13, the SR22 (sortie 1790619465-approach, 2026-09-28),
-/// 4.7 kt of wind from 145, the final's air 20 fpm rms (smooth). The arrest
-/// took the servos at 50.6 ft sinking 476 fpm and flew the 172's tracker on
-/// this elevator: 0.14 of pull had the sink at +10 by 45 ft, the roundout
-/// then PUSHED 0.10 and the sink rebuilt to -471 at 28 ft; again to -52;
-/// the flare's full 0.35 from 22 ft met the step to idle a dead time later
-/// (-528 at 12.5 ft), ballooned to +298 at 22 ft, was let go to neutral in
-/// one tick, the balloon's thrust came back and went again, and the sink
-/// the 0.35 met too late was -585 fpm at 1.4 ft (575 on the scorecard).
-///
-/// The plant is the SR22's elevator with the servos out in the form of
-/// [`FlareModel`] (a standing change of sink per unit of pull through two
-/// lags after a dead time), plus what the model does not carry, fitted to
-/// the same 38 ticks: the thrust (fpm per unit of lever through a lag) and
-/// the speed (fpm of sink per knot lost from the gate), the speed itself
-/// -2.70 kt/s less 5.1 per 1,000 fpm of climb plus 2.74 per unit of lever
-/// (0.32 kt/s rms). Each plant is a fit: the whole record, and the record's
-/// parts (the first arrest, the arrest to the flare, the flare), so a law
-/// that lands on all of them does not depend on one fit being right. Rough
-/// air is a random vertical gust (an Ornstein-Uhlenbeck sink, 1.5 s). The
-/// plugin's pitch channel and the loop's tick (0.35 s) are inside the dead
-/// time.
-///
-/// What the plants say: at idle with full flap this wing bleeds 2.7 kt a
-/// second and sinks about 115 fpm harder for each knot, so a flare that cuts
-/// the lever at its gate has lost the lift it is flaring with before the
-/// column's dead time is out. The profile declares the model (6,000 fpm per
-/// unit through 1.0 s lags after 0.8 s: under every fit's gain but the
-/// arrest's, so it pulls for the weakest; the fitted 10,000 / 1.45 / 0.9
-/// lands the same gates at 291) and a retard held until a second from the
-/// wheels (`flare_power` `retard_at_s`).
-#[cfg(test)]
-mod lemg13_sr22_flare_tests;
 
 
 /// Issue #166, the rollout: LEMG 13, the SR22 (sortie 1790619465-approach,
@@ -481,35 +429,16 @@ mod lemg13_sr22_rollout_tests;
 #[cfg(test)]
 mod lemg13_sr22_rollout_split_tests;
 
-/// Issue #180: the A330 at LEMG 30, 10 nm final (sortie
-/// 1790634412-approach, 2026-09-28), first approach in rough air (the
-/// final's air 119 fpm rms). The arrest took the servos at 86.8 ft and flew
-/// the default tracker (the A330 declared no `flare_elevator:`): 0.35 of
-/// pull held five seconds arrested -1,155 fpm into a +277 climb, the column
-/// came back to neutral and the aircraft FLOATED at 30 to 48 ft for 17 s,
-/// was committed at 46.4 ft with 1,432 m ahead and went around
-/// `overflew_the_runway` 0.3 s later.
-///
-/// The plant is the A330's sidestick with the servos out: a RATE plant (the
-/// pull asks a change of sink, through two lags after a dead time, and a
-/// neutral stick holds the sink it has), the ground's own rate growing
-/// below a height, and a sink that grows with the airspeed lost since the
-/// gate (fpm per knot), the speed itself -1.0 kt/s less 1.3 per 1,000 fpm of
-/// climb (the four arrests' idle bleed). Fitted per arrest to every tick of
-/// the four recorded A330 arrests (LEMG 13, sortie 1790621184; LEMG 30,
-/// sorties 1790633832 and 1790634412 twice): 6 to 21 fpm rms each, and the
-/// four together. A standing-sink fit of the same ticks needs a 93 s lag,
-/// which is the integrator. Rough air is a random vertical gust (an
-/// Ornstein-Uhlenbeck sink, 1.5 s). The loop's tick is 0.2 s.
+/// Issue #180: the A330 at LEMG 30 (sorties 1790621184, 1790633832 and
+/// 1790634412, 2026-09-28): a commit that lasted one tick, and the arrest's
+/// wings on its sidestick's roll rate.
 #[cfg(test)]
-mod a330_lemg30_flare_tests;
+mod a330_lemg30_arrest_tests;
 
-/// LEMG 30, the Zibo 737's six own-flare arrests of 2026-10-07: its column
-/// with the servos out fitted to them (a standing plant, the lever's pitch,
-/// the ground and the speed), the tracker as flown replayed through it, and
-/// the declared model flare from every gate on every fit.
+/// LEMG 30, the Zibo 737's six own-flare arrests of 2026-10-07: the
+/// go/no-go at each recorded roundout gate.
 #[cfg(test)]
-mod zibo_lemg30_flare_tests;
+mod zibo_lemg30_landing_call_tests;
 
 /// #199: the missed approach flies a speed.
 #[cfg(test)]

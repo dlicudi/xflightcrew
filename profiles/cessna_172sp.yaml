@@ -100,19 +100,16 @@ vne_kts: 163.0
 # idle at 22 ft let the elevator arrest the sink to almost zero, but spent the
 # airspeed holding the aeroplane up. The sink then rebuilt to 436 fpm at the
 # wheels. Fly the energy out continuously instead: walk the lever back through
-# the flare, and ease a pull that predicts a climb instead of dropping the
-# column to neutral in one tick. These are rates, not event-triggered rescues.
+# the flare. A rate, not an event-triggered rescue.
 flare_power:
   reduction_per_second: 0.10
   retard_max_per_s: 0.10
 flare_elevator:
-  gain: 1.0
   # The attitude flare's pull limit: it holds the nose angle, so more pull
   # is no balloon. At 0.35 the last 2 ft sat on the limit with the nose 0.7
   # deg under its command (LEMG 13, 1791760476, 1791760789).
   max: 0.5
   max_push: 0.10
-  balloon_ease_per_s: 0.15
 
 # EGBS Bravo, 2026-10-02: full linked-nosewheel steering produced about
 # 10 deg/s near 4 kt. Candidate limit for the corner-speed schedule following
@@ -305,9 +302,6 @@ lights:
 # 2026-10-11: with the flight director up, `approach` arms the glideslope.
 # Unflown: blackbox `ils` `coupling` Off to Coupled, `autoflight` `press`
 # APP once, no HDG or V/S press after the captures, the stable gate passed.
-# The layered autonomy (docs/tasks/autonomy-layers): the reference airframe.
-# Flare by attitude flown 7 times on LEMG 13 (243 to 287 fpm, 2026-10-11).
-layers: true
 ils_coupled: true
 # A coupled Cat I ILS is flown to its decision height, then landed visually:
 # the GFC 700 tracked LEMG 13's localiser 18 to 37 m left in a light

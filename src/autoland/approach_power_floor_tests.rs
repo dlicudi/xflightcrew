@@ -79,60 +79,22 @@
         assert!(!xp.ran(super::CMD_SERVOS_FDIR_OFF));
     }
 
-    /// EDLP 24 (2026-09-24): the SF50's 0.35 went to neutral in one tick at
-    /// +190 fpm, and neutral is the TRIMMED approach attitude: the sink was
-    /// back at -590 two seconds later. A declared ease walks the pull down.
+    /// A declared block is used only when its numbers are sane; undeclared,
+    /// the attitude flare flies the defaults.
     #[test]
-    fn a_declared_balloon_ease_walks_the_pull_down_instead_of_dropping_it() {
-        let gains = super::FlareGains {
-            balloon_ease_per_s: Some(0.15),
-            ..Default::default()
-        };
-        let mut law = super::FlarePitch::with_gains(gains);
-        // Sinking hard: the ratchet builds the pull to the cap.
-        for _ in 0..10 {
-            law.step(-100.0, -600.0, 0.0, 0.22, true);
-        }
-        let held = law.step(-100.0, -600.0, 0.0, 0.22, true);
-        assert!(held > 0.3, "{held}");
-        // Now climbing: one tick eases 0.15 x 0.22, it does not let go.
-        let next = law.step(-100.0, 150.0, 400.0, 0.22, true);
-        assert!((held - next - 0.033).abs() < 1e-6, "{held} -> {next}");
-        // The default law (the 172, the 737, the Citation) still lets go.
-        let mut old = super::FlarePitch::default();
-        for _ in 0..10 {
-            old.step(-100.0, -600.0, 0.0, 0.22, true);
-        }
-        assert_eq!(old.step(-100.0, 150.0, 400.0, 0.22, true), 0.0);
-        // And a reset keeps the airframe's numbers.
-        law.reset();
-        for _ in 0..10 {
-            law.step(-100.0, -600.0, 0.0, 0.22, true);
-        }
-        let h = law.step(-100.0, -600.0, 0.0, 0.22, true);
-        assert!(h - law.step(-100.0, 150.0, 400.0, 0.22, true) < 0.05);
-    }
-
-    #[test]
-    fn a_flare_elevator_block_scales_the_law_and_a_bad_one_is_the_default() {
-        let p = crate::aircraft::FlareElevatorProfile {
-            gain: 0.5,
-            trim_gain: 3.0,
+    fn a_flare_elevator_block_is_used_only_when_sane() {
+        use crate::aircraft::FlareElevatorProfile;
+        let p = FlareElevatorProfile {
             max: 0.30,
             max_push: 0.05,
-            balloon_ease_per_s: Some(0.15),
-            tau_s: None,
-            model: None,
             ground_pull: 0.0,
         };
-        let g = super::FlareGains::from_profile(Some(p));
-        let d = super::FlareGains::default();
-        assert!((g.p - 0.5 * d.p).abs() < 1e-12 && (g.d - 0.5 * d.d).abs() < 1e-12);
-        assert!((g.trim_rate - 3.0 * d.trim_rate).abs() < 1e-12);
-        assert_eq!((g.max, g.min, g.balloon_ease_per_s), (0.30, -0.05, Some(0.15)));
-        let bad = crate::aircraft::FlareElevatorProfile { max: 2.0, ..p };
-        assert_eq!(super::FlareGains::from_profile(Some(bad)), d);
-        assert_eq!(super::FlareGains::from_profile(None), d);
+        assert_eq!(p.valid(), Some(p));
+        assert_eq!(FlareElevatorProfile { max: 2.0, ..p }.valid(), None);
+        assert_eq!(FlareElevatorProfile { max_push: 0.5, ..p }.valid(), None);
+        let d = FlareElevatorProfile::default();
+        assert_eq!((d.max, d.max_push, d.ground_pull), (0.35, 0.10, 0.0));
+        assert_eq!(d.valid(), Some(d));
     }
 
     /// LSZS RNAV 03 (2026-09-24): the MAP is 1.98 nm from the threshold,

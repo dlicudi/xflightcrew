@@ -28,202 +28,6 @@
         );
     }
 
-    /// The flare flies the ELEVATOR, and it has to arrest a real sink in the
-    /// three seconds it has. Flown against a plant with no autopilot in it —
-    /// elevator to pitch rate to sink — because removing the autopilot's
-    /// 1.5 s of dead time is the entire point of the change.
-    #[test]
-    fn the_flare_arrests_a_jets_sink_on_the_elevator() {
-        // A 737-ish short-period response: elevator commands a pitch rate,
-        // pitch changes the sink, both first order and quick. Deliberately
-        // NOT the VS-mode plant, which is what we stopped flying through.
-        struct Plant {
-            vvi: f64,
-            rate: f64,
-        }
-        impl Plant {
-            fn step(&mut self, elev: f64, dt: f64) {
-                // Elevator to vertical acceleration, with a short lag.
-                let want = elev * 1400.0; // fpm/s at full commanded travel
-                self.rate += (want - self.rate) * (dt / 0.35).min(1.0);
-                self.vvi += self.rate * dt;
-            }
-        }
-        let mut law = FlarePitch::default();
-        let mut p = Plant {
-            vvi: -900.0,
-            rate: 0.0,
-        };
-        let target = -175.0; // the 737's flare target
-        let dt = 0.1; // the flare tick rate
-        let mut prev = p.vvi;
-        let mut worst_up: f64 = 0.0;
-        for _ in 0..30 {
-            // 3 seconds
-            let trend = (p.vvi - prev) / dt;
-            prev = p.vvi;
-            let e = law.step(target, p.vvi, trend, dt, false);
-            worst_up = worst_up.max(e);
-            p.step(e, dt);
-        }
-        assert!(
-            p.vvi > target - 120.0,
-            "three seconds must arrest 900 fpm to near {target}: got {:.0}",
-            p.vvi
-        );
-        assert!(
-            p.vvi < 0.0,
-            "and must not balloon: the arrest settles ON the target, it does \
-             not fly through it: got {:.0}",
-            p.vvi
-        );
-        assert!(
-            (p.vvi - target).abs() < 60.0,
-            "settled on {target}, not merely near it: got {:.0}",
-            p.vvi
-        );
-        assert!(
-            worst_up <= FLARE_PITCH_MAX + 1e-9,
-            "never past the clamp: {worst_up}"
-        );
-    }
-
-    /// EGLF 06, 2026-09-22: the arrest worked and then gave the runway back.
-    /// The law beat its target at thirteen feet, relaxed the column from 0.35
-    /// to 0.185 because the error had gone negative, and [`FlarePower`] -
-    /// unlocked by that very arrest - took the lever from 0.29 to idle over
-    /// the last 3.4 s. Touchdown at about 360 fpm and still worsening.
-    ///
-    /// The plant is the flare plant above with the thrust leaving underneath
-    /// it: a sinking bias that ramps in over three seconds, which is what
-    /// losing a third of a lever's travel at 140 kt feels like. Without the
-    /// ratchet the law hands it back; with it the column stays where the
-    /// arrest put it and the wheels arrive softly.
-    #[test]
-    fn the_flare_does_not_hand_back_the_arrest_when_the_thrust_leaves() {
-        struct Plant {
-            vvi: f64,
-            rate: f64,
-            /// Sink the departing thrust adds, fpm/s at full effect.
-            thrust_loss: f64,
-        }
-        impl Plant {
-            fn step(&mut self, elev: f64, dt: f64, retard: f64) {
-                let want = elev * 1400.0 - self.thrust_loss * retard;
-                self.rate += (want - self.rate) * (dt / 0.35).min(1.0);
-                self.vvi += self.rate * dt;
-            }
-        }
-
-        /// Fly the last four seconds and return the touchdown sink.
-        fn fly(ratchet: bool) -> f64 {
-            let mut law = FlarePitch::default();
-            let mut p = Plant {
-                vvi: -510.0, // where the EGLF arrest had got to at 21 ft
-                rate: 0.0,
-                thrust_loss: 260.0,
-            };
-            let (target, dt) = (-197.0, 0.1);
-            let mut prev = p.vvi;
-            for tick in 0..40 {
-                // The lever walks off over the last 3.4 s, as it did live.
-                let retard = (tick as f64 * dt / 3.4).clamp(0.0, 1.0);
-                let trend = (p.vvi - prev) / dt;
-                prev = p.vvi;
-                let e = law.step(target, p.vvi, trend, dt, ratchet);
-                p.step(e, dt, retard);
-            }
-            p.vvi
-        }
-
-        let handed_back = fly(false);
-        assert!(
-            handed_back < -300.0,
-            "the tracker must still reproduce the firm landing, or this test \
-             is not about EGLF any more: got {handed_back:.0}"
-        );
-        let held = fly(true);
-        assert!(
-            held > -300.0,
-            "the column stays where the arrest put it, so the wheels arrive \
-             under the instructor's firm threshold: got {held:.0}"
-        );
-        assert!(held < 0.0, "and the aircraft still lands: got {held:.0}");
-    }
-
-    /// EDDV 27L, 2026-09-22, the Citation: the flare at 28 ft held its pull
-    /// through a climb (+545 fpm, up to 58 ft), and the phase flipped back to
-    /// final, which pushed. The plant needs a STANDING pull to hold the flare
-    /// attitude (`E_TRIM`), so neutral elevator sinks and anything held above
-    /// it climbs: that is what makes a held pull a balloon. The old ratchet
-    /// is exactly the running maximum of the free law (the integrator never
-    /// reads `held`), so the test flies both.
-    #[test]
-    fn a_balloon_eases_the_pull_and_settles_onto_the_runway() {
-        const E_TRIM: f64 = 0.10;
-        struct Plant {
-            h: f64,
-            vvi: f64,
-            rate: f64,
-        }
-        impl Plant {
-            fn step(&mut self, elev: f64, dt: f64) {
-                let want = (elev - E_TRIM) * 1400.0;
-                self.rate += (want - self.rate) * (dt / 0.35).min(1.0);
-                self.vvi += self.rate * dt;
-                self.h += self.vvi / 60.0 * dt;
-            }
-        }
-        // (peak height, touchdown sink) from the flare gate at 140 kt.
-        fn fly(old_ratchet: bool) -> (f64, f64) {
-            let mut law = FlarePitch::default();
-            let mut p = Plant {
-                h: 37.0,
-                vvi: -480.0,
-                rate: 0.0,
-            };
-            let (_, target) = arrest_targets_fpm(-(140.0 / 60.0) * GLIDEPATH_FT_PER_NM);
-            let dt = 0.1;
-            let (mut prev, mut peak, mut held) = (p.vvi, p.h, f64::MIN);
-            for _ in 0..300 {
-                let trend = (p.vvi - prev) / dt;
-                prev = p.vvi;
-                let e = if old_ratchet {
-                    held = held.max(law.step(target, p.vvi, trend, dt, false));
-                    held
-                } else {
-                    law.step(target, p.vvi, trend, dt, true)
-                };
-                p.step(e, dt);
-                peak = peak.max(p.h);
-                if p.h <= 0.0 {
-                    return (peak, p.vvi);
-                }
-            }
-            (peak, p.vvi)
-        }
-        let (old_peak, _) = fly(true);
-        assert!(
-            old_peak > 55.0,
-            "the old ratchet must still balloon, or this test is not about \
-             EDDV any more: peaked at {old_peak:.0} ft"
-        );
-        let (peak, sink) = fly(false);
-        assert!(
-            peak < old_peak - 10.0,
-            "eased: {peak:.0} ft against {old_peak:.0}"
-        );
-        let (_, band) = arrest_gates_ft(25.0, 140.0);
-        assert!(
-            peak < band,
-            "never high enough to balk: {peak:.0} against {band:.0}"
-        );
-        assert!(
-            sink > -400.0 && sink < 0.0,
-            "and it lands softly: {sink:.0} fpm"
-        );
-    }
-
     /// Once flaring, a balloon is still the flare; above the roundout band it
     /// is a balked landing, never "final" again with its push.
     #[test]
@@ -358,7 +162,7 @@
     }
 
     #[test]
-    fn a_balloon_holds_the_approach_thrust_and_the_ratchet_lets_go_ahead_of_it() {
+    fn a_balloon_holds_the_approach_thrust() {
         assert_eq!(balloon_power(Some(300.0), Some(0.32), false, false), Some(0.32));
         assert_eq!(
             balloon_power(Some(157.0), Some(0.52), false, true),
@@ -376,71 +180,6 @@
             "coming back down to the band on power"
         );
         assert_eq!(balloon_power(Some(300.0), None, false, false), None, "nothing measured");
-        // EDLP 24: 0.3 held, vvi -192 easing at +480 fpm/s is a balloon in
-        // 0.4 s. The ratchet lets go now instead of at the climb.
-        let mut p = FlarePitch::default();
-        let held = p.step(-107.0, -451.0, -200.0, 0.2, true);
-        assert!(held > 0.2, "{held}");
-        let next = p.step(-107.0, -192.0, 480.0, 0.2, true);
-        assert!(next < held, "released ahead of the balloon: {held} -> {next}");
-        assert!(next >= 0.0, "never a push");
-    }
-
-    /// The ratchet is the flare's, not the roundout's, and it never outlives
-    /// its approach: a balk and the next arrest starts from nothing.
-    #[test]
-    fn the_ratchet_is_the_flares_alone_and_resets_with_the_approach() {
-        let mut law = FlarePitch::default();
-        // Sinking hard: the law pulls, and the ratchet remembers it.
-        let pulled = law.step(-197.0, -600.0, 0.0, 0.1, true);
-        assert!(pulled > 0.0, "a sink that fast is a pull: {pulled}");
-        // Now beating the target by a mile. The tracker wants the column
-        // forward; in the flare it does not get it.
-        let held = law.step(-197.0, 0.0, 0.0, 0.1, true);
-        assert!(
-            held >= pulled,
-            "the flare's column only comes back: {pulled} then {held}"
-        );
-        // The same tick in the ROUNDOUT is ordinary flying.
-        let mut loose = FlarePitch::default();
-        loose.step(-197.0, -600.0, 0.0, 0.1, false);
-        let relaxed = loose.step(-197.0, 0.0, 0.0, 0.1, false);
-        assert!(
-            relaxed < held,
-            "the roundout is free both ways: {relaxed} against {held}"
-        );
-        law.reset();
-        let fresh = law.step(-197.0, 0.0, 0.0, 0.1, true);
-        assert!(
-            fresh < held,
-            "a new approach inherits no standing pull: {fresh} against {held}"
-        );
-    }
-
-    /// The old VS path could not do it, which is why the change exists: the
-    /// same three seconds through the 737's declared lag and dead time.
-    #[test]
-    fn the_vs_dial_could_not_have_arrested_it() {
-        // 1.5 s of dead time plus a 1.5 s lag, the 737's ArrestLeadProfile.
-        let (dt, target) = (0.6f64, -175.0f64); // and the OLD tick rate
-        let mut vvi = -900.0f64;
-        let mut queue = std::collections::VecDeque::from(vec![vvi; 3]);
-        for _ in 0..5 {
-            // 3 seconds at the old rate is five commands
-            let commanded = target;
-            queue.push_back(commanded);
-            let effective = queue.pop_front().unwrap_or(commanded);
-            vvi += (effective - vvi) * (dt / 1.5).min(1.0);
-        }
-        // Three seconds of dead time and lag leave it at about -436 against a
-        // -175 target: a quarter of a G of unarrested sink still to absorb in
-        // the undercarriage. The elevator law above settles ON -175 in the
-        // same three seconds, which is the whole argument for the change.
-        assert!(
-            vvi < target - 200.0,
-            "the dial path is still {:.0} fpm fast at touchdown: {vvi:.0}",
-            target - vvi
-        );
     }
 
     /// The tick rate is the bandwidth the flare has to fly with.
@@ -729,50 +468,14 @@
         };
         assert_eq!(power.step(invalid, 0.3, -100.0, 0.5, 10.0, ias, app), None);
     }
-    /// LEMG 13 (2026-09-26, 737): the arrest levelled at 20 ft, the sink-keyed
-    /// retard took the lever to idle IN the float, and the sink came back to
-    /// -859 fpm. A jet retards by height: nothing above it, and below it a
-    /// ramp that reaches idle as the wheels arrive.
-    /// LEMG 13, the approach test (2026-09-26): -300 by 29 ft, then the sink
-    /// built back to -587 against a target still steeper than the aircraft.
-    /// Held to the best sink reached, the law pulls as soon as it grows.
-    #[test]
-    fn the_flare_never_lets_the_sink_grow_again() {
-        let mut law = FlarePitch::default();
-        law.step(-450.0, -700.0, 0.0, 0.2, false);
-        // Flare: reaches -300 while the target is -636.
-        let a = law.step(-636.0, -300.0, 0.0, 0.2, true);
-        // The sink grows to -400 with the target still -580: pull more.
-        let b = law.step(-580.0, -400.0, -200.0, 0.2, true);
-        assert!(b > a, "pulled for the growing sink: {a} -> {b}");
-    }
-
-    /// LEMG circuit (2026-09-26): the roundout's pull is where the flare
-    /// starts. The flare's first ask (a path target the aircraft is already
-    /// shallower than) must not take the column forward at the hand-over.
-    #[test]
-    fn the_flare_starts_from_the_roundouts_pull() {
-        let mut law = FlarePitch::default();
-        // Roundout: sinking 860 against 460 wanted, the pull builds.
-        let mut pull = 0.0;
-        for _ in 0..10 {
-            pull = law.step(-460.0, -860.0, 0.0, 0.2, false);
-        }
-        assert!(pull > 0.2, "{pull}");
-        // Flare: the target is the path (-759) and the sink already -690.
-        let first = law.step(-759.0, -690.0, 200.0, 0.2, true);
-        assert!(first >= pull - 1e-9, "the column held: {first} after {pull}");
-    }
-
     /// EGLF 24, 2026-10-03, sortie 1791029430: the stock C172 arrested the
-    /// sink at 21 ft, dropped 0.183 of elevator to neutral and cut 0.497 of
-    /// approach power to idle. Energy and lift then vanished together and it
-    /// touched at 436 fpm. Its airframe laws remove both continuously.
+    /// sink at 21 ft and cut 0.497 of approach power to idle. Energy and lift
+    /// then vanished together and it touched at 436 fpm. Its retard takes the
+    /// power off continuously.
     #[test]
-    fn the_c172_flare_does_not_drop_its_energy_or_column() {
+    fn the_c172_flare_does_not_drop_its_energy() {
         let profile = crate::aircraft::load("cessna_172sp").expect("C172 profile");
         let power_cfg = profile.flare_power.expect("continuous flare power");
-        let elevator_cfg = profile.flare_elevator.expect("continuous elevator easing");
 
         let mut power = FlarePower::default();
         let mut lever = power
@@ -785,15 +488,6 @@
                 .unwrap();
         }
         assert!((lever - 0.297).abs() < 1e-9, "two seconds removes 0.20, not all power: {lever}");
-
-        let mut pitch = FlarePitch::with_gains(FlareGains::from_profile(Some(elevator_cfg)));
-        let mut pull = 0.0;
-        for _ in 0..8 {
-            pull = pitch.step(-150.0, -300.0, 0.0, 0.2, true);
-        }
-        let eased = pitch.step(-150.0, -5.0, 300.0, 0.2, true);
-        assert!(pull - eased <= 0.030_000_001, "one tick eased {pull} -> {eased}");
-        assert!(eased > 0.0, "a predicted balloon must not drop the column to neutral");
     }
 
     /// A 172's rollout from 60 kt on a long runway: the drag (growing with
@@ -838,27 +532,6 @@
         assert!((after_gap - brake).abs() < 0.02, "{brake:.2} -> {after_gap:.2}");
         let (_, peak_short, _, x) = fly(250.0);
         assert!(peak_short > 0.3 && x < 250.0 * 0.95, "short runway: peak {peak_short:.2}, stopped in {x:.0} m");
-    }
-
-    /// LEMG 13 (2026-09-26): the 737 floated from 36 to 19 ft on a flat
-    /// -175. Exponential with 4 s, it is the path at the gate, -475 at 20 ft,
-    /// -325 at 10, and the touchdown sink at the wheels; undeclared, flat.
-    #[test]
-    fn the_737s_flare_is_exponential_and_the_rest_stay_flat() {
-        let (flare_vs, nominal) = (-175.0, -700.0);
-        let t = |h: f64| super::flare_target_with(h, flare_vs, nominal, Some(4.0));
-        assert_eq!(t(35.0), -700.0, "the path at the gate, never steeper");
-        assert!((t(20.0) + 475.0).abs() < 1.0, "{}", t(20.0));
-        assert!((t(10.0) + 325.0).abs() < 1.0, "{}", t(10.0));
-        assert!((t(0.0) + 175.0).abs() < 1.0, "{}", t(0.0));
-        assert_eq!(super::flare_target_with(20.0, flare_vs, nominal, None), flare_vs);
-        // Time from 35 ft: the float is gone (about 5.5 s, not 12).
-        let (mut h, mut secs) = (35.0_f64, 0.0);
-        while h > 0.5 {
-            h += t(h) / 60.0 * 0.1;
-            secs += 0.1;
-        }
-        assert!(secs < 7.0, "{secs:.1} s from 35 ft");
     }
 
     #[test]
@@ -1446,29 +1119,6 @@
         // A balk above the call height is called on its own tick.
         let w = BalkWatch::new(Some("unstabilised_at_gate"), 1000.0);
         assert!(due(&w, false, 1000.0, Some(-700.0)));
-    }
-
-    /// The rollout brakes by wanted deceleration, not a fixed clamp. A flat
-    /// 0.45 measured ~3.3 m/s² from 79 kt to a dead stop — "brakes really
-    /// really hard" from the right seat (EGHI, 2026-08-02) — on a runway with
-    /// over a kilometre to spare.
-    #[test]
-    fn rollout_brakes_for_comfort_unless_the_runway_disagrees() {
-        // Plenty of pavement: the comfort rate, well under the old 0.45.
-        let easy = rollout_brake_ratio(79.0, 0.0, 1300.0);
-        assert!((0.2..0.3).contains(&easy), "{easy}");
-        // Short remaining: physics outranks comfort.
-        let tight = rollout_brake_ratio(79.0, 0.0, 300.0);
-        assert!(tight > 0.5, "{tight}");
-        // ...and the cap holds even when the sums say more.
-        assert_eq!(rollout_brake_ratio(120.0, 0.0, 80.0), 0.8);
-        // Slowing to a vacate handoff needs less than slowing to a stop.
-        assert!(
-            rollout_brake_ratio(40.0, VACATE_HANDOFF_KTS, 500.0)
-                <= rollout_brake_ratio(40.0, 0.0, 500.0)
-        );
-        // Near the target the floor still holds a gentle squeeze on.
-        assert!(rollout_brake_ratio(12.0, 10.0, 800.0) >= 0.2);
     }
 
     // Gibraltar 2026-09-11: the only lateral balk was the flare gate under

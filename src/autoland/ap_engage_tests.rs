@@ -82,9 +82,8 @@
     }
 
     /// The 737's pitch plant, fitted to the seven LEMG flares of 2026-09-26
-    /// (profiles/boeing_737_800.yaml `flare_elevator.model`: 4,970 fpm per
-    /// unit of elevator through lags of 0.84 and 3.1 s after 1.35 s of dead
-    /// time), with the new-flight start of LEMG 13 (sortie
+    /// (4,970 fpm per unit of elevator through lags of 0.84 and 3.1 s after
+    /// 1.35 s of dead time), with the new-flight start of LEMG 13 (sortie
     /// 1790587073-approach, 2026-09-28) as its disturbance: the sim starts
     /// the flight at 1.3 s descending 900 fpm with 0.54 of nose-down
     /// mistrim, read through a 1 s VSI (fitted to the recorded ticks, 112
@@ -217,7 +216,7 @@
         let mut e = ApEngage::default();
         assert!(e.arm(0.0).fire);
         p.press();
-        let mut law = FlarePitch::with_gains(engage_hold_gains());
+        let mut law = LevelHold::with_gains(engage_hold_gains());
         let mut prev: Option<(f64, f64)> = None;
         let mut elev = 0.0;
         let mut confirmed_at = None;
@@ -238,7 +237,7 @@
             prev = Some((p.vsi, t));
             elev = if s.hold {
                 held_ticks += 1;
-                law.step(0.0, p.vsi, trend, dt, false)
+                law.step(0.0, p.vsi, trend, dt)
             } else {
                 0.0
             };
@@ -263,7 +262,7 @@
         p.run(ARM_S, 0.0);
         let mut e = ApEngage::default();
         e.arm(0.0);
-        let mut law = FlarePitch::with_gains(engage_hold_gains());
+        let mut law = LevelHold::with_gains(engage_hold_gains());
         let mut prev: Option<(f64, f64)> = None;
         let mut elev = 0.0;
         let mut worst_vsi: f64 = 0.0;
@@ -286,7 +285,7 @@
             let dt = prev.map_or(0.6, |(_, t0)| t - t0);
             prev = Some((p.vsi, t));
             assert!(s.hold);
-            elev = law.step(0.0, p.vsi, trend, dt, false);
+            elev = law.step(0.0, p.vsi, trend, dt);
             assert!(elev <= engage_hold_gains().max + 1e-9);
             t += 0.6;
         }

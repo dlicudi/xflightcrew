@@ -24,17 +24,8 @@
             * 0.3048
     }
 
-    fn model() -> (Option<f64>, Option<f64>) {
-        let f = crate::aircraft::load("boeing_737_800")
-            .expect("the 737 profile loads")
-            .flare_elevator
-            .expect("the 737's flare block");
-        (f.tau_s, f.model.and_then(|m| m.touchdown_fpm))
-    }
-
     /// The gate as recorded, at `ias` (its groundspeed the wind's less).
     fn gate_call(ias: f64, length_m: f64) -> LandingCall {
-        let (tau, td) = model();
         landing_call(
             0.0745 * M_PER_NM,
             length_m,
@@ -42,8 +33,6 @@
             ias - HEAD_KTS,
             Some(ias),
             145.0,
-            tau,
-            td,
             wheels_need_m(Some(BOOK_M), Some(roll_m())),
         )
         .expect("every measurement read")
@@ -78,21 +67,23 @@
         assert_eq!(wheels_need_m(Some(BOOK_M), Some(f64::NAN)), book_wheels);
     }
 
-    /// From the recorded gate the energy predicts a touchdown in the first
-    /// half of the strip with the roll and more ahead: LAND, decided at
-    /// 79.8 ft. The same gate 25 kt fast floats past the room to stop: the
-    /// go-around is flown from there, with height in hand; on LEMG 13's 3,200 m
-    /// the fast one still lands.
+    /// From the recorded gate the energy predicts a touchdown with the roll
+    /// still ahead: LAND, decided at 79.8 ft. On the attitude flare's
+    /// round-out and hold-off that is 923 m in with 840 m left against the
+    /// roll's 792 (the old law's 5.5 s exponential: 9 to 13 s of air, the
+    /// touchdown 400 to 800 m in). The same gate 25 kt fast floats past the
+    /// room to stop: the go-around is flown from there, with height in hand;
+    /// on LEMG 13's 3,200 m the fast one still lands.
     #[test]
     fn the_lxgb_gate_calls_a_landing() {
         let c = gate_call(145.9, LENGTH_M);
         assert!(c.land, "{c:?}");
         assert!(
-            c.touchdown_m > 400.0 && c.touchdown_m < 800.0,
+            c.touchdown_m > 800.0 && c.touchdown_m < 1000.0,
             "the flare from 79.8 ft: {c:?}"
         );
-        assert!(c.remaining_m > c.need_m + 200.0, "{c:?}");
-        assert!(c.air_s > 9.0 && c.air_s < 13.0, "{c:?}");
+        assert!(c.remaining_m > c.need_m, "{c:?}");
+        assert!(c.air_s > 13.0 && c.air_s < 16.0, "{c:?}");
         let fast = gate_call(170.0, LENGTH_M);
         assert!(!fast.land, "25 kt fast: {fast:?}");
         assert!(fast.touchdown_m > c.touchdown_m + 500.0);
@@ -105,8 +96,6 @@
             140.0,
             None,
             145.0,
-            None,
-            None,
             800.0
         )
         .is_none());
@@ -117,8 +106,6 @@
             f64::NAN,
             None,
             145.0,
-            None,
-            None,
             800.0
         )
         .is_none());
@@ -130,40 +117,32 @@
             140.4,
             None,
             145.0,
-            model().0,
-            model().1,
             800.0,
         )
         .unwrap();
         assert!(unread.air_s < c.air_s, "{unread:?} {c:?}");
     }
 
-    /// The flare's time is the exponential's: `tau ln((h + h_f) / h_f)`
-    /// under the height where it asks less than the path, the path's sink
-    /// above it. Without a time constant, the flat flare.
+    /// The flare's time is the attitude flare's: the path's sink down to
+    /// its flare height, then its round-out to the hold-off's sink.
     #[test]
     fn the_flare_time_is_the_law_it_flies() {
-        let (tau, td) = model();
-        let tau_s = tau.unwrap();
-        let td_fpm = td.unwrap();
-        let h_f = td_fpm * tau_s / 60.0;
-        let t20 = flare_time_s(20.0, 140.0, tau, td).unwrap();
+        use super::attitude_flare as af;
+        let path = -(140.0 / 60.0) * gp_ft_per_nm();
+        let gate = af::gate_ft(path, af::RESPONSE_S);
+        let t_gate = flare_time_s(gate, 140.0).unwrap();
+        let t80 = flare_time_s(80.0, 140.0).unwrap();
         assert!(
-            (t20 - tau_s * ((20.0 + h_f) / h_f).ln()).abs() < 1e-9,
-            "{t20}"
+            (t80 - t_gate - (80.0 - gate) / -path * 60.0).abs() < 1e-9,
+            "the path's sink above the gate: {t80} {t_gate}"
         );
-        assert!(flare_time_s(0.0, 140.0, tau, td).unwrap().abs() < 1e-9);
-        let t80 = flare_time_s(80.0, 140.0, tau, td).unwrap();
-        assert!(t80 > t20 + 2.0, "{t80} {t20}");
-        // Flat: 25 kt of a 172's 65, the roundout's -250 to the 25 ft gate,
-        // then -100.
-        let flat = flare_time_s(50.0, 65.0, None, None).unwrap();
-        assert!(
-            (flat - (25.0 / 250.0 * 60.0 + 25.0 / 100.0 * 60.0)).abs() < 1e-9,
-            "{flat}"
-        );
-        assert!(flare_time_s(f64::NAN, 140.0, tau, td).is_none());
-        assert!(flare_time_s(20.0, 0.0, tau, td).is_none());
+        // Below the gate never faster than the path, never slower than the
+        // hold-off's sink.
+        assert!(t_gate > gate / -path * 60.0, "{t_gate}");
+        assert!(t_gate < gate / -af::HOLDOFF_VS_FPM * 60.0, "{t_gate}");
+        assert!(flare_time_s(0.0, 140.0).unwrap().abs() < 1e-9);
+        assert!(flare_time_s(f64::NAN, 140.0).is_none());
+        assert!(flare_time_s(20.0, 0.0).is_none());
     }
 
     /// The balk at 4.5 ft as flown: unlatched, and latched on the book's

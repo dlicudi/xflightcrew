@@ -99,7 +99,8 @@
                 let target = crate::autotakeoff::roll_target_heading(COURSE, x, r, gs);
                 let psi = at(t, 2) + dpsi;
                 let err = crate::angles::signed_diff_deg(target, psi);
-                let brake = rollout_brake_ratio(gs, 0.0, 2500.0);
+                // The stop as flown: both brakes at 0.24.
+                let brake = 0.24;
                 let b = if split {
                     law.step_with(err, Some(psi), None, 0.0, TICK_S, gs, brake)
                 } else {

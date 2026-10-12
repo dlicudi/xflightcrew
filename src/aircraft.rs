@@ -81,7 +81,8 @@ pub struct AircraftProfile {
     /// 172's fitted numbers (see [`ArrestLeadProfile`]).
     #[serde(default)]
     pub arrest_lead: Option<ArrestLeadProfile>,
-    /// The flare's elevator law, when the default does not fit.
+    /// The attitude flare's elevator limits and ground pull, when the
+    /// defaults do not fit.
     #[serde(default)]
     pub flare_elevator: Option<FlareElevatorProfile>,
     /// The rudder's authority on the takeoff roll, when measured.
@@ -406,13 +407,6 @@ pub struct AircraftProfile {
     /// and VS dial handed over as the localizer and glideslope capture. Off
     /// until a capture has been flown on the type; the copilot's own path
     /// otherwise.
-    /// Flies the layered autonomy (docs/tasks/autonomy-layers): the
-    /// aircraft's own autopilot for the approach, an ILS intercepted level,
-    /// the speed on total energy (`autoland::energy_throttle`), the flare by
-    /// attitude (`autoland::attitude_flare`). An airframe crosses over by
-    /// flying it, never by a fitted number.
-    #[serde(default)]
-    pub layers: bool,
     #[serde(default)]
     pub ils_coupled: bool,
     /// Radio height, feet, below which a coupled ILS is handed back to
