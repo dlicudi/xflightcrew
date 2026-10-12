@@ -7,7 +7,7 @@ in the other seat who works the panel and can fly the aircraft, the **tower** on
 the radio, and the **cabin crew** down the back. Three voices, one microphone,
 and nothing leaves your machine.
 
-You speak normally and they answer in their own voices — no menus, no key
+You speak normally and they answer in their own voices: no menus, no key
 combinations, and no connection to anything.
 
 ```
@@ -19,7 +19,7 @@ in what you *see*; this layers in what you *hear*.
 
 ## What it's for
 
-**It has hands.** It doesn't just talk — it writes datarefs. It works the panel,
+**It has hands.** It doesn't just talk; it writes datarefs. It works the panel,
 and it will taxi, line up, take off, fly a circuit or a published approach, and
 land. That's a different trust model from a voice that only narrates, so every
 action is gated and read back from the aircraft's *actual* state, never from the
@@ -29,7 +29,7 @@ intent.
 rule set, no model), and mouth (ONNX/piper) all run locally. Nothing is metered
 per call, and it works with the network off.
 
-**The tower is deterministic.** ATC is a state machine, not an LLM — a mishear
+**The tower is deterministic.** ATC is a state machine, not an LLM. A mishear
 can earn "say again", but it can never earn a clearance. Frequencies, taxi
 routes and approach geometry come from X-Plane's own `apt.dat`, `earth_nav.dat`
 and CIFP data, so the field you're at is the field it works.
@@ -56,18 +56,18 @@ of the aircraft's loaded checklist; they do not perform or verify its items.
 
 - **Commands** across every system the airframe has: flaps, gear, autopilot,
   engine, fuel, electrics, lights, radios, transponder, instruments.
-- **Compound and conversational** — "flaps ten and throttle seventy", then
+- **Compound and conversational**: "flaps ten and throttle seventy", then
   "make it eighty", "switch it back to both".
-- **Checklists it actually runs** — "run the before-takeoff checklist": it reads
+- **Checklists it actually runs**: "run the before-takeoff checklist": it reads
   each item, **acts** the ones it can, **verifies** the ones it can read, and
   **calls out** the ones that are yours. Interpreted from **XChecklist** files,
   so any aircraft's list drops straight in.
-- **Safety gates and readbacks** — refuses flap extension over Vfe, gear up on
+- **Safety gates and readbacks**: refuses flap extension over Vfe, gear up on
   the ground, low-altitude AP targets; re-reads the dataref after writing and
   confirms what the aircraft *did*.
 - **A background monitor** that speaks up unprompted: alternator offline, low
   fuel, gear, stall, terrain, altitude deviations.
-- **Flight planning from a destination** — "plan a flight to Malaga", "divert
+- **Flight planning from a destination**: "plan a flight to Malaga", "divert
   to Gibraltar", "take us to lima echo mike golf". A direct route from the field
   you're at, cruise altitude picked over the sim's own terrain, time and fuel
   from the aircraft profile against what's in the tanks, and a refusal when the
@@ -91,6 +91,16 @@ each refuses rather than guesses.
 | "land us" | Autoland from wherever you are |
 | "full auto" | All of it, cold and dark to the runway |
 | "fly my flight plan" | Your SimBrief route, gate to gate |
+
+**How it lands.** The way a pilot does. Above minimums the aircraft's own
+autopilot flies: its approach mode on an ILS, otherwise a heading set with the
+wind correction and changed only now and then, in whole degrees. At minimums the
+copilot disconnects and hand-flies to the wheels with one pilot controller
+(`src/pilot`): the ailerons for the centreline, the elevator for the path and
+the flare, the throttle for the energy. The same controller flies every
+fixed-wing type; what differs between types (how hard the aircraft answers each
+control) is measured in flight, not typed in. The laws are tested on models
+fitted to recorded flights of each aircraft.
 
 ### Talk to the tower
 
@@ -150,16 +160,25 @@ FMS route load, terrain queries, and the control channels the ground automation
 steers through. It also renders XVoiceLayer's traffic via XPMP2 when CSL models
 are installed.
 
-It also draws an in-sim **status panel** — Flight, Transcript, ATC, Route and
-Settings tabs — with the live strip, an automation status well, one-press
+It also draws an in-sim **status panel** (Flight, Transcript, ATC, Route and
+Settings tabs) with the live strip, an automation status well, one-press
 buttons for every automation, and the phraseology reference.
+
+## On a tablet: the EFB
+
+An Electronic Flight Bag served on your LAN for an iPad, a phone or a second
+screen: Flight, Map, Plan and Radio tabs laid out by the phase of flight, the
+crew's warnings, a hold-to-talk button, and buttons that say pilot English for
+you (so every tap goes through the same grammar, gates and readbacks as your
+voice). Off by default: `XCOPILOT_EFB=true`, or turn it on in Settings; the
+link with its key is in the log. See [docs/efb.md](docs/efb.md).
 
 ## Quick start
 
 Two local pieces:
 
 1. **X-Plane 12** with the Web API on (Settings → Network → Web API, port 8086).
-2. A **whisper.cpp** model — a ggml `.bin` in `models/`, e.g. `ggml-base.en.bin`.
+2. A **whisper.cpp** model: a ggml `.bin` in `models/`, e.g. `ggml-base.en.bin`.
 
 Then:
 
@@ -188,16 +207,18 @@ than silently inheriting Cessna limits.
 - **Push-to-talk**: `XCOPILOT_LISTEN=ptt`, or bind the plugin's PTT commands in
   X-Plane. The **radio** PTT transmits to ATC; the **intercom** PTT talks to the
   copilot.
-- **Type instead**: `XCOPILOT_UI=tui` gives a dashboard with a command line —
+- **Type instead**: `XCOPILOT_UI=tui` gives a dashboard with a command line:
   no mic, no mishears, ideal for testing.
 
-### Running only half of it
+### Modes
 
 `XCOPILOT_MODE` (or the panel's Settings tab, live):
 
-- `both` — copilot and ATC (default)
-- `copilot` — no simulated ATC, so real/online ATC owns the radio
-- `atc` — the world without the crew
+- `both`: copilot and ATC (default)
+- `copilot`: no simulated ATC, so real/online ATC owns the radio
+- `atc`: the world without the crew
+- `instructor`: a flight instructor that teaches one task at a time and grades
+  it, hands off the controls ("show me" demonstrates once, then "your controls")
 
 ## Stack
 
@@ -206,6 +227,7 @@ than silently inheriting Cessna limits.
 | Mic capture | `cpal` |
 | Speech-to-text | `whisper-rs` (whisper.cpp, Metal on Apple Silicon) |
 | Commands and conversation | deterministic grammar, curated tools, conversation state |
+| Flying | the aircraft's autopilot, plus one pilot controller (`src/pilot`) for what a pilot hand-flies |
 | X-Plane read/write | `reqwest` → Web API (`PATCH /api/v1/datarefs/...`) |
 | In-sim capability | native C++ plugin (PTT, panel, FMS, terrain, controls) |
 | Navigation data | `nav` crate (`apt.dat`, fixes, navaids, CIFP, taxi geometry) |
@@ -222,12 +244,12 @@ controller cannot actuate either your aircraft or traffic. These boundaries are
 compiler-checked rather than conventions.
 
 The tool surface is per-airframe: a profile declares which systems exist and
-their limits, and the tool registry is built from it — so a 172 is never
+their limits, and the tool registry is built from it, so a 172 is never
 offered a gear lever. See [CLAUDE.md](CLAUDE.md) for the design rationale.
 
 ## Configuration
 
-All via environment / `.env` — [.env.example](.env.example) is the documented
+All via environment / `.env`; [.env.example](.env.example) is the documented
 list. Common knobs:
 
 | Var | Default | What |
@@ -239,10 +261,11 @@ list. Common knobs:
 | `XCOPILOT_CONFIRM` | `true` | require "affirm" before safety-critical commands |
 | `XCOPILOT_MONITOR` | `true` | background problem callouts |
 | `XCOPILOT_ATC_AIRPORT` | `LXGB` | home field for the tower |
-| `XCOPILOT_SIMBRIEF_ID` | — | your SimBrief username, for flight plans |
+| `XCOPILOT_SIMBRIEF_ID` | (none) | your SimBrief username, for flight plans |
 | `XCOPILOT_TRAFFIC` | `off` | `ours`, `real`, or `off` |
 | `XCOPILOT_TRAFFIC_DENSITY` | `normal` | generated fleet: `off`, `light`, or `normal` |
-| `XCOPILOT_TRAFFIC_FILE` | — | optional local YAML schedule instead of generation |
+| `XCOPILOT_TRAFFIC_FILE` | (none) | optional local YAML schedule instead of generation |
+| `XCOPILOT_EFB` | `false` | serve the EFB page on the LAN |
 
 For rendered traffic, install CSL packages and point the X-Plane plugin at
 them with `XCOPILOT_TRAFFIC_CSL`. LiveTraffic commonly owns X-Plane's TCAS
@@ -259,6 +282,8 @@ live installs for nothing.
 
 - Commands and checklists: [Cessna 172SP](docs/cessna_172sp.md) ·
   [Cirrus SR22](docs/cirrus_sr22.md)
+- The EFB: [docs/efb.md](docs/efb.md)
+- Checking a new aircraft profile, parked: [docs/conform.md](docs/conform.md)
 - Background callouts: [docs/monitoring.md](docs/monitoring.md)
 - In-sim ATC soak test: [docs/atc-chaos-card.md](docs/atc-chaos-card.md)
 
@@ -268,6 +293,14 @@ live installs for nothing.
 cargo test --workspace                        # everything deterministic, no sim needed
 cargo test --release -p atc -- --ignored atc_world_sweep   # cross-airport sweep (needs apt.dat)
 cargo run -- stt-eval bench/atc_stt_cases.yaml             # spoken-call accuracy
+```
+
+With the sim running:
+
+```sh
+xvl sortie bench/sorties/c172-g1000-ils13.yaml   # fly a scripted test flight, scored PASS/FAIL
+xvl debrief                                      # the last flight's lessons and grades
+xvl conform                                      # check every channel an aircraft profile declares, parked
 ```
 
 Every flight writes `logs/blackbox.jsonl`; `xvl analyze` mines the logs for
@@ -287,10 +320,12 @@ data, or a running simulator.
   rendered traffic need the native plugin.
 - The Cessna 172 is the reference airframe. Other profiles expose their
   declared systems and limits, but do not all have equal live-sortie coverage.
-- The autonomous flying stack is substantial but safety-sensitive. Development
-  is currently focused on the copilot/checklists, ATC and owned traffic;
-  autonomous flight modes receive crash and safety fixes rather than new
-  behaviour while that stack is redesigned around each aircraft's autopilot.
+- The autonomous flying stack is being rebuilt in layers: the aircraft's own
+  autopilot where a pilot would use it, one pilot controller for what a pilot
+  hand-flies. The final approach and landing are done (validated on the C172,
+  SR22, King Air, Lancair Evolution, Baron 58 and SF50); the jets fly the same
+  controller but are not yet validated, and the other flying modes (takeoff,
+  circuits, taxi, full auto) take only crash and safety fixes until their turn.
 - Traffic does not fetch online schedules and requires user-installed CSL
   models for useful rendering. It currently freezes under accelerated time,
   has no wind triangle, and operates at controlled fields when ATC is enabled.
