@@ -14296,3 +14296,11 @@ declared: the path closed on its command to 0.1 deg by the wheels. Its old fitte
 model (issue #196) and its tests and LILB recordings are gone, and with them the last users
 of the SR22 bounce file's plant: `lemg13_sr22_bounce_tests` is deleted, its one live test
 (`TouchHold`) moved beside `TouchHold` in `autoland::rollout`.
+
+### 2026-10-12: the Baron 58 crosses to layers
+
+On the default tracker before (no `flare_elevator:`); on layers 186 fpm with the nose 0.7
+deg under its command as the pull rose 0.13 to 0.40 below 9 ft (1791802802), then with its
+measured ground pull (0.3) 76 and 119 fpm, drift under 2 deg, the centreline within 2.6 m
+(1791803088, 1791803366; `bench/sorties/baron-lemg.yaml`). Every low wing so far (SR22,
+King Air, Baron) needed its ground pull declared; the Evolution did not.

@@ -246,3 +246,19 @@ lights:
 # No XChecklist file ships for this airframe, so there is no `checklist` /
 # `checklist_map` block and no `locations` — cockpit geography is answered from
 # a verified layout or not at all, never guessed.
+
+# The layered autonomy (docs/tasks/autonomy-layers): the attitude flare,
+# the energy throttle and the measured rollout brake, no fitted law: 186
+# fpm, then with its ground pull 76 and 119 (LEMG 13, 1791802802,
+# 1791803088, 1791803366).
+layers: true
+flare_elevator:
+  gain: 1.0
+  # The attitude flare's pull limit: it holds the nose angle, the limit is
+  # the stop.
+  max: 0.8
+  # Its low wing's ground effect, measured: the pull went from 0.13 at 9 ft
+  # to 0.40 at the wheels with the nose 0.7 deg under its command and the
+  # sink rebuilt from 127 to 232 fpm (LEMG 13, 1791802802: 186 fpm). Fed
+  # forward along the ground effect's shape (`attitude_flare::ground_shape`).
+  ground_pull: 0.3
