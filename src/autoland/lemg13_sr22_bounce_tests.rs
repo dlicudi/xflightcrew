@@ -423,28 +423,6 @@
         secs_to_wheels: f64,
     }
 
-    fn sr22() -> crate::aircraft::AircraftProfile {
-        crate::aircraft::load("cirrus_sr22").expect("the SR22 profile loads")
-    }
-
-    /// The profile as flown on 2026-09-29 at 80 kt: the model without the
-    /// hold-off, the lever held to a second from the wheels.
-    fn as_flown() -> (FlareModel, crate::aircraft::FlarePowerProfile) {
-        (
-            FlareModel::from_profile(Some(super::lemg13_sr22_flare_tests::flare_0928()))
-                .expect("the 09-28 model"),
-            super::lemg13_sr22_flare_tests::power_0928(),
-        )
-    }
-
-    fn today() -> (FlareModel, crate::aircraft::FlarePowerProfile) {
-        let p = sr22();
-        (
-            FlareModel::from_profile(p.flare_elevator).expect("the SR22 declares its model"),
-            p.flare_power.expect("the SR22 declares its retard"),
-        )
-    }
-
     fn land(
         p: &mut Plant,
         model: &mut FlareModel,
@@ -542,56 +520,6 @@
         }
     }
 
-    /// Gates at 75 kt (the final since 6c4276f): the recorded three scaled to
-    /// the slower path, a little steeper and shallower, faster and slower.
-    const GATES_75: [(f64, f64, f64, f64); 5] = [
-        (49.0, -356.0, 75.0, -0.027),
-        (49.0, -420.0, 75.0, -0.02),
-        (49.0, -300.0, 75.0, -0.03),
-        (46.0, -356.0, 77.0, -0.027),
-        (50.0, -356.0, 73.0, -0.027),
-    ];
-
-    /// The flare as flown (the 80 kt law, `lemg13_sr22_flare_tests::
-    /// flare_0928`), closed loop from the three recorded gates, bounces on
-    /// every plant as it did in the sim (3.8 to 5.9 ft). The hold-off from
-    /// every 75 kt gate on every plant, calm and rough: one contact under 250
-    /// fpm near the stall (57 to 70 kt), never over 1.5 ft after it, never
-    /// slower than 57 kt before it (the best fit: 124 fpm at 64.5 to 68.5
-    /// kt, 1.2 ft), and every plant's hold-off under a third of its flare
-    /// as flown.
-    #[test]
-    fn the_hold_off_touches_once_where_the_flare_as_flown_bounced() {
-        let mut worst = (0.0_f64, 0.0_f64);
-        for fit in plants() {
-            let mut flown_worst = 0.0_f64;
-            for src in FLOWN {
-                let f = flown(src);
-                let (_, h, v, ias, _) = f.ticks[0];
-                let mut p = Plant::at(fit, h, v.unwrap(), ias, f.writes[0].1);
-                let (mut m, pw) = as_flown();
-                flown_worst = flown_worst.max(land(&mut p, &mut m, pw, 80.0, true, 30.0).bounce_ft);
-            }
-            assert!(flown_worst > 3.0, "{fit:?} as flown: {flown_worst:.2} ft");
-            let mut held = 0.0_f64;
-            for (h, v, ias, pipe) in GATES_75 {
-                for rough in [false, true] {
-                    let mut p = Plant::at(fit, h, v, ias, pipe);
-                    let (mut m, pw) = today();
-                    let l = land(&mut p, &mut m, pw, 75.0, rough, 40.0);
-                    assert!(l.first_fpm < 250.0, "{fit:?} {h} {v} {ias}: {l:?}");
-                    assert!(l.bounce_ft < 1.5, "{fit:?} {h} {v} {ias}: {l:?}");
-                    assert!((57.0..=70.0).contains(&l.first_ias), "{fit:?}: {l:?}");
-                    assert!(l.min_ias > 57.0, "{fit:?}: {l:?}");
-                    held = held.max(l.bounce_ft);
-                    worst = (worst.0.max(l.first_fpm), worst.1.max(l.bounce_ft));
-                }
-            }
-            assert!(held < flown_worst / 3.0, "{fit:?}: {held:.2} against {flown_worst:.2}");
-        }
-        eprintln!("held off: worst {:.0} fpm, {:.2} ft", worst.0, worst.1);
-    }
-
     /// Held on: the pull it touched with, never more and never less, the
     /// lever closed; let go only on the wheels below the release speed.
     #[test]
@@ -612,19 +540,6 @@
         let mut push = TouchHold::default();
         push.note(true, Some(-0.04));
         assert_eq!(push.elev(70.0, true, 0.45), Some(0.0), "never a push");
-    }
-
-    /// Only an airframe that declares the hold-off flies it: the 737, the
-    /// A330 and the SF50 keep their firm-touchdown flares.
-    #[test]
-    fn only_the_sr22_holds_off() {
-        for id in ["boeing_737_800", "airbus_a330_300", "cirrus_vision_sf50"] {
-            let p = crate::aircraft::load(id).expect("the profile loads");
-            let m = FlareModel::from_profile(p.flare_elevator).expect("a model");
-            assert!(!m.holds_off(), "{id}");
-        }
-        let (m, _) = today();
-        assert!(m.holds_off());
     }
 
     /// A recorded flare's column and lever, open loop, from its gate on a

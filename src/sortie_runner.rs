@@ -3551,17 +3551,22 @@ pub async fn run_all(
     on_row: &mut (dyn FnMut(&Row) + Send),
 ) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
-    // What the runner last set LiveTraffic to: shown, as found. Only a case
-    // that wants otherwise touches it, so a spec without `traffic` reads
-    // and writes nothing.
-    let mut traffic_shown = true;
+    // LiveTraffic as FOUND, read once a case names `traffic`, and restored
+    // at the end. Assumed shown, the end of every run switched it ON: a sim
+    // set up for our own traffic got LiveTraffic's beside it after each test
+    // (2026-10-12). A case without `traffic` gets the found state back;
+    // unread (no LiveTraffic), nothing is touched.
+    let mut found: Option<bool> = None;
+    let mut traffic_read = false;
     'run: for case in &spec.cases {
         for rep in 1..=repeat.max(1) {
             let t0 = now_s();
-            let want = case.traffic.unwrap_or(true);
-            if want != traffic_shown {
+            if case.traffic.is_some() && !traffic_read {
+                traffic_read = true;
+                found = sim.read(TRAFFIC_SHOWN).await.ok().map(|v| v > 0.5);
+            }
+            if let Some(want) = case.traffic.or(found) {
                 set_traffic(sim, want).await;
-                traffic_shown = want;
             }
             let left_flying = rows.last().is_some_and(|r| r.verdict.left_flying);
             let stop_now = rows.last().is_some_and(|r| r.verdict.stop_owed);
@@ -3581,8 +3586,8 @@ pub async fn run_all(
             }
         }
     }
-    if !traffic_shown {
-        set_traffic(sim, true).await;
+    if let Some(found) = found {
+        set_traffic(sim, found).await;
     }
     if !ensure_real_time(sim, "the run ended").await {
         eprintln!("sim_speed did not read back 1 at the run's end: check it");
