@@ -14323,3 +14323,20 @@ King Air, Baron) needed its ground pull declared; the Evolution did not.
   the ground after a layered sortie with the cabin at sea level and no `cabin_air` `masks`
   record: nothing of ours wrote it, and written 0 it stayed 0. Suspected: the sim's own
   engines-running air start. To confirm at the next air start.
+
+### 2026-10-12 (later): the layered final pays for the vertical the autopilot is in
+
+The visual card regressed today (LEMG 12, two go-arounds) and the cause was ours. The G1000
+captures a GPS glidepath by itself; the VS dial is then not its input, but the path nudge kept
+moving it against OUR path (to -50), and the 200 ft hand-back levelled the 172 over the
+runway (1791807406); the throttle, paying for that dial since the RV-10 fix, ran it to 80 kt
+(1791806643). Now: under a captured glidepath (`Modes::gs`) the throttle pays for the path's
+rate and the dial is left alone; handed back, it is set afresh (the hand-back then held -300
+to the threshold, 1791808122). The ILS reference after it: 136 fpm (1791808787).
+
+- Open, older than today: on LEMG 12's GPS approach the autopilot flies 10 to 30 m left of
+  the apt.dat centreline (12 m on this morning's pass, 1791761926; 15 to 29 in a 140/9 wind,
+  1791808122), and after the 200 ft hand-back our heading steer closed to 4 m and drifted
+  back to 22: `off_centreline_low` at 25 ft, the gate's right call.
+- Flown before these two fixes (VS-mode autopilots, where the dial IS the path): the SR22,
+  King Air, Evolution, Baron and SF50 results above. Not re-flown since.
