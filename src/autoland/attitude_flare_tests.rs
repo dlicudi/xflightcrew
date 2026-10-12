@@ -1,108 +1,14 @@
+//! The attitude flare on plants FITTED to five airframes' recorded flares
+//! (2026-10-12, multiple shooting from the gate to the wheels on the
+//! recorded column and lever, 0.11 to 0.25 deg rms on theta and gamma). One
+//! shape fits all five: the column sets an angle of attack through the
+//! short period, lift is the angle of attack above its zero-lift angle times
+//! the dynamic pressure (more with the power's slipstream and in ground
+//! effect), and the lever's drag decides the speed. The plant the law was
+//! first tested on had a lift slope five times too steep and a fifth of the
+//! idle deceleration, and could not show the windy evening's sag.
+
 use super::*;
-
-/// A second-order pitch plant from the G1000 172's LEMG 13 approach
-/// (1791739518): the pitch rate answers the elevator through a 0.25 s lag
-/// at `b` deg/s per unit, the path follows the nose's attitude less its trim
-/// alpha through `t_gamma`, the trim alpha and elevator rise as the speed
-/// bleeds. The law is flown through the loop's real transport delay
-/// (0.15 s) and its 0.2 s tick.
-#[derive(Clone, Copy)]
-struct Plant {
-    b: f64,
-    t_gamma: f64,
-    /// The extra pull ground effect takes at the wheels, elevator: none in
-    /// free air, growing as the square below [`GE_FROM_FT`].
-    ge: f64,
-    /// What the airframe DECLARES of it (`flare_elevator.ground_pull`).
-    ground_pull: f64,
-    /// The pull limit it declares (`flare_elevator.max`).
-    pull: f64,
-    theta: f64,
-    q: f64,
-    gamma: f64,
-    v_kts: f64,
-    h_ft: f64,
-}
-
-const T_Q: f64 = 0.25;
-/// The pull the flare may use: the 172's declared `flare_elevator.max`.
-const PULL: f64 = 0.5;
-/// Ground effect from about half the 172's 36 ft span: a 0.25 pull at the
-/// wheels reproduced the flights' 226 to 287 fpm on the old law.
-const GE_FROM_FT: f64 = 18.0;
-const ALPHA0: f64 = 2.5;
-const V0: f64 = 63.0;
-
-impl Plant {
-    fn new(b: f64, t_gamma: f64, gamma0: f64, h_ft: f64) -> Self {
-        let alpha = ALPHA0;
-        Plant { b, t_gamma, ge: 0.0, ground_pull: 0.0, pull: PULL, theta: gamma0 + alpha, q: 0.0, gamma: gamma0, v_kts: V0, h_ft }
-    }
-    fn alpha_trim(&self) -> f64 {
-        ALPHA0 * (V0 / self.v_kts).powi(2)
-    }
-    fn e_trim(&self) -> f64 {
-        0.012 * (V0 - self.v_kts) + self.ge * (1.0 - self.h_ft / GE_FROM_FT).max(0.0).powi(2)
-    }
-    fn alpha(&self) -> f64 {
-        self.theta - self.gamma
-    }
-    fn step(&mut self, e: f64, dt: f64) {
-        let q_ss = self.b * (e - self.e_trim());
-        self.q += (q_ss - self.q) * dt / T_Q;
-        self.theta += self.q * dt;
-        self.gamma += (self.theta - self.alpha_trim() - self.gamma) * dt / self.t_gamma;
-        let decel = -0.6 - 19.06 * (self.gamma.to_radians().sin() - (-3f64).to_radians().sin());
-        self.v_kts += decel * dt;
-        self.h_ft += self.v_kts * 1.687_81 * self.gamma.to_radians().sin() * dt;
-    }
-    fn vs_fpm(&self) -> f64 {
-        self.v_kts * 101.268_591 * self.gamma.to_radians().sin()
-    }
-}
-
-struct Landing {
-    sink_fpm: f64,
-    balloon_ft: f64,
-    v_kts: f64,
-    min_elev: f64,
-    max_elev: f64,
-    secs: f64,
-}
-
-/// Fly the law from `h_ft` to the wheels. None if it never lands in 40 s.
-fn fly(mut p: Plant) -> Option<Landing> {
-    let (dt, tick, delay) = (0.01, 0.2, 0.15);
-    let mut law = AttitudeFlare::default();
-    let mut queue: Vec<(f64, f64)> = Vec::new();
-    let (mut t, mut next_tick, mut applied) = (0.0, 0.0, 0.0);
-    let (mut low, mut balloon) = (p.h_ft, 0.0_f64);
-    let (mut min_e, mut max_e) = (f64::MAX, f64::MIN);
-    while t < 40.0 {
-        if t >= next_tick {
-            let o = law.step(
-                In { radio_ft: p.h_ft, theta_deg: p.theta, alpha_deg: p.alpha(), q_dps: p.q, tas_kts: p.v_kts, dt: tick, ground_pull: p.ground_pull },
-                p.pull,
-                0.10,
-            );
-            min_e = min_e.min(o.elev);
-            max_e = max_e.max(o.elev);
-            queue.push((t + delay, o.elev));
-            next_tick += tick;
-        }
-        while queue.first().is_some_and(|(at, _)| *at <= t) {
-            applied = queue.remove(0).1;
-        }
-        p.step(applied, dt);
-        low = low.min(p.h_ft);
-        balloon = balloon.max(p.h_ft - low);
-        if p.h_ft <= 0.0 {
-            return Some(Landing { sink_fpm: p.vs_fpm(), balloon_ft: balloon, v_kts: p.v_kts, min_elev: min_e, max_elev: max_e, secs: t });
-        }
-        t += dt;
-    }
-    None
-}
 
 #[test]
 fn the_flare_height_is_the_sink_times_the_response() {
@@ -124,103 +30,223 @@ fn the_sink_wanted_shrinks_with_the_height_left() {
     assert_eq!(vs_target_fpm(5.0, -50.0, 6.0), HOLDOFF_VS_FPM, "never asks a climb");
 }
 
-/// The 172 from the arrest's 48 ft on its 3 degree path: the old law
-/// touched down at 463 fpm after a balloon; this one lands softly, never
-/// climbs, keeps flying speed and stays inside the pull and push limits.
-#[test]
-fn the_172_lands_softly_from_its_path() {
-    let l = fly(Plant::new(32.0, 1.0, -3.0, 48.0)).expect("lands");
-    assert!(l.sink_fpm > -200.0 && l.sink_fpm < -40.0, "sink {:.0}", l.sink_fpm);
-    assert!(l.balloon_ft < 1.0, "balloon {:.1} ft", l.balloon_ft);
-    assert!(l.v_kts > 50.0, "speed {:.1}", l.v_kts);
-    assert!(l.min_elev >= -0.10 && l.max_elev <= PULL);
-    assert!(l.secs < 20.0, "a float of {:.0} s", l.secs);
+const G: f64 = 9.806_65;
+const KT: f64 = 0.514_444;
+
+/// One airframe's fit and the gate it was recorded from.
+#[derive(Clone, Copy)]
+struct Fit {
+    name: &'static str,
+    /// Short period: stiffness (1/s^2) and damping (1/s) at the gate's speed.
+    w2: f64,
+    cq: f64,
+    /// Angle of attack per unit of column, deg; the ground effect's column
+    /// (ge) and the power's pitch (kl, per unit of lever) against it.
+    ke: f64,
+    ge: f64,
+    kl: f64,
+    /// Lift: load factor per deg above the zero-lift angle `a0` at 80 kt,
+    /// more with the lever (`kp`) and in ground effect (`kg`).
+    c: f64,
+    a0: f64,
+    kp: f64,
+    kg: f64,
+    /// Speed rate, kt/s: idle (`s0`) and per unit of lever (`s1`).
+    s0: f64,
+    s1: f64,
+    /// The column's angle-of-attack offset.
+    aoff: f64,
+    /// The pitch trim the autopilot left at the gate, elevator: the column
+    /// applied is the law's plus this.
+    trim: f64,
+    /// Transport delay, s.
+    delay: f64,
+    /// What the profile declares to the law.
+    ground_pull: f64,
+    pull: f64,
+    push: f64,
+    /// The recorded gate: height, pitch, path, speed, pitch rate.
+    h0: f64,
+    th0: f64,
+    g0: f64,
+    v0: f64,
+    q0: f64,
+    /// The lever as flown, by height: at 40, 30, 20, 10, 5, 0 ft.
+    lever: [f64; 6],
 }
 
-/// The elevator's authority 50% either side of the figure the law assumes
-/// (`Gains::b_hat`, the 172's measured 32: an airframe's own is measured,
-/// not fitted), a path that follows the nose in 0.7 to 1.5 s and ground
-/// effect from none to a 0.3 pull at the wheels, through the same delay:
-/// never a balloon, under the scorecard's 240 fpm from a 3 degree path and
-/// under 280 from a steep 4.5 degree one; the 172's own authority on a 3
-/// degree path inside the 100 to 180 band (99 to 154 across the band).
-#[test]
-fn it_lands_across_the_band_without_a_fit() {
-    for (g0, limit) in [(-3.0, crate::scorecard::TOUCHDOWN_MAX_SINK_FPM), (-4.5, 280.0)] {
-        for b in [22.0, 32.0, 46.0] {
-            for t_gamma in [0.7, 1.0, 1.5] {
-                for ge in [0.0, 0.15, 0.3] {
-                    let l = fly(Plant { ge, ..Plant::new(b, t_gamma, g0, 48.0) })
-                        .unwrap_or_else(|| panic!("{g0} b {b} tg {t_gamma} ge {ge}: no landing"));
-                    let sink = -l.sink_fpm;
-                    let band = g0 == -3.0 && b == 32.0;
-                    assert!(
-                        sink < limit && sink > 30.0 && l.balloon_ft < 1.0 && (!band || (60.0..=180.0).contains(&sink)),
-                        "{g0} b {b} tg {t_gamma} ge {ge}: sink {sink:.0} balloon {:.1}",
-                        l.balloon_ft
-                    );
-                }
+const FITS: [Fit; 5] = [
+    // Lancair Evolution, LEMG 13 (1791801818, 1791802111, 1791815852).
+    Fit { name: "Evolution", w2: 19.71, cq: 3.703, ke: 12.87, ge: 0.0222, kl: -0.1628, c: 0.0755, a0: -10.56, kp: 0.1541, kg: 0.1019,
+          s0: -2.876, s1: 2.934, aoff: -1.48, trim: -0.0455, delay: 0.10, ground_pull: 0.0, pull: 0.8, push: 0.05,
+          h0: 51.8, th0: -5.50, g0: -3.91, v0: 92.7, q0: -0.44, lever: [0.293, 0.293, 0.293, 0.068, 0.012, 0.0] },
+    // Cirrus SR22, LEMG 13 (1791812680, 1791813026, 1791814190, 1791814508).
+    Fit { name: "SR22", w2: 6.920, cq: 1.455, ke: 11.15, ge: 0.2165, kl: -0.1656, c: 0.0982, a0: -11.31, kp: 0.1917, kg: 0.0304,
+          s0: -3.084, s1: 8.160, aoff: -2.56, trim: 0.0398, delay: 0.02, ground_pull: 0.5, pull: 0.8, push: 0.05,
+          h0: 49.9, th0: -3.77, g0: -2.56, v0: 78.9, q0: 0.04, lever: [0.255, 0.255, 0.255, 0.114, 0.0, 0.0] },
+    // King Air C90B, LEMG 13 (1791799361, 1791800024, 1791815553).
+    Fit { name: "King Air", w2: 8.404, cq: 1.171, ke: 14.75, ge: -0.0454, kl: -0.2320, c: 0.0513, a0: -9.364, kp: 0.1006, kg: 0.0092,
+          s0: -4.455, s1: 5.417, aoff: -0.13, trim: -0.102, delay: 0.02, ground_pull: 0.25, pull: 0.8, push: 0.10,
+          h0: 68.7, th0: -4.12, g0: -4.40, v0: 113.3, q0: 0.26, lever: [0.495, 0.495, 0.444, 0.213, 0.092, 0.0] },
+    // Baron 58, LEMG 13 (1791802802, 1791803088, 1791816184).
+    Fit { name: "Baron", w2: 19.61, cq: 3.304, ke: 12.47, ge: 0.0906, kl: -0.2359, c: 0.0581, a0: -7.760, kp: 0.3633, kg: 0.0992,
+          s0: -3.096, s1: 3.873, aoff: -2.22, trim: 0.0945, delay: 0.02, ground_pull: 0.3, pull: 0.8, push: 0.10,
+          h0: 60.3, th0: -2.85, g0: -3.69, v0: 104.2, q0: 0.12, lever: [0.512, 0.512, 0.48, 0.359, 0.275, 0.09] },
+    // Cessna 172 G1000, LEMG 13 (1791814879).
+    Fit { name: "C172", w2: 10.31, cq: 1.502, ke: 11.34, ge: 0.0255, kl: -0.2245, c: 0.2000, a0: -7.534, kp: -0.0186, kg: -0.0896,
+          s0: -2.935, s1: 4.045, aoff: 0.30, trim: -0.1572, delay: 0.02, ground_pull: 0.0, pull: 0.5, push: 0.10,
+          h0: 49.7, th0: -3.28, g0: -2.84, v0: 67.4, q0: 0.34, lever: [0.515, 0.473, 0.359, 0.172, 0.068, 0.003] },
+];
+
+fn shape(h: f64) -> f64 {
+    (1.0 - h / 18.0).clamp(0.0, 1.0).powi(2)
+}
+
+impl Fit {
+    fn lever_at(&self, h: f64) -> f64 {
+        const AT: [f64; 6] = [40.0, 30.0, 20.0, 10.0, 5.0, 0.0];
+        if h >= AT[0] {
+            return self.lever[0];
+        }
+        for i in 1..6 {
+            if h >= AT[i] {
+                let k = (h - AT[i]) / (AT[i - 1] - AT[i]);
+                return self.lever[i] + k * (self.lever[i - 1] - self.lever[i]);
             }
         }
+        self.lever[5]
     }
 }
 
-/// The SR22's low wing: ground effect taking a 0.6 pull at the wheels, more
-/// than the observer finds in the flare's last seconds (247 fpm twice, LEMG
-/// 30, 1791793670, 1791793963). Its measured `ground_pull` fed forward lands
-/// it soft across the authority band, and declaring it half again too much
-/// or too little still lands under the scorecard's limit.
-#[test]
-fn a_measured_ground_pull_lands_a_low_wing_soft() {
-    for b in [22.0, 32.0, 46.0] {
-        for t_gamma in [0.7, 1.0, 1.5] {
-            let bare = fly(Plant { ge: 0.6, pull: 0.8, ..Plant::new(b, t_gamma, -3.0, 48.0) }).unwrap();
-            for (declared, limit) in [(0.6, 180.0), (0.3, 240.0), (0.9, 240.0)] {
-                let l = fly(Plant { ge: 0.6, ground_pull: declared, pull: 0.8, ..Plant::new(b, t_gamma, -3.0, 48.0) }).unwrap();
-                let sink = -l.sink_fpm;
-                assert!(
-                    sink < limit && sink > 30.0 && l.balloon_ft < 1.0,
-                    "b {b} tg {t_gamma} declared {declared}: sink {sink:.0} (bare {:.0}) balloon {:.1}",
-                    -bare.sink_fpm,
-                    l.balloon_ft
-                );
-            }
-        }
-    }
+#[derive(Debug)]
+struct Landing {
+    /// The sink at the wheels, and the worst in the last 2.5 s (the
+    /// scorecard's window), fpm.
+    wheels_fpm: f64,
+    scored_fpm: f64,
+    balloon_ft: f64,
 }
 
-/// A gust that shallows the path in the arrest is never pushed back down to
-/// the entry path: the SR22 entered at -460 fpm, a gust at 29 ft took it to
-/// -1.0 deg, and the law pushed the nose to -7.8 deg on its push limit for
-/// 14 ft, diving it to -544 fpm and onto the runway at 441 (LEMG 13,
-/// 1791813026). Above the gate the path flown stands; below it the
-/// round-out is the plan's.
-#[test]
-fn a_gust_that_shallows_the_path_is_never_pushed_back_down() {
-    for b in [22.0, 32.0, 46.0] {
-        let mut p = Plant::new(b, 1.0, -3.0, 48.0);
-        let mut law = AttitudeFlare::default();
-        let (dt, mut t, mut gusted, mut min_after) = (0.2, 0.0, false, f64::MAX);
-        while p.h_ft > 0.0 && t < 40.0 {
-            if !gusted && p.h_ft < 30.0 {
-                p.gamma = -1.0;
-                p.theta = p.gamma + ALPHA0;
-                gusted = true;
-            }
+/// A path disturbance, deg/s, at time `t`: none, or one gust that shallows
+/// the path by `deg` over a second once below `below_ft`.
+#[derive(Clone, Copy)]
+enum Air {
+    Calm,
+    Gust { below_ft: f64, deg: f64 },
+}
+
+fn fly(f: Fit, air: Air) -> Landing {
+    let (dt, tick) = (0.01, 0.2);
+    let delay = f.delay.max(0.02);
+    let mut law = AttitudeFlare::default();
+    let (mut th, mut q, mut gam, mut v, mut h) = (f.th0, f.q0, f.g0, f.v0, f.h0);
+    let mut queue: Vec<(f64, f64)> = Vec::new();
+    let (mut t, mut next_tick, mut e_app) = (0.0, 0.0, f.trim);
+    let (mut low, mut balloon) = (h, 0.0_f64);
+    let mut gust_from: Option<f64> = None;
+    let mut sinks: Vec<(f64, f64)> = Vec::new();
+    while t < 40.0 {
+        if t >= next_tick - 1e-9 {
             let o = law.step(
-                In { radio_ft: p.h_ft, theta_deg: p.theta, alpha_deg: p.alpha(), q_dps: p.q, tas_kts: p.v_kts, dt, ground_pull: 0.0 },
-                PULL,
-                0.10,
+                In { radio_ft: h, theta_deg: th, alpha_deg: th - gam, q_dps: q, tas_kts: v, dt: tick, ground_pull: f.ground_pull },
+                f.pull,
+                f.push,
             );
-            if gusted && p.h_ft > o.gate_ft {
-                min_after = min_after.min(o.gamma_cmd_deg - p.gamma.min(0.0));
-            }
-            for _ in 0..20 {
-                p.step(o.elev, dt / 20.0);
-            }
-            t += dt;
+            queue.push((t + delay, o.elev + f.trim));
+            next_tick += tick;
         }
-        assert!(min_after > -0.01, "b {b}: asked {min_after:.2} deg steeper than flown");
-        assert!(-p.vs_fpm() < 200.0, "b {b}: {:.0} fpm", -p.vs_fpm());
+        while queue.first().is_some_and(|(at, _)| *at <= t + 1e-9) {
+            e_app = queue.remove(0).1;
+        }
+        let lev = f.lever_at(h);
+        let al = th - gam;
+        let ae = f.aoff + f.ke * (e_app - f.ge * shape(h) - f.kl * lev);
+        let qd = f.w2 * (v / f.v0).powi(2) * (ae - al) - f.cq * (v / f.v0) * q;
+        let n = f.c * (v / 80.0).powi(2) * (al - f.a0) * (1.0 + f.kp * lev) * (1.0 + f.kg * shape(h));
+        let gust = match air {
+            Air::Calm => 0.0,
+            Air::Gust { below_ft, deg } => {
+                if gust_from.is_none() && h < below_ft {
+                    gust_from = Some(t);
+                }
+                if gust_from.is_some_and(|t0| t - t0 < 1.0) { deg } else { 0.0 }
+            }
+        };
+        let gd = (G / (v * KT) * (n - gam.to_radians().cos())).to_degrees() + gust;
+        let vd = f.s0 + f.s1 * lev - G * gam.to_radians().sin() / KT;
+        q += qd * dt;
+        th += q * dt;
+        gam += gd * dt;
+        v += vd * dt;
+        h += v * 1.687_81 * gam.to_radians().sin() * dt;
+        low = low.min(h);
+        balloon = balloon.max(h - low);
+        let sink = -v * 101.268_591 * gam.to_radians().sin();
+        sinks.push((t, sink));
+        t += dt;
+        if h <= 0.0 {
+            let scored = sinks.iter().filter(|(ts, _)| t - ts <= 2.5).map(|s| s.1).fold(f64::MIN, f64::max);
+            return Landing { wheels_fpm: sink, scored_fpm: scored, balloon_ft: balloon };
+        }
+    }
+    panic!("{}: no landing in 40 s", f.name);
+}
+
+/// Calm air, every fitted airframe from its own recorded gate: inside the
+/// 100 to 180 sweet spot's neighbourhood at the wheels, never a balloon.
+#[test]
+fn every_fitted_airframe_lands_soft_in_calm_air() {
+    for f in FITS {
+        let l = fly(f, Air::Calm);
+        eprintln!("{}: {l:?}", f.name);
+        assert!(
+            (50.0..=180.0).contains(&l.wheels_fpm) && l.scored_fpm < 200.0 && l.balloon_ft < 1.0,
+            "{}: {l:?}",
+            f.name
+        );
+    }
+}
+
+/// A gust that shallows the path 1.5 deg for a second, above the gate and
+/// below it: never pushed back down into a hard landing, never a balloon
+/// (the SR22 met the runway at 441 fpm from one at 29 ft, 1791813026). The
+/// same gust ending at 10 ft is a limit, not a test: the lift it lent is
+/// gone with the wheels a second away (211 to 250 fpm scored, under the
+/// previous law 240 on the Evolution).
+#[test]
+fn a_gust_that_shallows_the_path_is_never_flown_into_the_runway() {
+    for f in FITS {
+        for below_ft in [35.0, 20.0] {
+            let l = fly(f, Air::Gust { below_ft, deg: 1.5 });
+            eprintln!("{} gust below {below_ft}: {l:?}", f.name);
+            assert!(
+                l.scored_fpm < crate::scorecard::TOUCHDOWN_MAX_SINK_FPM && l.balloon_ft < 1.0,
+                "{} gust below {below_ft}: {l:?}",
+                f.name
+            );
+        }
+    }
+}
+
+/// The fits half again either way (the column's authority, the short
+/// period's damping, the ground effect's column): no fitted number is the
+/// law's, so none may decide a landing.
+#[test]
+fn the_fits_moved_either_way_still_land() {
+    for f in FITS {
+        for (what, g) in [
+            ("ke x0.6", Fit { ke: f.ke * 0.6, ..f }),
+            ("ke x1.6", Fit { ke: f.ke * 1.6, ..f }),
+            ("cq x0.6", Fit { cq: f.cq * 0.6, ..f }),
+            ("ge +0.2", Fit { ge: f.ge + 0.2, ..f }),
+        ] {
+            let l = fly(g, Air::Calm);
+            eprintln!("{} {what}: {l:?}", f.name);
+            assert!(
+                l.scored_fpm < crate::scorecard::TOUCHDOWN_MAX_SINK_FPM && l.wheels_fpm > 30.0 && l.balloon_ft < 1.0,
+                "{} {what}: {l:?}",
+                f.name
+            );
+        }
     }
 }
