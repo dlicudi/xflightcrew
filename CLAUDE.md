@@ -18,10 +18,14 @@ identifier that left this file can still be grepped there.
 
 Three pillars: **copilot + checklists, ATC, AI traffic** (our own, REPLACING LiveTraffic; the
 tower controls it). **The Cessna 172 is the reference airframe**; other profiles stay as they
-are. **Autonomy is FROZEN**: the flying loops (autoland, full_auto, circuit, procedure,
-autotakeoff, autotaxi, taxi_in, pushback, heli_*, recover, reversal...) take crash and safety
-fixes only, no new behaviour, no new airframe work, until it is redesigned in layers on the
-aircraft's own autopilot. "Every miss becomes a rule" is for the grammar, never a flight law.
+are. **Autonomy is redesigned in layers, loop by loop** (docs/tasks/autonomy-layers): the
+aircraft's own autopilot flies where a pilot would use it, and ONE pilot controller (`src/pilot`)
+flies by hand what a pilot hand-flies, the same laws for every fixed-wing airframe, every airframe
+number MEASURED in flight, never typed into a profile. Laws are designed from first principles on
+plants FITTED to recorded flights, never tuned flight by flight. Done: the final approach and
+landing (2026-10-12). The other flying loops (full_auto, circuit, procedure, autotakeoff,
+autotaxi, taxi_in, pushback, heli_*, recover, reversal...) stay FROZEN until their turn: crash
+and safety fixes only. "Every miss becomes a rule" is for the grammar, never a flight law.
 Order: stage A (untangle copilot from autonomy, station behind `party_line`), B (command loop),
 C (ATC per-flight strips, `crates/nav`), D (`crates/traffic`).
 
@@ -506,24 +510,32 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
 - **An approach never takes away the flap the wing flies on** (`flap_kept_flying`); flaps never
   cycle on a placard; **a climb is flown on thrust** (`climb_power_floor`); a give-up hands the
   SPEED to the governor (`hand_back_speed_kts`).
-- **Autoland core**: full-lead pursuit (`pursuit_aim_nm`); a roundout band before the flare
-  (level-hold over the runway is the bug); a sticky `MissedStage`; give-ups hand back a FLYABLE
-  aircraft; the glidepath aims at the pavement (`aim_elevation_ft`).
-- **The crab is LOW-PASSED** (`CrabFilter`); a bias is `TrackTrim`'s, from a settled track only.
+- **The final is flown as a pilot flies it**: ABOVE MINIMUMS the autopilot (its approach mode
+  where coupled, else HDG set by `FinalHeading`: course, crab and a cut, whole degrees, no oftener
+  than every 10 s, less the autopilot's own standing error, learnt); FROM MINIMUMS
+  (`arrest::minimums_ft`: the coupled ILS's `ils_decouple_agl_ft`, else 200; any other final 300)
+  the servos come out and `src/pilot` hand-flies to the wheels: bank through the ailerons on the
+  roll response measured in flight (`pilot::bank`) to the PAINTED centreline (`pilot::line`; a
+  coupled line was 8 to 23 m off it), the attitude law for the path then the flare, power on total
+  energy. The heading bug is never a control stick: nothing writes it below minimums.
+- **Autoland core**: a sticky `MissedStage`; give-ups hand back a FLYABLE aircraft; the glidepath
+  aims at the pavement (`aim_elevation_ft`). **The crab is LOW-PASSED** (`CrabFilter`, 5 s).
 - **A tower's go-around order outranks everything, and reaches whoever flies the final**
   (`party_line::GoAroundOrders`). **The pilot's go-around is flown the same way**
   (`src/go_around.rs`, `GoAroundWatch`): closed words, reads back the loop's ANSWER. **A slow, low
   go-around pitches for speed** (`go_around_vs_fpm`).
-- **The landing arrest leads the AP's lag** (`ArrestLeadProfile`) and **takes the servos out at the
-  roundout gate** (`arrest_hands_step`): an engaged servo writes the yoke back. **The AP comes out
-  at the wheels** (`disconnect_autopilot`). **Once taken, the servos stay out** (`hold_roundout`).
-- **A model flare holds its column in rough air** (`FlareModel::step` `rough`). **The retard is
-  keyed on height, time and speed, never on the sink the arrest removes** (`FlarePower`); **a FLOAT
-  takes the thrust off** (at its own `retard_float_per_s`).
-- **The heading knob is set, not rewritten** (`heading_bug::BugHold`); short final and flare still
-  steer every tick.
-- **In the flare the column only comes BACK** (`FlarePitch::step` `ratchet`): forward column a few
-  feet up is a nosewheel landing. **Except on a RATE plant** (`flare_elevator.model.rate`).
+- **The servos come out at minimums** (`arrest_hands_step`): an engaged servo writes the yoke
+  back. **The AP comes out at the wheels** (`disconnect_autopilot`). **Once taken, the servos stay
+  out** (`hold_roundout`). The VS dial above minimums leads the AP's lag (`ArrestLeadProfile`).
+- **The flare is the attitude law** (`autoland::attitude_flare`), one law for every fixed-wing
+  airframe: the nose angle for the path (gamma = theta - alpha) from a gate of the sink times 3 s,
+  a smoothstep to a -70 fpm hold-off, a disturbance observer for the elevator the nose needs, a
+  declared `ground_pull` where a low wing's ground effect was measured; its path trim closes inside
+  the flare and never winds below zero (a gust wound it down: 441 fpm). Tested on plants FITTED to
+  five airframes' recorded flares (`attitude_flare_tests`, the roll plants in `pilot::plants_tests`),
+  never on an invented plant (one with a lift slope five times too steep hid the windy sag).
+- **The retard is keyed on height, time and speed, never on the sink the arrest removes**
+  (`FlarePower`); **a FLOAT takes the thrust off** (at its own `retard_float_per_s`).
 - **A low flare with room to stop is COMMITTED** (`autoland::commit_flare`) and **stays committed**
   (`commit_flare_latched`). **The go/no-go is decided at the roundout gate, never at 4 ft**
   (`landing_call`, where `landing_roll_ft` is declared): the predicted touchdown must leave the ROLL,
