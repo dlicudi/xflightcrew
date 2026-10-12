@@ -1,14 +1,19 @@
 # XFlightCrew
 
-**Your flight crew for X-Plane 12: copilot, ATC and cabin crew. Entirely local.**
+**The rest of the crew, and the world around you, for X-Plane 12. Entirely local.**
 
-You are one pilot in the cockpit. XFlightCrew is everyone else: the **copilot**
-in the other seat who works the panel and can fly the aircraft, the **tower** on
-the radio, and the **cabin crew** down the back. Three voices, one microphone,
-and nothing leaves your machine.
+You are one pilot in the cockpit. XFlightCrew is everyone else:
 
-You speak normally and they answer in their own voices: no menus, no key
-combinations, and no connection to anything.
+- a **copilot** in the other seat who works the panel, runs the checklists and
+  can fly the aircraft;
+- **ATC**: Delivery, Ground, Tower and Approach, working real frequencies and
+  procedures;
+- **AI traffic** that the same controllers sequence alongside you;
+- the **cabin crew** down the back.
+
+You work with them the way you would with real people: **by voice** (speak
+normally, they answer in their own voices), or from the in-sim panel or a
+tablet. No menus, no key combinations, and nothing leaves your machine.
 
 ```
 🎙️  "flaps ten"  →  whisper (STT)  →  deterministic grammar  →  curated tool + readback  →  TTS
