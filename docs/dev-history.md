@@ -14340,3 +14340,22 @@ to the threshold, 1791808122). The ILS reference after it: 136 fpm (1791808787).
   back to 22: `off_centreline_low` at 25 ft, the gate's right call.
 - Flown before these two fixes (VS-mode autopilots, where the dial IS the path): the SR22,
   King Air, Evolution, Baron and SF50 results above. Not re-flown since.
+
+### 2026-10-12 (later): the visual final rejoins its path in proportion; the short final's lateral is next
+
+- **The path is rejoined in proportion** (`path_nudge`, `REJOIN_S` 30 s): the dial is the
+  path's rate plus the height off it closed in 30 s, round 50s, re-set only when that answer
+  changes, no oftener than every 10 s; low it may go to level, high at most 300 steeper. The
+  50 fpm-every-10 s nudge, never shallower than the path less 300, left the SR22 and the
+  RV-10 150 to 300 ft low after the air start's dive (1791810002, 1791804448). Now the SR22
+  went from 257 ft low to 11 by 2.9 nm, 76 kt on 75, stable at the gate (1791810954).
+- **Open: the short final's lateral in a crosswind** (150/10, crab to 2.7 deg). On the
+  autopilot's heading the SR22 weaved +-9 m on a 35 s period; from 150 ft our every-tick
+  bug steer turned 4.6 deg for 7.6 m and swung it from +9 to -19 m in 15 s:
+  `off_centreline_low` at 56 ft (1791810954). The 172's visual went round the same way
+  (1791808122). Nothing lateral changed today: this morning's lighter wind hid it.
+- **The SF50's masks** (`o2_valve_on`): not reproduced. Off after a fresh SF50 load, xvl's
+  boot and the air start (1791809604); set to 1 by hand it did NOT survive a load into the
+  SR22 (the load reset it). No mask record of ours today. The SR22's climb checklist turns it
+  on passing 10,000 ft (right for an unpressurised SR22). The SF50 checklist has no oxygen or
+  pressurisation items at all (transcribed from image pages): a gap to fill.
