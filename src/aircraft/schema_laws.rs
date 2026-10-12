@@ -509,6 +509,14 @@ pub struct FlareElevatorProfile {
     /// sink the elevator does not explain) instead of the P+D tracker.
     #[serde(default)]
     pub model: Option<FlareModelProfile>,
+    /// The extra pull this airframe's ground effect takes at the wheels,
+    /// MEASURED on its own flares (`autoland::attitude_flare` feeds it
+    /// forward along the ground effect's shape); 0 for an airframe whose
+    /// flare finds it in time (the 172). The SR22's low wing took 0.33 at
+    /// 5 ft to 0.61 at the wheels with the nose held flat (LEMG 30,
+    /// 1791793670, 1791793963).
+    #[serde(default)]
+    pub ground_pull: f64,
 }
 
 /// The elevator-to-sink response of an airframe with the servos out, as its
@@ -1046,7 +1054,11 @@ impl FlareElevatorProfile {
     pub fn valid(self) -> Option<Self> {
         ((0.1..=3.0).contains(&self.gain)
             && (0.0..=10.0).contains(&self.trim_gain)
-            && (0.05..=0.6).contains(&self.max)
+            // Up to the stop: the attitude flare holds the nose angle, so
+            // its limit is the elevator's travel, not a balloon guard. At
+            // 0.6 the SR22's 0.8 dropped the whole block and the old law
+            // flew it in silence (452 fpm, LEMG 13, 1791792579).
+            && (0.05..=1.0).contains(&self.max)
             && (0.0..=0.3).contains(&self.max_push)
             && self
                 .balloon_ease_per_s

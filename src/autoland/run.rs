@@ -305,6 +305,8 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let mut attitude_flare = super::attitude_flare::AttitudeFlare::default();
             let mut energy_throttle = super::energy_throttle::EnergyThrottle::default();
             let mut decel_brake = DecelBrake::default();
+            let mut path_nudge = super::path_nudge::PathNudge::default();
+            let path_clock = std::time::Instant::now();
             // ...or, where the airframe declares its elevator's response,
             // the arrest flown on that model (`FlareModel`, the 737).
             let mut flare_model = FlareModel::from_profile(crate::aircraft::flare_elevator());
@@ -2473,9 +2475,19 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 };
                 prev_vvi = vvi.map(|v| (v, t_now));
                 let arrest_lead = crate::aircraft::arrest_lead();
-                let vs_dial = match vvi {
-                    Some(v) => vs_dial_fpm(g.target_vs_fpm, v, vvi_trend, g.arresting, arrest_lead),
-                    None => g.target_vs_fpm,
+                // A layered airframe's final on its own path: the VS set once to
+                // the path's rate and nudged, as a pilot flies it (`path_nudge`).
+                let nudged = (layers && g.phase == ApproachPhase::Final && !g.arresting).then(|| {
+                    let path_fpm = -(gs_kts / 60.0) * gp_ft_per_nm();
+                    path_nudge.step(path_fpm, alt - raw.glidepath_alt_ft, path_clock.elapsed().as_secs_f64())
+                });
+                if nudged.is_none() {
+                    path_nudge.reset();
+                }
+                let vs_dial = match (nudged, vvi) {
+                    (Some(d), _) => d,
+                    (None, Some(v)) => vs_dial_fpm(g.target_vs_fpm, v, vvi_trend, g.arresting, arrest_lead),
+                    (None, None) => g.target_vs_fpm,
                 };
                 // The servos' pitch AUTHORITY (#181): the arrest takes the
                 // servos out, so the check ends there; before it, a dial the
@@ -2580,6 +2592,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                         q_dps,
                                         tas_kts: tas_ms * 1.943_844,
                                         dt: tick_dt,
+                                        ground_pull: lim.ground_pull,
                                     },
                                     lim.max,
                                     lim.max_push,

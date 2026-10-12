@@ -175,9 +175,26 @@ flaps:
 # `flare_ask`, `flare_target` and `ias` below 20 ft, the `power` events'
 # `retard` (float or timed from 20 ft, then `touched`), `bounce` events, and
 # the landing's `sink_fpm` (under 250) and `bounce_ft` (under 1.5).
+# The layered autonomy (docs/tasks/autonomy-layers): the attitude flare,
+# the power on total energy, the light rollout brake, the VS nudged on its
+# own path. Crossed with no fitted number: its elevator answers about 25
+# deg/s per unit (LEMG 13 baseline 1791791921, 400 fpm on the old law),
+# inside the band the flare was tested over. The blocks below are the old
+# laws', unread on a layered final, to delete once it has flown.
+layers: true
+
 flare_elevator:
   gain: 1.0
-  max: 0.5
+  # The attitude flare's pull limit: the low wing's ground effect held the
+  # nose at 0.3 deg under a 1.2 to 1.6 command with the pull on 0.5 from
+  # 3 ft (LEMG 13, 1791792245). The law holds the nose angle; the limit is
+  # the stop, not a balloon guard.
+  max: 0.8
+  # Its low wing's ground effect, measured: the pull went from about 0.1 on
+  # the approach to 0.61 at the wheels with the nose held flat (LEMG 30,
+  # 1791793670, 1791793963: 247 fpm twice). Fed forward along the ground
+  # effect's shape (`attitude_flare::ground_shape`).
+  ground_pull: 0.5
   max_push: 0.05
   balloon_ease_per_s: 0.15
   tau_s: 7.0

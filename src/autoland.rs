@@ -330,6 +330,8 @@ mod flare;
 pub(crate) mod attitude_flare;
 // The approach's power on total energy (docs/tasks/autonomy-layers).
 pub(crate) mod energy_throttle;
+// A visual final's VS set once and nudged (docs/tasks/autonomy-layers).
+pub(crate) mod path_nudge;
 pub use flare::*;
 mod arrest;
 pub use arrest::*;

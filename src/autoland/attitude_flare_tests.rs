@@ -13,6 +13,10 @@ struct Plant {
     /// The extra pull ground effect takes at the wheels, elevator: none in
     /// free air, growing as the square below [`GE_FROM_FT`].
     ge: f64,
+    /// What the airframe DECLARES of it (`flare_elevator.ground_pull`).
+    ground_pull: f64,
+    /// The pull limit it declares (`flare_elevator.max`).
+    pull: f64,
     theta: f64,
     q: f64,
     gamma: f64,
@@ -32,7 +36,7 @@ const V0: f64 = 63.0;
 impl Plant {
     fn new(b: f64, t_gamma: f64, gamma0: f64, h_ft: f64) -> Self {
         let alpha = ALPHA0;
-        Plant { b, t_gamma, ge: 0.0, theta: gamma0 + alpha, q: 0.0, gamma: gamma0, v_kts: V0, h_ft }
+        Plant { b, t_gamma, ge: 0.0, ground_pull: 0.0, pull: PULL, theta: gamma0 + alpha, q: 0.0, gamma: gamma0, v_kts: V0, h_ft }
     }
     fn alpha_trim(&self) -> f64 {
         ALPHA0 * (V0 / self.v_kts).powi(2)
@@ -77,8 +81,8 @@ fn fly(mut p: Plant) -> Option<Landing> {
     while t < 40.0 {
         if t >= next_tick {
             let o = law.step(
-                In { radio_ft: p.h_ft, theta_deg: p.theta, alpha_deg: p.alpha(), q_dps: p.q, tas_kts: p.v_kts, dt: tick },
-                PULL,
+                In { radio_ft: p.h_ft, theta_deg: p.theta, alpha_deg: p.alpha(), q_dps: p.q, tas_kts: p.v_kts, dt: tick, ground_pull: p.ground_pull },
+                p.pull,
                 0.10,
             );
             min_e = min_e.min(o.elev);
@@ -156,6 +160,30 @@ fn it_lands_across_the_band_without_a_fit() {
                         l.balloon_ft
                     );
                 }
+            }
+        }
+    }
+}
+
+/// The SR22's low wing: ground effect taking a 0.6 pull at the wheels, more
+/// than the observer finds in the flare's last seconds (247 fpm twice, LEMG
+/// 30, 1791793670, 1791793963). Its measured `ground_pull` fed forward lands
+/// it soft across the authority band, and declaring it half again too much
+/// or too little still lands under the scorecard's limit.
+#[test]
+fn a_measured_ground_pull_lands_a_low_wing_soft() {
+    for b in [22.0, 32.0, 46.0] {
+        for t_gamma in [0.7, 1.0, 1.5] {
+            let bare = fly(Plant { ge: 0.6, pull: 0.8, ..Plant::new(b, t_gamma, -3.0, 48.0) }).unwrap();
+            for (declared, limit) in [(0.6, 180.0), (0.3, 240.0), (0.9, 240.0)] {
+                let l = fly(Plant { ge: 0.6, ground_pull: declared, pull: 0.8, ..Plant::new(b, t_gamma, -3.0, 48.0) }).unwrap();
+                let sink = -l.sink_fpm;
+                assert!(
+                    sink < limit && sink > 30.0 && l.balloon_ft < 1.0,
+                    "b {b} tg {t_gamma} declared {declared}: sink {sink:.0} (bare {:.0}) balloon {:.1}",
+                    -bare.sink_fpm,
+                    l.balloon_ft
+                );
             }
         }
     }

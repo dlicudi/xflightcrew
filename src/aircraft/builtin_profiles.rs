@@ -130,6 +130,7 @@ pub(super) fn cessna_172sp() -> AircraftProfile {
             balloon_ease_per_s: Some(0.15),
             tau_s: None,
             model: None,
+            ground_pull: 0.0,
         }),
         roll_rudder: None,
         rotate_elevator: None,
