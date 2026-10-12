@@ -1208,23 +1208,6 @@ arrest_lead:
   gain: 1.5
   max_climb_fpm: 100.0
   trend_seconds: 1.5
-# Autoland's final as a track closure (`autoland::final_track_cut_deg`), not
-# the fixed-lead pursuit: the pursuit asks a degree of cut for 36 m of
-# offset, the heading window takes whole degrees (above), and the MCP's
-# heading select answers slowly and wanders off its window by a degree
-# (1.5 degrees of bank a degree, a 4 s roll lag, 2 s late, fitted to
-# bench/approach/lemg30_zibo_2026-10-07.jsonl), so four LEMG 30 finals wove
-# 30 m either side and went around 28 to 34 m off (2026-10-07). Here a
-# degree of cut answers 14.5 m, led 10 s on the ground track: on the fitted
-# plant 1.4 to 3.3 m inside 1.5 nm from 30 m off at 5 nm, calm or 10 kt
-# across (the pursuit 3.8 to 7.0), 6 to 11 m with the heading wandering
-# (the pursuit 18 to 28, 9 go-arounds in 24). VERIFY: autoland ticks inside
-# 1.5 nm, `xtk_m` within 5 m and no `going_around`
-# `unstabilised_below_floor`; the knob (`heading_set`) moving a whole degree
-# a few times a minute (7 to 22 moves a final on the plant).
-final_track:
-  close_s: 12.0
-  lead_s: 10.0
 
 # Taxi pace: the type's.
 taxi:
