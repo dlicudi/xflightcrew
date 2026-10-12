@@ -190,6 +190,11 @@ flare_elevator:
   # 3 ft (LEMG 13, 1791792245). The law holds the nose angle; the limit is
   # the stop, not a balloon guard.
   max: 0.8
+  # Its low wing's ground effect, measured: the pull went from about 0.1 on
+  # the approach to 0.61 at the wheels with the nose held flat (LEMG 30,
+  # 1791793670, 1791793963: 247 fpm twice). Fed forward along the ground
+  # effect's shape (`attitude_flare::ground_shape`).
+  ground_pull: 0.5
   max_push: 0.05
   balloon_ease_per_s: 0.15
   tau_s: 7.0

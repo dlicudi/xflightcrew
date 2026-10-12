@@ -89,6 +89,19 @@ pub struct In {
     pub q_dps: f64,
     pub tas_kts: f64,
     pub dt: f64,
+    /// The airframe's measured ground-effect pull at the wheels
+    /// (`flare_elevator.ground_pull`), fed forward along [`ground_shape`].
+    pub ground_pull: f64,
+}
+
+/// Ground effect from about half a light aircraft's span, ft.
+pub const GROUND_EFFECT_FROM_FT: f64 = 18.0;
+
+/// How much of the ground effect's pull applies at this height: none above
+/// [`GROUND_EFFECT_FROM_FT`], growing as the square to all of it at the
+/// wheels. Pure.
+pub fn ground_shape(radio_ft: f64) -> f64 {
+    (1.0 - radio_ft / GROUND_EFFECT_FROM_FT).clamp(0.0, 1.0).powi(2)
 }
 
 /// What the law asked for this tick (the blackbox's `att_*`).
@@ -111,6 +124,7 @@ pub struct AttitudeFlare {
     gamma_trim: f64,
     integ: f64,
     last_elev: f64,
+    last_ff: f64,
     last_theta_cmd: Option<f64>,
 }
 
@@ -195,11 +209,16 @@ impl AttitudeFlare {
         // nose's rate says it is doing beyond holding. Ground effect and the
         // bleeding speed show up here within a second; a slow trim could not
         // find them in the flare's three (226 to 287 fpm, LEMG 2026-10-11).
-        let need = self.last_elev - i.q_dps / g.b_hat;
+        // The ground effect's measured pull, fed forward ahead of the nose
+        // falling; the observer reads only what is left beyond it (else it
+        // would count the feed-forward twice and run away).
+        let ff = i.ground_pull.max(0.0) * ground_shape(i.radio_ft);
+        let need = self.last_elev - self.last_ff - i.q_dps / g.b_hat;
         self.integ = (self.integ + (need - self.integ) * (dt / g.dob_tau_s).min(1.0)).clamp(-push, pull);
-        let elev = (self.integ + g.k_theta * e_theta + theta_rate / g.b_hat - g.k_q * (i.q_dps - theta_rate))
+        let elev = (self.integ + ff + g.k_theta * e_theta + theta_rate / g.b_hat - g.k_q * (i.q_dps - theta_rate))
             .clamp(-push, pull);
         self.last_elev = elev;
+        self.last_ff = ff;
         Out {
             elev,
             gate_ft: entry.gate_ft,

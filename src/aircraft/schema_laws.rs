@@ -509,6 +509,14 @@ pub struct FlareElevatorProfile {
     /// sink the elevator does not explain) instead of the P+D tracker.
     #[serde(default)]
     pub model: Option<FlareModelProfile>,
+    /// The extra pull this airframe's ground effect takes at the wheels,
+    /// MEASURED on its own flares (`autoland::attitude_flare` feeds it
+    /// forward along the ground effect's shape); 0 for an airframe whose
+    /// flare finds it in time (the 172). The SR22's low wing took 0.33 at
+    /// 5 ft to 0.61 at the wheels with the nose held flat (LEMG 30,
+    /// 1791793670, 1791793963).
+    #[serde(default)]
+    pub ground_pull: f64,
 }
 
 /// The elevator-to-sink response of an airframe with the servos out, as its

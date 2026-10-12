@@ -14244,3 +14244,23 @@ under 55 kt (1791758534, 1791758911, 1791759234, 1791759560).
 - Open: the visual final still moves the VS dial every 4 to 5 s (56 changes in 246 s); a pilot
   sets a rate once and nudges it.
 
+### 2026-10-12: the SR22 crosses to layers
+
+The SR22 (G1000 Perspective, low wing) flies the layered autonomy with no fitted law: on its
+old fitted flare it touched at 400 to 452 fpm on LEMG; on `layers` 169, then 247 and 247 into
+wind on 30, its nose held flat in the last 5 ft while the pull rose 0.33 to 0.61 (the low
+wing's ground effect, bigger than the observer finds in time). Its MEASURED ground pull
+(`flare_elevator.ground_pull` 0.5, fed forward along `attitude_flare::ground_shape`, the
+observer reading only what is left) lands it at 174 and 123 fpm, nose up 1.6 to 2.2 deg
+(1791794303, 1791794608 approx; runways 30 and 12 into wind). The plant gained the declared
+pull and a per-case pull limit; declaring it 50% off still lands under 240.
+
+- `flare_elevator.max` may be up to 1.0 (the attitude flare's limit is the stop); a declared
+  block out of range is warned and blackboxed (`aircraft` `block_invalid`): the SR22's 0.8
+  against the old 0.6 bound had dropped its whole flare block and the old law flew it in silence.
+- `autoland::path_nudge`: a layered final on its own path sets the VS once to the path's rate
+  and nudges it 50 fpm when 40 ft off, no oftener than every 10 s, leaving a setting that holds.
+- LiveTraffic had come up during the session (20 aircraft beside our 55, its prefs still saying
+  no auto-start): turned off with `LiveTraffic/Aircrafts/Display`; flight loads since have not
+  brought it back.
+

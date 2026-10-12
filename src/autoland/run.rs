@@ -2592,6 +2592,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                         q_dps,
                                         tas_kts: tas_ms * 1.943_844,
                                         dt: tick_dt,
+                                        ground_pull: lim.ground_pull,
                                     },
                                     lim.max,
                                     lim.max_push,
