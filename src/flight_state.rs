@@ -101,7 +101,7 @@ pub(crate) fn airframe_facts(p: &AircraftProfile) -> crate::aircraft::AirframeFa
             .arrest_lead
             .and_then(a::ArrestLeadProfile::valid)
             .unwrap_or_default(),
-        flare_elevator: p.flare_elevator.and_then(a::FlareElevatorProfile::valid),
+        flare_elevator: valid_or_said(p, "flare_elevator", p.flare_elevator, a::FlareElevatorProfile::valid),
         roll_rudder: p.roll_rudder.and_then(a::RollRudderProfile::valid),
         landing_distance_m: a::landing_distance_m_for(
             p.reference.as_ref().and_then(|r| r.landing_distance_ft),
@@ -1848,4 +1848,24 @@ mod tests {
         }
         assert!(found.is_empty(), "airframe facts written outside the door: {found:#?}");
     }
+}
+
+/// A declared block validated, or dropped LOUDLY: a number out of range
+/// otherwise swaps the airframe's law in silence (the SR22's 0.8 pull
+/// dropped its flare block and the old law flew it, LEMG 13, 1791792579).
+fn valid_or_said<T: Copy>(
+    p: &AircraftProfile,
+    block: &str,
+    declared: Option<T>,
+    valid: impl Fn(T) -> Option<T>,
+) -> Option<T> {
+    let v = declared.and_then(valid);
+    if declared.is_some() && v.is_none() {
+        tracing::warn!(target: "xvoicelayer::aircraft", profile = %p.id, block, "a declared block is out of range and is IGNORED");
+        crate::blackbox::record(
+            "aircraft",
+            serde_json::json!({"event": "block_invalid", "profile": p.id, "block": block}),
+        );
+    }
+    v
 }

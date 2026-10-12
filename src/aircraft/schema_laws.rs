@@ -1046,7 +1046,11 @@ impl FlareElevatorProfile {
     pub fn valid(self) -> Option<Self> {
         ((0.1..=3.0).contains(&self.gain)
             && (0.0..=10.0).contains(&self.trim_gain)
-            && (0.05..=0.6).contains(&self.max)
+            // Up to the stop: the attitude flare holds the nose angle, so
+            // its limit is the elevator's travel, not a balloon guard. At
+            // 0.6 the SR22's 0.8 dropped the whole block and the old law
+            // flew it in silence (452 fpm, LEMG 13, 1791792579).
+            && (0.05..=1.0).contains(&self.max)
             && (0.0..=0.3).contains(&self.max_push)
             && self
                 .balloon_ease_per_s

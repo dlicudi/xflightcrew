@@ -6,9 +6,9 @@
 after: stop
 
 cases:
-  - name: SR22 LEMG 13, 5 nm final, the baseline
+  - name: SR22 LEMG into wind, 5 nm final
     setup:
       aircraft: "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf"
-      approach: { field: LEMG, runway: 13, final_nm: 5 }
+      approach: { field: LEMG, runway: wind, final_nm: 5 }
     traffic: off
     deadline_min: 10

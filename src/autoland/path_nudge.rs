@@ -1,16 +1,17 @@
 //! A visual final flown as a pilot flies it on the autopilot: the vertical
-//! speed SET ONCE to the path's rate for the groundspeed, and NUDGED by 100
+//! speed SET ONCE to the path's rate for the groundspeed, and NUDGED by 50
 //! fpm when the aircraft is clearly off the path, no oftener than every
 //! [`NUDGE_EVERY_S`] (docs/tasks/autonomy-layers). The dial was rewritten by
 //! the path law every tick: 56 times in four minutes on LEMG 12's visual
 //! final, 270 times in eight on the old ILS approach (2026-10-11/12).
 
-/// Off the path by more than this, ft, is a nudge.
+/// Off the path by more than this, ft, is a nudge; a setting that holds the
+/// path is left alone. Returning toward the path's own rate once back on it
+/// cycled the SR22 between -400 and -500 every 10 s where its path wanted
+/// -430 (LEMG 13, 1791792245).
 pub const NUDGE_BAND_FT: f64 = 40.0;
-/// ...and back within this, ft, the dial returns toward the path's rate.
-const BACK_ON_FT: f64 = 15.0;
 /// One nudge, fpm.
-pub const NUDGE_FPM: f64 = 100.0;
+pub const NUDGE_FPM: f64 = 50.0;
 /// No oftener than this, seconds.
 pub const NUDGE_EVERY_S: f64 = 10.0;
 /// The most the dial strays from the path's rate, fpm.
@@ -49,8 +50,6 @@ impl PathNudge {
             dial - NUDGE_FPM
         } else if above_ft < -NUDGE_BAND_FT {
             dial + NUDGE_FPM
-        } else if above_ft.abs() < BACK_ON_FT && (dial - set).abs() >= NUDGE_FPM / 2.0 {
-            dial + NUDGE_FPM * (set - dial).signum()
         } else {
             dial
         };
@@ -78,16 +77,16 @@ mod tests {
     }
 
     #[test]
-    fn nudged_when_off_no_oftener_than_every_ten_seconds_and_back() {
+    fn nudged_when_off_no_oftener_than_every_ten_seconds_and_left_when_holding() {
         let mut n = PathNudge::default();
         n.step(-350.0, 0.0, 0.0);
         assert_eq!(n.step(-350.0, 60.0, 5.0), -350.0, "too soon");
-        assert_eq!(n.step(-350.0, 60.0, 10.0), -450.0, "high: steeper");
-        assert_eq!(n.step(-350.0, 50.0, 15.0), -450.0, "too soon again");
-        assert_eq!(n.step(-350.0, 45.0, 20.0), -550.0);
-        assert_eq!(n.step(-350.0, 10.0, 30.0), -450.0, "back on: toward the path's rate");
-        assert_eq!(n.step(-350.0, 5.0, 40.0), -350.0);
-        assert_eq!(n.step(-350.0, -60.0, 50.0), -250.0, "low: shallower");
+        assert_eq!(n.step(-350.0, 60.0, 10.0), -400.0, "high: steeper");
+        assert_eq!(n.step(-350.0, 50.0, 15.0), -400.0, "too soon again");
+        assert_eq!(n.step(-350.0, 45.0, 20.0), -450.0);
+        assert_eq!(n.step(-350.0, 10.0, 30.0), -450.0, "back on: the setting that got it there stays");
+        assert_eq!(n.step(-350.0, -5.0, 60.0), -450.0);
+        assert_eq!(n.step(-350.0, -60.0, 70.0), -400.0, "low: shallower");
     }
 
     #[test]
