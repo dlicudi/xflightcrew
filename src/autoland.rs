@@ -321,18 +321,11 @@ use run::*;
 mod approach;
 pub use approach::*;
 mod flare;
-// The flare by attitude, judged by height (docs/tasks/autonomy-layers).
-pub(crate) mod attitude_flare;
-// The approach's power on total energy (docs/tasks/autonomy-layers).
-pub(crate) mod energy_throttle;
 // A visual final's VS set once and nudged (docs/tasks/autonomy-layers).
 pub(crate) mod path_nudge;
 pub use flare::*;
 mod arrest;
 pub use arrest::*;
-// The final's one lateral law, to the arrest (2026-10-12).
-mod final_lateral;
-pub use final_lateral::*;
 mod missed;
 pub use missed::*;
 mod guidance;
@@ -342,6 +335,10 @@ use crate::reversal::TerrainHold;
 
 #[cfg(test)]
 mod terrain_hold_tests;
+
+/// The final above minimums on the fitted heading modes (2026-10-12).
+#[cfg(test)]
+mod final_heading_tests;
 
 #[cfg(test)]
 mod lxgb09_landing_call_tests;
@@ -380,8 +377,8 @@ pub(crate) mod lemg_replay;
 mod issue_147_tests;
 
 /// LEMG 30, the Zibo 737's finals of 2026-10-07: its heading select fitted
-/// to the recorded windows, its whole-degree window, and the final flown on
-/// the final's one lateral law (`FinalLateral`).
+/// to the recorded windows, its whole-degree window, and the final flown as
+/// a pilot flies it (whole degrees above minimums, hand flown below).
 #[cfg(test)]
 mod lemg30_zibo_final_tests;
 
@@ -433,8 +430,8 @@ mod lemg13_sr22_rollout_tests;
 mod lemg13_sr22_rollout_split_tests;
 
 /// Issue #180: the A330 at LEMG 30 (sorties 1790621184, 1790633832 and
-/// 1790634412, 2026-09-28): a commit that lasted one tick, and the arrest's
-/// wings on its sidestick's roll rate.
+/// 1790634412, 2026-09-28): a commit that lasted one tick (its roll gates
+/// fly the hand-flown bank in `pilot::plants_tests`).
 #[cfg(test)]
 mod a330_lemg30_arrest_tests;
 

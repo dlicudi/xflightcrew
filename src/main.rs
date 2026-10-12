@@ -72,6 +72,7 @@ mod ils;
 mod scorecard;
 mod persona;
 mod phrase;
+mod pilot;
 mod pilot_altitude;
 mod plan;
 mod plugin_status;

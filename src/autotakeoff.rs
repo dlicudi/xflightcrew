@@ -343,9 +343,6 @@ pub(crate) const AIL_FULL_BANK_DEG: f64 = 15.0;
 pub(crate) const AIL_LEAD_S: f64 = 0.3;
 pub(crate) const AIL_MAX: f64 = 0.5;
 pub(crate) const AIL_SLEW_PER_S: f64 = 2.0;
-/// The tick the stiff wings-level gain was set on, seconds (see
-/// `WingsLevel::step`).
-pub(crate) const STIFF_TUNED_TICK_S: f64 = 0.3;
 /// Default hand-back height above the field, feet (a normal departure); a
 /// circuit overrides it lower via `Params::handoff_agl_ft`.
 pub const DEFAULT_HANDOFF_AGL_FT: f64 = 1000.0;

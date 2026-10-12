@@ -127,7 +127,7 @@
     /// its flare height, then its round-out to the hold-off's sink.
     #[test]
     fn the_flare_time_is_the_law_it_flies() {
-        use super::attitude_flare as af;
+        use crate::pilot::attitude as af;
         let path = -(140.0 / 60.0) * gp_ft_per_nm();
         let gate = af::gate_ft(path, af::RESPONSE_S);
         let t_gate = flare_time_s(gate, 140.0).unwrap();

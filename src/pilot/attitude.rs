@@ -1,5 +1,8 @@
-//! The flare flown by ATTITUDE, judged by HEIGHT (docs/tasks/autonomy-layers,
-//! phase 2). Nothing in it is fitted to an airframe.
+//! The path and the flare flown by ATTITUDE, judged by HEIGHT
+//! (docs/tasks/autonomy-layers, phase 2). Nothing in it is fitted to an
+//! airframe. Handed a [`Path`] it holds that path from wherever the hand
+//! flying begins (minimums, 2026-10-12), rejoining it in proportion, and
+//! flares from it: one law from minimums to the wheels.
 //!
 //! The G1000 172 on LEMG 13 (2026-10-11, 1791739518) gave the measurements
 //! it rests on:
@@ -96,6 +99,36 @@ pub struct In {
     /// The airframe's measured ground-effect pull at the wheels
     /// (`flare_elevator.ground_pull`), fed forward along [`ground_shape`].
     pub ground_pull: f64,
+    /// The path to hold above the flare, when there is one (the final's
+    /// glidepath); `None` holds the path the first tick finds.
+    pub path: Option<Path>,
+}
+
+/// A path to hold: its own sink at the groundspeed (fpm, negative down) and
+/// how far above it the aircraft is (ft).
+#[derive(Debug, Clone, Copy)]
+pub struct Path {
+    pub vs_fpm: f64,
+    pub above_ft: f64,
+}
+
+/// A height off the path is closed over this long, s: a pilot's glidepath
+/// correction, a dot in fifteen seconds, never a dive.
+const REJOIN_S: f64 = 15.0;
+/// ...asking at most this much off the path's own sink, fpm.
+const REJOIN_MAX_FPM: f64 = 300.0;
+/// ...and none of it below this height, ft (all of it from twice this): a
+/// pilot stops chasing the glidepath for the flare, and past the threshold
+/// the glidepath's height means nothing.
+const REJOIN_TO_FT: f64 = 50.0;
+
+/// The sink wanted above the flare on a path: its own, plus the height off
+/// it closed over [`REJOIN_S`], faded out by [`REJOIN_TO_FT`], never a
+/// climb. Pure.
+pub fn path_vs_fpm(path: Path, radio_ft: f64) -> f64 {
+    let fade = ((radio_ft - REJOIN_TO_FT) / REJOIN_TO_FT).clamp(0.0, 1.0);
+    let rejoin = (-path.above_ft * 60.0 / REJOIN_S).clamp(-REJOIN_MAX_FPM, REJOIN_MAX_FPM);
+    (path.vs_fpm + fade * rejoin).min(HOLDOFF_VS_FPM)
 }
 
 /// Ground effect from about half a light aircraft's span, ft.
@@ -178,13 +211,22 @@ impl AttitudeFlare {
         let dt = i.dt.clamp(0.02, 0.5);
         let v_fpm = i.tas_kts.max(30.0) * FPM_PER_KT;
         let gamma = i.theta_deg - i.alpha_deg;
-        let entry = *self.entry.get_or_insert_with(|| {
+        let mut entry = *self.entry.get_or_insert_with(|| {
             self.alpha_f = i.alpha_deg;
-            let vs = v_fpm * gamma.to_radians().sin();
+            let vs = i.path.map_or(v_fpm * gamma.to_radians().sin(), |p| p.vs_fpm);
             Entry { vs_fpm: vs, gate_ft: gate_ft(vs, g.response_s) }
         });
+        // On a path the flare starts from the path's sink as it is when the
+        // gate is reached (the speed moves it on the way down).
+        if let Some(p) = i.path.filter(|_| i.radio_ft > entry.gate_ft) {
+            entry = Entry { vs_fpm: p.vs_fpm, gate_ft: gate_ft(p.vs_fpm, g.response_s) };
+            self.entry = Some(entry);
+        }
         self.alpha_f += (i.alpha_deg - self.alpha_f) * (dt / ALPHA_TAU_S).min(1.0);
-        let vs_t = vs_target_fpm(i.radio_ft, entry.vs_fpm, entry.gate_ft);
+        let vs_t = match i.path {
+            Some(p) if i.radio_ft > entry.gate_ft => path_vs_fpm(p, i.radio_ft),
+            _ => vs_target_fpm(i.radio_ft, entry.vs_fpm, entry.gate_ft),
+        };
         let gamma_cmd = (vs_t / v_fpm).clamp(-1.0, 1.0).asin().to_degrees();
         // The target moves with the height, predictably: below the gate the
         // wanted sink falls by (entry - touchdown) / gate per foot, and the
@@ -237,7 +279,3 @@ impl AttitudeFlare {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "attitude_flare_tests.rs"]
-mod tests;

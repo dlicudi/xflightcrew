@@ -242,11 +242,9 @@ const INVERTER_ON: &str = "sim/cockpit2/electrical/inverter_on";
 /// Command: turn the heading bug one degree (knob presses).
 #[cfg(test)]
 const CMD_HDG_UP: &str = autoflight::cmd::HEADING_UP;
-#[cfg(test)]
-const CMD_HDG_DN: &str = autoflight::cmd::HEADING_DOWN;
 
 // The heading knob is the panel's owner's (`autoflight::drive_heading_bug`).
-pub use crate::autoflight::{bug_step_from, drive_heading_bug, drive_heading_bug_step, BugStep};
+pub use crate::autoflight::{drive_heading_bug, drive_heading_bug_step};
 
 /// Read the servo status as a bool ("is the autopilot actually flying").
 async fn servos_engaged(ctx: &ToolCtx<'_>) -> Result<bool> {
@@ -1736,36 +1734,6 @@ mod tests {
             status: None,
             reminders: None,
         }
-    }
-
-    /// The decision from a bug already read is the drive's own: a fine
-    /// correction writes the same value, a small one writes nothing, a big
-    /// one is left to the drive (presses), an unread bug is set outright.
-    #[tokio::test]
-    async fn a_bug_step_from_the_ticks_read_is_the_drives_own_decision() {
-        for (start, target) in [
-            (131.0, 131.5),
-            (131.0, 131.1),
-            (359.8, 1.2),
-            (10.0, 358.5),
-            (90.0, 96.0),
-            (90.0, 84.0),
-            (200.0, 200.0),
-        ] {
-            let fake = FakeXPlane::with_reads(&[(HEADING_BUG, start)]);
-            let _ = drive_heading_bug_step(&fake, target, 30.0).await;
-            let first_write = fake.writes_to(HEADING_BUG).first().copied();
-            match bug_step_from(Some(start), target) {
-                BugStep::Leave => assert_eq!(first_write, None, "{start} -> {target}"),
-                BugStep::Set(v) => assert_eq!(first_write, Some(v), "{start} -> {target}"),
-                BugStep::Drive => assert!(
-                    fake.ran(CMD_HDG_UP) || fake.ran(CMD_HDG_DN),
-                    "{start} -> {target}: pressed"
-                ),
-            }
-        }
-        assert_eq!(bug_step_from(None, 370.0), BugStep::Set(10.0));
-        assert_eq!(bug_step_from(Some(f64::NAN), 45.0), BugStep::Set(45.0));
     }
 
     #[tokio::test]

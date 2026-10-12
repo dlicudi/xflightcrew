@@ -516,36 +516,6 @@ pub(super) fn default_max_push() -> f64 {
     0.10
 }
 
-/// How the airframe's bank answers the roll channel with the servos out, for
-/// the landing arrest's wings (`autotakeoff::WingsLevel::rate_plant`). An
-/// Airbus's sidestick asks a ROLL RATE and a neutral stick holds the bank, so
-/// the stiff wings-level law (full aileron at 6 degrees of error) led only by
-/// the bank's measured rate rang through the loop's own delay: the A330 at
-/// LEMG 30 (sorties 1790633832 and 1790634412, 2026-09-28) swung +/-2 to 4
-/// degrees at a 1.5 to 2 s period with 0.3 to 0.5 of aileron, fitted 11 to 13
-/// deg/s per unit after 0.25 to 0.37 s. Declared, the arrest flies the bank
-/// the ailerons already written WILL make (a predictor over the dead time)
-/// toward its target over `close_s`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct ArrestRollProfile {
-    /// Roll rate per unit of aileron, deg/s.
-    pub deg_s_per_unit: f64,
-    /// Before the aileron is felt, seconds (the loop's write included).
-    pub dead_s: f64,
-    /// The bank error is closed over this, seconds.
-    pub close_s: f64,
-}
-
-impl ArrestRollProfile {
-    /// Used only when every number is a sane one.
-    pub fn valid(self) -> Option<Self> {
-        ((2.0..=60.0).contains(&self.deg_s_per_unit)
-            && (0.0..=1.5).contains(&self.dead_s)
-            && (0.2..=3.0).contains(&self.close_s))
-        .then_some(self)
-    }
-}
-
 /// The yaw plant of a free castoring nose (`ground_steer::GroundPlant`),
 /// identified from the airframe's own ground ticks: the one ground law's
 /// model for the taxi, the line-up, the roll's start and the rollout
@@ -680,11 +650,6 @@ impl SpeedGovernorProfile {
             && (0.02..=0.2).contains(&self.max_step))
         .then_some(self)
     }
-}
-
-/// The live airframe's arrest roll plant, when declared and sane.
-pub fn arrest_roll() -> Option<ArrestRollProfile> {
-    live_profile().and_then(|p| p.arrest_roll).and_then(ArrestRollProfile::valid)
 }
 
 /// The live airframe's speed governor, when declared and sane.

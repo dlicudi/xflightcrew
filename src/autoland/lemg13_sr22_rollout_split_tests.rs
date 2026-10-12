@@ -222,7 +222,7 @@
                     }
                 } else {
                     let v = v_rec[k] + dv;
-                    bank_cmds.push((tk, arrest_bank_target(x, v, phi, 5.0)));
+                    bank_cmds.push((tk, crate::pilot::line::bank_for_line(x, v, phi, 5.0)));
                     0.0
                 };
                 if on {
@@ -251,7 +251,7 @@
                     .last()
                     .map_or(f.phi0, |c| c.1);
                 phi += (cmd - phi) * h / 0.8;
-                dv += G_M_S2 * phi.to_radians().tan() * h;
+                dv += 9.81 * phi.to_radians().tan() * h;
                 dx += dv * h;
                 let vr = interp(t, &|i| v_rec[i]);
                 let base = v_ms.max(1.0);
