@@ -190,7 +190,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             // (`ApEngage`), holding the aircraft level until then.
             let engage_t0 = std::time::Instant::now();
             let mut engage = ApEngage::default();
-            let mut engage_pitch = FlarePitch::with_gains(engage_hold_gains());
+            let mut engage_pitch = LevelHold::with_gains(engage_hold_gains());
             let mut engage_held = false;
             {
                 let e = engage.arm(0.0);
@@ -295,21 +295,14 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let mut vvi_read_failed = false;
             // The vertical speed one tick ago, for the arrest's trend term.
             let mut prev_vvi: Option<(f64, std::time::Instant)> = None;
-            // The flare's elevator law. Its integrator is per-approach: a
-            // standing pull must not survive a go-around into the next one.
-            let mut flare_pitch =
-                FlarePitch::with_gains(FlareGains::from_profile(crate::aircraft::flare_elevator()));
-            // ...or the arrest by attitude, judged by height, where declared.
-            let layers = crate::aircraft::live_profile().is_some_and(|p| p.layers);
-            let attitude_law = crate::aircraft::flare_elevator().filter(|_| layers);
+            // The arrest by attitude, judged by height: the airframe's
+            // declared limits and ground pull, else the defaults.
+            let attitude_law = crate::aircraft::flare_elevator().unwrap_or_default();
             let mut attitude_flare = super::attitude_flare::AttitudeFlare::default();
             let mut energy_throttle = super::energy_throttle::EnergyThrottle::default();
             let mut decel_brake = DecelBrake::default();
             let mut path_nudge = super::path_nudge::PathNudge::default();
             let path_clock = std::time::Instant::now();
-            // ...or, where the airframe declares its elevator's response,
-            // the arrest flown on that model (`FlareModel`, the 737).
-            let mut flare_model = FlareModel::from_profile(crate::aircraft::flare_elevator());
             // The lever the loop last commanded, for the tick record (the
             // flare's table had the elevator and the sink but not the power).
             let mut last_lever: Option<f64> = None;
@@ -333,8 +326,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let mut arrest_prev_xtk: Option<f64> = None;
             let mut roll_yielded = false;
             let mut last_arresting = false;
-            // The final's air (`FinalAir`), for how the flare holds the column.
-            let mut final_air = FinalAir::default();
             // Airspeed history for the throttle governor's derivative term — the
             // anti-stall reflex needs the TREND (kts/sec), not just the error.
             let mut prev_ias: Option<f64> = None;
@@ -381,11 +372,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let mut reverse_selected = false;
             // The wheels off again after the rollout latched (a bounce).
             let mut bounce_hold = BounceHold::default();
-            // A hold-off airframe held on from its first contact
-            // (`TouchHold`), and the elevator the flare last wrote.
-            let holds_off = flare_model.as_ref().is_some_and(|m| m.holds_off());
-            let mut touch_hold = TouchHold::default();
-            let mut last_flare_elev: Option<f64> = None;
             // The landing readback last sent, so an owed one goes out once
             // (the party line keeps it owed until the tower hears it).
             let mut readback_sent: Option<String> = None;
@@ -489,15 +475,11 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 let af_panel = autoflight::panel();
                 let mut extra_names: Vec<String> = vec![thr_name.clone()];
                 extra_names.extend(af_panel.tick_names());
-                // The pitch plant on the tape, final and flare only: how this
-                // airframe's nose answers the elevator, the data the attitude
-                // flare is built on (docs/tasks/autonomy-layers). Logged only.
+                // The pitch plant, every tick: the attitude flare's
+                // measurements, and the true vertical speed the power is
+                // flown on (`energy_throttle`).
                 let panel_n = extra_names.len() - 1;
-                // ...and throughout on a layered airframe, whose power is
-                // flown on the true vertical speed (`energy_throttle`).
-                if layers || matches!(last_phase, Some(ApproachPhase::Final | ApproachPhase::Flare)) {
-                    extra_names.extend(PITCH_PLANT.iter().map(|n| n.to_string()));
-                }
+                extra_names.extend(PITCH_PLANT.iter().map(|n| n.to_string()));
                 let extra_refs: Vec<&str> = extra_names.iter().map(String::as_str).collect();
                 // ...and on a landing the autopilot flies (`ap_lands`), its
                 // FMA, second channel and speed window, in the same round.
@@ -742,23 +724,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     // standalone landing into a rolling handoff to nobody.
                     if !rolling_out {
                         rolling_out = true;
-                        // A hold-off airframe holds the pull it touched with
-                        // (`TouchHold`); the flare's own contact, if it saw
-                        // one first, already took it.
-                        // Only a column the flare was flying: never a take
-                        // of the pitch the arrest never had.
-                        if holds_off
-                            && !pitch_yielded
-                            && last_flare_elev.is_some()
-                            && touch_hold.note(true, last_flare_elev)
-                        {
-                            crate::blackbox::record(
-                                "autoland",
-                                serde_json::json!({"event": "touch_hold", "held": touch_hold.held(),
-                                    "at": "rollout", "radio": radio_ft, "gs": gs_kts, "ias": ias,
-                                    "on_ground": on_ground > 0.5}),
-                            );
-                        }
                         // The arrest's last aileron rides the roll channel's
                         // 1 s heartbeat onto the wheels unless it is
                         // centred: full right at the handover banked a 737
@@ -984,16 +949,13 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
                     let remaining_m = (rwy.length_m + along_m).max(0.0);
                     let target_kts = if vacate_follows { VACATE_HANDOFF_KTS } else { 0.0 };
-                    // A layered airframe brakes on the deceleration it measures,
-                    // lightly, the drag doing the early work (`DecelBrake`).
+                    // Braked on the deceleration it measures, lightly, the
+                    // drag doing the early work (`DecelBrake`).
                     if airborne {
                         decel_brake = DecelBrake::default();
                     }
-                    let brake = if layers {
-                        decel_brake.step(gs_kts, roll_dt, rollout_required_decel(gs_kts, target_kts, remaining_m))
-                    } else {
-                        rollout_brake_ratio(gs_kts, target_kts, remaining_m)
-                    };
+                    let brake =
+                        decel_brake.step(gs_kts, roll_dt, rollout_required_decel(gs_kts, target_kts, remaining_m));
                     let brakes = if airborne {
                         RolloutBrakes {
                             sym: 0.0,
@@ -1017,14 +979,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                             right: 0.0,
                         }
                     };
-                    // A hold-off airframe keeps the pull it touched with
-                    // (`TouchHold`), in the air too: the channel is a 1 s
-                    // heartbeat, so it is written every tick it is held.
-                    let touch_elev = if pitch_yielded {
-                        None
-                    } else {
-                        touch_hold.elev(gs_kts, !airborne, roll_dt)
-                    };
                     // The rollout kept no record of its own: the EGLF and LFPB
                     // weaves had to be reconstructed from the 1 Hz `state`
                     // samples, which is no way to read a control loop.
@@ -1032,8 +986,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         "autoland",
                         serde_json::json!({
                             "event": "rollout", "gs": gs_kts, "xtk_m": xtk_m,
-                            // The held pull (#166), when one is.
-                            "touch_elev": touch_elev,
                             "xtk_rate": xtk_rate, "err": err, "steer": steer,
                             "trim": roll_law.trim(), "psi": psi, "dt": roll_dt,
                             // The sim's yaw rate a declared rollout steer
@@ -1069,11 +1021,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         if let Some(c) = rollout_tiller.command(steer, gs_kts) {
                             writes.set(crate::tiller::TILLER, c);
                         }
-                    }
-                    if let Some(e) = touch_elev {
-                        // Ours, not a hand (the scorer's yoke check).
-                        crate::monitor::note_crew_yoke();
-                        writes.set(FLARE_PITCH, e);
                     }
                     // A vacate follows: hand off ROLLING at taxi pace — the
                     // completion of a landing is clearing the runway, and a
@@ -1238,7 +1185,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     && !runtime.go_around.active()
                     && on_ground < 0.5
                 {
-                    let model = crate::aircraft::flare_elevator();
                     let call = landing_call(
                         along_nm * M_PER_NM,
                         rwy.length_m,
@@ -1246,8 +1192,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         gs_kts,
                         Some(ias),
                         approach_ias,
-                        flare_tau_s(),
-                        model.and_then(|f| f.model).and_then(|m| m.touchdown_fpm),
                         wheels_need_m(book_m, roll_m),
                     );
                     if let Some(call) = call {
@@ -2475,15 +2419,14 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 };
                 prev_vvi = vvi.map(|v| (v, t_now));
                 let arrest_lead = crate::aircraft::arrest_lead();
-                // A layered airframe's final on its own path: the VS set once to
-                // the path's rate and nudged, as a pilot flies it (`path_nudge`).
+                // The final on its own path: the VS set once to the path's
+                // rate and nudged, as a pilot flies it (`path_nudge`).
                 // Not while the autopilot flies a captured glidepath: the dial is
                 // not its input then, and nudged against our own path it walked to
                 // -50 under a GPS path; handed back at 200 ft, the 172 levelled
                 // over the runway (LEMG 12, 1791807406). Handed back, it is set
                 // afresh to the path's rate.
-                let nudged = (layers
-                    && g.phase == ApproachPhase::Final
+                let nudged = (g.phase == ApproachPhase::Final
                     && !g.arresting
                     && !ap_modes.is_some_and(|m| m.gs()))
                 .then(|| {
@@ -2538,49 +2481,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     break;
                 }
                 // THE ARREST FLIES THE ELEVATOR, not the autopilot's VS dial.
-                // Only while actually arresting, and only with both
+                // Only while actually arresting, and only with its
                 // measurements in hand: anywhere else the dial is right and
                 // proven. The channel is a 1 s expiring heartbeat, so simply
                 // ceasing to write it hands the pitch back by itself.
-                // The final's air, for the flare (`FinalAir`): measured on the
-                // way down to the gate with the autopilot flying, begun again
-                // above it (a go-around's climb, a new pattern).
-                if radio_ft > FINAL_AIR_FROM_FT {
-                    final_air = FinalAir::default();
-                } else if let (ApproachPhase::Final, false, false, Some(v)) =
-                    (g.phase, g.arresting, es.hold, vvi)
-                {
-                    final_air.note(v, g.target_vs_fpm);
-                }
-                let mut model_out: Option<FlareModelOut> = None;
-                // A model that carries the speed leads its bleed (`fpm_per_kt`).
-                if let Some(m) = flare_model.as_mut() {
-                    m.note_speed(ias, tick_dt);
-                }
-                // A HOLD-OFF held on from its first contact (`TouchHold`):
-                // the wheels, or the radio under TOUCH_RADIO_FT, in the
-                // flare. A go-around or a new pattern starts free.
-                if missed.is_some() || g.phase == ApproachPhase::Intercept {
-                    touch_hold.reset();
-                    last_flare_elev = None;
-                } else if holds_off
-                    && !pitch_yielded
-                    && !ap_flies
-                    && g.phase == ApproachPhase::Flare
-                    && touch_hold.note(on_ground > 0.5 || radio_ft < TOUCH_RADIO_FT, last_flare_elev)
-                {
-                    crate::blackbox::record(
-                        "autoland",
-                        serde_json::json!({"event": "touch_hold", "held": touch_hold.held(),
-                            "at": "flare", "radio": radio_ft, "gs": gs_kts, "ias": ias,
-                            "vvi": vvi, "on_ground": on_ground > 0.5}),
-                    );
-                }
-                let touch_elev = if touch_hold.touched() && !pitch_yielded {
-                    touch_hold.elev(gs_kts, on_ground > 0.5, tick_dt)
-                } else {
-                    None
-                };
                 // A landing the autopilot flies (`ap_lands`) is its flare:
                 // our column never arrests it (the plugin releases our yoke
                 // channels while CMD is lit anyway).
@@ -2589,10 +2493,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     // The arrest by attitude: the path from the attitude, no
                     // VSI. No attitude read is no decision (the channel
                     // expires by itself).
-                    (true, _, false) if attitude_law.is_some() => {
+                    (true, _, false) => {
                         match (plant_at(0), plant_at(1), plant_at(2), plant_at(5)) {
                             (Some(theta_deg), Some(alpha_deg), Some(q_dps), Some(tas_ms)) => {
-                                let lim = attitude_law.expect("guarded");
                                 let o = attitude_flare.step(
                                     super::attitude_flare::In {
                                         radio_ft,
@@ -2601,10 +2504,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                         q_dps,
                                         tas_kts: tas_ms * 1.943_844,
                                         dt: tick_dt,
-                                        ground_pull: lim.ground_pull,
+                                        ground_pull: attitude_law.ground_pull,
                                     },
-                                    lim.max,
-                                    lim.max_push,
+                                    attitude_law.max,
+                                    attitude_law.max_push,
                                 );
                                 att_out = Some(o);
                                 Some(o.elev)
@@ -2612,70 +2515,19 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                             _ => None,
                         }
                     }
-                    // Once the pilot has taken the pitch it stays taken for
-                    // this approach — the debounce the taxi and takeoff
-                    // channels learned: a latch that re-arms is a fight over
-                    // a control with a person on the other end.
-                    (true, Some(v), false) => match flare_model.as_mut() {
-                        Some(m) => {
-                            let o = m.step(
-                                radio_ft,
-                                gs_kts,
-                                v,
-                                tick_dt,
-                                g.phase == ApproachPhase::Flare,
-                                final_air.rough(),
-                            );
-                            model_out = Some(o);
-                            Some(o.elev)
-                        }
-                        None => Some(flare_pitch.step(
-                            g.target_vs_fpm,
-                            v,
-                            vvi_trend,
-                            tick_dt,
-                            g.phase == ApproachPhase::Flare,
-                        )),
-                    },
-                    // No sink read: no decision. The model keeps time with
-                    // what is on the channel (it expires by itself).
-                    (true, None, false) if flare_model.is_some() => {
-                        if let Some(m) = flare_model.as_mut() {
-                            m.coast(tick_dt, radio_ft);
-                        }
-                        None
-                    }
                     // NOBODY IS FLYING: the autopilot is not confirmed and
                     // its servos read off. Level on the elevator until it
                     // is (`ApEngage`, `engage_hold_gains`); the same
                     // channel, the same single write below.
                     (false, Some(v), false) if es.hold => {
                         engage_held = true;
-                        flare_pitch.reset();
-                        if let Some(m) = flare_model.as_mut() {
-                            m.reset();
-                        }
-                        Some(engage_pitch.step(0.0, v, vvi_trend, tick_dt, false))
+                        Some(engage_pitch.step(0.0, v, vvi_trend, tick_dt))
                     }
                     _ => {
-                        flare_pitch.reset();
                         attitude_flare.reset();
-                        if let Some(m) = flare_model.as_mut() {
-                            m.reset();
-                        }
                         None
                     }
                 };
-                // Held on: the pull it touched with, whatever the flare
-                // would have asked.
-                let flare_elev = if touch_hold.touched() && !pitch_yielded {
-                    touch_elev
-                } else {
-                    flare_elev
-                };
-                if flare_elev.is_some() {
-                    last_flare_elev = flare_elev;
-                }
                 // THE ARREST TAKES THE SERVOS. The pitch channel writes the
                 // yoke under the joystick override and the autopilot's pitch
                 // servo writes it back the same frame: LFPG 09R (2026-09-22)
@@ -2728,8 +2580,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                             "autoland",
                             serde_json::json!({
                                 "event": "arrest_hands", "taken": true, "ok": ok, "radio": radio_ft,
-                                // The final's air the flare will be flown for.
-                                "air_rms": final_air.rms_fpm(), "rough": final_air.rough(),
                             }),
                         );
                     }
@@ -2817,18 +2667,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     // The autopilot not yet confirmed and read off: the
                     // elevator above is the level hold's (`ApEngage`).
                     "ap_hold": es.hold,
-                    // The model flare's own numbers: the sink it flew toward,
-                    // the height that was taken at, and the sink the
-                    // elevator did not explain.
-                    "flare_target": model_out.map(|o| o.target_fpm),
-                    "flare_ahead": model_out.map(|o| o.ahead_ft),
-                    "flare_unexplained": model_out.map(|o| o.unexplained_fpm),
-                    // The prediction's own ask before the flare's ratchet:
-                    // `flare_elev` over it is the pull held.
-                    "flare_ask": model_out.map(|o| o.ask),
-                    // A hold-off's pull held from its first contact (#166).
-                    "touch_hold": touch_hold.held(),
-                    "rough_air": g.arresting.then(|| final_air.rough()),
                     "lever": last_lever,
                     "phi": phi_r.as_ref().ok().copied(),
                     "psi": psi_r.as_ref().ok().copied(), "bug_true": crabbed_true,
@@ -3189,7 +3027,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // 270 times in 8 minutes, +524 fpm climbing to our own path
                 // under the beam). A dead glideslope or a beam below us keeps
                 // the path's VS.
-                let level_for_gs = layers && matches!(
+                let level_for_gs = matches!(
                     coupling,
                     crate::ils::Coupling::Armed | crate::ils::Coupling::LocCaptured
                 ) && !ap_modes.is_some_and(|m| m.gs())
@@ -3248,10 +3086,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                             "You have the pitch. I'm holding the wings and the power.".into(),
                             Priority::Caution,
                         );
-                    }
-                    flare_pitch.reset();
-                    if let Some(m) = flare_model.as_mut() {
-                        m.reset();
                     }
                 }
                 // Likewise the roll: the plugin dropped that override the
@@ -3377,12 +3211,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         ),
                         None => 1.0,
                     })
-                } else if touch_hold.touched() {
-                    // A hold-off held on (`TouchHold`): the lever closed,
-                    // never the balloon's approach thrust. Each iMac SR22
-                    // hop had 0.265 back on at 3 to 4 ft (LEMG 13
-                    // 1790702352, 1790702623, 2026-09-29).
-                    Some(0.0)
                 } else if let Some(hold) = g
                     .phase
                     .eq(&ApproachPhase::Flare)
@@ -3434,11 +3262,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         &crate::aircraft::flap_limits(),
                         floor,
                     );
-                    // A layered airframe flies its power on total energy: the
-                    // shared governor chased the phugoid in ALT hold (LEMG 13,
-                    // 2026-10-11). No true vertical speed read: the lever stays.
-                    let adj = if layers {
-                        match (thr_now, plant_at(3)) {
+                    // The power on total energy: the shared governor chased
+                    // the phugoid in ALT hold (LEMG 13, 2026-10-11). No true
+                    // vertical speed read: the lever stays.
+                    let adj = match (thr_now, plant_at(3)) {
                             (Some(t), Some(vy_ms)) => {
                                 energy_throttle.step(super::energy_throttle::In {
                                     ias_kts: ias,
@@ -3464,9 +3291,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                 }) - t
                             }
                             _ => 0.0,
-                        }
-                    } else {
-                        crate::tools::speedhold::throttle_adjust_live(target - ias, trend_kts_s)
                     };
                     // In the roundout the lever only ever comes back. The
                     // speed law read the roundout's own deceleration as
@@ -3580,9 +3404,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     // climb's approach thrust is "balloon" (issue #146: the
                     // last key's word hid it).
                     "retard": (g.phase == ApproachPhase::Flare)
-                        .then(|| if touch_hold.touched() {
-                            Some("touched")
-                        } else if ballooned {
+                        .then(|| if ballooned {
                             Some("balloon")
                         } else {
                             flare_power.last_key.map(RetardKey::word)
