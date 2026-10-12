@@ -92,7 +92,12 @@ pub fn clearance_differs(planned_id: &str, cleared_id: &str) -> bool {
 /// swing with a ~13 s period at the numbers, a standing 35 m offset the
 /// short-final law could not close, and the lateral balk gate at 74 ft.
 /// At 15 s the 13 s swing comes through at about a seventh of its amplitude.
-pub const CRAB_TAU_S: f64 = 15.0;
+/// 5 s since the final's one lateral law (2026-10-12, `FinalLateral`): its
+/// lead on the drift and its integral answer what the crab misses, and a
+/// 15 s crab held the wind of half a minute before through a shear. On the
+/// fitted plants under the 60 recorded finals, 15 s to 5 s took the replays
+/// within 5 m at 50 ft from 56 to 59 and a 15 to 0 kt shear from 46 to 49.
+pub const CRAB_TAU_S: f64 = 5.0;
 
 /// The wind crab actually commanded: heading minus ground track, low-passed
 /// with [`CRAB_TAU_S`]. Fed EVERY tick (intercept included) so it is settled

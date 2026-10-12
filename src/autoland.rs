@@ -330,6 +330,9 @@ pub(crate) mod path_nudge;
 pub use flare::*;
 mod arrest;
 pub use arrest::*;
+// The final's one lateral law, to the arrest (2026-10-12).
+mod final_lateral;
+pub use final_lateral::*;
 mod missed;
 pub use missed::*;
 mod guidance;
