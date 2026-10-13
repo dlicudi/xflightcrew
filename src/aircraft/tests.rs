@@ -1681,3 +1681,32 @@
             .all(|r| second.contains(&r.as_str())));
         assert!(p.seat_belt_signs.is_some() && p.transponder_mode_knob.is_some());
     }
+
+/// What the pilot controller flies on is MEASURED (`aircraft::learned`),
+/// never typed (2026-10-13): no profile carries the flare's elevator limits
+/// or ground pull, its power schedule, the arrest's lead or the final's
+/// track law. A key added back is a gain fitted by hand again.
+#[test]
+fn no_profile_types_the_pilots_numbers() {
+    const GONE: [&str; 6] = ["flare_elevator", "flare_power", "final_track", "arrest_lead", "max_push", "ground_pull"];
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+    let mut checked = 0;
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.extension().is_none_or(|x| x != "yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
+            for key in GONE {
+                assert!(
+                    !line.trim_start().starts_with(&format!("{key}:")),
+                    "{}: `{key}` is measured now, never declared",
+                    path.display()
+                );
+            }
+        }
+        checked += 1;
+    }
+    assert!(checked >= 10, "only {checked} profiles");
+}

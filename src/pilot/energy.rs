@@ -21,9 +21,11 @@
 //!   about equal on a light aircraft: the 172's 730 fpm book climb gives
 //!   1,460 against its fitted 1,440).
 //! - **Underspeed protection** (TECS's): below 90% of the speed wanted, or
-//!   the flap's floor, the lever goes to full at the hand's quick rate and
-//!   stays until the speed is back. It replaced the 6 s slow-side close and
-//!   its own urgent rate (2026-10-12), which did the same thing by hand.
+//!   the flap's floor, the speed takes all the weight (its error closed in
+//!   a third of the time constant) at the hand's quick rate, until it is
+//!   back within 3%. It replaced the slow-side close and urgent rate of
+//!   2026-10-12 (`SPEED_CLOSE_SLOW_S`, `URGENT_SLOW_KTS`), which did the
+//!   same thing from a typed band of knots.
 //! - **Bad descent** (TECS's): sinking more than [`BAD_DESCENT_FPM`] below
 //!   the path's energy for a second, the same full power.
 //! - **The flare**: height has priority (the elevator holds the path the
