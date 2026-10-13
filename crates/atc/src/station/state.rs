@@ -14,14 +14,15 @@
 //!
 //! | Lifetime | Group | Dies at |
 //! |---|---|---|
-//! | flight AND field: the party line's clearance picture | strip `facts` | `install`, `uninstall`, `retire_for_new_flight` |
-//! | flight AND field: the station's own worksheets | strip `worksheet`, [`StationFlight`] | `install`, `uninstall`, `retire_for_new_flight` |
+//! | flight AND field: the party line's clearance picture | strip `facts` | `install`, `uninstall`, `retire_for_new_flight`, `new_flight_here` |
+//! | flight AND field: the station's own worksheets | strip `worksheet`, [`StationFlight`], our `StripDesk` | `install`, `uninstall`, `retire_for_new_flight`, `new_flight_here` |
 //! | flight, carried across a region handoff | strip `carried`, [`FlightCarried`] | `uninstall`, `retire_for_new_flight` (never `install`) |
-//! | field: the installed station's watches | strip `watch`, [`StationField`] | `install`, `uninstall` |
+//! | field: the installed station's watches over us | strip `watch` | `install`, `uninstall`, `new_flight_here` |
+//! | field: the installed station's watches | [`StationField`] | `install`, `uninstall` |
 //! | field: the traffic strips themselves | [`TrafficStrips`] | `install`, `uninstall` (never `retire_for_new_flight`) |
 //! | field: facts built FROM the station | [`FieldFacts`] | `install` writes `for_station`, `uninstall` writes `empty` |
 //! | world: survives install, ends with ATC | [`WorldOnly`] | `uninstall` |
-//! | transition | `NEW_FLIGHT_PENDING` | set FIRST by `retire_for_new_flight`, cleared LAST by `install` / `uninstall` |
+//! | transition | `NEW_FLIGHT_PENDING` | set FIRST by `retire_for_new_flight`, cleared LAST by `install` / `uninstall` / `new_flight_here` |
 //! | self-expiring world memory | [`SELF_EXPIRING`] | never reset; pruned by age |
 //! | session | [`SESSION`] | never reset: memos of files on disk, crew providers, counters |
 //!
@@ -211,6 +212,15 @@ pub(crate) const UNINSTALL_RESETS: &[Group] = &[
     Group::StationField,
     Group::TrafficStrips,
     Group::WorldOnly,
+];
+
+/// What [`Station::new_flight_here`] resets, in order: OUR strip's groups
+/// of [`INSTALL_RESETS`], none of the field's or the traffic's.
+pub(crate) const NEW_FLIGHT_HERE_RESETS: &[Group] = &[
+    Group::StripFacts,
+    Group::StripWorksheet,
+    Group::StationFlight,
+    Group::StripWatch,
 ];
 
 /// What [`retire_for_new_flight`] resets, in order.
@@ -416,6 +426,41 @@ impl Station {
         reset_groups(INSTALL_RESETS);
         FieldFacts::for_station(self).publish();
         // ...and is the new flight's station: its replies publish again.
+        NEW_FLIGHT_PENDING.store(false, Ordering::SeqCst);
+    }
+
+    /// This station works `apt`'s field: a swap armed for it is a new flight
+    /// of ours here ([`Station::new_flight_here`]), never a new station.
+    pub fn works(&self, apt: &nav::AirportInfo) -> bool {
+        self.apt.name == apt.name && self.apt.position() == apt.position()
+    }
+
+    /// A NEW FLIGHT OF OURS AT THE FIELD THIS STATION ALREADY WORKS: the
+    /// station's part for us starts again, the field's and the traffic's do
+    /// not. Our desk (the tower FSM and worksheet for us) is a fresh one and
+    /// our strip's cells are reset as [`Station::install`] resets them; the
+    /// traffic's strips and desks, the runway in use, the field's watches
+    /// and its facts stand. LEMG 2026-09-26 is why our part goes: the desk
+    /// that had watched the 737 on runway 30 earned the arrival on 13 "you
+    /// landed without clearance". LEMG 2026-10-13 is why the rest stays: the
+    /// whole station rebuilt for an EFB "Move here" cleared every traffic
+    /// strip, and the traffic link sent thirteen moving aircraft off the
+    /// frequency (its reinstall rule). Like `install`, the new flight gets the
+    /// zone watch's grace to call, and the flag drops LAST.
+    pub fn new_flight_here(&mut self) {
+        self.desk = StripDesk::new();
+        reset_groups(NEW_FLIGHT_HERE_RESETS);
+        COMPLIANCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .zone_last = Some(Instant::now());
+        let traffic = STRIPS.lock().unwrap_or_else(|e| e.into_inner()).len();
+        tracing::info!(airport = %self.apt.name, traffic, "a new flight at the station's field: our desk reset, the traffic kept");
+        sim::blackbox::record(
+            "atc",
+            serde_json::json!({ "event": "new_flight_here", "airport": self.apt.name,
+                "traffic_strips": traffic }),
+        );
         NEW_FLIGHT_PENDING.store(false, Ordering::SeqCst);
     }
 
@@ -696,6 +741,13 @@ mod tests {
         retire.extend(names(&station_flight));
         retire.extend(names(&flight_carried));
         assert_eq!(door_cells(RETIRE_RESETS), retire, "retire_for_new_flight");
+
+        // A new flight of ours at the installed field: our strip's cells of
+        // `install`, never the field's watches nor the traffic's strips.
+        let mut here = names(&party_line_facts);
+        here.extend(names(&station_flight));
+        here.extend(names(&["GO_AROUND_LAST", "COMPLIANCE_FLIGHT", "SEEN"]));
+        assert_eq!(door_cells(NEW_FLIGHT_HERE_RESETS), here, "new_flight_here");
     }
 
     #[test]

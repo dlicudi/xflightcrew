@@ -20,11 +20,13 @@ pub(super) fn publish_clearance(strip: &FlightStrip, snap: ClearanceSnap) {
 
 /// A NEW FLIGHT at `icao` (the crew's "put us on a ten mile final", which
 /// starts a flight through the sim's own initialisation): the station for that
-/// field is rebuilt from nothing on the main loop's next pass, even when it is
-/// the one already up. The tower's worksheet for us belongs to the flight that
-/// ended: at LEMG (2026-09-26) the station that had watched the 737 sit on
-/// runway 30 went on as if the arrival 10 nm out on 13 were the same aircraft,
-/// and the landing earned "you landed without clearance". Overrides any swap
+/// field is armed for the main loop's next pass. The tower's worksheet for us
+/// belongs to the flight that ended: at LEMG (2026-09-26) the station that had
+/// watched the 737 sit on runway 30 went on as if the arrival 10 nm out on 13
+/// were the same aircraft, and the landing earned "you landed without
+/// clearance". When the field is the one already up the main loop resets OUR
+/// part of that station in place ([`Station::new_flight_here`]) and the
+/// traffic's strips stand; another field's is built new. Overrides any swap
 /// already waiting (the new flight wins), starts the region cooldown so the
 /// nearest-field pick cannot move the station straight back, and drops the
 /// old flight's arrival pin and region handoff (install() keeps both on
@@ -37,7 +39,7 @@ pub fn arm_new_flight(icao: &str, now: Instant) -> Option<i64> {
         let khz = a.apt.freq(nav::FREQ_TOWER)?.khz;
         (a.icao.clone(), a.apt.clone(), khz)
     };
-    tracing::info!(%code, khz, "station rebuilt for a new flight");
+    tracing::info!(%code, khz, "station armed for a new flight");
     *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = Some((code, apt));
     *LAST_REGION_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
     *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = None;

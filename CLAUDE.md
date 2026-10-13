@@ -227,7 +227,10 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   `OWN_STRIP` ours, `STRIPS` the traffic's (cleared by install/uninstall, never by a new flight of
   ours); the desk half (`StripDesk`, tower FSM and worksheet) per flight, a traffic desk swapped
   in only for its synchronous answer (`Station::respond_for`, drop guard); the ticks are
-  `_for(strip, state)` cores. `FlightId::Own` is never keyed by callsign.
+  `_for(strip, state)` cores. `FlightId::Own` is never keyed by callsign. **A new flight of
+  ours at the field already up resets OUR part in place** (`Station::new_flight_here`: our desk,
+  our strip's cells, `NEW_FLIGHT_HERE_RESETS`), never a reinstall: a rebuild clears `STRIPS` and
+  the traffic link's reinstall rule despawns every moving aircraft (LEMG 2026-10-13).
 - **The runway book is COMPUTED, never stored** (`station::RunwayBook`): every strip's claim from
   its clearance and position, plus the ghost memory; `own_strip_claim`, `player_blocked_strip`,
   `runway_occupancy_authorised` and the holds' releases are its queries (pinned to the old
@@ -466,7 +469,8 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
 - **Every planned arrival hands its runway down** (`EndAction::Approach { rwy_id }`); the
   self-pick (`autoland::self_pick`) keeps to the plan's destination.
 - **A new flight takes its clearances with it** (`party_line::retire_for_new_flight`); **its
-  station is the field under the NEW, SETTLED position** (`station::arm_new_flight_at`,
+  station is the field under the NEW, SETTLED position** (`station::arm_new_flight_at`; the field
+  already up keeps its station, our desk reset, `Station::new_flight_here`;
   `setup::SettleJudge`); nothing arms while it loads (`setup::new_flight_loading`).
 - **The tower's clearance outranks the plan** (`runway_from_clearance`), watched THROUGH the
   approach; it moves the ONE arrival runway (`full_auto::retarget_arrival_runway`). Arrival wind
