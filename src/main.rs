@@ -122,6 +122,7 @@ mod ui;
 mod undo;
 mod vad;
 mod voice;
+mod voices;
 mod weather;
 mod world_tick;
 
@@ -197,6 +198,14 @@ async fn main() -> Result<()> {
     // the ticks, `sortie_result` at each mission's end.
     blackbox::set_tap(scorecard::tap);
     let config = Config::from_env()?;
+    // `xfc voices [list|install|remove]`: the voice and speech-model manager
+    // (src/voices.rs). First, before the log is set up: its screen owns the
+    // terminal, and it never talks to the sim.
+    if std::env::args().nth(1).as_deref() == Some("voices") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        let ok = voices::main_cmd(rest, config)?;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     let tui = config.ui == "tui";
 
     // Always log to a daily-rolling file. In TUI mode the stderr layer would

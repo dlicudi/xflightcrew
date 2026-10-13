@@ -19,6 +19,17 @@ environment is fixed and the screen says which variable to change.
 | `XCOPILOT_SIMBRIEF_ID` | | your SimBrief username |
 | `XCOPILOT_TRAFFIC` | `off` | `ours`, `real`, or `off` |
 | `XCOPILOT_EFB` | `false` | serve the EFB page on your network |
+| `XCOPILOT_MODELS_DIR` | `models` | where voices and speech models live |
+
+## Voices and speech models
+
+`xfc voices` lists every Piper voice and whisper model, installs and
+removes them, and previews a voice (`p`). `u` makes an installed voice the
+copilot's or the cabin crew's, the same pick as the panel's voice picker;
+a running xfc picks it up on restart. The ATC voices stay in `.env`
+(`XCOPILOT_ATC_PIPER_VOICE`, `_APPROACH_`, `_DEPARTURE_`, `_ATIS_PIPER_VOICE`,
+`XCOPILOT_ATC_VOICE_POOL`) and the speech model is `WHISPER_MODEL`. A model
+something is configured to use cannot be removed until it is moved off it.
 
 ## Names
 

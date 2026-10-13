@@ -103,6 +103,11 @@ tracing-appender = "0.2"
 # Terminal dashboard (optional UI, XCOPILOT_UI=tui)
 ratatui = "0.29"
 dotenvy = "0.15"
+# `xfc voices` (src/voices/): every download verified before it is renamed in,
+# md5 for the Piper catalogue's digests, sha256 for the whisper models'
+# (RustCrypto, MIT OR Apache-2.0)
+md-5 = "0.10"
+sha2 = "0.10"
 
 # WAV read/write: the `transcribe` subcommand reads a clip for whisper, and the
 # onnx backend writes synthesized PCM for playback. Pure Rust, always built.

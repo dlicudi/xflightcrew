@@ -6,7 +6,7 @@
   port 8086)
 - macOS on Apple Silicon (the speech model runs on Metal)
 - Rust, to build the app
-- a whisper.cpp model, a ggml `.bin` such as `ggml-base.en.bin`, in `models/`
+- a whisper.cpp model and the Piper voices, in `models/` (see below)
 
 ## Build and install
 
@@ -20,6 +20,25 @@ cargo run
 `X-Plane 12/Resources/plugins/xflightcrew/`. It also removes an old
 `plugins/xcopilot/` folder if there is one, since two copies would both load.
 Install it with X-Plane closed, or reload plugins afterwards.
+
+## Voices and the speech model
+
+`xfc voices` fetches them from Hugging Face into `models/` (or
+`XCOPILOT_MODELS_DIR`), each file checked against its published size and
+checksum:
+
+```sh
+xfc voices install ggml-base.en en_US-amy-medium en_US-hfc_female-medium
+xfc voices install en_GB-alba-medium en_US-ryan-high en_GB-northern_english_male-medium
+xfc voices list --installed
+```
+
+Those are the speech model and the default copilot, cabin, tower, approach
+and departure voices. Run `xfc voices` alone for the screen: browse and
+filter the catalogue, preview a voice, install or remove one, and pick the
+copilot's or the cabin crew's voice. `xfc voices list --filter en_GB`
+prints the catalogue; `xfc voices remove <key>` refuses a model that is in
+use and says who uses it.
 
 The plugin and the app work together: the app does the listening, thinking
 and speaking, and the plugin gives it push-to-talk, the in-sim panel, FMS

@@ -72,6 +72,10 @@ Rust: a latency- and audio-sensitive real-time loop.
 - **Voices can ride the sim's audio** (`plugin/src/audio.cpp`, `XCOPILOT_AUDIO_BUS`, off by
   default): `xcopilot/audio/cut`'s ONE writer is `tts::play_on_bus`, so a cut never overtakes the
   next play; a failed post plays locally.
+- **Voices and speech models are installed by `xfc voices`** (`src/voices.rs`, into
+  `config::models_dir()`): the third outbound call after SimBrief and the METAR file, on demand
+  only, never at boot or in the command loop; every download size- and checksum-verified before
+  its rename, an in-use model never removed.
 
 ## Core design rule: curated tool surface, not raw dataref access
 

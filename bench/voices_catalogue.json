@@ -1,0 +1,156 @@
+{
+  "en_GB-alan-medium": {
+    "key": "en_GB-alan-medium",
+    "name": "alan",
+    "language": {
+      "code": "en_GB",
+      "family": "en",
+      "region": "GB",
+      "name_native": "English",
+      "name_english": "English",
+      "country_english": "Great Britain"
+    },
+    "quality": "medium",
+    "num_speakers": 1,
+    "speaker_id_map": {},
+    "files": {
+      "en/en_GB/alan/medium/en_GB-alan-medium.onnx": {
+        "size_bytes": 63201294,
+        "md5_digest": "8f6b35eeb8ef6269021c6cb6d2414c9b"
+      },
+      "en/en_GB/alan/medium/en_GB-alan-medium.onnx.json": {
+        "size_bytes": 4888,
+        "md5_digest": "b11d9afd0a8f5372c42a52fbd6e021d4"
+      },
+      "en/en_GB/alan/medium/MODEL_CARD": {
+        "size_bytes": 320,
+        "md5_digest": "24a2232470ca1be071debf53c984666e"
+      }
+    },
+    "aliases": []
+  },
+  "en_GB-alba-medium": {
+    "key": "en_GB-alba-medium",
+    "name": "alba",
+    "language": {
+      "code": "en_GB",
+      "family": "en",
+      "region": "GB",
+      "name_native": "English",
+      "name_english": "English",
+      "country_english": "Great Britain"
+    },
+    "quality": "medium",
+    "num_speakers": 1,
+    "speaker_id_map": {},
+    "files": {
+      "en/en_GB/alba/medium/en_GB-alba-medium.onnx": {
+        "size_bytes": 63201294,
+        "md5_digest": "c07f313752bb3aba8061041666251654"
+      },
+      "en/en_GB/alba/medium/en_GB-alba-medium.onnx.json": {
+        "size_bytes": 4888,
+        "md5_digest": "dbb6f2ede31082710665221417906e13"
+      },
+      "en/en_GB/alba/medium/MODEL_CARD": {
+        "size_bytes": 324,
+        "md5_digest": "d5a8716acb311b20e0f28710d0fcc982"
+      }
+    },
+    "aliases": []
+  },
+  "en_GB-vctk-medium": {
+    "key": "en_GB-vctk-medium",
+    "name": "vctk",
+    "language": {
+      "code": "en_GB",
+      "family": "en",
+      "region": "GB",
+      "name_native": "English",
+      "name_english": "English",
+      "country_english": "Great Britain"
+    },
+    "quality": "medium",
+    "num_speakers": 109,
+    "speaker_id_map": {
+      "p239": 0,
+      "p236": 1,
+      "p264": 2
+    },
+    "files": {
+      "en/en_GB/vctk/medium/en_GB-vctk-medium.onnx": {
+        "size_bytes": 76952753,
+        "md5_digest": "573025290fdc68812543b7438ace0c29"
+      },
+      "en/en_GB/vctk/medium/en_GB-vctk-medium.onnx.json": {
+        "size_bytes": 6637,
+        "md5_digest": "68e82dee4c9a723e804f9fc0b14f1802"
+      },
+      "en/en_GB/vctk/medium/MODEL_CARD": {
+        "size_bytes": 326,
+        "md5_digest": "b88a963e3bee27bc4fff84563f1be388"
+      }
+    },
+    "aliases": []
+  },
+  "en_US-amy-medium": {
+    "key": "en_US-amy-medium",
+    "name": "amy",
+    "language": {
+      "code": "en_US",
+      "family": "en",
+      "region": "US",
+      "name_native": "English",
+      "name_english": "English",
+      "country_english": "United States"
+    },
+    "quality": "medium",
+    "num_speakers": 1,
+    "speaker_id_map": {},
+    "files": {
+      "en/en_US/amy/medium/en_US-amy-medium.onnx": {
+        "size_bytes": 63201294,
+        "md5_digest": "778d28aeb95fcdf8a882344d9df142fc"
+      },
+      "en/en_US/amy/medium/en_US-amy-medium.onnx.json": {
+        "size_bytes": 4882,
+        "md5_digest": "7f37dadb26340c90ebc8088e0b252310"
+      },
+      "en/en_US/amy/medium/MODEL_CARD": {
+        "size_bytes": 284,
+        "md5_digest": "c5f20f730b35aeaa6c18271e3c122451"
+      }
+    },
+    "aliases": []
+  },
+  "de_DE-thorsten-high": {
+    "key": "de_DE-thorsten-high",
+    "name": "thorsten",
+    "language": {
+      "code": "de_DE",
+      "family": "de",
+      "region": "DE",
+      "name_native": "Deutsch",
+      "name_english": "German",
+      "country_english": "Germany"
+    },
+    "quality": "high",
+    "num_speakers": 1,
+    "speaker_id_map": {},
+    "files": {
+      "de/de_DE/thorsten/high/de_DE-thorsten-high.onnx": {
+        "size_bytes": 113895201,
+        "md5_digest": "256505fe58fb8b9d6ed78b83f6b8a9d2"
+      },
+      "de/de_DE/thorsten/high/de_DE-thorsten-high.onnx.json": {
+        "size_bytes": 4875,
+        "md5_digest": "e81686e00a9d825e2488ead660bec6fd"
+      },
+      "de/de_DE/thorsten/high/MODEL_CARD": {
+        "size_bytes": 279,
+        "md5_digest": "19da09a2681bb31bce0f12fc16bd7033"
+      }
+    },
+    "aliases": []
+  }
+}
