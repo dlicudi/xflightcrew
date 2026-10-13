@@ -59,6 +59,8 @@ pub(crate) fn position(tag: Option<&str>) -> &'static str {
         Some("APP") => "APPROACH",
         Some("DEP") => "DEPARTURE",
         Some("ATIS") => "ATIS",
+        Some("GND") => "GROUND",
+        Some("DEL") => "DELIVERY",
         _ => "ATC",
     }
 }
@@ -417,6 +419,11 @@ pub(crate) fn panel_label(text: &str, kind: Panel, c: &Ctx) -> String {
                 ("APP: ", Who::Atc, "APP"),
                 ("DEP: ", Who::Atc, "DEP"),
                 ("ATIS: ", Who::Atis, "ATIS"),
+                // The ground positions: without them a Ground or Delivery
+                // line read as the crew's, "COPILOT" on the panel's chip
+                // (LEMG, 2026-10-13).
+                ("GND: ", Who::Atc, "GND"),
+                ("DEL: ", Who::Atc, "DEL"),
                 ("TFC: ", Who::Traffic, "TWR"),
                 ("CAB: ", Who::Cabin, ""),
             ]
@@ -685,6 +692,24 @@ mod tests {
             ),
             "TOWER > EASY 8791"
         );
+        // Every position the station speaks as is a controller, never the
+        // crew: each `StationSpeaker::tag` prefix but the traffic's.
+        for (tag, pos) in [
+            ("TWR", "TOWER"),
+            ("APP", "APPROACH"),
+            ("DEP", "DEPARTURE"),
+            ("GND", "GROUND"),
+            ("DEL", "DELIVERY"),
+        ] {
+            assert_eq!(
+                panel_label(
+                    &format!("{tag}: Whiskey Alpha Tango five one niner, hold short runway one two."),
+                    feed,
+                    &c
+                ),
+                format!("{pos} > WAT519")
+            );
+        }
         assert_eq!(
             panel_label(
                 "~TFC: Cleared to land, Easy eight seven niner one.",
