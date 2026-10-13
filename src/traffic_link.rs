@@ -1622,6 +1622,8 @@ pub(crate) struct TrafficWorld {
     /// The Board tab as last sent, and when.
     board_last: String,
     board_sent: Option<Instant>,
+    /// When the EFB's boards were last tapped (`note_efb_boards`).
+    efb_boards_at: Option<Instant>,
     /// The Board tab's other field when nobody simulates it (2026-10-13):
     /// its board by the clock, built off the tick once picked, and one
     /// being built.
@@ -1671,6 +1673,8 @@ impl DrawLog {
 /// regardless.
 const BOARD_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 const BOARD_RESEND: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often the EFB's boards are rebuilt ([`TrafficWorld::note_efb_boards`]).
+const EFB_BOARDS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Our own flight on the board, from the plan on the shelf: a departure
 /// from `field`, or an arrival to it; no times (the plan's are not the
@@ -1898,7 +1902,33 @@ impl TrafficWorld {
         if let Some(s) = status {
             self.publish_board(xp, s, here, now).await;
         }
+        self.note_efb_boards(now);
         station_out
+    }
+
+    /// The EFB's Board card (2026-10-13): every simulated field's board,
+    /// the same payload the panel gets, tapped into `efb::feed` every 5 s
+    /// while the EFB is serving (no reads: the fleets are already here).
+    fn note_efb_boards(&mut self, now: Instant) {
+        if self
+            .efb_boards_at
+            .is_some_and(|t| now.saturating_duration_since(t) < EFB_BOARDS_EVERY)
+            || crate::efb::serving_url().is_none()
+        {
+            return;
+        }
+        self.efb_boards_at = Some(now);
+        let boards = self
+            .links
+            .iter()
+            .map(|(icao, link)| {
+                (
+                    icao.clone(),
+                    link.board_payload(own_board_flight(link.icao()), &[]),
+                )
+            })
+            .collect();
+        crate::efb::feed::note_boards(boards);
     }
 
     /// The pilot's station moved to `active`: the old station's field is

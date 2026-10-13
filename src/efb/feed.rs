@@ -325,6 +325,26 @@ pub(crate) fn callsign() -> Option<String> {
         .map(|(_, s)| s.clone())
 }
 
+/// Every simulated field's flight information board, as the traffic world
+/// last built it (`traffic::board::payload`, by ICAO, in the world's
+/// order), with its own expiry: a world that stopped ticking (traffic off,
+/// stood down) is a dash on the page within 30 s, never a frozen board.
+static BOARDS: Mutex<Option<(Instant, Vec<(String, String)>)>> = Mutex::new(None);
+
+/// The traffic world's tap (`TrafficWorld::note_efb_boards`).
+pub(crate) fn note_boards(boards: Vec<(String, String)>) {
+    *BOARDS.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), boards));
+}
+
+pub(crate) fn boards() -> Option<Vec<(String, String)>> {
+    BOARDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(at, b)| at.elapsed() < Duration::from_secs(30) && !b.is_empty())
+        .map(|(_, b)| b.clone())
+}
+
 /// A verdict the crew reached about the plan and said once.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub(crate) struct Verdict {

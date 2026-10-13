@@ -14838,3 +14838,42 @@ about 40 nm (TCAS range), drawing being the frame cost. Built from
   `api_load` beside them; the Board tab's LXGB live (statuses moving with LXGB's own aircraft,
   "At gate" once one parks). Owed: stage 4 (the station adopts a desk's strips; speech by
   frequency), stage 5.
+
+## 2026-10-13: the EFB link and its QR code on the panel, a shorter token, the board on the EFB
+
+The pilot wanted the EFB's link reachable from the sim (only the terminal and the log had it).
+
+- **The link on the panel**: the app publishes `xcopilot/status/efb_url` (`efb::qr::panel_payload`,
+  from the monitor's tick: on a change and on the periodic resend, since a plugin reload zeroes
+  it) as `url|N|hex`: the link exactly as logged, the QR's side in modules with its four-module
+  quiet zone, the modules row-major (dark = 1, high bit first); empty while the EFB is off or
+  not listening. The panel's Settings tab draws it under the `EFB token` field: the link as
+  read-only text with a Copy link button (ImGui's macOS clipboard), and the QR as ImGui
+  rectangles, one per run of dark modules, dark on white whatever the theme, whole pixels a
+  module (about 200 pt). Off, it says how to turn the EFB on. Old pairs: an app without the
+  dataref is never sent it (`plugin_status` skips an unresolved id, as for the board); a plugin
+  that has not had it written in 30 s draws nothing rather than a false "off". Listed in
+  `health::PLUGIN_DATAREFS`, so a stale `.xpl` is said at boot.
+- **Where the QR is made**: in the app, by the `qrcode` crate (0.14, MIT OR Apache-2.0, no
+  dependencies with its default features off), at error correction M. Simpler than vendoring a
+  C encoder into the plugin: the encoder is tested upstream, the plugin stays a painter, and the
+  payload is pinned by a plain `cargo test` that decodes the published matrix back to the link
+  (`rqrr`, a dev dependency): `the_published_matrix_decodes_back_to_the_link`, with
+  `the_matrix_has_its_quiet_zone_and_a_real_version` and the on/off payload tests. A link with a
+  10 digit token (38 characters) is version 3: 29 modules, 37 with the quiet zone, 343 hex digits.
+- **The token is 10 hex digits** when generated (`efb::TOKEN_HEX`, was 32): nobody types it
+  now, and a wrong guess is a 403, blackboxed. A set `XCOPILOT_EFB_TOKEN` (8 to 64) and a long
+  one already saved stay; blank the setting for a short one.
+- **The board on the EFB** (the coordinator, for the pilot): a Board card on the Plan tab, every
+  field the traffic world simulates, Departures and Arrivals, read-only, a field selector picked
+  on the device (localStorage, the panel's own pick untouched). No new source: the traffic world
+  taps each link's `board_payload` (the panel's rows) into `efb::feed::note_boards` every 5 s
+  while the EFB serves (`TrafficWorld::note_efb_boards`), expiring in 30 s; `efb::board` is the
+  pure reading of it ("On time" where the expected time is the timetable's). No world: a dash,
+  never an empty table (`no_traffic_world_is_a_dash_not_an_empty_board`).
+
+- **UNFLOWN.** With the plugin rebuilt, installed and reloaded and the EFB on: the Settings tab
+  shows the link and a QR the iPad's camera opens (the token in it); turning the EFB off in the
+  terminal turns the block into the "turn it on" line within a few seconds. With
+  `XCOPILOT_TRAFFIC=ours` at LEMG: the EFB's Plan tab Board card lists LEMG (and LXGB once
+  simulated), statuses moving as on the panel.

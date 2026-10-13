@@ -4,6 +4,7 @@
 
 #include "panel.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -533,8 +534,84 @@ private:
                                        "Spoken: not resolved yet");
                 }
             }
+            // Under the EFB token: the whole link and its QR code.
+            if (key == "efb_token") buildEfbLink();
             ImGui::PopID();
         }
+    }
+
+    // The EFB link under its token (2026-10-13: the pilot wanted it in the
+    // sim, where only the terminal and the log had it): the URL as
+    // read-only text (select and copy, or the Copy button) and a QR code to
+    // scan with the iPad. The app sends "url|N|hex" (xcopilot/status/efb_url,
+    // efb::qr), the matrix with its quiet zone; empty while the EFB is off.
+    // An app that has not written it in 30 s (older than the link, or gone)
+    // gets nothing drawn rather than a false "off".
+    char mEfbUrl[256] = {0};
+    void buildEfbLink() {
+        if (!drefs::efb_url_fresh()) return;
+        const TextRef& t = drefs::efb_url();
+        const std::string all(t.buf, static_cast<size_t>(t.len > 0 ? t.len : 0));
+        const std::vector<std::string> f = SplitBar(all);
+        if (f.size() < 3 || f[0].empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "The EFB is off. Turn it on in xvl's terminal Settings "
+                               "(EFB), or set XCOPILOT_EFB=true in your .env and restart "
+                               "xvl; its link and QR code then show here.");
+            ImGui::PopTextWrapPos();
+            return;
+        }
+        const std::string& url = f[0];
+        const int n = std::atoi(f[1].c_str());
+        const std::string& hex = f[2];
+        ImGui::TextUnformatted("EFB link");
+        std::snprintf(mEfbUrl, sizeof mEfbUrl, "%s", url.c_str());
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputText("##efb_url", mEfbUrl, sizeof mEfbUrl, ImGuiInputTextFlags_ReadOnly);
+        if (ImGui::SmallButton("Copy link")) ImGui::SetClipboardText(url.c_str());
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                           "or scan it with the iPad's camera");
+        // A malformed matrix is drawn as nothing: a wrong QR is worse.
+        if (n < 21 + 8 || n > 177 + 8 ||
+            hex.size() != (static_cast<size_t>(n) * n + 3) / 4) {
+            return;
+        }
+        // Whole pixels per module (a fractional module blurs the edges a
+        // phone reads), about 200 points wide, never past the panel.
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float want = 200.0f * ImGui::GetFontSize() / 13.0f;
+        int px = static_cast<int>(std::min(avail, want)) / n;
+        if (px < 2) px = 2;
+        const float side = static_cast<float>(px * n);
+        const ImVec2 o = ImGui::GetCursorScreenPos();
+        const ImVec2 o0(std::floor(o.x), std::floor(o.y));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        // Dark on WHITE whatever the panel's theme: a phone reads a light
+        // field with dark modules; the quiet zone is in the matrix.
+        dl->AddRectFilled(o0, ImVec2(o0.x + side, o0.y + side), IM_COL32(255, 255, 255, 255));
+        auto dark = [&](int x, int y) {
+            const size_t i = static_cast<size_t>(y) * n + x;
+            const char c = hex[i / 4];
+            const int v = (c >= '0' && c <= '9') ? c - '0'
+                        : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : 0;
+            return (v & (8 >> (i % 4))) != 0;
+        };
+        // One rectangle per horizontal run of dark modules.
+        for (int y = 0; y < n; ++y) {
+            int x = 0;
+            while (x < n) {
+                if (!dark(x, y)) { ++x; continue; }
+                int end = x;
+                while (end < n && dark(end, y)) ++end;
+                dl->AddRectFilled(ImVec2(o0.x + x * px, o0.y + y * px),
+                                  ImVec2(o0.x + end * px, o0.y + (y + 1) * px),
+                                  IM_COL32(0, 0, 0, 255));
+                x = end;
+            }
+        }
+        ImGui::Dummy(ImVec2(side, side));
     }
 
     // One choice row: `key|label|pinned_env|value|notice|help|a,b,c`. The

@@ -229,6 +229,19 @@ static TextRef g_state = {{0}, 0};
 // (source override, simbrief or tail), refreshed by the app.
 static TextRef g_callsign = {{0}, 0};
 static XPLMDataRef g_callsign_dref = nullptr;
+// The Settings tab's EFB link and its QR code (xcopilot/status/efb_url,
+// 2026-10-13): "url|N|hex" (N modules a side, quiet zone included; hex the
+// modules row-major, dark = 1, high bit first), empty while the EFB is off.
+// Resent by the app every few seconds, so its write time tells an app that
+// publishes it (fresh) from an older one that never will (the tab then
+// shows nothing rather than a false "off").
+static TextRef g_efb_url = {{0}, 0};
+static double g_efb_url_at = -1.0;
+static XPLMDataRef g_efb_url_dref = nullptr;
+static void WriteEfbUrl(void*, void* in, int offset, int len) {
+    StoreText(&g_efb_url, in, offset, len);
+    g_efb_url_at = XPLMGetElapsedTime();
+}
 static void WriteCallsign(void* ref, void* in, int offset, int len) {
     StoreText(static_cast<TextRef*>(ref), in, offset, len);
 }
@@ -1566,6 +1579,10 @@ void start() {
         "xcopilot/status/callsign", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteCallsign, &g_callsign, &g_callsign);
+    g_efb_url_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/efb_url", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteEfbUrl, &g_efb_url, &g_efb_url);
     g_fromto_dref = XPLMRegisterDataAccessor(
         "xcopilot/status/fromto", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -1727,6 +1744,7 @@ void stop_first() {
     if (g_opt_text_dref) { XPLMUnregisterDataAccessor(g_opt_text_dref); g_opt_text_dref = nullptr; }
     if (g_opt_text_edit_dref) { XPLMUnregisterDataAccessor(g_opt_text_edit_dref); g_opt_text_edit_dref = nullptr; }
     if (g_callsign_dref) { XPLMUnregisterDataAccessor(g_callsign_dref); g_callsign_dref = nullptr; }
+    if (g_efb_url_dref) { XPLMUnregisterDataAccessor(g_efb_url_dref); g_efb_url_dref = nullptr; }
     if (g_fromto_dref) { XPLMUnregisterDataAccessor(g_fromto_dref); g_fromto_dref = nullptr; }
     if (g_opt_ui_scale_dref) { XPLMUnregisterDataAccessor(g_opt_ui_scale_dref); g_opt_ui_scale_dref = nullptr; }
     if (g_loadsheet_dref) { XPLMUnregisterDataAccessor(g_loadsheet_dref); g_loadsheet_dref = nullptr; }
@@ -1830,6 +1848,10 @@ void set_typed(const char* text) {
 }
 const TextRef& opt_text() { return g_opt_text; }
 const TextRef& callsign_status() { return g_callsign; }
+const TextRef& efb_url() { return g_efb_url; }
+bool efb_url_fresh() {
+    return g_efb_url_at >= 0.0 && XPLMGetElapsedTime() - g_efb_url_at < 30.0;
+}
 bool send_text_edit(const char* key, const char* value) {
     char line[sizeof g_opt_text_edit.buf];
     int n = std::snprintf(line, sizeof line, "%s=%s", key, value);

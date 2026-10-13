@@ -21,7 +21,8 @@ palette from the device's setting, or picked on the Settings tab (this device on
 Off by default. Any one of:
 
 - `.env` or the shell: `XCOPILOT_EFB=true` (pins it; the terminal and panel then refuse to change it)
-- the terminal's Settings screen or the panel's Settings tab: `EFB` on
+- the terminal's Settings screen: `EFB` on (the panel's Settings tab says so where the link
+  would be)
 - `prefs.json` (`settings.efb = "on"`), written by either of the above
 
 It applies live: turning it on starts the server within two seconds, off stops it, and a new port
@@ -38,15 +39,30 @@ rebinds.
 At the first bind `xvl` prints (plain mode) and logs (`EFB serving`, both modes) the full link:
 
 ```
-http://192.168.1.20:8787/?t=3f9a0c1d2b7e4a6f8c5d1e0b9a7f6c3d
+http://192.168.1.20:8787/?t=3f9a0c1d2b
 ```
+
+The panel's Settings tab shows the same link under the `EFB token` field, as text to select or
+copy (the Copy link button) and as a QR code to scan with the iPad's camera (2026-10-13). The app
+publishes it on `xcopilot/status/efb_url` (`efb::qr::panel_payload`, from the monitor's tick: on
+a change and every few seconds, since a plugin reload zeroes it) as `url|N|hex`: the link, the
+side in modules with the four-module quiet zone, and the modules row-major, dark = 1, most
+significant bit first. The matrix is made in the app by the `qrcode` crate (MIT OR Apache-2.0, no
+dependencies with its default features off) at error correction M, and a test decodes it back
+(`rqrr`, a dev dependency); the plugin only paints it, dark modules on a white field whatever
+the panel's theme, whole pixels a module. Empty while the EFB is off or not yet listening: the
+tab then says how to turn it on. A plugin without the dataref is simply not sent it; an app that
+has not written it in 30 s (older than the link) gets nothing drawn rather than a false "off".
 
 Open it once on the device. Every request needs the token: the page takes it from `?t=`, sets a
 cookie, and keeps it in the device's local storage; the API calls send it as `X-EFB-Token`. A wrong
 or missing token is a 403 and a blackbox `efb` `auth_failed` record (the peer address and the path,
 never the token tried). The token is the `EFB token` setting (shown on the terminal's Settings
 screen and the panel's Settings tab): blank it and the next enable makes a new one, which retires
-every old link.
+every old link. A generated token is 10 hex digits (2026-10-13, was 32: the QR code means nobody
+types it, and a wrong guess is a 403, blackboxed: 40 bits is out of reach of guessing on a LAN); one
+you set yourself (`XCOPILOT_EFB_TOKEN`, 8 to 64 letters, digits, '-' or '_') stays as it is, and
+so does a long one saved before: blank it for a short one.
 
 The server binds `0.0.0.0`: anyone on your LAN who has the link can press the buttons. Keep the
 link to yourself, and leave the EFB off on a network you do not trust.
@@ -74,7 +90,7 @@ is a dash, never a guess.
 | Strip | callsign (written, "WAT519"), type, route, phase and altitude, who flies, COM1 and its station | the monitor's callsign resolve (`feed::note_callsign`) written by `transcript::written_callsign` over the override and the plan's id, the live profile, the plan on the shelf, `flight::published()`, `flight_state::crew_has_aircraft` / `crew_mission`, the runway watch's COM1 read (`feed::note_com1`) named by the station's services |
 | Flight | the layout for the phase (below): a headline, four readouts, the cards; the running checklist as a card in any phase; the intercom log | `flight_tab::build` over the same facts; `flow::sheet`, `flow::proposal_title`, `flow::waiting_for`; the transcript's intercom lines |
 | Map | on the ground or low near the destination, the airport diagram; elsewhere the route over water and coastlines: legs in magenta, flown legs dimmed, the active fix ringed, the top of descent, the plan's fields, the aircraft (below) | `airport::page` (below); `route_map::build` over the plan's legs, `procedure::active_leg`, the monitor's tick, `procedure::planned_tod` (else the plan's ring measured back from the destination), the field directory (`station::field_position`); `GET /basemap` from X-Plane's installed map data |
-| Plan | source and when shelved, the route string, the plan check and preflight, route and procedures, plan fuel, the load sheet, the legs (the follower's fix in magenta), the weather for destination, origin and alternate with the runway picked or cleared | `simbrief::loaded_plan` / `plan_shelved_at`, `procedure::active_leg`, `feed::AUDIT`, `feed::PREFLIGHT`, the sim's real-weather file (`weather::latest_file`, re-read at most once a minute), `full_auto::arrival_runway`, `party_line::clearance_runway` |
+| Plan | source and when shelved, the route string, the plan check and preflight, route and procedures, plan fuel, the load sheet, the legs (the follower's fix in magenta), the weather for destination, origin and alternate with the runway picked or cleared; the Board (2026-10-13): every field our traffic simulates, Departures and Arrivals as the panel's Board tab shows them, the field picked on the device, a dash with no traffic running | `simbrief::loaded_plan` / `plan_shelved_at`, `procedure::active_leg`, `feed::AUDIT`, `feed::PREFLIGHT`, the sim's real-weather file (`weather::latest_file`, re-read at most once a minute), `full_auto::arrival_runway`, `party_line::clearance_runway`; the board: `feed::boards`, each simulated field's `board_payload` tapped by the traffic world every 5 s while the EFB serves (`TrafficWorld::note_efb_boards`), read by `efb::board` |
 | Radio | COM1 and who it is, the accepted clearance (or the tower's state for us), a readback owed, the controller's last call to us with Say again, the station's frequencies, the frequency log (Radio or All) | `feed::com1`, `station::tuned_station`, `station::active_station_in_range`, `party_line::assigned_clearance`, the flight model's clearance fact, `party_line::readback_owed`, `Voice::last_controller_line`, the labelled transcript |
 | Settings | every row of the settings registry, as the terminal's Settings screen shows it, and this device's theme | `settings::ALL` |
 | Every page | the crew's warning as a banner until acknowledged on the page, the latest caution as an amber chip, a dot for idle / listening / thinking / speaking | `feed::note_alert` (tapped where the voice mirrors to the panel; a banner or chip only for a `Voice::hazard`, below), `feed::note_activity`, `Voice::is_speaking` |

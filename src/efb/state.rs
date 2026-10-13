@@ -379,6 +379,9 @@ pub(crate) struct Facts {
     /// own waypoint): ("origin" | "destination" | "alternate", ICAO, lat,
     /// lon). The route map labels them always.
     pub(crate) fields: Vec<(&'static str, String, f64, f64)>,
+    /// Every field the traffic world simulates, its board payload
+    /// (`feed::boards`); `None` with no world running.
+    pub(crate) boards: Option<Vec<(String, String)>>,
 }
 
 /// What a setting accepts, as the registry declares it (`settings::Kind`).
@@ -667,6 +670,8 @@ pub(crate) struct EfbState {
     pub(crate) airport: crate::efb::airport::AirportOut,
     /// The Map tab's route picture (`efb::route_map`).
     pub(crate) map: crate::efb::route_map::MapOut,
+    /// The Plan tab's flight information board (`efb::board`).
+    pub(crate) board: crate::efb::board::BoardOut,
 }
 
 // ---------------------------------------------------------------- build
@@ -1463,6 +1468,7 @@ pub(crate) fn build(f: &Facts) -> EfbState {
         }),
         airport,
         map,
+        board: crate::efb::board::build(f.boards.as_deref()),
     }
 }
 
@@ -1817,7 +1823,32 @@ pub(crate) mod tests {
                 ("destination", "EGKK".into(), 51.148, -0.190),
                 ("alternate", "EGLL".into(), 51.471, -0.461),
             ],
+            boards: None,
         }
+    }
+
+    /// The Plan tab's Board card: a dash with no traffic world, every
+    /// simulated field's rows with one (`efb::board`).
+    #[test]
+    fn the_board_card_is_the_worlds_boards_or_a_dash() {
+        let s = build(&cruise());
+        assert_eq!(s.board.fields, None);
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json["board"]["fields"].is_null(), "a dash on the page");
+        let mut f = cruise();
+        f.boards = Some(vec![(
+            "LEMG".into(),
+            "H|LEMG|10:42\nD|10:30|10:30|U2 8062|easyJet|London Gatwick|A320|42|Taxiing|0".into(),
+        )]);
+        let s = build(&f);
+        let fields = s.board.fields.as_ref().unwrap();
+        assert_eq!(fields[0].icao, "LEMG");
+        assert_eq!(fields[0].departures[0].exp, "On time");
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            json["board"]["fields"][0]["departures"][0]["status"],
+            "Taxiing"
+        );
     }
 
     #[test]

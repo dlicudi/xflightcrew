@@ -94,6 +94,10 @@ pub async fn run(
     let mut auto_resend = 0u8;
     // When the Settings tab's resolved callsign was last published.
     let mut callsign_at: Option<Instant> = None;
+    // The Settings tab's EFB link and QR (2026-10-13): the link it was last
+    // built from (`None` = never), and the payload, rebuilt only on a change.
+    let mut last_efb: Option<Option<String>> = None;
+    let mut efb_payload = String::new();
 
     // Talk-down pacing: when the last callout went out, and whether we've
     // already handed over at the threshold (say it once, then shut up).
@@ -1275,6 +1279,18 @@ pub async fn run(
                         s.callsign(&format!("{}|{}", r.spoken, r.source.as_str()));
                         crate::efb::feed::note_callsign(&r.spoken);
                     }
+                }
+                // The EFB link under the panel's EFB setting, with its QR:
+                // sent on a change (on, off, a new port or token) and on
+                // the periodic resend (a plugin reload zeroes it).
+                let efb_now = crate::efb::serving_url();
+                let efb_changed = last_efb.as_ref() != Some(&efb_now);
+                if efb_changed {
+                    efb_payload = crate::efb::qr::panel_payload(efb_now.as_deref());
+                    last_efb = Some(efb_now);
+                }
+                if efb_changed || auto_resend == 0 {
+                    s.efb_url(&efb_payload);
                 }
                 if auto != last_auto || auto_resend == 0 {
                     s.auto_status(&auto);

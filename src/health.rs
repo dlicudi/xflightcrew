@@ -144,6 +144,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/status/callout",
     "xcopilot/status/callsign",
     "xcopilot/status/coach",
+    "xcopilot/status/efb_url",
     "xcopilot/status/fromto",
     "xcopilot/status/heard",
     "xcopilot/status/loadsheet",
@@ -309,6 +310,7 @@ mod plugin_contract_tests {
             "xcopilot/opt/text_edit",
             "xcopilot/status/callsign",
             "xcopilot/opt/board_field",
+            "xcopilot/status/efb_url",
         ] {
             assert!(PLUGIN_DATAREFS.contains(&name), "{name}");
             assert!(
