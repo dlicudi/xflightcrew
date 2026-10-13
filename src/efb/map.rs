@@ -393,6 +393,8 @@ mod tests {
             on_ground: false,
             gs_kts: 280.0,
             ahead: Vec::new(),
+            journey: None,
+            modeled: false,
         }
     }
 
@@ -546,6 +548,7 @@ mod tests {
             out.wide = M.baseBox(40, -14, 56, 12);
             out.wide_tiles = out.wide ? M.tileCount(out.wide[0], out.wide[1], out.wide[2], out.wide[3]) : 0;
             out.continent = M.baseBox(-60, -170, 60, 170);
+            out.gc = M.gcPoints([36.67, -4.5], [51.15, -0.19]);
             console.log(JSON.stringify(out));"#
         );
         let Ok(run) = std::process::Command::new("node")
@@ -580,5 +583,19 @@ mod tests {
             num("wide_tiles") <= crate::efb::basemap::MAX_TILES as f64 && num("wide_tiles") > 459.0
         );
         assert!(v["continent"].is_null());
+        // A whole flight's line is the server's great circle, point for
+        // point (Malaga to Gatwick, about every 20 nm).
+        let gc: Vec<(f64, f64)> = v["gc"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p[0].as_f64().unwrap(), p[1].as_f64().unwrap()))
+            .collect();
+        assert!((40..=50).contains(&gc.len()), "{} points", gc.len());
+        let n = (gc.len() - 1) as f64;
+        for (i, p) in gc.iter().enumerate() {
+            let want = traffic::track::gc_point((36.67, -4.5), (51.15, -0.19), i as f64 / n);
+            assert!(traffic::track::gc_dist_m(*p, want) < 1.0, "point {i}: {p:?} {want:?}");
+        }
     }
 }

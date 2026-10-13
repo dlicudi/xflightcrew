@@ -43,6 +43,10 @@ pub struct Fleet {
     /// Flights parked at the end of their flight, waiting for the way past
     /// their stand to clear before they turn round.
     finished: Vec<u32>,
+    /// Departures that left the area since the last [`Fleet::take_left`]:
+    /// each as it was the substep it left and that substep's fleet time,
+    /// for the whole-flight model to fly on ([`crate::track`]).
+    left: Vec<(TrafficAircraft, f64)>,
 }
 
 /// How an aircraft holds a stand ([`Fleet::stand_holder`]).
@@ -71,7 +75,15 @@ impl Fleet {
             turn_round: false,
             ready_at: HashMap::new(),
             finished: Vec::new(),
+            left: Vec::new(),
         }
+    }
+
+    /// The departures that left the area since the last call, as each was
+    /// the moment it left and the fleet time then (2026-10-13: the model
+    /// flies them on to their destinations, [`crate::track::Whole`]).
+    pub fn take_left(&mut self) -> Vec<(TrafficAircraft, f64)> {
+        std::mem::take(&mut self.left)
     }
 
     /// Add an aircraft; its `Spawn` comes out of the next step. An id
@@ -415,7 +427,8 @@ impl Fleet {
         self.own = own;
         let mut events = std::mem::take(&mut self.pending);
         let n = self.clock.advance(dt);
-        for _ in 0..n {
+        let end_s = self.clock.now_s();
+        for k in 0..n {
             let mut picture = self.picture();
             // Our own aircraft on the ground takes a stand like a parked
             // one: an arrival never picks the stand we stand on.
@@ -453,6 +466,15 @@ impl Fleet {
                     &picture,
                     &mut events,
                 );
+            }
+            let at_s = end_s - f64::from(n - 1 - k) * SUBSTEP_S;
+            for a in self.aircraft.iter().filter(|a| a.phase == Phase::Gone) {
+                let left = events.iter().rev().any(|e| {
+                    matches!(e, Event::Despawn { id, reason: Despawn::LeftTheArea } if *id == a.id)
+                });
+                if left {
+                    self.left.push((a.clone(), at_s));
+                }
             }
             self.aircraft.retain(|a| a.phase != Phase::Gone);
         }

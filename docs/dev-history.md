@@ -15231,3 +15231,64 @@ its own canvas (the route map in page.html, the diagram in `diagram.js`).
   landing: our `go_around_deferred` records show it `"departing": true`, `exit` `clearing` with
   `clear_s` falling to 0 as it lifts off (never 40.0 while it rolls), and no `go_around_judged`
   while `clear_s` + 10 is under `own_s`.
+## 2026-10-13: the whole flight, origin to destination, like FlightAware (LEMG)
+
+The pilot on the EFB map: "I just saw an aircraft pop up out of nowhere ... An aircraft from
+London to Malaga, we should see its route ... and see its progress ... so it looks like
+FlightAware." An instrument arrival spawned 25 to 40 nm out on a random side of the approach
+(`arrival::ENTRY_NM`, `schedule::entry_clear_of_own`), a departure despawned `LeftTheArea` 12 nm
+out on a random bearing (`midflow::movement`'s "the crate knows no other field's position", true
+before `places`). The design, its cost and its tests are in
+`docs/tasks/multi-field-traffic/DESIGN.md` ("Built: the whole flight"); offline.
+
+- **The model** (`crates/traffic/src/track.rs`, pure, no randomness): taxi, a climb at 0.6 of the
+  class's rate, a cruise level by distance on the semicircular rule (`cruise_level_ft`), a 3
+  degree descent, on the great circle; ground speed linear in distance per segment, so position
+  by time is closed form. An air end past its time holds there.
+- **One flight, two sources of position.** An arrival still to enter is its `Due` movement; its
+  model ends at the aircraft its spawn makes (`Movement::entry_anchor`) at its first due time,
+  takes an id the first time it shows, and the spawn keeps it (`src/traffic_whole.rs`). A
+  departure leaving the area is captured as it left (`Fleet::take_left`) and flown on to its
+  destination's blocks, same aircraft value and id. Departures gone before the start come from
+  `midflow::plan` as `Start::Away` (looking back 9 h; by number AND time, a route's numbers
+  repeating daily: keyed by number alone, LEMG at 10:00 found 1 such flight instead of 41).
+- **The ends face the flight**: `arrival::entry_toward` puts an airliner's entry toward its
+  origin, on the approach side within 80 degrees; a departure's exit bearing is the great circle
+  to its destination.
+- **Drawn in the ring**: the model's airborne aircraft are candidates of the same `DrawCull` (40
+  nm), so TCAS no longer loses a departure at 12 nm nor gains an arrival at its entry; never in
+  the station's picture. `traffic` `draw` gains `modeled`.
+- **The EFB**: each aircraft's `journey` (ends, positions, off-block on the origin's clock,
+  on-block on the destination's, minutes since and to go, progress) and `model`; the selected
+  flight's whole route (solid great circle flown, dashed ahead to the destination, both ends
+  ringed), a card with Off blocks, Arrives and a Progress bar; the model's flights small far out,
+  named from zoom 8.
+- **Blackbox**: `traffic` `handover` `in` (`off_m`, `off_ft`, `held_s`, `shown`) and `out` (`to`,
+  `alt_ft`, `cruise_ft`, `eta_s`).
+- **Measured** (release): a position 0.02 us; LEMG 10:00 summer Tuesday on its desk
+  (`real_install_lemg_whole_flights`): up to 71 flights modelled at once, the model tick 70 us a
+  second, the EFB tap 115 us a second, the map's traffic up to 47 kB; over 90 min 26 arrivals out
+  of the model and 10 departures into it, no flight moving more than 0.2 m or 1 ft beyond a
+  second's flight from one second to the next.
+- **The harness, before and after** (entries now toward the origins): `real_install_midflow_start`
+  LEMG 10:00 30 min, 0 conflicts, 0 oracle, 9 of 9 readbacks, 1 overlap, 0 go-arounds, final gap
+  4.9 nm least and 10.4 median; `real_install_two_fields_at_once` 30 min LEMG 7 completed, 8
+  touchdowns, 0 conflicts, 1 overlap, 0 go-arounds, 8 towed (was 6, 10, 0, 1, 0, 9), LXGB
+  unchanged (1, 1, 0, 0, 0, 0); LEMG alone the same as beside LXGB.
+- Tests: the model's four, `an_arrival_enters_the_simulation_where_the_model_puts_it`,
+  `a_departure_leaves_the_simulation_where_the_model_takes_it`,
+  `a_whole_flight_never_jumps_at_either_handover`, `a_whole_flight_rides_the_map_with_its_journey`,
+  the map's node test (the page's great circle is the server's).
+
+- **UNFLOWN.** With `XCOPILOT_TRAFFIC=ours` at LEMG and the EFB on (no plugin change, no reload):
+  zoom the Map tab out to Europe: violet flights small on great circles to and from Malaga. Tap
+  an inbound from London (EZY or BAW from EGKK, EGLL): its card shows Off blocks with how long
+  ago, Arrives with how long to go, a Progress bar, "Beyond our simulated airspace"; selected, a
+  solid line back to London and a dashed one on to Malaga. Follow it to the gate: as it crosses
+  25 to 40 nm out it becomes simulated (the note goes, the dashed line becomes its approach)
+  without moving; blackbox `traffic` `handover` `dir` `in` for its callsign with `off_m` under
+  1 and `off_ft` 0 (a runway turned since the model's last second excepted), then its `spawn` with
+  the same `id`. A departure to the UK: past 12 nm `handover` `dir` `out` with `to`, still drawn
+  in the sim beyond 12 nm (TCAS keeps it to 40 nm), on the EFB on to its destination, the card's
+  Arrives time on the destination's clock. `traffic` `draw` now carries `modeled`; read it beside
+  `api_load` and fps.

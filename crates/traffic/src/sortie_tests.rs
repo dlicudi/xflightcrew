@@ -2569,3 +2569,141 @@ fn the_route_ahead_is_what_is_left_of_it() {
     r.follow.done = true;
     assert!(r.ahead(5).is_empty());
 }
+
+/// THE WHOLE FLIGHT'S HANDOVER IN (2026-10-13, [`crate::track`]): an
+/// arrival from Paris is modelled to the simulation's entry and spawned
+/// there; at the handover the model and the spawned aircraft agree in
+/// position, altitude and speed, and a second before it the model is a
+/// second's flight short of it. The entry faces the origin, on the
+/// approach side.
+#[test]
+fn an_arrival_enters_the_simulation_where_the_model_puts_it() {
+    use crate::schedule::{Movement, MovementKind, SpawnCtx};
+    use crate::track::{gc_dist_m, End, Whole};
+    let field = fixtures::xnoc();
+    let end = field.end("12").unwrap();
+    let origin = crate::places::position("LFPG").unwrap();
+    let entry = crate::arrival::entry_toward(&end, origin, 0.4, None).unwrap();
+    let off = crate::kin::signed_diff_deg(
+        crate::kin::bearing(end.thr, entry),
+        end.course_deg + 180.0,
+    );
+    assert!(off.abs() <= crate::arrival::ENTRY_SIDE_DEG + 0.5, "{off}");
+    let m = Movement {
+        t_s: 3600.0,
+        callsign: "AFR1234".into(),
+        spoken: "Air France one two three four".into(),
+        icao_type: "A320".into(),
+        kind: MovementKind::Arrival,
+        runway: "12".into(),
+        stand: None,
+        entry: Some(entry),
+        straight_in: true,
+        laps: 0,
+        sid: None,
+        star: None,
+        exit_bearing: 0.0,
+        seed: 77,
+        parked_from_start: false,
+        flight: None,
+        start: None,
+    };
+    let anchor = m.entry_anchor(9, &field).unwrap();
+    let here = field.reference().unwrap();
+    let w = Whole::inbound(
+        "LFPG",
+        "XNOC",
+        here,
+        End::air(&anchor.kin),
+        3600.0,
+        4500.0,
+        anchor.perf,
+    )
+    .unwrap();
+    let spawned = m.spawn(9, &field, &SpawnCtx::default()).unwrap();
+    let fix = w.at(3600.0).unwrap();
+    let gap = gc_dist_m(fix.pos, spawned.kin.pos());
+    assert!(gap < 1.0, "{gap} m apart at the handover");
+    assert!((fix.alt_ft - spawned.kin.alt_ft).abs() < 1.0);
+    assert!((fix.gs_kts - spawned.kin.gs_kts).abs() < 0.5);
+    let before = w.at(3599.0).unwrap();
+    let step = gc_dist_m(before.pos, spawned.kin.pos());
+    let want = spawned.kin.gs_kts * crate::kin::KT_TO_MS;
+    assert!((step - want).abs() < 0.05 * want, "{step} m in the last second");
+    assert!(before.alt_ft >= spawned.kin.alt_ft, "descending into it");
+    // It left Paris about an hour and a half before (440 nm).
+    let up = (3600.0 - w.track.t_a) / 3600.0;
+    assert!((0.9..1.6).contains(&up), "{up} h");
+}
+
+/// THE WHOLE FLIGHT'S HANDOVER OUT: a departure to Paris flown by the
+/// simulation until it leaves the area; the model takes it from that very
+/// state and time, on toward Paris, still climbing.
+#[test]
+fn a_departure_leaves_the_simulation_where_the_model_takes_it() {
+    use crate::track::{gc_bearing, gc_dist_m, End, Whole};
+    let field = fixtures::xnoc();
+    let here = field.reference().unwrap();
+    let paris = crate::places::position("LFPG").unwrap();
+    let ac = TrafficAircraft::at_stand(
+        30,
+        "IBE3201",
+        "Iberia three two zero one",
+        "A320",
+        Plan::Departure {
+            runway: "12".into(),
+            sid: None,
+            exit_bearing: gc_bearing(here, paris),
+        },
+        &field,
+        "S1",
+        30,
+    )
+    .unwrap();
+    let mut fleet = Fleet::new(field);
+    assert!(fleet.spawn(ac));
+    let tower = RefCell::new(ScriptedTower::default());
+    let mut last = None;
+    let mut left = Vec::new();
+    for _ in 0..40_000 {
+        let events = {
+            let tw = &tower;
+            fleet.step(0.1, None, &|id| tw.borrow().orders.get(&id).cloned())
+        };
+        for e in &events {
+            tower.borrow_mut().hear(e);
+        }
+        left = fleet.take_left();
+        if !left.is_empty() {
+            break;
+        }
+        last = fleet.get(30).map(|a| (a.kin.clone(), fleet.clock.now_s()));
+    }
+    let (gone, at_s) = left.pop().expect("left the area");
+    let (prev, prev_s) = last.unwrap();
+    assert!((at_s - prev_s - crate::SUBSTEP_S).abs() < 1e-9);
+    let w = Whole::outbound(
+        "XNOC",
+        here,
+        "LFPG",
+        End::air(&gone.kin),
+        at_s,
+        0.0,
+        gone.perf,
+    )
+    .unwrap();
+    assert!(w.at(at_s - 1.0).is_none(), "the simulation's until then");
+    let fix = w.at(at_s).unwrap();
+    assert!(gc_dist_m(fix.pos, gone.kin.pos()) < 0.01);
+    assert!((fix.alt_ft - gone.kin.alt_ft).abs() < 1e-6);
+    // The model's first second is as long as the simulation's last
+    // substep was (scaled), the same way and still climbing.
+    let next = w.at(at_s + 1.0).unwrap();
+    let sim_ms = gc_dist_m(prev.pos(), gone.kin.pos()) / crate::SUBSTEP_S;
+    let model_ms = gc_dist_m(gone.kin.pos(), next.pos);
+    assert!((model_ms - sim_ms).abs() < 0.1 * sim_ms, "{model_ms} vs {sim_ms} m/s");
+    let turn = crate::kin::signed_diff_deg(next.hdg_deg, gone.kin.hdg_deg).abs();
+    assert!(turn < 15.0, "{turn} degrees off its heading");
+    assert!(w.at(at_s + 120.0).unwrap().alt_ft > gone.kin.alt_ft);
+    assert!(w.on_block_s > at_s + 3600.0, "an hour or more to Paris");
+}

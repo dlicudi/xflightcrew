@@ -266,6 +266,23 @@ taxiing out, holding short, lined up, taking off, climbing out, departing, inbou
 on final, landing, vacating, taxiing in, going around), its stand, its timetable slot and today's
 estimate, its altitude in the air and its speed. Tap anywhere else to close it.
 
+**The whole flight, like FlightAware (2026-10-13).** Every timetabled flight to or from a
+simulated field is on the map from its off-block at the origin to its on-block at the
+destination, not only while the full simulation flies it near the field: far out the
+traffic world's whole-flight model places it (`traffic::track`, a climb at the type's rate, a
+cruise level by distance, a 3 degree descent, along the great circle), drawn smaller and named
+only from zoom 8 (`model: true`). An arrival comes out of the model into the simulation, and a
+departure goes the other way, under the same id and at the same point: no aircraft appears or
+vanishes. Each aircraft carries its `journey` (`airport::JourneyOut`: `from`, `to`, both ends'
+`from_pos`/`to_pos`, the off-block `off` on the origin's clock and the on-block `on` (estimated)
+on the destination's, `since_min`, `to_go_min`, `progress` 0 to 1 along the great circle).
+Selected, its whole route is drawn: the great circle from the origin to where it is solid (cyan,
+under its trail), its route ahead dashed (violet: the simulated route, or for a modelled arrival
+the great circle to its entry), then on to the destination, both ends ringed and named. Its card
+adds Off blocks (the time and how long ago), Arrives (the time and how long to go) and a Progress
+bar, and says "Beyond our simulated airspace: placed by its timetable." for a modelled one.
+Nothing new is read from X-Plane: the model is a pure function of the timetable and time.
+
 The stands (apt.dat 1300) are coloured once zoomed in a little: green FREE, red TAKEN, white
 ours, grey UNKNOWN. Taken is the traffic world's own rule (`traffic::fleet::Fleet::stand_holder`,
 the one the fleet spawns and parks by): an aircraft standing on it, one taxiing in to it, or an

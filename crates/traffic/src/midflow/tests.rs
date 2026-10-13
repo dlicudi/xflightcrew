@@ -111,7 +111,10 @@ fn a_start_at_ten_places_each_flight_by_its_rotation() {
         let mut occupied: Vec<LatLon> = Vec::new();
         let mut placed = 0;
         for (i, m) in p.movements.iter().enumerate() {
-            if m.start.is_none() && !m.parked_from_start {
+            // Gone before the start: the whole-flight model's, never placed.
+            if (m.start.is_none() && !m.parked_from_start)
+                || matches!(m.start, Some(Start::Away { .. }))
+            {
                 continue;
             }
             let ctx = SpawnCtx {
@@ -136,7 +139,7 @@ fn a_start_at_ten_places_each_flight_by_its_rotation() {
                 Some(Start::TaxiIn { .. }) => Phase::TaxiIn,
                 Some(Start::TaxiOut { .. }) => Phase::TaxiOut,
                 Some(Start::HoldShort) => Phase::HoldShort,
-                Some(Start::Climb { .. }) => ac.phase,
+                Some(Start::Climb { .. }) | Some(Start::Away { .. }) => ac.phase,
                 None => Phase::Parked,
             };
             assert_eq!(ac.phase, want, "{}", m.callsign);

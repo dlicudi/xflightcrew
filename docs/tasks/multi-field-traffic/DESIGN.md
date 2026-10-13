@@ -179,6 +179,71 @@ mid-flow run had it go around once.
 Owed from these stages: stage 4 (the station adopts a desk's strips, speech per field's
 frequency), the frame cost measured live (`traffic` `draw` against `api_load` and fps).
 
+## Built: the whole flight (2026-10-13, unflown)
+
+The pilot: "an aircraft popped up out of nowhere on the map ... London to Malaga, we should see
+its route and its progress, like FlightAware". An arrival spawned 25 to 40 nm out on a random
+side, a departure despawned 12 nm out on a random bearing. Now every timetabled flight of a
+simulated field exists from its off-block at the origin to its on-block at the destination.
+
+- **The model** (`crates/traffic/src/track.rs`, pure): `Track` from one `End` to another along
+  the great circle, taxi `TAXI_OUT_S` 10 min before the wheels up and `TAXI_IN_S` 5 min after
+  the wheels on at a field end, a climb at 0.6 of the class's `climb_fpm` over its average
+  speed, a cruise at `cruise_level_ft` (100 ft a mile over 5,000, capped by the class: FL370
+  narrowbody, FL390 widebody, FL250 turboprop, 9,000 ft piston, on the semicircular rule), a 3
+  degree descent (318 ft a mile); a short hop peaks where the climb meets the descent. Each of
+  the three segments varies its ground speed linearly with distance from the end's own speed to
+  the class's cruise and back, so position by time inverts in closed form. An air end
+  past its time HOLDS there (a spawn retried, a runway not yet known): never a jump. `Whole`
+  adds the two fields and the block times. No randomness: the flight is the timetable's.
+- **One notion of a flight, the model only a source of position.** An arrival still to enter IS
+  its `Due` movement in the link; its model (`traffic_whole::Modeled`) ENDS at the very aircraft
+  its spawn will make (`Movement::entry_anchor`, the same `at_entry`), at its first due time,
+  built once per runway once the entry is within 9 h. The first time it shows it takes an id
+  from the world's counter, and the spawn keeps that id (`Due.id`): one roster entry from the
+  origin to the gate. A departure that leaves the area (`Fleet::take_left`, its state and the
+  substep's fleet time) is flown on by the model from exactly that state, the same aircraft
+  value and id (`Link.beyond`), to its destination's blocks. Departures gone before the start
+  (`Start::Away`, `midflow::plan` looking back `AWAY_BACK_S` 9 h, keyed by number AND time, a
+  route's numbers repeat daily) are modelled from their wheels up at the field. No second
+  fleet.
+- **The ends face the flight.** `arrival::entry_toward`: an instrument arrival's entry is on
+  the bearing from the threshold toward its ORIGIN (`places`), turned onto the approach side
+  within `ENTRY_SIDE_DEG` 80; a departure's `exit_bearing` is the great circle toward its
+  destination. Unplaced ends keep the old draws (one draw either way: the rest of the start is
+  unchanged).
+- **The draw ring**: the model's airborne aircraft join the sink's candidates
+  (`Link::modeled_drawn`), culled by the same `DrawCull` (40 nm in, 44 out): a departure past
+  12 nm and an arrival before its entry stay in TCAS range instead of popping. Never in the
+  station's picture (`Link::targets`). The `traffic` `draw` record gains `modeled`.
+- **The EFB**: `efb::feed::TrafficAc` gains `journey` (`Journey`: ends, positions, off-block
+  on the origin's clock, on-block on the destination's, `places::utc_offset_h`, since, to go,
+  progress) and `modeled`; the map draws the selected flight's whole route (`docs/efb.md`).
+- **The blackbox**: `traffic` `handover` with `dir` `in` (`off_m`, `off_ft`: the model's fix at
+  the spawn against the spawned aircraft, `held_s`, `shown`) or `out` (`to`, `alt_ft`,
+  `cruise_ft`, `eta_s`).
+- **Cost** (release, on the development MacBook): a track built 0.1 us, a position 0.02 us
+  (`the_model_is_cheap`); LEMG at 10:00 on a summer Tuesday (`real_install_lemg_whole_flights`):
+  41 departures gone before the start, up to 71 flights modelled at once, a model tick (every
+  arrival due within 9 h and every flight beyond) 70 us once a second, the EFB tap 115 us a
+  second, the map's traffic up to 47 kB a state; over 90 minutes 26 arrivals out of the model
+  and 10 departures into it, no flight ever moving more than 0.2 m or 1 ft beyond a second's
+  flight between two seconds.
+- Tests: `a_long_flight_climbs_cruises_and_descends_on_the_great_circle`,
+  `the_level_follows_the_distance_and_the_direction`,
+  `a_short_hop_peaks_where_the_climb_meets_the_descent`, `an_air_anchor_is_met_exactly_and_held`
+  (the model); `an_arrival_enters_the_simulation_where_the_model_puts_it`,
+  `a_departure_leaves_the_simulation_where_the_model_takes_it` (each handover, within 1 m and
+  1 ft); `a_whole_flight_never_jumps_at_either_handover` (a ULMM-Heathrow link on its desk for
+  4 h: every id moves no further than its speed each second, model or simulation, never both);
+  `a_whole_flight_rides_the_map_with_its_journey` and the map's node test (the page's great
+  circle is the server's, point for point).
+
+Owed: the model has no wind, no separation from the simulated traffic or between modelled
+flights, and its origin's elevation is taken as sea level (the places table has none); a field
+leaving `SIM_OUT_NM` takes its whole flights with it; a remote board (`RemoteBoard`) shows no
+model.
+
 ## Code facts behind the design (read 2026-10-13)
 
 - One station: `Session.atc_station` (`src/main/station_work.rs`), swapped through the single

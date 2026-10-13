@@ -184,6 +184,10 @@ pub enum Start {
     HoldShort,
     /// Climbing out, this far past the runway's far end, metres.
     Climb { past_end_m: f64 },
+    /// Off the blocks `off_s` seconds before the start (negative) and gone:
+    /// flown by the whole-flight model to its destination
+    /// ([`crate::track`]), never spawned.
+    Away { off_s: f64 },
 }
 
 /// What the world looks like at generation or spawn time.
@@ -295,6 +299,27 @@ impl Movement {
             self.seed,
         )
         .ok_or(Refusal::NoStand)
+    }
+
+    /// An arrival as the simulation takes it at its entry, as traffic id
+    /// `id`: the very aircraft [`Movement::spawn`] makes there (the same
+    /// [`TrafficAircraft::at_entry`]), for the whole-flight model to end on
+    /// ([`crate::track::Whole::inbound`], 2026-10-13). `None` for anything
+    /// but an arrival still to enter.
+    pub fn entry_anchor(&self, id: u32, field: &FieldModel) -> Option<TrafficAircraft> {
+        if self.kind != MovementKind::Arrival || self.start.is_some() {
+            return None;
+        }
+        let plan = self.plan(field).ok()?;
+        TrafficAircraft::at_entry(
+            id,
+            &self.callsign,
+            &self.spoken,
+            &self.icao_type,
+            plan,
+            field,
+            self.seed,
+        )
     }
 
     /// What the movement flies, at its runway (`NoRunway` when the field
