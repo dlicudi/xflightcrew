@@ -383,11 +383,14 @@ pub struct AircraftProfile {
     pub load_sheet: LoadSheet,
     /// Fly an ILS COUPLED on this airframe's own approach mode (see
     /// `ils::Coupling`): armed on an intercept from below the beam, the bug
-    /// and VS dial handed over as the localizer and glideslope capture. Off
-    /// until a capture has been flown on the type; the copilot's own path
-    /// otherwise.
+    /// and VS dial handed over as the localizer and glideslope capture.
+    /// Absent: coupled wherever the surveyed autopilot has an approach mode
+    /// (`ils::coupled_allowed`, `systems::ApType::has_approach`): the final
+    /// is the airframe's own modes' to minimums where it has them. `false`
+    /// where a capture was flown and failed, or the autopilot lands it
+    /// another way (the Zibo's `autopilot_lands`).
     #[serde(default)]
-    pub ils_coupled: bool,
+    pub ils_coupled: Option<bool>,
     /// Radio height, feet, below which a coupled ILS is handed back to
     /// autoland's own VS final (`ils::CouplingIn::decouple_below_ft`).
     /// `None`: coupled to the arrest.

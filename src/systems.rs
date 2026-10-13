@@ -42,6 +42,13 @@ pub enum ApType {
 }
 
 impl ApType {
+    /// Whether this model flies an approach mode (APR: a localiser and,
+    /// where it has one, a glideslope): every model but the Piper wing
+    /// leveller, and a Plane Maker custom one is unknown, so no.
+    pub fn has_approach(self) -> bool {
+        !matches!(self, Self::Custom | Self::PiperAutocontrol)
+    }
+
     pub fn from_code(code: i64) -> Option<Self> {
         Some(match code {
             0 => Self::Custom,

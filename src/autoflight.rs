@@ -787,7 +787,7 @@ impl Panel {
             } else {
                 WindowRule::ParkAbove
             },
-            coupled_ils: p.ils_coupled,
+            coupled_ils: p.ils_coupled == Some(true),
             // Both or neither: a button without its lamp cannot be read
             // before it is pressed, and it is a toggle.
             lnav: a
