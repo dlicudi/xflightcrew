@@ -215,10 +215,19 @@ fn movement(
 ) -> Movement {
     let l = if arr { &r.arr } else { &r.dep };
     let end = field.end(runway);
+    // The other end where the timetable places it (2026-10-13, the whole
+    // flight): an airliner arrives from it and a departure leaves toward
+    // it, so the model's great circle meets the simulation's own way in
+    // and out. Unplaced, as before (one draw either way: the rest of the
+    // start draws the same).
+    let other = crate::places::position(l.other);
+    let instrument = crate::arrival::is_instrument(class_for_type(r.icao_type).0);
     let entry = arr
         .then(|| {
-            end.as_ref()
-                .and_then(|e| entry_clear_of_own(e, ctx.own, rng))
+            end.as_ref().and_then(|e| match other.filter(|_| instrument) {
+                Some(o) => crate::arrival::entry_toward(e, o, rng.next_f64(), ctx.own),
+                None => entry_clear_of_own(e, ctx.own, rng),
+            })
         })
         .flatten();
     let pick = |v: &[String], rng: &mut XorShift64| {
@@ -251,8 +260,15 @@ fn movement(
         laps: 0,
         sid,
         star,
-        // A seeded way out: the crate knows no other field's position.
-        exit_bearing: rng.range_f64(0.0, 360.0),
+        // Toward the destination where the timetable places it, else a
+        // seeded way out.
+        exit_bearing: {
+            let seeded = rng.range_f64(0.0, 360.0);
+            match (other, field.reference()) {
+                (Some(o), Some(here)) if !arr => crate::track::gc_bearing(here, o),
+                _ => seeded,
+            }
+        },
         seed: rng.next_u64() ^ r.seed,
         parked_from_start: false,
         flight: Some(info(r, arr)),
@@ -684,9 +700,49 @@ pub fn plan(
             f.stand = planned;
         }
     }
+    // The departures already gone at the start (2026-10-13, the whole
+    // flight): every one off the blocks before now that no movement above
+    // places, back as far as the longest flight lasts, flown on by the
+    // model from its wheels up ([`Start::Away`]; the link drops the ones
+    // already on the blocks at the other end).
+    // By number AND time: a route's numbers repeat every day, and
+    // tomorrow's flight is a movement already.
+    let key = |cs: &str, est: Option<f64>| (cs.to_string(), est.map(|e| (e / 60.0).round() as i64));
+    let placed: std::collections::HashSet<(String, Option<i64>)> = out
+        .movements
+        .iter()
+        .map(|m| key(&m.callsign, m.flight.as_ref().and_then(|f| f.est_s)))
+        .collect();
+    let fits = |t: &str| {
+        end.length_m >= runway_needed_m(t) && field.net.stands.iter().any(|s| field.takes(s, t))
+    };
+    for r in rotation::window(table, date, seed, density, now_s - AWAY_BACK_S, now_s) {
+        if r.dep.est_s >= now_s
+            || placed.contains(&key(&r.dep.callsign, Some(r.dep.est_s)))
+            || !fits(r.icao_type)
+        {
+            continue;
+        }
+        let mut quiet = XorShift64::new(r.seed);
+        let mut m = movement(&r, false, 0.0, &runway, field, ctx, &mut quiet);
+        m.start = Some(Start::Away {
+            off_s: r.dep.est_s - now_s,
+        });
+        m.stand = stand_plan.get(&m.callsign).cloned();
+        if let Some(f) = m.flight.as_mut() {
+            f.inbound = None;
+            f.stand.clone_from(&m.stand);
+        }
+        out.movements.push(m);
+    }
     let _ = OWN_CLEAR_NM;
     out
 }
+
+/// The start looks this far back for departures still in the air,
+/// seconds: the longest flight a table names (Malaga to Doha, about 7 h)
+/// and a margin.
+pub const AWAY_BACK_S: f64 = 9.0 * 3600.0;
 
 impl Movement {
     /// The aircraft placed where its [`Start`] says (the mid-flow start), as
@@ -733,6 +789,9 @@ impl Movement {
                 Some(ac)
             }
             Start::Climb { past_end_m } => climbing(self, id, plan, field, &end, *past_end_m),
+            // Gone before the start: the whole-flight model flies it
+            // ([`crate::track`]), never the simulation.
+            Start::Away { .. } => None,
         }
         .ok_or(Refusal::NoRunway)?;
         let pos = ac.kin.pos();

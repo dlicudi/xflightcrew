@@ -94,6 +94,35 @@ pub fn entry_point(end: &RunwayEnd, entry: LatLon, draw: f64) -> LatLon {
     project_m(end.thr, bearing(end.thr, entry), nm * NM)
 }
 
+/// The most an entry toward the flight's origin is turned off the approach
+/// side's centre, degrees: beyond it the entry is put on the side's edge
+/// (an arrival from the far side flies round to its approach, as a real
+/// one is vectored onto a downwind).
+pub const ENTRY_SIDE_DEG: f64 = 80.0;
+
+/// Where an instrument arrival from `origin` appears (2026-10-13, the whole
+/// flight, [`crate::track`]): on the bearing from the threshold toward its
+/// origin, turned onto the approach side ([`ENTRY_SIDE_DEG`]), `draw` (0
+/// to 1) of the way through [`ENTRY_NM`]; turned further round in 20 degree
+/// steps when that is within [`crate::schedule::OWN_CLEAR_NM`] of us. Its
+/// great circle from the origin ends there, so it comes in from where it
+/// left rather than from a random side.
+pub fn entry_toward(
+    end: &RunwayEnd,
+    origin: LatLon,
+    draw: f64,
+    own: Option<LatLon>,
+) -> Option<LatLon> {
+    let back = end.course_deg + 180.0;
+    let to = crate::track::gc_bearing(end.thr, origin);
+    let off = crate::kin::signed_diff_deg(to, back).clamp(-ENTRY_SIDE_DEG, ENTRY_SIDE_DEG);
+    let nm = ENTRY_NM.0 + draw.clamp(0.0, 1.0) * (ENTRY_NM.1 - ENTRY_NM.0);
+    [0.0, 20.0, -20.0, 40.0, -40.0, 60.0, -60.0]
+        .iter()
+        .map(|k| project_m(end.thr, back + off + k, nm * NM))
+        .find(|p| own.is_none_or(|o| dist_m(o, *p) >= crate::schedule::OWN_CLEAR_NM * NM))
+}
+
 /// The route from `entry` to the threshold: an intercept leg onto the
 /// final at no more than [`INTERCEPT_DEG`] when the entry is off the
 /// centreline, then the final from [`JOIN_NM`]. Points only; the last is
