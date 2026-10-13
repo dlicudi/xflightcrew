@@ -722,7 +722,7 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   controller line, the METAR file); `efb::feed` taps the speakers, the command loop and the monitor's
   tick as they already run. A fact nobody holds is a dash. The plan check and preflight are kept in
   flight-scoped cells (`feed::AUDIT`, `PREFLIGHT`).
-- **Four tabs** (v3, `docs/tasks/efb-v3/mockup.html`): Flight, Map, Plan, Radio, Settings behind
+- **Five tabs** (v3, `docs/tasks/efb-v3/mockup.html`): Flight, Map, Plan, Radio, Board, Settings behind
   the gear; MY CONTROLS, HOLD TO TALK and the phase's ONE suggested action (a `PHRASES` entry) in
   a fixed bar. **The Flight tab is laid out by the flight model's phase**
   (`efb::flight_tab::layout_for`, `each_phase_has_its_layout`): a readout with no source is

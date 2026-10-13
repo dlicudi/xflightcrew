@@ -403,6 +403,8 @@ form.say .send { min-height: 52px; }
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l4 4v14H6z"/><path d="M9 11h7M9 15h7M9 7h3"/></svg>Plan</button>
     <button class="tab" role="tab" aria-selected="false" data-tab="radio" id="t-radio" type="button">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h16v11H4z"/><path d="M8 4l10 5"/><circle cx="9" cy="14.5" r="2.5"/><path d="M15 13h3M15 16h3"/></svg>Radio</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="board" id="t-board" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z"/><path d="M3 10h18M8 5v14"/><path d="M11 14h7M11 17h5"/></svg>Board</button>
     <button class="gear" aria-label="Settings" aria-pressed="false" id="t-settings" type="button">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></button>
   </nav>
@@ -466,6 +468,10 @@ form.say .send { min-height: 52px; }
         </div>
         <section class="card"><div class="ch"><h2>Legs</h2><span class="note">Planned altitude and navlog stage</span></div><div class="legs leg-table" id="pl-legs"></div></section>
         <section class="card"><div class="ch"><h2>Weather</h2><span class="note" id="wx-age"></span></div><div class="rows" id="wx-list"></div></section>
+      </section>
+
+      <!-- BOARD -->
+      <section class="page" id="p-board" aria-labelledby="t-board">
         <section class="card">
           <div class="ch"><h2>Board</h2><div class="seg" role="group" aria-label="Field" id="bd-fields"></div><span class="note" id="bd-clock"></span></div>
           <div id="bd-body"></div>
@@ -604,7 +610,7 @@ form.say .send { min-height: 52px; }
   });
 
   // ------------------------------------------------------------ tabs
-  var PAGES = { flight: 'p-flight', map: 'p-apt', plan: 'p-plan', radio: 'p-radio', settings: 'p-settings' };
+  var PAGES = { flight: 'p-flight', map: 'p-apt', plan: 'p-plan', radio: 'p-radio', board: 'p-board', settings: 'p-settings' };
   var tab = 'flight';
   try { var saved = localStorage.getItem(TAB_KEY); if (saved && PAGES[saved]) tab = saved; } catch (e) {}
   if (PAGES[location.hash.slice(1)]) tab = location.hash.slice(1);

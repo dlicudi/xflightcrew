@@ -1295,7 +1295,7 @@ mod tests {
         assert!(PAGE.contains("viewport-fit=cover"));
         assert!(!PAGE.contains('\u{2014}') && !PAGE.contains('\u{2013}'));
         assert!(PAGE.contains("<script src=\"/diagram.js\"></script>"));
-        for tab in ["flight", "map", "plan", "radio"] {
+        for tab in ["flight", "map", "plan", "radio", "board"] {
             assert!(
                 PAGE.contains(&format!("data-tab=\"{tab}\"")),
                 "the {tab} tab"
@@ -1305,7 +1305,7 @@ mod tests {
             PAGE.contains("id=\"t-settings\""),
             "settings behind the gear"
         );
-        assert!(!PAGE.contains("more-sheet"), "four tabs, no More sheet");
+        assert!(!PAGE.contains("more-sheet"), "five tabs, no More sheet");
         assert!(DIAGRAM_JS.contains("window.XvlDiagram"));
         assert!(!DIAGRAM_JS.contains('\u{2014}') && !DIAGRAM_JS.contains('\u{2013}'));
         assert!(!DIAGRAM_JS.contains("http"), "no tile, no CDN: this server only");
