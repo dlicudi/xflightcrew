@@ -24,6 +24,7 @@ mod autotakeoff;
 mod autotaxi;
 mod cabin;
 mod checklist;
+mod checklist_panel;
 mod circuit;
 mod climb_watch;
 mod cockpit_auto;

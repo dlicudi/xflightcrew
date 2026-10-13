@@ -34,3 +34,5 @@ static const ImU32 COL_MAGENTA = IM_COL32(235, 110, 235, 255);
 // 2 KB: the Brief tab carries a whole plan read-out. Slots whose payload the
 // app keeps short (the FMS route mailbox thins itself to 511) are unchanged.
 struct TextRef { char buf[2048]; int len; };
+// The Checklist tab's slot: a whole section, its longest about 35 rows.
+struct ChecklistRef { char buf[6144]; int len; };

@@ -406,6 +406,11 @@ private:
     // The typed-command line (Transcript tab): what the pilot can type when
     // speaking is not an option, sent on Enter through xcopilot/typed.
     char mTyped[256] = {0};
+    // The Checklist tab's airframe (its header's), and the pilot's own
+    // ticks on call-out rows by "title#row": display only, never sent to
+    // the app, and dropped with the pick when the airframe changes.
+    std::string mClAircraft;
+    std::map<std::string, bool> mClTicks;
     // A scale change asks the next frame (font pushed, metrics real) to
     // re-fit the window to its tab strip.
     bool mFitPending = false;
@@ -673,7 +678,7 @@ private:
     // and down, kept on screen) rather than truncating its own tabs.
     void fitToTabs() {
         const ImGuiStyle& st = ImGui::GetStyle();
-        static const char* kTabs[] = {"Flight", "Transcript   ", "ATC   ", "Route", "Settings"};
+        static const char* kTabs[] = {"Flight", "Transcript   ", "ATC   ", "Route", "Checklist", "Settings"};
         float tabs = st.WindowPadding.x * 2.0f + st.ScrollbarSize;
         for (const char* t : kTabs) {
             tabs += ImGui::CalcTextSize(t).x + st.FramePadding.x * 2.0f + st.ItemInnerSpacing.x;
@@ -790,6 +795,10 @@ protected:
                 mTab = 3;
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("Checklist")) {
+                mTab = 8;
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("Brief")) {
                 mTab = 4;
                 ImGui::EndTabItem();
@@ -828,6 +837,7 @@ protected:
             case 4: buildBriefTab(); break;
             case 5: buildStateTab(); break;
             case 7: buildBoardTab(); break;
+            case 8: buildChecklistTab(connected); break;
             default: buildSettingsTab(); break;
         }
         ImGui::EndChild();
@@ -1407,6 +1417,159 @@ protected:
         boardTable("DEPARTURES", "To", "board_dep", deps);
         ImGui::Spacing();
         boardTable("ARRIVALS", "From", "board_arr", arrs);
+    }
+    // The Checklist tab (2026-10-13): the airframe's profiled lists, one
+    // section on screen, each item with its state (format in drefs.cpp).
+    // The app reads the shown section live only while this tab is drawn
+    // (xcopilot/opt/checklist_view); a running flow's own verdicts replace
+    // the live ones on its list. Run types the app's phrase for the section
+    // on the typed line, so the grammar starts it like a spoken request.
+    static void checklistState(char kind, char state, const char*& word, ImU32& col) {
+        word = "";
+        col = COL_DIM;
+        switch (state) {
+            case 'p': word = "OK"; col = COL_GREEN; break;
+            case 'n': word = "NOT YET"; col = COL_AMBER; break;
+            case 'u': word = (kind == 'A' || kind == 'V') ? "?" : ""; break;
+            case 'R': word = "NOW"; col = COL_CYAN; break;
+            case 'D': word = "DONE"; col = COL_GREEN; break;
+            case 'H': word = "HELD"; col = COL_CYAN; break;
+            case 'X': word = "NOT AS LISTED"; col = COL_AMBER; break;
+            case 'S': word = "SKIPPED"; break;
+            case 'F': word = "FAILED"; col = COL_RED; break;
+            case 'U': word = "NO READ"; break;
+            case 'W': word = "SAID"; break;
+            default: break;
+        }
+    }
+    void buildChecklistTab(bool connected) {
+        drefs::note_checklist_drawn();
+        const ChecklistRef& feed = drefs::checklist();
+        if (!drefs::checklist_ever() || feed.len <= 0) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "No checklist yet. The app publishes the aircraft's lists while it runs.");
+            return;
+        }
+        std::string aircraft, phrase;
+        int shown = -1, sheet = -1;
+        char run = '-';
+        std::vector<std::string> titles;
+        struct Row { char kind; char state; std::string by; std::string text; };
+        std::vector<Row> rows;
+        std::string text(feed.buf, feed.len);
+        size_t start = 0;
+        while (start < text.size()) {
+            size_t end = text.find('\n', start);
+            if (end == std::string::npos) end = text.size();
+            std::string line = text.substr(start, end - start);
+            start = end + 1;
+            if (line.rfind("H|", 0) == 0) {
+                std::vector<std::string> f = splitBar(line);
+                if (f.size() < 7) continue;
+                aircraft = f[1];
+                shown = std::atoi(f[2].c_str());
+                sheet = std::atoi(f[3].c_str());
+                run = f[4].empty() ? '-' : f[4][0];
+                phrase = f[5];
+                size_t at = 0;
+                while (at < f[6].size()) {
+                    size_t tilde = f[6].find('~', at);
+                    if (tilde == std::string::npos) tilde = f[6].size();
+                    titles.push_back(f[6].substr(at, tilde - at));
+                    at = tilde + 1;
+                }
+                continue;
+            }
+            // kind|state|by|text: the text is last and taken whole.
+            size_t b1 = line.find('|');
+            size_t b2 = b1 == std::string::npos ? b1 : line.find('|', b1 + 1);
+            size_t b3 = b2 == std::string::npos ? b2 : line.find('|', b2 + 1);
+            if (b3 == std::string::npos || b1 != 1 || b2 != 3) continue;
+            rows.push_back({line[0], line[2], line.substr(b2 + 1, b3 - b2 - 1), line.substr(b3 + 1)});
+        }
+        // A new airframe: the pick and the ticks were the last one's.
+        if (aircraft != mClAircraft) {
+            mClAircraft = aircraft;
+            mClTicks.clear();
+            drefs::set_checklist_pick("");
+        }
+        if (!drefs::checklist_fresh()) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_AMBER),
+                               "Not refreshed for 30 s: is the app running?");
+        }
+        if (titles.empty()) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "%s has no checklist in its profile.",
+                               aircraft.empty() ? "This aircraft" : aircraft.c_str());
+            return;
+        }
+        if (shown < 0 || shown >= static_cast<int>(titles.size())) shown = 0;
+        const std::string& title = titles[shown];
+        ImGui::SetNextItemWidth(ImGui::CalcTextSize("WWWWWWWWWWWWWWWW").x);
+        if (ImGui::BeginCombo("##checklist_section", title.c_str())) {
+            for (size_t i = 0; i < titles.size(); ++i) {
+                const bool on = static_cast<int>(i) == shown;
+                ImGui::PushID(static_cast<int>(i));
+                if (ImGui::Selectable(titles[i].c_str(), on)) {
+                    drefs::set_checklist_pick(titles[i].c_str());
+                }
+                if (on) ImGui::SetItemDefaultFocus();
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        const bool ours = sheet == shown;
+        if (ours && run == 'R') {
+            ImGui::SameLine();
+            Chip("RUNNING", COL_CYAN);
+        } else if (!phrase.empty()) {
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!connected);
+            if (ImGui::SmallButton("Run")) {
+                drefs::set_typed(phrase.c_str());
+                AppendLog("PILOT", COL_WHITE, phrase.c_str());
+            }
+            ImGui::EndDisabled();
+        }
+        if (ours && run == 'L') {
+            ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "last run this flight");
+        }
+        const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH;
+        if (!ImGui::BeginTable("checklist_rows", 2, flags)) return;
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::CalcTextSize("NOT AS LISTED").x);
+        ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const Row& r = rows[i];
+            ImGui::TableNextRow();
+            ImGui::PushID(static_cast<int>(i));
+            if (r.state == 'R') {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, IM_COL32(90, 200, 255, 50));
+            }
+            ImGui::TableSetColumnIndex(0);
+            if (r.kind == 'C' && r.state == '-') {
+                // The pilot's own tick on a call-out: this panel's, never sent.
+                const std::string key = title + "#" + std::to_string(i);
+                bool ticked = mClTicks[key];
+                if (ImGui::Checkbox("##tick", &ticked)) mClTicks[key] = ticked;
+            } else {
+                const char* word;
+                ImU32 col;
+                checklistState(r.kind, r.state, word, col);
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%s", word);
+            }
+            ImGui::TableSetColumnIndex(1);
+            const ImU32 textCol = r.kind == 'N' ? COL_DIM : COL_WHITE;
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(textCol), "%s", r.text.c_str());
+            if (r.state == 'H' && !r.by.empty()) {
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_CYAN), "held by %s", r.by.c_str());
+            }
+            ImGui::PopTextWrapPos();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
     }
     void boardTable(const char* title, const char* place, const char* id,
                     const std::vector<std::vector<std::string>>& rows) {

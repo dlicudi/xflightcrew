@@ -186,6 +186,13 @@ pub(super) fn reverse_and_start(line: &Line) -> Option<ToolCall> {
         return Some(call("reverse_thrust", json!({ "on": !stow })));
     }
 
+    // A list named by its title ("engine start checklist", "shutdown
+    // checklist") is the list, never the start or the shutdown it describes:
+    // the title matcher runs it (the panel's Run button, 2026-10-13).
+    if crate::checklist::mentions_checklist(t) {
+        return None;
+    }
+
     // fixed verbs
     if (has(t, "start") && (has(t, "engine") || has(t, "engines")))
         || t.contains("engine on")

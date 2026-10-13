@@ -113,6 +113,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/opt/cabin_crew",
     "xcopilot/opt/cabin_voice",
     "xcopilot/opt/camera_snap",
+    "xcopilot/opt/checklist_view",
     "xcopilot/opt/mode",
     "xcopilot/opt/monitor_mute",
     "xcopilot/opt/negative_tone",
@@ -143,6 +144,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/status/brief",
     "xcopilot/status/callout",
     "xcopilot/status/callsign",
+    "xcopilot/status/checklist",
     "xcopilot/status/coach",
     "xcopilot/status/efb_url",
     "xcopilot/status/fromto",
@@ -311,6 +313,8 @@ mod plugin_contract_tests {
             "xcopilot/status/callsign",
             "xcopilot/opt/board_field",
             "xcopilot/status/efb_url",
+            "xcopilot/status/checklist",
+            "xcopilot/opt/checklist_view",
         ] {
             assert!(PLUGIN_DATAREFS.contains(&name), "{name}");
             assert!(

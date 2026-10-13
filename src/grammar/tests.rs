@@ -2221,6 +2221,54 @@ fn panel_request_phrases_parse_deterministically() {
     // None and did nothing, silently (EGHI, 2026-08-02).
     assert_eq!(one("my controls").unwrap().0, "autopilot_off");
 }
+
+/// The Checklist tab's Run button types its section's phrase
+/// (`checklist_panel::run_phrase`) through `xcopilot/typed`: for every list
+/// of every profile with a checklist in the repo, that phrase is no tool to
+/// the grammar and the title matcher a spoken request meets picks that very
+/// list, so the press reaches `flow::start` and nothing else.
+#[test]
+fn every_checklist_tab_run_phrase_starts_its_own_list() {
+    let mut checked = 0;
+    for e in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/profiles")).unwrap() {
+        let path = e.unwrap().path();
+        if path.extension().is_none_or(|x| x != "yaml") {
+            continue;
+        }
+        let id = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let Some(profile) = aircraft::load(&id) else {
+            continue;
+        };
+        // An `acf:` list ships with the aircraft, not here.
+        let Ok(lists) = crate::checklist::load(&profile) else {
+            continue;
+        };
+        let registry = Registry::for_aircraft(&profile);
+        for (i, cl) in lists.iter().enumerate() {
+            // No phrase only for a title with no words to say: no Run button.
+            let Some(phrase) = crate::checklist_panel::run_phrase(&lists, i) else {
+                let words: Vec<&str> = cl
+                    .id
+                    .split('_')
+                    .filter(|w| !w.is_empty() && *w != "checklist")
+                    .collect();
+                assert!(words.is_empty(), "{id}: no run phrase for {:?}", cl.title);
+                continue;
+            };
+            assert!(
+                try_parse(&phrase, &registry, &profile).is_none(),
+                "{id}: {phrase:?} is a tool to the grammar"
+            );
+            assert_eq!(
+                crate::checklist::match_request(&phrase, &lists).map(|c| c.id.as_str()),
+                Some(cl.id.as_str()),
+                "{id}: {phrase:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 50, "only {checked} lists checked");
+}
 #[test]
 fn a_plan_check_is_its_own_ask() {
     for yes in [

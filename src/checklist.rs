@@ -635,10 +635,12 @@ pub fn match_request<'a>(transcript: &str, checklists: &'a [Checklist]) -> Optio
 fn request_words(transcript: &str) -> Vec<String> {
     let text = transcript.to_lowercase();
     // Single letters are apostrophe shrapnel ("let's" splits to "let", "s"),
-    // never part of a section name - drop them with the empties.
+    // never part of a section name - drop them with the empties. A single
+    // DIGIT is a part's number ("preliminary preflight procedure 1" and its
+    // "2", the MD-82's), kept so the parts are told apart.
     let mut words: Vec<String> = text
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| w.len() > 1)
+        .filter(|w| w.len() > 1 || w.bytes().any(|c| c.is_ascii_digit()))
         .map(str::to_string)
         .collect();
     let mut i = 0;
