@@ -73,7 +73,7 @@ impl Session {
                         let facts = crew_radio_facts(xplane).await;
                         if let Some(why) = crew_radio::stale_reason(queued.holds, age_s, &facts) {
                             tracing::info!(
-                                target: "xvoicelayer::radio",
+                                target: "xflightcrew::radio",
                                 call = %crew_radio::call_words(&queued.call),
                                 why,
                                 age_s,
@@ -161,7 +161,7 @@ impl Session {
                     // The copilot transmits (its own voice), then the tower.
                     // Both sides logged so the full ATC transcript shows in
                     // the log, not just the panel.
-                    tracing::info!(target: "xvoicelayer::radio", copilot = %call, "tx");
+                    tracing::info!(target: "xflightcrew::radio", copilot = %call, "tx");
                     // ROUTED before it is spoken: `say` blocks until the
                     // frequency is quiet, and a handoff readback queued
                     // behind a party-line exchange was routed 19 s later,
@@ -186,7 +186,7 @@ impl Session {
                     );
                     if let Some((reply, who)) = routed {
                         if !reply.is_empty() {
-                            tracing::info!(target: "xvoicelayer::radio", station = %who.tag(), reply = %reply, "rx");
+                            tracing::info!(target: "xflightcrew::radio", station = %who.tag(), reply = %reply, "rx");
                             reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
                             voice.say_station_until(
                                 Priority::Readback,

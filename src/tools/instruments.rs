@@ -227,7 +227,7 @@ async fn set_side(xp: &dyn crate::xplane::XPlane, side: &Side<'_>, inhg: f64) ->
         settle().await;
         let before = now;
         now = xp.get_float(side.dial).await?;
-        tracing::info!(target: "xvoicelayer::instruments", side = side.name, asked = inhg, dial_write_read = actual, cmd, round, presses, now, "altimeter stepped");
+        tracing::info!(target: "xflightcrew::instruments", side = side.name, asked = inhg, dial_write_read = actual, cmd, round, presses, now, "altimeter stepped");
         if !keep_stepping(before, now, inhg, n) {
             break;
         }

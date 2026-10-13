@@ -2181,7 +2181,7 @@ pub(crate) mod tests {
     }
 
     /// Every button's words reach the branch or tool its table names, the
-    /// way the command loop routes a typed line (`xvl sortie --check`'s
+    /// way the command loop routes a typed line (`xfc sortie --check`'s
     /// router): a button can never do what the voice cannot, and a phrase
     /// that drifts out of the grammar fails here, not in the cockpit.
     #[test]

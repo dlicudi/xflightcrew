@@ -1,9 +1,9 @@
 # Ground conformance check
 
 ```
-xvl conform
-xvl conform --only mcp,yoke
-xvl conform --prepare
+xfc conform
+xfc conform --only mcp,yoke
+xfc conform --prepare
 ```
 
 Every control channel the live profile declares, moved on a PARKED aircraft
@@ -18,11 +18,11 @@ trim at 8.35 units, levers snapping to the hardware throttle, a beta reverse
 write undone, MCP toggles, a heading window that must be written, a V/S
 window quantum).
 
-It is a second process beside the sim (like `xvl sortie`): it resolves the
+It is a second process beside the sim (like `xfc sortie`): it resolves the
 profile the way the app does (`XCOPILOT_AIRCRAFT`, `auto` detects the loaded
 model) and installs that airframe's facts in its own process only
 (`flight_state::install_for_check`); it begins no flight and stands nothing
-down in a running xvl.
+down in a running xfc.
 
 ## --prepare
 

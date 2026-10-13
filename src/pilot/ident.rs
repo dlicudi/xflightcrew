@@ -1,5 +1,5 @@
 //! Identification: fitting an axis' [`Response`] to what a measurement
-//! flight recorded (`xvl identify`, `src/identify.rs`). Pure, so the plants
+//! flight recorded (`xfc identify`, `src/identify.rs`). Pure, so the plants
 //! test it (`plants_tests`).
 //!
 //! Output error ([`fit_segment`]): the rate simulated from the control `d`

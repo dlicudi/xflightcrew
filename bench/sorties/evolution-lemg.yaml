@@ -2,7 +2,7 @@
 # (the baseline before it crosses to `layers`, docs/tasks/autonomy-layers):
 # the pitch plant on the tape (`autoland` theta, alpha, q, elev_total, tas)
 # measures its elevator authority for the attitude flare.
-#   xvl sortie bench/sorties/evolution-lemg.yaml
+#   xfc sortie bench/sorties/evolution-lemg.yaml
 after: stop
 
 cases:

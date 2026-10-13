@@ -121,7 +121,7 @@ pub async fn item_as(voice: Option<&Voice>, calls: StartCalls, line: &str) {
         "start_item",
         serde_json::json!({ "item": line, "spoken": spoken }),
     );
-    tracing::info!(target: "xvoicelayer::crew_pace", item = %line, spoken, "start item");
+    tracing::info!(target: "xflightcrew::crew_pace", item = %line, spoken, "start item");
     if spoken {
         speak(voice, line);
     }
@@ -148,7 +148,7 @@ pub async fn checked_as(
         "start_item",
         serde_json::json!({ "item": done, "taken": taken, "spoken": line }),
     );
-    tracing::info!(target: "xvoicelayer::crew_pace", item = %done, ?taken, "start item");
+    tracing::info!(target: "xflightcrew::crew_pace", item = %done, ?taken, "start item");
     if let Some(l) = line {
         speak(voice, l);
     }

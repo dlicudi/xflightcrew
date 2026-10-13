@@ -749,7 +749,7 @@ pub(crate) fn spawn_aircraft_detector(
 
 /// The resolver for an ICAO and .acf path alone (no author or
 /// description): the curated profile they resolve to, `None` when generic.
-/// The tests' view, and `xvl sortie --check`'s.
+/// The tests' view, and `xfc sortie --check`'s.
 pub(crate) fn resolved_id(icao: &str, relative_path: &str) -> Option<String> {
     let who = AcfIdentity {
         icao: icao.into(),
@@ -812,7 +812,7 @@ mod probe_cache_tests {
     #[tokio::test]
     async fn the_probe_fetches_the_indexes_once_per_session() {
         let sim = Sim {
-            datarefs: vec![crate::datarefs::LATITUDE, crate::datarefs::LONGITUDE, "xvl/own"],
+            datarefs: vec![crate::datarefs::LATITUDE, crate::datarefs::LONGITUDE, "xfc/own"],
             commands: vec!["sim/operation/pause_toggle"],
             ..Default::default()
         };
@@ -830,7 +830,7 @@ mod probe_cache_tests {
 
         // A name the cache lacks: one lookup (the index said it was there
         // all along, so it is found without a dump).
-        let own = names(&["xvl/own"]);
+        let own = names(&["xfc/own"]);
         let mut fresh = Some(ProbeIndex { commands_at: Some(t), ..Default::default() });
         assert!(missing_with_cache(&sim, &mut fresh, &own, t).await.unwrap().is_empty());
         assert_eq!(sim.lookups.load(SeqCst), 1);

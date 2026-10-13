@@ -1,4 +1,4 @@
-//! The ground conformance check, `xvl conform [--only <area>[,<area>]]`: on a
+//! The ground conformance check, `xfc conform [--only <area>[,<area>]]`: on a
 //! PARKED aircraft (on the ground, stopped, park brake set; refused otherwise,
 //! with the reading that refused it) every control channel the live profile
 //! declares is moved through the code's OWN seam, read back, and put back,
@@ -2044,7 +2044,7 @@ async fn engines_running(xp: &dyn XPlane, n: usize) -> Option<bool> {
     (r.len() >= n).then(|| r.iter().take(n).all(|v| *v > 0.5))
 }
 
-/// `xvl conform --prepare`: the aircraft brought up from cold the way full
+/// `xfc conform --prepare`: the aircraft brought up from cold the way full
 /// auto's crew does it before the check, so the channels that need
 /// hydraulics, engine bleed or an aligned IRS read as they fly: the battery
 /// (the profile's bus commands), the preflight with the APU first
@@ -2177,7 +2177,7 @@ pub fn summary(rows: &[Row]) -> String {
     )
 }
 
-const USAGE: &str = "usage: xvl conform [--prepare] [--only <area>[,<area>...]]\n\
+const USAGE: &str = "usage: xfc conform [--prepare] [--only <area>[,<area>...]]\n\
 areas: profile, mcp, flaps, speedbrake, trim, yoke, steer, throttle, reverse, brake\n\
 --prepare: battery, APU, preflight, engine start and IRS alignment first (a Boeing start)\n\
 Runs only on a parked aircraft: on the ground, stopped, park brake set.";
@@ -2204,7 +2204,7 @@ async fn resolve_profile(
         .ok_or_else(|| anyhow::anyhow!("no profile for {id}"))
 }
 
-/// `xvl conform [--only <area>]`: `Ok(true)` when nothing failed.
+/// `xfc conform [--only <area>]`: `Ok(true)` when nothing failed.
 pub async fn main_cmd(args: &[String], base_url: &str, configured: &str) -> anyhow::Result<bool> {
     let mut only = Vec::new();
     let mut prepare_first = false;

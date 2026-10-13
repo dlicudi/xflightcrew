@@ -556,9 +556,9 @@ private:
         if (f.size() < 3 || f[0].empty()) {
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
-                               "The EFB is off. Turn it on in xvl's terminal Settings "
+                               "The EFB is off. Turn it on in xfc's terminal Settings "
                                "(EFB), or set XCOPILOT_EFB=true in your .env and restart "
-                               "xvl; its link and QR code then show here.");
+                               "xfc; its link and QR code then show here.");
             ImGui::PopTextWrapPos();
             return;
         }

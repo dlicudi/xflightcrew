@@ -1,4 +1,4 @@
-# Build the XVoiceLayer X-Plane plugin (macOS, universal arm64 + x86_64).
+# Build the XFlightCrew X-Plane plugin (macOS, universal arm64 + x86_64).
 #
 # Prereq: the X-Plane SDK 4.4.0 or newer (free, developer.x-plane.com/sdk;
 # the panel renders through the 4.4 panel-graphics API, so X-Plane 12.4.4+)

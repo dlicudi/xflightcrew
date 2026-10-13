@@ -1,6 +1,6 @@
 # The EFB
 
-A browser Electronic Flight Bag served by `xvl` on your LAN, for an iPad, an iPhone or a second
+A browser Electronic Flight Bag served by `xfc` on your LAN, for an iPad, an iPhone or a second
 screen: the copilot's knowledge as four tabs (Flight, Map, Plan, Radio) and Settings behind the
 gear, the crew's warnings and cautions, a hold-to-talk button, and buttons that speak for you.
 Code: `src/efb/` (`mod.rs` the server, `state.rs` the page state, `flight_tab.rs` the Flight tab's
@@ -36,7 +36,7 @@ rebinds.
 
 ## The URL and the token
 
-At the first bind `xvl` prints (plain mode) and logs (`EFB serving`, both modes) the full link:
+At the first bind `xfc` prints (plain mode) and logs (`EFB serving`, both modes) the full link:
 
 ```
 http://192.168.1.20:8787/?t=3f9a0c1d2b

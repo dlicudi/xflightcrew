@@ -1,4 +1,4 @@
-//! `xvl identify`: the measurement flight that teaches the pilot controller
+//! `xfc identify`: the measurement flight that teaches the pilot controller
 //! an airframe (2026-10-13; the Rust of the 737's ident.py of 2026-10-12).
 //!
 //! The aircraft is started in the air at a safe height on its approach
@@ -10,9 +10,9 @@
 //! autopilot back on to settle. A power step in altitude hold measures what
 //! the lever buys. The fits (`pilot::ident`) are stored per `.acf`
 //! (`aircraft::learned`), where the detector loads them on the next airframe
-//! swap or start of xvl.
+//! swap or start of xfc.
 //!
-//! **Safety.** xvl must be stopped (one writer per channel). A paused or
+//! **Safety.** xfc must be stopped (one writer per channel). A paused or
 //! replaying sim is refused. Every input aborts on a bank past
 //! [`BANK_ABORT_DEG`], a pitch past [`PITCH_ABORT_DEG`] or a height lost past
 //! [`HEIGHT_LOSS_ABORT_FT`]; an abort hands the aircraft back to its own
@@ -50,11 +50,11 @@ fn amplitude(axis: Axis) -> f64 {
     }
 }
 
-const USAGE: &str = "usage: xvl identify [--alt FT] [--ias KT] [--flap RATIO] [--here]\n\
+const USAGE: &str = "usage: xfc identify [--alt FT] [--ias KT] [--flap RATIO] [--here]\n\
   Air-starts the loaded aircraft at FT (default 5000) over its present position\n\
   at the profile's approach speed and approach flap, flies the measurement\n\
   inputs and stores the fits in profiles/learned/. --here skips the air start\n\
-  (the aircraft must already be flying, level, on its autopilot). xvl must be stopped.";
+  (the aircraft must already be flying, level, on its autopilot). xfc must be stopped.";
 
 /// One tick's reads, in [`NAMES`] order.
 const NAMES: [&str; 11] = [
@@ -368,7 +368,7 @@ async fn power_step(xp: &XPlaneClient, lever: &str, t0: std::time::Instant) -> V
     out
 }
 
-/// `xvl identify`: `Ok(true)` when something was measured and stored.
+/// `xfc identify`: `Ok(true)` when something was measured and stored.
 pub async fn main_cmd(args: &[String], base_url: &str) -> anyhow::Result<bool> {
     let (mut alt_ft, mut ias, mut flap, mut here) = (5_000.0, None, None, false);
     let mut it = args.iter();

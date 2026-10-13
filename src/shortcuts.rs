@@ -6,7 +6,7 @@ use super::*;
 
 /// A branch of the command loop that answers (or acts on) a line from its
 /// words alone, before the grammar ever sees it. The loop routes through
-/// [`question_shortcut`], in this order, and `xvl sortie --check` asks the
+/// [`question_shortcut`], in this order, and `xfc sortie --check` asks the
 /// same function whether a scripted line is taken here instead of reaching
 /// its tool: LEMG (2026-09-28) "put us enroute 30 miles before top of
 /// descent" was answered "Top of descent about 893 miles ahead" and the
@@ -118,7 +118,7 @@ pub(crate) fn question_shortcut(
     // A new flight's setup is never a question: "put us enroute 30 miles
     // before top of descent" was answered as one at LEMG (2026-09-28), and
     // "enroute ... before the destination" carries "route" and "the", the
-    // flight plan brief's words (`xvl sortie --check`, 2026-09-29).
+    // flight plan brief's words (`xfc sortie --check`, 2026-09-29).
     if grammar::enroute_setup_request(command) || grammar::approach_setup_request(&tl) {
         return None;
     }

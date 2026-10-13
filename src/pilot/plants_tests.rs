@@ -1,5 +1,5 @@
 //! The pilot on plants FITTED to recorded flights: each airframe is first
-//! IDENTIFIED as `xvl identify` would fly it (doublets at a safe height,
+//! IDENTIFIED as `xfc identify` would fly it (doublets at a safe height,
 //! `pilot::ident`), its loops designed from that measurement by the one
 //! rule (`pilot::response::design`), then flown from minimums to the wheels
 //! (`segment`: pitch, roll, yaw and speed together) and through the flare
@@ -305,7 +305,7 @@ impl Delay {
     }
 }
 
-/// The identification flight on the plant, as `xvl identify` flies it: at
+/// The identification flight on the plant, as `xfc identify` flies it: at
 /// the gate's speed clear of the ground, trimmed level, each axis's input
 /// twice (each sign) from trim, sampled at 8 Hz; then a power step with the
 /// attitude law holding level on the fleet's priors. The airframe the
@@ -846,7 +846,7 @@ fn the_roll_response_is_refined_in_flight() {
 /// The A330's four recorded arrest gates at LEMG 30 (#180, sorties
 /// 1790633832 and 1790634412, 2026-09-28) on its sidestick's roll-rate
 /// plant (fitted 11 to 13 deg/s per unit after 0.25 to 0.37 s; 9 to 20 and
-/// up to 0.6 s bound it), identified as `xvl identify` would, then flown by
+/// up to 0.6 s bound it), identified as `xfc identify` would, then flown by
 /// the bank hold on the NPFG period its measured roll gives: (x m, sideways
 /// m/s, bank, s to the wheels, ft). On the delays fitted (0.35 s) within
 /// 2 m of the line at the wheels; at the 0.6 s bound within 4 m (the period

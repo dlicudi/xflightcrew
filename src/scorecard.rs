@@ -3,7 +3,7 @@
 //! Unattended testing needs a verdict per stage, not a pilot watching (asked
 //! 2026-09-25). Pure: [`Scorer::feed`] takes each blackbox record in order and
 //! returns the records it concludes, so the SAME code runs live (a blackbox tap,
-//! `stage_result` written beside the ticks) and offline (`xvl debrief` over any
+//! `stage_result` written beside the ticks) and offline (`xfc debrief` over any
 //! file). Every pass line is a number with a limit, because the complaints that
 //! started it ("jerky braking", "lined up at an angle", "it wobbles on the
 //! centreline") were seen and never measured. The limits are first guesses,
@@ -1286,7 +1286,7 @@ mod tests {
     /// records (every tenth taxi tick and every one far off the line, every
     /// third roll tick, the touchdown's state and flare ticks whole, the crew's yoke
     /// writes before each intervention). Pinned so any change to a verdict is
-    /// a changed line here; `xvl debrief` prints the same block from the same
+    /// a changed line here; `xfc debrief` prints the same block from the same
     /// file (asserted below), so the two agree by construction.
     const LEMG_737: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1790441293-full_auto.trimmed.jsonl"));
 

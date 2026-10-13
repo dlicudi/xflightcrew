@@ -1,8 +1,8 @@
-//! The unattended sortie runner: `xvl sortie <spec.yaml> [--repeat N]`.
+//! The unattended sortie runner: `xfc sortie <spec.yaml> [--repeat N]`.
 //!
 //! A landing test took a person at the keyboard for every step (LEMG,
 //! 2026-09-26: reposition, arm, watch, read the verdict). The runner is that
-//! person: a second process beside a LIVE X-Plane and a LIVE xvl, talking to
+//! person: a second process beside a LIVE X-Plane and a LIVE xfc, talking to
 //! the sim's Web API and to the app through the plugin's mailboxes, never the
 //! STT or the sim's SDK. Per case it sets the flight up, types the mission
 //! into the panel's typed line (`xcopilot/typed`, the same queue a pilot's
@@ -2742,7 +2742,7 @@ async fn type_line(sim: &dyn RunnerSim, line: &str, pace: &Pace) -> Result<()> {
             return Ok(());
         }
     }
-    Err(anyhow!("the typed line was never taken: is xvl running?"))
+    Err(anyhow!("the typed line was never taken: is xfc running?"))
 }
 
 /// Refuse to start over a flying loop or a replay.
@@ -3148,7 +3148,7 @@ async fn set_up_start(
         let waited = now_s() - t0;
         if !swapped && waited > pace.swap_max_s {
             return Err(anyhow!(
-                "the app never took the {acf} (no profile_probe for it in {:.0} s): is xvl running?",
+                "the app never took the {acf} (no profile_probe for it in {:.0} s): is xfc running?",
                 pace.swap_max_s
             ));
         }
@@ -3205,7 +3205,7 @@ async fn enroute_setup(
         }
         if now_s() - t0 > pace.enroute_max_s {
             return Err(anyhow!(
-                "no enroute_result in {:.0} s after {line:?}: is xvl running?",
+                "no enroute_result in {:.0} s after {line:?}: is xfc running?",
                 pace.enroute_max_s
             ));
         }
@@ -3604,7 +3604,7 @@ pub async fn run_all(
     rows
 }
 
-/// `xvl sortie <spec.yaml> [--repeat N] [--log logs/blackbox.jsonl]`: the
+/// `xfc sortie <spec.yaml> [--repeat N] [--log logs/blackbox.jsonl]`: the
 /// entry from main. Returns whether every case passed.
 // ---- The check: every typed line routed offline, no sim --------------------------
 
@@ -3982,7 +3982,7 @@ pub fn spec_word_problems(spec: &Spec, sources: &[(String, String)]) -> Vec<Stri
     out
 }
 
-/// `xvl sortie <spec> --check`: the spec parsed, its plan words resolved
+/// `xfc sortie <spec> --check`: the spec parsed, its plan words resolved
 /// when a SimBrief id is set (else said), every typed line routed offline
 /// on its airframe's profile. `Ok(true)`: no problem. No sim is asked.
 async fn check_cmd(spec_path: &str) -> Result<bool> {
@@ -4056,7 +4056,7 @@ pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<
         }
     }
     let spec_path = spec_path.ok_or_else(|| {
-        anyhow!("usage: xvl sortie <spec.yaml> [--repeat N] [--log path] [--check]")
+        anyhow!("usage: xfc sortie <spec.yaml> [--repeat N] [--log path] [--check]")
     })?;
     if check {
         return check_cmd(&spec_path).await;
@@ -4069,7 +4069,7 @@ pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<
     }
     if !std::path::Path::new(&log).exists() {
         return Err(anyhow!(
-            "{log} not found: run from the xvl checkout the app writes into"
+            "{log} not found: run from the xfc checkout the app writes into"
         ));
     }
     let xp = crate::xplane::XPlaneClient::new(base_url.to_string());

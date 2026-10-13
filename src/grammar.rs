@@ -15,7 +15,7 @@
 //! flap detent it lacks) is NOT rejected here — it's routed to the tool, which
 //! replies with the valid options ("I have up, approach, down"), far more useful
 //! than a bare "Say again?". Extend the tables here as the logs surface new
-//! recurring phrasings (see `xvl analyze`).
+//! recurring phrasings (see `xfc analyze`).
 
 use serde_json::{json, Value};
 

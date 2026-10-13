@@ -2,7 +2,7 @@
 //! after): the real `state` records (`bench/replay/2026-10-05-lemg-737.jsonl`)
 //! through the safe hold's decision.
 //!
-//! 12:42:29 xvl booted into a 737 at 2,900 ft flying autoland's last command
+//! 12:42:29 xfc booted into a 737 at 2,900 ft flying autoland's last command
 //! (VS -330, the window at 0, heading 306 toward the hills west of Malaga).
 //! Nothing held it; at 12:44:58 it crossed a ridge 72 ft above the ground,
 //! the pilot pulling up by hand. At 12:53:03 "my controls" cancelled a

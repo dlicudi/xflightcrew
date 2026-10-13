@@ -1380,7 +1380,7 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
         _ => Priority::Readback,
     };
     let say = |line: &str| {
-        tracing::info!(target: "xvoicelayer::flow", spoke = %line, "checklist");
+        tracing::info!(target: "xflightcrew::flow", spoke = %line, "checklist");
         voice.say_crew(priority, line.to_string());
     };
     crate::blackbox::record(

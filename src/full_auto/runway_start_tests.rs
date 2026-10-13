@@ -36,7 +36,7 @@
     /// EGKK's two strips, the rows as apt.dat has them.
     fn egkk() -> Vec<crate::runway::Runway> {
         use std::io::Write;
-        let apt = std::env::temp_dir().join("xvl-runway-start-egkk-apt.dat");
+        let apt = std::env::temp_dir().join("xfc-runway-start-egkk-apt.dat");
         let mut f = std::fs::File::create(&apt).unwrap();
         writeln!(f, "1    203 0 0 EGKK London Gatwick").unwrap();
         writeln!(f, "100 46.00 26 1527 0.25 1 3 0 08R 51.1450993 -0.2123748 395 0 7 4 1 3 26L 51.1514994 -0.1659296 425 30 7 4 1 3").unwrap();
@@ -92,7 +92,7 @@
     /// displaced on 12; 13/31 with 75 m on each end).
     fn lemg() -> Vec<crate::runway::Runway> {
         use std::io::Write;
-        let apt = std::env::temp_dir().join("xvl-runway-start-lemg-apt.dat");
+        let apt = std::env::temp_dir().join("xfc-runway-start-lemg-apt.dat");
         let mut f = std::fs::File::create(&apt).unwrap();
         writeln!(f, "1     48 0 0 LEMG Malaga").unwrap();
         writeln!(f, "100 45.11 1 1 0.00 1 3 0  12 36.6910753 -4.5078270 0 190 3 1 1 1 30 36.6795648 -4.4805125 0 489 3 0 0 1").unwrap();

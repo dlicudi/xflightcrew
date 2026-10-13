@@ -1,7 +1,7 @@
 //! The safe hold: an airborne aircraft that NOBODY flies is never left in a
 //! state that flies into the ground.
 //!
-//! LEMG 737, 2026-10-05 (sortie 1791187965-full_auto): xvl was restarted at
+//! LEMG 737, 2026-10-05 (sortie 1791187965-full_auto): xfc was restarted at
 //! 12:42:27 with the autopilot still flying autoland's last command, VS -330
 //! fpm with the altitude window at 0 ft, heading 306 toward the hills west of
 //! Malaga at 2,900 ft. Nothing of ours owned the aircraft after the restart,

@@ -1,5 +1,5 @@
 # One airframe after another, each on its own unflown fixes:
-#   xvl sortie bench/sorties/backlog-types.yaml
+#   xfc sortie bench/sorties/backlog-types.yaml
 # Every case loads its aircraft (setup.aircraft) and waits for the app to
 # swap to it before the first line. The shape is lemg-737.yaml's header.
 # Parse-tested (every line pinned to the tool it must reach), not yet flown.

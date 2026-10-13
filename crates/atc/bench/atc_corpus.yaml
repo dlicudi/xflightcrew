@@ -1,7 +1,7 @@
 # The ATC battle-test corpus: what pilots actually said, what whisper actually
 # wrote, and the near-misses that must never earn a clearance.
 #
-# Sources: real transmissions mined from logs/xvoicelayer.log.* (2026-06/07
+# Sources: real transmissions mined from logs/xflightcrew.log.* (2026-06/07
 # flights, kept verbatim including whisper's mangling), plus hand-written
 # paraphrases and corruptions in whisper's real failure modes (homophones,
 # dropped words, merged words). Run by `transcript_corpus_parses_safely` in

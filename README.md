@@ -21,8 +21,7 @@ tablet. No menus, no key combinations, and nothing leaves your machine.
 
 [xflightcrew.com](https://xflightcrew.com)
 
-Formerly XVoiceLayer. Until the rename is complete, the binary is still `xvl`
-and the repository `xvoicelayer`.
+Formerly XVoiceLayer (binary `xvl`); renamed 2026-10-13. The command is now `xfc`.
 
 ## What it's for
 
@@ -315,12 +314,12 @@ cargo run -- stt-eval bench/atc_stt_cases.yaml             # spoken-call accurac
 With the sim running:
 
 ```sh
-xvl sortie bench/sorties/c172-g1000-ils13.yaml   # fly a scripted test flight, scored PASS/FAIL
-xvl debrief                                      # the last flight's lessons and grades
-xvl conform                                      # check every channel an aircraft profile declares, parked
+xfc sortie bench/sorties/c172-g1000-ils13.yaml   # fly a scripted test flight, scored PASS/FAIL
+xfc debrief                                      # the last flight's lessons and grades
+xfc conform                                      # check every channel an aircraft profile declares, parked
 ```
 
-Every flight writes `logs/blackbox.jsonl`; `xvl analyze` mines the logs for
+Every flight writes `logs/blackbox.jsonl`; `xfc analyze` mines the logs for
 phrasings the deterministic grammar missed.
 
 The ordinary workspace suite is deterministic and runs without X-Plane. It

@@ -7,12 +7,12 @@ docs/dev-history.md before reworking any subsystem it names.
 - Evidence lives in the main checkout, not the worktree: sortie files are
   `logs/sorties/<id>.jsonl` (one file per mission, every record tagged
   `sortie`), the whole log is `logs/blackbox.jsonl` (40 MB; grep it, never
-  cat it), both relative to the main checkout. `xvl debrief [file]` prints a
+  cat it), both relative to the main checkout. `xfc debrief [file]` prints a
   flight's numbers.
 - Run tests with `XCOPILOT_BLACKBOX=off cargo test --workspace` (a test that
   walks a real path otherwise records into the live log). The suite takes
   seconds once built; the build takes minutes the first time.
-- Never touch the sim: no Web API calls, no plugin reload, no `xvl` start or
+- Never touch the sim: no Web API calls, no plugin reload, no `xfc` start or
   kill. The pilot may be flying on this machine.
 - Never run a bare `cargo fmt`; format only the files you edited
   (`rustfmt <file>`), then check `git diff --stat` for foreign hunks.

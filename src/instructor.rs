@@ -17,7 +17,7 @@
 //! for the chosen level, narrating a sustained excursion as it happens
 //! ("Altitude, 120 low.") and reading the grade back at the end. Everything
 //! is blackboxed under kind `instructor`, and the same scorer runs OFFLINE
-//! over the blackbox's `state` records in `xvl debrief` (`grade_flight`), so
+//! over the blackbox's `state` records in `xfc debrief` (`grade_flight`), so
 //! a hand-flown sortie with no lesson armed still gets its numbers.
 //!
 //! Pure state machine plus text, tested as plain `cargo test`: the monitor

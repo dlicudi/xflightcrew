@@ -3,7 +3,7 @@
 # reposition cannot test it: the Zibo loads its systems cold in the air,
 # IRS off, and its autopilot will not engage (2026-10-07). Here the IRS is
 # aligned on the ground before the takeoff. Fuel by hand before the run.
-#   xvl sortie bench/sorties/zibo-lezl.yaml
+#   xfc sortie bench/sorties/zibo-lezl.yaml
 after: stop
 
 cases:

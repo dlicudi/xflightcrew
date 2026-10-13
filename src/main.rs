@@ -1,4 +1,4 @@
-//! XVoiceLayer — the voice layer for X-Plane 12: copilot, ATC and cabin crew.
+//! XFlightCrew: the rest of the crew, and the world around you, for X-Plane 12.
 //!
 //! The voice loop, end to end and fully local:
 //!   listen → whisper (STT) → deterministic command/conversation routing →
@@ -184,7 +184,7 @@ use xplane::XPlaneClient;
 /// names, the package (the lib's default target) and the binary (the bin's),
 /// CLAUDE.md "Wire contracts". Pinned by
 /// `tests::the_log_filter_names_every_crate_and_both_crew_names`.
-const DEFAULT_LOG_FILTER: &str = "xvoicelayer=info,xvl=info,atc=info,nav=info,sim=info,traffic=info";
+const DEFAULT_LOG_FILTER: &str = "xflightcrew=info,xfc=info,atc=info,nav=info,sim=info,traffic=info";
 
 // Single-threaded runtime: the cpal stream isn't `Send`, and the loop is
 // inherently sequential (listen → think → act → speak), so there's nothing to
@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
 
     // Always log to a daily-rolling file. In TUI mode the stderr layer would
     // scribble over the dashboard, so it's omitted there (file only).
-    let file_appender = tracing_appender::rolling::daily("logs", "xvoicelayer.log");
+    let file_appender = tracing_appender::rolling::daily("logs", "xflightcrew.log");
     let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
     // Every workspace crate, not just the crew: since the 2026-07-14 split the
     // world's tracing lives in `atc` and the Web API client's in `sim`, and a
@@ -210,12 +210,12 @@ async fn main() -> Result<()> {
     // instead of grepping (2026-07-27).
     // BOTH names for the crew, and they are not the same thing: a log line's
     // default target is `module_path!()`, which for code in a BINARY is the
-    // BIN name (`xvl`) and for code in the lib is the PACKAGE name
-    // (`xvoicelayer`). Naming only the package silently dropped all 158
+    // BIN name (`xfc`) and for code in the lib is the PACKAGE name
+    // (`xflightcrew`). Naming only the package silently dropped all 158
     // default-target sites in this file and its modules — the startup/build
     // line included, so the one documented way to tell which build is flying
     // ("check the build= line") reported nothing, while the explicit
-    // `target: "xvoicelayer::..."` lines kept arriving and made the log look
+    // `target: "xflightcrew::..."` lines kept arriving and made the log look
     // healthy (2026-07-30, found by grepping for a startup line that was
     // never there). Renaming the binary must move this default with it.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -238,7 +238,7 @@ async fn main() -> Result<()> {
         version = env!("XVL_VERSION"),
         build = env!("XCOPILOT_BUILD"),
         profile = env!("XVL_PROFILE"),
-        "XVoiceLayer starting"
+        "XFlightCrew starting"
     );
 
     // Publish the configuration to the live store and let saved preferences
@@ -313,7 +313,7 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("transcribe") {
         let path = std::env::args()
             .nth(2)
-            .ok_or_else(|| anyhow!("usage: xvl transcribe <audio-file>"))?;
+            .ok_or_else(|| anyhow!("usage: xfc transcribe <audio-file>"))?;
         let text = transcribe_file(&config.whisper_model_path, &path)?;
         println!("{text}");
         return Ok(());
@@ -324,12 +324,12 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("onnx-info") {
         let path = std::env::args()
             .nth(2)
-            .ok_or_else(|| anyhow!("usage: xvl onnx-info <model.onnx>"))?;
+            .ok_or_else(|| anyhow!("usage: xfc onnx-info <model.onnx>"))?;
         println!("{}", tts_onnx::inspect(&path)?);
         return Ok(());
     }
 
-    // `xvl tts ["phrase"] [--voice SPEC] [--pace N] [--radio] [--out FILE.wav]`
+    // `xfc tts ["phrase"] [--voice SPEC] [--pace N] [--radio] [--out FILE.wav]`
     // synthesizes one phrase - an audition tool for voices without launching
     // the loop. Defaults: the copilot's configured voice (honouring the
     // XCOPILOT_TTS_LENGTH/NOISE/NOISE_W scale overrides), played aloud.
@@ -392,7 +392,7 @@ async fn main() -> Result<()> {
         }
         let path = match &out {
             Some(p) => std::path::PathBuf::from(p),
-            None => std::env::temp_dir().join("xvoicelayer-tts.wav"),
+            None => std::env::temp_dir().join("xflightcrew-tts.wav"),
         };
         tts_onnx::write_wav(&path, &samples, v.sample_rate())?;
         match out {
@@ -402,7 +402,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `xvl debrief [logs/blackbox.jsonl]` — what the last flight did, from the
+    // `xfc debrief [logs/blackbox.jsonl]` — what the last flight did, from the
     // blackbox: the read a pilot gets after the sortie, and the one the
     // fly-fix-fly loop starts from.
     if std::env::args().nth(1).as_deref() == Some("debrief") {
@@ -418,8 +418,8 @@ async fn main() -> Result<()> {
     // `xcopilot/sim/loading`; failing open without it).
     xplane::enable_load_gate(&config.xplane_base_url);
 
-    // `xvl sortie <spec.yaml> [--repeat N]`: the unattended runner, a second
-    // process beside a running xvl (src/sortie_runner.rs). Exit 1 on any fail.
+    // `xfc sortie <spec.yaml> [--repeat N]`: the unattended runner, a second
+    // process beside a running xfc (src/sortie_runner.rs). Exit 1 on any fail.
     if std::env::args().nth(1).as_deref() == Some("sortie") {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         let all_passed =
@@ -427,7 +427,7 @@ async fn main() -> Result<()> {
         std::process::exit(if all_passed { 0 } else { 1 });
     }
 
-    // `xvl conform [--only <area>]`: every control channel the live profile
+    // `xfc conform [--only <area>]`: every control channel the live profile
     // declares, exercised on a PARKED aircraft through the code's own seams
     // and put back (src/conform.rs). A second process like the runner. Exit
     // 1 on any FAIL or a refusal.
@@ -437,9 +437,9 @@ async fn main() -> Result<()> {
         std::process::exit(if passed { 0 } else { 1 });
     }
 
-    // `xvl identify`: the measurement flight that teaches the pilot
+    // `xfc identify`: the measurement flight that teaches the pilot
     // controller the loaded airframe (src/identify.rs), its fits stored per
-    // .acf in profiles/learned/. A second process like conform: xvl stopped.
+    // .acf in profiles/learned/. A second process like conform: xfc stopped.
     if std::env::args().nth(1).as_deref() == Some("identify") {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         let stored = identify::main_cmd(&rest, &config.xplane_base_url).await?;
@@ -520,7 +520,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         aircraft = %profile.display_name,
         mode = %config.listen_mode,
-        "starting XVoiceLayer"
+        "starting XFlightCrew"
     );
 
     // whisper model load is the one slow init — do it once, up front. Bias its
@@ -816,7 +816,7 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         println!(
-            "\n  XVoiceLayer — {} ({}). Ctrl-C to quit.\n",
+            "\n  XFlightCrew — {} ({}). Ctrl-C to quit.\n",
             profile.display_name, config.listen_mode
         );
         let mut reporter = Reporter::plain();
@@ -1042,7 +1042,7 @@ fn preview_checklist(
     conversation.start_preview(cl.title.clone(), items, now)
 }
 
-/// Transcribe an audio file with whisper, for `xvl transcribe <file>`.
+/// Transcribe an audio file with whisper, for `xfc transcribe <file>`.
 /// Decodes/resamples to 16 kHz mono via macOS `afconvert` (handles mp3/m4a/wav/…
 /// — whisper needs 16 kHz mono), reads the PCM, and returns the text. Reuses the
 /// same STT model the live loop uses, so no extra model download.
@@ -1052,7 +1052,7 @@ fn load_wav_16k(input: &str) -> Result<Vec<f32>> {
     if !std::path::Path::new(input).exists() {
         return Err(anyhow!("no such file: {input}"));
     }
-    let wav = std::env::temp_dir().join("xvoicelayer-16k.wav");
+    let wav = std::env::temp_dir().join("xflightcrew-16k.wav");
     let status = Command::new("afconvert")
         .args([
             input,
@@ -1113,7 +1113,8 @@ fn analyze_commands() -> Result<()> {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| {
-                n.starts_with("xvoicelayer.log")
+                // Logs from before the 2026-10-13 rename keep their old name.
+                (n.starts_with("xflightcrew.log") || n.starts_with("xvoicelayer.log"))
                     && (since.is_empty() || n.rsplit('.').next().is_some_and(|d| d >= since.as_str()))
             });
         if !is_log {

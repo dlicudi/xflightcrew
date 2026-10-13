@@ -65,9 +65,9 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::tools::anti_ice::clear_claims();
 }
 
-/// A second process's view of the live airframe (`xvl conform`): the facts
+/// A second process's view of the live airframe (`xfc conform`): the facts
 /// the seams read, installed from the profile, and nothing else. It begins
-/// no flight, stands nothing down and records nothing: the running xvl owns
+/// no flight, stands nothing down and records nothing: the running xfc owns
 /// all three.
 pub(crate) fn install_for_check(p: &AircraftProfile) {
     crate::aircraft::install_airframe_facts(airframe_facts(p));

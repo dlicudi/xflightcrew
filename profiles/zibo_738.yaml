@@ -219,7 +219,7 @@ autoflight:
     # `course_pilot` until the localiser captures (B738.glaresheild.lua:3598),
     # so a stock OBS write is undone. Its knob commands step a whole degree
     # (`up_dn_crs1_dial`, mode 0; held or fast repeats accelerate, mode 2).
-    # VERIFY parked (`xvl conform --only mcp`): knob, or a write.
+    # VERIFY parked (`xfc conform --only mcp`): knob, or a write.
     # The course windows take a WRITE (probed in flight 2026-10-07: 311
     # written, 311 read). Knob-stepped they could not reach the ILS: the
     # 120-press cap left the captain's at 251 for a 311 course (from 131) and

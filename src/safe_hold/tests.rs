@@ -22,7 +22,7 @@ fn air() -> Air {
 }
 
 /// HDG + VS + ALT armed, servos in, the window at 0, VS -330: what the
-/// restarted xvl found at 12:42:29.
+/// restarted xfc found at 12:42:29.
 fn ap_vs_down() -> ApRead {
     ApRead {
         servos: Some(true),

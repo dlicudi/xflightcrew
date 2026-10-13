@@ -45,7 +45,7 @@ for m in "$@"; do
   [[ "$m" == qwen3:* ]] && nothink=1
   start=$EPOCHSECONDS
   XCOPILOT_MODEL="$m" XCOPILOT_NO_THINK="$nothink" \
-    cargo test --bin xvl "$TEST" -- --ignored --nocapture \
+    cargo test --bin xfc "$TEST" -- --ignored --nocapture \
     > "$log" 2>&1
   elapsed=$(( EPOCHSECONDS - start ))
   pass=$(grep -c '✓' "$log")

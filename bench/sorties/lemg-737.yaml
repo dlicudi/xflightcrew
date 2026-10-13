@@ -1,5 +1,5 @@
-# Sortie runner spec: `xvl sortie bench/sorties/lemg-737.yaml [--repeat N]`
-# (src/sortie_runner.rs). Run it from the xvl checkout while xvl is running
+# Sortie runner spec: `xfc sortie bench/sorties/lemg-737.yaml [--repeat N]`
+# (src/sortie_runner.rs). Run it from the xfc checkout while xfc is running
 # and X-Plane is live with the aircraft under test loaded (these cases: the
 # Laminar 737-800). The runner never flies: it sets up each case, types the
 # mission into the panel's typed line, and reads the verdict the app's live

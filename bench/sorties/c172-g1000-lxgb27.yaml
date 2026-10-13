@@ -2,8 +2,8 @@
 # east, over the Mediterranean: no ILS, no RNAV procedure, the PAPI's 3.00
 # (`nav::papi_for`), the Rock beside the runway, a short strip. Path ours,
 # autopilot on HDG and VS, power on total energy, the attitude flare.
-#   xvl sortie bench/sorties/c172-g1000-lxgb27.yaml --check
-#   xvl sortie bench/sorties/c172-g1000-lxgb27.yaml
+#   xfc sortie bench/sorties/c172-g1000-lxgb27.yaml --check
+#   xfc sortie bench/sorties/c172-g1000-lxgb27.yaml
 after: stop
 
 cases:

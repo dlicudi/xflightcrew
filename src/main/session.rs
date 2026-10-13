@@ -385,7 +385,7 @@ impl Session {
         // straight back.
         // The pre-grammar shortcuts' decisions, taken once from the words
         // (`question_shortcut`): every branch below that answers on words
-        // alone asks this, so `xvl sortie --check` sees what the loop does.
+        // alone asks this, so `xfc sortie --check` sees what the loop does.
         let shortcut = question_shortcut(
             &u.command,
             &self.registry,

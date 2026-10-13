@@ -13,7 +13,7 @@ decision reproducible from its inputs and testable in plain `cargo test`.
 
 ---
 
-## 1. What XVoiceLayer already does
+## 1. What XFlightCrew already does
 
 The short answer: **a lot, in many places, and they disagree.** Today's EDLP-LOWI
 sortie failed in exactly the seams between them (the tower gave the grass

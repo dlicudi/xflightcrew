@@ -15,7 +15,7 @@
 //!
 //! Nothing in it is typed into a profile. What differs between airframes is
 //! MEASURED: each axis' response by an identification flight
-//! ([`ident`], `xvl identify`, stored per `.acf` in `aircraft::learned`)
+//! ([`ident`], `xfc identify`, stored per `.acf` in `aircraft::learned`)
 //! and refined as the segment flies (the roll's [`bank::RollResponse`]),
 //! the gains derived from it by one rule ([`response::design`]: McRuer's
 //! crossover, scaled by the air), the nose limited by the airframe's

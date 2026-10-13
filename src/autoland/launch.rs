@@ -110,7 +110,7 @@ impl ApproachRuntime {
 }
 
 pub(super) fn announce_autoland(voice: &Option<Voice>, line: String, sev: Priority) {
-    tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
+    tracing::info!(target: "xflightcrew::autoland", spoke = %line, "copilot");
     if let Some(v) = voice {
         v.alert(sev, line);
     }
@@ -207,7 +207,7 @@ pub(super) async fn arm_runway(
     let mut runway = match picked {
         Ok(Some(r)) => r,
         other => {
-            tracing::warn!(target: "xvoicelayer::autoland", ?other, from=?(lat0, lon0), "no runway found");
+            tracing::warn!(target: "xflightcrew::autoland", ?other, from=?(lat0, lon0), "no runway found");
             announce_autoland(
                 voice,
                 "No suitable runway within range. You have the aircraft.".into(),
@@ -217,7 +217,7 @@ pub(super) async fn arm_runway(
         }
     };
     tracing::info!(
-        target: "xvoicelayer::autoland",
+        target: "xflightcrew::autoland",
         icao = %runway.icao, id = %runway.id, dist_nm = runway.dist_nm,
         len_m = runway.length_m, course = runway.course_deg, elev = runway.elev_ft,
         "runway selected"

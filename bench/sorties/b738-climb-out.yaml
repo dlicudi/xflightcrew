@@ -2,7 +2,7 @@
 # off", and at 3,000 ft a reposition to a 4 mile final so nobody is left
 # holding the climb. Check autotakeoff `climb` law_vs dropping toward 1,200
 # fpm past 1,000 ft, the `flap_step` heights, and `ap_engage` tries.
-#   xvl sortie bench/sorties/b738-climb-out.yaml
+#   xfc sortie bench/sorties/b738-climb-out.yaml
 after: stop
 
 cases:

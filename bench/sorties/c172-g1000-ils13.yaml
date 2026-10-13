@@ -5,8 +5,8 @@
 # after the air start (#270). Check blackbox
 # `ils` `coupling` reaching Coupled, `autoflight` `press` APP once, no HDG
 # or V/S press after the captures, and `autoland` stable at 500 ft.
-#   xvl sortie bench/sorties/c172-g1000-ils13.yaml --check
-#   xvl sortie bench/sorties/c172-g1000-ils13.yaml
+#   xfc sortie bench/sorties/c172-g1000-ils13.yaml --check
+#   xfc sortie bench/sorties/c172-g1000-ils13.yaml
 after: stop
 
 cases:
