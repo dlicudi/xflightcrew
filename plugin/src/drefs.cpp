@@ -649,6 +649,58 @@ void StoreText(TextRef* t, void* in, int offset, int len) {
     t->len = len;
 }
 
+// The Checklist tab (xcopilot/status/checklist, 2026-10-13): the airframe's
+// profiled lists and the shown section's rows, written by the app about
+// once a second on a change and every 10 s regardless. '\n'-separated:
+//   H|aircraft|shown|sheet|run|phrase|title~title~...
+//   kind|state|by|text
+// shown/sheet: list indexes (-1 none); run: R the flow runs, L its last
+// list this flight, '-' none; phrase: what Run types (empty: no button).
+// kind: A act, V verify, C call-out, N narration. state: p pass, n not
+// yet, u unknown, '-' no test; from the flow: R now, D done, H held (by),
+// X discrepancy, S skipped, F failed, U unread, W said. Text is last. The
+// app's side is checklist_panel.rs. Its write time is kept, as the board's.
+static ChecklistRef g_checklist = {{0}, 0};
+static double g_checklist_at = -1.0;
+static XPLMDataRef g_checklist_dref = nullptr;
+static int ReadChecklist(void*, void* out, int offset, int max) {
+    if (out == nullptr) return g_checklist.len;
+    if (offset >= g_checklist.len) return 0;
+    int n = g_checklist.len - offset;
+    if (n > max) n = max;
+    std::memcpy(out, g_checklist.buf + offset, static_cast<size_t>(n));
+    return n;
+}
+static void WriteChecklist(void*, void* in, int offset, int len) {
+    g_last_status_time = XPLMGetElapsedTime();
+    if (offset != 0) return;
+    if (len > static_cast<int>(sizeof g_checklist.buf) - 1) len = static_cast<int>(sizeof g_checklist.buf) - 1;
+    if (len < 0) len = 0;
+    std::memset(g_checklist.buf, 0, sizeof g_checklist.buf);
+    std::memcpy(g_checklist.buf, in, static_cast<size_t>(len));
+    g_checklist.len = len;
+    g_checklist_at = XPLMGetElapsedTime();
+}
+// The tab's view, plugin to app (xcopilot/opt/checklist_view): "1|title"
+// while the tab was drawn in the last 2 s, "0|title" otherwise (title: the
+// pilot's pick, empty for the app's own). Built on each read, so a closed
+// window reads "0" without anyone writing it; the app reads live only
+// while it says "1". Read-only to the app: the panel is its one writer.
+static char g_checklist_pick[256] = {0};
+static double g_checklist_drawn_at = -1.0;
+static TextRef g_checklist_view = {{0}, 0};
+static XPLMDataRef g_checklist_view_dref = nullptr;
+static int ReadChecklistView(void* ref, void* out, int offset, int max) {
+    const bool open = g_checklist_drawn_at >= 0.0
+        && XPLMGetElapsedTime() - g_checklist_drawn_at < 2.0;
+    int n = std::snprintf(g_checklist_view.buf, sizeof g_checklist_view.buf, "%c|%s",
+                          open ? '1' : '0', g_checklist_pick);
+    if (n < 0) n = 0;
+    if (n > static_cast<int>(sizeof g_checklist_view.buf) - 1) n = static_cast<int>(sizeof g_checklist_view.buf) - 1;
+    g_checklist_view.len = n;
+    return ReadText(ref, out, offset, max);
+}
+
 // The next transcript row's "FROM > TO" label: the app writes it just
 // before the heard or action line it labels (the same writer thread, in
 // order). Taken by that row, never by a later one: a label older than a
@@ -1554,6 +1606,15 @@ void start() {
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteOptText,
         &g_board_field, &g_board_field);
+    g_checklist_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/checklist", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadChecklist, WriteChecklist, nullptr, nullptr);
+    g_checklist_view_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/checklist_view", xplmType_Data, 0,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadChecklistView, nullptr,
+        &g_checklist_view, nullptr);
     g_opt_ui_scale_dref = XPLMRegisterDataAccessor(
         "xcopilot/opt/ui_scale", xplmType_Int, 1,
         ReadOptUiScale, WriteOptUiScale, nullptr, nullptr, nullptr, nullptr,
@@ -1752,6 +1813,8 @@ void stop_first() {
     if (g_state_dref) { XPLMUnregisterDataAccessor(g_state_dref); g_state_dref = nullptr; }
     if (g_board_dref) { XPLMUnregisterDataAccessor(g_board_dref); g_board_dref = nullptr; }
     if (g_board_field_dref) { XPLMUnregisterDataAccessor(g_board_field_dref); g_board_field_dref = nullptr; }
+    if (g_checklist_dref) { XPLMUnregisterDataAccessor(g_checklist_dref); g_checklist_dref = nullptr; }
+    if (g_checklist_view_dref) { XPLMUnregisterDataAccessor(g_checklist_view_dref); g_checklist_view_dref = nullptr; }
     if (g_auto_dref) { XPLMUnregisterDataAccessor(g_auto_dref); g_auto_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }
@@ -1819,6 +1882,16 @@ void set_board_field(const char* icao) {
 bool board_fresh() {
     return g_board_at >= 0.0 && XPLMGetElapsedTime() - g_board_at < 30.0;
 }
+const ChecklistRef& checklist() { return g_checklist; }
+bool checklist_ever() { return g_checklist_at >= 0.0; }
+bool checklist_fresh() {
+    return g_checklist_at >= 0.0 && XPLMGetElapsedTime() - g_checklist_at < 30.0;
+}
+void set_checklist_pick(const char* title) {
+    std::snprintf(g_checklist_pick, sizeof g_checklist_pick, "%s", title);
+}
+const char* checklist_pick() { return g_checklist_pick; }
+void note_checklist_drawn() { g_checklist_drawn_at = XPLMGetElapsedTime(); }
 bool auto_active() { return g_auto_active; }
 const std::vector<AtcField>& atc_fields() { return g_atc_fields; }
 

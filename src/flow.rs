@@ -181,6 +181,12 @@ fn lists() -> Arc<Vec<Checklist>> {
     lock(&LISTS).clone().unwrap_or_else(|| Arc::new(Vec::new()))
 }
 
+/// The installed lists, for readers (the panel's Checklist tab): the same
+/// `Arc` until the next [`install`], so a reader can tell a swap by it.
+pub(crate) fn installed() -> Arc<Vec<Checklist>> {
+    lists()
+}
+
 /// "before_landing" / "Before Landing" -> "before landing".
 fn section_key(k: &str) -> String {
     checklist::section_key(k)
@@ -1366,7 +1372,7 @@ async fn confirm(voice: &Voice, hazard: &str) -> Waited {
     out
 }
 
-fn item_line(item: &Item) -> &str {
+pub(crate) fn item_line(item: &Item) -> &str {
     match item {
         Item::Narrate(t) | Item::CallOut(t) => t,
         Item::Act { say, .. } | Item::Verify { say, .. } => say,

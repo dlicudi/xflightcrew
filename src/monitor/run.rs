@@ -98,6 +98,8 @@ pub async fn run(
     // built from (`None` = never), and the payload, rebuilt only on a change.
     let mut last_efb: Option<Option<String>> = None;
     let mut efb_payload = String::new();
+    // The Checklist tab's change gate (`checklist_panel::ChecklistTab`).
+    let mut checklist_tab = crate::checklist_panel::ChecklistTab::default();
 
     // Talk-down pacing: when the last callout went out, and whether we've
     // already handed over at the threshold (say it once, then shut up).
@@ -1292,6 +1294,11 @@ pub async fn run(
                 if efb_changed || auto_resend == 0 {
                     s.efb_url(&efb_payload);
                 }
+                // The Checklist tab: once a second, its shown section read
+                // live only while the tab is on screen (`checklist_panel`).
+                checklist_tab
+                    .tick(&xp, s, || live.get().display_name, Instant::now())
+                    .await;
                 if auto != last_auto || auto_resend == 0 {
                     s.auto_status(&auto);
                     last_auto = auto;

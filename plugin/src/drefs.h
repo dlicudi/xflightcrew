@@ -82,6 +82,15 @@ bool board_fresh();
 // The Board tab's field pick, plugin to app (an ICAO; empty = the field
 // the traffic runs at).
 void set_board_field(const char* icao);
+// The Checklist tab's feed (see drefs.cpp): ever written, and written in
+// the last 30 s. The pick (a list title, empty = the app's own) and the
+// tab drawn this frame ride xcopilot/opt/checklist_view back to the app.
+const ChecklistRef& checklist();
+bool checklist_ever();
+bool checklist_fresh();
+void set_checklist_pick(const char* title);
+const char* checklist_pick();
+void note_checklist_drawn();
 const std::vector<AtcField>& atc_fields();
 
 // COM1, for the ATC tab: khz read (0 if the sim dataref is missing) and the
