@@ -14,4 +14,7 @@ void stop();
 // mailbox write until 3 s of sim frames after XPLMInitFlight returns.
 bool loading();
 
+// X-Plane's own load messages (XPluginReceiveMessage) open the quiet window.
+void sim_load_message(const char* what);
+
 } // namespace flightinit

@@ -42,14 +42,16 @@ const BACKOFF: Duration = Duration::from_secs(10);
 /// 2026-10-08). Two small writes per period.
 const REASSERT_EVERY: Duration = Duration::from_secs(5);
 
-/// Aircraft within this of us are drawn, nm (TCAS range; the pilot's ask,
-/// 2026-10-13: simulated within 100 nm, drawn within 40).
-pub(crate) const DRAW_RANGE_NM: f64 = 40.0;
+/// Aircraft within this of us are drawn, nm: the whole simulated area (the
+/// pilot's ask, 2026-10-13, first 40 nm for TCAS range, then all of the
+/// 100 nm world; at LEMG with LXGB beside it the frame rate held, see the
+/// history). The cap below still bounds the cost.
+pub(crate) const DRAW_RANGE_NM: f64 = 100.0;
 
 /// A drawn aircraft stays drawn until this far, nm: one flying along the
 /// ring does not flicker in and out (the plugin destroys and recreates
 /// the plane on every roster change).
-pub(crate) const DRAW_OUT_NM: f64 = 44.0;
+pub(crate) const DRAW_OUT_NM: f64 = 110.0;
 
 /// At most this many aircraft drawn, nearest first (the design's budget:
 /// LEMG's 10:00 start draws about 40 moving plus up to 80 parked,
@@ -375,11 +377,12 @@ mod tests {
             let a = [north_of(&one[0], 7, own, nm, false)];
             ids(&cull.select(Some(own), &a.iter().collect::<Vec<_>>()))
         };
-        assert!(at(42.0).is_empty(), "42 nm coming in");
-        assert_eq!(at(39.0), [7]);
-        assert_eq!(at(43.5), [7], "kept on the ring");
-        assert!(at(44.5).is_empty(), "gone past 44 nm");
-        assert!(at(43.0).is_empty(), "not back before 40 nm");
+        let mid = (DRAW_RANGE_NM + DRAW_OUT_NM) / 2.0;
+        assert!(at(mid).is_empty(), "between the rings coming in");
+        assert_eq!(at(DRAW_RANGE_NM - 1.0), [7]);
+        assert_eq!(at(DRAW_OUT_NM - 0.5), [7], "kept on the ring");
+        assert!(at(DRAW_OUT_NM + 0.5).is_empty(), "gone past the outer ring");
+        assert!(at(mid).is_empty(), "not back before the inner ring");
     }
 
     /// THE CAP (stage 1): past [`DRAW_MAX`] the parked aircraft beyond
