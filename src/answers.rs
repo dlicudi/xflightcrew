@@ -496,8 +496,7 @@ pub(crate) fn remote_weather_target(
                     // Not on the plan: only if the METAR file actually lists it,
                     // so "in this" or "at that" never becomes an airport.
                     let on_file = || {
-                        weather::latest_file(&crate::config::xplane_root())
-                            .and_then(|p| std::fs::read_to_string(p).ok())
+                        weather::latest_text(&crate::config::xplane_root())
                             .is_some_and(|text| weather::has_station(&text, &icao))
                     };
                     if known

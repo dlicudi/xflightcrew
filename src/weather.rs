@@ -66,6 +66,27 @@ pub fn has_station(text: &str, icao: &str) -> bool {
     line_for(text, icao).is_some()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's METAR text in place of the sim's file: CI has no X-Plane.
+    static TEST_METARS: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Stand in `text` for the sim's METAR file on this test's thread.
+#[cfg(test)]
+pub fn set_test_metars(text: Option<&str>) {
+    TEST_METARS.with(|t| *t.borrow_mut() = text.map(str::to_string));
+}
+
+/// The newest METAR file's text under `xplane_root`, if there is one.
+pub fn latest_text(xplane_root: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(t) = TEST_METARS.with(|t| t.borrow().clone()) {
+        return Some(t);
+    }
+    latest_file(xplane_root).and_then(|p| std::fs::read_to_string(p).ok())
+}
+
 fn num(s: &str) -> Option<u32> {
     (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok())?
 }

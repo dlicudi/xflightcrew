@@ -2180,6 +2180,13 @@ pub(crate) mod tests {
     /// that drifts out of the grammar fails here, not in the cockpit.
     #[test]
     fn every_button_routes_where_it_says() {
+        // The weather buttons' fields as the sim's METAR file would list
+        // them (CI has no X-Plane, so no file).
+        crate::weather::set_test_metars(Some(
+            "EGKK 131920Z 24008KT 9999 FEW030 14/09 Q1018\n\
+             LEMG 131930Z 13004KT CAVOK 22/15 Q1024\n\
+             KSFO 131956Z 29012KT 10SM FEW008 17/12 A3001\n",
+        ));
         let prof = crate::aircraft::load("boeing_737_800").expect("profile");
         let reg = crate::tools::Registry::for_aircraft(&prof);
         let routed = |words: &str| -> Route {

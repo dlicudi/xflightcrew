@@ -469,7 +469,23 @@ pub enum OurChange {
 /// How long the ledger remembers, s.
 pub const LEDGER_S: f64 = 300.0;
 
-static LEDGER: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, OurChange)>> =
+/// One ledger entry: when, what, and (under test) the thread that made it.
+type Entry = (std::time::Instant, OurChange, Writer);
+
+/// Who made a change. One process is one crew, so one writer; tests run in
+/// parallel threads, each its own crew, and a press of another test's must
+/// never read as ours (it held back a test's own presses on CI).
+#[cfg(not(test))]
+type Writer = ();
+#[cfg(test)]
+type Writer = std::thread::ThreadId;
+
+fn writer() -> Writer {
+    #[cfg(test)]
+    return std::thread::current().id();
+}
+
+static LEDGER: std::sync::Mutex<std::collections::VecDeque<Entry>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
 fn note(c: OurChange) {
@@ -477,11 +493,11 @@ fn note(c: OurChange) {
     let mut l = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
     while l
         .front()
-        .is_some_and(|(t, _)| now.duration_since(*t).as_secs_f64() > LEDGER_S)
+        .is_some_and(|(t, _, _)| now.duration_since(*t).as_secs_f64() > LEDGER_S)
     {
         l.pop_front();
     }
-    l.push_back((now, c));
+    l.push_back((now, c, writer()));
 }
 
 /// Every change of ours since `since` (oldest first). The one question a
@@ -489,12 +505,13 @@ fn note(c: OurChange) {
 /// in the tree goes through this module (`every_mcp_write_goes_through_the_owner`),
 /// so a change this ledger does not hold was someone else's.
 pub fn ours_since(since: std::time::Instant) -> Vec<(std::time::Instant, OurChange)> {
+    let me = writer();
     LEDGER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .filter(|(t, _)| *t >= since)
-        .copied()
+        .filter(|(t, _, w)| *t >= since && *w == me)
+        .map(|(t, c, _)| (*t, *c))
         .collect()
 }
 
