@@ -1317,8 +1317,12 @@ protected:
             for (int c = 0; c < 7; ++c) {
                 ImGui::TableSetColumnIndex(c);
                 // The expected time only where it differs from the timetable.
-                const std::string& v = (c == 1 && r[2] == r[1]) ? std::string() : r[c + 1];
-                const ImU32 col = own ? COL_MAGENTA : (c == 1 ? COL_AMBER : COL_WHITE);
+                // An expected time equal to the schedule reads "On time",
+                // dimmed, as an airport board shows it (a blank read as a
+                // missing estimate, 2026-10-13).
+                const bool on_time = c == 1 && r[2] == r[1];
+                const std::string v = on_time ? std::string("On time") : r[c + 1];
+                const ImU32 col = own ? COL_MAGENTA : (on_time ? COL_DIM : (c == 1 ? COL_AMBER : COL_WHITE));
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%s", v.c_str());
             }
             ImGui::TableSetColumnIndex(7);
