@@ -38,6 +38,12 @@
 #include "panel.h"
 #include "traffic.h"
 
+// The build's identity as one plain string in the binary, for `xfc plugin
+// status` to read from an installed .xpl's bytes (src/plugin_install.rs
+// `marker`). Nothing here reads it; `used` keeps the linker from dropping it.
+__attribute__((used)) static const char kXfcPluginMarker[] =
+    "XFC_PLUGIN_VERSION=" XCOPILOT_VERSION ";XFC_PLUGIN_BUILD=" XCOPILOT_BUILD ";";
+
 // ---- lifecycle --------------------------------------------------------------
 
 PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {

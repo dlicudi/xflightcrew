@@ -739,6 +739,13 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   then shipped, WRITTEN there). Decided once, logged: `XCOPILOT_HOME` override, a dev checkout
   (the cwd, kept relative so every path is the string it was, or the binary's own checkout),
   installed (`~/Library/Application Support/XFlightCrew`, XDG on Linux). `xfc paths` says where.
+- **One `xfc` file needs nothing beside it** (2026-10-13): the resources are built in
+  (`crates/sim/build.rs`, a missing folder fails the build) and unpacked once to
+  `data()/resources/<build id>/` only when no `profiles/*.yaml` is on disk; on-disk and the
+  checkout always win. `xfc plugin status|install` (`src/plugin_install.rs`, the `embed-plugin`
+  feature, `scripts/build-release.sh`): `xcopilot/` removed first, backups to
+  `data()/plugin-backups/`, never inside `plugins/`; refused while X-Plane runs unless
+  `--while-running`; it NEVER reloads plugins. `xfc licenses` prints the notices verbatim.
 
 ## EFB: a page on the LAN (`src/efb/`, `docs/efb.md`)
 

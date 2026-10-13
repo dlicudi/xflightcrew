@@ -49,4 +49,39 @@ fn main() {
     for dir in ["src", "crates", "profiles", "Cargo.toml"] {
         println!("cargo:rerun-if-changed={dir}");
     }
+    embed_plugin();
+}
+
+/// The `embed-plugin` feature: the built `.xpl` (`XFC_PLUGIN_XPL`, set by
+/// scripts/build-release.sh) carried inside `xfc` for `xfc plugin install`
+/// (src/plugin_install.rs). Cargo cannot build the plugin (it needs the
+/// X-Plane SDK and clang), so a release builds it first and points here.
+fn embed_plugin() {
+    println!("cargo:rerun-if-env-changed=XFC_PLUGIN_XPL");
+    if std::env::var_os("CARGO_FEATURE_EMBED_PLUGIN").is_none() {
+        return;
+    }
+    let Some(path) = std::env::var_os("XFC_PLUGIN_XPL").filter(|p| !p.is_empty()) else {
+        panic!(
+            "the embed-plugin feature needs XFC_PLUGIN_XPL, the path of a built xflightcrew.xpl \
+             (make -C plugin; or run scripts/build-release.sh)"
+        );
+    };
+    let path = std::path::PathBuf::from(path);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "embed-plugin: XFC_PLUGIN_XPL={} cannot be read: {e}",
+            path.display()
+        )
+    });
+    // The marker `xfc plugin status` compares by (plugin/src/xflightcrew.cpp).
+    let needle = b"XFC_PLUGIN_VERSION=";
+    assert!(
+        bytes.windows(needle.len()).any(|w| w == needle),
+        "embed-plugin: {} carries no XFC_PLUGIN_VERSION marker (built before it; rebuild with make -C plugin)",
+        path.display()
+    );
+    let abs = path.canonicalize().unwrap();
+    println!("cargo:rerun-if-changed={}", abs.display());
+    println!("cargo:rustc-env=XFC_PLUGIN_XPL_FILE={}", abs.display());
 }

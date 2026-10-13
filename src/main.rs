@@ -49,6 +49,7 @@ mod handover;
 mod identify;
 mod flight_state;
 mod scoped;
+mod licenses;
 mod lifetimes;
 mod flightplan;
 mod flow;
@@ -77,6 +78,7 @@ mod phrase;
 mod pilot;
 mod pilot_altitude;
 mod plan;
+mod plugin_install;
 mod plugin_status;
 mod pollers;
 mod prefs;
@@ -210,6 +212,19 @@ async fn main() -> Result<()> {
     // `sim::paths`), the models, the log and the prefs. Never talks to the sim.
     if std::env::args().nth(1).as_deref() == Some("paths") {
         print!("{}", paths_report());
+        return Ok(());
+    }
+    // `xfc plugin status|install`: the X-Plane plugin this build carries
+    // (src/plugin_install.rs). Never talks to the sim, never reloads it.
+    if std::env::args().nth(1).as_deref() == Some("plugin") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        let ok = plugin_install::main_cmd(&rest)?;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    // `xfc licenses [--full]`: the notices this binary carries.
+    if std::env::args().nth(1).as_deref() == Some("licenses") {
+        let full = std::env::args().nth(2).as_deref() == Some("--full");
+        print!("{}", licenses::text(full));
         return Ok(());
     }
     let tui = config.ui == "tui";
@@ -1107,7 +1122,7 @@ fn paths_report() -> String {
     use sim::paths;
     let r = paths::roots();
     let mut out = format!("mode:       {}\n", r.mode.as_str());
-    out += &format!("resources:  {}\n", paths::shown(&r.resources));
+    out += &format!("resources:  {}\n", paths::resources_shown());
     if let Some(missing) = paths::missing_line() {
         out += &format!("            ({missing})\n");
     }

@@ -70,4 +70,6 @@ design rules are in [CLAUDE.md](CLAUDE.md); the history behind them is in
 
 GPL-3.0-or-later ([LICENSE](LICENSE)). Third-party parts keep their own
 licences, all GPL-compatible: the X-Plane SDK (MIT/BSD), Dear ImGui (MIT),
-XPMP2 (MIT) and the B612 font (SIL OFL). CSL models are not bundled.
+XPMP2 (MIT), the B612 font (SIL OFL) and the AFV-Native radio sounds
+(BSD-3-Clause). CSL models are not bundled. `xfc licenses` prints every
+notice.
