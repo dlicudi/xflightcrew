@@ -14708,3 +14708,67 @@ the first movement on the ground a minute in.
   stand; the Board tab against the arrivals seen on final. Owed: the LXGB arrival flew 27
   while the tower worked 09 in the harness (the runway in use not known at spawn, as
   before this change).
+
+## 2026-10-13: the board's gaps, its stands and its field selector (LEMG, LXGB)
+
+The pilot at LEMG, 08:00 local on a summer Tuesday, on the new Board tab: no arrival from
+08:06 to 09:03 and no departure from 08:47 to 09:45, the 09:00 arrivals bunched inside eight
+minutes; a Stand column of "10", "77", "Gate 21"; departures Boarding with no stand; and only
+the field the traffic runs at.
+
+- **Lines of flying** (`crates/traffic/src/rotation.rs` `line_visits`, `routes::LINES`,
+  `crates/traffic/src/places.rs`): Malaga's rows had three fixed windows (the low-cost banks
+  09:00 to 12:00, 13:30 to 17:00, 19:00 to 23:00; a hub day 08:30 to 22:30; a shuttle 07:30
+  to 23:00) and the gaps were the windows' edges. Each route's day is now built from first
+  principles: a block time from the other end's place (the 129 places a table names, read
+  once from Global Airports apt.dat; 430 kt jet, 270 kt turboprop, 36 min on top: Gatwick
+  2 h 40, Madrid 1 h 08) and the type's planned turnaround; a based aircraft leaves in the
+  morning wave (06:00 to 09:30) having come in last night and is back every cycle; a visitor
+  arrives a block time after its own base's morning departure (05:30 on, up to three
+  quarters of a cycle later), on our clock (each country's offset and summer time, `places::
+  clock`); more rotations than one aircraft flies take more aircraft staggered through the
+  cycle; every time on five minutes. Gibraltar keeps its published slots.
+  Scheduled movements by local hour, 2026-07-14, seed 3 (before, then after):
+  - LEMG arrivals 07..23h: `4 1 19 20 20 8 12 17 13 10 5 6 18 16 17 18 0` then
+    `3 6 10 17 19 8 21 20 12 8 15 9 12 17 6 6 4`
+  - LEMG departures 06..23h: `10 12 4 8 18 20 15 7 13 16 17 7 8 6 15 17 21 12` then
+    `7 12 13 10 15 16 16 11 22 19 10 11 11 12 11 16 4 6`
+  - LXGB unchanged: arrivals one each at 10, 12 to 16h; departures at 11, 13, 14 (two), 16, 17h.
+  Over the summer week the longest wait between arrivals 08:30 to 22:00 is 25 min
+  and between departures 06:30 to 22:00 at most 35 min (the pilot's board: 57 and 58); every five minutes of the hour within
+  half again its share, :00 no busier than the rest (`a_week_at_malaga_is_continuous_and_
+  never_on_the_hour`).
+- **The stand plan** (`crates/traffic/src/stands.rs` `plan`): a stand was known only once an
+  aircraft stood on one (the inbound parked, or the start placed it), and a departure the start
+  could not stand (the stands kept free for arrivals) had none until it appeared at its time.
+  Each rotation now gets its stand when the day is planned, as a stand planner does: a contact
+  gate before a remote stand (LEMG: 31 gates, 94 tie-downs), clear of the lanes, the tightest
+  size, held 15 min before the arrival to 15 min after the departure, never over a stand drawn
+  on top. The mid-flow start parks on it where free; the board shows the stand an aircraft
+  holds once it holds one, else the plan's (an arrival's only once landed).
+- **Stand names** (`stands::label`): the board names a stand by the field's own number, the
+  apt.dat name with a leading "Gate", "Stand", "Parking" or "Position" dropped ("Gate 21"
+  reads "21", "02", "90F", "W3" as written), as a FIDS column headed Stand does; kept whole
+  where the short name is another stand's.
+- **The field selector**: the board header carries the fields the tab may show
+  (`H|field|HH:MM|LEMG,LXGB`: the active one first, then every timetable field within 100 nm,
+  `traffic_link::board_choices`); the plugin's combo writes `xcopilot/opt/board_field`
+  (empty for our traffic's), the app reads it as the board is due and publishes that field's
+  board (`RemoteBoard`: `midflow::timetable_board` built off the tick, statuses by the clock,
+  `board::Status::by_clock`, rebuilt every 6 h of sim time). An older plugin reads the first
+  three header fields; with an older app no list comes and the tab shows the field as before.
+- **Harness** (`real_install_midflow_start` at 08:00 and 10:00, the two-field hour sweep):
+  every departure on the start's board has its stand, none reads "Gate ...". 08:00: LEMG 3
+  placed, 0 conflicts, 0 oracle, 2 of 2 readbacks, 1 overlap (a taxi-out 18.3 m past a parked
+  aircraft). 10:00: 5 placed (three on the approach at 5, 9 and 13 nm), 0 conflicts, 0 oracle,
+  10 of 10 readbacks, 1 overlap, 0 go-arounds, final gap 4.1 nm least. The hour at 10:00: LEMG
+  16 landings, 0 conflicts, 0 oracle, 18 of 18 readbacks, 2 overlaps (taxi-outs 18.4 and 18.9
+  m past parked aircraft), 1 go-around, final gap 4.1 nm least and 6.3 median; LXGB clean, its
+  one go-around as before. The design for many fields at once is
+  `docs/tasks/multi-field-traffic/DESIGN.md`.
+
+- **UNFLOWN.** Next session at LEMG with `XCOPILOT_TRAFFIC=ours`, after the plugin is installed
+  and reloaded: the Board tab at 08:00 with arrivals and departures through the morning; every
+  Stand cell filled for departures, numbers only; the selector offering LXGB, its board by the
+  clock, back to LEMG on "(our traffic)"; the log line `traffic: a board for another field`.
+  Owed: the planned stand is not yet kept clear of a neighbour's way out (the two 18 m overlaps).

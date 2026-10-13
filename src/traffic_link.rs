@@ -543,10 +543,22 @@ impl Link {
     /// inbound's while it turns round), the live ETA of an arrival in the
     /// air, the actual time once it happened, its stand; `own` adds our own
     /// flight. Empty with nothing to show.
-    pub(crate) fn board_payload(&self, own: Option<traffic::board::BoardFlight>) -> String {
+    pub(crate) fn board_payload(
+        &self,
+        own: Option<traffic::board::BoardFlight>,
+        choices: &[String],
+    ) -> String {
         use traffic::board::{Dir, Row, Seen, Status};
         let now = self.local_now_s();
         let find = |cs: &str| self.fleet.aircraft().iter().find(|a| a.callsign == cs);
+        let names: Vec<&str> = self
+            .fleet
+            .field
+            .net
+            .stands
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
         let rows: Vec<Row> = self
             .board
             .iter()
@@ -578,7 +590,33 @@ impl Link {
                     .copied()
                     .or(eta)
                     .or(f.info.est_s);
-                let stand = ac.and_then(|a| a.stand.clone());
+                // The stand the aircraft holds once it holds one (its own,
+                // or a departure's inbound's on the ground: a gate change
+                // where it parked elsewhere), else the field's plan; an
+                // arrival's only once it is down (2026-10-13: departures
+                // Boarding with an empty Stand column).
+                let holding = ac.and_then(|a| a.stand.clone()).or_else(|| {
+                    (f.dir == Dir::Departure)
+                        .then(|| {
+                            let inbound = f.info.inbound.as_deref()?;
+                            self.fleet
+                                .aircraft()
+                                .iter()
+                                .find(|a| a.callsign == inbound && !a.phase.airborne())?
+                                .stand
+                                .clone()
+                        })
+                        .flatten()
+                });
+                let planned = match f.dir {
+                    Dir::Departure => f.info.stand.clone(),
+                    Dir::Arrival => matches!(status, Status::Landed | Status::AtGate)
+                        .then(|| f.info.stand.clone())
+                        .flatten(),
+                };
+                let stand = holding
+                    .or(planned)
+                    .map(|n| traffic::stands::label(&n, &names));
                 Row {
                     flight: f,
                     status,
@@ -587,7 +625,7 @@ impl Link {
                 }
             })
             .collect();
-        traffic::board::payload(self.icao(), now, &rows)
+        traffic::board::payload(self.icao(), now, &rows, choices)
     }
 
     /// The board's actual times from this tick's events: a departure's
@@ -1414,6 +1452,13 @@ pub(crate) struct TrafficWorld {
     /// The Board tab as last sent, and when.
     board_last: String,
     board_sent: Option<Instant>,
+    /// The Board tab's other field (2026-10-13): its board by the clock,
+    /// built off the tick once picked, and one being built.
+    remote: Option<RemoteBoard>,
+    remote_loading: Option<(String, std::sync::mpsc::Receiver<Option<RemoteBoard>>)>,
+    /// The plugin has no field pick (an older one): not asked again before
+    /// this.
+    board_pick_quiet_until: Option<Instant>,
 }
 
 /// The Board tab is resent at most this often on a change, and this often
@@ -1581,21 +1626,6 @@ impl TrafficWorld {
             sink.publish(link.fleet().aircraft(), self.last_sim_s.unwrap_or(0.0));
         }
         record(&out, link);
-        // The Board tab: on a change, at most every 2 s, and every 10 s
-        // regardless (a plugin reload zeroes its buffer).
-        if let Some(s) = status {
-            let payload = link.board_payload(own_board_flight(link.icao()));
-            let since = self.board_sent.map(|t| now.saturating_duration_since(t));
-            let due = match since {
-                None => true,
-                Some(d) => (payload != self.board_last && d >= BOARD_MIN_GAP) || d >= BOARD_RESEND,
-            };
-            if due {
-                s.board(&payload);
-                self.board_last = payload;
-                self.board_sent = Some(now);
-            }
-        }
         // The frequencies: the tower's runway-watch lines in the tower's
         // voice, the positions' handoffs in theirs, each on its own
         // frequency. The calls themselves are said with their answers, on
@@ -1607,7 +1637,128 @@ impl TrafficWorld {
         for (id, line, who) in &out.positions {
             voice.overhear_checked(*who, *who, line, now, still_valid(*id));
         }
+        if let Some(s) = status {
+            self.publish_board(xp, s, (snap.lat, snap.lon), now).await;
+        }
         Some(out)
+    }
+
+    /// The Board tab: on a change, at most every 2 s, and every 10 s
+    /// regardless (a plugin reload zeroes its buffer). The field is the
+    /// panel's pick among [`board_choices`] (read as the board is due),
+    /// else the one the traffic runs at.
+    async fn publish_board(
+        &mut self,
+        xp: &crate::xplane::XPlaneClient,
+        s: &crate::plugin_status::StatusSink,
+        own: (f64, f64),
+        now: Instant,
+    ) {
+        let since = self.board_sent.map(|t| now.saturating_duration_since(t));
+        if since.is_some_and(|d| d < BOARD_MIN_GAP) {
+            return;
+        }
+        let Some(active) = self.link.as_ref().map(|l| l.icao().to_string()) else {
+            return;
+        };
+        let choices = board_choices(&active, own);
+        let pick = if choices.len() > 1 {
+            self.board_pick(xp, now).await
+        } else {
+            None
+        };
+        let sim_s = self.last_sim_s.unwrap_or(0.0);
+        let shown = board_field(pick.as_deref(), &choices).map(str::to_string);
+        if let Some((_, rx)) = &self.remote_loading {
+            match rx.try_recv() {
+                Ok(b) => {
+                    self.remote = b;
+                    self.remote_loading = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.remote_loading = None,
+            }
+        }
+        if let Some(icao) = &shown {
+            let fresh = self
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.icao.eq_ignore_ascii_case(icao) && !r.stale(sim_s));
+            let loading = self
+                .remote_loading
+                .as_ref()
+                .is_some_and(|(i, _)| i.eq_ignore_ascii_case(icao));
+            if !fresh && !loading {
+                let zulu = sim_zulu_s(xp).await;
+                let day = sim_date_days(xp).await;
+                self.remote_loading =
+                    Some((icao.clone(), self.build_remote(icao, zulu, day, sim_s)));
+            }
+        }
+        let list: &[String] = if choices.len() > 1 { &choices } else { &[] };
+        let payload = match (&shown, &self.remote) {
+            (Some(icao), Some(r)) if r.icao.eq_ignore_ascii_case(icao) => r.payload(sim_s, list),
+            _ => match self.link.as_ref() {
+                Some(link) => link.board_payload(own_board_flight(link.icao()), list),
+                None => return,
+            },
+        };
+        let due = since.is_none_or(|d| payload != self.board_last || d >= BOARD_RESEND);
+        if due {
+            s.board(&payload);
+            self.board_last = payload;
+            self.board_sent = Some(now);
+        }
+    }
+
+    /// The panel's field pick ([`DR_BOARD_FIELD`]), upper case; `None` for
+    /// none, or a plugin without it (not asked again for a minute).
+    async fn board_pick(
+        &mut self,
+        xp: &crate::xplane::XPlaneClient,
+        now: Instant,
+    ) -> Option<String> {
+        if self.board_pick_quiet_until.is_some_and(|t| now < t) {
+            return None;
+        }
+        match xp.get_string(DR_BOARD_FIELD).await {
+            Ok(v) => {
+                self.board_pick_quiet_until = None;
+                let v = v.trim().to_ascii_uppercase();
+                (!v.is_empty()).then_some(v)
+            }
+            Err(_) => {
+                self.board_pick_quiet_until = Some(now + std::time::Duration::from_secs(60));
+                None
+            }
+        }
+    }
+
+    /// Build a remote field's board off the tick.
+    fn build_remote(
+        &self,
+        icao: &str,
+        zulu: Option<f64>,
+        day: Option<u32>,
+        sim0_s: f64,
+    ) -> std::sync::mpsc::Receiver<Option<RemoteBoard>> {
+        let cfg = crate::settings::live();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (icao, apt) = (icao.to_string(), cfg.apt_data_path.clone());
+        let density =
+            traffic::Density::parse(&cfg.traffic_density).unwrap_or(traffic::Density::Normal);
+        let spawned = std::thread::Builder::new()
+            .name("traffic-board".into())
+            .spawn(move || {
+                let b = RemoteBoard::build(&icao, &apt, density, zulu, day, sim0_s);
+                tracing::info!(%icao, flights = b.as_ref().map(|b| b.flights.len()),
+                    "traffic: a board for another field");
+                let _ = tx.send(b);
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("traffic: the board loader did not start: {e}");
+        }
+        rx
     }
 
     /// Drop the link: every strip it opened retired, the picture withdrawn.
@@ -1633,6 +1784,8 @@ impl TrafficWorld {
         // has a link, or never while none).
         self.board_last.clear();
         self.board_sent = None;
+        self.remote = None;
+        self.remote_loading = None;
         self.loading = None;
         self.last_sim_s = None;
         self.hours = None;
@@ -1805,14 +1958,7 @@ pub(crate) fn timetable_start(
     day: Option<u32>,
     runway: Option<String>,
 ) -> (Vec<Movement>, Vec<traffic::board::BoardFlight>, f64) {
-    use traffic::rotation::Date;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64());
-    let today = Date::from_epoch_days((now / 86_400.0).floor() as i64);
-    let date = day.map_or(today, |o| Date::of_year(today.year, o));
-    let zulu = zulu_s.unwrap_or(now % 86_400.0);
-    let local_s = traffic::rotation::local_s(zulu, table.utc_offset_h, date);
+    let (date, zulu, local_s) = timetable_clock(table, zulu_s, day);
     let ctx = SpawnCtx {
         runway,
         zulu_s: Some(zulu),
@@ -1840,6 +1986,168 @@ pub(crate) fn timetable_start(
 
 /// A timetable field flies this much of its day from the start.
 pub(crate) const TIMETABLE_HORIZON_S: f64 = 24.0 * 3600.0;
+
+/// A timetable's day and clock: the sim's date and zulu time when they
+/// read, else the system clock's (the year is the system clock's, X-Plane's
+/// date carries none): (date, zulu seconds, local seconds after the
+/// date's midnight at the table's field).
+fn timetable_clock(
+    table: &traffic::routes::FieldRoutes,
+    zulu_s: Option<f64>,
+    day: Option<u32>,
+) -> (traffic::rotation::Date, f64, f64) {
+    use traffic::rotation::Date;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    let today = Date::from_epoch_days((now / 86_400.0).floor() as i64);
+    let date = day.map_or(today, |o| Date::of_year(today.year, o));
+    let zulu = zulu_s.unwrap_or(now % 86_400.0);
+    (
+        date,
+        zulu,
+        traffic::rotation::local_s(zulu, table.utc_offset_h, date),
+    )
+}
+
+/// The Board tab offers every field with a timetable this near us, nm
+/// (2026-10-13; Malaga and Gibraltar are 54 nm apart).
+pub(crate) const BOARD_RANGE_NM: f64 = 100.0;
+
+/// The Board tab's field pick, plugin to app: an ICAO, empty for the field
+/// the traffic runs at (2026-10-13). An older plugin has none: the board
+/// stays the active field's.
+pub(crate) const DR_BOARD_FIELD: &str = "xcopilot/opt/board_field";
+
+/// The fields the Board tab can show: the one the traffic runs at first
+/// (its board is the live one), then every other field with a route table
+/// within [`BOARD_RANGE_NM`] of `own` (lat, lon), nearest first. Pure.
+pub(crate) fn board_choices(active: &str, own: (f64, f64)) -> Vec<String> {
+    let mut near: Vec<(f64, &str)> = traffic::routes::fields()
+        .iter()
+        .filter(|f| !f.icao.eq_ignore_ascii_case(active))
+        .filter_map(|f| {
+            let d = traffic::places::dist_nm(own, traffic::places::position(f.icao)?);
+            (d <= BOARD_RANGE_NM).then_some((d, f.icao))
+        })
+        .collect();
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    std::iter::once(active.to_ascii_uppercase())
+        .chain(near.into_iter().map(|(_, i)| i.to_string()))
+        .collect()
+}
+
+/// The field whose board to show: the pick when it is one of `choices`
+/// other than the active one (the first), else the active one. Pure.
+pub(crate) fn board_field<'a>(pick: Option<&str>, choices: &'a [String]) -> Option<&'a str> {
+    let p = pick?.trim();
+    choices
+        .iter()
+        .skip(1)
+        .find(|c| c.eq_ignore_ascii_case(p))
+        .map(String::as_str)
+}
+
+/// A remote board is built again after this much sim time, seconds.
+const REMOTE_BOARD_REBUILD_S: f64 = 6.0 * 3600.0;
+
+/// The seed of a field the fleet does not fly: its timetable's delays are
+/// the first link's (the same seed the fleet gets when it is the first
+/// field of a session).
+const REMOTE_BOARD_SEED: u64 = 1;
+
+/// The board of a field with a timetable that the fleet does not fly
+/// (2026-10-13, the Board tab's selector): its flights round the time it
+/// was built (`traffic::midflow::timetable_board`, its planned stands),
+/// the statuses by the clock (`Status::by_clock`), since its aircraft are
+/// not simulated.
+pub(crate) struct RemoteBoard {
+    icao: String,
+    flights: Vec<traffic::board::BoardFlight>,
+    names: Vec<String>,
+    /// Local seconds at the field when built, and the sim's running time
+    /// then: the board's clock runs with the sim's.
+    t0_local_s: f64,
+    sim0_s: f64,
+}
+
+impl RemoteBoard {
+    /// Built off the tick: the field from apt.dat and its timetable;
+    /// `None` without either.
+    pub(crate) fn build(
+        icao: &str,
+        apt: &str,
+        density: traffic::Density,
+        zulu_s: Option<f64>,
+        day: Option<u32>,
+        sim0_s: f64,
+    ) -> Option<RemoteBoard> {
+        let table = traffic::routes::field_routes(icao)?;
+        let field = FieldModel::load(apt, icao).ok()??;
+        let (date, _, local_s) = timetable_clock(table, zulu_s, day);
+        Some(RemoteBoard::from_field(
+            &field, table, density, date, local_s, sim0_s,
+        ))
+    }
+
+    /// The board of `field` at `local_s` on `date`. Pure.
+    pub(crate) fn from_field(
+        field: &FieldModel,
+        table: &traffic::routes::FieldRoutes,
+        density: traffic::Density,
+        date: traffic::rotation::Date,
+        local_s: f64,
+        sim0_s: f64,
+    ) -> RemoteBoard {
+        RemoteBoard {
+            icao: field.icao.clone(),
+            flights: traffic::midflow::timetable_board(
+                field,
+                table,
+                density,
+                REMOTE_BOARD_SEED,
+                date,
+                local_s,
+                TIMETABLE_HORIZON_S,
+            ),
+            names: field.net.stands.iter().map(|s| s.name.clone()).collect(),
+            t0_local_s: local_s,
+            sim0_s,
+        }
+    }
+
+    fn stale(&self, sim_s: f64) -> bool {
+        sim_s - self.sim0_s > REMOTE_BOARD_REBUILD_S || sim_s < self.sim0_s
+    }
+
+    /// The payload at sim running time `sim_s`: each flight's status by
+    /// the clock, a departure's planned stand, an arrival's once landed.
+    pub(crate) fn payload(&self, sim_s: f64, choices: &[String]) -> String {
+        use traffic::board::{Dir, Row, Status};
+        let now = self.t0_local_s + (sim_s - self.sim0_s).max(0.0);
+        let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
+        let rows: Vec<Row> = self
+            .flights
+            .iter()
+            .map(|f| {
+                let status = Status::by_clock(f, now);
+                let shown = f.dir == Dir::Departure || status == Status::Landed;
+                Row {
+                    flight: f.clone(),
+                    status,
+                    time_s: f.info.est_s,
+                    stand: f
+                        .info
+                        .stand
+                        .as_deref()
+                        .filter(|_| shown)
+                        .map(|n| traffic::stands::label(n, &names)),
+                }
+            })
+            .collect();
+        traffic::board::payload(&self.icao, now, &rows, choices)
+    }
+}
 
 /// The sim's date, days since the first of January; `None` on a failed
 /// read.

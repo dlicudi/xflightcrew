@@ -248,13 +248,251 @@ fn leg(carrier: &Carrier, number: u32, row: &RouteRow, sched_s: f64, est_s: f64)
     }
 }
 
-/// The rotations of `table` on `date`, times local to `date`'s midnight:
-/// for each row its day's count; with a based row its FIRST rotation
-/// night-stops (in the evening before, 22:30 to 23:45, out in the morning
-/// wave, 06:15 to 07:45); the rest arrive in the row's windows and leave a
-/// turnaround later. A late inbound pushes its outbound back to the
-/// type's minimum turnaround. At [`Density::Light`] half of them
-/// (deterministically), at `Off` none.
+/// A base's morning wave: its based aircraft leave between these, local
+/// hours (Malaga's first departures from 06:00, a base of ten or more
+/// aircraft off by 08:30).
+const WAVE_FIRST_H: f64 = 6.0;
+const WAVE_SPAN_H: f64 = 3.5;
+
+/// A visitor's line reaches us in its first wave or after a sector
+/// elsewhere: its first departure from its base is up to this share of a
+/// cycle after the wave opens (at 0 every UK route's first arrival fell
+/// 09:40 to 11:25, 34 arrivals in the 10:00 hour and 4 at noon).
+const VISITOR_PHASE: f64 = 0.75;
+const VISITOR_FIRST_H: f64 = 5.5;
+
+/// The latest a line's arrival is timetabled, local hours: the night is
+/// quiet (Malaga has no scheduled movement 01:00 to 06:00).
+const LINE_LAST_ARR_H: f64 = 23.75;
+
+/// Block-time cruise, knots, and the minutes on top for the taxi, climb
+/// and descent: Malaga to Gatwick (892 nm) 2 h 40 against easyJet's 2 h 45,
+/// to Madrid (233 nm) 1 h 08 against Iberia's 1 h 10.
+const JET_BLOCK_KTS: f64 = 430.0;
+const PROP_BLOCK_KTS: f64 = 270.0;
+const BLOCK_EXTRA_S: f64 = 36.0 * 60.0;
+
+/// The most aircraft one route's lines take.
+const LINE_AIRCRAFT_MAX: u32 = 12;
+
+/// A timetable time is on five minutes, as published.
+fn on_five(s: f64) -> f64 {
+    (s / 300.0).round() * 300.0
+}
+
+/// The type a route is timetabled for: its heaviest weight.
+fn main_type(types: &'static [(&'static str, u32)]) -> &'static str {
+    types.iter().max_by_key(|t| t.1).map_or("A320", |t| t.0)
+}
+
+/// Gate to gate from `from` to `to` in `icao_type`, seconds, where both
+/// are places we know ([`crate::places`]).
+pub fn block_s(from: &str, to: &str, icao_type: &str) -> Option<f64> {
+    let nm = crate::places::dist_nm(crate::places::position(from)?, crate::places::position(to)?);
+    let kts = if class_for_type(icao_type).0.name == TURBOPROP.name {
+        PROP_BLOCK_KTS
+    } else {
+        JET_BLOCK_KTS
+    };
+    Some(nm / kts * 3600.0 + BLOCK_EXTRA_S)
+}
+
+/// The middle of the type's planned turnaround ([`sched_turn_s`]): the
+/// one the timetable plans its lines on.
+fn plan_turn_s(icao_type: &str) -> f64 {
+    let p = class_for_type(icao_type).0;
+    60.0 * if p.name == JET_HEAVY.name {
+        105.0
+    } else if p.name == TURBOPROP.name {
+        30.0
+    } else {
+        47.5
+    }
+}
+
+/// One timetabled visit before the day's draws: on the blocks here, and,
+/// for a night-stop, off them in the morning wave.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Visit {
+    sta: f64,
+    std: Option<f64>,
+    night_stop: bool,
+}
+
+/// `n` picks spread evenly over `slots` (sorted), each route its own
+/// stable offset `off` (0 to 1) into the spacing.
+fn spread(slots: &[f64], n: usize, off: f64) -> Vec<f64> {
+    let s = slots.len();
+    if s == 0 {
+        return Vec::new();
+    }
+    (0..n)
+        .map(|k| {
+            let i = ((k as f64 + off) * s as f64 / n as f64).floor() as usize;
+            slots[i.min(s - 1)]
+        })
+        .collect()
+}
+
+/// The visits of a row flown on its carrier's LINES OF FLYING
+/// ([`crate::routes::LINES`]), `n` of them on `date`, local seconds; `None`
+/// where either end has no place. From first principles: an aircraft's
+/// day starts at its BASE in the morning wave (06:00 to 07:45 there, each
+/// route its own stable minute) and goes on one rotation every CYCLE (a
+/// block time each way and a turnaround at each end).
+///
+/// - A visitor (based at the other end) arrives first a block time after
+///   its morning departure, on our clock; its later slots are a cycle
+///   apart until the last arrival of the evening. More rotations than one
+///   aircraft's slots take more aircraft, staggered through the cycle; a
+///   route flown less often takes its picks spread evenly over the slots
+///   (the aircraft flies elsewhere in between).
+/// - A BASED row's aircraft night-stop here: each leaves in the morning
+///   wave and is back a cycle less a turnaround later, and again every
+///   cycle on; its last return of the day night-stops (tomorrow's first
+///   rotation), its first rotation is the one that came in last night.
+fn line_visits(table: &FieldRoutes, row: &RouteRow, date: Date, n: u32) -> Option<Vec<Visit>> {
+    let types = if row.types.is_empty() {
+        row.carrier.types
+    } else {
+        row.types
+    };
+    let t = main_type(types);
+    let block = block_s(row.other, table.icao, t)?;
+    let turn = plan_turn_s(t);
+    let cycle = 2.0 * (block + turn);
+    let last = LINE_LAST_ARR_H * 3600.0;
+    let frac = |salt: u64| (row_hash(row, salt) % 10_000) as f64 / 10_000.0;
+    let n = n as usize;
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    if !row.based {
+        let summer = date.summer();
+        let here = table.utc_offset_h + if summer { 1.0 } else { 0.0 };
+        let tz = (here - crate::places::utc_offset_h(row.other, summer)) * 3600.0;
+        let phase = (WAVE_SPAN_H * 3600.0).max(VISITOR_PHASE * cycle);
+        let first = VISITOR_FIRST_H * 3600.0 + phase * frac(0x11) + tz + block;
+        let mut slots = Vec::new();
+        for a in 1..=LINE_AIRCRAFT_MAX {
+            slots.clear();
+            for i in 0..a {
+                let mut at = first + cycle * f64::from(i) / f64::from(a);
+                while at <= last {
+                    slots.push(at);
+                    at += cycle;
+                }
+            }
+            if slots.len() >= n {
+                break;
+            }
+        }
+        if slots.is_empty() {
+            slots.push(first.min(last));
+        }
+        slots.sort_by(f64::total_cmp);
+        let visits = spread(&slots, n, frac(0x22))
+            .into_iter()
+            .map(|sta| Visit {
+                sta,
+                std: None,
+                night_stop: false,
+            })
+            .collect();
+        return Some(visits);
+    }
+    // Based: each aircraft's departure in the wave and its returns.
+    let u = frac(0x33);
+    let mut lines: Vec<(f64, Vec<f64>)> = Vec::new();
+    for a in 1..=LINE_AIRCRAFT_MAX {
+        lines = (0..a)
+            .map(|i| {
+                let d = (WAVE_FIRST_H + WAVE_SPAN_H * (f64::from(i) + u) / f64::from(a)) * 3600.0;
+                let mut returns = Vec::new();
+                let mut r = d + cycle - turn;
+                while r <= last {
+                    returns.push(r);
+                    r += cycle;
+                }
+                (d, returns)
+            })
+            .collect();
+        let capacity: usize = lines.iter().map(|(_, r)| r.len().max(1)).sum();
+        if capacity >= n {
+            break;
+        }
+    }
+    // The rotations dealt round the aircraft, as many each as it flies.
+    let mut q = vec![0usize; lines.len()];
+    let mut dealt = 0;
+    loop {
+        let before = dealt;
+        for (i, (_, r)) in lines.iter().enumerate() {
+            if dealt < n && q[i] < r.len().max(1) {
+                q[i] += 1;
+                dealt += 1;
+            }
+        }
+        if dealt == before || dealt >= n {
+            break;
+        }
+    }
+    let off = frac(0x44);
+    let mut out = Vec::new();
+    for ((d, returns), q) in lines.iter().zip(q) {
+        if q == 0 {
+            continue;
+        }
+        // In last night as the day's last return, out in the wave.
+        let night = returns.last().copied().unwrap_or(last - 3600.0) - 86_400.0;
+        out.push(Visit {
+            sta: night,
+            std: Some(*d),
+            night_stop: true,
+        });
+        let day = &returns[..returns.len().saturating_sub(1)];
+        out.extend(spread(day, q - 1, off).into_iter().map(|sta| Visit {
+            sta,
+            std: None,
+            night_stop: false,
+        }));
+    }
+    Some(out)
+}
+
+/// The visits of a row with WINDOWS: for a based row its night-stop in the
+/// evening before (22:30 to 23:45) and out in the morning wave (06:15 to
+/// 07:45); the rest spread evenly through the windows ([`slot_s`]).
+fn window_visits(row: &RouteRow, n: u32) -> Vec<Visit> {
+    let through = if row.based { n.saturating_sub(1) } else { n };
+    (0..n)
+        .map(|k| {
+            if row.based && k == 0 {
+                let stable = (row_hash(row, 99) % 1000) as f64 / 1000.0;
+                Visit {
+                    sta: -3600.0 * (1.5 - 1.25 * stable),
+                    std: Some(3600.0 * (6.25 + 1.5 * stable)),
+                    night_stop: true,
+                }
+            } else {
+                let j = if row.based { k - 1 } else { k };
+                Visit {
+                    sta: slot_s(row, j, through.max(1)),
+                    std: None,
+                    night_stop: false,
+                }
+            }
+        })
+        .collect()
+}
+
+/// The rotations of `table` on `date`, times local to `date`'s midnight,
+/// on five minutes: for each row its day's count, on its lines of flying
+/// ([`line_visits`]) or in its windows ([`window_visits`]); a night-stop
+/// leaves in the morning wave, the rest a planned turnaround after they
+/// arrive. A late inbound pushes its outbound back to the type's minimum
+/// turnaround. At [`Density::Light`] half of them (deterministically), at
+/// `Off` none.
 pub fn day_rotations(
     table: &FieldRoutes,
     date: Date,
@@ -273,8 +511,13 @@ pub fn day_rotations(
         } else {
             row.types
         };
-        let through = if row.based { n.saturating_sub(1) } else { n };
-        for k in 0..n {
+        let lines = if row.windows.is_empty() {
+            line_visits(table, row, date, n)
+        } else {
+            None
+        };
+        let visits = lines.unwrap_or_else(|| window_visits(row, n));
+        for (k, v) in (0u32..).zip(visits) {
             let seed_k = row_hash(
                 row,
                 day_salt ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ u64::from(k),
@@ -286,17 +529,11 @@ pub fn day_rotations(
             let icao_type = pick_type(types, &mut rng);
             let in_no = row.number + 2 * k;
             let out_no = in_no + 1;
-            let night_stop = row.based && k == 0;
-            let (sta, std) = if night_stop {
-                let stable = (row_hash(row, 99 + u64::from(k)) % 1000) as f64 / 1000.0;
-                let sta = -3600.0 * (1.5 - 1.25 * stable);
-                let std = 3600.0 * (6.25 + 1.5 * stable);
-                (sta, std)
-            } else {
-                let j = if row.based { k - 1 } else { k };
-                let sta = slot_s(row, j, through.max(1));
-                (sta, sta + sched_turn_s(icao_type, &mut rng))
-            };
+            let sta = on_five(v.sta);
+            let std = on_five(
+                v.std
+                    .unwrap_or_else(|| sta + sched_turn_s(icao_type, &mut rng)),
+            );
             let eta = sta + delay_s(&mut rng);
             let etd = (std + delay_s(&mut rng).max(0.0)).max(eta + min_turn_s(icao_type));
             out.push(Rotation {
@@ -304,7 +541,7 @@ pub fn day_rotations(
                 icao_type,
                 arr: leg(&row.carrier, in_no, row, sta, eta),
                 dep: leg(&row.carrier, out_no, row, std, etd),
-                night_stop,
+                night_stop: v.night_stop,
                 seed: rng.next_u64(),
             });
         }
@@ -552,5 +789,100 @@ mod tests {
         assert!(ns
             .iter()
             .all(|r| r.arr.est_s < 0.0 && r.dep.sched_s > 6.0 * 3600.0));
+    }
+
+    /// Scheduled arrivals and departures by local hour, and by five
+    /// minutes past the hour.
+    fn by_hour(rs: &[Rotation]) -> ([u32; 24], [u32; 24], [u32; 12]) {
+        let (mut arr, mut dep, mut five) = ([0u32; 24], [0u32; 24], [0u32; 12]);
+        for r in rs {
+            for (t, h) in [(r.arr.sched_s, &mut arr), (r.dep.sched_s, &mut dep)] {
+                if (0.0..86_400.0).contains(&t) {
+                    h[(t / 3600.0) as usize] += 1;
+                    five[((t / 60.0) as usize % 60) / 5] += 1;
+                }
+            }
+        }
+        (arr, dep, five)
+    }
+
+    /// The longest wait between two scheduled times inside `from_h..to_h`,
+    /// minutes, and the local hour it starts at.
+    fn longest_gap(times: impl Iterator<Item = f64>, from_h: f64, to_h: f64) -> (f64, f64) {
+        let (a, b) = (from_h * 3600.0, to_h * 3600.0);
+        let mut v: Vec<f64> = times.filter(|t| (a..b).contains(t)).collect();
+        v.extend([a, b]);
+        v.sort_by(f64::total_cmp);
+        v.windows(2)
+            .map(|w| ((w[1] - w[0]) / 60.0, w[0] / 3600.0))
+            .fold((0.0, 0.0), |m, g| if g.0 > m.0 { g } else { m })
+    }
+
+    /// A summer week at Malaga is CONTINUOUS from the morning wave to the
+    /// evening, with banks, and never bunched on the hour: the pilot's
+    /// board at 08:00 local (2026-10-13) had no arrival from 08:06 to 09:03
+    /// and no departure from 08:47 to 09:45, and the 09:00 arrivals all
+    /// within eight minutes, where the windows began. Every hour from 08:00
+    /// to 22:00 has its arrivals and its departures, no wait between two
+    /// arrivals from 08:30 nor two departures from 06:30 is over 40
+    /// minutes up to 22:00, no five minutes past the hour holds more than
+    /// half again its share, and on the hour no more than any other. Run
+    /// with --nocapture for the counts.
+    #[test]
+    fn a_week_at_malaga_is_continuous_and_never_on_the_hour() {
+        for d in 0..7 {
+            let date = Date::ymd(2026, 7, 13).plus(d);
+            let rs = day("LEMG", date, 3);
+            let (arr, dep, five) = by_hour(&rs);
+            let ga = longest_gap(rs.iter().map(|r| r.arr.sched_s), 8.5, 22.0);
+            let gd = longest_gap(rs.iter().map(|r| r.dep.sched_s), 6.5, 22.0);
+            println!(
+                "LEMG {date:?}\n  arr {arr:?}\n  dep {dep:?}\n  five {five:?} gaps arr {ga:?} dep {gd:?}"
+            );
+            for h in 8..22 {
+                assert!(arr[h] >= 3 && dep[h] >= 3, "{h}:00 arr {arr:?} dep {dep:?}");
+            }
+            assert!(ga.0 <= 40.0 && gd.0 <= 40.0, "{ga:?} {gd:?}");
+            let mean = f64::from(five.iter().sum::<u32>()) / 12.0;
+            assert!(five.iter().all(|c| f64::from(*c) <= 1.5 * mean), "{five:?}");
+            assert!(five[0] <= *five[1..].iter().max().unwrap(), "{five:?}");
+        }
+        let winter = day("LEMG", Date::ymd(2026, 1, 20), 3);
+        let (arr, dep, _) = by_hour(&winter);
+        assert!((9..21).all(|h| arr[h] > 0 && dep[h] > 0), "{arr:?} {dep:?}");
+        // Gibraltar keeps its published slots.
+        let (arr, dep, _) = by_hour(&day("LXGB", Date::ymd(2026, 7, 14), 3));
+        println!("LXGB\n  arr {arr:?}\n  dep {dep:?}");
+    }
+
+    /// A line's times are the route's own: a block time from its place
+    /// (Malaga to Gatwick 2 h 40, to Madrid about 1 h 10), the based
+    /// aircraft out in the morning wave having come in last night, every
+    /// time on five minutes.
+    #[test]
+    fn a_line_flies_its_block_times() {
+        let gatwick = block_s("LEMG", "EGKK", "A320").unwrap() / 60.0;
+        assert!((150.0..175.0).contains(&gatwick), "{gatwick}");
+        let madrid = block_s("LEMG", "LEMD", "A320").unwrap() / 60.0;
+        assert!((60.0..80.0).contains(&madrid), "{madrid}");
+        assert!(block_s("LEMG", "XXXX", "A320").is_none());
+        let rs = day("LEMG", Date::ymd(2026, 7, 14), 3);
+        let wave = WAVE_FIRST_H * 3600.0..=(WAVE_FIRST_H + WAVE_SPAN_H) * 3600.0 + 300.0;
+        let mut night_stops = 0;
+        for r in rs.iter().filter(|r| r.night_stop) {
+            night_stops += 1;
+            assert!(
+                wave.contains(&r.dep.sched_s),
+                "{} out at {}",
+                r.dep.callsign,
+                hhmm(r.dep.sched_s)
+            );
+            assert!(r.arr.sched_s < 0.0, "{} came in last night", r.arr.callsign);
+        }
+        assert!(night_stops >= 20, "{night_stops}");
+        assert!(rs.iter().all(|r| {
+            (r.arr.sched_s / 300.0).fract().abs() < 1e-9
+                && (r.dep.sched_s / 300.0).fract().abs() < 1e-9
+        }));
     }
 }

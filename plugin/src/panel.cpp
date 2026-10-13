@@ -1276,7 +1276,8 @@ protected:
             return;
         }
         std::vector<std::vector<std::string>> deps, arrs;
-        std::string header;
+        std::string header, field;
+        std::vector<std::string> choices;
         std::string text(feed.buf, feed.len);
         size_t start = 0;
         while (start < text.size()) {
@@ -1286,12 +1287,44 @@ protected:
             start = end + 1;
             if (f.empty()) continue;
             if (f[0] == "H" && f.size() >= 3) {
-                header = f[1] + "   local " + f[2];
+                field = f[1];
+                header = "local " + f[2];
+                // The fields the board can show, the active one first (an
+                // app before the selector sends none).
+                if (f.size() >= 4) {
+                    size_t at = 0;
+                    while (at <= f[3].size()) {
+                        size_t comma = f[3].find(',', at);
+                        if (comma == std::string::npos) comma = f[3].size();
+                        if (comma > at) choices.push_back(f[3].substr(at, comma - at));
+                        at = comma + 1;
+                    }
+                }
             } else if (f.size() >= 10 && f[0] == "D") {
                 deps.push_back(f);
             } else if (f.size() >= 10 && f[0] == "A") {
                 arrs.push_back(f);
             }
+        }
+        // The field selector (2026-10-13): every field with a timetable in
+        // range; a pick is written back and the app publishes that board.
+        if (choices.size() >= 2) {
+            ImGui::SetNextItemWidth(ImGui::CalcTextSize("WWWWW").x + 2.0f * ImGui::GetFrameHeight());
+            if (ImGui::BeginCombo("##board_field", field.c_str())) {
+                for (size_t i = 0; i < choices.size(); ++i) {
+                    const bool on = choices[i] == field;
+                    std::string label = choices[i] + (i == 0 ? "  (our traffic)" : "");
+                    if (ImGui::Selectable(label.c_str(), on)) {
+                        drefs::set_board_field(i == 0 ? "" : choices[i].c_str());
+                    }
+                    if (on) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+        } else {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE), "%s", field.c_str());
+            ImGui::SameLine();
         }
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", header.c_str());
         boardTable("DEPARTURES", "To", "board_dep", deps);

@@ -1661,8 +1661,15 @@ fn real_install_midflow_start_inner() {
             on_runway.is_empty(),
             "{icao}: on the runway at the start {on_runway:?}"
         );
-        let payload = link.board_payload(None);
+        let payload = link.board_payload(None, &[]);
         println!("{icao} board:\n{payload}");
+        // Every departure shows its stand (2026-10-13: Boarding with an
+        // empty Stand column), named as the field numbers it.
+        for l in payload.lines().filter(|l| l.starts_with("D|")) {
+            let f: Vec<&str> = l.split('|').collect();
+            assert!(!f[7].is_empty(), "{icao}: no stand on {l}");
+            assert!(!f[7].starts_with("Gate "), "{icao}: {l}");
+        }
         assert!(
             payload.lines().any(|l| l.starts_with("D|")),
             "{icao} departures"
@@ -1712,4 +1719,71 @@ fn real_install_midflow_start_inner() {
         let _ = st;
         Station::uninstall();
     }
+}
+
+/// THE BOARD'S FIELD SELECTOR (2026-10-13): the field the traffic runs at
+/// first, then every other timetable field within 100 nm, nearest first;
+/// a pick shows only one of the others, any other pick (none, the active
+/// one, a field out of range) the active board.
+#[test]
+fn the_board_offers_the_timetable_fields_in_range() {
+    let lemg = (36.67, -4.50);
+    assert_eq!(board_choices("LEMG", lemg), ["LEMG", "LXGB"]);
+    assert_eq!(board_choices("lxgb", (36.15, -5.35)), ["LXGB", "LEMG"]);
+    // A field with no timetable still comes first: its board is the live one.
+    assert_eq!(
+        board_choices("LEZL", (37.42, -5.89)),
+        ["LEZL", "LEMG", "LXGB"]
+    );
+    assert_eq!(board_choices("EGKK", (51.15, -0.19)), ["EGKK"]);
+    let c = board_choices("LEMG", lemg);
+    assert_eq!(board_field(Some("lxgb"), &c), Some("LXGB"));
+    assert_eq!(board_field(Some("LEMG"), &c), None);
+    assert_eq!(board_field(Some(""), &c), None);
+    assert_eq!(board_field(Some("EGKK"), &c), None);
+    assert_eq!(board_field(None, &c), None);
+}
+
+/// A field nobody simulates has its board from its timetable, by the
+/// clock: both halves, a departure inside 40 minutes Boarding at its
+/// planned stand, statuses moving with the sim's time, the selector's
+/// fields on its header.
+#[test]
+fn a_board_for_a_field_nobody_flies() {
+    use traffic::routes::{FieldRoutes, RouteRow};
+    let gibraltar = traffic::routes::field_routes("LXGB").unwrap().rows[0];
+    let rows: &'static [RouteRow] = Box::leak(Box::new([RouteRow {
+        summer: 42,
+        winter: 42,
+        windows: &[(9.0, 12.0)],
+        based: false,
+        types: &[("A320", 100)],
+        ..gibraltar
+    }]));
+    let table = FieldRoutes {
+        icao: "ULMM",
+        utc_offset_h: 3.0,
+        rows,
+    };
+    let apt = format!("{}/ulmm.dat", fixtures());
+    let field = FieldModel::load(&apt, "ULMM").unwrap().unwrap();
+    let date = traffic::rotation::Date::ymd(2026, 7, 14);
+    let b = RemoteBoard::from_field(&field, &table, Density::Normal, date, 9.5 * 3600.0, 100.0);
+    let picks = ["LEMG".to_string(), "ULMM".to_string()];
+    let p = b.payload(100.0, &picks);
+    assert!(p.starts_with("H|ULMM|09:30|LEMG,ULMM\n"), "{p}");
+    let rows: Vec<Vec<&str>> = p.lines().skip(1).map(|l| l.split('|').collect()).collect();
+    assert!(rows.iter().any(|r| r[0] == "D") && rows.iter().any(|r| r[0] == "A"));
+    for r in &rows {
+        if r[0] == "D" {
+            assert!(!r[7].is_empty(), "a departure's stand: {r:?}");
+        }
+        if r[8] == "Boarding" {
+            assert_eq!(r[0], "D");
+        }
+    }
+    // An hour on, the clock has moved the statuses on.
+    let later = b.payload(100.0 + 3600.0, &picks);
+    assert!(later.starts_with("H|ULMM|10:30|"), "{later}");
+    assert_ne!(p, later);
 }

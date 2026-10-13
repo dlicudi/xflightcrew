@@ -19,6 +19,7 @@ pub mod kin;
 pub mod midflow;
 pub mod perf;
 pub mod phase;
+pub mod places;
 pub mod rate;
 pub mod rng;
 pub mod rotation;
@@ -26,6 +27,7 @@ pub mod routes;
 pub mod schedule;
 pub mod slot;
 pub mod spacing;
+pub mod stands;
 pub mod wire;
 
 pub use aircraft::{Route, Seen, TrafficAircraft};

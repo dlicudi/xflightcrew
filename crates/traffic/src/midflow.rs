@@ -104,6 +104,7 @@ fn info(r: &Rotation, arr: bool) -> FlightInfo {
         sched_s: Some(l.sched_s),
         est_s: Some(l.est_s),
         inbound: (!arr).then(|| r.arr.callsign.clone()),
+        stand: None,
     }
 }
 
@@ -259,6 +260,87 @@ fn movement(
     }
 }
 
+/// The timetable's rotations round `now_s` (two hours back, `horizon_s`
+/// on) that `field` flies, and the day's stand plan for them
+/// ([`crate::stands::plan`]: the board's stands from the start; the
+/// pilot's board at LEMG, 2026-10-13, had departures Boarding with no
+/// stand). A type the runway (`runway_m`) or the stands cannot take is not
+/// flown: the table is the real airline's, the scenery may be smaller.
+#[allow(clippy::too_many_arguments)]
+fn flown_window(
+    field: &FieldModel,
+    table: &FieldRoutes,
+    density: Density,
+    seed: u64,
+    date: Date,
+    now_s: f64,
+    horizon_s: f64,
+    runway_m: f64,
+) -> (Vec<Rotation>, std::collections::HashMap<String, String>) {
+    let fits = |t: &str| {
+        runway_m >= runway_needed_m(t) && field.net.stands.iter().any(|s| field.takes(s, t))
+    };
+    let rots: Vec<Rotation> = rotation::window(
+        table,
+        date,
+        seed,
+        density,
+        now_s - 2.0 * 3600.0,
+        now_s + horizon_s,
+    )
+    .into_iter()
+    .filter(|r| fits(r.icao_type))
+    .collect();
+    let stands = crate::stands::plan(field, &rots);
+    (rots, stands)
+}
+
+/// The board of a field whose aircraft are NOT simulated (2026-10-13, the
+/// Board tab's field selector): every flight of its timetable round
+/// `now_s` local, as [`plan`] puts them on the board of the field it flies
+/// at (the same rotations for the same seed and date, its longest runway,
+/// the stand plan), for the statuses to come from the clock
+/// ([`crate::board::Status::by_clock`]). Pure and cheap once the field is
+/// loaded.
+pub fn timetable_board(
+    field: &FieldModel,
+    table: &FieldRoutes,
+    density: Density,
+    seed: u64,
+    date: Date,
+    now_s: f64,
+    horizon_s: f64,
+) -> Vec<BoardFlight> {
+    let Some(end) = default_runway(field).and_then(|r| field.end(&r)) else {
+        return Vec::new();
+    };
+    let (rots, stands) = flown_window(
+        field,
+        table,
+        density,
+        seed,
+        date,
+        now_s,
+        horizon_s,
+        end.length_m,
+    );
+    let mut out = Vec::new();
+    for r in &rots {
+        for (dir, leg, arr) in [(Dir::Arrival, &r.arr, true), (Dir::Departure, &r.dep, false)] {
+            let mut info = info(r, arr);
+            info.stand = stands.get(&leg.callsign).cloned();
+            out.push(BoardFlight {
+                dir,
+                callsign: leg.callsign.clone(),
+                icao_type: r.icao_type.to_string(),
+                info,
+                own: false,
+            });
+        }
+    }
+    out
+}
+
 /// The fleet's start at `field` with route table `table`, at `now_s` local
 /// seconds after `date`'s midnight, the next `horizon_s` of the timetable
 /// (see the module's rules). `ctx.runway` is the tower's runway in use (the
@@ -281,19 +363,16 @@ pub fn plan(
         return out;
     };
     let mut rng = XorShift64::new(field_seed(&field.icao, seed) ^ 0x4D49_4446_4C4F_57);
-    let rots = rotation::window(
+    let (rots, stand_plan) = flown_window(
+        field,
         table,
-        date,
-        seed,
         density,
-        now_s - 2.0 * 3600.0,
-        now_s + horizon_s,
+        seed,
+        date,
+        now_s,
+        horizon_s,
+        end.length_m,
     );
-    // A type the runway or the stands cannot take is not flown (the table
-    // is the real airline's; the scenery may be smaller).
-    let fits = |t: &str| {
-        end.length_m >= runway_needed_m(t) && field.net.stands.iter().any(|s| field.takes(s, t))
-    };
     let mut taken: Vec<LatLon> = ctx
         .own
         .into_iter()
@@ -305,7 +384,31 @@ pub fn plan(
         .iter()
         .filter(|s| field.takes(s, "A320") || field.takes(s, crate::schedule::REGIONAL))
         .count();
-    let take_stand = |t: &str, taken: &mut Vec<LatLon>, rng: &mut XorShift64| -> Option<String> {
+    let take_stand = |t: &str,
+                      want: Option<&String>,
+                      taken: &mut Vec<LatLon>,
+                      rng: &mut XorShift64|
+     -> Option<String> {
+        // Room kept for the arrivals still to come.
+        let held = field
+            .net
+            .stands
+            .iter()
+            .filter(|s| crate::field::stand_taken(s, taken))
+            .count();
+        if airline_stands.saturating_sub(held) <= STANDS_KEPT_FREE {
+            return None;
+        }
+        // Its planned stand where that is free, clear of the lanes and of
+        // the stands already held as the picks below are.
+        if let Some(s) = want.and_then(|n| field.stand(n)).filter(|s| {
+            field.takes(s, t)
+                && field.lane_clearance_m((s.lat, s.lon)) >= crate::schedule::parked_lane_clear_m(t)
+                && taken.iter().all(|p| dist_m(*p, (s.lat, s.lon)) >= BESIDE_M)
+        }) {
+            taken.push((s.lat, s.lon));
+            return Some(s.name.clone());
+        }
         // An aircraft turning round stands there for up to two hours: a
         // stand clear of the lanes others taxi along first, as a parked
         // one's (the mid-flow harness, 2026-10-13: a taxi-out passed 18.6 m
@@ -336,16 +439,6 @@ pub fn plan(
             .cloned()
             .collect();
         let free = if apart.is_empty() { pool } else { apart };
-        // Room kept for the arrivals still to come.
-        let held = field
-            .net
-            .stands
-            .iter()
-            .filter(|s| crate::field::stand_taken(s, taken))
-            .count();
-        if airline_stands.saturating_sub(held) <= STANDS_KEPT_FREE {
-            return None;
-        }
         let name = free
             .get(rng.below(free.len().max(1) as u64) as usize)?
             .clone();
@@ -364,7 +457,7 @@ pub fn plan(
     let mut approaching: Vec<(f64, crate::perf::Wake, Movement)> = Vec::new();
     // Ground first, oldest first: the aircraft on their stands, then the
     // movers among them.
-    for r in rots.iter().filter(|r| fits(r.icao_type)) {
+    for r in &rots {
         let (eta, etd) = (r.arr.est_s - now_s, r.dep.est_s - now_s);
         out.board.push(BoardFlight {
             dir: Dir::Arrival,
@@ -405,7 +498,13 @@ pub fn plan(
         }
         if eta > -TAXI_IN_S && etd > 0.0 {
             // Landed: taxiing in to a stand, where its way is clear.
-            let placed = take_stand(r.icao_type, &mut taken, &mut rng).and_then(|stand| {
+            let placed = take_stand(
+                r.icao_type,
+                stand_plan.get(&r.arr.callsign),
+                &mut taken,
+                &mut rng,
+            )
+            .and_then(|stand| {
                 let s = field.stand(&stand)?;
                 let way = taxi_in_way(field, &end, r.icao_type, s)?;
                 let (pos, ahead) = along(&way, (-eta / TAXI_IN_S).clamp(0.15, 0.9))?;
@@ -435,7 +534,12 @@ pub fn plan(
             // Else it is on a stand already, turning round (below).
         }
         // On its stand: the departure stands there from the start.
-        let Some(stand) = take_stand(r.icao_type, &mut taken, &mut rng) else {
+        let Some(stand) = take_stand(
+            r.icao_type,
+            stand_plan.get(&r.arr.callsign),
+            &mut taken,
+            &mut rng,
+        ) else {
             // No stand: it appears on one at its time, if it is still to go.
             if etd > 0.0 {
                 let mut m = movement(r, false, etd, &runway, field, ctx, &mut rng);
@@ -565,6 +669,21 @@ pub fn plan(
         last_entry = m.t_s;
     }
     out.movements.sort_by(|a, b| a.t_s.total_cmp(&b.t_s));
+    // Every flight's planned stand on its board line; a departure with no
+    // stand yet (waiting for its inbound, or none free at the start) starts
+    // there when it appears, where free.
+    for b in &mut out.board {
+        b.info.stand = stand_plan.get(&b.callsign).cloned();
+    }
+    for m in &mut out.movements {
+        let planned = stand_plan.get(&m.callsign).cloned();
+        if m.kind == MovementKind::Departure && m.stand.is_none() {
+            m.stand.clone_from(&planned);
+        }
+        if let Some(f) = m.flight.as_mut() {
+            f.stand = planned;
+        }
+    }
     let _ = OWN_CLEAR_NM;
     out
 }

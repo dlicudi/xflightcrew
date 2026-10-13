@@ -118,6 +118,26 @@ impl Status {
         }
     }
 
+    /// The status of `f` at a field whose aircraft are not simulated (the
+    /// Board tab's other fields, 2026-10-13): the clock alone. A departure
+    /// past its estimate has gone, inside [`BOARDING_S`] of it is Boarding
+    /// (at its planned stand); an arrival past its estimate has Landed;
+    /// else Scheduled, or Delayed while [`DELAYED_S`] behind its timetable.
+    pub fn by_clock(f: &BoardFlight, now_s: f64) -> Status {
+        let est = f.info.est_s.or(f.info.sched_s);
+        let late = match (f.info.sched_s, f.info.est_s) {
+            (Some(s), Some(e)) => e - s >= DELAYED_S,
+            _ => false,
+        };
+        match (f.dir, est) {
+            (Dir::Departure, Some(e)) if e < now_s => Status::Departed,
+            (Dir::Arrival, Some(e)) if e < now_s => Status::Landed,
+            (Dir::Departure, Some(e)) if e - now_s <= BOARDING_S => Status::Boarding,
+            _ if late => Status::Delayed,
+            _ => Status::Scheduled,
+        }
+    }
+
     /// Finished with: off the board once [`KEPT_S`] past.
     pub fn done(self) -> bool {
         matches!(self, Status::Departed | Status::Landed | Status::AtGate)
@@ -139,15 +159,25 @@ pub struct Row {
 pub const ROWS_EACH: usize = 10;
 
 /// The board's payload for `xcopilot/status/board`: a header line
-/// "H|<field>|<HH:MM local>", then up to [`ROWS_EACH`] departures and as
+/// "H|<field>|<HH:MM local>", with "|<ICAO>,<ICAO>..." on it when there are
+/// `choices` (the fields the Board tab may pick, the active one first,
+/// 2026-10-13; a plugin before the selector reads the first three fields
+/// only), then up to [`ROWS_EACH`] departures and as
 /// many arrivals, each "D" or "A"|sched|time|number|airline|city|type|
 /// stand|status|own, '\n'-separated, in timetable order; a flight finished
 /// more than [`KEPT_S`] ago is off. Times "HH:MM", a blank where unknown;
-/// a '|' in a name becomes '/'. Empty with no rows: the tab says so.
-pub fn payload(field: &str, now_s: f64, rows: &[Row]) -> String {
-    let clean = |s: &str| s.replace(['|', '\n'], "/");
+/// a '|' in a name becomes '/'. Empty with no rows and no other field to
+/// pick: the tab says so.
+pub fn payload(field: &str, now_s: f64, rows: &[Row], choices: &[String]) -> String {
+    let clean = |s: &str| s.replace(['|', '\n', ','], "/");
     let t = |v: Option<f64>| v.map(hhmm).unwrap_or_default();
-    let mut out = vec![format!("H|{}|{}", clean(field), hhmm(now_s))];
+    let mut head = format!("H|{}|{}", clean(field), hhmm(now_s));
+    if !choices.is_empty() {
+        let list: Vec<String> = choices.iter().map(|c| clean(c)).collect();
+        head.push('|');
+        head.push_str(&list.join(","));
+    }
+    let mut out = vec![head];
     for (dir, tag) in [(Dir::Departure, 'D'), (Dir::Arrival, 'A')] {
         let mut half: Vec<&Row> = rows
             .iter()
@@ -183,7 +213,7 @@ pub fn payload(field: &str, now_s: f64, rows: &[Row]) -> String {
             ));
         }
     }
-    if out.len() == 1 {
+    if out.len() == 1 && choices.len() < 2 {
         return String::new();
     }
     out.join("\n")
@@ -206,6 +236,7 @@ mod tests {
                 sched_s: Some(sched),
                 est_s: Some(est),
                 inbound: Some("EZY8061".into()),
+                stand: None,
             },
             own: false,
         }
@@ -323,7 +354,7 @@ mod tests {
                 None,
             ),
         ];
-        let p = payload("LEMG", now, &rows);
+        let p = payload("LEMG", now, &rows, &[]);
         let lines: Vec<&str> = p.lines().collect();
         assert_eq!(lines[0], "H|LEMG|10:00");
         assert_eq!(
@@ -335,7 +366,43 @@ mod tests {
             "A|10:05|10:06|U2 8062|easyJet|London Gatwick|A320||Approaching|0"
         );
         assert_eq!(lines.len(), 3, "the 07:00 departure is long gone: {p}");
-        assert_eq!(payload("LEMG", now, &[]), "");
+        assert_eq!(payload("LEMG", now, &[], &[]), "");
         assert!(p.len() < 2000);
+        // With fields to pick, the header lists them, the active first;
+        // the selector's header shows even with no rows.
+        let picks = ["LEMG".to_string(), "LXGB".to_string()];
+        let p = payload("LEMG", now, &rows, &picks);
+        assert_eq!(p.lines().next(), Some("H|LEMG|10:00|LEMG,LXGB"));
+        assert_eq!(p.lines().count(), 3);
+        assert_eq!(payload("LXGB", now, &[], &picks), "H|LXGB|10:00|LEMG,LXGB");
+        assert_eq!(payload("LEMG", now, &[], &picks[..1]), "");
+    }
+
+    /// A field nobody simulates goes by the clock: a departure inside 40
+    /// minutes Boarding, gone past its estimate; an arrival Landed past
+    /// its estimate; a late one Delayed until then.
+    #[test]
+    fn a_field_by_the_clock() {
+        let now = 36_000.0;
+        let st = |dir, sched: f64, est: f64| Status::by_clock(&flight(dir, sched, est), now);
+        assert_eq!(
+            st(Dir::Departure, now + 1800.0, now + 1800.0),
+            Status::Boarding
+        );
+        assert_eq!(
+            st(Dir::Departure, now + 3600.0, now + 3600.0),
+            Status::Scheduled
+        );
+        assert_eq!(st(Dir::Departure, now - 60.0, now - 60.0), Status::Departed);
+        assert_eq!(
+            st(Dir::Departure, now + 600.0, now + 3600.0),
+            Status::Delayed
+        );
+        assert_eq!(st(Dir::Arrival, now - 60.0, now - 60.0), Status::Landed);
+        assert_eq!(
+            st(Dir::Arrival, now + 600.0, now + 600.0),
+            Status::Scheduled
+        );
+        assert_eq!(st(Dir::Arrival, now + 600.0, now + 2400.0), Status::Delayed);
     }
 }

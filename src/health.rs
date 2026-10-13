@@ -109,6 +109,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/fms/load",
     "xcopilot/fms/route",
     "xcopilot/opt/audio_bus",
+    "xcopilot/opt/board_field",
     "xcopilot/opt/cabin_crew",
     "xcopilot/opt/cabin_voice",
     "xcopilot/opt/camera_snap",
@@ -307,6 +308,7 @@ mod plugin_contract_tests {
             "xcopilot/opt/text",
             "xcopilot/opt/text_edit",
             "xcopilot/status/callsign",
+            "xcopilot/opt/board_field",
         ] {
             assert!(PLUGIN_DATAREFS.contains(&name), "{name}");
             assert!(

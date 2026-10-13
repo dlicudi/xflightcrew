@@ -79,6 +79,9 @@ const TextRef& state_lines();
 // was written in the last 30 s.
 const TextRef& board();
 bool board_fresh();
+// The Board tab's field pick, plugin to app (an ICAO; empty = the field
+// the traffic runs at).
+void set_board_field(const char* icao);
 const std::vector<AtcField>& atc_fields();
 
 // COM1, for the ATC tab: khz read (0 if the sim dataref is missing) and the
