@@ -273,21 +273,36 @@ button { touch-action: manipulation; }
 .wx-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
 .wx-head .icao { font-size: 18px; font-weight: 700; }
 .leg-table .leg { grid-template-columns: minmax(64px, auto) minmax(0, 1fr) auto; }
-/* The flight information board (2026-10-13): a table that scrolls inside
-   its card on a phone, never the page. */
-.fids-wrap { overflow-x: auto; }
-.fids { width: 100%; border-collapse: collapse; font-size: 13px; white-space: nowrap; }
-.fids th { text-align: left; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 600; padding: 4px 10px 6px 0; }
-.fids td { padding: 6px 10px 6px 0; border-top: 1px solid var(--line); }
-.fids .num { font-variant-numeric: tabular-nums; }
-.fids .exp { color: var(--amber); }
-.fids .exp.on { color: var(--muted); }
-.fids .st-warn { color: var(--amber); }
-.fids .st-active { color: var(--cyan); }
-.fids .st-done { color: var(--muted); }
-.fids .st-ok { color: var(--green); }
-.fids tr.own td { color: var(--magenta); }
-.fids-h { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--soft); font-weight: 700; margin-top: 4px; }
+/* The flight information board (2026-10-13): an airport departures board,
+   dark in either theme as the real one is, split-flap tiles in amber and
+   green; the table scrolls inside its card on a phone, never the page. */
+.fids-board { --fb-bg: #050505; --fb-tile: #161616; --fb-seam: #000; --fb-text: #F2F2EC;
+  --fb-amber: #FFB81C; --fb-green: #3DDC5A; --fb-dim: #8A8A84;
+  background: var(--fb-bg); border-radius: 10px; padding: 12px; margin-top: 4px;
+  font-family: var(--mono); color: var(--fb-text); }
+.fids-board + .fids-board { margin-top: 14px; }
+.fids-bar { display: flex; align-items: center; gap: 10px; background: #F5C400; color: #050505;
+  padding: 6px 12px; border-radius: 4px; font-weight: 800; font-size: 15px; letter-spacing: .14em; text-transform: uppercase; }
+.fids-bar svg { width: 20px; height: 20px; fill: #050505; stroke: none; flex: none; }
+.fids-wrap { overflow-x: auto; margin-top: 8px; }
+.fids { width: 100%; border-collapse: separate; border-spacing: 0 4px; font-size: 14px; white-space: nowrap; text-transform: uppercase; }
+.fids th { text-align: left; font-size: 11px; letter-spacing: .12em; color: var(--fb-dim); font-weight: 700; padding: 2px 10px 2px 0; }
+.fids td { padding: 0 6px 0 0; }
+.fids td > span { display: inline-block; padding: 5px 7px; border-radius: 3px; font-weight: 700; letter-spacing: .06em;
+  background: linear-gradient(to bottom, var(--fb-tile) 0 49%, var(--fb-seam) 49% 51%, var(--fb-tile) 51% 100%);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.06); }
+.fids .t > span { color: var(--fb-amber); font-variant-numeric: tabular-nums; }
+.fids .exp > span { color: var(--fb-amber); font-variant-numeric: tabular-nums; }
+.fids .exp.on > span { color: var(--fb-dim); }
+.fids .st-ok > span { color: var(--fb-green); }
+.fids .st-active > span { color: var(--fb-green); animation: fids-blink 1.6s steps(2, start) infinite; }
+.fids .st-warn > span { color: var(--fb-amber); }
+.fids .st-done > span, .fids .st-plain > span { color: var(--fb-dim); }
+.fids tr.own td > span { color: #050505; background: var(--fb-amber); }
+.fids-board .empty { color: var(--fb-dim); padding: 10px 2px 2px; text-transform: uppercase; letter-spacing: .1em; }
+@keyframes fids-blink { to { visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) { .fids .st-active > span { animation: none; } }
+#bd-clock { font-family: var(--mono); font-weight: 700; color: var(--amber); letter-spacing: .06em; }
 
 /* Map */
 .page.map { position: relative; padding: 0; height: calc(100dvh - var(--strip-h) - var(--bar-h) - var(--tabbar-h) - 40px); min-height: 280px; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); }
@@ -1117,24 +1132,37 @@ form.say .send { min-height: 52px; }
   var BOARD_KEY = 'xvl-efb-board';
   var boardPick = null;
   try { boardPick = localStorage.getItem(BOARD_KEY); } catch (e) {}
+  var BOARD_ICONS = {
+    Departures: '<path d="M2 19h20v2H2zM21.4 9.6c-.2-.8-1-1.3-1.8-1.1L14.3 10 7.4 3.6l-1.9.5 4.1 7.2-5 1.3-2-1.6-1.4.4 2.6 4.5 16.3-4.4c.8-.2 1.3-1.1 1.3-1.9z"/>',
+    Arrivals: '<path d="M2 19h20v2H2zM9.8 13.4l4.3 1.2 5.3 1.4c.8.2 1.7-.3 1.9-1.1.2-.8-.3-1.7-1.1-1.9l-5.3-1.4L12.2 3l-1.9-.5v8.3L5.3 9.4l-.9-2.4-1.5-.4v5.2l1.6.4z"/>'
+  };
+  // A cell is a tile: the text in a span the board's CSS draws as a flap.
+  function tile(cls, text) {
+    var td = el('td', cls);
+    td.appendChild(el('span', null, text));
+    return td;
+  }
   function boardTable(title, place, rows) {
-    var box = el('div');
-    box.appendChild(el('div', 'fids-h', title));
-    if (!rows.length) { box.appendChild(el('div', 'empty', 'None')); return box; }
+    var box = el('div', 'fids-board');
+    var bar = el('div', 'fids-bar');
+    bar.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true">' + BOARD_ICONS[title] + '</svg>';
+    bar.appendChild(document.createTextNode(title));
+    box.appendChild(bar);
+    if (!rows.length) { box.appendChild(el('div', 'empty', 'No flights')); return box; }
     var wrap = el('div', 'fids-wrap'), t = el('table', 'fids'), hr = el('tr');
-    ['Time', 'Exp', 'Flight', 'Airline', place, 'Type', 'Stand', 'Status'].forEach(function (h) { hr.appendChild(el('th', null, h)); });
+    ['Time', 'Exp', 'Flight', 'Airline', place, 'Type', 'Stand', 'Remarks'].forEach(function (h) { hr.appendChild(el('th', null, h)); });
     var th = el('thead'); th.appendChild(hr); t.appendChild(th);
     var tb = el('tbody');
     rows.forEach(function (r) {
       var tr = el('tr', r.own ? 'own' : null);
-      tr.appendChild(el('td', 'num', r.sched || '-'));
-      tr.appendChild(el('td', 'num exp' + (r.on_time ? ' on' : ''), r.exp || '-'));
-      tr.appendChild(el('td', null, r.number));
-      tr.appendChild(el('td', null, r.airline));
-      tr.appendChild(el('td', null, r.city));
-      tr.appendChild(el('td', null, r.aircraft));
-      tr.appendChild(el('td', null, r.stand || '-'));
-      tr.appendChild(el('td', 'st-' + r.tone, r.status));
+      tr.appendChild(tile('t', r.sched || '-'));
+      tr.appendChild(tile('exp' + (r.on_time ? ' on' : ''), r.exp || '-'));
+      tr.appendChild(tile(null, r.number));
+      tr.appendChild(tile(null, r.airline));
+      tr.appendChild(tile(null, r.city));
+      tr.appendChild(tile(null, r.aircraft));
+      tr.appendChild(tile(null, r.stand || '-'));
+      tr.appendChild(tile('st-' + r.tone, r.status));
       tb.appendChild(tr);
     });
     t.appendChild(tb); wrap.appendChild(t); box.appendChild(wrap);
@@ -1164,7 +1192,7 @@ form.say .send { min-height: 52px; }
       });
       segs.appendChild(bt);
     });
-    $('bd-clock').textContent = shown.icao + (shown.clock ? ', local ' + shown.clock : '');
+    $('bd-clock').textContent = shown.clock ? shown.icao + '  ' + shown.clock : shown.icao;
     body.appendChild(boardTable('Departures', 'To', shown.departures));
     body.appendChild(boardTable('Arrivals', 'From', shown.arrivals));
   }
