@@ -486,6 +486,7 @@ fn traffic_ac(f: &Frame, id: u32, x: f64, y: f64, on_ground: bool) -> crate::efb
         alt_ft: 1_234.0,
         on_ground,
         gs_kts: 141.6,
+        ahead: vec![(t.lat + 0.0001234567, t.lon)],
     }
 }
 
@@ -524,6 +525,8 @@ fn traffic_rides_the_map_in_lat_lon_with_its_card() {
     assert_eq!(a.from.as_deref(), Some("EGKK"));
     assert_eq!(a.to, None);
     assert_eq!(a.gs_kts, 142.0);
+    assert_eq!(a.ahead.len(), 1, "the way on rides along");
+    assert!(close(a.ahead[0][0] - a.lat, 0.000123, 0.0000011), "rounded like the position");
     assert_eq!(out[1].alt_ft, Some(1_230.0));
     assert_eq!(out[1].phase, "on final");
 }

@@ -798,6 +798,7 @@ impl Link {
                     alt_ft: a.kin.alt_ft,
                     on_ground: a.kin.on_ground,
                     gs_kts: a.kin.gs_kts,
+                    ahead: if a.dormant() { Vec::new() } else { a.route.ahead(EFB_AHEAD_POINTS) },
                 }
             })
             .collect();
@@ -1769,6 +1770,8 @@ impl DrawLog {
 /// regardless.
 const BOARD_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 const BOARD_RESEND: std::time::Duration = std::time::Duration::from_secs(10);
+/// The most route points ahead each aircraft carries to the EFB's map.
+const EFB_AHEAD_POINTS: usize = 24;
 /// How often the EFB's boards are rebuilt ([`TrafficWorld::note_efb_boards`]).
 const EFB_BOARDS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 /// How often the EFB's map traffic is rebuilt ([`TrafficWorld::note_efb_traffic`]).

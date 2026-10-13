@@ -133,6 +133,21 @@ impl Route {
         }
     }
 
+    /// The route still ahead of the aircraft: the points past the segment
+    /// it is on, at most `max` of them, thinned evenly with the last kept
+    /// (the EFB draws a selected aircraft's way on). Empty once flown.
+    pub fn ahead(&self, max: usize) -> Vec<LatLon> {
+        if self.follow.done || max == 0 {
+            return Vec::new();
+        }
+        let rest = self.path.get(self.follow.seg + 1..).unwrap_or(&[]);
+        if rest.len() <= max {
+            return rest.to_vec();
+        }
+        let step = (rest.len() - 1) as f64 / (max - 1).max(1) as f64;
+        (0..max).map(|i| rest[((i as f64 * step).round() as usize).min(rest.len() - 1)]).collect()
+    }
+
     /// A ground route: every leg taxi.
     pub fn taxi(path: Vec<LatLon>) -> Route {
         let n = path.len().saturating_sub(1);

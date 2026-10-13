@@ -392,6 +392,7 @@ mod tests {
             alt_ft: 9_000.0,
             on_ground: false,
             gs_kts: 280.0,
+            ahead: Vec::new(),
         }
     }
 
