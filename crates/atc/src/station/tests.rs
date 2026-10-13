@@ -4132,12 +4132,13 @@ fn a_tower_only_strip_loses_the_region_but_wins_its_own_frequency() {
 }
 
 #[test]
-fn a_new_flight_rebuilds_the_station_even_when_it_is_the_one_up() {
+fn a_new_flight_arms_its_field_even_when_it_is_the_one_up() {
     // LEMG 2026-09-26: the 737 was put on a 10 nm final for 13 from a
     // seat on runway 30, and the station that had been watching it on the
-    // runway carried on as if nothing had happened. A new flight arms a
-    // fresh station for its field, over any swap already waiting, and the
-    // old flight's pin and handoff go with it.
+    // runway carried on as if nothing had happened. A new flight arms its
+    // field, over any swap already waiting, and the old flight's pin and
+    // handoff go with it. The field already up is served in place by the
+    // main loop (`Station::new_flight_here`, 2026-10-13), never rebuilt.
     let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut malaga = region_apt("LEMG Malaga", 36.675, -4.499);
     malaga.apt.freqs[0].khz = 118155;
@@ -4159,6 +4160,108 @@ fn a_new_flight_rebuilds_the_station_even_when_it_is_the_one_up() {
     *REGION.lock().unwrap() = Vec::new();
     *ACTIVE_FIELD.lock().unwrap() = None;
     *LAST_REGION_SWITCH.lock().unwrap() = None;
+}
+
+/// A NEW FLIGHT OF OURS AT THE FIELD ALREADY UP resets our part of the
+/// station and nothing else. LEMG 2026-09-26: the desk that had watched the
+/// 737 lined up on 30 earned the arrival on 13 "you landed without
+/// clearance", so our desk, clearance, runway claim and compliance memory
+/// all go. LEMG 2026-10-13: an EFB "Move here" rebuilt the whole station,
+/// cleared every traffic strip, and the traffic link sent thirteen moving
+/// aircraft off the frequency, so the traffic's strips and desks, and the
+/// runway in use, stay.
+#[test]
+fn a_new_flight_at_the_field_up_resets_our_desk_and_keeps_the_traffic() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = super::strip_tests::ClearStrips;
+    Station::uninstall();
+    let mut st = lxgb();
+    st.install();
+    st.runway_in_use = Some("09".into());
+    // The flight that ended: lined up on 09, the tower's word on our strip,
+    // the compliance watch's memory of a runway start.
+    st.desk.twr.state = tower::State::LinedUp;
+    st.desk.told_runway = Some("09".into());
+    *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
+        state: tower::State::LinedUp,
+        callsign: "November one seven two Sierra Papa".into(),
+        runway_ident: "09".into(),
+        pending_readback: None,
+        holds_runway: true,
+    });
+    {
+        let mut f = OWN_STRIP.compliance_flight.lock().unwrap();
+        f.prev_on_ground = Some(true);
+        f.runway_start = Some("09".into());
+    }
+    // The traffic: a strip cleared to land, and the desk working it.
+    let traffic = open_traffic_strip(7);
+    *traffic.clearance.lock().unwrap() = Some(ClearanceSnap {
+        state: tower::State::ClearedToLand,
+        callsign: "Ryanair four three one".into(),
+        runway_ident: "09".into(),
+        pending_readback: None,
+        holds_runway: true,
+    });
+    st.desks.insert(
+        FlightId::Traffic(7),
+        StripDesk::for_strip(StripRef::Traffic(traffic.clone())),
+    );
+
+    retire_for_new_flight();
+    assert!(new_flight_pending());
+    assert!(st.works(&lxgb().apt), "the swap armed is this station's field");
+    st.new_flight_here();
+
+    // Ours: nothing of the last flight.
+    assert!(!new_flight_pending(), "the station answers for the new flight");
+    assert_eq!(st.desk.twr.state, tower::Tower::new().state);
+    assert_eq!(st.desk.told_runway, None);
+    assert_eq!(crate::party_line::clearance_state(), None);
+    assert_eq!(crate::party_line::clearance_runway(), None);
+    {
+        let f = OWN_STRIP.compliance_flight.lock().unwrap();
+        assert_eq!(f.prev_on_ground, None);
+        assert_eq!(f.runway_start, None);
+    }
+    assert!(COMPLIANCE.lock().unwrap().zone_last.is_some(), "zone-watch grace");
+    // The traffic's: its strip, its clearance, its desk; the runway in use.
+    let kept = traffic_strip(7).expect("the traffic strip stands");
+    assert!(std::sync::Arc::ptr_eq(&kept, &traffic));
+    assert_eq!(
+        kept.clearance.lock().unwrap().as_ref().map(|c| c.state),
+        Some(tower::State::ClearedToLand)
+    );
+    assert!(st.desks.contains_key(&FlightId::Traffic(7)), "its desk stands");
+    assert_eq!(st.runway_in_use(), Some("09"));
+    // The new flight's call is answered by a fresh desk, and published.
+    let wx = Wx { wind_from_deg: 90.0, wind_kts: 8.0 };
+    let ctx = st.make_ctx(
+        wx,
+        "QNH one zero one seven".into(),
+        "November one seven two Sierra Papa".into(),
+        false,
+        false,
+        None,
+        false,
+        None,
+    );
+    st.respond("", Service::Tower, tower::Intent::ReportFinal, &ctx, wx);
+    assert!(
+        crate::party_line::clearance_state().is_some(),
+        "the new flight's word is published"
+    );
+    Station::uninstall();
+}
+
+/// A station works the field it was built for and no other.
+#[test]
+fn a_station_works_its_own_field_only() {
+    let st = lxgb();
+    assert!(st.works(&lxgb().apt));
+    let mut elsewhere = lxgb().apt;
+    elsewhere.name = "Malaga".into();
+    assert!(!st.works(&elsewhere));
 }
 
 /// EGKK, 2026-09-28 (#151): after a day at LEMG the runner put the 737 on

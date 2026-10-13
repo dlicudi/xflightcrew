@@ -166,6 +166,15 @@ impl Session {
             party_line::take_pending_station().filter(|_| mode::atc_enabled())
         {
             let name = apt.name.clone();
+            // A new flight of ours at the field already up: our part of its
+            // station starts again, the traffic's strips stand (an EFB "Move
+            // here" at LEMG, 2026-10-13, rebuilt it and lost every moving
+            // aircraft).
+            if let Some(st) = self.atc_station.as_mut().filter(|st| st.works(&apt)) {
+                st.new_flight_here();
+                reporter.log(ui::LogKind::Info, format!("ATC: a new flight at {name}"));
+                return;
+            }
             match party_line::Station::from_airport(apt) {
                 Some(mut st) => {
                     reporter.log(ui::LogKind::Info, format!("ATC region: now working {name}"));

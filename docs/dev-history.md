@@ -14933,3 +14933,49 @@ is, see which stands are free, and move the aircraft to a free one from the page
   `move_readback` (`off_m` under 30), `flight_state` `flight_begins` `ramp`. Then refused: moving
   (gs over a knot), on a red stand (button greyed, and the server refuses it too), during a
   taxi ("I'm taxiing. Say my controls first, then move.").
+
+## 2026-10-13: a new flight of ours at the field already up keeps the traffic (LEMG)
+
+- **The bug.** An EFB "Move here" at LEMG (`tools::setup::reposition_to_stand` ->
+  `flight_begins(Ramp)` -> `settle_on_ramp` -> `station::arm_new_flight_at`) armed LEMG's station
+  with LEMG's already up. `arm_new_flight` queued `PENDING_STATION` "rebuilt from nothing ... even
+  when it is the one already up", the main loop's `take_pending_station` built and installed a
+  new `Station`, `install` cleared `STRIPS` (`TrafficStrips`), and the traffic link's REINSTALL
+  RULE (`Link::tick`: a flight noted last tick whose strip is gone) despawned every aircraft not
+  parked. Blackbox at t=1791897819.8: thirteen LEMG aircraft `traffic` `despawn` reason
+  `removed` (taxiing, departing, on final), 19 parked stayed. "Put us on approach to LEMG 13" or
+  any setup at the field up did the same.
+- **Why the rebuild existed.** LEMG 2026-09-26: the station that watched the 737 sit on runway 30
+  kept its worksheet for us, and the new arrival on 13 earned "you landed without clearance". The
+  tower's worksheet FOR US belongs to the flight that ended; the traffic's never did.
+- **The fix: reset our part in place.** `take_pending_station` asks the installed station whether
+  it `works` the armed field (name and position of its `AirportInfo`); if so it calls
+  `Station::new_flight_here` instead of building a station: our `StripDesk` (tower FSM, told
+  runway, circuits, ATIS letter, QNH given, squawk, planned route, IFR worksheet, re-sequence) is a
+  fresh one, and `NEW_FLIGHT_HERE_RESETS` resets OUR strip's groups as `install` does (`facts`,
+  `worksheet`, `StationFlight`, `watch`: the clearance, holds, handoffs, flags, the compliance
+  watch's memory of us, the go-around cadence); the zone watch's grace is given as `install`
+  gives it, and `NEW_FLIGHT_PENDING` drops LAST. Kept: the traffic's strips (`STRIPS`), their
+  desks (`Station::desks`), the runway in use, the field's watches (`StationField`: ghosts, wake,
+  streams, types) and its published facts. The carried groups were already retired by
+  `retire_for_new_flight` (and the enroute setup's IFR code, written after it, must survive, as
+  through an install). Another field is still built new: a different field IS a different station,
+  and its traffic is the traffic link's business (`make_station`, `make_desk`).
+- **Why not the other fix.** Teaching the traffic link to survive a reinstall (re-noting its
+  strips, the "stage 4 hands the desk's strips to the station" note) would keep the aircraft but
+  still throw away every traffic clearance, hold and sequence the tower had issued at its own
+  field, for a change that is ours alone. The smaller correct change is to stop rebuilding what
+  did not change.
+- Tests: `a_new_flight_at_the_field_up_resets_our_desk_and_keeps_the_traffic` (our desk, clearance,
+  runway claim and compliance memory gone; the traffic strip, its clearance and desk, and the
+  runway in use kept; the next call answered and published), `a_station_works_its_own_field_only`,
+  the door's cells pinned in `each_door_resets_exactly_what_it_reset_before_the_strip`, and in
+  the crew `a_new_flight_of_ours_keeps_the_moving_traffic` (the fixture field's fleet ticked
+  through a new flight: nobody leaves the frequency). `a_new_flight_rebuilds_the_station_even_when
+  _it_is_the_one_up` is renamed `a_new_flight_arms_its_field_even_when_it_is_the_one_up`: the arm
+  is unchanged, the rebuild is gone.
+- **UNFLOWN.** With `XCOPILOT_TRAFFIC=ours` at LEMG, an EFB Move here to a free stand while
+  traffic taxis and lands: blackbox `flight_state` `flight_begins` `ramp`, then `atc`
+  `new_flight_here` (with `traffic_strips` above zero) and NO burst of `traffic` `despawn`
+  `removed`/`reinstalled`; the moving traffic keeps calling and being answered. A later approach
+  to the field must not hear "you landed without clearance".

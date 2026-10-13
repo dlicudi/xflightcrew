@@ -1611,6 +1611,63 @@ fn a_reinstall_inner() {
     Station::uninstall();
 }
 
+/// A NEW FLIGHT OF OURS AT THE FIELD UP is no reinstall: the station
+/// resets our part in place (`Station::new_flight_here`), the strips stand,
+/// and nobody leaves the frequency. LEMG 2026-10-13: an EFB "Move here"
+/// rebuilt the station and thirteen moving aircraft were despawned. In its
+/// own process (module docs).
+#[test]
+fn a_new_flight_of_ours_keeps_the_moving_traffic() {
+    in_own_process("traffic_link::tests::a_new_flight_of_ours_inner");
+}
+
+#[test]
+#[ignore = "run in its own process by a_new_flight_of_ours_keeps_the_moving_traffic"]
+fn a_new_flight_of_ours_inner() {
+    if std::env::var(HARNESS_ENV).is_err() {
+        return;
+    }
+    let apt = format!("{}/xtst.dat", fixtures());
+    let field = FieldModel::load(&apt, "XTST")
+        .unwrap()
+        .unwrap()
+        .with_cifp(&format!("{}/cifp", fixtures()));
+    let schedule = traffic::generate(&field, Density::Normal, 7, &SpawnCtx::default());
+    let mut st = installed_station(&apt, "XTST");
+    let mut link = Link::new(field, schedule, "Test");
+    let epoch = Instant::now();
+    let mut t = 0.0;
+    let moving = |l: &Link| {
+        l.fleet()
+            .aircraft()
+            .iter()
+            .filter(|x| x.phase != traffic::Phase::Parked)
+            .map(|x| x.id)
+            .collect::<Vec<u32>>()
+    };
+    while t < 1800.0 && moving(&link).is_empty() {
+        t += 0.25;
+        let _ = link.tick(None, 0.25, epoch + Duration::from_secs_f64(t));
+        let _ = drain_calls(&mut st);
+    }
+    let before = moving(&link);
+    assert!(!before.is_empty(), "someone moving by {t:.0} s");
+    let fleet = link.fleet().aircraft().len();
+    // The crew's door, then the main loop's: the same field is up.
+    crate::party_line::retire_for_new_flight();
+    st.new_flight_here();
+    for _ in 0..4 {
+        t += 0.25;
+        let out = link.tick(None, 0.25, epoch + Duration::from_secs_f64(t));
+        assert!(out.left_frequency.is_empty(), "nobody left the frequency");
+    }
+    assert!(link.fleet().aircraft().len() >= fleet, "nobody was taken out");
+    for id in &before {
+        assert!(link.fleet().get(*id).is_some(), "{id} still flies");
+    }
+    Station::uninstall();
+}
+
 /// Every carrier our traffic flies (`traffic::airlines`) has its telephony
 /// in the station's table, the same words: the tower reads a call's
 /// telephony to know an airline (its go-around is the missed approach,
