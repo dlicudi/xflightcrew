@@ -116,6 +116,10 @@ const TextRef& opt_text();
 bool send_text_edit(const char* key, const char* value);
 // The resolved callsign for the Settings tab, "spoken|source" (empty = none yet).
 const TextRef& callsign_status();
+// The EFB link and its QR for the Settings tab, "url|N|hex" (empty = the EFB
+// is off; see drefs.cpp), and whether the app wrote it in the last 30 s.
+const TextRef& efb_url();
+bool efb_url_fresh();
 int opt_voice();
 void set_opt_voice(int v);
 int opt_cabin_voice();

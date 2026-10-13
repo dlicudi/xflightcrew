@@ -42,6 +42,10 @@ const DR_FROMTO: &str = "xcopilot/status/fromto";
 /// 2026-10-13). A plugin without it never resolves the id, and the board
 /// is simply not sent.
 const DR_BOARD: &str = "xcopilot/status/board";
+/// The Settings tab's EFB link and its QR code (`efb::qr::panel_payload`,
+/// 2026-10-13). A plugin without it never resolves the id, and the link is
+/// simply not sent.
+const DR_EFB_URL: &str = "xcopilot/status/efb_url";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
@@ -96,6 +100,8 @@ enum Update {
     FromTo(String),
     /// The Board tab's departures and arrivals. Empty: nothing to show.
     Board(String),
+    /// The Settings tab's EFB link, "url|N|hex". Empty: the EFB is off.
+    EfbUrl(String),
 }
 
 /// Severity of a panel alert — drives the chip colour/label in the plugin.
@@ -237,6 +243,16 @@ impl StatusSink {
     pub fn board(&self, payload: &str) {
         let _ = self.0.send(Update::Board(clip_to(payload, BRIEF_MAX)));
     }
+    /// The Settings tab's EFB link and QR (its 2 KB slot). A payload that
+    /// would not fit is sent empty, never cut: a cut matrix is no QR.
+    pub fn efb_url(&self, payload: &str) {
+        let payload = if payload.len() <= BRIEF_MAX {
+            payload
+        } else {
+            ""
+        };
+        let _ = self.0.send(Update::EfbUrl(payload.to_string()));
+    }
 }
 
 /// Scrub em/en dashes (the panel font can't render them) and trim to the plugin
@@ -280,6 +296,7 @@ enum Slot {
     Callsign,
     FromTo,
     Board,
+    EfbUrl,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -304,6 +321,7 @@ struct Ids {
     callsign: Option<i64>,
     fromto: Option<i64>,
     board: Option<i64>,
+    efb_url: Option<i64>,
 }
 
 impl Ids {
@@ -327,6 +345,7 @@ impl Ids {
             Slot::Callsign => self.callsign,
             Slot::FromTo => self.fromto,
             Slot::Board => self.board,
+            Slot::EfbUrl => self.efb_url,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -357,6 +376,7 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         callsign: resolve_id(http, rest, DR_CALLSIGN),
         fromto: resolve_id(http, rest, DR_FROMTO),
         board: resolve_id(http, rest, DR_BOARD),
+        efb_url: resolve_id(http, rest, DR_EFB_URL),
     }
 }
 
@@ -471,6 +491,7 @@ fn run(base: String, rx: Receiver<Update>) {
                 Update::Callsign(text) => (Slot::Callsign, json!(STANDARD.encode(text.as_bytes()))),
                 Update::FromTo(text) => (Slot::FromTo, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Board(text) => (Slot::Board, json!(STANDARD.encode(text.as_bytes()))),
+                Update::EfbUrl(text) => (Slot::EfbUrl, json!(STANDARD.encode(text.as_bytes()))),
             };
             // A plugin older than the label never registered it: nothing to
             // send, and nothing wrong with the link.
@@ -478,6 +499,9 @@ fn run(base: String, rx: Receiver<Update>) {
                 continue;
             }
             if slot == Slot::Board && ids.board.is_none() {
+                continue;
+            }
+            if slot == Slot::EfbUrl && ids.efb_url.is_none() {
                 continue;
             }
             if crate::xplane::sim_loading() {

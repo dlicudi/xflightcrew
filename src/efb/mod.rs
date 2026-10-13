@@ -21,9 +21,11 @@
 
 pub(crate) mod airport;
 pub(crate) mod basemap;
+pub(crate) mod board;
 pub(crate) mod feed;
 pub(crate) mod flight_tab;
 pub(crate) mod ptt;
+pub(crate) mod qr;
 pub(crate) mod route_map;
 pub(crate) mod state;
 pub(crate) mod transcript;
@@ -77,24 +79,28 @@ pub(crate) fn token_ok(t: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// A fresh 128-bit token, hex. `RandomState` is keyed from the OS's
-/// randomness; two of them, mixed with the clock and the pid, are plenty
-/// for a key on a home LAN (no crypto crate for one string).
+/// The length of a generated token, in hex digits (40 bits). 2026-10-13:
+/// was 32; the panel's QR code means nobody types it, and a wrong guess is
+/// a 403, blackboxed: 40 bits is out of reach of guessing on a LAN (a
+/// spoken line is further limited to one per 500 ms). A token the pilot set
+/// (`XCOPILOT_EFB_TOKEN`, 8 or more) stays as it is.
+pub(crate) const TOKEN_HEX: usize = 10;
+
+/// A fresh token, [`TOKEN_HEX`] hex digits. `RandomState` is keyed from the
+/// OS's randomness; mixed with the clock and the pid it is plenty for a key
+/// on a home LAN (no crypto crate for one string).
 pub(crate) fn new_token() -> String {
     use std::hash::{BuildHasher, Hasher};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    (0..2u8)
-        .map(|i| {
-            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-            h.write_u128(nanos);
-            h.write_u32(std::process::id());
-            h.write_u8(i);
-            format!("{:016x}", h.finish())
-        })
-        .collect()
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(nanos);
+    h.write_u32(std::process::id());
+    let mut t = format!("{:016x}", h.finish());
+    t.truncate(TOKEN_HEX);
+    t
 }
 
 /// Equal without an early exit on the first differing byte.
@@ -442,6 +448,7 @@ fn gather(server: &Server) -> state::Facts {
         .unwrap_or_default();
     state::Facts {
         fields,
+        boards: feed::boards(),
         now_t: now_unix(),
         flight: crate::flight::published(),
         owner: crate::flight_state::crew_has_aircraft().map(|o| o.name()),
@@ -1188,7 +1195,8 @@ mod tests {
     fn tokens_are_fresh_and_well_formed() {
         let a = new_token();
         let b = new_token();
-        assert_eq!(a.len(), 32);
+        assert_eq!(a.len(), TOKEN_HEX);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(token_ok(&a));
         assert_ne!(a, b);
         assert!(!token_ok("short"));

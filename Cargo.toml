@@ -112,8 +112,13 @@ hound = "3"
 # the default build stays light. `ort` wraps libonnxruntime.
 ort = { version = "2.0.0-rc.12", optional = true }
 earshot = "1.1.0"
+# the EFB link's QR code for the panel (efb::qr, 2026-10-13): MIT OR Apache-2.0,
+# no dependencies with its default features (image, svg) off
+qrcode = { version = "0.14.1", default-features = false }
 
 [dev-dependencies]
+# decodes efb::qr's matrix back to the link in a test (MIT OR Apache-2.0)
+rqrr = { version = "0.11.0", default-features = false }
 # `start_paused` for the flows that sleep at a crew's pace: a thirty-second
 # start runs in milliseconds with the clock paused and the order still tested.
 tokio = { version = "1", features = ["full", "test-util"] }
