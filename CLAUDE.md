@@ -258,7 +258,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   (`own_strip_claim`). A turn of our runway is SAID (`state_runway_change`). FROZEN while committed;
   a stated runway stands when the wind does not argue (`stated_runway_stands`). **The wind picks a
   direction, the longest parallel the strip** (`best_runway_for_wind`, `close_parallel_main`).
-- **Release threads the arrival stream** (`DEPART_GAP_NM`). **A hold keeps its word**
+- **Release threads the arrival stream** (`DEPART_GAP_NM`); **a strip cleared to land and still
+  flying is an ARRIVAL to a departure, never "traffic on the runway"**
+  (`RunwayBook::departure_blocked`). **A hold keeps its word**
   (`on_independent_final`, `occupies`, `TakeoffHold.held_for`).
 - **Circuit traffic stays with the tower** (`tower::wants_circuits`): cleared FOR THE CIRCUIT
   (`tower::circuit_clearance_lines`), no departure handoff. **A reject is a radio call**
@@ -266,7 +268,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   runway's** (`station::runway_occupancy_authorised`).
 - **The runway watch ticks whoever flies the final** (`go_around_tick` / `landing_hold_tick` ahead
   of the monitor's `quiet`); **the crew never lands uncleared** (`UnclearedWatch`). **One departure
-  on the runway at a time** (`WAKE_SECS`); departure clears no higher than the FILED cruise
+  on the runway at a time** (`WAKE_SECS`, ours included: `wake_remaining_for`), **and a takeoff
+  clearance's claim ends when the aircraft flies, ours too** (`RunwayBook::add_strip`), never on
+  a next call a hand-flown departure may not make; departure clears no higher than the FILED cruise
   (`capped_departure_climb`).
 - **A landing is never cleared onto an occupied runway, and the go-around is judged on time**
   (`LANDING_HOLD`, `landing_release_due`, `go_around_due`, `strip_exit`). **An occupant is the
