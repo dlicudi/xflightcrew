@@ -991,6 +991,43 @@ pub(crate) struct TrafficOut {
     pub(crate) gs_kts: f64,
     /// The route still ahead, [lat, lon] pairs: drawn for the selected one.
     pub(crate) ahead: Vec<[f64; 2]>,
+    /// Flown by the whole-flight model, outside the full simulation: drawn
+    /// small far out (2026-10-13).
+    pub(crate) model: bool,
+    /// The whole flight, origin to destination, as FlightAware shows it.
+    pub(crate) journey: Option<JourneyOut>,
+}
+
+/// A flight's whole journey on the wire (`efb::feed::Journey`): both ends
+/// and their positions, the off-block and on-block local "HH:MM", the
+/// minutes since the one and to the other, and the share flown (0 to 1,
+/// two decimals).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct JourneyOut {
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) from_pos: [f64; 2],
+    pub(crate) to_pos: [f64; 2],
+    pub(crate) off: String,
+    pub(crate) on: String,
+    pub(crate) since_min: i64,
+    pub(crate) to_go_min: i64,
+    pub(crate) progress: f64,
+}
+
+/// The wire's journey. Pure.
+pub(crate) fn journey_out(j: &crate::efb::feed::Journey) -> JourneyOut {
+    JourneyOut {
+        from: j.from.clone(),
+        to: j.to.clone(),
+        from_pos: [r6(j.from_pos.0), r6(j.from_pos.1)],
+        to_pos: [r6(j.to_pos.0), r6(j.to_pos.1)],
+        off: j.off.clone(),
+        on: j.on.clone(),
+        since_min: (j.since_s / 60.0).round() as i64,
+        to_go_min: (j.to_go_s / 60.0).round() as i64,
+        progress: (j.progress.clamp(0.0, 1.0) * 100.0).round() / 100.0,
+    }
 }
 
 /// A stand somebody holds.
@@ -1073,6 +1110,8 @@ pub(crate) fn traffic_out(fields: &[crate::efb::feed::TrafficField]) -> Vec<Traf
             alt_ft: (!a.on_ground).then(|| (a.alt_ft / 10.0).round() * 10.0),
             gs_kts: a.gs_kts.round(),
             ahead: a.ahead.iter().map(|&(la, lo)| [r6(la), r6(lo)]).collect(),
+            model: a.modeled,
+            journey: a.journey.as_ref().map(journey_out),
         })
         .collect()
 }

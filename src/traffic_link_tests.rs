@@ -1734,6 +1734,7 @@ fn real_install_midflow_start_inner() {
         };
         let placed: Vec<String> = schedule
             .iter()
+            .filter(|m| !matches!(m.start, Some(traffic::Start::Away { .. })))
             .filter_map(|m| m.start.as_ref().map(|s| format!("{} {s:?}", m.callsign)))
             .collect();
         println!(

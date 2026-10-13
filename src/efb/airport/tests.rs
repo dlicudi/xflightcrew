@@ -487,6 +487,8 @@ fn traffic_ac(f: &Frame, id: u32, x: f64, y: f64, on_ground: bool) -> crate::efb
         on_ground,
         gs_kts: 141.6,
         ahead: vec![(t.lat + 0.0001234567, t.lon)],
+        journey: None,
+        modeled: false,
     }
 }
 
@@ -529,6 +531,44 @@ fn traffic_rides_the_map_in_lat_lon_with_its_card() {
     assert!(close(a.ahead[0][0] - a.lat, 0.000123, 0.0000011), "rounded like the position");
     assert_eq!(out[1].alt_ft, Some(1_230.0));
     assert_eq!(out[1].phase, "on final");
+}
+
+/// A whole flight rides the map with its journey (2026-10-13): the model's
+/// flagged, both ends' positions rounded as a position, minutes since the
+/// off-block and to the on-block, the share flown to two decimals; a flight
+/// with no journey carries none.
+#[test]
+fn a_whole_flight_rides_the_map_with_its_journey() {
+    let f = Frame::new(36.675, -4.499);
+    let mut far = traffic_ac(&f, 7, 400_000.0, 600_000.0, false);
+    far.modeled = true;
+    far.journey = Some(crate::efb::feed::Journey {
+        from: "EGKK".into(),
+        to: "LEMG".into(),
+        from_pos: (51.148_123_456_7, -0.19),
+        to_pos: (36.675, -4.499),
+        off: "08:05".into(),
+        on: "11:50".into(),
+        since_s: 4_830.0,
+        to_go_s: 2_129.0,
+        progress: 0.684_9,
+    });
+    let near = traffic_ac(&f, 8, 100.0, 0.0, true);
+    let out = traffic_out(&[crate::efb::feed::TrafficField {
+        icao: "LEMG".into(),
+        aircraft: vec![far, near],
+        taken: Vec::new(),
+    }]);
+    let j = out[0].journey.as_ref().expect("a journey");
+    assert!(out[0].model && !out[1].model);
+    assert_eq!(j.from_pos, [51.148123, -0.19]);
+    assert_eq!((j.since_min, j.to_go_min), (81, 35));
+    assert_eq!(j.progress, 0.68);
+    assert_eq!((j.off.as_str(), j.on.as_str()), ("08:05", "11:50"));
+    assert!(out[1].journey.is_none());
+    let wire = serde_json::to_value(&out[0]).unwrap();
+    assert_eq!(wire["model"], true);
+    assert_eq!(wire["journey"]["to"], "LEMG");
 }
 
 /// A stand is free or taken by the traffic world's own holds and our own

@@ -63,8 +63,29 @@
     return null;
   }
 
+  // Points along the great circle from a to b ([lat, lon]), one about
+  // every 20 nm, both ends included: a whole flight's line (the server's
+  // `traffic::track::gc_point`, the same slerp).
+  function gcPoints(a, b) {
+    var R = Math.PI / 180;
+    var la = a[0] * R, oa = a[1] * R, lb = b[0] * R, ob = b[1] * R;
+    var h = Math.pow(Math.sin((lb - la) / 2), 2) + Math.cos(la) * Math.cos(lb) * Math.pow(Math.sin((ob - oa) / 2), 2);
+    var d = 2 * Math.asin(Math.min(1, Math.sqrt(h)));
+    var n = Math.max(1, Math.min(120, Math.ceil(d * 3440 / 20)));
+    if (d < 1e-9) return [a, b];
+    var out = [];
+    for (var i = 0; i <= n; i++) {
+      var f = i / n, ka = Math.sin((1 - f) * d) / Math.sin(d), kb = Math.sin(f * d) / Math.sin(d);
+      var x = ka * Math.cos(la) * Math.cos(oa) + kb * Math.cos(lb) * Math.cos(ob);
+      var y = ka * Math.cos(la) * Math.sin(oa) + kb * Math.cos(lb) * Math.sin(ob);
+      var z = ka * Math.sin(la) + kb * Math.sin(lb);
+      out.push([Math.atan2(z, Math.hypot(x, y)) / R, Math.atan2(y, x) / R]);
+    }
+    return out;
+  }
+
   var host = typeof window !== 'undefined' ? window : {};
-  host.XvlMapMath = { mx: mx, my: my, lonOf: lonOf, latOf: latOf, kAt: kAt, fieldFrame: fieldFrame, tileCount: tileCount, baseBox: baseBox, M_PER_DEG: M_PER_DEG };
+  host.XvlMapMath = { mx: mx, my: my, lonOf: lonOf, latOf: latOf, kAt: kAt, fieldFrame: fieldFrame, tileCount: tileCount, baseBox: baseBox, gcPoints: gcPoints, M_PER_DEG: M_PER_DEG };
   if (typeof document === 'undefined') return;
 
   // ------------------------------------------------------------ state
@@ -175,13 +196,33 @@
     });
     Object.keys(tr).forEach(function (k) { if (!seen[k]) { delete tr[k]; delete trails[k]; } });
   }
-  // The selected aircraft's trail behind it (fading) and its route ahead
-  // (dashed), under the symbols.
+  // A [lat, lon] polyline on the screen (no wrap: the map never crosses
+  // the antimeridian at these ranges).
+  function strokeLatLon(pts, from) {
+    ctx.beginPath();
+    if (from) ctx.moveTo(from[0], from[1]);
+    pts.forEach(function (p, i) {
+      var x = sx(mx(p[1])), y = sy(my(p[0]));
+      if (i === 0 && !from) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+  // The selected aircraft's whole flight (2026-10-13, like FlightAware):
+  // the great circle from its origin to where it is solid, its trail
+  // behind it (fading), its route ahead and on to its destination dashed,
+  // both ends marked; under the symbols.
   function drawSelectedPath(t) {
     if (!sel || sel.kind !== 'ac' || !tr[sel.id]) return;
     var a = tr[sel.id].d, n = glideNow(tr[sel.id], t);
     screenTransform();
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    var j = a.journey, here = [latOf(n.Y), lonOf(n.X)];
+    if (j) {
+      ctx.globalAlpha = 0.7;
+      ctx.strokeStyle = C.cyan; ctx.lineWidth = 2;
+      strokeLatLon(gcPoints(j.from_pos, here));
+      ctx.globalAlpha = 1;
+    }
     var tl = trails[sel.id] || [];
     for (var i = 1; i < tl.length; i++) {
       ctx.beginPath();
@@ -191,13 +232,29 @@
       ctx.strokeStyle = C.cyan; ctx.lineWidth = 3; ctx.stroke();
     }
     ctx.globalAlpha = 1;
+    ctx.setLineDash([8, 6]);
+    ctx.strokeStyle = C.violet; ctx.lineWidth = 2.5;
+    var tip = here;
     if (a.ahead && a.ahead.length) {
-      ctx.beginPath();
-      ctx.moveTo(sx(n.X), sy(n.Y));
-      a.ahead.forEach(function (p) { ctx.lineTo(sx(mx(p[1])), sy(my(p[0]))); });
-      ctx.setLineDash([8, 6]);
-      ctx.strokeStyle = C.violet; ctx.lineWidth = 2.5; ctx.stroke();
-      ctx.setLineDash([]);
+      // Far out (a modelled arrival) the way to its entry is a great
+      // circle; the approach beyond it, and a simulated route, as drawn.
+      var lead = gcPoints(here, a.ahead[0]);
+      strokeLatLon(lead.concat(a.ahead.slice(1)), [sx(n.X), sy(n.Y)]);
+      tip = a.ahead[a.ahead.length - 1];
+    }
+    if (j && Math.hypot(tip[0] - j.to_pos[0], (tip[1] - j.to_pos[1]) * Math.cos(tip[0] * Math.PI / 180)) > 0.03) {
+      strokeLatLon(gcPoints(tip, j.to_pos));
+    }
+    ctx.setLineDash([]);
+    if (j) {
+      [[j.from_pos, j.from], [j.to_pos, j.to]].forEach(function (e) {
+        var x = sx(mx(e[0][1])), y = sy(my(e[0][0]));
+        if (!onScreen(x, y, 20)) return;
+        ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2);
+        ctx.fillStyle = C.cyan; ctx.fill();
+        ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5; ctx.stroke();
+        tag(x, y - 14, e[1], { size: 11, bold: true, color: C.cyan, bg: 'rgba(7,9,12,0.75)' });
+      });
     }
   }
 
@@ -433,6 +490,9 @@
     '.apt-pop dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:2px 0 0;font-size:14px}',
     '.apt-pop dt{color:var(--muted)}',
     '.apt-pop dd{margin:0;overflow-wrap:anywhere}',
+    '.apt-pop dd.prog{display:flex;align-items:center;gap:8px}',
+    '.apt-pop dd.prog .bar{flex:1 1 auto;height:6px;border-radius:3px;background:var(--line2);overflow:hidden}',
+    '.apt-pop dd.prog .fill{display:block;height:100%;background:var(--cyan)}',
     '.apt-pop .pact{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:4px}',
     '.apt-pop .pact:empty{display:none}',
     '.apt-pop .pact span{flex:1 1 100%;font-size:14px;color:var(--amber)}',
@@ -1174,6 +1234,8 @@
       var x = sx(n.X), y = sy(n.Y);
       if (!onScreen(x, y, 30)) return;
       var zz = ppmAt(a.lat) > STAND_NAME_PPM ? 1.25 : z;
+      // The whole flights far out (the model's): small, more so zoomed out.
+      if (a.model) zz = view.z < 8 ? 0.5 : 0.75;
       ctx.save();
       ctx.translate(x, y);
       ctx.rotate(n.h * Math.PI / 180);
@@ -1187,7 +1249,9 @@
       ctx.lineJoin = 'round';
       ctx.strokeStyle = '#000'; ctx.lineWidth = 2.5; ctx.stroke();
       ctx.fillStyle = a.on_ground ? '#9C8CD8' : C.violet;
+      if (a.model) ctx.globalAlpha = 0.8;
       ctx.fill();
+      ctx.globalAlpha = 1;
       ctx.restore();
       if (sel && sel.kind === 'ac' && sel.id === a.id) {
         ctx.beginPath(); ctx.arc(x, y, 16 * zz, 0, Math.PI * 2);
@@ -1256,6 +1320,9 @@
     Object.keys(tr).forEach(function (k) {
       var a = tr[k].d, n = glideNow(tr[k], t);
       if (a.on_ground && ppmAt(a.lat) <= GROUND_CS_PPM) return;
+      // Far out, the model's flights are named only once zoomed in a little
+      // (or selected): a region's sky of callsigns is noise.
+      if (a.model && view.z < 8 && !(sel && sel.id === a.id)) return;
       var x = sx(n.X), y = sy(n.Y);
       if (onScreen(x, y, 0)) tag(x, y + 16, a.callsign, { size: 11, bold: true, color: C.violet, bg: 'rgba(7,9,12,0.75)' });
     });
@@ -1377,6 +1444,25 @@
     popRows.appendChild(el('dt', null, dt));
     popRows.appendChild(el('dd', null, String(dd)));
   }
+  // "1 h 05 min", "35 min".
+  function span(min) {
+    min = Math.max(0, Math.round(min));
+    var h = Math.floor(min / 60), m = min % 60;
+    return h ? h + ' h ' + (m < 10 ? '0' : '') + m + ' min' : m + ' min';
+  }
+  // The share flown as FlightAware draws it: a bar and its percentage.
+  function progressRow(p) {
+    var pct = Math.round(Math.max(0, Math.min(1, p)) * 100);
+    popRows.appendChild(el('dt', null, 'Progress'));
+    var dd = el('dd', 'prog');
+    var bar = el('span', 'bar');
+    var fill = el('span', 'fill');
+    fill.style.width = pct + '%';
+    bar.appendChild(fill);
+    dd.appendChild(bar);
+    dd.appendChild(el('span', null, pct + '%'));
+    popRows.appendChild(dd);
+  }
   function button(text, cls, onClick, disabled) {
     var b = el('button', 'go' + (cls ? ' ' + cls : ''), text);
     b.type = 'button';
@@ -1395,7 +1481,7 @@
     var mv = st && st.reposition;
     // Rebuilt only when what it says changed: a button rebuilt under a
     // finger would lose its tap.
-    var sig = JSON.stringify(a ? [a.callsign, a.phase, a.stand, a.alt_ft, a.gs_kts, a.est]
+    var sig = JSON.stringify(a ? [a.callsign, a.phase, a.stand, a.alt_ft, a.gs_kts, a.est, a.journey]
       : [sel.icao, s.name, standState(sel.icao, s.name), confirming, popNote, mv]);
     if (sig === popSig && !popBox.hidden) return;
     popSig = sig;
@@ -1405,13 +1491,20 @@
     if (a) {
       popTitle.textContent = a.callsign;
       popSub.textContent = [a.airline, a.spoken && a.spoken !== a.callsign ? '"' + a.spoken + '"' : ''].filter(Boolean).join(', ');
+      var j = a.journey;
       row('Type', a.icao_type);
       row('Route', (a.from || '?') + ' to ' + (a.to || '?'));
       row('Doing', a.phase);
+      if (j) {
+        row('Off blocks', j.off + (j.since_min >= 0 ? ' (' + span(j.since_min) + ' ago)' : ' (in ' + span(-j.since_min) + ')'));
+        row(j.to_go_min >= 0 ? 'Arrives' : 'Arrived', j.on + (j.to_go_min >= 0 ? ' (in ' + span(j.to_go_min) + ')' : ''));
+        progressRow(j.progress);
+      }
       row('Stand', a.stand);
       row('Slot', a.sched ? a.sched + (a.est && a.est !== a.sched ? ', expected ' + a.est : '') : null);
       row('Altitude', a.alt_ft !== null && a.alt_ft !== undefined ? Math.round(a.alt_ft).toLocaleString('en-GB') + ' ft' : null);
       row('Speed', a.gs_kts > 1 ? a.gs_kts + ' kt' : null);
+      if (a.model) popAct.appendChild(el('div', 'note', 'Beyond our simulated airspace: placed by its timetable.'));
       return;
     }
     var ss = standState(sel.icao, s.name);

@@ -375,6 +375,33 @@ pub(crate) struct TrafficAc {
     pub(crate) gs_kts: f64,
     /// The route still ahead (lat, lon), thinned ([`traffic::aircraft::Route::ahead`]).
     pub(crate) ahead: Vec<(f64, f64)>,
+    /// The whole flight, origin to destination (2026-10-13), where the
+    /// timetable places both ends.
+    pub(crate) journey: Option<Journey>,
+    /// Flown by the whole-flight model, outside the full simulation
+    /// (`traffic::track`).
+    pub(crate) modeled: bool,
+}
+
+/// A flight's whole journey as FlightAware shows it (2026-10-13,
+/// `traffic::track`): both ends, the off-block on the origin's clock and
+/// the on-block (estimated) on the destination's, the time since the one
+/// and to the other, and how far along the great circle it is.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Journey {
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) from_pos: (f64, f64),
+    pub(crate) to_pos: (f64, f64),
+    /// Local "HH:MM".
+    pub(crate) off: String,
+    pub(crate) on: String,
+    /// Seconds since the off-block (negative: still to come) and to the
+    /// on-block.
+    pub(crate) since_s: f64,
+    pub(crate) to_go_s: f64,
+    /// 0 to 1.
+    pub(crate) progress: f64,
 }
 
 /// A stand one of our traffic holds ([`traffic::fleet::Fleet::stand_holder`]).

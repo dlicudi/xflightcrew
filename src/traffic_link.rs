@@ -16,6 +16,10 @@
 //! The station never actuates: the fleet moves its own aircraft, and the
 //! plugin draws them from the packed frames this side writes.
 //!
+//! The whole flight (2026-10-13, [`whole`]): every timetabled flight of a
+//! simulated field exists from its origin's blocks to its destination's,
+//! the model flying what the simulation does not.
+//!
 //! Several fields at once (2026-10-13, `docs/tasks/multi-field-traffic`):
 //! [`TrafficWorld`] keeps a link per field simulated, the station's field
 //! worked as above, every other timetable field in range by its own runway
@@ -416,6 +420,15 @@ struct Due {
     /// since the fleet's start ([`Movement::parked_from_start`]): released
     /// at its time rather than spawned.
     held: Option<u32>,
+    /// When it was first due, fleet seconds: an arrival's whole-flight model
+    /// reaches its entry then ([`whole`]), whatever retries come after.
+    first_s: f64,
+    /// Its id once the model has shown it (the spawn keeps it: one flight,
+    /// one id, one roster entry from the origin to the gate).
+    id: Option<u32>,
+    /// An arrival's whole-flight model and the runway it was built for
+    /// (`None` inside: the model cannot fly it, not tried again).
+    model: Option<(String, Option<whole::Modeled>)>,
 }
 
 /// The fleet at the installed field, its schedule and its spawn book.
@@ -466,6 +479,21 @@ pub(crate) struct Link {
     /// Generated schedules flown so far at this field (the next hour's
     /// seed and offset); `None` for a timetable or the pilot's file.
     hours: Option<u32>,
+    /// THE WHOLE FLIGHT (2026-10-13, `traffic::track`): the departures the
+    /// model flies on beyond the simulation, to their destinations.
+    beyond: Vec<whole::Modeled>,
+    /// The departures gone before the start, still to be modelled from
+    /// their wheels up at the first model tick (the board's clock is set
+    /// after [`Link::new`]).
+    away: Vec<Movement>,
+    /// Fleet time of the last model tick ([`whole::MODEL_EVERY_S`]).
+    model_s: f64,
+    /// The timetable's day is in the summer season (the other ends'
+    /// clocks, `traffic::places::utc_offset_h`).
+    summer: bool,
+    /// The whole flight of each arrival the simulation took from the model,
+    /// by id: its origin's times for the EFB's card.
+    entered: HashMap<u32, (String, traffic::track::Whole)>,
 }
 
 /// Traffic ids from ONE counter for every field's fleet (multi-field
@@ -530,14 +558,21 @@ impl Link {
         let (to_park, schedule): (Vec<Movement>, Vec<Movement>) = schedule
             .into_iter()
             .partition(|m| m.kind == MovementKind::Parked);
+        // Gone before the start: the whole-flight model's from its wheels up.
+        let (away, schedule): (Vec<Movement>, Vec<Movement>) = schedule
+            .into_iter()
+            .partition(|m| matches!(m.start, Some(traffic::Start::Away { .. })));
         let mut due: Vec<Due> = schedule
             .into_iter()
             .map(with_telephony)
             .map(|m| Due {
                 at_s: m.t_s,
+                first_s: m.t_s,
                 m,
                 tries: 0,
                 held: None,
+                id: None,
+                model: None,
             })
             .collect();
         due.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
@@ -570,6 +605,11 @@ impl Link {
             actual: HashMap::new(),
             desk: None,
             hours: None,
+            beyond: Vec::new(),
+            away,
+            model_s: f64::NEG_INFINITY,
+            summer: true,
+            entered: HashMap::new(),
         }
     }
 
@@ -762,7 +802,7 @@ impl Link {
             .iter()
             .map(|s| s.name.as_str())
             .collect();
-        let aircraft = self
+        let mut aircraft: Vec<TrafficAc> = self
             .fleet
             .aircraft()
             .iter()
@@ -799,9 +839,50 @@ impl Link {
                     on_ground: a.kin.on_ground,
                     gs_kts: a.kin.gs_kts,
                     ahead: if a.dormant() { Vec::new() } else { a.route.ahead(EFB_AHEAD_POINTS) },
+                    journey: f.and_then(|f| self.journey_simulated(a, f)),
+                    modeled: false,
                 }
             })
             .collect();
+        // The whole flights the model flies (2026-10-13): far out, the
+        // arrivals still to enter and the departures flown on.
+        aircraft.extend(self.modeled().map(|m| {
+            let a = &m.ac;
+            let f = m.info.as_ref();
+            let arriving = matches!(a.plan, traffic::Plan::Arrival { .. });
+            // An arrival's way still to come: its entry, where the
+            // simulation takes it (the page draws the great circle to it
+            // and on to the field; the approach's points come with the
+            // simulated aircraft, a map's worth of them for every flight
+            // far out would double the tap).
+            let ahead = if arriving {
+                vec![m.whole.track.b.pos]
+            } else {
+                Vec::new()
+            };
+            TrafficAc {
+                id: a.id,
+                callsign: a.callsign.clone(),
+                spoken: a.spoken.clone(),
+                airline: f.map(|f| f.airline.clone()).unwrap_or_default(),
+                icao_type: a.icao_type.clone(),
+                from: m.whole.origin.clone(),
+                to: m.whole.dest.clone(),
+                phase: m.words(),
+                stand: f.and_then(|f| f.stand.as_deref()).map(|n| traffic::stands::label(n, &names)),
+                sched: f.and_then(|f| f.sched_s).map(traffic::rotation::hhmm),
+                est: f.and_then(|f| f.est_s).map(traffic::rotation::hhmm),
+                lat: a.kin.lat,
+                lon: a.kin.lon,
+                hdg: a.kin.hdg_deg,
+                alt_ft: a.kin.alt_ft,
+                on_ground: a.kin.on_ground,
+                gs_kts: a.kin.gs_kts,
+                ahead,
+                journey: Some(self.journey_modeled(m)),
+                modeled: true,
+            }
+        }));
         let taken = self
             .fleet
             .field
@@ -854,9 +935,12 @@ impl Link {
         self.due
             .extend(schedule.into_iter().map(with_telephony).map(|m| Due {
                 at_s: m.t_s + offset_s,
+                first_s: m.t_s + offset_s,
                 m,
                 tries: 0,
                 held: None,
+                id: None,
+                model: None,
             }));
         self.due.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
     }
@@ -1078,6 +1162,7 @@ impl Link {
         }
         self.note_actuals(&events);
         out.events = events;
+        self.fly_models();
         out
     }
 
@@ -1090,6 +1175,7 @@ impl Link {
         let mut out = TickOut::default();
         self.spawn_due(own, &mut out);
         let Some(desk) = self.desk.as_mut() else {
+            self.fly_models();
             return out;
         };
         desk.tick(&self.fleet);
@@ -1113,6 +1199,7 @@ impl Link {
         desk.hear(&events);
         self.note_actuals(&events);
         out.events = events;
+        self.fly_models();
         out
     }
 
@@ -1430,7 +1517,8 @@ impl Link {
                     continue;
                 }
             }
-            let spawned = d.m.spawn(self.ids.peek(), &self.fleet.field, &ctx);
+            let id = d.id.unwrap_or_else(|| self.ids.peek());
+            let spawned = d.m.spawn(id, &self.fleet.field, &ctx);
             if let Err(why) = &spawned {
                 tracing::info!(callsign = %d.m.callsign, kind = ?d.m.kind, runway = %d.m.runway,
                     tries = d.tries, "traffic: spawn refused ({why:?})");
@@ -1445,8 +1533,14 @@ impl Link {
                     let id = ac.id;
                     let cs = ac.callsign.clone();
                     self.note_type(&ac.callsign, &ac.icao_type);
+                    let entered = whole::entered(&d, &ac, now_s, self.icao());
                     if self.fleet.spawn(ac) {
-                        self.ids.bump();
+                        if d.id.is_none() {
+                            self.ids.bump();
+                        }
+                        if let Some(w) = entered {
+                            self.entered.insert(id, (cs.clone(), w));
+                        }
                         out.spawned.push((id, cs));
                     }
                 }
@@ -1738,7 +1832,7 @@ pub(crate) struct TrafficWorld {
 /// the monitor ticks at about 3 Hz and a record a tick would drown the log.
 #[derive(Debug, Default)]
 struct DrawLog {
-    last: Option<(usize, usize, usize)>,
+    last: Option<(usize, usize, usize, usize)>,
     at: Option<Instant>,
 }
 
@@ -1746,9 +1840,9 @@ const DRAW_LOG_GAP: std::time::Duration = std::time::Duration::from_secs(5);
 const DRAW_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl DrawLog {
-    fn note(&mut self, simulated: usize, drawn: &[&TrafficAircraft], now: Instant) {
+    fn note(&mut self, simulated: usize, modeled: usize, drawn: &[&TrafficAircraft], now: Instant) {
         let parked = drawn.iter().filter(|a| a.dormant()).count();
-        let counts = (simulated, drawn.len(), parked);
+        let counts = (simulated, modeled, drawn.len(), parked);
         let since = self.at.map(|t| now.saturating_duration_since(t));
         let due = match since {
             None => true,
@@ -1760,7 +1854,7 @@ impl DrawLog {
             crate::blackbox::record(
                 "traffic",
                 serde_json::json!({ "event": "draw", "simulated": simulated,
-                    "drawn": drawn.len(), "parked_drawn": parked }),
+                    "modeled": modeled, "drawn": drawn.len(), "parked_drawn": parked }),
             );
         }
     }
@@ -1977,14 +2071,19 @@ impl TrafficWorld {
             );
         }
         if let Some(sink) = self.sink.as_mut() {
+            // The simulated aircraft and, inside the same ring, the whole
+            // flights the model flies (a departure past 12 nm, an arrival
+            // still to enter): no aircraft pops in or out of TCAS range.
+            let simulated = self.links.values().map(|l| l.fleet().aircraft().len()).sum();
             let all: Vec<&TrafficAircraft> = self
                 .links
                 .values()
-                .flat_map(|l| l.fleet().aircraft())
+                .flat_map(|l| l.fleet().aircraft().iter().chain(l.modeled_drawn()))
                 .collect();
             let drawn = self.cull.select(Some(here), &all);
             sink.publish(&drawn, self.last_sim_s.unwrap_or(0.0));
-            self.draw_log.note(all.len(), &drawn, now);
+            self.draw_log
+                .note(simulated, all.len() - simulated, &drawn, now);
         }
         // The frequencies: the tower's runway-watch lines in the tower's
         // voice, the positions' handoffs in theirs, each on its own
@@ -2505,6 +2604,9 @@ fn build_link(
     if let Some((flights, local_s)) = board {
         link.set_board(flights, local_s);
     }
+    if let Some(table) = table {
+        link.set_summer(timetable_clock(table, zulu_s, day).0.summer());
+    }
     Some(link)
 }
 
@@ -2926,6 +3028,9 @@ pub(crate) fn despawn_word(d: Despawn) -> &'static str {
         Despawn::Towed => "towed",
     }
 }
+
+#[path = "traffic_whole.rs"]
+mod whole;
 
 #[cfg(test)]
 #[path = "traffic_link_tests.rs"]

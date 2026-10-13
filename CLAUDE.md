@@ -737,6 +737,13 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
 - **The Map tab's traffic and stands are the traffic world's** (`TrafficWorld::note_efb_traffic`,
   1 s while serving): free or taken is the fleet's own `Fleet::stand_holder`, plus our aircraft on
   one; no world simulating the field is UNKNOWN, never free (`airport::stand_states`).
+  **A timetabled flight exists from blocks to blocks** (2026-10-13): beyond the simulation the
+  pure whole-flight model places it by time (`traffic::track`, `src/traffic_whole.rs`), an
+  arrival's model ENDING at the very aircraft its spawn makes (`Movement::entry_anchor`, entry
+  toward its origin) and a departure's STARTING from the state it left the area in
+  (`Fleet::take_left`), same id both sides: no flight appears or vanishes
+  (`a_whole_flight_never_jumps_at_either_handover`). Drawn by the plugin only inside the draw
+  ring, never a TCAS target for the station; on the map with its `journey`.
 - **No new sim reads**: the page is ONE pure `state::build` over `Facts` gathered from what the app
   holds (flight model, owners, the shelf's plan, the follower, the party line, the voice's last
   controller line, the METAR file); `efb::feed` taps the speakers, the command loop and the monitor's
