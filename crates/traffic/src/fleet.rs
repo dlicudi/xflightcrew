@@ -45,6 +45,17 @@ pub struct Fleet {
     finished: Vec<u32>,
 }
 
+/// How an aircraft holds a stand ([`Fleet::stand_holder`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandHold {
+    /// Standing on it: parked, boarding, turned round, or about to leave.
+    OnIt,
+    /// Taxiing in to it.
+    TaxiingIn,
+    /// An arrival not yet down whose stand it is.
+    Assigned,
+}
+
 /// The margin kept between a parked aircraft's wing and a taxiing one's,
 /// metres ([`Fleet::way_runs_past`]).
 const WAY_MARGIN_M: f64 = 10.0;
@@ -328,6 +339,47 @@ impl Fleet {
             .collect()
     }
 
+    /// Who holds `stand`, by the same rule as [`Fleet::stands_held`]: an
+    /// aircraft on the ground standing on it (within
+    /// [`crate::field::STAND_TAKEN_M`]), else one taxiing in to it, else an
+    /// arrival still in the air or on the runway whose stand it is (the
+    /// stand plan's, [`crate::stands::plan`]). `None`: free of our traffic.
+    /// A departure that has left its stand no longer holds it. The EFB's
+    /// stand markers and its "Move here" read this (2026-10-13), never a
+    /// second rule.
+    pub fn stand_holder(&self, stand: &nav::Stand) -> Option<(&TrafficAircraft, StandHold)> {
+        let at = (stand.lat, stand.lon);
+        let on = self.aircraft.iter().find(|a| {
+            a.kin.on_ground
+                && a.phase != Phase::Gone
+                && crate::kin::dist_m(a.kin.pos(), at) < crate::field::STAND_TAKEN_M
+        });
+        if let Some(a) = on {
+            return Some((a, StandHold::OnIt));
+        }
+        let names = |a: &&TrafficAircraft| {
+            a.stand
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&stand.name))
+        };
+        if let Some(a) = self
+            .aircraft
+            .iter()
+            .filter(|a| a.phase == Phase::TaxiIn)
+            .find(names)
+        {
+            return Some((a, StandHold::TaxiingIn));
+        }
+        self.aircraft
+            .iter()
+            .filter(|a| {
+                matches!(a.plan, Plan::Arrival { .. })
+                    && (a.phase.airborne() || matches!(a.phase, Phase::Landing | Phase::Vacate))
+            })
+            .find(names)
+            .map(|a| (a, StandHold::Assigned))
+    }
+
     /// The stands the aircraft taxiing in are bound for.
     fn stands_claimed(&self) -> impl Iterator<Item = LatLon> + '_ {
         self.aircraft
@@ -410,5 +462,74 @@ impl Fleet {
         let ids: Vec<u32> = self.aircraft.iter().map(|a| a.id).collect();
         self.ready_at.retain(|id, _| ids.contains(id));
         events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::fixtures;
+
+    fn parked(field: &FieldModel, id: u32, stand: &str) -> TrafficAircraft {
+        TrafficAircraft::at_stand(
+            id,
+            &format!("TST{id}"),
+            "test",
+            "C172",
+            Plan::Parked,
+            field,
+            stand,
+            u64::from(id),
+        )
+        .unwrap()
+    }
+
+    /// A stand is held by whoever stands on it, then whoever taxis in to
+    /// it, then an arrival not yet down that it is planned for; a
+    /// departure gone from it, or nobody, leaves it free.
+    #[test]
+    fn a_stand_is_held_by_who_stands_taxis_in_or_is_due() {
+        let field = fixtures::xtst();
+        let mut fleet = Fleet::new(field.clone());
+        fleet.spawn(parked(&field, 1, "GA1"));
+        let mut taxiing = parked(&field, 2, "GA2");
+        taxiing.phase = Phase::TaxiIn;
+        taxiing.kin.lat -= 0.003;
+        fleet.spawn(taxiing);
+        let mut due = parked(&field, 3, "GA3");
+        due.plan = Plan::Arrival {
+            entry: (36.1, -5.0),
+            star: None,
+            runway: "09".into(),
+            straight_in: true,
+        };
+        due.phase = Phase::Final;
+        due.kin.on_ground = false;
+        due.kin.lat -= 0.03;
+        fleet.spawn(due);
+        let mut gone = parked(&field, 4, "GA4");
+        gone.plan = Plan::Departure {
+            runway: "09".into(),
+            sid: None,
+            exit_bearing: 90.0,
+        };
+        gone.phase = Phase::TaxiOut;
+        gone.kin.lat -= 0.003;
+        fleet.spawn(gone);
+        let hold = |n: &str| {
+            fleet
+                .stand_holder(field.stand(n).unwrap())
+                .map(|(a, h)| (a.id, h))
+        };
+        assert_eq!(hold("GA1"), Some((1, StandHold::OnIt)));
+        assert_eq!(hold("GA2"), Some((2, StandHold::TaxiingIn)));
+        assert_eq!(hold("GA3"), Some((3, StandHold::Assigned)));
+        assert_eq!(hold("GA4"), None, "a departure gone from its stand");
+        // The spawner's own picture agrees on the stands stood on or
+        // taxied in to.
+        let held = fleet.stands_held();
+        for n in ["GA1", "GA2"] {
+            assert!(crate::field::stand_taken(field.stand(n).unwrap(), &held));
+        }
     }
 }

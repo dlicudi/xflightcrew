@@ -2167,6 +2167,7 @@ pub(crate) mod tests {
                 length_m: 3_159.0,
                 heading_true: 257.8,
             }],
+            stands: Vec::new(),
         });
         f
     }

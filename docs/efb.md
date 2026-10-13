@@ -89,7 +89,7 @@ is a dash, never a guess.
 |---|---|---|
 | Strip | callsign (written, "WAT519"), type, route, phase and altitude, who flies, COM1 and its station | the monitor's callsign resolve (`feed::note_callsign`) written by `transcript::written_callsign` over the override and the plan's id, the live profile, the plan on the shelf, `flight::published()`, `flight_state::crew_has_aircraft` / `crew_mission`, the runway watch's COM1 read (`feed::note_com1`) named by the station's services |
 | Flight | the layout for the phase (below): a headline, four readouts, the cards; the running checklist as a card in any phase; the intercom log | `flight_tab::build` over the same facts; `flow::sheet`, `flow::proposal_title`, `flow::waiting_for`; the transcript's intercom lines |
-| Map | on the ground or low near the destination, the airport diagram; elsewhere the route over water and coastlines: legs in magenta, flown legs dimmed, the active fix ringed, the top of descent, the plan's fields, the aircraft (below) | `airport::page` (below); `route_map::build` over the plan's legs, `procedure::active_leg`, the monitor's tick, `procedure::planned_tod` (else the plan's ring measured back from the destination), the field directory (`station::field_position`); `GET /basemap` from X-Plane's installed map data |
+| Map | on the ground or low near the destination, the airport diagram with our traffic and the stands free or taken; elsewhere the route over water and coastlines: legs in magenta, flown legs dimmed, the active fix ringed, the top of descent, the plan's fields, the aircraft (below) | `airport::page` (below), `feed::traffic` (`TrafficWorld::note_efb_traffic`); `route_map::build` over the plan's legs, `procedure::active_leg`, the monitor's tick, `procedure::planned_tod` (else the plan's ring measured back from the destination), the field directory (`station::field_position`); `GET /basemap` from X-Plane's installed map data |
 | Plan | source and when shelved, the route string, the plan check and preflight, route and procedures, plan fuel, the load sheet, the legs (the follower's fix in magenta), the weather for destination, origin and alternate with the runway picked or cleared | `simbrief::loaded_plan` / `plan_shelved_at`, `procedure::active_leg`, `feed::AUDIT`, `feed::PREFLIGHT`, the sim's real-weather file (`weather::latest_file`, re-read at most once a minute), `full_auto::arrival_runway`, `party_line::clearance_runway` |
 | Board | its own tab (2026-10-13): every field our traffic simulates, Departures and Arrivals as the panel's Board tab shows them, the field picked on the device, a dash with no traffic running | `feed::boards`, each simulated field's `board_payload` tapped by the traffic world every 5 s while the EFB serves (`TrafficWorld::note_efb_boards`), read by `efb::board` |
 | Radio | COM1 and who it is, the accepted clearance (or the tower's state for us), a readback owed, the controller's last call to us with Say again, the station's frequencies, the frequency log (Radio or All) | `feed::com1`, `station::tuned_station`, `station::active_station_in_range`, `party_line::assigned_clearance`, the flight model's clearance fact, `party_line::readback_owed`, `Voice::last_controller_line`, the labelled transcript |
@@ -213,8 +213,47 @@ the route (`route.driven`, `route.remaining`, `holds`, `dest`; drawn only when i
 the runway (`runway`: cleared, arrival, or the plan's). The card exists only while the copilot's
 taxi guide runs (the crew on, `taxi_guide` on, a taxi clearance held).
 
-On the page: pinch or wheel to zoom, drag to pan, double tap to follow the aircraft again (or to
-see the whole field with no aircraft on it). The buttons: zoom, the whole field, north up or track
+### Our traffic and the stands (2026-10-13)
+
+With our own traffic running (`XCOPILOT_TRAFFIC=ours`), the diagram draws every aircraft of the
+traffic world within 30 km of the field (every simulated field's, so a neighbour's arrival flying
+past shows too) as a violet airliner rotated to its heading, smaller than our own white chevron,
+gliding between updates like ours; its callsign beside it in the air, and on the ground once
+zoomed in. Tap one for its card: callsign, airline and the callsign as spoken, ICAO type, from and
+to (the board's flight, else its plan), what it is doing in plain words (parked, starting up,
+taxiing out, holding short, lined up, taking off, climbing out, departing, inbound, downwind, base,
+on final, landing, vacating, taxiing in, going around), its stand, its timetable slot and today's
+estimate, its altitude in the air and its speed. Tap anywhere else to close it.
+
+The stands (apt.dat 1300) are coloured once zoomed in a little: green FREE, red TAKEN, white
+ours, grey UNKNOWN. Taken is the traffic world's own rule (`traffic::fleet::Fleet::stand_holder`,
+the one the fleet spawns and parks by): an aircraft standing on it, one taxiing in to it, or an
+arrival not yet down whose planned stand it is; and our own aircraft on the ground within 20 m of
+one. With no traffic world simulating the field nothing is known free: the stands are grey.
+Nothing new is read from X-Plane: the traffic world taps its fleets into the EFB's feed about once
+a second while the EFB serves (`TrafficWorld::note_efb_traffic`, `efb::feed::note_traffic`,
+expiring in 5 s), and the page state carries `airport.traffic` and `airport.stands` (`known` and
+the `taken` list).
+
+Tap a stand for its card: its name, kind (gate, tie down, hangar, other), the types it takes and
+its size code (1301) where apt.dat gives them, free or taken and by whom, and **Move here**
+(greyed on a taken stand). Move here asks first ("Move to Stand 24? The flight reloads.") and
+then `POST /reposition {"icao", "stand"}` (token required, one per 3 s, blackbox `efb`
+`reposition` with `asked`, then the outcome). It is SIM MANAGEMENT, not a crew action: it does not
+go through `/say` or the grammar, and no phrase starts it. The endpoint answers 202 at once and
+runs `tools::setup::reposition_to_stand` on its own thread, which owns every gate, in order: no
+other move under way, no new flight loading, no loop of ours holding the aircraft (the taxi and
+the tug included: "Say my controls first"), not in replay, stopped on the ground, the stand in the
+field's apt.dat, not on it already, not taken by our traffic. Then a ramp start through the
+plugin's mailbox exactly as "set up the flight" does, with THIS aircraft and its engines as they
+are (running or not), waited on through the load (`init_seq`/`init_result`), the new flight begun
+(`flight_state::flight_begins`), the station for the field put up, and the position READ BACK: on
+the stand within 30 m of its 1300 point, else "The move didn't take: we're N metres from Stand
+24." The outcome comes back as a toast (`airport.reposition`), and a move or a failure is said
+on the intercom as a status line ("We're on stand 24."); a refusal is shown only.
+
+On the page: pinch or wheel to zoom, drag to pan, tap an aircraft or a stand for its card,
+double tap to follow the aircraft again (or to see the whole field with no aircraft on it). The buttons: zoom, the whole field, north up or track
 up, follow. The aircraft glides between the one-second updates; a jump over 400 m is a jump.
 The script is `/diagram.js` (code, no data, served without the token like the icon). To look at
 it without a sim: `EFB_DIAGRAM_OUT=target/efb cargo test --release -- --ignored
@@ -225,10 +264,12 @@ real_install_page_states` writes the real LEMG and EGKK diagrams and a taxiing p
 Every button POSTs the words a pilot would say (`/say`), and the line goes onto the command channel
 exactly like the panel's typed line (`pollers::queue_command`; blackbox `typed` `taken` with
 `source: "efb"`, and `efb` `say`). The grammar picks the tool, with its gates and readback. There
-is no other way in: the EFB cannot do anything the voice cannot. The phrases are in
+is no other way in for a crew action: the EFB cannot do anything the voice cannot. The phrases are in
 `efb::state::PHRASES`, each pinned by `every_button_routes_where_it_says` to the branch or tool the
 command loop takes it to; the two built from a fact (a field's weather, the station's "say
-again" and "ready for departure") are pinned in the same test. "Fly the flight plan", "Land the
+again" and "ready for departure") are pinned in the same test. The one exception is sim
+management, not a crew action: the Map tab's "Move here" calls the setup tool's gated function
+through its own endpoint (`/reposition`, above), never a phrase. "Fly the flight plan", "Land the
 aircraft", "Load the aircraft" and "Go around" need a second tap within three seconds; "My
 controls" is always one tap, on every page and size.
 
@@ -301,6 +342,6 @@ The voice pickers, the audio bus, camera snap, the negative tone and the UI scal
 - The tower's runway in use at a field other than the one we are cleared at.
 - Wind and temperature at the aircraft, V speeds, landing performance beyond the book figure:
   each needs a new read or a new publisher.
-- On the Airport page: other traffic, the auto taxi's paint-ridden path (the page draws the route
+- On the Airport page: traffic other than our own (LiveTraffic's, X-Plane's AI), the auto taxi's paint-ridden path (the page draws the route
   as the party line holds it), Custom Scenery airports (only Global Airports' apt.dat is read, as
   everywhere else in the app).

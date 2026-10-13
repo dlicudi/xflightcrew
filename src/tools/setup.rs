@@ -396,12 +396,7 @@ pub fn pick_stand<'a>(stands: &'a [crate::nav::Stand], class: &[&str], jet: bool
 
 /// The flight-initialisation JSON: the aircraft at the ramp, cold and dark.
 pub fn init_json(acf_rel: &str, airport: &str, ramp: &str) -> String {
-    json!({
-        "aircraft": { "path": acf_rel },
-        "ramp_start": { "airport_id": airport, "ramp": ramp },
-        "engine_status": { "all_engines": { "running": false } },
-    })
-    .to_string()
+    ramp_json(acf_rel, airport, ramp, false)
 }
 
 pub struct SetUpFlight;
@@ -534,10 +529,21 @@ async fn follow_up(base: String, voice: Option<Voice>, body: String, origin: Str
             return;
         }
     }
-    // Settled: on the ground AT the terrain and still for five seconds (the
-    // load's transient sits "on the ground" 157 ft up a runway's midpoint,
-    // EGKK 2026-09-28), then the profile detection has its moment before the
-    // plan and the load.
+    settle_on_ramp(&xp, t0, &origin).await;
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    say(&format!("We're at {origin}, {stand}. Loading the plan and the load sheet."));
+    let _ = xp.set_data(TYPED, b"load the flight plan").await;
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    let _ = xp.set_data(TYPED, b"load the aircraft").await;
+    crate::blackbox::record("setup", json!({ "event": "done", "airport": origin, "ramp": stand }));
+}
+
+/// After a ramp start: wait until the aircraft is settled on the ground AT
+/// the terrain and still for five seconds (the load's transient sits "on the
+/// ground" 157 ft up a runway's midpoint, EGKK 2026-09-28), at most four
+/// minutes from `t0`, then put up the station of the field we are now at,
+/// before anything arms (#151).
+async fn settle_on_ramp(xp: &crate::xplane::XPlaneClient, t0: std::time::Instant, airport: &str) {
     let mut still = 0;
     while t0.elapsed().as_secs() < 240 && still < 10 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -554,27 +560,276 @@ async fn follow_up(base: String, voice: Option<Voice>, body: String, origin: Str
             0
         };
     }
-    // The station is the field we are now at, up before the flag drops and
-    // anything arms (#151).
     if crate::mode::atc_enabled() {
-        let fix = settled_position(&xp, SettleTiming::LIVE).await;
+        let fix = settled_position(xp, SettleTiming::LIVE).await;
         let station = match fix {
             Some(fix) => new_flight_station(fix, STATION_UP_S).await,
             None => NewFlightStation::default(),
         };
         crate::blackbox::record(
             "setup",
-            json!({ "event": "ramp_station", "airport": origin, "field": station.field,
+            json!({ "event": "ramp_station", "airport": airport, "field": station.field,
                     "tower": station.tower, "station_up": station.up, "was": station.was,
                     "settled": fix.is_some() }),
         );
     }
-    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-    say(&format!("We're at {origin}, {stand}. Loading the plan and the load sheet."));
-    let _ = xp.set_data(TYPED, b"load the flight plan").await;
-    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-    let _ = xp.set_data(TYPED, b"load the aircraft").await;
-    crate::blackbox::record("setup", json!({ "event": "done", "airport": origin, "ramp": stand }));
+}
+
+// ---- A move to another stand (the EFB's "Move here", 2026-10-13) -------------
+//
+// Sim management, not a crew action: the Map tab's stand card calls
+// [`reposition_to_stand`] through its own endpoint (`POST /reposition`), never
+// through the grammar, and no phrase reaches it. The same mailbox and the same
+// ramp start as "set up the flight", with THIS aircraft and its engines as
+// they are. The function owns every gate and the readback.
+
+/// The aircraft is on the stand it was moved to within this of its 1300
+/// point, metres: the sim parks the aircraft's own reference there, a few
+/// metres from wherever the gear stands.
+pub const MOVE_READBACK_M: f64 = 30.0;
+
+/// Our own aircraft this close to a stand is on it already, metres (the
+/// traffic's own rule, `traffic::field::STAND_TAKEN_M`).
+const ON_STAND_M: f64 = traffic::field::STAND_TAKEN_M;
+
+/// A move is under way: a second is refused, not queued.
+static MOVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Holds [`MOVING`] for one move.
+struct MoveGuard;
+
+impl MoveGuard {
+    fn take() -> Option<MoveGuard> {
+        use std::sync::atomic::Ordering::SeqCst;
+        MOVING
+            .compare_exchange(false, true, SeqCst, SeqCst)
+            .ok()
+            .map(|_| MoveGuard)
+    }
+}
+
+impl Drop for MoveGuard {
+    fn drop(&mut self) {
+        MOVING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What the move's gates read, one fact each.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MoveFacts {
+    /// Another move is under way.
+    pub busy: bool,
+    /// A new flight is loading ([`new_flight_loading`]).
+    pub loading: bool,
+    /// A loop of ours holds the aircraft, as its words
+    /// (`flight_state::crew_has_aircraft`, the taxi and the tug included).
+    pub holding: Option<&'static str>,
+    pub replay: bool,
+    /// Stopped on the ground; `None`: the read failed.
+    pub stopped: Option<bool>,
+    /// The stand is in the field's apt.dat.
+    pub stand_known: bool,
+    /// Our own aircraft stands on it already.
+    pub on_it: bool,
+    /// One of our traffic holds it ("EZY123, parked").
+    pub taken_by: Option<String>,
+}
+
+/// The stand as said: a bare number is "stand 24", a name keeps its own
+/// word ("Gate 5", "GA North"). Pure.
+pub fn stand_words(name: &str) -> String {
+    let name = name.trim();
+    if name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        format!("stand {name}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Why the move is refused, if it is: each gate in turn, the reason said
+/// with the thing to do about it. Pure.
+pub fn move_refusal(f: &MoveFacts, airport: &str, stand: &str) -> Option<String> {
+    let at = stand_words(stand);
+    if f.busy {
+        return Some("A move is already under way.".into());
+    }
+    if f.loading {
+        return Some("A new flight is still loading. Try again once it's up.".into());
+    }
+    if let Some(who) = f.holding {
+        return Some(format!("{who}. Say my controls first, then move."));
+    }
+    if f.replay {
+        return Some("We're in replay. Go back to live first.".into());
+    }
+    match f.stopped {
+        None => return Some("I can't read whether we're stopped.".into()),
+        Some(false) => {
+            return Some("Only when we're stopped on the ground: the move reloads the flight.".into())
+        }
+        Some(true) => {}
+    }
+    if !f.stand_known {
+        return Some(format!("{airport} has no {at} in its scenery data."));
+    }
+    if f.on_it {
+        return Some(format!("We're on {at} already."));
+    }
+    if let Some(by) = &f.taken_by {
+        let mut c = at.chars();
+        let at = c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default();
+        return Some(format!("{at} is taken: {by}."));
+    }
+    None
+}
+
+/// How a move ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MoveOutcome {
+    /// A gate said no; nothing was written.
+    Refused(String),
+    /// Written, and the aircraft is not on the stand (or the sim refused).
+    Failed(String),
+    /// On the stand, read back.
+    Done(String),
+}
+
+/// The flight-initialisation JSON for a ramp start of the loaded aircraft,
+/// its engines running or not. Pure.
+pub fn ramp_json(acf_rel: &str, airport: &str, ramp: &str, running: bool) -> String {
+    json!({
+        "aircraft": { "path": acf_rel },
+        "ramp_start": { "airport_id": airport, "ramp": ramp },
+        "engine_status": { "all_engines": { "running": running } },
+    })
+    .to_string()
+}
+
+/// Move THIS aircraft to `stand` at `airport` (the EFB's "Move here"): the
+/// gates ([`move_refusal`]), then a ramp start with the aircraft loaded and
+/// its engines as they are, waited on through the load as "set up the
+/// flight" waits (the plugin's `init_seq`/`init_result`, never a read into
+/// the load but the mailbox's), the new flight begun, the station put up for
+/// the field, and the position READ BACK against the stand's 1300 point
+/// ([`MOVE_READBACK_M`]). `started` hears the move go out (the gates passed,
+/// the JSON about to be posted). Run it off any loop's runtime: it takes
+/// tens of seconds.
+pub async fn reposition_to_stand(
+    xp: &crate::xplane::XPlaneClient,
+    apt_path: &str,
+    airport: &str,
+    stand: &str,
+    started: &(dyn Fn(&str) + Sync),
+) -> MoveOutcome {
+    let airport = airport.trim().to_ascii_uppercase();
+    let guard = MoveGuard::take();
+    let mut facts = MoveFacts {
+        busy: guard.is_none(),
+        loading: new_flight_loading(),
+        holding: crate::flight_state::crew_has_aircraft().map(crate::flight_state::Owner::doing),
+        ..MoveFacts::default()
+    };
+    // Nothing is read under another move, a load or a loop of ours.
+    if facts.busy || facts.loading || facts.holding.is_some() {
+        return MoveOutcome::Refused(move_refusal(&facts, &airport, stand).unwrap_or_default());
+    }
+    let (replay, g, gs, here, acf, running) = tokio::join!(
+        xp.get_float(crate::datarefs::IS_IN_REPLAY),
+        xp.get_float(crate::datarefs::ON_GROUND_ANY),
+        xp.get_float(crate::datarefs::GROUNDSPEED_MS),
+        sim::position::read_lat_lon(xp),
+        xp.get_string(crate::datarefs::ACF_RELATIVE_PATH),
+        xp.get_float_array(crate::datarefs::ENGINE_RUNNING),
+    );
+    facts.replay = replay.is_ok_and(|v| v > 0.5);
+    facts.stopped = (g.is_ok() && gs.is_ok()).then(|| sim::ground::stopped_on_ground(g.ok(), gs.ok()));
+    let (apt, icao) = (apt_path.to_string(), airport.clone());
+    let net = tokio::task::spawn_blocking(move || crate::nav::find_taxi_net(&apt, &icao).ok().flatten())
+        .await
+        .ok()
+        .flatten();
+    let spot = net.as_ref().and_then(|n| {
+        n.stands
+            .iter()
+            .find(|s| s.name == stand)
+            .or_else(|| n.stands.iter().find(|s| s.name.eq_ignore_ascii_case(stand.trim())))
+            .cloned()
+    });
+    facts.stand_known = spot.is_some();
+    let dist_to = |s: &crate::nav::Stand, (lat, lon): (f64, f64)| {
+        crate::nav::haversine_nm(lat, lon, s.lat, s.lon) * 1852.0
+    };
+    if let (Some(s), Ok((lat, lon, _))) = (&spot, &here) {
+        facts.on_it = dist_to(s, (*lat, *lon)) < ON_STAND_M;
+    }
+    facts.taken_by = spot
+        .as_ref()
+        .and_then(|s| crate::efb::feed::stand_taken_by(&airport, &s.name));
+    if let Some(line) = move_refusal(&facts, &airport, stand) {
+        return MoveOutcome::Refused(line);
+    }
+    let Some(spot) = spot else {
+        return MoveOutcome::Refused(format!("{airport} has no {stand}."));
+    };
+    let Some(acf) = acf.ok().filter(|p| !p.trim().is_empty()) else {
+        return MoveOutcome::Refused("I can't read which aircraft is loaded.".into());
+    };
+    let running = running.is_ok_and(|v| v.iter().any(|e| *e > 0.5));
+    let at = stand_words(&spot.name);
+    let body = ramp_json(&acf, &airport, &spot.name, running);
+    crate::blackbox::record(
+        "setup",
+        json!({ "event": "move_init", "acf": acf, "airport": airport, "ramp": spot.name,
+                "running": running, "json": body }),
+    );
+    started(&format!("Moving to {at} at {airport}."));
+    let _loading = Loading::begin();
+    let t0 = std::time::Instant::now();
+    let run = run_init(xp, body.as_bytes(), InitTiming::RAMP, &|w| {
+        crate::blackbox::record("setup", json!({ "event": "move_wait", "seq": w.seq, "result": w.result,
+            "seq0": w.seq0, "read_errors": w.read_errors, "polls": w.polls }));
+    })
+    .await;
+    if new_flight_began(&run.outcome) {
+        crate::flight_state::flight_begins(crate::flight_state::NewFlight::Ramp);
+    }
+    match run.outcome {
+        InitOutcome::Done(0) => {}
+        InitOutcome::Done(code) => {
+            return MoveOutcome::Failed(format!(
+                "The move didn't take: {}.",
+                match code {
+                    1 => "X-Plane called the request invalid",
+                    2 => "X-Plane couldn't load this aircraft",
+                    4 => "X-Plane doesn't know the airport",
+                    5 => "that stand isn't in the loaded scenery",
+                    _ => "X-Plane refused it",
+                }
+            ))
+        }
+        InitOutcome::Unreachable | InitOutcome::NoBaseline => {
+            return MoveOutcome::Failed("I couldn't reach the plugin to move us. Is it up to date?".into())
+        }
+        InitOutcome::TimedOut => {
+            return MoveOutcome::Failed("The move didn't answer. Check X-Plane.".into())
+        }
+    }
+    settle_on_ramp(xp, t0, &airport).await;
+    let now = sim::position::read_lat_lon(xp).await;
+    let off = now.as_ref().ok().map(|(lat, lon, _)| dist_to(&spot, (*lat, *lon)));
+    crate::blackbox::record(
+        "setup",
+        json!({ "event": "move_readback", "airport": airport, "ramp": spot.name,
+                "off_m": off.map(|m| m.round()), "ms": t0.elapsed().as_millis() as u64 }),
+    );
+    match off {
+        Some(m) if m <= MOVE_READBACK_M => MoveOutcome::Done(format!("We're on {at}.")),
+        Some(m) => MoveOutcome::Failed(format!(
+            "The move didn't take: we're {} metres from {at}.",
+            m.round() as i64
+        )),
+        None => MoveOutcome::Failed(format!("The move went out, but I can't read whether we're on {at}.")),
+    }
 }
 
 // ---- A new flight on a final --------------------------------------------------
@@ -1899,10 +2154,17 @@ mod tests {
         assert!(!foreign.contains(&["active", "_icao()"].concat()), "never the active field");
         assert!(foreign.contains("settled_position(") && foreign.contains("new_flight_station("));
         assert!(foreign.contains("Loading::begin()"), "the arm waits while it resolves");
+        let settle = body("async fn settle_on_ramp(");
+        assert!(settle.contains("settled_position(") && settle.contains("new_flight_station("));
         let ramp = body("async fn follow_up(");
-        let station = ramp.find("new_flight_station(").expect("the ramp setup resolves it");
+        let station = ramp.find("settle_on_ramp(").expect("the ramp setup resolves it");
         let typed = ramp.find("load the flight plan").unwrap();
         assert!(station < typed, "up before anything is asked of the new flight");
+        // The move to a stand too, before its readback.
+        let moved = body("pub async fn reposition_to_stand(");
+        let station = moved.find("settle_on_ramp(").expect("the move resolves it");
+        assert!(station < moved.find("move_readback").unwrap());
+        assert!(moved.find("Loading::begin()").unwrap() < moved.find("run_init(").unwrap());
         let resolve = body("pub async fn new_flight_station(");
         assert!(resolve.contains("arm_new_flight_at(fix.lat, fix.lon"));
     }
@@ -1957,5 +2219,56 @@ mod tests {
         assert_eq!(v["ramp_start"]["airport_id"], "LIBP");
         assert_eq!(v["ramp_start"]["ramp"], "Stand 1");
         assert_eq!(v["engine_status"]["all_engines"]["running"], false);
+    }
+
+    /// The move keeps the aircraft and its engines as they are.
+    #[test]
+    fn a_move_is_this_aircraft_at_the_stand_engines_as_they_are() {
+        let v: Value = serde_json::from_str(&ramp_json("Aircraft/c172.acf", "LEMG", "Gate 21", true)).unwrap();
+        assert_eq!(v["aircraft"]["path"], "Aircraft/c172.acf");
+        assert_eq!(v["ramp_start"]["airport_id"], "LEMG");
+        assert_eq!(v["ramp_start"]["ramp"], "Gate 21");
+        assert_eq!(v["engine_status"]["all_engines"]["running"], true);
+        assert_eq!(stand_words("24"), "stand 24");
+        assert_eq!(stand_words(" Gate 21 "), "Gate 21");
+        assert_eq!(stand_words("GA North"), "GA North");
+    }
+
+    /// Each gate in turn, named with what to do about it; a stand that is
+    /// free, ours to move to, on the ground and stopped, passes.
+    #[test]
+    fn a_move_is_refused_by_each_gate_in_turn() {
+        let ok = MoveFacts {
+            stopped: Some(true),
+            stand_known: true,
+            ..MoveFacts::default()
+        };
+        assert_eq!(move_refusal(&ok, "LEMG", "24"), None);
+        let says = |f: MoveFacts, word: &str| {
+            let line = move_refusal(&f, "LEMG", "24").expect("refused");
+            assert!(line.contains(word), "{line}");
+            assert!(!line.contains('\u{2014}') && !line.contains('\u{2013}'));
+        };
+        says(MoveFacts { busy: true, ..ok.clone() }, "already under way");
+        says(MoveFacts { loading: true, ..ok.clone() }, "still loading");
+        says(MoveFacts { holding: Some("I'm taxiing"), ..ok.clone() }, "I'm taxiing. Say my controls");
+        says(MoveFacts { replay: true, ..ok.clone() }, "replay");
+        says(MoveFacts { stopped: Some(false), ..ok.clone() }, "stopped on the ground");
+        says(MoveFacts { stopped: None, ..ok.clone() }, "can't read");
+        says(MoveFacts { stand_known: false, ..ok.clone() }, "LEMG has no stand 24");
+        says(MoveFacts { on_it: true, ..ok.clone() }, "on stand 24 already");
+        says(
+            MoveFacts { taken_by: Some("EZY123, parked".into()), ..ok.clone() },
+            "Stand 24 is taken: EZY123, parked",
+        );
+        // The first gate that fails is the one said: a loop of ours before
+        // the stand's state.
+        let line = move_refusal(
+            &MoveFacts { holding: Some("We're pushing back"), taken_by: Some("X".into()), ..ok },
+            "LEMG",
+            "24",
+        )
+        .unwrap();
+        assert!(line.starts_with("We're pushing back"), "{line}");
     }
 }

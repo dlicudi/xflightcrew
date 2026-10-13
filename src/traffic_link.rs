@@ -745,6 +745,88 @@ impl Link {
         traffic::board::payload(self.icao(), now, &rows, choices)
     }
 
+    /// The Map tab's picture of this field (2026-10-13): every aircraft
+    /// with the board's words for it, and every stand one of them holds
+    /// ([`Fleet::stand_holder`], the fleet's own rule). No reads: the
+    /// fleet and the board are already here.
+    pub(crate) fn efb_traffic(&self) -> crate::efb::feed::TrafficField {
+        use crate::efb::feed::{StandTaken, TrafficAc, TrafficField};
+        use traffic::board::Dir;
+        use traffic::fleet::StandHold;
+        let icao = self.icao().to_string();
+        let names: Vec<&str> = self
+            .fleet
+            .field
+            .net
+            .stands
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let aircraft = self
+            .fleet
+            .aircraft()
+            .iter()
+            .filter(|a| a.phase != Phase::Gone)
+            .map(|a| {
+                let f = self.board.iter().find(|f| f.callsign == a.callsign);
+                let (from, to) = match (f.map(|f| (f.dir, &f.info.other)), &a.plan) {
+                    (Some((Dir::Departure, o)), _) => (icao.clone(), o.clone()),
+                    (Some((Dir::Arrival, o)), _) => (o.clone(), icao.clone()),
+                    (None, traffic::Plan::Departure { .. }) => (icao.clone(), String::new()),
+                    (None, traffic::Plan::Arrival { .. }) => (String::new(), icao.clone()),
+                    (None, traffic::Plan::Circuit { .. }) => (icao.clone(), icao.clone()),
+                    (None, traffic::Plan::Parked) => (String::new(), String::new()),
+                };
+                TrafficAc {
+                    id: a.id,
+                    callsign: a.callsign.clone(),
+                    spoken: a.spoken.clone(),
+                    airline: f.map(|f| f.info.airline.clone()).unwrap_or_default(),
+                    icao_type: a.icao_type.clone(),
+                    from,
+                    to,
+                    phase: crate::efb::airport::traffic_phase_words(a.phase, a.dormant()),
+                    stand: a
+                        .stand
+                        .as_deref()
+                        .map(|n| traffic::stands::label(n, &names)),
+                    sched: f.and_then(|f| f.info.sched_s).map(traffic::rotation::hhmm),
+                    est: f.and_then(|f| f.info.est_s).map(traffic::rotation::hhmm),
+                    lat: a.kin.lat,
+                    lon: a.kin.lon,
+                    hdg: a.kin.hdg_deg,
+                    alt_ft: a.kin.alt_ft,
+                    on_ground: a.kin.on_ground,
+                    gs_kts: a.kin.gs_kts,
+                }
+            })
+            .collect();
+        let taken = self
+            .fleet
+            .field
+            .net
+            .stands
+            .iter()
+            .filter_map(|s| {
+                let (a, how) = self.fleet.stand_holder(s)?;
+                Some(StandTaken {
+                    name: s.name.clone(),
+                    by: a.callsign.clone(),
+                    how: match how {
+                        StandHold::OnIt => "parked",
+                        StandHold::TaxiingIn => "taxiing in",
+                        StandHold::Assigned => "due",
+                    },
+                })
+            })
+            .collect();
+        TrafficField {
+            icao,
+            aircraft,
+            taken,
+        }
+    }
+
     /// The board's actual times from this tick's events: a departure's
     /// wheels up, an arrival's touchdown.
     fn note_actuals(&mut self, events: &[Event]) {
@@ -1624,6 +1706,8 @@ pub(crate) struct TrafficWorld {
     board_sent: Option<Instant>,
     /// When the EFB's boards were last tapped (`note_efb_boards`).
     efb_boards_at: Option<Instant>,
+    /// When the EFB's map traffic was last tapped (`note_efb_traffic`).
+    efb_traffic_at: Option<Instant>,
     /// The Board tab's other field when nobody simulates it (2026-10-13):
     /// its board by the clock, built off the tick once picked, and one
     /// being built.
@@ -1675,6 +1759,8 @@ const BOARD_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 const BOARD_RESEND: std::time::Duration = std::time::Duration::from_secs(10);
 /// How often the EFB's boards are rebuilt ([`TrafficWorld::note_efb_boards`]).
 const EFB_BOARDS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often the EFB's map traffic is rebuilt ([`TrafficWorld::note_efb_traffic`]).
+const EFB_TRAFFIC_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Our own flight on the board, from the plan on the shelf: a departure
 /// from `field`, or an arrival to it; no times (the plan's are not the
@@ -1903,7 +1989,23 @@ impl TrafficWorld {
             self.publish_board(xp, s, here, now).await;
         }
         self.note_efb_boards(now);
+        self.note_efb_traffic(now);
         station_out
+    }
+
+    /// The EFB's Map tab (2026-10-13): every simulated field's aircraft
+    /// and held stands ([`Link::efb_traffic`]), tapped into `efb::feed`
+    /// about once a second while the EFB serves (no reads).
+    fn note_efb_traffic(&mut self, now: Instant) {
+        if self
+            .efb_traffic_at
+            .is_some_and(|t| now.saturating_duration_since(t) < EFB_TRAFFIC_EVERY)
+            || crate::efb::serving_url().is_none()
+        {
+            return;
+        }
+        self.efb_traffic_at = Some(now);
+        crate::efb::feed::note_traffic(self.links.values().map(Link::efb_traffic).collect());
     }
 
     /// The EFB's Board card (2026-10-13): every simulated field's board,

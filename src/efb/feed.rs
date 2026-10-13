@@ -345,6 +345,135 @@ pub(crate) fn boards() -> Option<Vec<(String, String)>> {
         .map(|(_, b)| b.clone())
 }
 
+/// One aircraft of our traffic world as its fleet holds it, for the Map
+/// tab's airport (2026-10-13): where it is and the board's words for it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TrafficAc {
+    pub(crate) id: u32,
+    pub(crate) callsign: String,
+    /// The callsign as the radio says it ("Easy eight nine zero one").
+    pub(crate) spoken: String,
+    /// The airline's name from the board ("easyJet"); empty for none.
+    pub(crate) airline: String,
+    pub(crate) icao_type: String,
+    /// The two ends, ICAO; empty where neither the board nor the plan says.
+    pub(crate) from: String,
+    pub(crate) to: String,
+    /// The phase in plain words (`airport::traffic_phase_words`).
+    pub(crate) phase: &'static str,
+    /// The stand it holds or is bound for, as the board labels it.
+    pub(crate) stand: Option<String>,
+    /// The timetable's time and today's estimate, local "HH:MM".
+    pub(crate) sched: Option<String>,
+    pub(crate) est: Option<String>,
+    pub(crate) lat: f64,
+    pub(crate) lon: f64,
+    /// Degrees true.
+    pub(crate) hdg: f64,
+    pub(crate) alt_ft: f64,
+    pub(crate) on_ground: bool,
+    pub(crate) gs_kts: f64,
+}
+
+/// A stand one of our traffic holds ([`traffic::fleet::Fleet::stand_holder`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StandTaken {
+    /// The apt.dat name, as the diagram draws it.
+    pub(crate) name: String,
+    pub(crate) by: String,
+    /// "parked", "taxiing in" or "due".
+    pub(crate) how: &'static str,
+}
+
+/// One simulated field: its aircraft and the stands they hold.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TrafficField {
+    pub(crate) icao: String,
+    pub(crate) aircraft: Vec<TrafficAc>,
+    pub(crate) taken: Vec<StandTaken>,
+}
+
+/// A traffic tap older than this is no traffic world: the stands go back
+/// to unknown, never to free.
+pub(crate) const TRAFFIC_FRESH: Duration = Duration::from_secs(5);
+
+/// Every simulated field as the traffic world last tapped it (about once a
+/// second while the EFB serves, `TrafficWorld::note_efb_traffic`), with its
+/// own expiry ([`TRAFFIC_FRESH`]).
+static TRAFFIC: Mutex<Option<(Instant, Vec<TrafficField>)>> = Mutex::new(None);
+
+/// The traffic world's tap.
+pub(crate) fn note_traffic(fields: Vec<TrafficField>) {
+    *TRAFFIC.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), fields));
+}
+
+/// The simulated fields, if a traffic world ticked lately (`Some` of none:
+/// a world that simulates no field yet).
+pub(crate) fn traffic() -> Option<Vec<TrafficField>> {
+    TRAFFIC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < TRAFFIC_FRESH)
+        .map(|(_, f)| f.clone())
+}
+
+/// Who of our traffic holds `stand` at `icao` ("EZY123, parked"), as last
+/// tapped; `None` when nobody does or no world ticked lately.
+pub(crate) fn stand_taken_by(icao: &str, stand: &str) -> Option<String> {
+    TRAFFIC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < TRAFFIC_FRESH)?
+        .1
+        .iter()
+        .find(|f| f.icao.eq_ignore_ascii_case(icao))?
+        .taken
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(stand))
+        .map(|t| format!("{}, {}", t.by, t.how))
+}
+
+/// A move to a stand asked on the Map tab (`POST /reposition`), as it went.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct Reposition {
+    /// Rises by one per note: the page toasts each new one.
+    pub(crate) id: u64,
+    pub(crate) t: f64,
+    pub(crate) stand: String,
+    /// "asked", "moving", "done", "refused" or "failed".
+    pub(crate) state: &'static str,
+    pub(crate) text: String,
+}
+
+/// The last move's word (session, with its own expiry: two minutes).
+static REPOSITION: Mutex<Option<(Instant, Reposition)>> = Mutex::new(None);
+
+pub(crate) fn note_reposition(stand: &str, state: &'static str, text: &str) {
+    let mut r = REPOSITION.lock().unwrap_or_else(|e| e.into_inner());
+    let id = r.as_ref().map_or(1, |(_, x)| x.id + 1);
+    *r = Some((
+        Instant::now(),
+        Reposition {
+            id,
+            t: now_unix(),
+            stand: stand.to_string(),
+            state,
+            text: crate::phrase::scrub_dashes(text.trim()),
+        },
+    ));
+}
+
+pub(crate) fn reposition() -> Option<Reposition> {
+    REPOSITION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < Duration::from_secs(120))
+        .map(|(_, r)| r.clone())
+}
+
 /// A verdict the crew reached about the plan and said once.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub(crate) struct Verdict {

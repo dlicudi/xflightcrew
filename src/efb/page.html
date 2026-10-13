@@ -1574,9 +1574,19 @@ form.say .send { min-height: 52px; }
   }
 
   // ------------------------------------------------------------ render
+  // A move to a stand (the Map tab's "Move here") says how it went as a
+  // toast, each word once; what was said before this page opened is not.
+  var moveSeen = null;
+  function renderMove(m) {
+    var id = m ? m.id : 0;
+    if (moveSeen === null || id === moveSeen) { moveSeen = id; return; }
+    moveSeen = id;
+    if (m) toast(m.state !== 'refused' && m.state !== 'failed', m.text);
+  }
   var last = null;
   function render(s) {
     last = s;
+    renderMove(s.airport && s.airport.reposition);
     if (window.XvlDiagram) window.XvlDiagram.update(s);
     renderHeader(s);
     renderAlerts(s.alerts);

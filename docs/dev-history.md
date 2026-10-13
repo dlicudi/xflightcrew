@@ -14877,3 +14877,59 @@ The pilot wanted the EFB's link reachable from the sim (only the terminal and th
   terminal turns the block into the "turn it on" line within a few seconds. With
   `XCOPILOT_TRAFFIC=ours` at LEMG: the EFB's Plan tab Board card lists LEMG (and LXGB once
   simulated), statuses moving as on the panel.
+
+## 2026-10-13: our traffic and the stands on the EFB's airport map, and "Move here"
+
+The pilot wanted to see our own traffic on the EFB's airport diagram, tap an aircraft for who it
+is, see which stands are free, and move the aircraft to a free one from the page.
+
+- **Traffic on the diagram**: no new sim read. The traffic world taps every simulated field into
+  `efb::feed::note_traffic` about once a second while the EFB serves
+  (`TrafficWorld::note_efb_traffic`, `Link::efb_traffic`; expiring in 5 s, `efb::feed::TRAFFIC`
+  'S'): each aircraft's position, heading, altitude and speed from its `Kin`, its words from the
+  board's flight by callsign (airline, the other end, the timetable slot and estimate), else its
+  plan, and its phase in plain words (`airport::traffic_phase_words`). `airport::page` projects
+  every field's aircraft within 30 km into the diagram's frame (`airport::traffic_out`,
+  `airport.traffic`). `diagram.js` draws them as violet airliners, smaller than our white chevron,
+  gliding by id; a tap opens a card (closed by a tap elsewhere).
+- **Free or taken, ONE rule**: `traffic::fleet::Fleet::stand_holder` (new, beside
+  `stands_held`, the rule the spawner and the parking already keep): standing on it within
+  `STAND_TAKEN_M`, taxiing in to it, or an arrival not yet down whose planned stand it is; a
+  departure gone from its stand no longer holds it (`a_stand_is_held_by_who_stands_taxis_in_or_is_due`).
+  The tap carries the holds per field; `airport::stand_states` adds our own aircraft on the ground
+  within 20 m of a stand and says UNKNOWN (never free) when no world simulates the field
+  (`a_stand_is_free_or_taken_and_unknown_without_traffic`). The diagram gains each stand's 1300
+  categories and its 1301 size letter for the card.
+- **"Move here"**: SIM MANAGEMENT, not a crew action, so not pilot English on `/say`: no
+  `PHRASES` entry, no matcher, no grammar (`no_phrase_moves_the_aircraft_to_a_stand`). The page
+  confirms, then `POST /reposition {icao, stand}` (token, one per 3 s, `reposition_request`
+  cleans it, blackbox `efb` `reposition` asked and outcome), answered 202 at once; the work runs
+  on `setup::spawn_off_loop` (its own thread and runtime). `tools::setup::reposition_to_stand`
+  owns every gate (`move_refusal`, pure, `a_move_is_refused_by_each_gate_in_turn`): another move
+  under way (`MOVING`, 'L'), a new flight loading, a loop of ours holding the aircraft
+  (`crew_has_aircraft`, the taxi and the tug included), replay, not stopped on the ground, a stand
+  apt.dat lacks, on it already, taken by our traffic (`feed::stand_taken_by`). Nothing is read
+  under a move, a load or a loop. Then the SAME ramp start as "set up the flight"
+  (`ramp_json`, of which `init_json` is now the cold and dark case) with THIS aircraft
+  (`acf_relative_path`) and its engines as they are (`ENGN_running`), `Loading` held, `run_init`
+  on the mailbox (`init_seq`/`init_result`, `InitTiming::RAMP`), `flight_begins(Ramp)`, and the
+  ramp's settle and station (`settle_on_ramp`, factored out of the setup's follow-up), then the
+  READBACK: the position within 30 m of the stand's 1300 point (`MOVE_READBACK_M`), else "The move
+  didn't take: we're N metres from stand 24". The outcome goes to the page as a toast
+  (`feed::note_reposition`, `airport.reposition`, 'S' with a two minute expiry) and, moved or
+  failed, on the intercom as a status line (`Voice::alert` advisory); a refusal is shown only.
+- CLAUDE.md's EFB section now says it: crew actions go as pilot English on `/say`; sim management
+  calls the owning tool's gated function through its own endpoint, never a raw dataref write and
+  never an invented phrase.
+
+- **UNFLOWN.** With `XCOPILOT_TRAFFIC=ours` at LEMG, the EFB on, on the ground: the Map tab
+  shows our traffic as violet aircraft moving with the panel's picture (headings right, gliding,
+  no jumps), callsigns in the air; a tap on one gives its card (type, ends, phase, stand, slot),
+  a tap elsewhere closes it. Zoomed in, stands are green or red; a parked airliner's stand is red
+  with its callsign, an arrival's stand turns red while it is still on final ("due"), ours is
+  white. Traffic off: grey. Move here on a free stand: the confirm, the toast "Moving to stand N",
+  the sim reloads with THIS aircraft (engines as they were), "We're on stand N." on the intercom;
+  blackbox `efb` `reposition` (asked, then done), `setup` `move_init`, `move_wait`,
+  `move_readback` (`off_m` under 30), `flight_state` `flight_begins` `ramp`. Then refused: moving
+  (gs over a knot), on a red stand (button greyed, and the server refuses it too), during a
+  taxi ("I'm taxiing. Say my controls first, then move.").
