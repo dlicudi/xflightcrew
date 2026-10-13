@@ -10737,10 +10737,14 @@ fn the_off_route_correction_holds_short_at_an_faa_field() {
 /// #263: the frequency briefing reads "point" at an FAA field.
 #[test]
 fn the_frequency_briefing_reads_the_fields_dialect() {
+    // The dialect is process-wide: other tests read "decimal" while this
+    // one holds FAA (four coach and taxi tests read "point", 2026-10-13).
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
     assert!(st.briefing_text(None).contains("decimal"), "{}", st.briefing_text(None));
     st.set_dialect(Dialect::Faa);
     let b = st.briefing_text(None);
+    st.set_dialect(Dialect::Icao);
     assert!(b.contains("point") && !b.contains("decimal"), "{b}");
 }
 
