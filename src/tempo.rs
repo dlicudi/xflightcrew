@@ -97,7 +97,7 @@ impl Turn {
             radio: false,
         });
         std::thread::Builder::new()
-            .name("xvl-standby".into())
+            .name("xfc-standby".into())
             .spawn(move || {
                 std::thread::sleep(STANDBY_AFTER);
                 if standby_due(gen, crate::voice::lines_queued()) {

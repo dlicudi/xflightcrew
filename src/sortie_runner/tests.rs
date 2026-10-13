@@ -109,7 +109,7 @@
         assert_eq!(calls[0].arguments["resume"], true, "{calls:?}");
     }
 
-    /// `xvl sortie --check` over every shipped spec: every line routed as
+    /// `xfc sortie --check` over every shipped spec: every line routed as
     /// the command loop routes it (the pre-grammar shortcuts first), on the
     /// case's own airframe, and no problem anywhere.
     #[test]
@@ -1479,7 +1479,7 @@ cases:
     #[test]
     fn the_tail_reads_whole_new_lines_and_survives_a_rotation() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("xvl-tail-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xfc-tail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("bb.jsonl");
         std::fs::write(&p, "{\"kind\":\"old\"}\n").unwrap();
@@ -1506,7 +1506,7 @@ cases:
     #[test]
     fn the_tail_skips_a_corrupt_line_and_keeps_the_next() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("xvl-tail-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xfc-tail-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("bb.jsonl");
         std::fs::write(&p, "").unwrap();
@@ -1788,7 +1788,7 @@ cases:
 
     #[tokio::test]
     async fn the_driver_flies_a_spec_against_a_fake_sim() {
-        let dir = std::env::temp_dir().join(format!("xvl-runner-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xfc-runner-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("blackbox.jsonl");
         std::fs::write(&log, "").unwrap();
@@ -2226,7 +2226,7 @@ cases:
     }
 
     fn scratch_log(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("xvl-runner-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xfc-runner-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("blackbox.jsonl");
         std::fs::write(&log, "").unwrap();

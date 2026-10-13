@@ -456,7 +456,7 @@ async fn fly_to(
             .unwrap_or_else(|| auto_vs_fpm(diff, diff > 0.0, cfg.climb.max_climb_fpm))
             .min(crate::pilot_altitude::follower_rate_fpm());
         tracing::info!(
-            target: "xvoicelayer::autopilot",
+            target: "xflightcrew::autopilot",
             movement,
             target_alt = altitude,
             "handed the altitude to the follower"
@@ -491,7 +491,7 @@ async fn fly_to(
     let vs_mode = mode_engaged(ctx, VS_STATUS).await;
     let alt_hold_mode = mode_engaged(ctx, ALT_HOLD_STATUS).await;
     tracing::info!(
-        target: "xvoicelayer::autopilot",
+        target: "xflightcrew::autopilot",
         movement,
         commanded_fpm = signed,
         vs_dial,
@@ -686,7 +686,7 @@ fn capture_at_altitude(
                         // settles consistently off-target, tune CAPTURE_LEAD_FT from
                         // (alt_at_capture - target) and the settled altitude.
                         tracing::info!(
-                            target: "xvoicelayer::autopilot",
+                            target: "xflightcrew::autopilot",
                             target_alt = target,
                             alt_at_capture = alt,
                             was_climb,

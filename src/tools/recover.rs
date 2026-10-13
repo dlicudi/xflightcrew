@@ -755,7 +755,7 @@ fn run_recovery(
                         say(&voice, &status, "Still recovering. Say my controls to take it.");
                     }
                     tracing::info!(
-                        target: "xvoicelayer::recover",
+                        target: "xflightcrew::recover",
                         bank = s.bank_deg, pitch = s.pitch_deg, stall = s.stall_ratio,
                         ias = s.ias_kts, yoke_pitch = cmd.pitch, yoke_roll = cmd.roll, "recover"
                     );

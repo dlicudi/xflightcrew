@@ -1533,7 +1533,7 @@ fn an_uncleared_landing_still_vacates_its_own_runway() {
 }
 
 /// Issue #155, sortie 1790601822-full_auto (EGKK 08R, 2026-09-28), from
-/// the xvl log: U28680 lifted off at 13:40:31 ("departure stream ...
+/// the xfc log: U28680 lifted off at 13:40:31 ("departure stream ...
 /// 08R", "wake clock started ... 26R"), our held release said "traffic
 /// clear ... cleared for takeoff" at 13:40:47 (the clock was on the 08L
 /// pavement's 26R, never the held 08R), and the party line, not ticked

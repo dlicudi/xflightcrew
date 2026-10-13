@@ -2294,7 +2294,7 @@
     /// Gibraltar as apt.dat has it: 09 at the west end, 27 at the east.
     fn gibraltar() -> crate::nav::AirportInfo {
         use std::io::Write;
-        let apt = std::env::temp_dir().join("xvl-proc-lxgb-apt.dat");
+        let apt = std::env::temp_dir().join("xfc-proc-lxgb-apt.dat");
         let mut f = std::fs::File::create(&apt).unwrap();
         writeln!(f, "1 11 0 0 LXGB Gibraltar").unwrap();
         writeln!(f, "100 46 0 0 0 0 0 0 09 36.1509000 -5.3581000 0 0 0 0 0 0 27 36.1515000 -5.3412000 0 0 0 0 0 0").unwrap();

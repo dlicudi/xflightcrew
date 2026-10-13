@@ -1817,7 +1817,7 @@
     #[test]
     fn the_arrival_flies_the_runway_the_arm_chose() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("xvl-arrival-planned");
+        let dir = std::env::temp_dir().join("xfc-arrival-planned");
         std::fs::create_dir_all(&dir).unwrap();
         let apt = dir.join("apt.dat");
         let mut f = std::fs::File::create(&apt).unwrap();
@@ -1967,7 +1967,7 @@
     #[test]
     fn the_gate_brief_says_what_the_destination_offers() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("xvl-brief");
+        let dir = std::env::temp_dir().join("xfc-brief");
         std::fs::create_dir_all(&dir).unwrap();
         let apt = dir.join("apt.dat");
         let mut f = std::fs::File::create(&apt).unwrap();

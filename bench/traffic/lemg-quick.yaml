@@ -1,5 +1,5 @@
 # A quick LEMG traffic test: something moves within seconds.
-#   XCOPILOT_TRAFFIC=ours XCOPILOT_TRAFFIC_FILE=bench/traffic/lemg-quick.yaml ./target/release/xvl
+#   XCOPILOT_TRAFFIC=ours XCOPILOT_TRAFFIC_FILE=bench/traffic/lemg-quick.yaml ./target/release/xfc
 # The departure first, so the tower has a runway in use before the arrivals call.
 - t_s: 0
   callsign: RYR4521

@@ -3,7 +3,7 @@
 # a full circuit. Check blackbox `yoke` armed ok, autotakeoff `roll` q near 0
 # below Vr, `climb_manual` theta tracking pitch_tgt, `ap_engaged` cmd_vs in
 # the low thousands, then the circuit's legs, the flare and the rollout.
-#   xvl sortie bench/sorties/zibo-circuit.yaml
+#   xfc sortie bench/sorties/zibo-circuit.yaml
 after: stop
 
 cases:

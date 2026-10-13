@@ -9,7 +9,7 @@
 //! Ported from the proven client in the sibling `rustdecks` project
 //! (`rustdecks/src/sim.rs`): one thread owns the socket and REST resolution,
 //! callers just read the cache. Sync (`tungstenite` + `reqwest::blocking`) on its
-//! own thread, matching XVoiceLayer's other background pollers — no async runtime.
+//! own thread, matching XFlightCrew's other background pollers — no async runtime.
 //!
 //! Best-effort: if X-Plane is unreachable or the socket drops, the cache simply
 //! stops updating and callers fall back to a REST read (see `state_snapshot`), so

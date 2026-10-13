@@ -241,7 +241,7 @@ impl OnnxTts {
     }
 
     /// The whole utterance as the app renders it, without playing it: for
-    /// `xvl tts`. Long texts are synthesized sentence by sentence (see
+    /// `xfc tts`. Long texts are synthesized sentence by sentence (see
     /// [`speech_chunks`]) and stitched with a short pause - one giant pass
     /// comes out rushed.
     pub fn render(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -663,7 +663,7 @@ mod tests {
         );
 
         // Write one out so the audio can be ear-checked.
-        let wav = std::env::temp_dir().join("xvoicelayer-onnx-test.wav");
+        let wav = std::env::temp_dir().join("xflightcrew-onnx-test.wav");
         let s = tts.synth("Roger, flaps up.").unwrap();
         write_wav(&wav, &s, tts.sample_rate).unwrap();
         println!("  wrote sample: {}", wav.display());

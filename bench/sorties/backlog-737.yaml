@@ -1,5 +1,5 @@
 # The Laminar 737-800's unflown backlog, unattended:
-#   xvl sortie bench/sorties/backlog-737.yaml
+#   xfc sortie bench/sorties/backlog-737.yaml
 # The shape is lemg-737.yaml's header. Parse-tested (every line pinned to
 # the tool it must reach), not yet flown.
 

@@ -1,8 +1,8 @@
 # The iMac's plan batch: the pilot's SimBrief plan (EGKK to EGBB, B738,
 # runways 26L and 33 at the time of writing; XCOPILOT_SIMBRIEF_ID is set) and
 # one local plan out of EGBB. Flown at 1x (no fast forward on this machine).
-#   xvl sortie bench/sorties/imac-plan.yaml --check
-#   xvl sortie bench/sorties/imac-plan.yaml
+#   xfc sortie bench/sorties/imac-plan.yaml --check
+#   xfc sortie bench/sorties/imac-plan.yaml
 # The shape is lemg-737.yaml's header. These cases are about ATC and the
 # arrival, so traffic is left alone (no LiveTraffic on the iMac anyway).
 # Only the gate to gate case tests the taxi in (#123's EGBB taxi-in): it parks.

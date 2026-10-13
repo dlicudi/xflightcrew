@@ -1,6 +1,6 @@
-# XVoiceLayer X-Plane plugin
+# XFlightCrew X-Plane plugin
 
-A tiny native plugin that gives XVoiceLayer a **dedicated push-to-talk** inside the
+A tiny native plugin that gives XFlightCrew a **dedicated push-to-talk** inside the
 sim. It registers:
 
 - a command **`xcopilot/ptt`** — bind it to any joystick/HOTAS button or key in
@@ -8,7 +8,7 @@ sim. It registers:
 - a read-only dataref **`xcopilot/ptt_active`** — `1` while that command is held,
   `0` otherwise.
 
-The XVoiceLayer app polls `xcopilot/ptt_active` over the X-Plane Web API and opens
+The XFlightCrew app polls `xcopilot/ptt_active` over the X-Plane Web API and opens
 the mic only while it's `1`. Unlike `sim/operation/contact_atc_ptt`, this does
 **not** key the radio, and unlike a global keyboard hook it needs **no macOS
 Input-Monitoring permission** — the button press is read by X-Plane itself.
@@ -29,7 +29,7 @@ committed so the build is self-contained. `third_party/XPMP2` is XPMP2
 (github.com/TwinFan/XPMP2, MIT, tag v3.7.0; `src`, `inc` and `LICENSE` only,
 `SoundFMOD.*` left out), the library that draws our AI traffic
 (`src/traffic.cpp`). It is built without `INCLUDE_FMOD_SOUND`. One local
-patch, marked "XVoiceLayer patch": `XPMPMultiplayerDisable` asks X-Plane who
+patch, marked "XFlightCrew patch": `XPMPMultiplayerDisable` asks X-Plane who
 really controls the AI planes before writing the TCAS and map overrides (on a
 reload X-Plane takes them first, and the writes made it call the plugin buggy). It needs CSL
 models the pilot installs: `XCOPILOT_TRAFFIC_CSL` in X-Plane's environment
@@ -60,7 +60,7 @@ make install XPLANE="/path/to/X-Plane 12"
 This copies the `.xpl` to `<X-Plane 12>/Resources/plugins/xcopilot/mac_x64/`.
 Restart X-Plane, then bind a button to the `xcopilot/ptt` command.
 
-## Wire up XVoiceLayer
+## Wire up XFlightCrew
 
 Point the app at the dataref:
 

@@ -8,7 +8,7 @@
 //! items live HERE, as a static table (name, what to fly, the evidence, the
 //! pass criterion and, where the criterion is a number, the predicate), and
 //! `docs/flight-test-card.md` is checked against it by a test so the two
-//! cannot drift. `xvl debrief` prints the verdicts over the whole file it is
+//! cannot drift. `xfc debrief` prints the verdicts over the whole file it is
 //! given.
 //!
 //! Every event and field named here was read off the source that records it
@@ -2681,7 +2681,7 @@ pub static ITEMS: &[Item] = &[
         shipped: "2026-09-22 125e2b3",
         since: S0922,
         airframe: None,
-        fly: "reload the plugin with status/auto empty, restart xvl, pick a cabin voice",
+        fly: "reload the plugin with status/auto empty, restart xfc, pick a cabin voice",
         evidence: "Health has no missing xcopilot/opt/cabin_voice; the new voice checks in",
         pass: "\"Flight deck, cabin crew. New voice, checked in.\" in the picked voice",
         check: None,
@@ -2743,7 +2743,7 @@ pub static ITEMS: &[Item] = &[
         since: S0923,
         airframe: None,
         fly: "any: key the intercom over a copilot line, then ask",
-        evidence: "said records around the press; the xvl log's recall line",
+        evidence: "said records around the press; the xfc log's recall line",
         pass: "the cut line is said again",
         check: None,
     },
@@ -2767,7 +2767,7 @@ pub static ITEMS: &[Item] = &[
         since: S0926B,
         airframe: None,
         fly: "any full auto from cold",
-        evidence: "said lines against the xvl log's \"dropped stale\" count",
+        evidence: "said lines against the xfc log's \"dropped stale\" count",
         pass: "no backlog of stale lines (about 20 dropped before)",
         check: None,
     },

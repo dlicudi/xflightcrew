@@ -1,4 +1,4 @@
-//! `xvl debrief`: the flight, read back from the blackbox.
+//! `xfc debrief`: the flight, read back from the blackbox.
 //!
 //! Every automation and the monitor already write what they saw to
 //! `logs/blackbox.jsonl`; the rule is "mine it after every flight", and until

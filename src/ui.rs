@@ -594,7 +594,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                format!(" XVoiceLayer {} ", app.boot.version),
+                format!(" XFlightCrew {} ", app.boot.version),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(

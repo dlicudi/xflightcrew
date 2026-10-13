@@ -1,6 +1,6 @@
 # The stock 737-800 on LEMG from a 5 nm final, on the pilot controller:
 # its autopilot above minimums, hand flown from minimums to the wheels.
-#   xvl sortie bench/sorties/b738-lemg.yaml
+#   xfc sortie bench/sorties/b738-lemg.yaml
 after: stop
 
 cases:

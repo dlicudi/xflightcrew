@@ -74,7 +74,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             LANDING_CONFIGURED.store(false, Ordering::SeqCst);
             ON_FINAL.store(false, Ordering::SeqCst);
             let announce = |line: String, sev: Priority| {
-                tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
+                tracing::info!(target: "xflightcrew::autoland", spoke = %line, "copilot");
                 if let Some(v) = &voice { v.alert(sev, line); }
             };
             // The approach speed is a number somebody handed us; the airframe's
@@ -326,7 +326,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let mut roundout_held = false;
             let mut bank_hold = crate::pilot::bank::BankHold::default();
             // What the hand-flown segment flies on: this airframe's measured
-            // responses (`xvl identify`, `aircraft::learned`), else the
+            // responses (`xfc identify`, `aircraft::learned`), else the
             // fleet's priors; the throttle's energy; the nose's geometry.
             let pilot_airframe = crate::pilot::airframe();
             crate::blackbox::record(
@@ -2355,7 +2355,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     rwy.icao, rwy.id, g.dist_nm, phase_word
                 ));
                 tracing::info!(
-                    target: "xvoicelayer::autoland",
+                    target: "xflightcrew::autoland",
                     dist = g.dist_nm, alt, gp_alt = g.glidepath_alt_ft, vs = g.target_vs_fpm,
                     hdg = g.target_heading_deg, ias, radio = radio_ft, phase = ?g.phase,
                     "autoland"
@@ -2419,7 +2419,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     Err(e) => {
                         if !vvi_read_failed {
                             vvi_read_failed = true;
-                            tracing::warn!(target: "xvoicelayer::autoland", error = %e, "VSI read failed; flying the bare VS target");
+                            tracing::warn!(target: "xflightcrew::autoland", error = %e, "VSI read failed; flying the bare VS target");
                         }
                         None
                     }
@@ -3662,7 +3662,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         _ => (line.to_string(), false),
                     };
                     if unstable {
-                        tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
+                        tracing::info!(target: "xflightcrew::autoland", spoke = %line, "copilot");
                         if let Some(v) = &voice {
                             v.hazard(crate::monitor::Severity::Caution, line);
                         }

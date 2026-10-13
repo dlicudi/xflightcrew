@@ -129,7 +129,7 @@ fn station_pace(model: &str) -> f32 {
 
 /// Per-speaker paces for the multi-speaker British sets, which read at very
 /// different natural speeds (VCTK p259 is 0.79 of VCTK p239's pace): each
-/// speaker's natural length on one tower call, measured with `xvl tts`,
+/// speaker's natural length on one tower call, measured with `xfc tts`,
 /// scaled so every one of them speaks at the rate picked by ear for p239 at
 /// 1.15 (2026-09-22). Every entry passed the same day's audition, except
 /// VCTK #58, #80 and #96, pool members from before it that were not rated.
@@ -2538,7 +2538,7 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         // radio transmission) is dropped: spoken late it's disinformation,
         // not guidance. The latch still fires — see `fire_latch`.
         if utt.stale_by.is_some_and(|t| Instant::now() > t) {
-            tracing::info!(target: "xvl::voice", text = %utt.text, "dropped stale intercom line");
+            tracing::info!(target: "xfc::voice", text = %utt.text, "dropped stale intercom line");
             fire_latch(utt.done);
             continue;
         }

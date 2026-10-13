@@ -1549,9 +1549,9 @@
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let top = read(&root.join("Cargo.toml"));
         let mut targets = names_under(&top, "[package]");
-        assert_eq!(targets, ["xvoicelayer"], "the crew package");
+        assert_eq!(targets, ["xflightcrew"], "the crew package");
         let bins = names_under(&top, "[[bin]]");
-        assert!(bins.iter().any(|b| b == "xvl"), "the crew binary: {bins:?}");
+        assert!(bins.iter().any(|b| b == "xfc"), "the crew binary: {bins:?}");
         targets.extend(bins);
         let members: Vec<String> = {
             let i = top.find("\nmembers").expect("a workspace members list");

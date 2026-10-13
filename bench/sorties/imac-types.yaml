@@ -1,6 +1,6 @@
 # The iMac's other airframes, each on its own unflown fix:
-#   xvl sortie bench/sorties/imac-types.yaml --check
-#   xvl sortie bench/sorties/imac-types.yaml
+#   xfc sortie bench/sorties/imac-types.yaml --check
+#   xfc sortie bench/sorties/imac-types.yaml
 # The shape is lemg-737.yaml's header. Every case loads its aircraft
 # (setup.aircraft) and waits for the swap and its profile probe. No case
 # tests the taxi in.

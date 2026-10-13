@@ -431,7 +431,7 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
 const NARRATION_STALE_S: u64 = 6;
 
 fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
-    tracing::info!(target: "xvoicelayer::full_auto", spoke = %line, "copilot");
+    tracing::info!(target: "xflightcrew::full_auto", spoke = %line, "copilot");
     if let Some(v) = voice {
         if priority == Priority::Advisory {
             v.narrate(priority, line, NARRATION_STALE_S);

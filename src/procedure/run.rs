@@ -69,7 +69,7 @@ pub fn start_scoped(
 }
 
 pub(super) fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
-    tracing::info!(target: "xvoicelayer::procedure", spoke = %line, "copilot");
+    tracing::info!(target: "xflightcrew::procedure", spoke = %line, "copilot");
     if let Some(v) = voice {
         v.alert(priority, line.to_string());
     }

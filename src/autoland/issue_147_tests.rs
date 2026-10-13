@@ -288,7 +288,7 @@
     /// arm's runway finds it.
     #[test]
     fn the_runway_read_from_apt_dat_carries_its_width() {
-        let dir = std::env::temp_dir().join(format!("xvl-147-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xfc-147-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let apt = dir.join("apt.dat");
         std::fs::write(

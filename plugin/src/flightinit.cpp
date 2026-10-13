@@ -202,7 +202,7 @@ void sim_load_message(const char* what) {
     // A load the pilot started from X-Plane's own menu (a new flight, an
     // airport, an aircraft) opens the same quiet window as one through the
     // mailbox: before 2026-10-13 only mailbox loads raised the flag, and a
-    // switch to LXGB from the menu hung X-Plane with xvl's two fleets still
+    // switch to LXGB from the menu hung X-Plane with xfc's two fleets still
     // asking and drawing through the load. Every message restarts the
     // window, so it closes 3 s of frames after the last of them.
     g_loading = true;

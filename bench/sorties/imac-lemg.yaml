@@ -1,14 +1,14 @@
 # The iMac's LEMG batch (X-Plane 12.4.4 at ~19 fps, no fast forward, no
-# LiveTraffic, text-only xvl): the open issues this machine can fly at
+# LiveTraffic, text-only xfc): the open issues this machine can fly at
 # Malaga, safety first.
-#   xvl sortie bench/sorties/imac-lemg.yaml --check   (routes the lines, no sim)
-#   xvl sortie bench/sorties/imac-lemg.yaml
+#   xfc sortie bench/sorties/imac-lemg.yaml --check   (routes the lines, no sim)
+#   xfc sortie bench/sorties/imac-lemg.yaml
 # The shape is lemg-737.yaml's header. Every case ends on the ground; none
 # tests the taxi in, so `after: stop`. No LiveTraffic here, so `traffic: off`
 # only documents that the case is not about ATC (the runner reads the
 # LiveTraffic dataref first and leaves it alone when it is missing).
 # Each case names its issues and the blackbox records to read afterwards
-# (`xvl debrief` first, then logs/sorties/<id>.jsonl).
+# (`xfc debrief` first, then logs/sorties/<id>.jsonl).
 
 after: stop
 

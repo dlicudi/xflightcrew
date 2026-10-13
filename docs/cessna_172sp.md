@@ -1,11 +1,11 @@
 # Cessna 172SP — voice command reference
 
-Everything you can say (or type) to XVoiceLayer when flying the stock X-Plane
+Everything you can say (or type) to XFlightCrew when flying the stock X-Plane
 **Cessna 172SP Skyhawk**. The command surface is per-airframe — this is the set
 the 172 profile exposes ([profiles/cessna_172sp.yaml](../profiles/cessna_172sp.yaml)).
 
 How it works: you speak (or type in the TUI), a local LLM picks one curated
-tool, XVoiceLayer writes the dataref, then **reads back the actual result**
+tool, XFlightCrew writes the dataref, then **reads back the actual result**
 ("Roger, flaps ten"). It confirms the *action*, not the intent.
 
 - **Compound commands** work: "flaps ten and throttle seventy" runs both.
@@ -152,7 +152,7 @@ landing → normal landing → after landing → engine shutdown.*
 
 ## Safety gates
 
-XVoiceLayer refuses (and explains) rather than do something unsafe:
+XFlightCrew refuses (and explains) rather than do something unsafe:
 
 - **Flap Vfe** — flaps to 10° need < 110 KIAS; 20°/full need < 85 KIAS. Too fast →
   refused ("103 knots is above the 85-knot limit for flaps full").

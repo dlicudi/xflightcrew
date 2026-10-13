@@ -4,7 +4,7 @@
 # (blackbox autoland coupled_tick carries the FMA codes). Fuel by hand
 # before the run until the setup can load it (the reload keeps what is
 # aboard).
-#   xvl sortie bench/sorties/zibo-ils13.yaml
+#   xfc sortie bench/sorties/zibo-ils13.yaml
 after: stop
 
 cases:

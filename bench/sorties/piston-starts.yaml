@@ -1,7 +1,7 @@
 # The piston start's readbacks (#225): each airframe loaded cold on a
 # LXGB stand, "start the engines", and the start_item records checked for
 # a false "didn't" (the mags on a twin read ignition_key 3 on every engine).
-#   xvl sortie bench/sorties/piston-starts.yaml
+#   xfc sortie bench/sorties/piston-starts.yaml
 after: stop
 
 cases:

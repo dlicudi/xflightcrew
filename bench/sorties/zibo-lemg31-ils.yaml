@@ -4,7 +4,7 @@
 # 2,500 ft (CMD A holds it) and "autoland runway 31": the ILS (GAA 109.90),
 # flown on the coupled path (blackbox autoland ap_lands_armed, ap_landing,
 # coupled_tick). Fuel by hand before the run.
-#   xvl sortie bench/sorties/zibo-lemg31-ils.yaml
+#   xfc sortie bench/sorties/zibo-lemg31-ils.yaml
 after: stop
 
 cases:

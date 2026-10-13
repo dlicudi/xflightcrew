@@ -2,8 +2,8 @@
 # PAPI shows 3.00, `nav::papi_for`, blackbox `autoland` `papi`). The path is
 # ours at the PAPI's angle, the autopilot on HDG and VS, the power on total
 # energy, then the attitude flare. The no-ILS case LXGB needs.
-#   xvl sortie bench/sorties/c172-g1000-visual12.yaml --check
-#   xvl sortie bench/sorties/c172-g1000-visual12.yaml
+#   xfc sortie bench/sorties/c172-g1000-visual12.yaml --check
+#   xfc sortie bench/sorties/c172-g1000-visual12.yaml
 after: stop
 
 cases:

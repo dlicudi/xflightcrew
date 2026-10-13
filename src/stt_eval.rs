@@ -203,7 +203,7 @@ fn word_error_rate(reference: &str, hypothesis: &str) -> f64 {
 /// Retried: the speech daemon intermittently drops a request when called
 /// back-to-back over a long manifest.
 fn synth(text: &str) -> Result<Vec<f32>> {
-    let aiff = std::env::temp_dir().join("xvoicelayer-stt-eval.aiff");
+    let aiff = std::env::temp_dir().join("xflightcrew-stt-eval.aiff");
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -224,7 +224,7 @@ fn load_16k(input: &Path) -> Result<Vec<f32>> {
     if !input.exists() {
         return Err(anyhow!("no such file: {}", input.display()));
     }
-    let wav = std::env::temp_dir().join("xvoicelayer-stt-eval-16k.wav");
+    let wav = std::env::temp_dir().join("xflightcrew-stt-eval-16k.wav");
     let status = Command::new("afconvert")
         .args([
             input.to_str().unwrap(),

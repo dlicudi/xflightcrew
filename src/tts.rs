@@ -192,7 +192,7 @@ fn speak_say(config: &Config, text: &str) -> Result<()> {
 
 /// Pipe `text` to piper to synthesize a WAV, then play it.
 fn speak_piper(config: &Config, text: &str) -> Result<()> {
-    let wav_path = std::env::temp_dir().join("xvoicelayer-readback.wav");
+    let wav_path = std::env::temp_dir().join("xflightcrew-readback.wav");
 
     let mut child = Command::new(&config.piper_binary)
         .arg("--model")
@@ -255,8 +255,8 @@ pub fn channel_generation(ch: Channel) -> u64 {
 #[allow(dead_code)] // consumed by the copilot binary's tree (voice.rs), not the lib's
 pub(crate) fn play_pcm(samples: &[f32], sample_rate: u32) -> Result<()> {
     let name = match thread_channel() {
-        Channel::Intercom => "xvoicelayer-pcm-intercom.wav",
-        Channel::Radio => "xvoicelayer-pcm-radio.wav",
+        Channel::Intercom => "xflightcrew-pcm-intercom.wav",
+        Channel::Radio => "xflightcrew-pcm-radio.wav",
     };
     let path = std::env::temp_dir().join(name);
     let spec = hound::WavSpec {

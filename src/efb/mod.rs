@@ -610,8 +610,8 @@ fn refuse(peer: SocketAddr, path: &str) -> Response {
 /// token this device saved (a home-screen launch, a cleared cookie).
 const NO_TOKEN_PAGE: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>XVL EFB</title><style>body{margin:0;background:#0D1117;color:#E6EDF3;font:16px system-ui,sans-serif;padding:32px 20px}</style></head>
-<body><p>This EFB needs its link with the token. Open the URL xvl printed at boot (or the EFB settings).</p>
+<title>XFC EFB</title><style>body{margin:0;background:#0D1117;color:#E6EDF3;font:16px system-ui,sans-serif;padding:32px 20px}</style></head>
+<body><p>This EFB needs its link with the token. Open the URL xfc printed at boot (or the EFB settings).</p>
 <script>try{var t=localStorage.getItem('xvl_efb_t');if(t&&location.search.indexOf('t=')<0){location.replace('/?t='+encodeURIComponent(t));}}catch(e){}</script>
 </body></html>"#;
 
@@ -640,8 +640,8 @@ async fn page(
 /// token in its start URL (a home-screen app has its own cookie jar).
 pub(crate) fn manifest(token: &str) -> serde_json::Value {
     serde_json::json!({
-        "name": "XVoiceLayer EFB",
-        "short_name": "XVL EFB",
+        "name": "XFlightCrew EFB",
+        "short_name": "XFC EFB",
         "start_url": format!("/?t={token}"),
         "scope": "/",
         "display": "standalone",
@@ -1031,7 +1031,7 @@ async fn ptt_route(
             if !ptt::press() {
                 return (
                     StatusCode::CONFLICT,
-                    "xvl is not listening on push to talk in this run",
+                    "xfc is not listening on push to talk in this run",
                 )
                     .into_response();
             }

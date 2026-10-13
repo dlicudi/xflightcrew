@@ -1,7 +1,8 @@
-# XVoiceLayer
+# XFlightCrew
 
-The voice layer for X-Plane 12: copilot, ATC and cabin crew, local and deterministic. The pilot
-speaks, the grammar picks a tool, the agent writes the dataref, the copilot reads it back aloud.
+The rest of the crew, and the world around you, for X-Plane 12: copilot, ATC, AI traffic and
+cabin crew, local and deterministic, with voice as the interface (formerly XVoiceLayer, binary
+`xvl`, renamed 2026-10-13). The pilot speaks, the grammar picks a tool, the agent writes the dataref, the copilot reads it back aloud.
 **There is no model at runtime** (retired 2026-09-13): every miss in the logs becomes a rule.
 
 ```
@@ -42,8 +43,8 @@ xflightcrew.xpl`, source `plugin/src/xflightcrew.cpp`): `make -C plugin install`
 `plugins/xcopilot/` folder FIRST, since two copies would both load and register every dataref
 twice. A hand install must do the same.
 
-Package `xvoicelayer`, binary `xvl`. The tracing filter names every crate (`atc`, `nav`, `sim`)
-AND both crew names: `xvoicelayer=info,xvl=info,atc=info,nav=info,sim=info,traffic=info` (`src/main.rs`
+Package `xflightcrew`, binary `xfc`. The tracing filter names every crate (`atc`, `nav`, `sim`)
+AND both crew names: `xflightcrew=info,xfc=info,atc=info,nav=info,sim=info,traffic=info` (`src/main.rs`
 `DEFAULT_LOG_FILTER`, pinned by
 `the_log_filter_names_every_crate_and_both_crew_names`). A line's default target is the BIN
 name in the binary and the PACKAGE name in the lib: drop either and half the log goes silently while
@@ -61,7 +62,7 @@ Rust: a latency- and audio-sensitive real-time loop.
 | X-Plane write | `reqwest` PATCH to the Web API (`PATCH /api/v1/datarefs/{id}/value`) |
 | TTS readback | in-process piper VITS via the `ort` crate |
 
-- **No LLM, local or cloud**: `xvl analyze` lists the top missed phrasings; each becomes a rule,
+- **No LLM, local or cloud**: `xfc analyze` lists the top missed phrasings; each becomes a rule,
   matcher or profile entry with the live transcript as its test (`--now --since <date>` replays
   misses through TODAY's grammar). A model returns only as the instructor answering handbook
   questions, never a fallback.
@@ -528,7 +529,7 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   bug is never a control stick: nothing writes it below minimums.
 - **The pilot flies on MEASURED responses, never typed gains** (2026-10-13): each axis' response
   (`aircraft::learned::Response`: effectiveness, damping, the airflow angle's spring and path,
-  delay) is an identification's (`xvl identify`, `src/identify.rs`, stored per `.acf` in
+  delay) is an identification's (`xfc identify`, `src/identify.rs`, stored per `.acf` in
   `profiles/learned/`, keyed by the `.acf`'s fingerprint and a schema version, loaded by the
   detector into the facts' `acf_model`), else the fleet's prior; scaled by the air
   (`Response::at`); every loop's gains by ONE rule (`pilot::response::design`, McRuer's
@@ -552,7 +553,7 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   finds the low wings' ground effect: no declared pull); its path trim closes inside the flare and
   never winds below zero (a gust wound it down: 441 fpm). Tested on plants FITTED to recorded
   flights (`pilot::plants_tests`: six airframes' flares and arrests, the 737's identification),
-  each IDENTIFIED first as `xvl identify` flies it, never on an invented plant (one with a lift
+  each IDENTIFIED first as `xfc identify` flies it, never on an invented plant (one with a lift
   slope five times too steep hid the windy sag).
 - **The flare's power is TECS's**: height first, the lever only back, at idle with the engine
   spooled down as the wheels the flare PLANS arrive (`attitude::planned_s`); underspeed and bad
@@ -668,7 +669,7 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   (`Task::standards`); the taxi line is judged by the scorecard's `LineJudge`. An AP-shaped command
   in a lesson is a RETARGET (`take_target`), never a write.
 - **"Teach me a full flight"** (`Syllabus`, behind `SyllabusIo`): the whole flight is a plain
-  `cargo test`. `xvl debrief` prints lessons and `instructor::grade_flight`.
+  `cargo test`. `xfc debrief` prints lessons and `instructor::grade_flight`.
 - **"Show me" is the one exception to folded arms** (`instructor::show_me`,
   `mode::tool_may_actuate`): the task's automation armed once through the tool door, narrated,
   graded as the instructor's own, then "Your controls."
@@ -708,7 +709,7 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
 - **Only settings persist** (`prefs.json`, env, geometry). Never a state dump: persisted facts
   outlive their context. The one other file is an airframe's MEASURED model
   (`profiles/learned/<acf>.json`, `aircraft::learned`): a property of the `.acf` like a profile
-  line, written only by `xvl identify`, keyed to the `.acf`'s fingerprint (an edit retires it,
+  line, written only by `xfc identify`, keyed to the `.acf`'s fingerprint (an edit retires it,
   said) and a schema version, reviewed and committed like a profile.
 
 ## EFB: a page on the LAN (`src/efb/`, `docs/efb.md`)
@@ -777,8 +778,8 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   `cargo run -- stt-eval bench/atc_stt_cases.yaml`; world sweep
   `cargo test --release -p atc -- --ignored atc_world_sweep`; ILS smoke
   `cargo test -- --ignored real_install_ils`; `docs/atc-chaos-card.md`.
-- `xvl debrief` (`src/debrief.rs`) after every flight, before diagnosing by hand.
-- **A new airframe or profile edit is checked parked first** (`xvl conform [--only <area>]`,
+- `xfc debrief` (`src/debrief.rs`) after every flight, before diagnosing by hand.
+- **A new airframe or profile edit is checked parked first** (`xfc conform [--only <area>]`,
   `src/conform.rs`, `docs/conform.md`): every declared channel through its own seam, read back,
   put back; a row per channel and a blackbox `conform` record each. `--prepare` brings it up
   from cold first (battery, APU, preflight, start, IRS) as full auto's crew does.
@@ -791,11 +792,11 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   **A blackbox record is one write** (`blackbox::append_line`, file-locked: the runner is a second
   process). `bench/sorties/` pins real verdicts; `bench/replay/` replays real flights through a
   pure decision.
-- **A night of landings is one command** (`xvl sortie bench/sorties/<spec>.yaml --repeat N`,
+- **A night of landings is one command** (`xfc sortie bench/sorties/<spec>.yaml --repeat N`,
   `src/sortie_runner.rs`). **An airborne aircraft is never handed to nobody** (`hand_back`,
   `pause_safe`); a TAKEN line is never retyped; **no setup under a moving aircraft**
   (`SettleWatch`); **a reposition or swap is a new flight to the scorer** (`Scorer::new_flight`).
-- **`--check` first, no sim** (`xvl sortie <spec> --check`): every typed line routed as the loop
+- **`--check` first, no sim** (`xfc sortie <spec> --check`): every typed line routed as the loop
   routes it, every record the runner reads pinned to its producer (`READ_SHAPES`).
 - **An arrival case starts IN THE AIR on the plan** (`setup: {enroute: ...}`,
   `setup_enroute::place`), **ready only once settled** (`SettleJudge`).

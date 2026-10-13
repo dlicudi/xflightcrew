@@ -609,7 +609,7 @@ impl Session {
             // mishear and repeating won't help. Log the miss to the panel and,
             // when addressed directly (PTT), acknowledge with the negative tone.
             // Continuous mode stays silent. Every miss here is a rule not yet
-            // written: `xvl analyze` lists them by frequency.
+            // written: `xfc analyze` lists them by frequency.
             tracing::info!(path = "deterministic-miss", "command path");
             reporter.log(ui::LogKind::Warn, format!("unrecognized: \"{command}\""));
             if explicit && live.get(DR_OPT_TONE).is_none_or(|v| v > 0.5) {

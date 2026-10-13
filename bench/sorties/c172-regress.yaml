@@ -2,8 +2,8 @@
 # copilot untied from the loops, the station behind the party line, the command loop
 # and grammar split, per-flight strips and the computed runway book). Every change
 # was offline; this is the first flight over them.
-#   xvl sortie bench/sorties/c172-regress.yaml --check
-#   xvl sortie bench/sorties/c172-regress.yaml
+#   xfc sortie bench/sorties/c172-regress.yaml --check
+#   xfc sortie bench/sorties/c172-regress.yaml
 # Check: the tower's taxi clearance, line-up, takeoff and landing clearances and the
 # vacate report (atc records), the readbacks going out once, and the verdict PASS.
 after: stop

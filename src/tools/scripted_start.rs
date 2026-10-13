@@ -558,7 +558,7 @@ pub async fn run(
                     rec["abort"] = json!(a.kind());
                 }
                 crate::blackbox::record("scripted_start", rec);
-                tracing::info!(target: "xvoicelayer::scripted_start", call = c.kind(), %line, spoken);
+                tracing::info!(target: "xflightcrew::scripted_start", call = c.kind(), %line, spoken);
                 if spoken {
                     if let Some(v) = voice {
                         // `alert` mirrors to the panel itself; an aborted

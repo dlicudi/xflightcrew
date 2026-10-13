@@ -9,7 +9,7 @@
 //!
 //! SHADOW ONLY (2026-09-25): the monitor asks it every tick, blackboxes the
 //! answer when it changes (`duty`) beside whether the automation actually
-//! running agrees, and `xvl debrief` lists the trail. It acts on nothing. A
+//! running agrees, and `xfc debrief` lists the trail. It acts on nothing. A
 //! duty earns the right to act once the shadow logs agree with the flights
 //! the pilot and full auto actually flew.
 

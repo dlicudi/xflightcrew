@@ -1,6 +1,6 @@
 # The iMac's S-76C batch: the heli route pad to field, twice.
-#   xvl sortie bench/sorties/imac-heli.yaml --check
-#   xvl sortie bench/sorties/imac-heli.yaml
+#   xfc sortie bench/sorties/imac-heli.yaml --check
+#   xfc sortie bench/sorties/imac-heli.yaml
 # The shape is lemg-737.yaml's header. The S-76's taxi in is a hover taxi
 # (part of what these cases test), so both park.
 

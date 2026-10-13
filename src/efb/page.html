@@ -6,10 +6,10 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="XVL EFB">
+<meta name="apple-mobile-web-app-title" content="XFC EFB">
 <meta name="theme-color" content="#0F141B">
 <meta name="color-scheme" content="dark light">
-<title>XVL Flight Bag</title>
+<title>XFC Flight Bag</title>
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
 <link id="manifest" rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
@@ -700,7 +700,7 @@ form.say .send { min-height: 52px; }
       toast(false, (r.status === 429 ? 'One line at a time, try again: ' : r.status === 403 ? 'Refused, the link token is wrong: ' : 'Not sent (' + r.status + '): ') + '"' + words + '"');
       return false;
     }).catch(function () {
-      toast(false, 'Not sent, xvl unreachable: "' + words + '"');
+      toast(false, 'Not sent, xfc unreachable: "' + words + '"');
       return false;
     }).then(function (ok) { setTimeout(function () { sending = false; }, 500); return ok; });
   }
@@ -801,9 +801,9 @@ form.say .send { min-height: 52px; }
     pttDown = true;
     pttShow(true);
     post('/ptt', { action: 'press' }).then(function (r) {
-      if (r.status === 409) { pttStop(false); toast(false, 'xvl is not on push to talk in this run.'); }
+      if (r.status === 409) { pttStop(false); toast(false, 'xfc is not on push to talk in this run.'); }
       else if (!r.ok) { pttStop(false); }
-    }).catch(function () { pttStop(false); toast(false, 'Talk not sent, xvl unreachable.'); });
+    }).catch(function () { pttStop(false); toast(false, 'Talk not sent, xfc unreachable.'); });
     pttBeat = setInterval(function () {
       if (!pttDown) return;
       post('/ptt', { action: 'beat' }).then(function (r) { return r.ok ? r.json() : null; })
@@ -1129,7 +1129,7 @@ form.say .send { min-height: 52px; }
   // ------------------------------------------------------------ board
   // The flight information board: every field our traffic simulates, the
   // panel's Board tab rows (`efb::board`), picked here on this device only.
-  var BOARD_KEY = 'xvl-efb-board';
+  var BOARD_KEY = 'xfc-efb-board';
   var boardPick = null;
   try { boardPick = localStorage.getItem(BOARD_KEY); } catch (e) {}
   var BOARD_ICONS = {
@@ -1479,7 +1479,7 @@ form.say .send { min-height: 52px; }
       } else setMsg(row, false, x.status === 429 ? 'One change at a time, try again.' : x.text || ('Refused (' + x.status + ')'));
       row.dirty = false;
       fillRow(row, true);
-    }).catch(function () { row.busy = false; setMsg(row, false, 'Not sent, xvl unreachable.'); });
+    }).catch(function () { row.busy = false; setMsg(row, false, 'Not sent, xfc unreachable.'); });
   }
   function askConfirm(row, value) {
     if (row.bar) row.bar.remove();

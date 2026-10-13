@@ -1,5 +1,5 @@
     //! The command loop's pre-grammar shortcuts are one function's decisions
-    //! (`question_shortcut`), asked by the loop and by `xvl sortie --check`.
+    //! (`question_shortcut`), asked by the loop and by `xfc sortie --check`.
     use super::*;
 
     fn b738() -> (aircraft::AircraftProfile, Registry) {

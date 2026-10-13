@@ -1,4 +1,4 @@
-//! What the airframe's own flight MEASURED (`xvl identify`, 2026-10-13): how
+//! What the airframe's own flight MEASURED (`xfc identify`, 2026-10-13): how
 //! each axis answers its control and what the throttle buys, stored per
 //! airframe where the pilot controller (`src/pilot`) reads it. And what its
 //! `.acf` says about its geometry and engines.

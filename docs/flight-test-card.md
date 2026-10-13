@@ -4,7 +4,7 @@ One card for every change that shipped on offline tests alone and has not
 yet been proven by a sortie. Run it after any flight:
 
 ```
-xvl debrief logs/blackbox.jsonl
+xfc debrief logs/blackbox.jsonl
 ```
 
 The last section of the debrief judges every row below over the WHOLE file
@@ -177,7 +177,7 @@ the debrief.
 | `hand_back_brakes` The hand-back's parking brake is set on an unscoped client ("automation cancelled") | 2026-09-26 a8730cb | any full auto that gives up on the ground | full_auto hand_back_brakes: held, tries, err | held true | not exercised |
 | `citation_cold_start` The Citation X starts from a cold APU (loaded at 99, bleed read back) | 2026-09-23 b3091d8 | Citation X cold and dark: "engines on" | turbine_start apu, apu_loaded: air, volts; turbine_start crank: engine, verdict, peak_spool | every engine's crank verdict is Lit | not exercised |
 | `cabin_open_line` A bare "cabin crew?" answers go ahead and opens the line | 2026-09-22 125e2b3 | 737 or A330 on the ramp: "cabin crew?", then a cabin call | cabin (route call): call, reply | the reply is "Go ahead, flight deck." | not exercised |
-| `cabin_voice_picker` The panel's cabin voice picker | 2026-09-22 125e2b3 | reload the plugin with status/auto empty, restart xvl, pick a cabin voice | Health has no missing xcopilot/opt/cabin_voice; the new voice checks in | "Flight deck, cabin crew. New voice, checked in." in the picked voice (by hand) | unflown (by hand) |
+| `cabin_voice_picker` The panel's cabin voice picker | 2026-09-22 125e2b3 | reload the plugin with status/auto empty, restart xfc, pick a cabin voice | Health has no missing xcopilot/opt/cabin_voice; the new voice checks in | "Flight deck, cabin crew. New voice, checked in." in the picked voice (by hand) | unflown (by hand) |
 | `voice_handover` "You have control" is a hand-over from the flight model, the recovery only for an upset | 2026-09-25 ee493cc | any phase: "you have control", then "I'll take it" | handover decide: took, why, phase, upset; recover | no upset recovery runs after a hand-over without an upset | not exercised |
 
 ### Hand-flown session (rapport, tempo, say again)
@@ -186,9 +186,9 @@ the debrief.
 |---|---|---|---|---|---|
 | `ils_setup` "Set up the ILS" as a pilot monitoring: tuned, APPR from off, needles called, missed altitude | 2026-09-25 5d5bf46 | 737 or 172 hand-flown arrival: "set up the ILS", then "couple the approach" | ils setup: rwy, freq_mhz, dh_set, arm, verdict; ils appr_pressed; ils watch: said; ils missed_alt_set: alt | a callout, APPR press or missed altitude follows every setup within 10 min | not exercised |
 | `say_again_repeat` The frequency's "say again" repeats the controller's last line | 2026-09-23 f1d6791 | any towered field: key over a clearance, then "say again" on the radio | atc (outcome say_again_repeat): reply, age_s, service | the repeat is of a line under 60 s old | not exercised |
-| `recall_cut_lines` "What were you saying?" says the lines a press cut | 2026-09-23 f1d6791 | any: key the intercom over a copilot line, then ask | said records around the press; the xvl log's recall line | the cut line is said again (by hand) | unflown (by hand) |
+| `recall_cut_lines` "What were you saying?" says the lines a press cut | 2026-09-23 f1d6791 | any: key the intercom over a copilot line, then ask | said records around the press; the xfc log's recall line | the cut line is said again (by hand) | unflown (by hand) |
 | `tempo_persona` Reaction pause, "stand by", line pace and small talk | 2026-09-23 f1d6791 | any hand-flown session with some chat | said: text, prio (no tempo event is recorded) | the pilot says it sounds like a person (by hand) | unflown (by hand) |
-| `crew_speech_trims` Fewer pre-announcements, narration perishes at 6 s, one take-back hint a session | 2026-09-26 327d121 | any full auto from cold | said lines against the xvl log's "dropped stale" count | no backlog of stale lines (about 20 dropped before) (by hand) | unflown (by hand) |
+| `crew_speech_trims` Fewer pre-announcements, narration perishes at 6 s, one take-back hint a session | 2026-09-26 327d121 | any full auto from cold | said lines against the xfc log's "dropped stale" count | no backlog of stale lines (about 20 dropped before) (by hand) | unflown (by hand) |
 | `mountain_map_handover` A mountain field's MAP approach is flown to the MAP and handed over with the talk-down | 2026-09-24 858a0d4 | LSZS RNAV 03 in the SR22 or SF50, full auto | procedure map_config, visual_segment; autoland glidepath | handed over at the MAP on a flyable visual segment, the talk-down heard (by hand) | unflown (by hand) |
 
 ## Retiring a row

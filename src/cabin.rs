@@ -987,7 +987,7 @@ mod tests {
     fn joined_in_cruise_or_put_on_a_ramp_invents_no_news() {
         let mut c = Cabin::new();
         let t = t0();
-        // xvl started at cruise: no "starting the service", but the status
+        // xfc started at cruise: no "starting the service", but the status
         // read knows it is out, and the descent still secures.
         let joined = c.watch(t, view(30_000.0, false, 450.0, 0.0, true)).unwrap();
         assert_eq!(joined.event, "joined_in_cruise");
