@@ -95,6 +95,9 @@ pub const QNH_PASCALS: &str = "sim/weather/aircraft/qnh_pas";
 // --- Time ---
 /// Sim UTC, seconds since midnight zulu.
 pub const ZULU_TIME_SEC: &str = "sim/time/zulu_time_sec";
+/// The sim's date, days since the first of January (0 based): the traffic's
+/// timetable day (`traffic::rotation::Date`, 2026-10-13).
+pub const LOCAL_DATE_DAYS: &str = "sim/time/local_date_days";
 
 // --- Radios ---
 /// COM1 active frequency. Despite the `hz` in the name, the value is in kHz

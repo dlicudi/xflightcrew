@@ -211,7 +211,7 @@ pub struct TrafficAircraft {
     /// Where it last touched down.
     pub touchdown: Option<LatLon>,
     /// The drawn lead-on from the hold onto the strip.
-    lead_on: Vec<LatLon>,
+    pub(crate) lead_on: Vec<LatLon>,
     /// The taxi route past each runway it crosses: the runway the stop at
     /// the end of the piece now driven is short of, and the piece beyond
     /// it, in order ([`FieldModel::cut_at_crossings`]).
@@ -869,7 +869,7 @@ impl TrafficAircraft {
 
     /// Taxi `full`, stopping short of every runway it crosses (by the
     /// strips' geometry) until the tower clears the crossing.
-    fn set_taxi_route(&mut self, full: &[LatLon], field: &FieldModel) {
+    pub(crate) fn set_taxi_route(&mut self, full: &[LatLon], field: &FieldModel) {
         let cut = field.cut_at_crossings(full);
         let mut pieces = cut.pieces.into_iter();
         self.route = Route::taxi(pieces.next().unwrap_or_default());

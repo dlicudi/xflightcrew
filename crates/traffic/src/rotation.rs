@@ -47,6 +47,21 @@ impl Date {
         Date { year: y, ordinal }
     }
 
+    /// The day `days` after 1970-01-01.
+    pub fn from_epoch_days(days: i64) -> Date {
+        Date::ymd(1970, 1, 1).plus(days)
+    }
+
+    /// Day `ordinal` (0 based, X-Plane's `local_date_days`, which carries
+    /// no year) of `year`, clamped to the year's length.
+    pub fn of_year(year: i32, ordinal: u32) -> Date {
+        let len = if is_leap(year) { 366 } else { 365 };
+        Date {
+            year,
+            ordinal: ordinal.min(len - 1),
+        }
+    }
+
     /// Days since 1970-01-01.
     pub fn epoch_days(self) -> i64 {
         days_from_civil(self.year, 1, 1) + i64::from(self.ordinal)
