@@ -165,6 +165,9 @@ pub struct FlightInfo {
     /// A departure flown by the airframe that arrives as this callsign
     /// (its rotation's inbound): it leaves from wherever that one parked.
     pub inbound: Option<String>,
+    /// The stand the field planned for it ([`crate::stands::plan`], or the
+    /// file row's own): the board's until its aircraft stands on one.
+    pub stand: Option<String>,
 }
 
 /// Where a movement already is at the fleet's start ([`crate::midflow`]).
@@ -1127,6 +1130,7 @@ fn file_flight(r: &FileEntry) -> Option<FlightInfo> {
         sched_s: sched,
         est_s: sched,
         inbound: None,
+        stand: r.stand.clone(),
     })
 }
 

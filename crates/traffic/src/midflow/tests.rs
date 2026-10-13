@@ -227,3 +227,48 @@ fn a_departure_names_the_airframe_it_waits_for() {
     }
     assert!(paired > 0);
 }
+
+const FEW: &[RouteRow] = &[RouteRow {
+    summer: 21,
+    winter: 21,
+    windows: &[(9.0, 11.0)],
+    ..BUSY[0]
+}];
+
+/// Every flight on the board has the stand the field planned for it from
+/// the start, both halves of a rotation the same one, and a departure that
+/// stands on its stand from the start stands on its planned one where that
+/// was free: the pilot's board at LEMG (2026-10-13) had departures
+/// Boarding with an empty Stand column.
+#[test]
+fn every_flight_on_the_board_has_its_planned_stand() {
+    for seed in 1..4 {
+        let (f, p) = start_at(FEW, seed);
+        assert!(!p.board.is_empty());
+        for b in &p.board {
+            let s = b.info.stand.as_deref().expect("a planned stand");
+            assert!(f.stand(s).is_some(), "{s}");
+        }
+        for b in p.board.iter().filter(|b| b.dir == Dir::Departure) {
+            let inbound = b.info.inbound.as_deref().unwrap();
+            let arr = p.board.iter().find(|a| a.callsign == inbound).unwrap();
+            assert_eq!(arr.info.stand, b.info.stand, "{}", b.callsign);
+        }
+        for m in p.movements.iter().filter(|m| m.parked_from_start) {
+            assert_eq!(
+                m.stand,
+                m.flight.as_ref().and_then(|f| f.stand.clone()),
+                "{}",
+                m.callsign
+            );
+        }
+        // A departure still to appear starts on its planned stand.
+        for m in p
+            .movements
+            .iter()
+            .filter(|m| m.kind == MovementKind::Departure && m.start.is_none())
+        {
+            assert!(m.stand.is_some(), "{}", m.callsign);
+        }
+    }
+}

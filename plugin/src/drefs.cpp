@@ -257,6 +257,13 @@ static XPLMDataRef g_state_dref = nullptr;
 static TextRef g_board = {{0}, 0};
 static double g_board_at = -1.0;
 static XPLMDataRef g_board_dref = nullptr;
+// The Board tab's field pick (xcopilot/opt/board_field, 2026-10-13): the
+// ICAO the pilot picked in its selector, plugin to app, read by the app as
+// it publishes the board (empty = the field the traffic runs at). The
+// choices ride the board's header ("H|field|HH:MM|ICAO,ICAO"); an app
+// before the selector sends none and the tab shows no selector.
+static TextRef g_board_field = {{0}, 0};
+static XPLMDataRef g_board_field_dref = nullptr;
 // COM1 active frequency (integer kHz despite the sim's `hz` name) — read for
 // the ATC tab's tuned highlight, written by its click-to-tune.
 static XPLMDataRef g_com1_dref = nullptr;
@@ -1529,6 +1536,11 @@ void start() {
         "xcopilot/status/board", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteBoard, &g_board, &g_board);
+    g_board_field_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/board_field", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteOptText,
+        &g_board_field, &g_board_field);
     g_opt_ui_scale_dref = XPLMRegisterDataAccessor(
         "xcopilot/opt/ui_scale", xplmType_Int, 1,
         ReadOptUiScale, WriteOptUiScale, nullptr, nullptr, nullptr, nullptr,
@@ -1721,6 +1733,7 @@ void stop_first() {
     if (g_brief_dref) { XPLMUnregisterDataAccessor(g_brief_dref); g_brief_dref = nullptr; }
     if (g_state_dref) { XPLMUnregisterDataAccessor(g_state_dref); g_state_dref = nullptr; }
     if (g_board_dref) { XPLMUnregisterDataAccessor(g_board_dref); g_board_dref = nullptr; }
+    if (g_board_field_dref) { XPLMUnregisterDataAccessor(g_board_field_dref); g_board_field_dref = nullptr; }
     if (g_auto_dref) { XPLMUnregisterDataAccessor(g_auto_dref); g_auto_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }
@@ -1778,6 +1791,13 @@ const TextRef& load_sheet() { return g_loadsheet; }
 const TextRef& brief() { return g_brief; }
 const TextRef& state_lines() { return g_state; }
 const TextRef& board() { return g_board; }
+void set_board_field(const char* icao) {
+    size_t n = std::strlen(icao);
+    if (n > sizeof g_board_field.buf - 1) n = sizeof g_board_field.buf - 1;
+    std::memcpy(g_board_field.buf, icao, n);
+    g_board_field.buf[n] = '\0';
+    g_board_field.len = static_cast<int>(n);
+}
 bool board_fresh() {
     return g_board_at >= 0.0 && XPLMGetElapsedTime() - g_board_at < 30.0;
 }
