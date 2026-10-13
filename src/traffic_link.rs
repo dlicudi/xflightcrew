@@ -15,8 +15,16 @@
 //!
 //! The station never actuates: the fleet moves its own aircraft, and the
 //! plugin draws them from the packed frames this side writes.
+//!
+//! Several fields at once (2026-10-13, `docs/tasks/multi-field-traffic`):
+//! [`TrafficWorld`] keeps a link per field simulated, the station's field
+//! worked as above, every other timetable field in range by its own runway
+//! desk ([`Link::make_desk`], `traffic::FieldDesk`), silent and never
+//! through the party line; ids come from one counter ([`Ids`]), each
+//! field's day from its own seed ([`SESSION_SEED`]); only the aircraft
+//! within 40 nm are drawn (`traffic_sink::DrawCull`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Instant;
 
 use traffic::{
@@ -450,6 +458,14 @@ pub(crate) struct Link {
     /// When each flight was seen to leave the runway or land on it, local
     /// seconds: the board's "actual" time.
     actual: HashMap<String, f64>,
+    /// A field that is not the pilot's station (multi-field traffic stage
+    /// 3, 2026-10-13): its traffic worked by this runway desk, silently,
+    /// and never through the party line ([`Link::make_desk`]); `None`: the
+    /// installed station works it, as it always did.
+    desk: Option<traffic::FieldDesk>,
+    /// Generated schedules flown so far at this field (the next hour's
+    /// seed and offset); `None` for a timetable or the pilot's file.
+    hours: Option<u32>,
 }
 
 /// Traffic ids from ONE counter for every field's fleet (multi-field
@@ -552,6 +568,8 @@ impl Link {
             board: Vec::new(),
             t0_local_s: 0.0,
             actual: HashMap::new(),
+            desk: None,
+            hours: None,
         }
     }
 
@@ -559,6 +577,70 @@ impl Link {
     /// fleets ([`Ids`]). Before the first tick: nothing is spawned yet.
     pub(crate) fn share_ids(&mut self, ids: &Ids) {
         self.ids = ids.clone();
+    }
+
+    /// Worked by a runway desk of its own ([`traffic::FieldDesk`]), not
+    /// the station: the field is not the pilot's station's.
+    pub(crate) fn is_desk(&self) -> bool {
+        self.desk.is_some()
+    }
+
+    /// Hand the field to its own runway desk (multi-field traffic stage 3,
+    /// 2026-10-13): built for a field in range that is not the station's,
+    /// or the station's field when the pilot's station moves on. Every
+    /// strip it held at the station is retired (a station installed since
+    /// cleared them already) and the desk takes each flight where its
+    /// phase says it was cleared ([`traffic::FieldDesk::adopt`]): nobody
+    /// leaves. The runway is the one the tower last cleared, else the
+    /// field's default.
+    pub(crate) fn make_desk(&mut self) {
+        if self.desk.is_some() {
+            return;
+        }
+        for a in self.fleet.aircraft() {
+            crate::world::retire_traffic(a.id);
+        }
+        let runway = self
+            .tower_runway
+            .clone()
+            .filter(|r| self.fleet.field.end(r).is_some())
+            .or_else(|| traffic::schedule::default_runway(&self.fleet.field));
+        let mut desk = traffic::FieldDesk::new(runway);
+        desk.adopt(&self.fleet);
+        self.desk = Some(desk);
+        self.outbox = Outbox::default();
+        self.noted.clear();
+        self.seen_orders.clear();
+    }
+
+    /// Hand the field to the station (the pilot's station installed on
+    /// it): the desk retires and, as the reinstall rule has it, every
+    /// aircraft not parked leaves the frequency (stage 4 hands the desk's
+    /// strips to the station instead). Their ids.
+    pub(crate) fn make_station(&mut self) -> Vec<u32> {
+        if self.desk.take().is_none() {
+            return Vec::new();
+        }
+        self.noted.clear();
+        self.seen_orders.clear();
+        self.despawn_moving()
+    }
+
+    /// The runway every movement spawns for: the desk's; else the one the
+    /// tower last cleared anyone for, else the station's in use.
+    fn runway_now(&self) -> Option<String> {
+        match &self.desk {
+            Some(d) => d.runway().map(str::to_string),
+            None => self.tower_runway.clone().or_else(station_runway),
+        }
+    }
+
+    /// The station's type for a traffic callsign (its wake and its
+    /// telephony): only for the station's own field.
+    fn note_type(&self, callsign: &str, icao_type: &str) {
+        if self.desk.is_none() {
+            crate::world::note_traffic_type(callsign, icao_type);
+        }
     }
 
     /// The board's flights and the local time of day at the fleet's start
@@ -755,6 +837,9 @@ impl Link {
     /// (clamped and substepped by its clock; nothing while frozen), and
     /// trade with the station. `now` is the station's clock for this tick.
     pub(crate) fn tick(&mut self, own: Option<&OwnState>, dt: f64, now: Instant) -> TickOut {
+        if self.desk.is_some() {
+            return self.tick_desk(own, dt);
+        }
         let mut out = TickOut::default();
         // THE REINSTALL RULE: an install clears the strips. A flight noted
         // last tick whose strip is gone (we retire only what we despawn)
@@ -913,6 +998,41 @@ impl Link {
         out
     }
 
+    /// One tick of a field worked by its desk ([`Link::make_desk`]): spawn
+    /// what is due, the desk's clearances, the fleet stepped on them, its
+    /// calls heard by the desk. Nothing reaches the station or the
+    /// frequency: no strip, no state noted, no call posted, no line said
+    /// (stage 3 runs these fields with no radio).
+    fn tick_desk(&mut self, own: Option<&OwnState>, dt: f64) -> TickOut {
+        let mut out = TickOut::default();
+        self.spawn_due(own, &mut out);
+        let Some(desk) = self.desk.as_mut() else {
+            return out;
+        };
+        desk.tick(&self.fleet);
+        let orders: HashMap<u32, Order> = self
+            .fleet
+            .aircraft()
+            .iter()
+            .filter_map(|a| desk.order(a.id).map(|o| (a.id, o)))
+            .collect();
+        for (id, o) in &orders {
+            let now_seen = (o.state, o.runway.clone());
+            if self.seen_orders.get(id) != Some(&now_seen) {
+                out.orders.push((*id, o.state, o.runway.clone()));
+                self.seen_orders.insert(*id, now_seen);
+            }
+        }
+        self.seen_orders.retain(|id, _| orders.contains_key(id));
+        let events = self
+            .fleet
+            .step(dt, own.map(OwnState::own_target), &|id| orders.get(&id).cloned());
+        desk.hear(&events);
+        self.note_actuals(&events);
+        out.events = events;
+        out
+    }
+
     /// Our own pilot is on position `on`'s frequency now (the PTT down, a
     /// line being routed, or the tower answering us): no traffic keys over
     /// it, and the next caller waits [`OWN_TAIL_S`] and its gap after.
@@ -962,7 +1082,7 @@ impl Link {
             let c = ctx(&self.fleet);
             if let Ok(ac) = self.due[i].m.park(self.ids.peek(), &self.fleet.field, &c) {
                 let (id, cs) = (ac.id, ac.callsign.clone());
-                crate::world::note_traffic_type(&ac.callsign, &ac.icao_type);
+                self.note_type(&ac.callsign, &ac.icao_type);
                 if self.fleet.spawn(ac) {
                     self.ids.bump();
                     self.due[i].held = Some(id);
@@ -974,7 +1094,7 @@ impl Link {
             let c = ctx(&self.fleet);
             if let Ok(ac) = m.park(self.ids.peek(), &self.fleet.field, &c) {
                 let (id, cs) = (ac.id, ac.callsign.clone());
-                crate::world::note_traffic_type(&ac.callsign, &ac.icao_type);
+                self.note_type(&ac.callsign, &ac.icao_type);
                 if self.fleet.spawn(ac) {
                     self.ids.bump();
                     out.parked.push((id, cs));
@@ -1081,7 +1201,7 @@ impl Link {
             if !self.fleet.release_as(id, plan, &m.callsign, &m.spoken) {
                 return None;
             }
-            crate::world::note_traffic_type(&m.callsign, &icao_type);
+            self.note_type(&m.callsign, &icao_type);
             return Some((id, m.callsign.clone(), "rotation"));
         }
         let runway_m = self.fleet.field.end(&m.runway)?.length_m;
@@ -1125,7 +1245,7 @@ impl Link {
         if !self.fleet.release_as(id, plan, &cs, &spoken) {
             return None;
         }
-        crate::world::note_traffic_type(&cs, &icao_type);
+        self.note_type(&cs, &icao_type);
         Some((id, cs, if turned { "turned_round" } else { "parked" }))
     }
 
@@ -1160,7 +1280,7 @@ impl Link {
         let mut later = Vec::new();
         while self.due.first().is_some_and(|d| d.at_s <= now_s) {
             let mut d = self.due.remove(0);
-            let runway = self.tower_runway.clone().or_else(station_runway);
+            let runway = self.runway_now();
             match &runway {
                 Some(r) if self.fleet.field.end(r).is_some() => d.m.runway = r.clone(),
                 None if d.m.kind == MovementKind::Arrival && now_s < d.m.t_s + ARRIVAL_WAIT_S => {
@@ -1175,7 +1295,7 @@ impl Link {
                 let plan = d.m.plan(&self.fleet.field);
                 if let Ok(plan) = plan {
                     if self.fleet.release(id, plan) {
-                        crate::world::note_traffic_type(&d.m.callsign, &d.m.icao_type);
+                        self.note_type(&d.m.callsign, &d.m.icao_type);
                         out.spawned.push((id, d.m.callsign.clone()));
                         out.from_stand.push((id, "parked"));
                         continue;
@@ -1229,7 +1349,7 @@ impl Link {
                 Ok(ac) => {
                     let id = ac.id;
                     let cs = ac.callsign.clone();
-                    crate::world::note_traffic_type(&ac.callsign, &ac.icao_type);
+                    self.note_type(&ac.callsign, &ac.icao_type);
                     if self.fleet.spawn(ac) {
                         self.ids.bump();
                         out.spawned.push((id, cs));
@@ -1463,23 +1583,33 @@ const FAST_OVER: f64 = 1.2;
 /// tower names us by `FlightId::Own`, never by this).
 const OWN_KEY: &str = "OWNSHIP";
 
-/// The monitor's side of the traffic: the link for the installed field
-/// (built off the tick: two apt.dat scans), its clock, the fast-forward
-/// latch. Owned by `WorldTick`, never a static.
+/// The monitor's side of the traffic: a link per field simulated (built
+/// off the tick, one at a time: two apt.dat scans each), the clock, the
+/// fast-forward latch, the sink. Owned by `WorldTick`, never a static.
+///
+/// SEVERAL FLEETS AT ONCE (multi-field traffic stage 3, 2026-10-13): the
+/// installed station's field, worked by the station as it always was, and
+/// every field with a timetable within [`SIM_RANGE_NM`] of us, each worked
+/// by its own runway desk ([`Link::make_desk`]), silent and kept out of the
+/// party line. A field past [`SIM_OUT_NM`] retires its fleet. When the
+/// pilot's station moves to a simulated field, that field's fleet is
+/// handed to the station (its moving aircraft leave the frequency, the
+/// reinstall rule) and the old field's to a desk.
 #[derive(Default)]
 pub(crate) struct TrafficWorld {
-    link: Option<Link>,
-    /// The field the link is for, or is being built for.
-    field: Option<String>,
-    /// A link being built, off the tick.
-    loading: Option<std::sync::mpsc::Receiver<Option<Link>>>,
+    /// The fleets, by ICAO upper case: in ICAO order, so the tick is
+    /// deterministic.
+    links: BTreeMap<String, Link>,
+    /// The installed station's field, the one the station works.
+    active: Option<String>,
+    /// A link being built, off the tick, and its field.
+    loading: Option<(String, std::sync::mpsc::Receiver<Option<Link>>)>,
+    /// Fields whose build came back empty: not tried again while in range.
+    failed: BTreeSet<String>,
     /// The sim's running time at the last tick.
     last_sim_s: Option<f64>,
     /// Frozen for time acceleration (said once per spell).
     fast: bool,
-    /// Generated schedules flown so far at this field (the next hour's seed
-    /// and offset); `None` for the pilot's file.
-    hours: Option<u32>,
     /// Every fleet's ids, one counter for the session ([`Ids`]): a link
     /// built later never reuses an id an earlier one handed out.
     ids: Ids,
@@ -1492,8 +1622,9 @@ pub(crate) struct TrafficWorld {
     /// The Board tab as last sent, and when.
     board_last: String,
     board_sent: Option<Instant>,
-    /// The Board tab's other field (2026-10-13): its board by the clock,
-    /// built off the tick once picked, and one being built.
+    /// The Board tab's other field when nobody simulates it (2026-10-13):
+    /// its board by the clock, built off the tick once picked, and one
+    /// being built.
     remote: Option<RemoteBoard>,
     remote_loading: Option<(String, std::sync::mpsc::Receiver<Option<RemoteBoard>>)>,
     /// The plugin has no field pick (an older one): not asked again before
@@ -1575,9 +1706,10 @@ fn own_board_flight(field: &str) -> Option<traffic::board::BoardFlight> {
 
 impl TrafficWorld {
     /// One monitor tick. Nothing at all unless `XCOPILOT_TRAFFIC=ours`, ATC
-    /// is on and a station is installed: the link is dropped (every strip
-    /// it opened retired, the picture withdrawn) the moment any of those
-    /// stops being true. `sim_speed` is the monitor's latest read.
+    /// is on and a station is installed: every fleet is dropped (every
+    /// strip it opened retired, the picture withdrawn) the moment any of
+    /// those stops being true. `sim_speed` is the monitor's latest read.
+    /// The tick's output is the station's field's.
     pub(crate) async fn tick(
         &mut self,
         xp: &crate::xplane::XPlaneClient,
@@ -1587,37 +1719,57 @@ impl TrafficWorld {
         now: Instant,
         status: Option<&crate::plugin_status::StatusSink>,
     ) -> Option<TickOut> {
-        let field = wanted_field(
+        let active = wanted_field(
             TrafficMode::now(),
             crate::mode::atc_enabled(),
             crate::party_line::installed_icao(),
-        );
-        if field != self.field {
-            self.stand_down();
-            self.field = field.clone();
-            if let Some(icao) = field {
+        )
+        .map(|f| f.trim().to_ascii_uppercase());
+        let Some(active) = active else {
+            if self.active.is_some() || !self.links.is_empty() || self.loading.is_some() {
+                self.stand_down();
+            }
+            return None;
+        };
+        let here = (snap.lat, snap.lon);
+        let running: BTreeSet<String> = self.links.keys().cloned().collect();
+        let wanted = wanted_fields(&active, here, &running);
+        if self.active.as_deref() != Some(active.as_str()) {
+            self.change_station(&active, &wanted);
+        }
+        let gone: Vec<String> = self
+            .links
+            .keys()
+            .filter(|k| !wanted.contains(*k))
+            .cloned()
+            .collect();
+        for icao in gone {
+            if let Some(link) = self.links.remove(&icao) {
+                retire_link(&link, "out_of_range");
+            }
+        }
+        self.failed.retain(|f| wanted.contains(f));
+        self.take_built(&active, &wanted);
+        if self.loading.is_none() {
+            let built: BTreeSet<String> = self
+                .links
+                .keys()
+                .chain(self.failed.iter())
+                .cloned()
+                .collect();
+            if let Some(icao) = next_build(&active, &wanted, &built) {
                 // The schedule follows the field's day (`traffic::rate`):
                 // the sim's zulu time, read only when a schedule is made.
                 let zulu = sim_zulu_s(xp).await;
                 let day = sim_date_days(xp).await;
-                self.loading = Some(self.build(&icao, zulu, day));
+                let station = icao == active;
+                self.loading = Some((icao.clone(), self.build(&icao, station, zulu, day)));
             }
         }
-        if let Some(rx) = &self.loading {
-            match rx.try_recv() {
-                Ok(mut link) => {
-                    self.loading = None;
-                    if let Some(l) = link.as_mut() {
-                        l.share_ids(&self.ids);
-                    }
-                    self.link = link;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.loading = None,
-            }
+        if self.links.is_empty() {
+            return None;
         }
-        let link = self.link.as_mut()?;
-        // Time acceleration freezes the fleet (v1), said once per spell.
+        // Time acceleration freezes the fleets (v1), said once per spell.
         let fast = sim_speed.is_some_and(|v| v > FAST_OVER);
         if fast != self.fast {
             self.fast = fast;
@@ -1632,10 +1784,12 @@ impl TrafficWorld {
                 );
             }
         }
-        link.set_frozen(fast);
-        // The fleet's clock is the sim's (a failed read is no time), and our
+        for link in self.links.values_mut() {
+            link.set_frozen(fast);
+        }
+        // The fleets' clock is the sim's (a failed read is no time), and our
         // height in the tower's picture is true feet MSL (the snapshot's is
-        // the altimeter's): one batched read, only while the fleet flies.
+        // the altimeter's): one batched read, only while a fleet flies.
         let (sim_s, ele_m) = tokio::join!(
             xp.get_float(crate::datarefs::TOTAL_RUNNING_TIME_SEC),
             xp.get_float(crate::datarefs::ELEVATION_M),
@@ -1673,61 +1827,158 @@ impl TrafficWorld {
             at: now,
         });
         // Our own pilot on the frequency (keying, a line being routed, the
-        // tower answering us): the traffic waits it out, never keys over it.
+        // tower answering us): the station's traffic waits it out, never
+        // keys over it.
         if voice.frequency_ours() || crate::pollers::command_waiting() {
-            let on = voice
-                .tuned_station()
-                .unwrap_or(crate::voice::StationSpeaker::Tower);
-            link.note_own_transmission(on);
+            if let Some(link) = self.links.get_mut(&active) {
+                let on = voice
+                    .tuned_station()
+                    .unwrap_or(crate::voice::StationSpeaker::Tower);
+                link.note_own_transmission(on);
+            }
         }
-        let out = link.tick(Some(&own), dt, now);
-        // The next hour of a generated schedule, once this one is spent.
-        if link.pending() == 0 {
-            if let Some(h) = self.hours.as_mut() {
+        let mut station_out = None;
+        let fields: Vec<String> = self.links.keys().cloned().collect();
+        for icao in fields {
+            let Some(link) = self.links.get_mut(&icao) else {
+                continue;
+            };
+            let out = link.tick(Some(&own), dt, now);
+            // The next hour of a generated schedule, once this one is spent.
+            if link.pending() == 0 {
                 let start = link.fleet().clock.now_s();
-                if start >= f64::from(*h) * traffic::schedule::HORIZON_S {
-                    *h += 1;
+                let next = link
+                    .hours
+                    .filter(|h| start >= f64::from(*h) * traffic::schedule::HORIZON_S);
+                if let Some(h) = next {
+                    link.hours = Some(h + 1);
                     let zulu = sim_zulu_s(xp).await;
-                    let ms = generate_for(link.fleet(), u64::from(*h), &own, zulu);
+                    let ms = generate_for(link.fleet(), u64::from(h + 1), &own, zulu);
                     link.add_schedule(ms, start);
                 }
             }
+            record(&out, link);
+            if icao == active {
+                station_out = Some(out);
+            }
         }
-        crate::party_line::publish_traffic_picture(Some(link.targets()));
-        crate::party_line::publish_stands_taken(link.stands_taken());
+        if let Some(link) = self.links.get(&active) {
+            crate::party_line::publish_traffic_picture(Some(link.targets()));
+            crate::party_line::publish_stands_taken(link.stands_taken());
+        }
         if self.sink.is_none() {
             self.sink = crate::traffic_sink::TrafficSink::start(
                 crate::settings::live().xplane_base_url.clone(),
             );
         }
         if let Some(sink) = self.sink.as_mut() {
-            let all: Vec<&TrafficAircraft> = link.fleet().aircraft().iter().collect();
-            let drawn = self.cull.select(Some((snap.lat, snap.lon)), &all);
+            let all: Vec<&TrafficAircraft> = self
+                .links
+                .values()
+                .flat_map(|l| l.fleet().aircraft())
+                .collect();
+            let drawn = self.cull.select(Some(here), &all);
             sink.publish(&drawn, self.last_sim_s.unwrap_or(0.0));
             self.draw_log.note(all.len(), &drawn, now);
         }
-        record(&out, link);
         // The frequencies: the tower's runway-watch lines in the tower's
         // voice, the positions' handoffs in theirs, each on its own
         // frequency. The calls themselves are said with their answers, on
-        // the position that heard them (`overhear_replies`).
-        let tower = crate::voice::StationSpeaker::Tower;
-        for (id, line) in &out.tower {
-            voice.overhear_checked(tower, tower, line, now, still_valid(*id));
-        }
-        for (id, line, who) in &out.positions {
-            voice.overhear_checked(*who, *who, line, now, still_valid(*id));
+        // the position that heard them (`overhear_replies`). Only the
+        // station's field speaks (the desks have no radio, stage 3).
+        if let Some(out) = &station_out {
+            let tower = crate::voice::StationSpeaker::Tower;
+            for (id, line) in &out.tower {
+                voice.overhear_checked(tower, tower, line, now, still_valid(*id));
+            }
+            for (id, line, who) in &out.positions {
+                voice.overhear_checked(*who, *who, line, now, still_valid(*id));
+            }
         }
         if let Some(s) = status {
-            self.publish_board(xp, s, (snap.lat, snap.lon), now).await;
+            self.publish_board(xp, s, here, now).await;
         }
-        Some(out)
+        station_out
+    }
+
+    /// The pilot's station moved to `active`: the old station's field is
+    /// handed to a desk while it stays in range (else retired), the new
+    /// one's fleet, if simulated already, to the station; a build for
+    /// another field gives way to the station's own.
+    fn change_station(&mut self, active: &str, wanted: &BTreeSet<String>) {
+        let old = self.active.replace(active.to_string());
+        if let Some(old) = old {
+            if wanted.contains(&old) {
+                if let Some(link) = self.links.get_mut(&old) {
+                    link.make_desk();
+                    crate::blackbox::record(
+                        "traffic",
+                        serde_json::json!({ "event": "to_desk", "field": old,
+                            "aircraft": link.fleet().aircraft().len() }),
+                    );
+                }
+            } else if let Some(link) = self.links.remove(&old) {
+                retire_link(&link, "station_moved");
+            }
+            crate::party_line::publish_traffic_picture(None);
+            crate::party_line::publish_stands_taken(Vec::new());
+        }
+        if let Some(link) = self.links.get_mut(active) {
+            let left = link.make_station();
+            crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "to_station", "field": active,
+                    "left_frequency": left.len() }),
+            );
+            for id in left {
+                crate::blackbox::record(
+                    "traffic",
+                    serde_json::json!({ "event": "despawn", "id": id, "reason": "reinstalled",
+                        "field": active }),
+                );
+            }
+        }
+        let other = self.loading.as_ref().is_some_and(|(i, _)| i != active);
+        if other && !self.links.contains_key(active) {
+            self.loading = None;
+        }
+        self.board_last.clear();
+        self.board_sent = None;
+    }
+
+    /// A link built off the tick, taken in: its ids from the world's
+    /// counter, a desk of its own unless it is the station's field.
+    fn take_built(&mut self, active: &str, wanted: &BTreeSet<String>) {
+        let Some((icao, rx)) = &self.loading else {
+            return;
+        };
+        let icao = icao.clone();
+        let link = match rx.try_recv() {
+            Ok(link) => link,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.loading = None;
+        match link {
+            Some(mut link) if wanted.contains(&icao) => {
+                link.share_ids(&self.ids);
+                if icao != active {
+                    link.make_desk();
+                }
+                self.links.insert(icao, link);
+            }
+            Some(_) => {}
+            None => {
+                self.failed.insert(icao);
+            }
+        }
     }
 
     /// The Board tab: on a change, at most every 2 s, and every 10 s
     /// regardless (a plugin reload zeroes its buffer). The field is the
     /// panel's pick among [`board_choices`] (read as the board is due),
-    /// else the one the traffic runs at.
+    /// else the station's: a simulated field's board is live, any other's
+    /// by the clock.
     async fn publish_board(
         &mut self,
         xp: &crate::xplane::XPlaneClient,
@@ -1739,7 +1990,7 @@ impl TrafficWorld {
         if since.is_some_and(|d| d < BOARD_MIN_GAP) {
             return;
         }
-        let Some(active) = self.link.as_ref().map(|l| l.icao().to_string()) else {
+        let Some(active) = self.active.clone().filter(|a| self.links.contains_key(a)) else {
             return;
         };
         let choices = board_choices(&active, own);
@@ -1760,7 +2011,9 @@ impl TrafficWorld {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.remote_loading = None,
             }
         }
-        if let Some(icao) = &shown {
+        // A field nobody simulates (still loading, or no fleet there): its
+        // board by the clock.
+        if let Some(icao) = shown.as_ref().filter(|i| !self.links.contains_key(*i)) {
             let fresh = self
                 .remote
                 .as_ref()
@@ -1777,9 +2030,17 @@ impl TrafficWorld {
             }
         }
         let list: &[String] = if choices.len() > 1 { &choices } else { &[] };
+        let live = shown
+            .as_deref()
+            .and_then(|i| self.links.get(i))
+            .or_else(|| self.links.get(&active));
         let payload = match (&shown, &self.remote) {
-            (Some(icao), Some(r)) if r.icao.eq_ignore_ascii_case(icao) => r.payload(sim_s, list),
-            _ => match self.link.as_ref() {
+            (Some(icao), Some(r))
+                if !self.links.contains_key(icao) && r.icao.eq_ignore_ascii_case(icao) =>
+            {
+                r.payload(sim_s, list)
+            }
+            _ => match live {
                 Some(link) => link.board_payload(own_board_flight(link.icao()), list),
                 None => return,
             },
@@ -1842,19 +2103,12 @@ impl TrafficWorld {
         rx
     }
 
-    /// Drop the link: every strip it opened retired, the picture withdrawn.
+    /// Drop every fleet: every strip opened retired, the picture withdrawn.
     fn stand_down(&mut self) {
-        if let Some(link) = self.link.take() {
-            let ids: Vec<u32> = link.fleet().aircraft().iter().map(|a| a.id).collect();
-            for id in &ids {
-                crate::world::retire_traffic(*id);
-            }
-            crate::blackbox::record(
-                "traffic",
-                serde_json::json!({ "event": "stand_down", "field": link.icao(), "aircraft": ids.len() }),
-            );
+        for link in std::mem::take(&mut self.links).values() {
+            retire_link(link, "stand_down");
         }
-        if self.field.is_some() {
+        if self.active.is_some() {
             crate::party_line::publish_traffic_picture(None);
             crate::party_line::publish_stands_taken(Vec::new());
         }
@@ -1869,16 +2123,19 @@ impl TrafficWorld {
         self.remote = None;
         self.remote_loading = None;
         self.loading = None;
+        self.failed.clear();
+        self.active = None;
         self.last_sim_s = None;
-        self.hours = None;
     }
 
     /// Build the link for `icao` off the tick: the field (apt.dat, its
-    /// taxi network and CIFP) and its schedule, the pilot's file or a
-    /// generated hour.
+    /// taxi network and CIFP) and its schedule. The `station`'s field flies
+    /// the pilot's file or a generated hour where it has no timetable, on
+    /// the station's runway; any other field its timetable, on its own.
     fn build(
         &mut self,
         icao: &str,
+        station: bool,
         zulu: Option<f64>,
         day: Option<u32>,
     ) -> std::sync::mpsc::Receiver<Option<Link>> {
@@ -1889,19 +2146,32 @@ impl TrafficWorld {
             cfg.apt_data_path.clone(),
             cfg.cifp_dir.clone(),
         );
-        let (file, density) = (cfg.traffic_file.clone(), cfg.traffic_density.clone());
+        let file = if station {
+            cfg.traffic_file.clone()
+        } else {
+            String::new()
+        };
+        let density = cfg.traffic_density.clone();
         let seed = traffic::field_seed(&icao, SESSION_SEED);
-        // A field with a route table flies its timetable's day whole; the
-        // rest generate an hour at a time.
-        let table = traffic::routes::field_routes(&icao).is_some();
-        self.hours = (file.is_empty() && !table).then_some(1);
-        let name = crate::party_line::active_field()
-            .map(|(n, ..)| crate::party_line::spoken_airport(&n).to_string())
-            .unwrap_or_default();
+        let name = if station {
+            crate::party_line::active_field()
+                .map(|(n, ..)| crate::party_line::spoken_airport(&n).to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let runway = if station { station_runway() } else { None };
         let spawned = std::thread::Builder::new()
             .name("traffic-field".into())
             .spawn(move || {
-                let link = build_link(&icao, &apt, &cifp, &file, &density, seed, &name, zulu, day);
+                let ctx = BuildCtx {
+                    seed,
+                    name: &name,
+                    zulu_s: zulu,
+                    day,
+                    runway,
+                };
+                let link = build_link(&icao, &apt, &cifp, &file, &density, &ctx);
                 let _ = tx.send(link);
             });
         if let Err(e) = spawned {
@@ -1909,6 +2179,69 @@ impl TrafficWorld {
         }
         rx
     }
+}
+
+/// A fleet dropped (`why`): every strip it opened at the station retired.
+fn retire_link(link: &Link, why: &str) {
+    let ids: Vec<u32> = link.fleet().aircraft().iter().map(|a| a.id).collect();
+    if !link.is_desk() {
+        for id in &ids {
+            crate::world::retire_traffic(*id);
+        }
+    }
+    crate::blackbox::record(
+        "traffic",
+        serde_json::json!({ "event": "stand_down", "field": link.icao(),
+            "aircraft": ids.len(), "why": why }),
+    );
+}
+
+/// Every field with a timetable within this of us is simulated, nm (the
+/// pilot's ask, 2026-10-13; Malaga and Gibraltar are 54 nm apart).
+pub(crate) const SIM_RANGE_NM: f64 = 100.0;
+
+/// A simulated field is retired only past this, nm: one on the edge of
+/// [`SIM_RANGE_NM`] does not churn (a build is two apt.dat scans).
+pub(crate) const SIM_OUT_NM: f64 = 120.0;
+
+/// The fields to simulate: the station's `active` field, and every field
+/// with a timetable within [`SIM_RANGE_NM`] of `own` (lat, lon), or
+/// within [`SIM_OUT_NM`] once `running`. Upper case. Pure.
+pub(crate) fn wanted_fields(
+    active: &str,
+    own: (f64, f64),
+    running: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::from([active.trim().to_ascii_uppercase()]);
+    for f in traffic::routes::fields() {
+        let Some(at) = traffic::places::position(f.icao) else {
+            continue;
+        };
+        let icao = f.icao.to_ascii_uppercase();
+        let reach = if running.contains(&icao) {
+            SIM_OUT_NM
+        } else {
+            SIM_RANGE_NM
+        };
+        if traffic::places::dist_nm(own, at) <= reach {
+            out.insert(icao);
+        }
+    }
+    out
+}
+
+/// The field to build next, one at a time: the station's first, then the
+/// others in ICAO order; `None` once every wanted field is `built` (or
+/// failed). Pure.
+pub(crate) fn next_build(
+    active: &str,
+    wanted: &BTreeSet<String>,
+    built: &BTreeSet<String>,
+) -> Option<String> {
+    if !built.contains(active) {
+        return Some(active.to_string());
+    }
+    wanted.iter().find(|f| !built.contains(*f)).cloned()
 }
 
 /// The field the fleet flies at: the installed station's, and only with
@@ -1926,18 +2259,21 @@ pub(crate) fn wanted_field(
 /// The link for one field, built off the tick; `None` (said in the log and
 /// the blackbox) when the field or the file cannot be read. `zulu_s` is
 /// the sim's zulu time now, for the field's day (`traffic::rate`).
-#[allow(clippy::too_many_arguments)]
 fn build_link(
     icao: &str,
     apt: &str,
     cifp: &str,
     file: &str,
     density: &str,
-    seed: u64,
-    name: &str,
-    zulu_s: Option<f64>,
-    day: Option<u32>,
+    ctx: &BuildCtx,
 ) -> Option<Link> {
+    let BuildCtx {
+        seed,
+        name,
+        zulu_s,
+        day,
+        ref runway,
+    } = *ctx;
     let field = match FieldModel::load(apt, icao) {
         Ok(Some(f)) => f.with_cifp(cifp),
         Ok(None) => {
@@ -1958,7 +2294,7 @@ fn build_link(
     let (schedule, source) = if let (true, Some(table)) = (file.is_empty(), table) {
         let d = traffic::Density::parse(density).unwrap_or(traffic::Density::Normal);
         let (schedule, flights, local_s) =
-            timetable_start(&field, table, d, seed, zulu_s, day, station_runway());
+            timetable_start(&field, table, d, seed, zulu_s, day, runway.clone());
         board = Some((flights, local_s));
         (schedule, "timetable")
     } else if file.is_empty() {
@@ -2016,10 +2352,25 @@ fn build_link(
         n => n,
     };
     let mut link = Link::new(field, schedule, &name);
+    // A field with a route table flies its timetable's day whole; the rest
+    // generate an hour at a time.
+    link.hours = (source == "generated").then_some(1);
     if let Some((flights, local_s)) = board {
         link.set_board(flights, local_s);
     }
     Some(link)
+}
+
+/// What a link is built with besides the files: the field's seed
+/// (`traffic::field_seed`), the station's spoken name (empty: the field's
+/// own), the sim's zulu time and date, the station's runway (`None` for a
+/// field worked by its desk: its timetable flies its default runway).
+struct BuildCtx<'a> {
+    seed: u64,
+    name: &'a str,
+    zulu_s: Option<f64>,
+    day: Option<u32>,
+    runway: Option<String>,
 }
 
 /// The timetable's day at a field with a route table, already in motion
@@ -2295,6 +2646,7 @@ async fn sim_zulu_s(xp: &crate::xplane::XPlaneClient) -> Option<f64> {
 /// The blackbox's `traffic` records for one tick: one record per event, each
 /// one write.
 fn record(out: &TickOut, link: &Link) {
+    let field = link.icao();
     for (id, callsign) in &out.spawned {
         let ac = link.fleet().get(*id);
         let from = out
@@ -2302,8 +2654,8 @@ fn record(out: &TickOut, link: &Link) {
             .iter()
             .find(|(i, _)| i == id)
             .map_or("new", |(_, f)| *f);
-        crate::blackbox::record(
-            "traffic",
+        rec(
+            field,
             serde_json::json!({
                 "event": "spawn", "id": id, "callsign": callsign, "from": from,
                 "type": ac.map(|a| a.icao_type.clone()),
@@ -2314,8 +2666,8 @@ fn record(out: &TickOut, link: &Link) {
     }
     for (id, callsign) in &out.parked {
         let ac = link.fleet().get(*id);
-        crate::blackbox::record(
-            "traffic",
+        rec(
+            field,
             serde_json::json!({
                 "event": "parked", "id": id, "callsign": callsign,
                 "type": ac.map(|a| a.icao_type.clone()),
@@ -2324,77 +2676,86 @@ fn record(out: &TickOut, link: &Link) {
         );
     }
     for id in &out.left_frequency {
-        crate::blackbox::record(
-            "traffic",
+        rec(
+            field,
             serde_json::json!({ "event": "despawn", "id": id, "reason": "reinstalled" }),
         );
     }
     for ev in &out.events {
         match ev {
-            Event::Despawn { id, reason } => crate::blackbox::record(
-                "traffic",
+            Event::Despawn { id, reason } => rec(
+                field,
                 serde_json::json!({ "event": "despawn", "id": id, "reason": despawn_word(*reason) }),
             ),
-            Event::Phase { id, from, to } => crate::blackbox::record(
-                "traffic",
+            Event::Phase { id, from, to } => rec(
+                field,
                 serde_json::json!({
                     "event": "phase", "id": id,
                     "from": format!("{from:?}"), "to": format!("{to:?}"),
                 }),
             ),
-            Event::TurnedRound { id } => crate::blackbox::record(
-                "traffic",
+            Event::TurnedRound { id } => rec(
+                field,
                 serde_json::json!({ "event": "turned_round", "id": id }),
             ),
-            Event::Touchdown { id, along_m, .. } => crate::blackbox::record(
-                "traffic",
+            Event::Touchdown { id, along_m, .. } => rec(
+                field,
                 serde_json::json!({ "event": "touchdown", "id": id, "along_m": along_m.round() }),
             ),
             // The gridlock guard on the ground, behind one that would not
             // move (null: our own aircraft): planned another way round it,
             // the blocker towed clear, or waiting with neither.
-            Event::SpacingRerouted { id, around } => crate::blackbox::record(
-                "traffic",
+            Event::SpacingRerouted { id, around } => rec(
+                field,
                 serde_json::json!({ "event": "spacing_rerouted", "id": id, "around": around }),
             ),
-            Event::SpacingCleared { id, removed } => crate::blackbox::record(
-                "traffic",
+            Event::SpacingCleared { id, removed } => rec(
+                field,
                 serde_json::json!({ "event": "spacing_cleared", "id": id, "removed": removed }),
             ),
-            Event::SpacingHeld { id, behind } => crate::blackbox::record(
-                "traffic",
+            Event::SpacingHeld { id, behind } => rec(
+                field,
                 serde_json::json!({ "event": "spacing_held", "id": id, "behind": behind }),
             ),
             Event::Call { .. } | Event::Spawn { .. } => {}
         }
     }
     for t in &out.transmissions {
-        crate::blackbox::record(
-            "traffic",
+        rec(
+            field,
             serde_json::json!({ "event": "call", "id": t.id, "callsign": t.callsign, "text": t.text,
                 "on": t.on.tag(), "waited_s": t.waited_s, "clear_s": t.clear_s }),
         );
     }
     for (id, state, runway) in &out.orders {
-        crate::blackbox::record(
-            "traffic",
+        rec(
+            field,
             serde_json::json!({
                 "event": "order", "id": id, "state": format!("{state:?}"), "runway": runway,
             }),
         );
     }
     for (id, line) in &out.tower {
-        crate::blackbox::record(
-            "traffic",
+        rec(
+            field,
             serde_json::json!({ "event": "tower", "id": id, "line": line }),
         );
     }
     for (id, line, who) in &out.positions {
-        crate::blackbox::record(
-            "traffic",
+        rec(
+            field,
             serde_json::json!({ "event": "handoff", "id": id, "line": line, "by": who.tag() }),
         );
     }
+}
+
+/// One `traffic` record of `field`'s fleet: the field named in it, since
+/// several fleets fly at once (multi-field traffic stage 3, 2026-10-13).
+fn rec(field: &str, mut v: serde_json::Value) {
+    if let Some(o) = v.as_object_mut() {
+        o.insert("field".into(), field.into());
+    }
+    crate::blackbox::record("traffic", v);
 }
 
 /// A plan in a word, for the blackbox.

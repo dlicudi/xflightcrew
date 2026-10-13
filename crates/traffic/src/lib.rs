@@ -13,6 +13,7 @@ pub mod airlines;
 pub mod arrival;
 pub mod board;
 pub mod clock;
+pub mod desk;
 pub mod field;
 pub mod fleet;
 pub mod kin;
@@ -32,6 +33,7 @@ pub mod wire;
 
 pub use aircraft::{Route, Seen, TrafficAircraft};
 pub use clock::{SimClock, SUBSTEP_S};
+pub use desk::FieldDesk;
 pub use field::{FieldModel, Procedures, RunwayEnd};
 pub use fleet::Fleet;
 pub use kin::{follow, follow_on_gear, Follow, FollowSpec, Gear, Kin, LatLon, Lights};

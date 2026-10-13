@@ -219,9 +219,24 @@ fn timetable_schedule(
 pub(super) fn fly_field_hours(
     station: &mut Station,
     field: FieldModel,
+    schedule: Vec<Movement>,
+    max_s: f64,
+    more_hours: bool,
+) -> HarnessScore {
+    fly_fields(station, field, schedule, max_s, more_hours, &mut [])
+}
+
+/// [`fly_field_hours`] with other fields flown at once on their own desks
+/// (multi-field traffic stage 3, 2026-10-13), ids from one counter: every
+/// tick each desk's field steps beside the station's, and no id is ever
+/// two fields'.
+pub(super) fn fly_fields(
+    station: &mut Station,
+    field: FieldModel,
     mut schedule: Vec<Movement>,
     max_s: f64,
     more_hours: bool,
+    desks: &mut [DeskRun],
 ) -> HarnessScore {
     let name = crate::party_line::spoken_airport(station.airport_name()).to_string();
     // A timetable's schedule comes with its own stands filled
@@ -240,6 +255,13 @@ pub(super) fn fly_field_hours(
     let zulu0 = sweep_ctx(&field).zulu_s;
     let mut hours: u32 = 1;
     let mut link = Link::new(field, schedule, &name);
+    let ids = Ids::default();
+    link.share_ids(&ids);
+    for d in desks.iter_mut() {
+        d.link.share_ids(&ids);
+    }
+    // Which field (0 the station's, k + 1 the k-th desk's) each id flew at.
+    let mut owner: HashMap<u32, usize> = HashMap::new();
     let mut s = HarnessScore {
         movements: link.pending(),
         ..Default::default()
@@ -519,6 +541,17 @@ pub(super) fn fly_field_hours(
             }
         }
         closeness(&link, t, &mut s, &mut overlapping);
+        for (k, d) in desks.iter_mut().enumerate() {
+            d.tick(t, dt, now);
+            for a in d.link.fleet().aircraft() {
+                let was = *owner.entry(a.id).or_insert(k + 1);
+                assert_eq!(was, k + 1, "id {} flew at two fields", a.id);
+            }
+        }
+        for a in link.fleet().aircraft() {
+            let was = *owner.entry(a.id).or_insert(0);
+            assert_eq!(was, 0, "id {} flew at two fields", a.id);
+        }
         // A window past the hour flies the next generated hours as the live
         // link does (`TrafficWorld::tick`): the turnarounds leave in them.
         let horizon = traffic::schedule::HORIZON_S;
@@ -539,7 +572,13 @@ pub(super) fn fly_field_hours(
             s.movements += ms.len();
             link.add_schedule(ms, link.fleet().clock.now_s());
         }
-        if link.pending() == 0 && link.active() == 0 && (!more_hours || t + horizon / 2.0 >= max_s)
+        let desks_done = desks
+            .iter()
+            .all(|d| d.link.pending() == 0 && d.link.active() == 0);
+        if link.pending() == 0
+            && link.active() == 0
+            && desks_done
+            && (!more_hours || t + horizon / 2.0 >= max_s)
         {
             break;
         }
@@ -1865,4 +1904,321 @@ fn a_fields_day_is_the_same_whoever_builds_it() {
         remote.flights, board_a,
         "the board by the clock is the fleet's"
     );
+}
+
+/// THE FIELDS IN RANGE (multi-field traffic stage 3, 2026-10-13): the
+/// station's field always; LXGB and LEMG together from either field or
+/// from between them (54 nm apart); a timetable field joins inside 100 nm
+/// and leaves only past 120 nm; a field far from both flies alone.
+#[test]
+fn the_fields_in_range_join_and_leave_with_hysteresis() {
+    let none = BTreeSet::new();
+    let both: BTreeSet<String> = ["LEMG", "LXGB"].map(String::from).into();
+    let lemg = traffic::places::position("LEMG").unwrap();
+    let lxgb = traffic::places::position("LXGB").unwrap();
+    assert_eq!(wanted_fields("lemg", lemg, &none), both);
+    assert_eq!(wanted_fields("LXGB", lxgb, &none), both);
+    let between = ((lemg.0 + lxgb.0) / 2.0, (lemg.1 + lxgb.1) / 2.0);
+    assert_eq!(wanted_fields("LEMG", between, &none), both);
+    assert_eq!(
+        wanted_fields("EGKK", (51.15, -0.19), &none),
+        BTreeSet::from(["EGKK".to_string()])
+    );
+    // West of Gibraltar along its parallel, past Malaga's reach.
+    let west = |nm: f64| (lxgb.0, lxgb.1 - nm / (60.0 * lxgb.0.to_radians().cos()));
+    let at = |nm: f64, running: &BTreeSet<String>| wanted_fields("LPFR", west(nm), running);
+    assert!(traffic::places::dist_nm(west(110.0), lemg) > SIM_OUT_NM);
+    let gib = BTreeSet::from(["LXGB".to_string()]);
+    let alone = BTreeSet::from(["LPFR".to_string()]);
+    assert!(at(95.0, &none).contains("LXGB"), "joins inside 100 nm");
+    assert_eq!(at(110.0, &none), alone, "not joined at 110 nm");
+    assert!(at(110.0, &gib).contains("LXGB"), "kept to 120 nm");
+    assert_eq!(at(125.0, &gib), alone, "retired past 120 nm");
+}
+
+/// ONE BUILD AT A TIME, THE STATION'S FIRST (stage 3), then the others in
+/// ICAO order; nothing once every field is built or failed.
+#[test]
+fn the_stations_field_is_built_first() {
+    let wanted: BTreeSet<String> = ["LEMG", "LXGB"].map(String::from).into();
+    let built = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+    assert_eq!(next_build("LXGB", &wanted, &built(&[])).as_deref(), Some("LXGB"));
+    assert_eq!(next_build("LXGB", &wanted, &built(&["LXGB"])).as_deref(), Some("LEMG"));
+    assert_eq!(next_build("LXGB", &wanted, &built(&["LXGB", "LEMG"])), None);
+}
+
+/// The runway conflicts on a desk's field this tick: an aircraft rolling
+/// or landing (on the ground, or low over the strip) and another on the
+/// ground on the same strip. Each pair (lower id first).
+fn desk_conflicts(link: &Link) -> Vec<(u32, u32)> {
+    let f = &link.fleet().field;
+    let acs: Vec<&traffic::TrafficAircraft> = link
+        .fleet()
+        .aircraft()
+        .iter()
+        .filter(|a| !a.dormant())
+        .collect();
+    let mut out = Vec::new();
+    for a in &acs {
+        let using = matches!(a.phase, traffic::Phase::Roll | traffic::Phase::Landing)
+            && (a.kin.on_ground || a.agl_ft(f) < 100.0);
+        let Some((strip, _)) = f.strip_at(a.kin.pos()).filter(|_| using) else {
+            continue;
+        };
+        for b in &acs {
+            let on = b.kin.on_ground && f.strip_at(b.kin.pos()).is_some_and(|(i, _)| i == strip);
+            if b.id != a.id && on {
+                out.push((a.id.min(b.id), a.id.max(b.id)));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// A field flown by its desk in a harness: the link, what it measured,
+/// the pairs drawn inside each other and in conflict as of last tick.
+pub(super) struct DeskRun {
+    pub(super) link: Link,
+    pub(super) s: HarnessScore,
+    overlapping: HashSet<(u32, u32)>,
+    conflicting: HashSet<(u32, u32)>,
+}
+
+impl DeskRun {
+    pub(super) fn new(link: Link) -> DeskRun {
+        let s = HarnessScore {
+            movements: link.pending(),
+            closest_share: f64::INFINITY,
+            ..Default::default()
+        };
+        DeskRun {
+            link,
+            s,
+            overlapping: HashSet::new(),
+            conflicting: HashSet::new(),
+        }
+    }
+
+    /// One tick at harness second `t`: the fleet stepped by its desk, its
+    /// events counted, closeness and runway conflicts measured.
+    pub(super) fn tick(&mut self, t: f64, dt: f64, now: Instant) {
+        let out = self.link.tick(None, dt, now);
+        let s = &mut self.s;
+        s.parked_at_start += out.parked.len();
+        for ev in &out.events {
+            match ev {
+                Event::Despawn { reason, .. } => {
+                    *s.despawns.entry(format!("{reason:?}")).or_default() += 1;
+                    match reason {
+                        Despawn::LeftTheArea | Despawn::Parked => s.completed += 1,
+                        Despawn::Towed => {}
+                        other => s.unfinished.push(format!("{other:?} at {t:.0} s")),
+                    }
+                }
+                Event::TurnedRound { .. } => {
+                    s.completed += 1;
+                    s.turned += 1;
+                }
+                Event::Call { call, .. } => {
+                    s.calls += 1;
+                    if matches!(call, Call::GoingAround) {
+                        s.go_arounds += 1;
+                    }
+                }
+                Event::Touchdown { .. } => s.touchdowns += 1,
+                Event::SpacingRerouted { .. } => s.spacing_rerouted += 1,
+                Event::SpacingCleared { .. } => s.spacing_cleared += 1,
+                Event::SpacingHeld { .. } => s.spacing_held += 1,
+                _ => {}
+            }
+        }
+        closeness(&self.link, t, &mut self.s, &mut self.overlapping);
+        let now_pairs: HashSet<(u32, u32)> = desk_conflicts(&self.link).into_iter().collect();
+        for p in now_pairs.difference(&self.conflicting) {
+            if self.s.conflicts.len() < 20 {
+                self.s.conflicts.push(format!("{t:.0} s [{}] and [{}]", p.0, p.1));
+            }
+        }
+        self.conflicting = now_pairs;
+        self.s.secs = t;
+    }
+
+    /// The towed count, as the sweeps print it.
+    pub(super) fn towed(&self) -> usize {
+        self.s.despawns.get("Towed").copied().unwrap_or(0)
+    }
+}
+
+/// TWO FIELDS AT ONCE ON THEIR DESKS (stage 3): XTST's and ULMM's
+/// generated hours flown together, each by its own runway desk, ids from
+/// one counter: no id is ever both fields', every movement completes (a
+/// tow counts), nobody is on a runway somebody is rolling or landing on,
+/// nobody is drawn inside anybody, and both fields took off and landed.
+/// Pure: a desk never reaches the station.
+#[test]
+fn two_fields_fly_at_once_on_their_desks() {
+    let ids = Ids::default();
+    let mut runs: Vec<DeskRun> = [("XTST", 7u64), ("ULMM", 3)]
+        .iter()
+        .map(|(icao, seed)| {
+            let apt = format!("{}/{}.dat", fixtures(), icao.to_ascii_lowercase());
+            let field = FieldModel::load(&apt, icao)
+                .unwrap()
+                .unwrap()
+                .with_cifp(&format!("{}/cifp", fixtures()));
+            let schedule = traffic::generate(&field, Density::Normal, *seed, &SpawnCtx::default());
+            let mut link = Link::new(field, schedule, "");
+            link.share_ids(&ids);
+            link.make_desk();
+            assert!(link.is_desk());
+            DeskRun::new(link)
+        })
+        .collect();
+    let mut owner: HashMap<u32, usize> = HashMap::new();
+    let epoch = Instant::now();
+    let dt = 0.25;
+    let mut t = 0.0;
+    while t < 2.5 * 3600.0 {
+        t += dt;
+        let now = epoch + Duration::from_secs_f64(t);
+        for (k, run) in runs.iter_mut().enumerate() {
+            run.tick(t, dt, now);
+            for a in run.link.fleet().aircraft() {
+                let was = *owner.entry(a.id).or_insert(k);
+                assert_eq!(was, k, "id {} flew at both fields", a.id);
+            }
+        }
+        if runs.iter().all(|r| r.link.pending() == 0 && r.link.active() == 0) {
+            break;
+        }
+    }
+    for (run, icao) in runs.iter().zip(["XTST", "ULMM"]) {
+        let s = &run.s;
+        println!(
+            "{icao} on its desk: {} scheduled, {} completed, {} towed, {} touchdowns, \
+             {} go-arounds, {} conflicts, {} overlaps",
+            s.movements,
+            s.completed,
+            run.towed(),
+            s.touchdowns,
+            s.go_arounds,
+            s.conflicts.len(),
+            s.overlaps.len()
+        );
+        assert!(s.conflicts.is_empty(), "{icao}: {:?}", s.conflicts);
+        assert!(s.overlaps.is_empty(), "{icao}: {:?}", s.overlaps);
+        assert!(s.unfinished.is_empty(), "{icao}: {:?}", s.unfinished);
+        assert!(s.touchdowns > 0, "{icao}: nobody landed");
+        assert_eq!(
+            s.completed + run.towed(),
+            s.movements,
+            "{icao}: every movement completes"
+        );
+        assert_eq!(run.link.active(), 0, "{icao}: still flying");
+    }
+}
+
+/// LEMG AND LXGB AT ONCE (multi-field traffic stage 3, 2026-10-13): our
+/// station at LEMG works LEMG's timetable as it always did, and LXGB's
+/// timetable flies beside it on its own desk, both from their mid-flow
+/// start at 10:00 on a summer Tuesday, half an hour
+/// (`XVL_TRAFFIC_SWEEP_S`). LEMG is clean as the mid-flow test asks (the
+/// book, the oracle, the readbacks, the pace); LXGB has nobody on a runway
+/// somebody rolls or lands on and nobody drawn inside anybody; no id is
+/// ever both fields'. The counts print for each field.
+#[test]
+#[ignore = "needs X-Plane's Global Airports apt.dat; run with -- --ignored"]
+fn real_install_two_fields_at_once() {
+    in_own_process("traffic_link::tests::real_install_two_fields_at_once_inner");
+}
+
+#[test]
+#[ignore = "run in its own process by real_install_two_fields_at_once"]
+fn real_install_two_fields_at_once_inner() {
+    if std::env::var(HARNESS_ENV).is_err() {
+        return;
+    }
+    let apt = install_apt();
+    let cifp = crate::nav::test_xplane_path("Custom Data/CIFP");
+    let load = |icao: &str| {
+        FieldModel::load(&apt, icao)
+            .ok()
+            .flatten()
+            .map(|f| f.with_cifp(&cifp))
+    };
+    let (Some(lemg), Some(lxgb)) = (load("LEMG"), load("LXGB")) else {
+        println!("no install, no verdict");
+        return;
+    };
+    let window_s: f64 = std::env::var("XVL_TRAFFIC_SWEEP_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800.0);
+    let (lxgb_schedule, lxgb_board, lxgb_local) =
+        timetable_schedule(&lxgb, traffic::routes::field_routes("LXGB").unwrap());
+    let mut desk = Link::new(lxgb, lxgb_schedule, "");
+    desk.set_board(lxgb_board, lxgb_local);
+    desk.make_desk();
+    let mut desks = [DeskRun::new(desk)];
+    let (lemg_schedule, _, _) =
+        timetable_schedule(&lemg, traffic::routes::field_routes("LEMG").unwrap());
+    let mut st = installed_station(&apt, "LEMG");
+    let s = fly_fields(&mut st, lemg, lemg_schedule, window_s, false, &mut desks);
+    let line = |icao: &str, s: &HarnessScore, towed: usize| {
+        println!(
+            "{icao}: {} scheduled, {} completed, {} touchdowns, {} conflicts, \
+             {} overlaps, {} go-arounds, {} towed, spacing {}/{}/{} \
+             rerouted/towed/held, {} on stands at the start, {} calls",
+            s.movements,
+            s.completed,
+            s.touchdowns,
+            s.conflicts.len(),
+            s.overlaps.len(),
+            s.go_arounds,
+            towed,
+            s.spacing_rerouted,
+            s.spacing_cleared,
+            s.spacing_held,
+            s.parked_at_start,
+            s.calls
+        );
+        for l in s.conflicts.iter().chain(&s.oracle).chain(&s.overlaps).take(10) {
+            println!("    {l}");
+        }
+    };
+    let towed = s.despawns.get("Towed").copied().unwrap_or(0) + s.parked_towed;
+    line("LEMG (station)", &s, towed);
+    let d = &desks[0];
+    line("LXGB (desk)", &d.s, d.towed());
+    println!(
+        "LXGB board at the end:\n{}",
+        d.link.board_payload(None, &[])
+    );
+    assert!(s.conflicts.is_empty(), "LEMG: {:?}", s.conflicts);
+    assert!(s.oracle.is_empty(), "LEMG: {:?}", s.oracle);
+    assert_eq!(s.readbacks, s.readbacks_accepted, "LEMG: readbacks");
+    assert_paced(&s, "LEMG");
+    // Overlaps print, as the mid-flow test's do: a taxi-out 18 to 19 m past
+    // a parked aircraft is the stand plan's owed clearance (2026-10-13).
+    assert!(d.s.conflicts.is_empty(), "LXGB: {:?}", d.s.conflicts);
+    assert!(d.s.unfinished.is_empty(), "LXGB: {:?}", d.s.unfinished);
+    assert!(d.s.calls > 0, "LXGB's traffic flew");
+    // The desk's field changes nothing at the station's: LEMG alone flies
+    // the same window the same way.
+    Station::uninstall();
+    let lemg = load("LEMG").expect("loaded above");
+    let (alone_schedule, _, _) =
+        timetable_schedule(&lemg, traffic::routes::field_routes("LEMG").unwrap());
+    let mut st = installed_station(&apt, "LEMG");
+    let alone = fly_field(&mut st, lemg, alone_schedule, window_s);
+    let alone_towed = alone.despawns.get("Towed").copied().unwrap_or(0) + alone.parked_towed;
+    line("LEMG (alone)", &alone, alone_towed);
+    assert_eq!(
+        (alone.completed, alone.touchdowns, alone.go_arounds, alone_towed),
+        (s.completed, s.touchdowns, s.go_arounds, towed),
+        "LEMG flies the same with LXGB beside it"
+    );
+    Station::uninstall();
 }
