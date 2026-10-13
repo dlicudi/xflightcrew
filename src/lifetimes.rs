@@ -76,6 +76,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("efb::basemap::EDGES", 'C'),
     ("efb::basemap::SIMPLE", 'C'),
     ("efb::basemap::TILES", 'C'),
+    ("efb::basemap::WORLD", 'C'),
     ("efb::feed::ACTIVITY", 'S'),
     ("efb::feed::ALERTS", 'F'),
     ("efb::feed::ALERT_SEQ", 'S'),

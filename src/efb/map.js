@@ -5,7 +5,7 @@
 // traffic and our aircraft share one set of world coordinates.
 //
 // Layers by zoom: X-Plane's own water and coast (GET /basemap, only the
-// view's tiles), the fields as dots then labels, the plan's route, our
+// view's tiles, or its world layer zoomed right out), the fields as dots then labels, the plan's route, our
 // traffic and our aircraft at every zoom; closer in, the diagram of every
 // field in view (GET /airport?icao=, built on demand by the server, kept
 // here, ETag'd), then its stands and names. The live picture rides the page
@@ -22,7 +22,8 @@
   var M_PER_DEG = 3440.065 * 1852 * Math.PI / 180;
   var TILE = 256;          // px across the world at zoom 0
   var MAX_LAT = 85.05;
-  // The widest view /basemap draws (`basemap::MAX_TILES`).
+  // The widest view /basemap draws from its tiles (`basemap::MAX_TILES`);
+  // a wider one is served from its coarse world layer.
   var MAX_TILES = 1200;
   function mx(lon) { return (lon + 180) / 360; }
   function my(lat) {
@@ -375,7 +376,7 @@
   // One /basemap answer, placed once: the water as one Path2D (even-odd),
   // the coast as another (every edge but the tiles' own sides), local to
   // the answer's middle in units of Q per world unit.
-  var base = null, baseBusy = false, baseRetry = 0, baseTimer = null;
+  var base = null, baseBusy = false, baseRetry = 0, baseTimer = null, baseAgain = null;
   var Q = 40075;
   function sameLine(a, b) { var r = Math.round(a); return r === Math.round(b) && Math.abs(a - r) < 2e-4 && Math.abs(b - r) < 2e-4; }
   function loadBase(j, z) {
@@ -407,15 +408,22 @@
     var b = base && base.bbox;
     var held = b && lat0 >= b[0] && lon0 >= b[1] && lat1 <= b[2] + 1 && lon1 <= b[3] + 1 && Math.abs(view.z - base.z) < 0.85;
     if (held) return;
-    var box = baseBox(lat0, lon0, lat1, lon1);
-    if (!box) { if (base) { base = null; dirty = true; } return; }
+    // Wider than the tiles serve: the view itself, from the server's
+    // coarse world layer. The water held stays drawn until the new answer.
+    var box = baseBox(lat0, lon0, lat1, lon1) || [Math.max(-MAX_LAT, lat0), Math.max(-180, lon0), Math.min(MAX_LAT, lat1), Math.min(179.999, lon1)];
     var px = Math.max(50, Math.round((mx(box[3]) - mx(box[1])) * scale));
     var z = view.z;
     baseBusy = true;
     fetch(withT('/basemap?bbox=' + box.map(function (v) { return v.toFixed(3); }).join(',') + '&px=' + px), { headers: tokenHeaders(), credentials: 'same-origin' })
       .then(function (r) { if (!r.ok) throw r.status; return r.json(); })
       .then(function (j) { baseBusy = false; loadBase(j, z); })
-      .catch(function () { baseBusy = false; baseRetry = Date.now() + 15000; });
+      .catch(function (e) {
+        // 503: the world layer is still being built; ask again soon.
+        var wait = e === 503 ? 5000 : 15000;
+        baseBusy = false;
+        baseRetry = Date.now() + wait;
+        if (!baseAgain) baseAgain = setTimeout(function () { baseAgain = null; wantBase(); }, wait + 50);
+      });
   }
   // Asked once the view has stood still a quarter of a second.
   var lastAsk = [NaN, NaN, NaN, 0, 0];

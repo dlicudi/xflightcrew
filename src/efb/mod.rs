@@ -778,8 +778,9 @@ struct BasemapQuery {
 }
 
 /// The map's water and fields for a view (`basemap`): X-Plane's own
-/// installed map data and the field directory, read off this thread. 404
-/// for a view wider than [`basemap::MAX_TILES`] (the page never asks).
+/// installed map data and the field directory, read off this thread. A
+/// view wider than [`basemap::MAX_TILES`] is the world layer's, 503 with a
+/// Retry-After until it is built (the page asks again).
 async fn basemap_route(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(q): Query<BasemapQuery>,
@@ -802,10 +803,22 @@ async fn basemap_route(
     let built =
         tokio::task::spawn_blocking(move || basemap::answer(&basemap::water_dir(), bbox, px))
             .await
-            .ok()
-            .flatten();
-    let Some(a) = built else {
-        return (StatusCode::NOT_FOUND, "no map data for that view").into_response();
+            .unwrap_or(Err(basemap::Miss::BadView));
+    let a = match built {
+        Ok(a) => a,
+        Err(basemap::Miss::NotReady) => {
+            let mut r = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the world map is not ready yet",
+            )
+                .into_response();
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            return r;
+        }
+        Err(basemap::Miss::BadView) => {
+            return (StatusCode::NOT_FOUND, "no map data for that view").into_response();
+        }
     };
     tracing::debug!(
         bytes = a.json.len(),
@@ -1273,6 +1286,8 @@ async fn supervise(server: Arc<Server>, print_url: bool) {
         announced = true;
         *SERVING.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
         tracing::info!(%url, "EFB serving");
+        // The coarse world water for wide views, once per run, behind us.
+        basemap::start_world(basemap::water_dir());
         crate::blackbox::record(
             "efb",
             serde_json::json!({ "event": "start", "port": port, "host": lan_ip() }),
@@ -1458,11 +1473,13 @@ mod tests {
         );
     }
 
-    /// The page asks /basemap for no wider a view than it draws, and
+    /// The page asks /basemap for its tiles no wider than they are drawn
+    /// (wider, the world layer, asked again while it is built), and
     /// measures a field's metres on the server's sphere.
     #[test]
     fn the_page_asks_no_wider_than_the_server_draws() {
         assert!(MAP_JS.contains(&format!("var MAX_TILES = {};", basemap::MAX_TILES)));
+        assert!(MAP_JS.contains("e === 503"));
         assert!(MAP_JS.contains("var M_PER_DEG = 3440.065 * 1852 * Math.PI / 180;"));
     }
 
@@ -1523,6 +1540,17 @@ mod tests {
             );
             assert!(v["transcript"].is_array());
             assert!(v["map"]["traffic"].is_array() && v["map"]["stands"].is_array());
+            // A continent before the world layer is built (nothing here
+            // starts it): not ready yet, ask again.
+            let r = http
+                .get(format!(
+                    "{base}/basemap?t=testtoken0123456&bbox=-60,-170,60,170&px=800"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 503);
+            assert_eq!(r.headers()["retry-after"], "5");
             let say = |text: &str| {
                 http.post(format!("{base}/say?t=testtoken0123456"))
                     .json(&serde_json::json!({ "text": text }))
