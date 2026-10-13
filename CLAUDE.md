@@ -31,11 +31,16 @@ C (ATC per-flight strips, `crates/nav`), D (`crates/traffic`).
 
 ## Wire contracts (never rename)
 
-Named 2026-07-30. Three names survived the rename because they are wire contracts:
+Named 2026-07-30. These names survived the renames because they are wire contracts:
 
 - the `xcopilot/*` dataref namespace (app and plugin agree on the strings),
 - the `XCOPILOT_*` env vars (the pilot's own `.env` and `prefs.json`),
-- the plugin binary `xcopilot.xpl` (renamed, X-Plane loads BOTH copies and double-registers).
+- the plugin SIGNATURE `com.dlicudi.xcopilot`.
+
+The plugin itself was renamed XFlightCrew on 2026-10-13 (`plugins/xflightcrew/mac_x64/
+xflightcrew.xpl`, source `plugin/src/xflightcrew.cpp`): `make -C plugin install` removes the old
+`plugins/xcopilot/` folder FIRST, since two copies would both load and register every dataref
+twice. A hand install must do the same.
 
 Package `xvoicelayer`, binary `xvl`. The tracing filter names every crate (`atc`, `nav`, `sim`)
 AND both crew names: `xvoicelayer=info,xvl=info,atc=info,nav=info,sim=info,traffic=info` (`src/main.rs`
@@ -61,7 +66,7 @@ Rust: a latency- and audio-sensitive real-time loop.
   misses through TODAY's grammar). A model returns only as the instructor answering handbook
   questions, never a fallback.
 - **REST for transport, plugin for capability.** Stock datarefs go over the Web API; the C++ plugin
-  (`plugin/src/`: `xcopilot.cpp`, `drefs.cpp`, `panel.cpp`, `fms.cpp`; `make install` in `plugin/`)
+  (`plugin/src/`: `xflightcrew.cpp`, `drefs.cpp`, `panel.cpp`, `fms.cpp`; `make install` in `plugin/`)
   adds `xcopilot/*` datarefs driven over the same API. The app never links the SDK.
 - **Voices can ride the sim's audio** (`plugin/src/audio.cpp`, `XCOPILOT_AUDIO_BUS`, off by
   default): `xcopilot/audio/cut`'s ONE writer is `tts::play_on_bus`, so a cut never overtakes the

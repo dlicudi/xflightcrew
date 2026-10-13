@@ -341,7 +341,7 @@ public:
         : XpImguiWindow(l, t, r, b, xplm_WindowDecorationRoundRectangle,
                         xplm_WindowLayerFloatingWindows) {
         // Keep the title clean; version + build id go to Log.txt on startup instead.
-        SetWindowTitle("XVoiceLayer");
+        SetWindowTitle("XFlightCrew");
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         // One visual system: dark slate instrument, grey controls, color used
@@ -804,7 +804,7 @@ protected:
     void buildFlightTab(bool connected) {
         if (!connected) {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
-                               "Start XVoiceLayer to connect.");
+                               "Start XFlightCrew to connect.");
             return;
         }
 
@@ -997,7 +997,7 @@ protected:
         ImGui::BeginChild("log", ImVec2(0, -footer), ImGuiChildFlags_Borders);
         if (g_log.empty()) {
             // Empty state, centred in the well — not a footer mumble.
-            const char* hint = connected ? "Hold PTT and speak." : "Start XVoiceLayer to connect.";
+            const char* hint = connected ? "Hold PTT and speak." : "Start XFlightCrew to connect.";
             ImVec2 ts = ImGui::CalcTextSize(hint);
             ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - ts.x) * 0.5f,
                                        (ImGui::GetWindowHeight() - ts.y) * 0.5f));
@@ -1907,11 +1907,11 @@ void create() {
             B612_Bold_ttf, static_cast<int>(B612_Bold_ttf_len), 0.0f, &cfg);
     }
     if (visible) g_panel->SetVisible(true);
-    g_toggle_cmd = XPLMCreateCommand("xcopilot/toggle_panel", "XVoiceLayer: toggle the status panel");
+    g_toggle_cmd = XPLMCreateCommand("xcopilot/toggle_panel", "XFlightCrew: toggle the status panel");
     XPLMRegisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr);
 
-    int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "XVoiceLayer", nullptr, 0);
-    g_menu = XPLMCreateMenu("XVoiceLayer", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
+    int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "XFlightCrew", nullptr, 0);
+    g_menu = XPLMCreateMenu("XFlightCrew", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
     XPLMAppendMenuItem(g_menu, "Toggle status panel", (void*)"toggle", 0);
 }
 

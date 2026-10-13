@@ -108,7 +108,7 @@ static float QuietTick(float since_last_loop) {
         g_first_tick = false;
         char msg[192];
         std::snprintf(msg, sizeof msg,
-                      "XVoiceLayer plugin: init_flight seq %d: first flight loop after the call "
+                      "XFlightCrew plugin: init_flight seq %d: first flight loop after the call "
                       "(%.2f s wall, %.2f s sim)\n",
                       g_seq, wall_since(g_returned_at), since_last_loop);
         XPLMDebugString(msg);
@@ -122,7 +122,7 @@ static float QuietTick(float since_last_loop) {
     g_loading = false;
     char msg[160];
     std::snprintf(msg, sizeof msg,
-                  "XVoiceLayer plugin: init_flight seq %d: load quiet window closed "
+                  "XFlightCrew plugin: init_flight seq %d: load quiet window closed "
                   "(%d frames, %.1f s wall)\n",
                   g_seq, g_quiet_frames, wall_since(g_returned_at));
     XPLMDebugString(msg);
@@ -146,7 +146,7 @@ static float InitLoop(float, float since_last_loop, int, void*) {
     {
         char msg[512];
         std::snprintf(msg, sizeof msg,
-                      "XVoiceLayer plugin: init_flight seq %d: calling XPLMInitFlight (%s, %s)\n",
+                      "XFlightCrew plugin: init_flight seq %d: calling XPLMInitFlight (%s, %s)\n",
                       g_seq + 1, start_type(json).c_str(), aircraft_path(json).c_str());
         XPLMDebugString(msg);
     }
@@ -160,7 +160,7 @@ static float InitLoop(float, float since_last_loop, int, void*) {
     g_quiet_frames = 0;
     char msg[160];
     std::snprintf(msg, sizeof msg,
-                  "XVoiceLayer plugin: init_flight result %d (seq %d, %.2f s in the call)\n",
+                  "XFlightCrew plugin: init_flight result %d (seq %d, %.2f s in the call)\n",
                   g_result, g_seq, wall_since(called_at));
     XPLMDebugString(msg);
     return -1.0f;

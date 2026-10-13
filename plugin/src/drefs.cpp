@@ -1417,7 +1417,7 @@ static void StopState() {
 namespace drefs {
 
 void start() {
-    g_ptt_cmd = XPLMCreateCommand("xcopilot/ptt", "XVoiceLayer: hold to talk");
+    g_ptt_cmd = XPLMCreateCommand("xcopilot/ptt", "XFlightCrew: hold to talk");
     XPLMRegisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr);
 
     g_ptt_dref = XPLMRegisterDataAccessor(
@@ -1426,7 +1426,7 @@ void start() {
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 
     g_radio_ptt_cmd =
-        XPLMCreateCommand("xcopilot/radio_ptt", "XVoiceLayer: hold to transmit (radio/ATC)");
+        XPLMCreateCommand("xcopilot/radio_ptt", "XFlightCrew: hold to transmit (radio/ATC)");
     XPLMRegisterCommandHandler(g_radio_ptt_cmd, RadioPttCommandHandler, 1, nullptr);
 
     g_radio_ptt_dref = XPLMRegisterDataAccessor(

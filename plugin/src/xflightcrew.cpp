@@ -1,5 +1,5 @@
-// XVoiceLayer X-Plane plugin — a virtual push-to-talk plus a slick in-sim status
-// panel (Dear ImGui) for the XVoiceLayer voice assistant.
+// XFlightCrew X-Plane plugin — a virtual push-to-talk plus a slick in-sim status
+// panel (Dear ImGui) for the XFlightCrew voice assistant.
 //
 // PTT: command `xcopilot/ptt` (bind to a button/key) drives the readable dataref
 // `xcopilot/ptt_active` (1 while held). The app captures the mic only while it's
@@ -16,7 +16,7 @@
 // station in VHF range, click a frequency to tune COM1), and Settings (live
 // switches, each a dataref the app polls: mode, camera snap, negative tone,
 // audio bus, UI scale).
-// Toggle via Plugins → XVoiceLayer.
+// Toggle via Plugins → XFlightCrew.
 //
 // Layout: this file is only the plugin lifecycle. The dataref/command surface
 // lives in drefs.cpp, the ImGui panel in panel.cpp, and the FMS mailbox plus
@@ -40,13 +40,13 @@
 // ---- lifecycle --------------------------------------------------------------
 
 PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
-    std::strcpy(name, "XVoiceLayer");
+    std::strcpy(name, "XFlightCrew");
     // The SIGNATURE is an identity contract, not branding, so it keeps the old
     // name for the same reason the xcopilot/* datarefs do: X-Plane and any
     // other plugin identify us by this string. Nothing looks it up today, but
     // changing it buys nothing and can only break a future lookup.
     std::strcpy(sig, "com.dlicudi.xcopilot");
-    std::strcpy(desc, "XVoiceLayer " XCOPILOT_VERSION ", push-to-talk and status panel for the voice layer.");
+    std::strcpy(desc, "XFlightCrew " XCOPILOT_VERSION ", push-to-talk and status panel for the flight crew.");
 
     // Get POSIX paths from the SDK, not legacy Mac HFS ("Macintosh HD:Users:...");
     // otherwise fopen can't open the nav-data file we read the AIRAC cycle from.
@@ -61,7 +61,7 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 
     char started[160];
     std::snprintf(started, sizeof started,
-                  "XVoiceLayer plugin: started, version %s, build %s, AIRAC %s (ptt + ImGui status panel)\n",
+                  "XFlightCrew plugin: started, version %s, build %s, AIRAC %s (ptt + ImGui status panel)\n",
                   XCOPILOT_VERSION, XCOPILOT_BUILD,
                   fms::airac_cycle().empty() ? "unknown" : fms::airac_cycle().c_str());
     XPLMDebugString(started);

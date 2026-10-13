@@ -397,7 +397,7 @@ std::string parent_of(std::string p) {
 }
 
 void log(const std::string& line) {
-    XPLMDebugString(("XVoiceLayer plugin: traffic: " + line + "\n").c_str());
+    XPLMDebugString(("XFlightCrew plugin: traffic: " + line + "\n").c_str());
 }
 
 void init_xpmp2() {
@@ -420,7 +420,7 @@ void init_xpmp2() {
         log("no CSL (looked for " + csl + " and Doc8643.txt in " + res + "); nothing will draw");
         return;
     }
-    const char* err = XPMPMultiplayerInit("XVoiceLayer", res.c_str(), Prefs, "C172", "XVL");
+    const char* err = XPMPMultiplayerInit("XFlightCrew", res.c_str(), Prefs, "C172", "XFC");
     if (err && *err) {
         g_csl_state = std::string("init failed: ") + err;
         log(g_csl_state);

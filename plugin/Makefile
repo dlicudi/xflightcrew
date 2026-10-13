@@ -6,7 +6,7 @@
 # and plugin/SDK/Libraries/Mac/XPLM.framework exist. Then: `make` → build/mac_x64/xcopilot.xpl. `make install` copies it into
 # X-Plane (override XPLANE=...). See README.md.
 
-PLUGIN  := xcopilot
+PLUGIN  := xflightcrew
 SDK     ?= ./SDK
 XPLANE  ?= $(HOME)/X-Plane 12
 
@@ -72,6 +72,9 @@ test: $(TEST_BIN)
 	./$(TEST_BIN)
 
 install: $(OUT)
+	@# Renamed from xcopilot (2026-10-13): two copies would both load and
+	@# register every dataref twice, so the old folder goes first.
+	@rm -rf "$(XPLANE)/Resources/plugins/xcopilot"
 	@mkdir -p "$(XPLANE)/Resources/plugins/$(PLUGIN)/mac_x64"
 	cp $(OUT) "$(XPLANE)/Resources/plugins/$(PLUGIN)/mac_x64/$(PLUGIN).xpl"
 	@echo "installed to $(XPLANE)/Resources/plugins/$(PLUGIN)/mac_x64/"

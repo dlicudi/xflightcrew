@@ -162,7 +162,7 @@ impl Tool for Circuit {
         }
         if !crate::autotaxi::steer_channel_ok(ctx.xplane).await {
             return Ok(
-                "I can't steer. The XVoiceLayer plugin needs updating, so this one is yours."
+                "I can't steer. The XFlightCrew plugin needs updating, so this one is yours."
                     .to_string(),
             );
         }
@@ -172,7 +172,7 @@ impl Tool for Circuit {
         );
         if pp.is_err() || pr.is_err() {
             return Ok(
-                "I can't reach the yoke. The XVoiceLayer plugin needs updating, so this one is yours."
+                "I can't reach the yoke. The XFlightCrew plugin needs updating, so this one is yours."
                     .to_string(),
             );
         }
