@@ -668,6 +668,10 @@ fn the_zibo_declares_its_fitted_rotation() {
     assert!(m.path_from_height);
     for entry in std::fs::read_dir("profiles").unwrap() {
         let path = entry.unwrap().path();
+        // Profiles only: `profiles/learned/` holds the measured responses.
+        if path.extension().is_none_or(|x| x != "yaml") {
+            continue;
+        }
         let text = std::fs::read_to_string(&path).unwrap();
         let p: crate::aircraft::AircraftProfile = serde_yaml::from_str(&text).unwrap();
         let Some(m) = p.rotate_elevator else { continue };

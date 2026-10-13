@@ -34,6 +34,11 @@ pub const BANK_ABORT_DEG: f64 = 20.0;
 pub const PITCH_ABORT_DEG: f64 = 10.0;
 /// ...or this much height lost from where it began, ft.
 pub const HEIGHT_LOSS_ABORT_FT: f64 = 800.0;
+/// The least fit quality an axis is stored on.
+pub const MIN_R2: f64 = 0.85;
+/// The least damping, per second, a fitted axis may have: below it the fit
+/// has found no damping at all, which no aircraft has.
+pub const MIN_DAMPING: f64 = 0.2;
 /// Each input's amplitude, unit control: small enough to stay linear, big
 /// enough to read over the air (the 737's 0.08 elevator, 0.15 aileron and
 /// 0.2 rudder rolled it to 15 degrees, 2026-10-12).
@@ -183,6 +188,49 @@ async fn settle(xp: &XPlaneClient, lever: &str, t0: std::time::Instant, ias: f64
     Ok(())
 }
 
+/// Seconds the attitude is held by hand before an input, and the last part
+/// of it averaged as the trim.
+const TRIM_HOLD_S: f64 = 4.0;
+const TRIM_AVERAGE_S: f64 = 2.0;
+
+/// Holds the pitch attitude found at the disconnect and the wings level on
+/// the plugin channels, a PI law on attitude damped on rate (the same small
+/// gains for every airframe: it only has to hold, not fly), and returns
+/// the average pitch and roll channel values over the last
+/// [`TRIM_AVERAGE_S`]: the trim. `None` when the sim does not read.
+async fn trim_by_hand(xp: &XPlaneClient, t0: std::time::Instant) -> Option<(f64, f64)> {
+    const KP: f64 = 0.02;
+    const KI: f64 = 0.02;
+    const KD: f64 = 0.01;
+    let first = read_tick(xp, t0).await?;
+    let theta_ref = first.theta;
+    let (mut ip, mut ir) = (0.0_f64, 0.0_f64);
+    let (mut sum_p, mut sum_r, mut n) = (0.0, 0.0, 0u32);
+    let mut last = first.t;
+    loop {
+        let k = read_tick(xp, t0).await?;
+        let dt = (k.t - last).clamp(0.02, 0.5);
+        last = k.t;
+        let held_s = k.t - first.t;
+        if held_s > TRIM_HOLD_S {
+            break;
+        }
+        let ep = theta_ref - k.theta;
+        let er = -k.phi;
+        ip = (ip + KI * ep * dt).clamp(-0.5, 0.5);
+        ir = (ir + KI * er * dt).clamp(-0.5, 0.5);
+        let up = (ip + KP * ep - KD * k.q).clamp(-0.6, 0.6);
+        let ur = (ir + KP * er - KD * k.p).clamp(-0.6, 0.6);
+        let _ = tokio::join!(xp.set_float(PITCH_CH, up), xp.set_float(ROLL_CH, ur), xp.set_float(YAW_CH, 0.0));
+        if held_s > TRIM_HOLD_S - TRIM_AVERAGE_S {
+            sum_p += up;
+            sum_r += ur;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| (sum_p / n as f64, sum_r / n as f64))
+}
+
 /// One input on `axis` with `sign`: the samples (and the roll on the slip
 /// for the yaw), or the abort's reason.
 async fn fly_input(
@@ -196,18 +244,21 @@ async fn fly_input(
         Axis::Roll => ROLL_CH,
         Axis::Yaw => YAW_CH,
     };
-    // Every input is flown about the TRIMMED controls, as flight test flies
-    // them: the yoke the autopilot holds at the disconnect (its servos
-    // write the yoke). From centred controls the 172's nose moved 10 deg
-    // before the input began and the flight measured nothing (LEMG,
-    // 2026-10-13).
-    let held = |n: &'static str| async move { xp.get_float(n).await.unwrap_or(0.0) };
-    let (base_p, base_r, base_y) = tokio::join!(
-        held("sim/cockpit2/controls/yoke_pitch_ratio"),
-        held("sim/cockpit2/controls/yoke_roll_ratio"),
-        held("sim/cockpit2/controls/yoke_heading_ratio"),
-    );
     ap_off(xp).await;
+    // Every input is flown about the TRIMMED controls, found as a test pilot
+    // finds them: the attitude held by hand for a few seconds after the
+    // disconnect, the controls that held it averaged. The yoke read under
+    // the stock autopilot is 0 on every airframe (its servo does not move
+    // it), and from that "neutral" the Baron's nose moved 3 deg before its
+    // input and the input aborted, every run (LEMG, 2026-10-13).
+    let (base_p, base_r) = match trim_by_hand(xp, t0).await {
+        Some(b) => b,
+        None => {
+            ap_on(xp).await;
+            return Ok(Err("the trim hold did not read"));
+        }
+    };
+    let base_y = 0.0;
     let start = loop {
         if let Some(k) = read_tick(xp, t0).await {
             break k;
@@ -216,8 +267,15 @@ async fn fly_input(
     let begin = start.t;
     let (mut out, mut slip) = (Vec::new(), Vec::new());
     let mut why = None;
-    // 1 s neutral, the input, then hands off to 6 s past its end.
-    let span: f64 = ident::input_for(axis).iter().map(|s| s.0).sum::<f64>() + 7.0;
+    // 1 s neutral, the input, then hands off past its end: 6 s, but 3 s in
+    // pitch, where the phugoid built in the hands-off seconds and tripped the
+    // 10 deg limit on the Baron, the Evolution and the 737 (LEMG,
+    // 2026-10-13); the short period the fit needs is over well inside 3 s.
+    // ...and in roll, where the Evolution's quick roll built past 20 deg of
+    // bank in the hands-off seconds (LEMG, 2026-10-13); the roll rate the
+    // fit needs settles inside a second. The yaw's Dutch roll is slower.
+    let after = if axis == Axis::Yaw { 6.0 } else { 3.0 };
+    let span: f64 = ident::input_for(axis).iter().map(|s| s.0).sum::<f64>() + 1.0 + after;
     loop {
         if crate::xplane::sim_frozen(xp).await {
             ap_on(xp).await;
@@ -422,7 +480,21 @@ pub async fn main_cmd(args: &[String], base_url: &str) -> anyhow::Result<bool> {
             }
             settle(&xp, &lever, t0, ias, 20.0).await?;
         }
-        fits[n] = ident::fit_axis(&runs, axis.has_angle());
+        // A fit is a measurement only when it explains the answer and its
+        // numbers are physical: the 737's pitch came out at R2 0.78 with a
+        // damping of 0.02 /s and was stored (LEMG, 2026-10-13). Below the
+        // bar the axis is left unmeasured and the controller keeps its
+        // defaults, which is safer than a wrong number.
+        fits[n] = ident::fit_axis(&runs, axis.has_angle()).filter(|f| {
+            let ok = f.r2 >= MIN_R2 && f.response.b > 0.0 && f.response.damping >= MIN_DAMPING;
+            if !ok {
+                println!(
+                    "{axis:?}: fit below the bar (R2 {:.2}, damping {:.2} /s); not stored.",
+                    f.r2, f.response.damping
+                );
+            }
+            ok
+        });
         match &fits[n] {
             Some(f) => println!(
                 "{axis:?}: b {:.1} deg/s2 a unit, damping {:.2} /s, stiffness {:.2}, path {:.2} /s, delay {:.2} s, rate {:.1} deg/s a unit (R2 {:.2}, {} inputs)",
@@ -437,7 +509,15 @@ pub async fn main_cmd(args: &[String], base_url: &str) -> anyhow::Result<bool> {
         println!("Roll on the slip: {:.2} deg/s2 a degree.", roll.response.cross);
     }
     let energy = if aborted.is_none() {
-        let e = ident::fit_energy(&power_step(&xp, &lever, t0).await);
+        // The same bar as the axes: the Evolution's power step stored 8,081
+        // fpm a unit on a fit of R2 0.37 (LEMG, 2026-10-13).
+        let e = ident::fit_energy(&power_step(&xp, &lever, t0).await).filter(|e| {
+            let ok = e.r2 >= MIN_R2;
+            if !ok {
+                println!("Energy: fit below the bar (R2 {:.2}); not stored.", e.r2);
+            }
+            ok
+        });
         match &e {
             Some(e) => println!("Energy: {:.0} fpm a unit of lever, the engine {:.1} s behind (R2 {:.2}).", e.fpm_per_unit, e.spool_s, e.r2),
             None => println!("Energy: the power step explained nothing; not stored."),
@@ -453,6 +533,19 @@ pub async fn main_cmd(args: &[String], base_url: &str) -> anyhow::Result<bool> {
         println!("Nothing measured: nothing stored.");
         return Ok(false);
     }
+    // A run adds or improves axes, never erases one: an axis this run could
+    // not measure keeps the one already stored for this same model. The
+    // Evolution's roll (R2 0.95) was overwritten by a run that aborted it
+    // (LEMG, 2026-10-13).
+    let before = Learned::load_for(&acf_rel, &acf_text).ok();
+    let kept = |new: Option<Fit>, old: Option<Fit>| match (new, old) {
+        (Some(n), _) => Some(n),
+        (None, o) => o,
+    };
+    let (pitch, roll, yaw, energy) = match before {
+        Some(b) => (kept(pitch, b.pitch), kept(roll, b.roll), kept(yaw, b.yaw), energy.or(b.energy)),
+        None => (pitch, roll, yaw, energy),
+    };
     let learned = Learned {
         version: VERSION,
         acf: acf_rel,
