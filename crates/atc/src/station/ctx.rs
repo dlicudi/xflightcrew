@@ -325,9 +325,12 @@ impl Station {
         // any ghost is seen on the pavement: the caller's line-up, takeoff
         // and landing wait for it (ours for a traffic strip, theirs for us).
         // For a caller on the ground a lander still flying is an ARRIVAL,
-        // as one in the picture is: traffic on final inside [`FINAL_NM`],
-        // nothing farther out (LEMG 12, 2026-10-13: "traffic on the runway"
-        // for an Air Nostrum cleared to land well out).
+        // never "traffic on the runway" (LEMG 12, 2026-10-13), judged on
+        // TIME by the release's one rule ([`DepartureBlock::holds`]): one
+        // the departure cannot be off the strip ahead of is landing traffic
+        // on final at its distance, any distance; one it can is nothing
+        // (LEMG 13, 2026-10-13: RYR5024 cleared from the holding point with
+        // us 4.02 nm and 99 s out, and we were sent round).
         let block = if on_ground {
             departure_held_by_others(&self.apt.runways, &runway, &self.desk.strip)
         } else {
@@ -335,18 +338,21 @@ impl Station {
                 .then_some(DepartureBlock::Occupied)
         };
         let runway_occupied = runway_occupied || block == Some(DepartureBlock::Occupied);
+        let lined_up = self.desk.twr.state == tower::State::LinedUp;
         let final_traffic = match block {
-            Some(DepartureBlock::Lander(nm)) if nm < FINAL_NM => Some(match final_traffic {
-                Some(f) if f.nm <= nm => f,
-                Some(f) => FinalTraffic { nm, ..f },
-                None => FinalTraffic {
-                    nm,
-                    callsign: None,
-                    count: 1,
-                    ghosts: Vec::new(),
-                    type_spoken: None,
-                },
-            }),
+            Some(b @ DepartureBlock::Lander(Lander { nm, .. })) if b.holds(lined_up) => {
+                Some(match final_traffic {
+                    Some(f) if f.nm <= nm => f,
+                    Some(f) => FinalTraffic { nm, ..f },
+                    None => FinalTraffic {
+                        nm,
+                        callsign: None,
+                        count: 1,
+                        ghosts: Vec::new(),
+                        type_spoken: None,
+                    },
+                })
+            }
             _ => final_traffic,
         };
         // "With information X" matching the current broadcast: the clearance

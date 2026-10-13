@@ -260,7 +260,11 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   direction, the longest parallel the strip** (`best_runway_for_wind`, `close_parallel_main`).
 - **Release threads the arrival stream** (`DEPART_GAP_NM`); **a strip cleared to land and still
   flying is an ARRIVAL to a departure, never "traffic on the runway"**
-  (`RunwayBook::departure_blocked`). **A hold keeps its word**
+  (`RunwayBook::departure_blocked`), at any distance, and **a departure goes ahead of it only if
+  the lander's own go-around watch would never revoke it**: ONE rule for reply and release
+  (`DepartureBlock::holds`, `departure_clears_lander`: the predicted exits fed through
+  `go_around_due`, `LINE_UP_S` from the hold, `LINED_UP_ROLL_S` lined up; in time, never
+  distance). **A hold keeps its word**
   (`on_independent_final`, `occupies`, `TakeoffHold.held_for`).
 - **Circuit traffic stays with the tower** (`tower::wants_circuits`): cleared FOR THE CIRCUIT
   (`tower::circuit_clearance_lines`), no departure handoff. **A reject is a radio call**

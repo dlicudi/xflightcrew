@@ -654,3 +654,199 @@ fn the_landing_sequence_counts_the_inbound_places_and_names_the_last() {
         "two inbound ahead, the cleared one and the asker left out"
     );
 }
+
+/// A RELEASE AHEAD OF A LANDER IS THE GO-AROUND WATCH'S OWN JUDGEMENT, IN
+/// TIME: the departure's predicted exits fed through [`go_around_due`].
+/// LEMG 13 (2026-10-13): RYR5024 cleared for takeoff at the holding point
+/// with us cleared to land 4.02 nm out at 147 kt (99 s), just outside the
+/// landing claim's 4 nm and so not in its book at all; it took 43 s to line
+/// up, and we were sent round. From the holding point the lander must be
+/// [`LINE_UP_S`] + the roll + [`RUNWAY_CLEAR_MARGIN_S`] out (107.5 s).
+#[test]
+fn a_release_ahead_of_a_lander_is_judged_as_the_go_around_watch_judges() {
+    let roll = roll_to_liftoff_s(0.0);
+    let trace = lander_secs(4.02, 146.7);
+    assert!((trace - 98.7).abs() < 0.5, "{trace}");
+    assert!(
+        !departure_clears_lander(Some(trace), LINE_UP_S),
+        "the LEMG 13 release from the holding point"
+    );
+    let need = LINE_UP_S + roll + RUNWAY_CLEAR_MARGIN_S;
+    assert!(!departure_clears_lander(Some(need - 1.0), LINE_UP_S));
+    assert!(departure_clears_lander(Some(need + 1.0), LINE_UP_S));
+    assert!(
+        !departure_clears_lander(None, LINE_UP_S),
+        "an unknown time holds"
+    );
+    assert!(!departure_clears_lander(Some(0.0), LINED_UP_ROLL_S));
+    // Lined up with a lander six miles out at 140 kt: released, and the
+    // lander's watch on the predicted state never fires, second by second.
+    let t = lander_secs(6.0, 140.0);
+    assert!(departure_clears_lander(Some(t), LINED_UP_ROLL_S));
+    let mut tau = 0.0;
+    while tau < t {
+        let exits: Vec<StripExit> = if tau < LINED_UP_ROLL_S {
+            vec![StripExit::LinedUp(roll)]
+        } else if tau < LINED_UP_ROLL_S + roll {
+            vec![StripExit::Clearing(roll - (tau - LINED_UP_ROLL_S))]
+        } else {
+            Vec::new()
+        };
+        assert!(!go_around_due(Some(t - tau), &exits), "+{tau} s");
+        tau += 0.5;
+    }
+    // Two miles out (51 s), even lined up: held.
+    assert!(!departure_clears_lander(
+        Some(lander_secs(2.0, 140.0)),
+        LINED_UP_ROLL_S
+    ));
+    // A groundspeed that did not read is the fast side.
+    assert_eq!(
+        lander_secs(3.0, f64::NAN),
+        lander_secs(3.0, DEFAULT_FINAL_KTS)
+    );
+}
+
+/// OUR LANDING CLEARANCE, A TRAFFIC DEPARTURE AT THE HOLDING POINT: the
+/// LEMG 13 case. Held with the landing traffic named, never cleared, never
+/// "traffic on the runway"; its release watch holds it too.
+#[test]
+fn a_traffic_departure_at_the_hold_is_not_released_ahead_of_our_landing() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let r = book_runways()[0].clone();
+    let mut st = gatwick();
+    st.install();
+    *OWN_STRIP.clearance.lock().unwrap() = Some(snap(tower::State::ClearedToLand, "26L", true));
+    let (lat, lon) = crate::nav::project_latlon(r.lat_b, r.lon_b, r.heading_a_deg(), 4.02);
+    note_own_state(AircraftState::at_position(lat, lon, false, 146.7));
+    let (hlat, hlon) = along(&r, 0.95);
+    let at_hold = AircraftState::at_position(hlat - 150.0 / 111_320.0, hlon, true, 0.0);
+    let dep = open_traffic_strip(2);
+    note_traffic_state(2, at_hold);
+    let line = st
+        .with_desk(FlightId::Traffic(2), |st| {
+            st.desk.twr.state = tower::State::TaxiCleared;
+            let ctx = ctx_for(st, "Ryanair five zero two four", true);
+            assert!(!ctx.runway_occupied, "flying, we are an arrival");
+            assert!(
+                ctx.final_traffic_nm
+                    .is_some_and(|nm| (nm - 4.0).abs() < 0.1),
+                "{:?}",
+                ctx.final_traffic_nm
+            );
+            st.route_keyed(
+                "Gatwick Tower, Ryanair five zero two four, ready for departure",
+                Service::Tower,
+                &ctx,
+                westerly(),
+            )
+        })
+        .unwrap();
+    assert!(!line.contains("cleared for takeoff"), "{line}");
+    assert!(line.contains("landing traffic"), "{line}");
+    assert!(!line.contains("traffic on the runway"), "{line}");
+    // Its release watch, at the hold, with us 3 nm out: still held.
+    *dep.takeoff_hold.lock().unwrap() = Some(TakeoffHold {
+        callsign: "Ryanair five zero two four".into(),
+        runway: "two six left".into(),
+        runway_ident: "26L".into(),
+        clear_since: None,
+        armed_at: Instant::now(),
+        logged_at: Instant::now(),
+        lined_up: false,
+        behind: false,
+        held_for: None,
+        cut_in_logged: Default::default(),
+    });
+    let (lat, lon) = crate::nav::project_latlon(r.lat_b, r.lon_b, r.heading_a_deg(), 3.0);
+    note_own_state(AircraftState::at_position(lat, lon, false, 140.0));
+    let t0 = Instant::now();
+    for s in [0, 20, 40] {
+        let at = t0 + std::time::Duration::from_secs(s);
+        assert_eq!(
+            takeoff_hold_tick_for(&dep, &at_hold, &[], 200.0, at),
+            None,
+            "+{s}"
+        );
+    }
+    *OWN_STRIP.seen.lock().unwrap() = None;
+    *OWN_STRIP.clearance.lock().unwrap() = None;
+    Station::uninstall();
+}
+
+/// A TRAFFIC LANDER AND OUR DEPARTURE: at the holding point with the lander
+/// 99 s out, held for the landing traffic; lined up with it six miles out,
+/// cleared, by the reply and by the release watch alike; lined up with it
+/// two miles out, held.
+#[test]
+fn our_departure_ahead_of_a_traffic_lander_is_judged_in_time() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let ready = "Gatwick Tower, Speedbird one two three, ready for departure";
+    let r = book_runways()[0].clone();
+    let on_final = |nm: f64, kts: f64| {
+        let (lat, lon) = crate::nav::project_latlon(r.lat_b, r.lon_b, r.heading_a_deg(), nm);
+        AircraftState::at_position(lat, lon, false, kts)
+    };
+    let mut st = gatwick();
+    st.install();
+    let lander = open_traffic_strip(8);
+    *lander.clearance.lock().unwrap() = Some(snap(tower::State::ClearedToLand, "26L", true));
+    note_traffic_state(8, on_final(4.02, 146.7));
+    st.desk.twr.state = tower::State::TaxiCleared;
+    let ctx = ctx_for(&mut st, "Speedbird one two three", true);
+    let line = st.route_keyed(ready, Service::Tower, &ctx, westerly());
+    assert!(!line.contains("cleared for takeoff"), "{line}");
+    assert!(line.contains("landing traffic on 4 mile final"), "{line}");
+    // Lined up, the lander six miles out: cleared.
+    st.desk = StripDesk::new();
+    st.desk.twr.state = tower::State::LinedUp;
+    note_traffic_state(8, on_final(6.0, 140.0));
+    let ctx = ctx_for(&mut st, "Speedbird one two three", true);
+    assert_eq!(ctx.final_traffic_nm, None);
+    let line = st.route_keyed(ready, Service::Tower, &ctx, westerly());
+    assert!(line.contains("cleared for takeoff"), "{line}");
+    // The release watch, lined up on the pavement.
+    let lined = along(&r, 0.97);
+    let arm = |t0: Instant| {
+        *OWN_STRIP.takeoff_hold.lock().unwrap() = Some(TakeoffHold {
+            callsign: "Speedbird one two three".into(),
+            runway: "two six left".into(),
+            runway_ident: "26L".into(),
+            clear_since: None,
+            armed_at: t0,
+            logged_at: t0,
+            lined_up: true,
+            behind: false,
+            held_for: None,
+            cut_in_logged: Default::default(),
+        });
+    };
+    let t0 = Instant::now();
+    let tick = |s: u64| {
+        takeoff_hold_tick_from(
+            &[],
+            200.0,
+            true,
+            Some(lined),
+            t0 + std::time::Duration::from_secs(s),
+        )
+    };
+    arm(t0);
+    let released = tick(0).or_else(|| tick(20));
+    assert!(
+        released
+            .as_ref()
+            .is_some_and(|l| l.contains("cleared for takeoff")),
+        "{released:?}"
+    );
+    // Two miles out, lined up: held.
+    note_traffic_state(8, on_final(2.0, 140.0));
+    arm(t0);
+    for s in [0, 20, 40] {
+        assert_eq!(tick(s), None, "+{s}");
+    }
+    *OWN_STRIP.takeoff_hold.lock().unwrap() = None;
+    Station::uninstall();
+}

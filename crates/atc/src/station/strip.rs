@@ -476,6 +476,64 @@ pub(crate) fn landing_release_due(own_s: Option<f64>, exits: &[StripExit]) -> bo
     })
 }
 
+/// A departure NOT yet lined up starts its roll this long after its takeoff
+/// clearance: taxi onto the strip, line up, the readback on the way.
+/// Measured on our traffic (blackbox `traffic` phase LineUp to Roll, 42
+/// departures): 35 to 47 s; LEMG 13 (2026-10-13) RYR5024 43 s from "cleared
+/// for takeoff" at the holding point. The safe side, and a pilot is slower.
+pub(super) const LINE_UP_S: f64 = 60.0;
+/// A departure already lined up starts its roll this long after its takeoff
+/// clearance: the readback and the spool-up. Our traffic rolls on the order,
+/// a pilot does not.
+pub(super) const LINED_UP_ROLL_S: f64 = 10.0;
+
+/// A lander's seconds to its threshold from `nm` out at `gs_kts`, as its
+/// go-around watch counts them ([`time_to_threshold_for`]): a groundspeed
+/// under 40 kt (or none) is [`DEFAULT_FINAL_KTS`], the fast side.
+pub(super) fn lander_secs(nm: f64, gs_kts: f64) -> f64 {
+    let gs = if gs_kts.is_finite() && gs_kts >= 40.0 {
+        gs_kts
+    } else {
+        DEFAULT_FINAL_KTS
+    };
+    nm * 3600.0 / gs
+}
+
+/// May a departure be released ahead of a lander `lander_s` seconds from the
+/// threshold? Only if the lander's own go-around watch will never send it
+/// round for it: the departure's predicted exits, from where it IS
+/// (`line_up_s` from the release to its roll), are fed through
+/// [`go_around_due`] at every second of the approach. Lining up it is on the
+/// pavement any moment, so it counts as lined up ([`StripExit::LinedUp`])
+/// from the release; rolling, it is [`StripExit::Clearing`] the roll left
+/// ([`roll_to_liftoff_s`]). The rule that falls out: `lander_s` at least
+/// `line_up_s` + the roll (37.5 s) + [`RUNWAY_CLEAR_MARGIN_S`]. An unknown
+/// time is no release. LEMG 13 (2026-10-13): RYR5024 cleared at the holding
+/// point with us 99 s out (4.02 nm at 147 kt, just outside the landing
+/// claim's 4 nm), 43 s to line up.
+pub(crate) fn departure_clears_lander(lander_s: Option<f64>, line_up_s: f64) -> bool {
+    let Some(t) = lander_s else {
+        return false;
+    };
+    let roll = roll_to_liftoff_s(0.0);
+    let mut tau = 0.0;
+    while tau < t {
+        let exit = if tau < line_up_s {
+            StripExit::LinedUp(roll)
+        } else if tau < line_up_s + roll {
+            StripExit::Clearing(roll - (tau - line_up_s))
+        } else {
+            return true;
+        };
+        if go_around_due(Some(t - tau), &[exit]) {
+            return false;
+        }
+        tau += 1.0;
+    }
+    // Still on the strip as the lander crosses the threshold.
+    false
+}
+
 /// One runway occupant as the landing judgement saw it: who, how it will
 /// leave, and WHERE it was (the blackbox's evidence: issue #162's ghosts
 /// were judged with no position on file).

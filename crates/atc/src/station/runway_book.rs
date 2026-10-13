@@ -23,7 +23,8 @@ pub(crate) enum ClaimKind {
     LineUp,
     /// Cleared for takeoff: the whole strip.
     Takeoff,
-    /// Cleared to land and not yet reported off: the whole strip.
+    /// Cleared to land and not yet reported off: the whole strip (ours far
+    /// out, its direction).
     Landing,
     /// Taxied to the runway or told to join final: its DIRECTION.
     Sequenced,
@@ -156,11 +157,13 @@ impl RunwayBook {
                 // flight flies the final it was cleared on, and two of them
                 // cleared at once is the conflict the book exists to stop;
                 // ours back inside the ring over a landing given meanwhile
-                // is the go-around watch's, judged on time.
+                // is the go-around watch's, judged on time. Still a LANDING:
+                // a departure judges it in time like any lander
+                // ([`Self::departure_blocked`]).
                 tower::State::ClearedToLand
                     if *held && e.strip.is_own() && self.far_out(e.state, ident) =>
                 {
-                    Some((ClaimKind::Sequenced, false))
+                    Some((ClaimKind::Landing, false))
                 }
                 // A landing reported vacated claims nothing.
                 tower::State::ClearedToLand if *held => Some((ClaimKind::Landing, true)),
@@ -416,18 +419,21 @@ impl RunwayBook {
 
     /// What holds a DEPARTURE off the strip `end` is on: [`Self::blocked`],
     /// except that a flight cleared to land and still FLYING is an arrival,
-    /// judged by its distance (the nearest one's, to its threshold), never a
-    /// blanket occupant. LEMG 12 (2026-10-13): Air Nostrum cleared to land
-    /// held our 737 at HW1 "hold position, traffic on the runway" with
-    /// nothing on it and the lander well out. An unknown position, a lander
-    /// on the ground, or any other claim is an occupant as before.
+    /// judged by its TIME to its threshold (the soonest one's,
+    /// [`DepartureBlock::holds`]), never a blanket occupant, and at ANY
+    /// distance: one farther out than [`LANDING_CLAIM_NM`] claims only its
+    /// direction, yet 4.5 nm at 160 kt is 101 s, inside a line-up's time.
+    /// LEMG 12 (2026-10-13): Air Nostrum cleared to land held our 737 at HW1
+    /// "hold position, traffic on the runway" with nothing on it and the
+    /// lander well out. An unknown position, a lander on the ground, or any
+    /// other whole-strip claim is an occupant as before.
     pub(crate) fn departure_blocked(
         &self,
         end: &str,
         except: Option<FlightId>,
     ) -> Option<DepartureBlock> {
         let ours = strip(&self.runways, end)?;
-        let mut lander: Option<f64> = None;
+        let mut lander: Option<Lander> = None;
         for c in self.claims.iter().filter(|c| {
             matches!(&c.who, Claimant::Strip(f) if Some(*f) != except)
                 && strip(&self.runways, &c.end).is_some_and(|r| std::ptr::eq(r, ours))
@@ -440,20 +446,27 @@ impl RunwayBook {
                         | ClaimKind::Takeoff
                         | ClaimKind::CrossingCleared
                 );
-            if !whole && c.kind != ClaimKind::Occupying {
+            if !whole && !matches!(c.kind, ClaimKind::Occupying | ClaimKind::Landing) {
                 continue;
             }
-            match self.airborne_lander_nm(c) {
-                Some(nm) => lander = Some(lander.map_or(nm, |l: f64| l.min(nm))),
+            match self.airborne_lander(c) {
+                Some(l) => {
+                    let sooner =
+                        |a: &Lander, b: &Lander| a.secs.unwrap_or(0.0) < b.secs.unwrap_or(0.0);
+                    if lander.as_ref().is_none_or(|k| sooner(&l, k)) {
+                        lander = Some(l);
+                    }
+                }
                 None => return Some(DepartureBlock::Occupied),
             }
         }
         lander.map(DepartureBlock::Lander)
     }
 
-    /// A landing claim whose flight is airborne at a known position: its
-    /// distance to the threshold it was cleared onto, nm.
-    fn airborne_lander_nm(&self, c: &Claim) -> Option<f64> {
+    /// A landing claim whose flight is airborne at a known position: how far
+    /// and how long from the threshold it was cleared onto
+    /// ([`lander_secs`]); its time is unknown once its state is stale.
+    fn airborne_lander(&self, c: &Claim) -> Option<Lander> {
         let Claimant::Strip(id) = c.who else {
             return None;
         };
@@ -471,7 +484,9 @@ impl RunwayBook {
         } else {
             (r.lat_b, r.lon_b)
         };
-        Some(nav::haversine_nm(lat, lon, tlat, tlon))
+        let nm = nav::haversine_nm(lat, lon, tlat, tlon);
+        let secs = (state.at.elapsed() < OWN_SEEN_FRESH).then(|| lander_secs(nm, state.gs_kts));
+        Some(Lander { nm, secs })
     }
 
     /// Whether movement on `end` conflicts with this flight's strip claim:
@@ -533,9 +548,35 @@ pub(crate) enum DepartureBlock {
     /// On the pavement, cleared onto it, or a lander whose position is
     /// unknown or on the ground: "traffic on the runway".
     Occupied,
-    /// Only flights cleared to land, still flying: the nearest one's
-    /// distance to its threshold, nm, for the release's gap.
-    Lander(f64),
+    /// Only flights cleared to land, still flying: the soonest one.
+    Lander(Lander),
+}
+
+/// A flight cleared to land and still flying, as a departure reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Lander {
+    /// To its threshold, nm: what the tower SAYS ("traffic on 4 mile final").
+    pub(crate) nm: f64,
+    /// To its threshold, seconds ([`lander_secs`]): what the release JUDGES.
+    /// `None` when its position is stale.
+    pub(crate) secs: Option<f64>,
+}
+
+impl DepartureBlock {
+    /// Does this hold a departure released now, `lined_up` or still at the
+    /// holding point? An occupant always; a lander unless the departure is
+    /// off the strip before the lander's go-around watch would send it round
+    /// ([`departure_clears_lander`]: [`LINED_UP_ROLL_S`] to roll lined up,
+    /// else [`LINE_UP_S`]). The ONE release rule the reply and the held
+    /// release share.
+    pub(crate) fn holds(&self, lined_up: bool) -> bool {
+        match self {
+            DepartureBlock::Occupied => true,
+            DepartureBlock::Lander(l) => {
+                !departure_clears_lander(l.secs, if lined_up { LINED_UP_ROLL_S } else { LINE_UP_S })
+            }
+        }
+    }
 }
 
 /// [`strip_held_by_others`] as a departure reads it.
@@ -662,9 +703,9 @@ pub fn runway_conflicts(own: Option<AircraftState>) -> Vec<String> {
                 conditional(x, y) && on_strip(fx) && flying(fy)
             };
             // A departure released ahead of a lander still flying: the
-            // tower's anticipated separation (`departure_blocked`, the
-            // release's gap), judged on time by the lander's go-around
-            // watch. Both on the ground with their claims is a conflict.
+            // tower's anticipated separation (`DepartureBlock::holds`, the
+            // lander's go-around watch's own time rule). Both on the ground
+            // with their claims is a conflict.
             let ahead = |x: &Claim, y: &Claim, fy: &FlightId| {
                 x.kind == ClaimKind::Takeoff && y.kind == ClaimKind::Landing && flying(fy)
             };
