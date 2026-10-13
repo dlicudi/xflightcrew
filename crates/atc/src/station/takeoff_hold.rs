@@ -327,19 +327,28 @@ pub(super) fn takeoff_hold_tick_for(
     if flight.is_own() {
         note_ground_traffic(targets, now);
     }
-    // The book: another strip cleared onto the held runway (or to land on
-    // it) holds it like an occupant, whatever the replay shows. Asked before
-    // the hold's lock (for ours, nothing to ask with no traffic strip open).
-    let other_strip_holds = (!flight.is_own() || !traffic_strips().is_empty()) && {
+    // The book: another strip cleared onto the held runway, or standing on
+    // it, holds it like an occupant, whatever the replay shows; one cleared
+    // to land and still flying is an ARRIVAL, judged by the gap like any
+    // other (`DEPART_GAP_NM`). Asked before the hold's lock (for ours,
+    // nothing to ask with no traffic strip open).
+    let other_strip = if flight.is_own() && traffic_strips().is_empty() {
+        None
+    } else {
         let held_ident = flight
             .takeoff_hold
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|h| h.runway_ident.clone());
-        held_ident
-            .is_some_and(|ident| strip_held_by_others(&active_runways(), &ident, flight))
+        held_ident.and_then(|ident| departure_held_by_others(&active_runways(), &ident, flight))
     };
+    let other_strip_holds = other_strip == Some(DepartureBlock::Occupied);
+    let lander_nm = match other_strip {
+        Some(DepartureBlock::Lander(nm)) => Some(nm),
+        _ => None,
+    };
+    let lander_close = lander_nm.is_some_and(|nm| nm < DEPART_GAP_NM);
     let player_on_ground = state.on_ground;
     let mut guard = flight.takeoff_hold.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_mut()?;
@@ -406,14 +415,18 @@ pub(super) fn takeoff_hold_tick_for(
     // line five seconds after "behind the landing Bee-line, line up behind"
     // with the lander at 2.4 nm, and only its 85 s crawl kept it off the
     // pavement until 15 s after the touchdown (12:21Z, 2026-09-11).
-    *flight.line_up_condition.lock().unwrap_or_else(|e| e.into_inner()) =
-        hold.behind.then(|| inbound.is_none());
+    *flight.line_up_condition.lock().unwrap_or_else(|e| e.into_inner()) = hold
+        .behind
+        .then(|| inbound.is_none() && lander_nm.is_none_or(|nm| nm >= FINAL_NM));
     let traffic = match &rwy {
-        Some(_) => on_strip || inbound.as_ref().is_some_and(|f| f.nm < DEPART_GAP_NM),
+        Some(_) => {
+            on_strip || lander_close || inbound.as_ref().is_some_and(|f| f.nm < DEPART_GAP_NM)
+        }
         // No geometry for the held runway: fall back to the blunt any-runway
         // checks rather than clearing blind.
         None => {
             on_strip
+                || lander_close
                 || targets
                     .iter()
                     .any(|t| !t.on_ground && (30.0..1500.0).contains(&(t.ele_ft - field_elev_ft)))
@@ -431,7 +444,7 @@ pub(super) fn takeoff_hold_tick_for(
     // budget at holding point Sierra before handing the aircraft back
     // (2026-07-27). One full interval at the hold IS the separation.
     let wake = now.duration_since(hold.armed_at).as_secs() < WAKE_SECS
-        && wake_remaining(&hold.runway_ident, now).is_some();
+        && wake_remaining_for(flight, &hold.runway_ident, now).is_some();
     if traffic || wake {
         hold.clear_since = None;
         // What is holding us, at a cadence — a held departure that says
@@ -447,6 +460,7 @@ pub(super) fn takeoff_hold_tick_for(
                 final_nm = ?inbound.as_ref().map(|f| (f.nm * 10.0).round() / 10.0),
                 arrivals = inbound.as_ref().map(|f| f.count).unwrap_or(0),
                 on_strip,
+                lander_nm = ?lander_nm.map(|nm| (nm * 10.0).round() / 10.0),
                 wake,
                 lined_up = hold.lined_up,
                 "departure still held"
