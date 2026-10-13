@@ -413,20 +413,6 @@ cabin_air:
   oxygen_read: sim/cockpit2/oxygen/actuators/demand_flow_setting
   oxygen_masks: sim/cockpit2/oxygen/actuators/o2_valve_on
 
-# The flare's power leaves over about three and a half seconds, paused
-# while the sink is over 300 fpm (`flare_power`): the engine sits high on
-# the tail, so the lever is a pitch input too (EDLP 24, 2026-09-24). On
-# the attitude flare 68 and 95 fpm (LEMG 13, 1791805150, 1791805443), no
-# ground pull needed (the old fitted flare's history, issue #163, is in
-# docs/dev-history.md).
-flare_elevator:
-  # The attitude flare's pull limit: it holds the nose angle, the limit is
-  # the stop.
-  max: 0.8
-  max_push: 0.05
-flare_power:
-  reduction_per_second: 0.06
-
 reference:
   kind: single-engine jet
   # Light jet. No optimum-altitude advisory: it cruises at or near its ceiling,

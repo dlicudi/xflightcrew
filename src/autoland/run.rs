@@ -249,12 +249,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
 
             TRACKING_ERROR.clear();
             let mut last_phase: Option<ApproachPhase> = None;
-            let mut flare_power = FlarePower::default();
             // The heading knob, set as a pilot sets it (`bug_knob`, issue #93).
             let mut bug_hold = crate::heading_bug::BugHold::default();
             let knob_t0 = std::time::Instant::now();
-            // The lever the approach was flown on, for a balloon to hold.
-            let mut approach_thr: Option<f64> = None;
             // The stabilised-approach rule (`stable_approach`, #199): the
             // breaches held so far, the clock they are timed on, the balk
             // word and spoken reason of a go-around it ordered, and whether
@@ -302,9 +299,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let mut vvi_read_failed = false;
             // The vertical speed one tick ago, for the arrest's trend term.
             let mut prev_vvi: Option<(f64, std::time::Instant)> = None;
-            // The arrest by attitude, judged by height: the airframe's
-            // declared limits and ground pull, else the defaults.
-            let attitude_law = crate::aircraft::flare_elevator().unwrap_or_default();
+            // The arrest by attitude, judged by height (`pilot::attitude`).
             let mut attitude_flare = crate::pilot::attitude::AttitudeFlare::default();
             let mut energy_throttle = crate::pilot::energy::EnergyThrottle::default();
             let mut decel_brake = DecelBrake::default();
@@ -330,6 +325,28 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             // the band), for the blackbox's `roundout_held` edges.
             let mut roundout_held = false;
             let mut bank_hold = crate::pilot::bank::BankHold::default();
+            // What the hand-flown segment flies on: this airframe's measured
+            // responses (`xvl identify`, `aircraft::learned`), else the
+            // fleet's priors; the throttle's energy; the nose's geometry.
+            let pilot_airframe = crate::pilot::airframe();
+            crate::blackbox::record(
+                "autoland",
+                serde_json::json!({"event": "pilot_airframe", "measured": pilot_airframe.measured,
+                    "pitch_b": pilot_airframe.pitch.b, "roll_b": pilot_airframe.roll.b,
+                    "yaw_b": pilot_airframe.yaw.b, "k_thr2ste": pilot_airframe.tecs.fpm_per_unit,
+                    "spool_s": pilot_airframe.tecs.spool_s, "theta_max": pilot_airframe.limits.max_deg,
+                    "theta_min_td": pilot_airframe.limits.touchdown_min_deg}),
+            );
+            // The centreline's period (NPFG): bounded by the bank loop's own
+            // answer on the roll response measured.
+            let line_period_s = |ias: f64, tas: f64, dt: f64| {
+                let g = crate::pilot::response::design(&pilot_airframe.roll.at(ias, tas), dt);
+                crate::pilot::line::period_s(crate::pilot::response::attitude_tc_s(&g))
+            };
+            // The rudder in the hand-flown segment (`pilot::yaw`): the slip
+            // to zero, then the decrab; the pilot's feet take it back.
+            let mut yaw_hold = crate::pilot::yaw::YawHold::default();
+            let mut steer_yielded = false;
             // The final's heading above minimums, the autopilot's standing
             // error learnt as it flies (`FinalHeading`).
             let mut final_heading = FinalHeading::default();
@@ -898,10 +915,13 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     let side_roll = crate::pilot::line::side_velocity_m_s(track_roll, rwy.course_deg, gs_kts)
                         .unwrap_or(xtk_rate);
                     let phi_roll = phi_r.as_ref().ok().copied();
-                    let air_bank_tgt =
-                        phi_roll.map(|phi| crate::pilot::line::bank_for_line(xtk_m, side_roll, phi, radio_ft));
+                    let tas_roll = plant_at(5).map_or(ias, |v| v * 1.943_844);
+                    let air_bank_tgt = phi_roll
+                        .map(|_| crate::pilot::line::bank_for_line(xtk_m, side_roll, phi_roll.unwrap_or(0.0), radio_ft, line_period_s(ias, tas_roll, roll_dt), 0.0));
                     let air_ail = match (airborne && arrest_hands && !roll_yielded, phi_roll, air_bank_tgt) {
-                        (true, Some(phi), Some(tgt)) => Some(bank_hold.step(phi, tgt, roll_dt)),
+                        (true, Some(phi), Some(tgt)) => {
+                            Some(bank_hold.step(phi, tgt, roll_dt, &pilot_airframe.roll, ias, tas_roll, plant_at(8).unwrap_or(0.0)))
+                        }
                         _ => None,
                     };
                     // Queued: the rollout's writes go out in one round below.
@@ -2418,7 +2438,6 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     _ => 0.0,
                 };
                 prev_vvi = vvi.map(|v| (v, t_now));
-                let arrest_lead = crate::aircraft::arrest_lead();
                 // The final on its own path: the VS set once to the path's
                 // rate and nudged, as a pilot flies it (`path_nudge`).
                 // Not while the autopilot flies a captured glidepath: the dial is
@@ -2436,11 +2455,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 if nudged.is_none() {
                     path_nudge.reset();
                 }
-                let vs_dial = match (nudged, vvi) {
-                    (Some(d), _) => d,
-                    (None, Some(v)) => vs_dial_fpm(g.target_vs_fpm, v, vvi_trend, g.arresting, arrest_lead),
-                    (None, None) => g.target_vs_fpm,
-                };
+                // The dial is the target: the arrest that led it through a VS
+                // mode's lag (`arrest_lead`) is hand flown since 2026-10-12.
+                let vs_dial = nudged.unwrap_or(g.target_vs_fpm);
                 // The servos' pitch AUTHORITY (#181): the hand-flown segment
                 // takes the servos out, so the check ends there; before it, a
                 // dial the autopilot's elevator does not fly is hand flown
@@ -2502,16 +2519,16 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                         theta_deg,
                                         alpha_deg,
                                         q_dps,
+                                        ias_kts: ias,
                                         tas_kts: tas_ms * 1.943_844,
                                         dt: tick_dt,
-                                        ground_pull: attitude_law.ground_pull,
                                         path: (g.phase == ApproachPhase::Final).then(|| crate::pilot::attitude::Path {
                                             vs_fpm: -(gs_kts / 60.0) * gp_ft_per_nm(),
                                             above_ft: alt - g.glidepath_alt_ft,
                                         }),
                                     },
-                                    attitude_law.max,
-                                    attitude_law.max_push,
+                                    &pilot_airframe.pitch,
+                                    pilot_airframe.limits,
                                 );
                                 att_out = Some(o);
                                 Some(o.elev)
@@ -2569,6 +2586,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         let ok = autoflight::press(&xp, Button::Disconnect).await.is_ok();
                         arrest_hands = true;
                         bank_hold = crate::pilot::bank::BankHold::default();
+                        yaw_hold = crate::pilot::yaw::YawHold::default();
                         crate::blackbox::record(
                             "autoland",
                             serde_json::json!({
@@ -2618,10 +2636,67 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 arrest_prev_xtk = Some(xtk_m_now);
                 let side_now = crate::pilot::line::side_velocity_m_s(track_now, rwy.course_deg, gs_kts)
                     .unwrap_or(arrest_rate_now);
-                let phi_now = phi_r.as_ref().ok().copied().unwrap_or(0.0);
-                let bank_tgt = crate::pilot::line::bank_for_line(xtk_m_now, side_now, phi_now, radio_ft);
+                let tas_now = plant_at(5).map_or(ias, |v| v * 1.943_844);
+                // The rudder while the segment has the servos (`pilot::yaw`):
+                // coordinated, then the decrab once the wheels are the crab's
+                // turn and the yaw loop's settling away (the flare's own plan
+                // of the time to them), held from then. No heading, slip, yaw
+                // rate or attitude read is no command (the channel expires by
+                // itself).
+                let mut yaw_mode = None;
+                let mut slip_deg = plant_at(8).unwrap_or(0.0);
+                let flare_rud = match (
+                    arrest_hands && !steer_yielded,
+                    psi_r.as_ref().ok().copied(),
+                    plant_at(8),
+                    st.opt(F::R),
+                    phi_r.as_ref().ok().copied(),
+                    plant_at(0),
+                ) {
+                    (true, Some(psi_deg), Some(beta_deg), Some(r_dps), Some(phi_deg), Some(theta_deg)) => {
+                        let yi = crate::pilot::yaw::In {
+                            psi_deg,
+                            beta_deg,
+                            r_dps,
+                            phi_deg,
+                            theta_deg,
+                            ias_kts: ias,
+                            tas_kts: tas_now,
+                            dt: tick_dt,
+                            course_deg: rwy.course_deg,
+                        };
+                        let mode = yaw_hold.mode(
+                            att_out.filter(|o| o.flaring).map(|o| o.to_wheels_s),
+                            &yi,
+                            &pilot_airframe.yaw,
+                        );
+                        yaw_mode = Some(mode);
+                        slip_deg = crate::pilot::yaw::slip_planned_deg(&yi, mode);
+                        Some(yaw_hold.step(yi, mode, &pilot_airframe.yaw))
+                    }
+                    _ => None,
+                };
+                // The bank: the centreline's (NPFG), with the wing down for
+                // the slip the rudder holds (or will hold, in the decrab).
+                let line_period = line_period_s(ias, tas_now, tick_dt);
+                let bank_tgt = crate::pilot::line::bank_for_line(
+                    xtk_m_now,
+                    side_now,
+                    phi_r.as_ref().ok().copied().unwrap_or(0.0),
+                    radio_ft,
+                    line_period,
+                    crate::pilot::line::slip_accel_m_s2(slip_deg, pilot_airframe.yaw.at(ias, tas_now).path, tas_now),
+                );
                 let flare_ail = match (arrest_hands, phi_r.as_ref().ok().copied(), roll_yielded) {
-                    (true, Some(phi), false) => Some(bank_hold.step(phi, bank_tgt, tick_dt)),
+                    (true, Some(phi), false) => Some(bank_hold.step(
+                        phi,
+                        bank_tgt,
+                        tick_dt,
+                        &pilot_airframe.roll,
+                        ias,
+                        tas_now,
+                        plant_at(8).unwrap_or(0.0),
+                    )),
                     _ => None,
                 };
                 TRACKING_ERROR.set_in(flight, xtk_now * M_PER_NM);
@@ -2651,7 +2726,12 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "xtk_m": xtk_now * M_PER_NM, "minimums": minimums, "hdg_bias": final_heading.bias_deg(),
                     // The roll response the segment has measured (`pilot::bank`).
-                    "kp": arrest_hands.then(|| bank_hold.kp()),
+                    "kp": arrest_hands.then(|| bank_hold.kp()).flatten(),
+                    // The rudder (`pilot::yaw`), the decrab's time, the
+                    // centreline's period and the attitude law's gain.
+                    "flare_rud": flare_rud, "yaw_mode": yaw_mode.map(|m| format!("{m:?}")),
+                    "line_period_s": arrest_hands.then_some(line_period),
+                    "att_k": att_out.map(|o| o.k_theta), "att_to_wheels_s": att_out.map(|o| o.to_wheels_s),
                     // "plugin": one frame's position; "split": an older
                     // plugin's separate reads (#157).
                     "pos": pos_source,
@@ -3048,6 +3128,23 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     }
                     None => Ok(0.0),
                 };
+                // The rudder rides the pedal channel the rollout steers on
+                // (one writer: the segment ends at the wheels, where the
+                // rollout takes it).
+                let steer_yield_r = match flare_rud {
+                    Some(r) => {
+                        writes.set(TAXI_STEER, r);
+                        st.get(F::SteerYield)
+                    }
+                    None => Ok(0.0),
+                };
+                if steer_yield_r.is_ok_and(|v| v > 0.5) && !steer_yielded {
+                    steer_yielded = true;
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "steer_yield", "radio": radio_ft}),
+                    );
+                }
                 // A keyed setting (once per phase or leg) is driven and READ
                 // BACK beside the write round.
                 let bug_drive = knob.and(knob_set);
@@ -3146,14 +3243,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 let trend_kts_s = prev_ias.map_or(0.0, |p| (ias - p) / dt_s);
                 prev_ias = Some(ias);
                 prev_ias_t = now;
-                if g.phase != ApproachPhase::Flare || missed.is_some() {
-                    flare_power.reset();
-                }
-                if g.phase == ApproachPhase::Flare || missed.is_some() {
+                if missed.is_some() {
                     energy_throttle.reset();
                 }
-                let mut ballooned = false;
-                let mut power_held = false;
+                let mut tecs_out: Option<crate::pilot::energy::Out> = None;
                 let thr = if missed == Some(MissedStage::Climb) {
                     // The balked landing itself is firewall, not a governor
                     // holding approach speed — the LXGB miss flew its last 20
@@ -3191,45 +3284,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         ),
                         None => 1.0,
                     })
-                } else if let Some(hold) = g
-                    .phase
-                    .eq(&ApproachPhase::Flare)
-                    .then(|| {
-                        balloon_power(
-                            vvi,
-                            approach_thr,
-                            radio_ft > arrest_gates_ft(25.0, gs_kts).1,
-                            cfg.flare_power.is_some(),
-                        )
-                    })
-                    .flatten()
-                {
-                    // A balloon at idle only bleeds the speed the settle
-                    // needs: hold the approach's own thrust until it sinks.
-                    ballooned = true;
-                    Some(hold)
-                } else if g.phase == ApproachPhase::Flare {
-                    match cfg.flare_power {
-                        Some(power) => match (thr_now, vvi) {
-                            (Some(throttle), Some(vs)) => flare_power.step(
-                                power,
-                                throttle,
-                                vs,
-                                dt_s,
-                                radio_ft,
-                                Some(ias),
-                                Some(retard_reference_kts(
-                                    approach_ias,
-                                    crate::aircraft::config_floor_kts(last_flap.unwrap_or(0.0)),
-                                )),
-                            ),
-                            _ => None, // No measurement: no guessed power and no ramp advance.
-                        },
-                        // An undeclared airframe retains the conservative
-                        // legacy idle flare. Airframes whose energy response
-                        // is known declare the continuous law above.
-                        None => Some(0.0),
-                    }
+                } else if g.phase == ApproachPhase::Flare && att_out.is_none() {
+                    // A flare nobody hand-flies (the plant unread, the
+                    // yoke the pilot's): idle, as it always was.
+                    Some(0.0)
                 } else {
                     // The target is only as safe as the flaps actually out
                     // (`config_floor_kts`), and the lever has a floor of its
@@ -3242,102 +3300,78 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         &crate::aircraft::flap_limits(),
                         floor,
                     );
-                    // The power on total energy: the shared governor chased
-                    // the phugoid in ALT hold (LEMG 13, 2026-10-11). No true
+                    // The power on total energy (TECS's throttle half,
+                    // `pilot::energy`): the shared governor chased the
+                    // phugoid in ALT hold (LEMG 13, 2026-10-11). Hand flown,
+                    // the path the attitude law asks and, below its gate,
+                    // the flare: the lever only back, at idle with the
+                    // engine spooled down as the wheels arrive. No true
                     // vertical speed read: the lever stays.
-                    let adj = match (thr_now, plant_at(3)) {
-                            (Some(t), Some(vy_ms)) => {
-                                energy_throttle.step(crate::pilot::energy::In {
-                                    ias_kts: ias,
-                                    accel_kts_s: trend_kts_s,
-                                    vs_fpm: vy_ms * 196.850_394,
-                                    target_kts: target,
-                                    // The path paid for is the one the autopilot
-                                    // FLIES, by its own mode: a captured glidepath
-                                    // at the path's rate, else our dial. The
-                                    // guidance's VS read 0 under a -500 dial (the
-                                    // RV-10 held 98 kt against 80, 1791803684); the
-                                    // dial read -150 under a captured -400 path (the
-                                    // 172 ran to 80 kt against 65, 1791806643).
-                                    // Hand flown, the path the attitude law asks.
-                                    path_vs_fpm: if let Some(o) = att_out {
-                                        o.vs_target_fpm
-                                    } else if level_for_gs {
-                                        0.0
-                                    } else if ap_modes.is_some_and(|m| m.gs()) {
-                                        -(gs_kts / 60.0) * gp_ft_per_nm()
-                                    } else {
-                                        vs_dial
-                                    },
-                                    thr_now: t,
-                                    dt: dt_s,
-                                }) - t
-                            }
-                            _ => 0.0,
-                    };
-                    // In the roundout the lever only ever comes back. The
-                    // speed law read the roundout's own deceleration as
-                    // "five knots slow" and walked the 737's lever from 0.32
-                    // to 0.55 at 30 ft over EGCC 23L; the flare then held
-                    // that thrust (sink over `hold_sink_fpm`) and the
-                    // aircraft climbed away from two feet at 155 kt
-                    // (2026-09-19). The floor still stands underneath.
-                    // ...and, where the airframe declares it, from the
-                    // short final's hold height on: a lever raised in the
-                    // seconds before the release spools into the roundout
-                    // with no trim left against it (`short_final_power_held`).
-                    let held = short_final_power_held(
-                        g.phase,
-                        g.dist_nm,
-                        radio_ft,
-                        gs_kts,
-                        cfg.flare_power.and_then(|p| p.hold_from_s),
-                        ias,
-                        trend_kts_s,
-                        retard_reference_kts(approach_ias, floor),
-                    );
-                    power_held = held;
-                    let adj = if g.arresting || held { adj.min(0.0) } else { adj };
-                    // A roundout that FLOATS takes the thrust off, as the
-                    // flare's float does: the arrest is ours, not yet the
-                    // Flare, and the speed law holds the approach's lever
-                    // into a level-off and a climb (`roundout_float_lever`).
-                    let float_lever = match (arrest_hands && g.arresting, thr_now, vvi) {
-                        (true, Some(throttle), Some(v)) => roundout_float_lever(
-                            throttle,
-                            v,
-                            vvi_trend,
-                            dt_s,
-                            cfg.flare_power.map_or(DEFAULT_ROUNDOUT_RETARD_PER_S, |p| {
-                                p.retard_float_per_s
-                                    .or(p.retard_max_per_s)
-                                    .unwrap_or(p.reduction_per_second)
-                            }),
-                        ),
+                    let flaring = att_out.is_some_and(|o| o.flaring);
+                    let out = match (thr_now, plant_at(3)) {
+                        (Some(t), Some(vy_ms)) => Some(energy_throttle.step(
+                            crate::pilot::energy::In {
+                                ias_kts: ias,
+                                accel_kts_s: trend_kts_s,
+                                vs_fpm: vy_ms * 196.850_394,
+                                target_kts: target,
+                                floor_kts: floor,
+                                // The path paid for is the one the autopilot
+                                // FLIES, by its own mode: a captured glidepath
+                                // at the path's rate, else our dial. The
+                                // guidance's VS read 0 under a -500 dial (the
+                                // RV-10 held 98 kt against 80, 1791803684); the
+                                // dial read -150 under a captured -400 path (the
+                                // 172 ran to 80 kt against 65, 1791806643).
+                                // Hand flown, the path the attitude law asks.
+                                path_vs_fpm: if let Some(o) = att_out {
+                                    o.vs_target_fpm
+                                } else if level_for_gs {
+                                    0.0
+                                } else if ap_modes.is_some_and(|m| m.gs()) {
+                                    -(gs_kts / 60.0) * gp_ft_per_nm()
+                                } else {
+                                    vs_dial
+                                },
+                                thr_now: t,
+                                dt: dt_s,
+                                flare_to_wheels_s: att_out.filter(|o| o.flaring).map(|o| o.to_wheels_s),
+                            },
+                            pilot_airframe.tecs,
+                        )),
                         _ => None,
                     };
-                    let min_thr = approach_power_floor(
-                        g.phase,
-                        radio_ft,
-                        target - ias,
-                        crate::aircraft::approach_thrust_min(),
-                        last_flap.is_some_and(|f| f >= LANDING_FLAP_RATIO),
-                    )
-                    .max(climb_power_floor(
-                        g.phase,
-                        g.target_vs_fpm,
-                        crate::aircraft::approach_thrust_min(),
-                    ));
-                    float_lever.or_else(|| thr_now.map(|throttle| (throttle + adj).clamp(min_thr, 1.0)))
+                    tecs_out = out;
+                    let min_thr = if flaring {
+                        0.0
+                    } else {
+                        approach_power_floor(
+                            g.phase,
+                            radio_ft,
+                            target - ias,
+                            crate::aircraft::approach_thrust_min(),
+                            last_flap.is_some_and(|f| f >= LANDING_FLAP_RATIO),
+                        )
+                        .max(climb_power_floor(
+                            g.phase,
+                            g.target_vs_fpm,
+                            crate::aircraft::approach_thrust_min(),
+                        ))
+                    };
+                    // In the autopilot's roundout the lever only ever comes
+                    // back: the speed law read the roundout's own
+                    // deceleration as "five knots slow" and walked the 737's
+                    // lever from 0.32 to 0.55 at 30 ft over EGCC 23L, and it
+                    // climbed away from two feet at 155 kt (2026-09-19).
+                    match (out, thr_now) {
+                        (Some(o), Some(t)) if g.arresting && att_out.is_none() => Some(o.lever.min(t).clamp(min_thr, 1.0)),
+                        (Some(o), _) => Some(o.lever.clamp(min_thr, 1.0)),
+                        (None, t) => t.map(|t| t.clamp(min_thr, 1.0)),
+                    }
                 };
                 // The A/T holds the speed and retards (`ap_lands`): our
                 // lever stands aside.
                 let thr = if at_speed.flies() { None } else { thr };
-                if g.phase != ApproachPhase::Flare && missed.is_none() {
-                    if let Some(t) = thr {
-                        approach_thr = Some(t);
-                    }
-                }
                 if thr.is_some() {
                     last_lever = thr;
                 }
@@ -3374,28 +3408,16 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     .zip(thr_now)
                     .map(|(c, r)| (c - r).abs() < LEVER_TOOK_TOL);
                 last_thr_written = if throttle_written == Some(true) { thr } else { None };
-                if throttle_written == Some(false) {
-                    flare_power.reset();
-                }
                 crate::blackbox::record("autoland", serde_json::json!({
                     "event": "power", "phase": format!("{:?}", g.phase),
                     "throttle_before": thr_now, "throttle_command": thr,
-                    "lever_took": lever_took, "write_ok": throttle_written,
-                    "progressive_flare": cfg.flare_power.is_some(), "dt": dt_s,
-                    // Which key moved the flare's lever this tick (issue
-                    // #76): entry, height, time, slow, float or timed; a
-                    // climb's approach thrust is "balloon" (issue #146: the
-                    // last key's word hid it).
-                    "retard": (g.phase == ApproachPhase::Flare)
-                        .then(|| if ballooned {
-                            Some("balloon")
-                        } else {
-                            flare_power.last_key.map(RetardKey::word)
-                        })
-                        .flatten(),
+                    "lever_took": lever_took, "write_ok": throttle_written, "dt": dt_s,
+                    // TECS's state (`pilot::energy`): the flare's retard,
+                    // the underspeed and bad-descent protections.
+                    "tecs_flare": tecs_out.map(|o| o.flare),
+                    "tecs_underspeed": tecs_out.map(|o| o.underspeed),
+                    "tecs_bad_descent": tecs_out.map(|o| o.bad_descent),
                     "vvi": vvi, "radio": radio_ft, "ias": ias,
-                    // The short final's hold (`short_final_power_held`).
-                    "held": power_held,
                 }));
 
                 // Config: gear down inside 6 nm; flaps by distance AND vertical
@@ -3629,8 +3651,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         }
                         ApproachPhase::Intercept => "Intercepting the final approach.",
                         ApproachPhase::Final => "On final. Gear and flaps as the speed allows.",
-                        ApproachPhase::Flare if cfg.flare_power.is_some() => "Over the threshold, flaring, easing the power back.",
-                        ApproachPhase::Flare => "Over the threshold, flaring, power to idle.",
+                        ApproachPhase::Flare => "Over the threshold, flaring, easing the power back.",
                     };
                     // A go-around the stabilised gate ordered says why, and
                     // is a hazard (the EFB's caution); the rest announce.

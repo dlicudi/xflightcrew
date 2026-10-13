@@ -69,22 +69,11 @@ pub struct AircraftProfile {
     /// against the 172's 24 volt threshold (2026-09-11). `None` = 24.
     #[serde(default)]
     pub bus_volts_nominal: Option<f64>,
-    /// Optional progressive autoland power reduction; absent retains idle flare.
-    #[serde(default)]
-    pub flare_power: Option<FlarePowerProfile>,
     /// The least thrust (lever ratio) the autoland holds on a stabilised
     /// final, when not more than a few knots fast. Jets fly the approach on
     /// thrust; `None` lets the speed law idle the engines (the pistons).
     #[serde(default)]
     pub approach_thrust_min: Option<f64>,
-    /// How the landing arrest leads this autopilot's lag. `None` = the
-    /// 172's fitted numbers (see [`ArrestLeadProfile`]).
-    #[serde(default)]
-    pub arrest_lead: Option<ArrestLeadProfile>,
-    /// The attitude flare's elevator limits and ground pull, when the
-    /// defaults do not fit.
-    #[serde(default)]
-    pub flare_elevator: Option<FlareElevatorProfile>,
     /// The rudder's authority on the takeoff roll, when measured.
     #[serde(default)]
     pub roll_rudder: Option<RollRudderProfile>,
@@ -394,11 +383,14 @@ pub struct AircraftProfile {
     pub load_sheet: LoadSheet,
     /// Fly an ILS COUPLED on this airframe's own approach mode (see
     /// `ils::Coupling`): armed on an intercept from below the beam, the bug
-    /// and VS dial handed over as the localizer and glideslope capture. Off
-    /// until a capture has been flown on the type; the copilot's own path
-    /// otherwise.
+    /// and VS dial handed over as the localizer and glideslope capture.
+    /// Absent: coupled wherever the surveyed autopilot has an approach mode
+    /// (`ils::coupled_allowed`, `systems::ApType::has_approach`): the final
+    /// is the airframe's own modes' to minimums where it has them. `false`
+    /// where a capture was flown and failed, or the autopilot lands it
+    /// another way (the Zibo's `autopilot_lands`).
     #[serde(default)]
-    pub ils_coupled: bool,
+    pub ils_coupled: Option<bool>,
     /// Radio height, feet, below which a coupled ILS is handed back to
     /// autoland's own VS final (`ils::CouplingIn::decouple_below_ft`).
     /// `None`: coupled to the arrest.
@@ -701,6 +693,7 @@ pub use facts::*;
 mod speeds;
 pub use speeds::*;
 mod generic;
+pub mod learned;
 pub use generic::*;
 mod builtin_profiles;
 use builtin_profiles::*;

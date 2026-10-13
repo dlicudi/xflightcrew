@@ -419,16 +419,3 @@ roll_rudder:
 takeoff_power:
   torque_ftlb: 1250.0
   until_kias: 150.0
-
-# The attitude flare: 117 and 86 fpm (LEMG 13, 1791801818, 1791802111),
-# no ground pull needed (the old fitted flare's history, issue #196, is in
-# docs/dev-history.md).
-flare_elevator:
-  # The attitude flare's pull limit: it holds the nose angle, the limit is
-  # the stop.
-  max: 0.8
-  max_push: 0.05
-flare_power:
-  reduction_per_second: 0.1
-  retard_max_per_s: 0.1
-  retard_below_ft: 20.0

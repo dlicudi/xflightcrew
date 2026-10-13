@@ -1,85 +1,10 @@
-//! Profile schema, the flight-law sections: flare power and arrest lead, cabin
-//! air, the altimeter, anti-ice, autoflight and its MCP, the autopilot's
-//! landing and FMA, the flare elevator and model, the arrest roll, the ground
-//! plant, the rollout steer, the speed governor, the final track, the rotate
-//! elevator and the roll rudder.
+//! Profile schema, the flight-law sections: cabin air, the altimeter,
+//! anti-ice, autoflight and its MCP, the autopilot's landing and FMA, the
+//! ground plant, the rollout steer, the speed governor, the rotate elevator
+//! and the roll rudder. What the hand-flown final flies on is MEASURED, never
+//! declared (`aircraft::learned`).
 
 use super::*;
-
-/// Simulator tuning, not a POH power setting. Throttle ratios per second.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct FlarePowerProfile {
-    /// The fastest the retard walks the lever, per second, where
-    /// `retard_max_per_s` is not declared.
-    pub reduction_per_second: f64,
-    /// The retard HEIGHT (radio ft): nothing comes off above it, and below
-    /// it the lever walks to idle timed to the wheels (`autoland::
-    /// FlarePower`). `None` retards from the flare gate. A Boeing retards
-    /// at 20 to 30 ft and lands at idle; keyed on the sink, the law fired in
-    /// the float the arrest had made (LEMG 13, 2026-09-26: idle at 20 ft
-    /// level, -859 fpm and 2.4 g at the wheels) or held until the float was
-    /// already spent (LEMG 13, 2026-09-28: inside 185 at 15.8 ft, then held
-    /// again for the sink it had rebuilt).
-    #[serde(default)]
-    pub retard_below_ft: Option<f64>,
-    /// The fastest the retard walks the lever, per second (absent:
-    /// `reduction_per_second`). Slower, the thrust leaving does not rebuild
-    /// the sink in the last second.
-    #[serde(default)]
-    pub retard_max_per_s: Option<f64>,
-    /// The SPEED key: the retard waits while the airspeed is more than this
-    /// under the approach speed (kt; absent: `autoland::RETARD_SLOW_KTS`).
-    /// The thrust is what holds a slow flare's speed, and a knot the retard
-    /// takes comes back as sink at the wheels (the 737's plant: 63 fpm a
-    /// knot). It defers only a retard not yet begun on a flare still
-    /// sinking: a float takes the thrust off whatever the speed
-    /// (`autoland::RETARD_FLOAT_FPM`; EGBB 15, 2026-09-28, issue #146).
-    #[serde(default)]
-    pub retard_slow_kts: Option<f64>,
-    /// The TIME key: below the retard height the lever starts off only once
-    /// the time to the wheels (radio over sink) is inside this (s), and
-    /// then walks to idle timed to them. `None`: at the retard height.
-    #[serde(default)]
-    pub retard_at_s: Option<f64>,
-    /// ...or once the airspeed is more than this over the approach speed
-    /// (kt): a fast flare floats, and the float is the speed.
-    #[serde(default)]
-    pub retard_fast_kts: Option<f64>,
-    /// The short final's power HOLD: from this many seconds of the path's
-    /// sink above the runway (at the groundspeed), the speed law only ever
-    /// takes power off, as the roundout's does, unless the airspeed projects
-    /// under the flare's protected speed (`autoland::short_final_power_held`).
-    /// A lever the speed law adds in the seconds before the servos are
-    /// released keeps spooling into the roundout with nothing trimming
-    /// against it. `None`: held only in the roundout.
-    #[serde(default)]
-    pub hold_from_s: Option<f64>,
-    /// The FLOAT's retard, lever per second (absent: `retard_max_per_s`).
-    /// A float has no sink to rebuild too hard: the thrust holding it up is
-    /// what lands it. The timed retard's cap (the 737's 0.04, for the sink
-    /// it rebuilds in the last second) walked 0.33 to 0.25 through LXGB's
-    /// 2 s float at 10 to 4.5 ft (2026-10-06), where the touchdown came
-    /// 631 m past the threshold. The roundout's float takes the same rate.
-    #[serde(default)]
-    pub retard_float_per_s: Option<f64>,
-}
-
-/// How the landing arrest's vertical-speed dial leads THIS autopilot's lag
-/// (`autoland::vs_dial_fpm`): dial = target + gain x (target - predicted),
-/// where predicted = actual + trend_seconds x the sink's rate of change,
-/// capped at `max_climb_fpm`. The default is the 172's, fitted to a
-/// first-order 4.5 s lag (LXGB 27, 2026-09-14). A jet's vertical-speed
-/// mode is second-order with two seconds of dead time (the 737 at EGCC,
-/// 2026-09-19: the same gain and cap pinned the dial at +300 for three
-/// seconds and ballooned it to +160 fpm at ten feet), so a slower airframe
-/// declares a lower gain, a lower cap and a trend term for damping.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct ArrestLeadProfile {
-    pub gain: f64,
-    pub max_climb_fpm: f64,
-    #[serde(default)]
-    pub trend_seconds: f64,
-}
 
 /// The cabin's air: how THIS airframe's bleed (pressurisation) and crew
 /// oxygen are switched and read. Declared, never guessed: the SF50's bleed is
@@ -477,45 +402,6 @@ pub struct PanelSwitch {
     pub position: String,
 }
 
-/// The attitude flare's elevator limits for this airframe
-/// (`autoland::attitude_flare`), and the pull its ground effect takes. An
-/// airframe that declares none flies the defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct FlareElevatorProfile {
-    /// Most pull the flare may command.
-    #[serde(default = "default_flare_max")]
-    pub max: f64,
-    /// Most push, as a positive number.
-    #[serde(default = "default_max_push")]
-    pub max_push: f64,
-    /// The extra pull this airframe's ground effect takes at the wheels,
-    /// MEASURED on its own flares (`autoland::attitude_flare` feeds it
-    /// forward along the ground effect's shape); 0 for an airframe whose
-    /// flare finds it in time (the 172). The SR22's low wing took 0.33 at
-    /// 5 ft to 0.61 at the wheels with the nose held flat (LEMG 30,
-    /// 1791793670, 1791793963).
-    #[serde(default)]
-    pub ground_pull: f64,
-}
-
-impl Default for FlareElevatorProfile {
-    fn default() -> Self {
-        Self {
-            max: default_flare_max(),
-            max_push: default_max_push(),
-            ground_pull: 0.0,
-        }
-    }
-}
-
-pub(super) fn default_flare_max() -> f64 {
-    0.35
-}
-
-pub(super) fn default_max_push() -> f64 {
-    0.10
-}
-
 /// The yaw plant of a free castoring nose (`ground_steer::GroundPlant`),
 /// identified from the airframe's own ground ticks: the one ground law's
 /// model for the taxi, the line-up, the roll's start and the rollout
@@ -870,39 +756,5 @@ impl RollRudderProfile {
             Some(p) => self.yaw_dps * (v / self.at_kts).powf(p),
             None => self.yaw_dps * (v / self.at_kts).powi(2),
         }
-    }
-}
-
-impl FlareElevatorProfile {
-    /// Used only when every number is a sane one.
-    pub fn valid(self) -> Option<Self> {
-        // Up to the stop: the attitude flare holds the nose angle, so
-        // its limit is the elevator's travel, not a balloon guard. At
-        // 0.6 the SR22's 0.8 dropped the whole block and the old law
-        // flew it in silence (452 fpm, LEMG 13, 1791792579).
-        ((0.05..=1.0).contains(&self.max) && (0.0..=0.3).contains(&self.max_push)).then_some(self)
-    }
-}
-
-impl Default for ArrestLeadProfile {
-    fn default() -> Self {
-        Self {
-            gain: 2.0,
-            max_climb_fpm: 300.0,
-            trend_seconds: 0.0,
-        }
-    }
-}
-
-impl ArrestLeadProfile {
-    /// A declared lead is only used when every number is a number.
-    pub fn valid(self) -> Option<Self> {
-        (self.gain.is_finite()
-            && (0.0..=5.0).contains(&self.gain)
-            && self.max_climb_fpm.is_finite()
-            && (0.0..=1000.0).contains(&self.max_climb_fpm)
-            && self.trend_seconds.is_finite()
-            && (0.0..=5.0).contains(&self.trend_seconds))
-        .then_some(self)
     }
 }

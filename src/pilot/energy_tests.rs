@@ -19,6 +19,10 @@ struct Plant {
 
 const A_T: f64 = 6.0; // ft/s^2 per unit of throttle
 const DRAG_C: f64 = 3.0 / (65.0 * FPS_PER_KT * 65.0 * FPS_PER_KT);
+/// What a unit of lever buys this plant at 65 kt, by the book's rule
+/// (twice the 172's 730 fpm best-rate climb: 1,460 against the plant's
+/// 1,230), the engine's 0.5 s.
+const PLANT_TECS: Tecs = Tecs { fpm_per_unit: 1_460.0, spool_s: 0.5 };
 
 impl Plant {
     fn new(kts: f64, path_vs_fpm: f64) -> Self {
@@ -58,15 +62,22 @@ fn fly(mut p: Plant, target_kts: f64, secs: f64) -> Run {
     while t < secs {
         if t >= next {
             let kts = p.v_fps / FPS_PER_KT;
-            thr = law.step(In {
-                ias_kts: kts,
-                accel_kts_s: (kts - prev_kts) / tick,
-                vs_fpm: p.vs_fpm(),
-                target_kts,
-                path_vs_fpm: p.path_at(t),
-                thr_now: thr,
-                dt: tick,
-            });
+            thr = law
+                .step(
+                    In {
+                        ias_kts: kts,
+                        accel_kts_s: (kts - prev_kts) / tick,
+                        vs_fpm: p.vs_fpm(),
+                        target_kts,
+                        floor_kts: None,
+                        path_vs_fpm: p.path_at(t),
+                        thr_now: thr,
+                        dt: tick,
+                        flare_to_wheels_s: None,
+                    },
+                    PLANT_TECS,
+                )
+                .lever;
             prev_kts = kts;
             next += tick;
             run.kts.push(kts);
@@ -91,7 +102,12 @@ fn a_phugoid_swing_does_not_move_the_lever() {
     let mut law = EnergyThrottle::default();
     let mut thr = 0.5;
     for _ in 0..30 {
-        thr = law.step(In { ias_kts: kts, accel_kts_s, vs_fpm: vs, target_kts: kts, path_vs_fpm: 0.0, thr_now: thr, dt: 0.33 });
+        thr = law
+            .step(
+                In { ias_kts: kts, accel_kts_s, vs_fpm: vs, target_kts: kts, floor_kts: None, path_vs_fpm: 0.0, thr_now: thr, dt: 0.33, flare_to_wheels_s: None },
+                PLANT_TECS,
+            )
+            .lever;
     }
     assert!((thr - 0.5).abs() < 1e-9, "lever {thr}");
     let old = crate::tools::speedhold::throttle_adjust(0.0, accel_kts_s);
@@ -111,7 +127,7 @@ fn a_slow_start_in_alt_hold_recovers_without_a_swing() {
     assert!(late(&r.vs).iter().all(|v| v.abs() < 250.0), "no swing late");
     let max_rate = r.thr.windows(2).map(|w| (w[1] - w[0]).abs() / 0.33).fold(0.0, f64::max);
     // Slow by 15 kt the hand moves at the slow side's rate, never faster.
-    assert!(max_rate <= SLEW_SLOW_PER_S + 1e-9, "the hand's rate: {max_rate}");
+    assert!(max_rate <= SLEW_PROTECT_PER_S + 1e-9, "the hand's rate: {max_rate}");
 }
 
 /// The glideslope captured from level at 10 s: the power comes off as the

@@ -472,9 +472,13 @@ pub async fn course_source_to_nav1(xp: &dyn crate::xplane::XPlane) -> Option<boo
     Some(xp.get_float(HSI_SOURCE).await.is_ok_and(|v| v.round() as i64 == 0))
 }
 
-/// Whether the live airframe may fly an ILS coupled.
+/// Whether the live airframe may fly an ILS coupled: as its profile says,
+/// else wherever its surveyed autopilot has an approach mode (2026-10-13:
+/// the final is flown in the modes built for it, down to minimums; our own
+/// heading and path, `FinalHeading`, only where the airframe cannot).
 pub fn coupled_allowed() -> bool {
-    crate::aircraft::live_profile().is_some_and(|p| p.ils_coupled)
+    let declared = crate::aircraft::live_profile().and_then(|p| p.ils_coupled);
+    declared.unwrap_or_else(|| crate::systems::current().ap_type.is_some_and(crate::systems::ApType::has_approach))
 }
 
 // ---------------------------------------------------------------------------

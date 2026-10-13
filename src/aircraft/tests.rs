@@ -77,8 +77,6 @@
             ("procedure", "NOT_CLIMBING_FPM", "a rate that is not a climb, any airframe"),
             ("pilot", "DEADBAND_FPM", "the energy throttle's hand: an energy-rate error it leaves alone (about 1.5 kt at a 172's approach speed), the learnt power still trims it; any airframe (2026-10-11)"),
             ("autoland", "LEVEL_RETURN_MAX_FPM", "the rate an engaged altitude hold may return to its altitude at and still be holding it, a watchdog band, not a commanded rate; any airframe (2026-10-11)"),
-            ("pilot", "SLOW_KTS", "a band under the airframe's own approach target where the energy throttle closes the deficit faster, not a commanded speed; any airframe (2026-10-12)"),
-            ("pilot", "URGENT_SLOW_KTS", "a band under the airframe's own approach target where the energy throttle's hand moves faster, not a commanded speed; any airframe (2026-10-12)"),
             ("autoland", "MAX_OFF_PATH_FPM", "how much steeper than the path's own rate a visual final's dial may go to rejoin it from above, a bound, not a commanded rate; any airframe (2026-10-12)"),
             ("pilot", "SPEED_TERM_MAX_FPM", "the most energy rate a speed error may ask of the energy throttle, a bound on the request, not a commanded rate; any airframe (2026-10-11)"),
             ("pilot", "REJOIN_MAX_FPM", "how far off the path's own sink the hand-flown segment may ask to rejoin it, a bound on the request, not a commanded rate; any airframe (2026-10-12)"),
@@ -238,11 +236,6 @@
             ),
             (
                 "autoland",
-                "VS_LEAD_MAX_CLIMB_FPM",
-                "default: ArrestLeadProfile overrides",
-            ),
-            (
-                "autoland",
                 "MAX_CLIMB_FPM",
                 "floor only: max_climb_fpm() takes the airframe's",
             ),
@@ -275,16 +268,6 @@
                 "autoland",
                 "APPROACH_FAST_KTS",
                 "MARGIN: over the approach speed",
-            ),
-            (
-                "autoland",
-                "RETARD_SLOW_KTS",
-                "MARGIN: default only; the profile's retard_slow_kts",
-            ),
-            (
-                "autoland",
-                "RETARD_SINK_FLOOR_FPM",
-                "floor only: time to the wheels is never infinite",
             ),
             (
                 "autoland",
@@ -1698,3 +1681,32 @@
             .all(|r| second.contains(&r.as_str())));
         assert!(p.seat_belt_signs.is_some() && p.transponder_mode_knob.is_some());
     }
+
+/// What the pilot controller flies on is MEASURED (`aircraft::learned`),
+/// never typed (2026-10-13): no profile carries the flare's elevator limits
+/// or ground pull, its power schedule, the arrest's lead or the final's
+/// track law. A key added back is a gain fitted by hand again.
+#[test]
+fn no_profile_types_the_pilots_numbers() {
+    const GONE: [&str; 6] = ["flare_elevator", "flare_power", "final_track", "arrest_lead", "max_push", "ground_pull"];
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+    let mut checked = 0;
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.extension().is_none_or(|x| x != "yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
+            for key in GONE {
+                assert!(
+                    !line.trim_start().starts_with(&format!("{key}:")),
+                    "{}: `{key}` is measured now, never declared",
+                    path.display()
+                );
+            }
+        }
+        checked += 1;
+    }
+    assert!(checked >= 10, "only {checked} profiles");
+}

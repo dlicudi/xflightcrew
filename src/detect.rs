@@ -645,6 +645,30 @@ pub(crate) fn spawn_aircraft_detector(
                                 crate::systems::publish(Some(sys));
                             }
                             if let Some(text) = acf {
+                                // The model the pilot controller flies: the
+                                // geometry, the engines and what an
+                                // identification learned on THIS .acf
+                                // (`aircraft::learned`); said when stale.
+                                let model = aircraft::learned::AcfModel::read(&rel, &text);
+                                blackbox::record(
+                                    "profile_probe",
+                                    serde_json::json!({ "profile": id, "acf_model": {
+                                        "level_deg": model.geometry.level_deg,
+                                        "tail_strike_deg": model.geometry.tail_strike_deg,
+                                        "engine": model.engine.map(|e| format!("{e:?}")),
+                                        "learned": match &model.learned {
+                                            Ok(l) => format!("measured {}", l.measured_on),
+                                            Err(e) => format!("{e:?}"),
+                                        },
+                                    }}),
+                                );
+                                if model.learned == Err(aircraft::learned::Refused::Stale) {
+                                    det_voice.alert(
+                                        voice::Priority::Advisory,
+                                        "This aircraft has changed since I measured it. I'll fly it on the fleet's numbers until it is measured again.".to_string(),
+                                    );
+                                }
+                                aircraft::learned::publish_acf_model(Some(model));
                                 if prof.retractable_gear && prof.gear_warning.is_none() {
                                     let w = aircraft::gear_warning_from_acf(&text);
                                     tracing::info!(?w, "gear warning envelope from the .acf");

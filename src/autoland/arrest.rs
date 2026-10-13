@@ -51,33 +51,6 @@ pub fn arrest_hands_step(taken: bool, arresting: bool) -> ArrestHands {
         (true, false) => ArrestHands::Return,
     }
 }
-
-/// Outside a landing arrest (`arresting` false) the dial is the target, as it
-/// always was. Inside one it leads the target by the autopilot's outstanding
-/// error - see [`VS_LEAD_GAIN`] - against the sink PREDICTED `trend_seconds`
-/// ahead (`trend_fpm_s`, the vertical speed's rate of change): on a
-/// second-order autopilot the trend is the damping the bare error lacks.
-/// The gain, the cap and the trend horizon are the airframe's
-/// ([`crate::aircraft::ArrestLeadProfile`]; the default is the 172's).
-pub fn vs_dial_fpm(
-    target_fpm: f64,
-    actual_fpm: f64,
-    trend_fpm_s: f64,
-    arresting: bool,
-    lead: crate::aircraft::ArrestLeadProfile,
-) -> f64 {
-    if !arresting {
-        return target_fpm;
-    }
-    let trend = if trend_fpm_s.is_finite() {
-        trend_fpm_s
-    } else {
-        0.0
-    };
-    let predicted = actual_fpm + lead.trend_seconds * trend;
-    (target_fpm + lead.gain * (target_fpm - predicted)).clamp(-1200.0, lead.max_climb_fpm)
-}
-
 /// May the roundout own the descent from HERE? Only where a
 /// [`ROUNDOUT_VS_FPM`] descent still REACHES the pavement. At or past the
 /// threshold, always — there the unsigned glidepath distance grows again and

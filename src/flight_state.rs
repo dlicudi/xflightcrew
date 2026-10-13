@@ -97,11 +97,6 @@ pub(crate) fn airframe_facts(p: &AircraftProfile) -> crate::aircraft::AirframeFa
         approach_floor_kts: a::approach_floor_for(vs0, p.vs_clean_kts),
         stall_curve: a::stall_curve_for(p.vs_clean_kts, vs0, p.flaps.as_ref()),
         approach_thrust_min: a::approach_thrust_min_for(p.approach_thrust_min),
-        arrest_lead: p
-            .arrest_lead
-            .and_then(a::ArrestLeadProfile::valid)
-            .unwrap_or_default(),
-        flare_elevator: valid_or_said(p, "flare_elevator", p.flare_elevator, a::FlareElevatorProfile::valid),
         roll_rudder: p.roll_rudder.and_then(a::RollRudderProfile::valid),
         landing_distance_m: a::landing_distance_m_for(
             p.reference.as_ref().and_then(|r| r.landing_distance_ft),
@@ -123,6 +118,9 @@ pub(crate) fn airframe_facts(p: &AircraftProfile) -> crate::aircraft::AirframeFa
         mode_knob: p.transponder_mode_knob.clone(),
         exterior: a::Exterior::from_lights(&p.lights),
         altimeter: p.altimeter.clone(),
+        // The .acf's model is read at detection (`publish_acf_model`): a
+        // new airframe starts unmeasured, never on the last one's numbers.
+        acf_model: None,
     }
 }
 
@@ -1795,10 +1793,11 @@ mod tests {
             text.split("#[cfg(test)]\nmod ").next().unwrap()
         }
         // The .acf's facts, read by the detector once it has the file.
-        const ACF_WRITERS: [&str; 3] = [
+        const ACF_WRITERS: [&str; 4] = [
             "pub fn publish_nose_castors(",
             "pub fn publish_nose_free(",
             "pub fn publish_gear_warning(",
+            "pub fn publish_acf_model(",
         ];
         let mut found = Vec::new();
         for f in crate::test_support::rust_files(&root) {
@@ -1850,22 +1849,3 @@ mod tests {
     }
 }
 
-/// A declared block validated, or dropped LOUDLY: a number out of range
-/// otherwise swaps the airframe's law in silence (the SR22's 0.8 pull
-/// dropped its flare block and the old law flew it, LEMG 13, 1791792579).
-fn valid_or_said<T: Copy>(
-    p: &AircraftProfile,
-    block: &str,
-    declared: Option<T>,
-    valid: impl Fn(T) -> Option<T>,
-) -> Option<T> {
-    let v = declared.and_then(valid);
-    if declared.is_some() && v.is_none() {
-        tracing::warn!(target: "xvoicelayer::aircraft", profile = %p.id, block, "a declared block is out of range and is IGNORED");
-        crate::blackbox::record(
-            "aircraft",
-            serde_json::json!({"event": "block_invalid", "profile": p.id, "block": block}),
-        );
-    }
-    v
-}

@@ -14581,3 +14581,59 @@ minimums it is hand flown to the wheels as one segment, all three controls ours.
   on the path and `att_gamma` following it from minimums; no `vs_dial` or `heading_set`
   under `hands`; the touchdown sink and the rollout's offset; and no `going_around`
   `off_centreline_low` or `unstabilised_below_floor`.
+
+### 2026-10-13: the pilot flies on measured responses (UNFLOWN)
+
+The pilot controller's numbers were hand picked per airframe (`b_hat` 32, `flare_elevator`
+limits and `ground_pull`, `flare_power` schedules, `arrest_lead`, the line's closure times). The
+literature derives them from MEASURED control effectiveness and book figures (research notes,
+2026-10-12: ArduPilot AP_TECS, AP_Landing, AP_AutoTune; PX4 NPFG and FW_LND; INDI on the
+Citation II, Grondman et al. 2018; TECS, Lambregts AIAA 83-2239). Now:
+
+- **Identification** (`xvl identify`, `src/identify.rs`; `pilot::ident`): an air start at a safe
+  height on the approach speed and flap, then with the autopilot off a 3-2-1-1 on the elevator and
+  doublets on the ailerons and rudder (each sign twice, 8 to 10 Hz parallel reads, refused when
+  paused or replaying, aborted past 20 degrees of bank, 10 of pitch or 800 ft lost), a power
+  step in ALT hold. OUTPUT-error fits (equation error read a 0.1 s-late roll at 73% of its
+  effectiveness at 8 Hz): effectiveness, damping, the airflow angle's spring and path, delay,
+  the median of the inputs; the dihedral from the rudder's slip; TECS's `K_thr2STE` and spool.
+  The 737's flight of 2026-10-12 (160 kt, flaps 15): pitch 23 deg/s2 a unit, spring 1.7, path
+  0.6 to 0.8; roll 47 over 1.87 /s; yaw 15, weathercock 1.8, path 0.28.
+- **Stored per `.acf`** (`profiles/learned/<acf>.json`, `aircraft::learned`): keyed by the
+  `.acf`'s fingerprint (an edit retires it, said) and a schema version; read by the detector
+  into the facts' `acf_model` with the `.acf`'s geometry and engine class.
+- **Gains by McRuer's crossover rule** (`pilot::response::design`, 50 degree margin, the delay
+  measured plus half the tick plus 50 ms transport), the response scaled by the air. On the 172's
+  pitch fit the attitude loop asks 0.15 elevator a degree (the hand tuning's 0.12).
+- **Attitude limits, not elevator limits**: the tail strike from the `.acf`'s fuselage pivoted on
+  the extended mains (737 10.7, A330 11.4, MD-82 10.9, 172 14.1), less 2; the mains first (the
+  nosewheel's level plus 1, ramped in from the hold-off). The elevator has its whole travel.
+- **NPFG** (`pilot::line`): one period, `4 pi zeta tc` on the measured bank loop, safety factor 1
+  (NPFG's 1.5 is for the bare roll mode; at 1.5 the A330's slow sidestick could not close #180's
+  gates); the bank already flown counted one `tc` ahead.
+- **The rudder** (`pilot::yaw`): NDI on the measured yaw; the slip to zero, then the decrab
+  (the crab's turn plus two time constants before the planned wheels), the wing down with it.
+- **TECS** (`pilot::energy`): `K_thr2STE` measured or twice the book climb; underspeed (90%, the
+  speed's weight tripled) and bad descent; the flare's retard at idle with the engine spooled down
+  as the planned wheels arrive (piston 0.3 s, turboprop 1, jet 2.5, or measured).
+- **Above minimums**: the ILS is coupled wherever the surveyed autopilot has an approach mode
+  (`ils_coupled` now optional). A GPS approach mode is NOT used: the approach is not loaded into
+  the navigator by autoland; `FinalHeading` remains its fallback.
+- **The bench** (`pilot::plants_tests`): seven plants (the six fitted airframes and the 737 from
+  its identification), each identified first (effectiveness within 20%: worst 13%, the 172's
+  roll and the 737's roll 20% high at 0.2), then flown from 200 and 300 ft, 23 m either side,
+  calm and 15 kt either way: within 3 m, 60 to 200 fpm, the heading within 2 degrees at the
+  wheels. Gusts: within 4 m (the decrab's last seconds on a capped bank). The A330 gates: within
+  2 m on the 0.35 s delay, 4 m at 0.6 s; gate 1 crosses the line by 4 to 6 m first.
+- **Deleted**: `flare_power`, `flare_elevator` (max, max_push, ground_pull), `arrest_lead` (dead:
+  the arrest is hand flown) and their schema, facts and profile blocks; `FlarePower`,
+  `balloon_power`, `roundout_float_lever`, `short_final_power_held`, `vs_dial_fpm`; b_hat,
+  FPM_PER_THROTTLE, CLOSE_S, VEL_TAU_S, BANK_LEAD_S, SPEED_CLOSE_SLOW_S, URGENT_SLOW_KTS; and the
+  tests and recording only they read (`lemg_737_retard_tests` but its knob test,
+  `lemg13_king_air_roundout_tests`, `king_air_lemg13_roundouts.jsonl`). Kept: `rollout_steer`
+  (a GROUND response; identification measures the air), `approach_thrust_min`.
+- **UNFLOWN.** Fly `xvl identify` per airframe first (check the printed fits against the
+  tables above and the stored file), then the cards. On the tape: `autoland` `pilot_airframe`
+  (`measured`, the limits), the ticks' `att_k`, `line_period_s`, `flare_rud`, `yaw_mode`
+  (Decrab only in the last seconds), `kp`; `power` `tecs_flare` / `tecs_underspeed`; the heading
+  at touchdown against the runway; no `steer_yield`.

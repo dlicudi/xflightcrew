@@ -38,6 +38,8 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
     // `_name` is one token here (split on whitespace); good enough for a label.
     p.display_name = format!("{name} (no profile)");
     p.checklist = None;
+    // The surveyed autopilot decides the coupled ILS (`ils::coupled_allowed`).
+    p.ils_coupled = None;
     p.checklist_map = Vec::new();
     p.checklist_flow = Default::default();
     p.checklist_map_only = false;

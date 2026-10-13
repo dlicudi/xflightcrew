@@ -126,28 +126,6 @@ flaps:
     - { label: "50", spoken: fifty percent, ratio: 0.5, vfe_kts: 150.0 }
     - { label: full, spoken: full,          ratio: 1.0, vfe_kts: 110.0 }
 
-# THE LANDING: the attitude flare (docs/tasks/autonomy-layers). Its
-# elevator answers about 25 deg/s per unit, inside the band the flare is
-# tested over, and its low wing's ground effect is MEASURED (`ground_pull`):
-# 174 and 123 fpm (2026-10-12; the old fitted flare's history is in
-# docs/dev-history.md).
-flare_elevator:
-  # The attitude flare's pull limit: the low wing's ground effect held the
-  # nose at 0.3 deg under a 1.2 to 1.6 command with the pull on 0.5 from
-  # 3 ft (LEMG 13, 1791792245). The law holds the nose angle; the limit is
-  # the stop, not a balloon guard.
-  max: 0.8
-  # Its low wing's ground effect, measured: the pull went from about 0.1 on
-  # the approach to 0.61 at the wheels with the nose held flat (LEMG 30,
-  # 1791793670, 1791793963: 247 fpm twice). Fed forward along the ground
-  # effect's shape (`attitude_flare::ground_shape`).
-  ground_pull: 0.5
-  max_push: 0.05
-flare_power:
-  reduction_per_second: 0.1
-  retard_max_per_s: 0.1
-  retard_below_ft: 20.0
-
 # XChecklist file to interpret (GoofyJP, read-only).
 # Taxi steering. The nosewheel CASTORS: the yoke-heading channel (nosewheel
 # + rudder) has only prop wash behind it at taxi speed, and measured over the

@@ -191,6 +191,7 @@ const AUTOLAND_WANT: &[F] = &[
     F::PitchYield,
     F::RollYield,
     F::R,
+    F::SteerYield,
 ];
 /// ...and with the ILS tuned, its needles (`crate::ils`; the modes are the
 /// bitfield's, `autoflight::Modes`, read beside the frame).
@@ -208,6 +209,7 @@ const AUTOLAND_WANT_ILS: &[F] = &[
     F::PitchYield,
     F::RollYield,
     F::R,
+    F::SteerYield,
     F::Hdef,
     F::Vdef,
     F::LocValid,
@@ -352,10 +354,9 @@ mod glidepath_gain_tests;
 #[cfg(test)]
 mod approach_power_floor_tests;
 
-/// The 737's flare retard keys (`flare_power`) on its own numbers, and the
-/// heading knob its LEMG 13 finals of 2026-09-28 set.
+/// The heading knob the 737's LEMG 13 finals of 2026-09-28 set.
 #[cfg(test)]
-mod lemg_737_retard_tests;
+mod lemg13_737_knob_tests;
 
 #[cfg(test)]
 mod ap_engage_tests;
@@ -465,14 +466,6 @@ mod missed_approach_speed_tests;
 /// 0.3 to 0.5 s.
 #[cfg(test)]
 mod lemg13_king_air_rollout_tests;
-
-/// Issue #197, the roundout: LEMG 13, the King Air C90B from 5 nm (iMac
-/// 2026-09-30, thirteen autolands). The recorded final from 150 ft to 6 s
-/// after the arrest took the servos (`bench/landings/
-/// king_air_lemg13_roundouts.jsonl`: autoland ticks, `arrest_hands`, and
-/// the `state` samples' groundspeed and pitch trim).
-#[cfg(test)]
-mod lemg13_king_air_roundout_tests;
 
 /// The LEMG 13 737 final of 2026-10-05 through the energy plan.
 #[cfg(test)]
