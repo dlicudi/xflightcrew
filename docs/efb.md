@@ -213,7 +213,29 @@ and none at all is open sea. Tiles are cached (96 read, 1,024 simplified, 16 ans
 on the real install: the EGKK terminal view 69 kB at 1,400 px (22 kB on a phone), a cruise view
 from Malaga to Gatwick 150 to 200 kB, a few to 30 ms. The page asks again only once its view
 leaves the tiles it holds or its zoom moves by about a step, with a margin of 30% (10%, then
-none, to stay within 1,200 tiles); a view wider than that draws no water. No map data: no water,
+none, to stay within 1,200 tiles).
+
+Wider than 1,200 tiles, `/basemap` answers from a coarse **world layer** (`basemap::World`),
+in the same wire format, so the coast is drawn at every zoom. It is built once per run when the
+EFB first serves (never while it is off; turning the EFB off mid-build cancels it), on its own
+thread (`efb-world`), paced to half a core, never on a request or the command loop: every
+installed tile read through the same reader, thinned (its sides kept), then each 10x10 degree
+block DISSOLVED: the tiles' shared sides cancel (an even-odd fill: a side drawn twice is no
+side), the open sea's missing tiles join in, and what is left (the coast, the lakes, the block's
+own sides) is chained into rings and thinned on Mercator to 2^-5 degrees of longitude, rings
+smaller than that dropped. A wide view gets the blocks under it, thinned again to its own pixel
+and rounded to the decimals that pixel needs, under the same 400 kB (coarser until it fits); the
+answer's `bbox` is the blocks' tiles. Until the layer is built a wide view is a 503 with
+`Retry-After: 5` and the page asks again; the water already drawn stays until a new answer
+arrives, so zooming in or out never blanks the map, and the detailed tiles take over as soon as
+the view is within 1,200 tiles. The antimeridian is the world's edge (nothing wraps), and
+everything beyond the page's 85.05 degrees is flattened onto it for thinning. Logged once
+("EFB world basemap built") and blackboxed `efb` `basemap_world` (`ms`, `tiles`, `rings`,
+`bytes`). Measured on the real install (17,848 tiles, release): 5.8 s unpaced (16.9 s paced as it
+runs live), 53,680 rings, 4.9 MB held; the whole world 322 kB at 2^-2 on 2,560 px or 1,400 px
+(102 kB at 2^0 on a phone), Europe 317 kB at 2^-4 on 1,400 px, under 50 ms built, cached after.
+
+No map data: no water,
 the fields still come (the field directory is apt.dat's). Land is the map's background, water a muted blue grey (`--water`), the coast a
 faint line (`--coast`), in the night palette whatever the theme.
 

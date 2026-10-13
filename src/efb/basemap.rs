@@ -257,7 +257,21 @@ pub(crate) fn water_tiles(
     edge: &dyn Fn(i32, i32, usize) -> f32,
 ) -> Vec<(i32, i32)> {
     let (la0, la1, lo0, lo1) = (lat.0, lat.1, lon.0, lon.1);
-    let mut class: HashMap<(i32, i32), bool> = HashMap::new();
+    if la1 < la0 || lo1 < lo0 {
+        return Vec::new();
+    }
+    // The box as a grid (the whole world's is 64,800 cells): present, and
+    // each missing tile's answer once it has one.
+    let cols = (lo1 - lo0 + 1) as usize;
+    let at = |a: i32, o: i32| (a - la0) as usize * cols + (o - lo0) as usize;
+    let inside_box = |a: i32, o: i32| (la0..=la1).contains(&a) && (lo0..=lo1).contains(&o);
+    let mut here = Vec::with_capacity(cols * (la1 - la0 + 1) as usize);
+    for a in la0..=la1 {
+        for o in lo0..=lo1 {
+            here.push(present(a, o));
+        }
+    }
+    let mut class: Vec<Option<bool>> = vec![None; here.len()];
     // The neighbour, and the side of IT that faces us.
     let around = |a: i32, o: i32| {
         [
@@ -269,12 +283,17 @@ pub(crate) fn water_tiles(
     };
     for a in la0..=la1 {
         for o in lo0..=lo1 {
-            if present(a, o) {
+            if here[at(a, o)] {
                 continue;
             }
             let (mut wet, mut dry) = (0, 0);
             for (na, no, side) in around(a, o) {
-                if present(na, no) {
+                let there = if inside_box(na, no) {
+                    here[at(na, no)]
+                } else {
+                    present(na, no)
+                };
+                if there {
                     if edge(na, no, side) >= 0.5 {
                         wet += 1;
                     } else {
@@ -283,7 +302,7 @@ pub(crate) fn water_tiles(
                 }
             }
             if wet + dry > 0 {
-                class.insert((a, o), wet >= dry);
+                class[at(a, o)] = Some(wet >= dry);
             }
         }
     }
@@ -292,16 +311,19 @@ pub(crate) fn water_tiles(
         let mut grew = false;
         for a in la0..=la1 {
             for o in lo0..=lo1 {
-                if present(a, o) || class.contains_key(&(a, o)) {
+                let i = at(a, o);
+                if here[i] || class[i].is_some() {
                     continue;
                 }
-                let votes: Vec<bool> = around(a, o)
-                    .iter()
-                    .filter_map(|(na, no, _)| class.get(&(*na, *no)).copied())
-                    .collect();
-                if !votes.is_empty() {
-                    let wet = votes.iter().filter(|w| **w).count();
-                    class.insert((a, o), wet * 2 >= votes.len());
+                let (mut wet, mut votes) = (0, 0);
+                for (na, no, _) in around(a, o) {
+                    if let Some(w) = inside_box(na, no).then(|| class[at(na, no)]).flatten() {
+                        votes += 1;
+                        wet += w as usize;
+                    }
+                }
+                if votes > 0 {
+                    class[i] = Some(wet * 2 >= votes);
                     grew = true;
                 }
             }
@@ -313,7 +335,8 @@ pub(crate) fn water_tiles(
     let mut out = Vec::new();
     for a in la0..=la1 {
         for o in lo0..=lo1 {
-            if !present(a, o) && class.get(&(a, o)).copied().unwrap_or(true) {
+            let i = at(a, o);
+            if !here[i] && class[i].unwrap_or(true) {
                 out.push((a, o));
             }
         }
@@ -330,6 +353,27 @@ fn on_tile_side(p: (f64, f64), sw: (f64, f64)) -> bool {
         || (x - sw.1 - 1.0).abs() < e
         || (y - sw.0).abs() < e
         || (y - sw.0 - 1.0).abs() < e
+}
+
+/// Douglas-Peucker over a ring, every `anchors` vertex kept: the spans
+/// between them are simplified each on its own, the ring closing back
+/// through its first point.
+fn thin(pts: &[(f64, f64)], tol: f64, mut anchors: Vec<usize>) -> Vec<(f64, f64)> {
+    if anchors.is_empty() || pts.is_empty() {
+        return crate::efb::airport::simplify(pts, tol);
+    }
+    if anchors[0] != 0 {
+        anchors.insert(0, 0);
+    }
+    if *anchors.last().unwrap_or(&0) != pts.len() - 1 {
+        anchors.push(pts.len() - 1);
+    }
+    let mut s: Vec<(f64, f64)> = vec![pts[0]];
+    for w in anchors.windows(2) {
+        let part = crate::efb::airport::simplify(&pts[w[0]..=w[1]], tol);
+        s.extend(part.into_iter().skip(1));
+    }
+    s
 }
 
 /// A ring at a tolerance (degrees, x scaled by the tile's cos(lat)), as the
@@ -349,28 +393,11 @@ pub(crate) fn wire_ring(r: &Ring, tol: f64, k: f64, sw: Option<(f64, f64)>) -> O
         return None;
     }
     let scaled: Vec<(f64, f64)> = r.iter().map(|&(x, y)| (x * k, y)).collect();
-    let mut anchors: Vec<usize> = match sw {
+    let anchors: Vec<usize> = match sw {
         Some(sw) => (0..r.len()).filter(|&i| on_tile_side(r[i], sw)).collect(),
         None => Vec::new(),
     };
-    let s = if anchors.is_empty() {
-        crate::efb::airport::simplify(&scaled, tol)
-    } else {
-        // The spans between the side vertices, each simplified on its own;
-        // the ring closes back through its first point.
-        if anchors[0] != 0 {
-            anchors.insert(0, 0);
-        }
-        if *anchors.last().unwrap_or(&0) != r.len() - 1 {
-            anchors.push(r.len() - 1);
-        }
-        let mut s: Vec<(f64, f64)> = vec![scaled[0]];
-        for w in anchors.windows(2) {
-            let part = crate::efb::airport::simplify(&scaled[w[0]..=w[1]], tol);
-            s.extend(part.into_iter().skip(1));
-        }
-        s
-    };
+    let s = thin(&scaled, tol, anchors);
     let mut out: Vec<f64> = Vec::with_capacity(s.len() * 2);
     let mut last: Option<(i64, i64)> = None;
     for (x, y) in s {
@@ -445,24 +472,46 @@ pub(crate) fn tile_range(lat0: f64, lon0: f64, lat1: f64, lon1: f64) -> (i32, i3
     )
 }
 
-/// Build (or recall) the answer for a view. Blocking: file reads. `None`
-/// when the view is too wide; no water (the fields only) when the map data
-/// is not installed.
-pub(crate) fn answer(dir: &Path, bbox: [f64; 4], px: f64) -> Option<Arc<Answer>> {
+/// Why a view has no answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Miss {
+    /// Not a box.
+    BadView,
+    /// Wider than [`MAX_TILES`] while the world layer is not built yet.
+    NotReady,
+}
+
+/// Build (or recall) the answer for a view. Blocking: file reads. A view
+/// wider than [`MAX_TILES`] is the world layer's ([`world_answer`]); no
+/// water (the fields only) when the map data is not installed.
+pub(crate) fn answer(dir: &Path, bbox: [f64; 4], px: f64) -> Result<Arc<Answer>, Miss> {
+    answer_with(dir, world().as_deref(), bbox, px)
+}
+
+pub(crate) fn answer_with(
+    dir: &Path,
+    world: Option<&World>,
+    bbox: [f64; 4],
+    px: f64,
+) -> Result<Arc<Answer>, Miss> {
     let have_water = dir.is_dir();
     let [lat0, lon0, lat1, lon1] = bbox;
     if !bbox.iter().all(|v| v.is_finite()) {
-        return None;
+        return Err(Miss::BadView);
     }
     let (a0, o0, a1, o1) = tile_range(lat0, lon0, lat1, lon1);
     let n = ((a1 - a0 + 1) * (o1 - o0 + 1)).max(0) as usize;
-    if n == 0 || n > MAX_TILES {
-        return None;
+    if n == 0 {
+        return Err(Miss::BadView);
+    }
+    if n > MAX_TILES {
+        let w = world.ok_or(Miss::NotReady)?;
+        return Ok(world_answer(w, bbox, px));
     }
     let mut bucket = bucket_for(lat0, lon0, lat1, lon1, px).max(-16);
     let key = (a0, o0, a1, o1, bucket);
     if let Some(a) = lock(&ANSWERS).get(&key) {
-        return Some(a);
+        return Ok(a);
     }
     let regions_ready = crate::party_line::region_loaded();
     let present = |a: i32, o: i32| tile_path(dir, a, o).is_file();
@@ -523,7 +572,391 @@ pub(crate) fn answer(dir: &Path, bbox: [f64; 4], px: f64) -> Option<Arc<Answer>>
             if regions_ready {
                 lock(&ANSWERS).put(key, a.clone());
             }
-            return Some(a);
+            return Ok(a);
+        }
+        bucket += 1;
+    }
+}
+
+// ---------------------------------------------------------------- the world
+//
+// Views wider than MAX_TILES. A whole world of one-degree tiles is 17,848
+// little rings, each with its tile's sides: megabytes at any tolerance. So
+// each 10x10 degree block is DISSOLVED once: every tile's sides cancel
+// against its neighbour's (an even-odd fill: a side drawn twice is no
+// side), the open sea's tiles join in, and what is left is the coast, the
+// block's own sides and the lakes, chained into rings and thinned on
+// Mercator (the page's projection: a tolerance there is a pixel anywhere).
+
+/// The world layer's tolerance, log2 of degrees of longitude (Mercator's
+/// unit): 2^-5, about a pixel of the widest view the tiles still serve
+/// (1,200 tiles across 1,400 px), a quarter of one of the whole world on
+/// 2,560 px. Rings smaller than it are dropped.
+pub(crate) const WORLD_BUCKET: i32 = -5;
+/// Each tile is thinned to this (its sides kept) before its block is
+/// dissolved: the dissolve then sees the coast, not the file's every point.
+const WORLD_READ_BUCKET: i32 = -7;
+/// A block: the 10x10 degree folder.
+const BLOCK: i32 = 10;
+/// A point at the wire's 4 decimals: (lat, lon) in 1e-4 degrees, exact, so
+/// the tiles' shared sides meet.
+type Q = (i32, i32);
+const QD: i32 = 10_000;
+
+/// Every installed tile dissolved per block, for views wider than
+/// [`MAX_TILES`]: built in the background ([`start_world`]), held for the
+/// run (a memo of the installed files, no flight fact).
+pub(crate) struct World {
+    /// Each block (its south-west corner) with rings, sorted: flat
+    /// `[lat, lon, ...]` in 1e-4 degrees, closed, at [`WORLD_BUCKET`].
+    blocks: Vec<((i32, i32), Vec<Vec<i32>>)>,
+    pub(crate) tiles_read: usize,
+    pub(crate) rings: usize,
+    /// What the layer holds in memory, about.
+    pub(crate) bytes: usize,
+    answers: Mutex<Lru<(i32, i32, i32, i32, i32), Arc<Answer>>>,
+}
+
+/// `None` until the EFB first serves; `Building` on the build's thread.
+static WORLD: Mutex<Option<WorldState>> = Mutex::new(None);
+
+enum WorldState {
+    Building,
+    Ready(Arc<World>),
+}
+
+/// The world layer, once built.
+pub(crate) fn world() -> Option<Arc<World>> {
+    match &*lock(&WORLD) {
+        Some(WorldState::Ready(w)) => Some(w.clone()),
+        _ => None,
+    }
+}
+
+/// "+51-001.shp" back to (51, -1).
+fn tile_of_name(s: &str) -> Option<(i32, i32)> {
+    let s = s.strip_suffix(".shp")?;
+    if s.len() != 7 || !s.is_ascii() {
+        return None;
+    }
+    Some((s[..3].parse().ok()?, s[3..].parse().ok()?))
+}
+
+/// Mercator's north, in degrees of longitude, within the page's MAX_LAT.
+fn merc(lat: f64) -> f64 {
+    let l = lat.clamp(-85.05, 85.05).to_radians();
+    (l / 2.0 + std::f64::consts::FRAC_PI_4)
+        .tan()
+        .ln()
+        .to_degrees()
+}
+
+/// The sides cancelled, the rest chained: the even-odd boundary of rings
+/// whose shared sides lie on whole degrees. A run along a whole degree
+/// is kept where an odd number of rings draw it; every other edge as is.
+fn dissolve(rings: &[Vec<Q>]) -> Vec<Vec<Q>> {
+    let mut lines: HashMap<(bool, i32), Vec<i32>> = HashMap::new();
+    let mut edges: Vec<(Q, Q)> = Vec::new();
+    for r in rings {
+        for w in r.windows(2) {
+            let (p, q) = (w[0], w[1]);
+            if p == q {
+                continue;
+            }
+            if p.0 == q.0 && p.0 % QD == 0 {
+                lines.entry((true, p.0)).or_default().extend([p.1, q.1]);
+            } else if p.1 == q.1 && p.1 % QD == 0 {
+                lines.entry((false, p.1)).or_default().extend([p.0, q.0]);
+            } else {
+                edges.push((p, q));
+            }
+        }
+    }
+    for ((along_lat, c), mut ends) in lines {
+        // Each run toggles the parity at both its ends.
+        ends.sort_unstable();
+        let mut odd = false;
+        let mut i = 0;
+        while i < ends.len() {
+            let x = ends[i];
+            let n = ends[i..].iter().take_while(|e| **e == x).count();
+            i += n;
+            odd ^= n % 2 == 1;
+            if odd && i < ends.len() {
+                let pt = |v: i32| if along_lat { (c, v) } else { (v, c) };
+                edges.push((pt(x), pt(ends[i])));
+            }
+        }
+    }
+    // Every vertex of an even-odd boundary has an even degree: a walk from
+    // any edge comes back to where it began.
+    let mut at: HashMap<Q, Vec<usize>> = HashMap::new();
+    for (i, (p, q)) in edges.iter().enumerate() {
+        at.entry(*p).or_default().push(i);
+        at.entry(*q).or_default().push(i);
+    }
+    let mut used = vec![false; edges.len()];
+    let mut out = Vec::new();
+    for s in 0..edges.len() {
+        if used[s] {
+            continue;
+        }
+        used[s] = true;
+        let start = edges[s].0;
+        let (mut ring, mut cur) = (vec![start, edges[s].1], edges[s].1);
+        while cur != start {
+            let next = at[&cur].iter().copied().find(|i| !used[*i]);
+            let Some(i) = next else { break };
+            used[i] = true;
+            cur = if edges[i].0 == cur {
+                edges[i].1
+            } else {
+                edges[i].0
+            };
+            ring.push(cur);
+        }
+        if cur != start {
+            ring.push(start);
+        }
+        if ring.len() >= 4 {
+            out.push(ring);
+        }
+    }
+    out
+}
+
+/// A block's ring thinned on Mercator to `tol`, the vertices on the
+/// block's sides kept (neighbouring blocks meet); flat `[lat, lon, ...]` in
+/// 1e-4 degrees, `None` once smaller than `tol`.
+fn world_ring(r: &[Q], tol: f64, block: (i32, i32)) -> Option<Vec<i32>> {
+    let pts: Vec<(f64, f64)> = r
+        .iter()
+        .map(|&(a, o)| (o as f64 / QD as f64, merc(a as f64 / QD as f64)))
+        .collect();
+    let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for &(x, y) in &pts {
+        (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
+    }
+    if (x1 - x0).max(y1 - y0) < tol {
+        return None;
+    }
+    // Which of the block's four sides a point is on (a corner: two).
+    let (s, w) = (block.0 * QD, block.1 * QD);
+    let sides = |&(a, o): &Q| {
+        (a == s) as u8
+            | ((a == s + BLOCK * QD) as u8) << 1
+            | ((o == w) as u8) << 2
+            | ((o == w + BLOCK * QD) as u8) << 3
+    };
+    // The ends of each run along a side are kept; between them the side is
+    // straight and thins to nothing.
+    let n = r.len();
+    let anchors = (0..n)
+        .filter(|&i| {
+            let (prev, next) = (r[if i == 0 { n - 2 } else { i - 1 }], r[(i + 1) % n]);
+            sides(&r[i]) != 0 && sides(&prev) & sides(&r[i]) & sides(&next) == 0
+        })
+        .collect();
+    // The thinned points are the ring's own, in order: back to their Q.
+    let mut out = Vec::new();
+    let mut j = 0;
+    for p in thin(&pts, tol, anchors) {
+        while j + 1 < pts.len() && pts[j] != p {
+            j += 1;
+        }
+        out.extend([r[j].0, r[j].1]);
+    }
+    (out.len() >= 8).then_some(out)
+}
+
+/// Read every installed tile, dissolve each block and thin it to
+/// [`WORLD_BUCKET`]. Blocking and long (the whole map data): `go_on` is
+/// asked between tiles and blocks and a `false` ends it with `None`;
+/// `pace` sleeps as long as each tile took (half a core at most, the sim's
+/// frames first). No map data: an empty world, as the tiles' own answer.
+pub(crate) fn build_world(dir: &Path, go_on: &dyn Fn() -> bool, pace: bool) -> Option<World> {
+    let mut names: Vec<(i32, i32, PathBuf)> = Vec::new();
+    for folder in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        for f in std::fs::read_dir(folder.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let Some((a, o)) = f.file_name().to_str().and_then(tile_of_name) {
+                if (-90..90).contains(&a) && (-180..180).contains(&o) {
+                    names.push((a, o, f.path()));
+                }
+            }
+        }
+    }
+    names.sort_by_key(|n| (n.0, n.1));
+    let block_of = |a: i32, o: i32| (a.div_euclid(BLOCK) * BLOCK, o.div_euclid(BLOCK) * BLOCK);
+    let pre = 2f64.powi(WORLD_READ_BUCKET);
+    let mut blocks: HashMap<(i32, i32), Vec<Vec<Q>>> = HashMap::new();
+    let mut edges: HashMap<(i32, i32), [f32; 4]> = HashMap::new();
+    for (i, (a, o, path)) in names.iter().enumerate() {
+        if i % 16 == 0 && !go_on() {
+            return None;
+        }
+        let t0 = std::time::Instant::now();
+        let Some(rings) = std::fs::read(path).ok().and_then(|b| parse_shp(&b)) else {
+            // Present but unreadable: dry, as the tiles' own answer has it.
+            edges.insert((*a, *o), [0.0; 4]);
+            continue;
+        };
+        let t = tile_from_rings(*a, *o, rings);
+        edges.insert((*a, *o), t.edges);
+        let k = ((*a as f64 + 0.5).to_radians().cos()).max(0.05);
+        let into = blocks.entry(block_of(*a, *o)).or_default();
+        for r in &t.rings {
+            if let Some(f) = wire_ring(r, pre, k, Some((*a as f64, *o as f64))) {
+                let q = |v: f64| (v * QD as f64).round() as i32;
+                into.push(f.chunks(2).map(|p| (q(p[0]), q(p[1]))).collect());
+            }
+        }
+        if pace {
+            std::thread::sleep(t0.elapsed().min(std::time::Duration::from_millis(50)));
+        }
+    }
+    if !names.is_empty() {
+        // The open sea: the missing tiles that are water, as squares.
+        let wet = water_tiles(
+            (-90, 89),
+            (-180, 179),
+            &|a, o| edges.contains_key(&(a, o)),
+            &|a, o, side| edges.get(&(a, o)).map_or(0.0, |e| e[side]),
+        );
+        for (a, o) in wet {
+            let (s, w, n, e) = (a * QD, o * QD, (a + 1) * QD, (o + 1) * QD);
+            let sq = vec![(s, w), (n, w), (n, e), (s, e), (s, w)];
+            blocks.entry(block_of(a, o)).or_default().push(sq);
+        }
+    }
+    let tol = 2f64.powi(WORLD_BUCKET);
+    let mut keys: Vec<(i32, i32)> = blocks.keys().copied().collect();
+    keys.sort_unstable();
+    let (mut out, mut rings, mut bytes) = (Vec::new(), 0usize, 0usize);
+    for key in keys {
+        if !go_on() {
+            return None;
+        }
+        let t0 = std::time::Instant::now();
+        let thin: Vec<Vec<i32>> = dissolve(&blocks.remove(&key).unwrap_or_default())
+            .iter()
+            .filter_map(|r| world_ring(r, tol, key))
+            .collect();
+        rings += thin.len();
+        bytes += thin.iter().map(|r| r.len() * 4 + 24).sum::<usize>() + 40;
+        out.push((key, thin));
+        if pace {
+            std::thread::sleep(t0.elapsed().min(std::time::Duration::from_millis(50)));
+        }
+    }
+    Some(World {
+        blocks: out,
+        tiles_read: names.len(),
+        rings,
+        bytes,
+        answers: Mutex::new(Lru::new(16)),
+    })
+}
+
+/// Build the world layer once per run, on its own thread, in the
+/// background; called when the EFB starts serving (never while it is off).
+/// The EFB turned off mid-build cancels it (the next start builds again).
+/// Logs one line and a blackbox `efb` `basemap_world` record when built.
+pub(crate) fn start_world(dir: PathBuf) {
+    {
+        let mut w = lock(&WORLD);
+        if w.is_some() {
+            return;
+        }
+        *w = Some(WorldState::Building);
+    }
+    let spawned = std::thread::Builder::new()
+        .name("efb-world".into())
+        .spawn(move || {
+            let t0 = std::time::Instant::now();
+            let built = build_world(&dir, &|| crate::settings::live().efb, true);
+            let Some(w) = built else {
+                *lock(&WORLD) = None;
+                tracing::info!("EFB world basemap: cancelled, the EFB turned off");
+                return;
+            };
+            let ms = t0.elapsed().as_millis() as u64;
+            tracing::info!(
+                ms,
+                tiles = w.tiles_read,
+                rings = w.rings,
+                bytes = w.bytes,
+                "EFB world basemap built"
+            );
+            crate::blackbox::record(
+                "efb",
+                serde_json::json!({ "event": "basemap_world", "ms": ms, "tiles": w.tiles_read,
+                                    "rings": w.rings, "bytes": w.bytes }),
+            );
+            *lock(&WORLD) = Some(WorldState::Ready(Arc::new(w)));
+        });
+    if spawned.is_err() {
+        *lock(&WORLD) = None;
+    }
+}
+
+/// A wide view from the world layer: the blocks under it (thinned again
+/// when the view is coarser than the layer), under [`MAX_BYTES`] like any
+/// answer; `bbox` the blocks' tiles. No fields: a view this wide is past
+/// [`TOWERED_SPAN_DEG`].
+pub(crate) fn world_answer(w: &World, bbox: [f64; 4], px: f64) -> Arc<Answer> {
+    let [lat0, lon0, lat1, lon1] = bbox;
+    let (a0, o0, a1, o1) = tile_range(lat0, lon0, lat1, lon1);
+    let (b0, c0) = (a0.div_euclid(BLOCK) * BLOCK, o0.div_euclid(BLOCK) * BLOCK);
+    let (b1, c1) = (a1.div_euclid(BLOCK) * BLOCK, o1.div_euclid(BLOCK) * BLOCK);
+    // Mercator's unit is a degree of longitude: the pixel is the span's.
+    let dpp = (lon1 - lon0).abs().max(1e-6) / px.clamp(50.0, 8_000.0);
+    let mut bucket = (dpp.log2().round() as i32).max(WORLD_BUCKET);
+    let key = (b0, c0, b1, c1, bucket);
+    if let Some(a) = lock(&w.answers).get(&key) {
+        return a;
+    }
+    let in_view = |(a, o): (i32, i32)| (b0..=b1).contains(&a) && (c0..=c1).contains(&o);
+    loop {
+        let tol = 2f64.powi(bucket);
+        // Decimals for an eighth of the tolerance (2 to 4): a whole degree
+        // stays whole, so the page still leaves the blocks' sides unstroked.
+        let d = 10f64.powi((-(tol / 8.0).log10()).ceil().clamp(2.0, 4.0) as i32);
+        let deg = |r: &[i32]| -> Vec<f64> {
+            r.iter()
+                .map(|v| (*v as f64 / QD as f64 * d).round() / d)
+                .collect()
+        };
+        let mut water: Vec<Vec<f64>> = Vec::new();
+        for (block, rings) in w.blocks.iter().filter(|(b, _)| in_view(*b)) {
+            for r in rings {
+                if bucket == WORLD_BUCKET {
+                    water.push(deg(r));
+                } else {
+                    let q: Vec<Q> = r.chunks(2).map(|p| (p[0], p[1])).collect();
+                    water.extend(world_ring(&q, tol, *block).map(|f| deg(&f)));
+                }
+            }
+        }
+        let out = Out {
+            bbox: [b0, c0, (b1 + BLOCK - 1).min(89), (c1 + BLOCK - 1).min(179)],
+            bucket,
+            tol,
+            water,
+            fields: Vec::new(),
+        };
+        let json = serde_json::to_string(&out).unwrap_or_default();
+        if json.len() <= MAX_BYTES || bucket >= 4 {
+            let a = Arc::new(Answer {
+                etag: crate::efb::airport::version_of(&json),
+                rings: out.water.len(),
+                json,
+            });
+            lock(&w.answers).put(key, a.clone());
+            return a;
         }
         bucket += 1;
     }
@@ -549,16 +982,24 @@ mod tests {
             (0.25, 51.75),
             (0.25, 51.25),
         ];
-        let pts: Vec<(f64, f64)> = outer.iter().chain(hole.iter()).copied().collect();
+        shapefile(&[&outer, &hole])
+    }
+
+    /// A one-record Polygon shapefile of these rings, (x = lon, y = lat).
+    fn shapefile(parts: &[&[(f64, f64)]]) -> Vec<u8> {
+        let pts: Vec<(f64, f64)> = parts.iter().flat_map(|p| p.iter().copied()).collect();
         let mut c: Vec<u8> = Vec::new();
         c.extend(5i32.to_le_bytes());
-        for v in [0.0f64, 51.0, 1.0, 52.0] {
+        for v in [0.0f64; 4] {
             c.extend(v.to_le_bytes());
         }
-        c.extend(2i32.to_le_bytes());
+        c.extend((parts.len() as i32).to_le_bytes());
         c.extend((pts.len() as i32).to_le_bytes());
-        c.extend(0i32.to_le_bytes());
-        c.extend(5i32.to_le_bytes());
+        let mut start = 0i32;
+        for p in parts {
+            c.extend(start.to_le_bytes());
+            start += p.len() as i32;
+        }
         for (x, y) in &pts {
             c.extend(x.to_le_bytes());
             c.extend(y.to_le_bytes());
@@ -676,14 +1117,30 @@ mod tests {
     }
 
     /// No map data installed: still an answer (the fields, no water); a
-    /// continent: none.
+    /// continent before the world layer is built: not ready; not a box: a
+    /// bad view.
     #[test]
-    fn no_map_data_is_no_water_and_a_continent_is_no_answer() {
+    fn no_map_data_is_no_water_and_a_continent_waits_for_the_world() {
         let none = Path::new("/nonexistent/map data/water");
-        let a = answer(none, [-12.5, -150.5, -11.5, -149.5], 800.0).expect("an answer");
+        let a = answer_with(none, None, [-12.5, -150.5, -11.5, -149.5], 800.0).expect("an answer");
         let v: serde_json::Value = serde_json::from_str(&a.json).unwrap();
         assert_eq!(v["water"], serde_json::json!([]));
-        assert!(answer(none, [-60.0, -170.0, 60.0, 170.0], 800.0).is_none());
+        let wide = [-60.0, -170.0, 60.0, 170.0];
+        assert_eq!(
+            answer_with(none, None, wide, 800.0).err(),
+            Some(Miss::NotReady)
+        );
+        let nan = [f64::NAN, 0.0, 1.0, 1.0];
+        assert_eq!(
+            answer_with(none, None, nan, 800.0).err(),
+            Some(Miss::BadView)
+        );
+        // No map data at all: the world is empty, and a continent no water.
+        let w = build_world(none, &|| true, false).expect("a world");
+        assert_eq!((w.tiles_read, w.rings), (0, 0));
+        let a = answer_with(none, Some(&w), wide, 800.0).expect("an answer");
+        let v: serde_json::Value = serde_json::from_str(&a.json).unwrap();
+        assert_eq!(v["water"], serde_json::json!([]));
     }
 
     #[test]
@@ -692,6 +1149,128 @@ mod tests {
         let b = bucket_for(50.0, -1.0, 52.0, 2.11, 1000.0);
         assert_eq!(b, -9);
         assert!(bucket_for(30.0, -10.0, 52.0, 5.0, 1000.0) > b);
+    }
+
+    /// The world layer over a fixture install of two tiles south of New
+    /// Zealand (a sea tile with an island; a coast with a wiggle and a lake
+    /// too small to see) and one damaged file: read, thinned, the open sea
+    /// classed; a whole-world view and a clipped one served from it, under
+    /// the cap; a narrow view still the tiles' own; cancelled, nothing.
+    #[test]
+    fn the_world_layer_serves_wide_views_from_every_tile() {
+        let dir = std::env::temp_dir().join(format!("xvl-basemap-world-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let put = |a: i32, o: i32, b: &[u8]| {
+            let p = tile_path(&dir, a, o);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b).unwrap();
+        };
+        let sea = [
+            (166.0, -47.0),
+            (166.0, -46.0),
+            (167.0, -46.0),
+            (167.0, -47.0),
+            (166.0, -47.0),
+        ];
+        let island = [
+            (166.25, -46.75),
+            (166.75, -46.75),
+            (166.75, -46.25),
+            (166.25, -46.25),
+            (166.25, -46.75),
+        ];
+        put(-47, 166, &shapefile(&[&sea, &island]));
+        let mut coast: Vec<(f64, f64)> = vec![(167.0, -47.0), (167.0, -46.5)];
+        coast.extend((1..100).map(|i| (167.0 + i as f64 / 100.0, -46.5 + 0.002 * (i % 2) as f64)));
+        coast.extend([(168.0, -46.5), (168.0, -47.0), (167.0, -47.0)]);
+        let lake = [
+            (167.5, -46.2),
+            (167.5, -46.199),
+            (167.501, -46.199),
+            (167.5, -46.2),
+        ];
+        put(-47, 167, &shapefile(&[&coast, &lake]));
+        put(10, 10, b"not a shapefile");
+        std::fs::write(dir.join("readme.txt"), b"x").unwrap();
+
+        assert!(build_world(&dir, &|| false, false).is_none(), "cancelled");
+        let w = build_world(&dir, &|| true, false).expect("a world");
+        assert_eq!(w.tiles_read, 3);
+        // Dissolved: the sides between water tiles are gone (the corner
+        // all four share), the coast thinned, the lake dropped.
+        let block = &w
+            .blocks
+            .iter()
+            .find(|b| b.0 == (-50, 160))
+            .expect("the block")
+            .1;
+        let pts: Vec<(i32, i32)> = block
+            .iter()
+            .flat_map(|r| r.chunks(2).map(|p| (p[0], p[1])))
+            .collect();
+        assert!(pts.len() < 80, "{} points: {block:?}", pts.len());
+        assert!(!pts.contains(&(-470_000, 1_660_000)), "a shared corner");
+        assert!(pts.contains(&(-462_500, 1_662_500)), "the island");
+        assert!(!pts.iter().any(|p| (p.0 + 462_000).abs() < 50), "the lake");
+
+        // The whole world, as the page asks for it zoomed right out.
+        let rings_of = |a: &Answer| -> (serde_json::Value, Vec<Vec<f64>>) {
+            let v: serde_json::Value = serde_json::from_str(&a.json).unwrap();
+            let r = serde_json::from_value(v["water"].clone()).unwrap();
+            (v, r)
+        };
+        let all = answer_with(&dir, Some(&w), [-85.05, -180.0, 85.05, 179.999], 2560.0).unwrap();
+        assert!(all.json.len() <= MAX_BYTES);
+        let (v, water) = rings_of(&all);
+        assert!(v["bucket"].as_i64().unwrap() >= WORLD_BUCKET as i64);
+        assert_eq!(v["fields"], serde_json::json!([]));
+        let has = |rings: &[Vec<f64>], lat: f64, lon: f64| {
+            rings
+                .iter()
+                .any(|r| r.chunks(2).any(|p| p[0] == lat && p[1] == lon))
+        };
+        assert!(has(&water, -46.25, 166.25), "the island");
+        let wet = |rings: &[Vec<f64>], lat: f64, lon: f64| {
+            let r: Vec<Ring> = rings
+                .iter()
+                .map(|r| r.chunks(2).map(|p| (p[1], p[0])).collect())
+                .collect();
+            inside(&r, lon, lat)
+        };
+        assert!(wet(&water, -47.5, 166.5), "the open sea south of it");
+        assert!(
+            wet(&water, -46.9, 167.5) && !wet(&water, -46.1, 167.5),
+            "the coast"
+        );
+        assert!(!wet(&water, -46.5, 166.5), "the island");
+
+        // Clipped to the blocks under the view: the antimeridian is an edge
+        // of the world, never crossed.
+        let east = answer_with(&dir, Some(&w), [-60.0, 100.0, -5.0, 179.999], 1400.0).unwrap();
+        let (v, water) = rings_of(&east);
+        assert_eq!(v["bbox"], serde_json::json!([-60, 100, -1, 179]));
+        assert!(has(&water, -46.25, 166.25));
+        for p in water.iter().flat_map(|r| r.chunks(2)) {
+            assert!(
+                (-60.0..=0.0).contains(&p[0]) && (100.0..=180.0).contains(&p[1]),
+                "{p:?}"
+            );
+        }
+        let west = answer_with(&dir, Some(&w), [20.0, -100.0, 70.0, -10.0], 1400.0).unwrap();
+        let (_, water) = rings_of(&west);
+        assert!(!has(&water, -46.25, 166.25));
+        assert!(water
+            .iter()
+            .flat_map(|r| r.chunks(2))
+            .all(|p| (-100.0..=0.0).contains(&p[1])));
+
+        // A narrow view is the tiles' own answer, world or not.
+        let narrow = [-47.5, 166.2, -46.3, 167.8];
+        let a = answer_with(&dir, Some(&w), narrow, 1000.0).unwrap();
+        let b = answer_with(&dir, None, narrow, 1000.0).unwrap();
+        assert_eq!(a.json, b.json);
+        assert!(has(&rings_of(&a).1, -46.25, 166.25));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The basemap answers for the fixture pages (`state::tests::
@@ -715,6 +1294,43 @@ mod tests {
             let a = answer(&dir, bbox, px).expect("an answer");
             println!("{name}: {} bytes, {} rings", a.json.len(), a.rings);
             std::fs::write(format!("{out}/basemap_{name}.json"), &a.json).unwrap();
+        }
+    }
+
+    /// The world layer on the real install: its build time and size, and
+    /// the wide views it serves.
+    /// `cargo test --release -- --ignored real_install_world_basemap --nocapture`
+    #[test]
+    #[ignore]
+    fn real_install_world_basemap() {
+        let dir = water_dir();
+        let t0 = std::time::Instant::now();
+        let w = build_world(&dir, &|| true, true).expect("a world");
+        println!(
+            "world: {} ms paced as live, {} tiles, {} rings, {} bytes held",
+            t0.elapsed().as_millis(),
+            w.tiles_read,
+            w.rings,
+            w.bytes
+        );
+        for (name, bbox, px) in [
+            ("world 2560", [-85.05, -180.0, 85.05, 179.999], 2560.0),
+            ("world 1400", [-85.05, -180.0, 85.05, 179.999], 1400.0),
+            ("world phone", [-85.05, -180.0, 85.05, 179.999], 390.0),
+            ("europe 1400", [30.0, -25.0, 72.0, 45.0], 1400.0),
+            ("pacific 1400", [-50.0, 140.0, 10.0, 179.999], 1400.0),
+        ] {
+            let t0 = std::time::Instant::now();
+            let a = answer_with(&dir, Some(&w), bbox, px).expect("an answer");
+            let v: serde_json::Value = serde_json::from_str(&a.json).unwrap();
+            println!(
+                "{name}: {} bytes, {} rings, bucket {}, {} ms",
+                a.json.len(),
+                a.rings,
+                v["bucket"],
+                t0.elapsed().as_millis()
+            );
+            assert!(a.json.len() <= MAX_BYTES && a.rings > 0);
         }
     }
 

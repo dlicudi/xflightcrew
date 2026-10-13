@@ -15292,3 +15292,58 @@ before `places`). The design, its cost and its tests are in
   in the sim beyond 12 nm (TCAS keeps it to 40 nm), on the EFB on to its destination, the card's
   Arrives time on the destination's clock. `traffic` `draw` now carries `modeled`; read it beside
   `api_load` and fps.
+
+## 2026-10-13: the world map has coastlines at every zoom (the EFB's world layer)
+
+The pilot: "If I zoom out completely why is the background entirely black?" `/basemap` refused
+any view over `basemap::MAX_TILES` (1,200 one-degree tiles) and the page asked for nothing that
+wide, so zoomed out there was no water at all, only the land-coloured background.
+
+- **The world layer** (`efb::basemap::World`, `build_world`, `start_world`): built once per run
+  when the EFB first serves (never while it is off; the EFB turned off mid-build cancels it,
+  the next start builds again), on its own `efb-world` thread, paced (it sleeps as long as each
+  tile took: half a core at most), never on a request or the command loop. Every installed tile
+  through the existing reader, thinned to 2^-7 with its sides kept, the open sea's missing
+  tiles classed by the same neighbour rule (`water_tiles`, now on a grid: the whole world's
+  64,800 cells with a few seeds took 14 s on the HashMap).
+- **Why dissolve**: the first cut kept every tile's rings at 2^-4 and sent the view's tiles;
+  the whole world then needed 2 degrees of tolerance to fit 400 kB, which drops every ring
+  (17,848 tile squares at 5 points each are over 1 MB before any coast). So each 10x10 degree
+  block is DISSOLVED: runs along whole degrees are kept where an odd number of rings draw them
+  (the page fills even-odd, so a side drawn twice is no side), the rest chained into rings
+  (every vertex of an even-odd boundary has an even degree, so a walk comes back to its start),
+  then thinned on Mercator (degrees of longitude: a pixel anywhere on the page's projection) to
+  2^-5, the block's sides anchored only at the ends of each run along them (anchoring every
+  side vertex left 26,000 collinear points in the whole world). Rings under the tolerance go.
+- **Served**: a view over 1,200 tiles gets the blocks under it, thinned again to its own pixel
+  (`log2` of its longitude span over its width), rounded to the decimals an eighth of that
+  needs (2 to 4; a whole degree stays whole, so the page still leaves the blocks' sides
+  unstroked), under the same 400 kB cap. `bbox` is the blocks' tiles, so the page asks again
+  only once the view leaves them or the zoom moves. Not built yet: 503, `Retry-After: 5`.
+- **The page** (`map.js` `wantBase`): a view wider than `MAX_TILES` asks for itself instead of
+  nothing and no longer drops the water it holds, so the coarse layer stays drawn until the
+  detailed tiles arrive (and back); a failed ask retries on its own timer (5 s on a 503, 15 s
+  else), since the view standing still never asks again.
+- **The antimeridian** is the world's edge (the page never wraps; tiles never cross it); the
+  poles beyond the page's 85.05 degrees are flattened onto it for thinning only.
+- **Measured** (`cargo test --release -- --ignored real_install_world_basemap --nocapture`,
+  17,848 tiles, warm disk): built in 5.8 s unpaced, 16.9 s paced as it runs live; 53,680 rings, 4.9 MB held.
+  Whole world 322 kB at 2^-2 on 2,560 or 1,400 px (rendered and checked: every continent, the
+  Great Lakes, the Caspian, no seams), 102 kB at 2^0 on a 390 px phone; Europe on 1,400 px
+  317 kB at 2^-4; the western Pacific 104 kB at 2^-5. Under 50 ms to build an answer, cached
+  after (16 per layer).
+- **Seen in the render**: north of about 80 degrees the missing tiles take their neighbour
+  column's answer (the narrow path's rule), so the Arctic edge shows land and water stripes;
+  the same as the tiles themselves would draw there, beyond most of the page's latitude.
+- Tests: `the_world_layer_serves_wide_views_from_every_tile` (a fixture install: a sea tile
+  with an island, a wiggly coast with a speck of a lake, a damaged file; shared corners gone,
+  the coast thinned, the lake dropped, the whole world and a clipped view, the narrow answer
+  unchanged, cancelled is nothing), `no_map_data_is_no_water_and_a_continent_waits_for_the_world`,
+  the loopback server's 503, the page's retry pinned beside `MAX_TILES`.
+
+- **UNFLOWN.** With the EFB on (no plugin change): the log says "EFB world basemap built" a few
+  seconds after "EFB serving", blackbox `efb` `basemap_world` with `ms`, `tiles` 17848, `rings`,
+  `bytes`; watch fps while it builds (it should not move). On the Map tab zoom right out: the
+  continents in the night palette, oceans muted blue grey; pan and zoom back in: no blank frame
+  as the tiles take over near a region's zoom. Within the first seconds after a start, a wide
+  view stays as it was and fills in by itself.
