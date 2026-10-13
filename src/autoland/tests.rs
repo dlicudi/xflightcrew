@@ -742,7 +742,7 @@
             let mut w = UnclearedWatch::default();
             radio
                 .iter()
-                .filter_map(|&r| w.step(working, false, r, false, false).map(|s| (r, s)))
+                .filter_map(|&r| w.step(working, false, r, false, false, true).map(|s| (r, s)))
                 .collect::<Vec<_>>()
         };
         let steps = run(true);
@@ -757,22 +757,46 @@
         assert!(run(false).is_empty());
         // Never on the wheels.
         let mut w = UnclearedWatch::default();
-        assert_eq!(w.step(true, false, 0.0, true, false), None);
+        assert_eq!(w.step(true, false, 0.0, true, false, true), None);
         // A missed approach resets the question for the next approach.
         let mut w = UnclearedWatch::default();
-        assert_eq!(w.step(true, false, 900.0, false, false), Some(UnclearedStep::Ask));
-        assert_eq!(w.step(true, false, 900.0, false, false), None);
-        assert_eq!(w.step(true, false, 250.0, false, true), None);
-        assert_eq!(w.step(true, false, 900.0, false, false), Some(UnclearedStep::Ask));
+        assert_eq!(w.step(true, false, 900.0, false, false, true), Some(UnclearedStep::Ask));
+        assert_eq!(w.step(true, false, 900.0, false, false, true), None);
+        assert_eq!(w.step(true, false, 250.0, false, true, true), None);
+        assert_eq!(w.step(true, false, 900.0, false, false, true), Some(UnclearedStep::Ask));
         // An unread height is no measurement.
-        assert_eq!(UnclearedWatch::default().step(true, false, f64::NAN, false, false), None);
+        assert_eq!(UnclearedWatch::default().step(true, false, f64::NAN, false, false, true), None);
         // A book still holding our takeoff: asked once, never sent around.
         let mut w = UnclearedWatch::default();
         let steps: Vec<_> = radio
             .iter()
-            .filter_map(|&r| w.step(false, true, r, false, false).map(|s| (r, s)))
+            .filter_map(|&r| w.step(false, true, r, false, false, true).map(|s| (r, s)))
             .collect();
         assert_eq!(steps, vec![(990.0, UnclearedStep::Ask)]);
+    }
+
+    /// LEMG 12 (sortie 1791917103-full_auto, 2026-10-13): a re-arm onto the
+    /// runway the tower re-sequenced us to, 0.46 nm out at 871 ft and 640 ft
+    /// above the path, asked "final runway one two, request landing
+    /// clearance" on its first tick, the tick it went round ("too high to
+    /// land from here"). The ask is a final report: only established on the
+    /// final, never going around. The go-around at 300 ft stands.
+    #[test]
+    fn the_landing_clearance_is_asked_only_established_on_the_final() {
+        let mut w = UnclearedWatch::default();
+        // The re-arm's first tick: not established (the flag is cleared at
+        // every launch), so no call.
+        assert_eq!(w.step(true, false, 871.0, false, false, false), None);
+        // Going around: nothing, whatever the flag says.
+        assert_eq!(w.step(true, false, 880.0, false, true, true), None);
+        // In the reposition pattern, low and not established: nothing.
+        assert_eq!(w.step(true, false, 900.0, false, false, false), None);
+        // Back established on the next final: asked, once.
+        assert_eq!(w.step(true, false, 900.0, false, false, true), Some(UnclearedStep::Ask));
+        assert_eq!(w.step(true, false, 800.0, false, false, true), None);
+        // Never established and still uncleared at 300 ft: around.
+        let mut w = UnclearedWatch::default();
+        assert_eq!(w.step(true, false, 296.0, false, false, false), Some(UnclearedStep::GoAround));
     }
 
     #[test]

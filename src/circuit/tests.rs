@@ -1104,7 +1104,7 @@
         for _ in 0..4 {
             transmit(LEMG_FIVE_MILE.to_string());
         }
-        transmit("November eight one six November November, going around".to_string());
+        transmit("November eight one six November November, request taxi".to_string());
         transmit(LEMG_FIVE_MILE.to_string());
         let calls: Vec<String> = take_crew_radio()
             .into_iter()
@@ -1114,7 +1114,7 @@
             calls,
             vec![
                 LEMG_FIVE_MILE.to_string(),
-                "November eight one six November November, going around".to_string(),
+                "November eight one six November November, request taxi".to_string(),
                 LEMG_FIVE_MILE.to_string(),
             ]
         );
@@ -1145,11 +1145,13 @@
             on_ground: Some(false),
             agl_ft: Some(agl_ft),
             gs_kts: Some(gs_kts),
+            on_final: None,
         };
         let ground = |gs_kts: f64| RadioFacts {
             on_ground: Some(true),
             agl_ft: Some(0.3),
             gs_kts: Some(gs_kts),
+            on_final: None,
         };
         // On time: two seconds after the queue, still at 4.6 nm.
         assert_eq!(stale_reason(holds, 2.0, &air(1335.0, 172.0)), None);
@@ -1176,6 +1178,7 @@
             on_ground: None,
             agl_ft: None,
             gs_kts: None,
+            on_final: None,
         };
         assert_eq!(stale_reason(holds, 93.2, &blind), Some("max_age"));
         // Failed reads alone never drop a call made on time.
@@ -1191,7 +1194,6 @@
             "final",
             "downwind runway two seven",
             "turning base",
-            "going around",
             "inbound for landing, runway one three",
         ] {
             assert!(
@@ -1207,6 +1209,9 @@
             t(&format!("{cs}runway vacated")),
             Holds::OnGround { .. }
         ));
+        // A go-around is its own: priority, true while the go-around is.
+        assert_eq!(t(&format!("{cs}going around")), Holds::GoAround);
+        assert_eq!(t("missed approach"), Holds::GoAround);
         assert!(matches!(
             holds_for(&CrewCall::CheckIn {
                 callsign: None,
@@ -1240,6 +1245,7 @@
             on_ground: Some(g),
             agl_ft: None,
             gs_kts: Some(10.0),
+            on_final: None,
         };
         assert_eq!(stale_reason(h, 20.0, &facts(true)), None);
         assert_eq!(stale_reason(h, 20.0, &facts(false)), Some("airborne"));
@@ -1254,9 +1260,110 @@
             on_ground: Some(false),
             agl_ft: Some(60.0),
             gs_kts: Some(140.0),
+            on_final: None,
         };
         assert_eq!(stale_reason(h, 3.0, &low), None);
-        assert_eq!(stale_reason(h, 45.0, &low), Some("max_age"));
+        // Never aged out while the go-around is in progress (LEMG 13,
+        // sortie 1791917103-full_auto: dropped at 42.8 and 39.3 s).
+        assert_eq!(stale_reason(h, 45.0, &low), None);
+        let climbing = RadioFacts {
+            on_ground: Some(false),
+            agl_ft: Some(804.0),
+            gs_kts: Some(60.0),
+            on_final: Some(false),
+        };
+        assert_eq!(stale_reason(h, 42.8, &climbing), None);
+        assert_eq!(stale_reason(h, 300.0, &climbing), None);
+        // Over: landed, or established on a new final.
+        let landed = RadioFacts {
+            on_ground: Some(true),
+            ..climbing
+        };
+        assert_eq!(stale_reason(h, 42.8, &landed), Some("on_ground"));
+        let new_final = RadioFacts {
+            on_final: Some(true),
+            ..climbing
+        };
+        assert_eq!(stale_reason(h, 120.0, &new_final), Some("go_around_over"));
+        // The approach being left still reads established for a tick.
+        assert_eq!(stale_reason(h, 0.5, &new_final), None);
+    }
+
+    /// A go-around goes out NEXT: ahead of every call queued before it, so
+    /// the tower hears it on the next drain, and the drain's waits give way
+    /// to it. A later position report means it is over; a report queued
+    /// before it reports a position that was left.
+    #[test]
+    fn a_going_around_call_jumps_the_queue_and_dies_only_with_the_go_around() {
+        let _q = QUEUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_crew_radio();
+        let cs = "November one seven two Sierra Papa, ";
+        transmit(format!("{cs}final runway one three, request landing clearance"));
+        transmit(format!("{cs}request taxi"));
+        assert!(!priority_pending());
+        transmit(format!("{cs}going around"));
+        assert!(priority_pending());
+        let q = take_crew_radio();
+        let words: Vec<String> = q.iter().map(|c| call_words(&c.call)).collect();
+        assert_eq!(
+            words,
+            vec![
+                format!("{cs}going around"),
+                format!("{cs}final runway one three, request landing clearance"),
+                format!("{cs}request taxi"),
+            ]
+        );
+        assert!(!priority_pending());
+        let gone = superseded(&q.iter().map(|c| (c.holds, c.at)).collect::<Vec<_>>());
+        assert_eq!(gone, vec![false, true, false], "the final report was left");
+        // A later report: the go-around is over.
+        let t0 = std::time::Instant::now();
+        let later = t0 + std::time::Duration::from_secs(60);
+        let downwind = holds_for(&CrewCall::Text("downwind runway one three".into()));
+        assert_eq!(
+            superseded(&[(Holds::GoAround, t0), (downwind, later)]),
+            vec![true, false]
+        );
+        // Never ahead of a readback: an instruction already given is
+        // answered first.
+        transmit(format!("{cs}request taxi"));
+        transmit_readback(
+            format!("{cs}Malaga Approach on one one eight decimal four five five"),
+            false,
+        );
+        transmit(format!("{cs}missed approach"));
+        let words: Vec<String> = take_crew_radio().iter().map(|c| call_words(&c.call)).collect();
+        assert_eq!(
+            words,
+            vec![
+                format!("{cs}request taxi"),
+                format!("{cs}Malaga Approach on one one eight decimal four five five"),
+                format!("{cs}missed approach"),
+            ]
+        );
+        forget_flight_calls();
+    }
+
+    /// A controller's reply held behind a busy frequency is dropped once the
+    /// controller has ordered a go-around since, or said anything newer to
+    /// us with no readback owed. LEMG 13 (sortie 1791917103-full_auto):
+    /// "continue approach runway one three ... expect late landing
+    /// clearance", routed at +673.3, spoken at +707.1 after the order of
+    /// +674.8.
+    #[test]
+    fn a_held_reply_superseded_by_the_controller_is_not_said() {
+        let routed = std::time::Instant::now();
+        let order_at = routed + std::time::Duration::from_millis(1500);
+        assert!(reply_superseded(routed, Some(order_at), true, false));
+        assert!(reply_superseded(routed, None, true, true), "an order voids anything");
+        assert!(reply_superseded(routed, Some(order_at), false, false));
+        // Nothing newer: said.
+        let before = routed - std::time::Duration::from_secs(5);
+        assert!(!reply_superseded(routed, Some(before), false, false));
+        assert!(!reply_superseded(routed, None, false, false));
+        // A clearance the tower waits to hear read back is never dropped by
+        // a newer line, only by an order.
+        assert!(!reply_superseded(routed, Some(order_at), false, true));
     }
 
     #[test]

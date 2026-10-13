@@ -1394,6 +1394,11 @@ async fn crew_radio_facts(xp: &XPlaneClient) -> crew_radio::RadioFacts {
         on_ground: ground.ok().map(|v| v > 0.5),
         agl_ft: agl.ok().map(|m| m * 3.28084),
         gs_kts: gs.ok().map(|ms| ms.abs() * 1.943_844),
+        // Only an autoland flies an approach that can be established;
+        // otherwise unknown, never "not on final".
+        on_final: autoland::ACTIVE
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(autoland::established_on_final),
     }
 }
 

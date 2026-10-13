@@ -37,7 +37,12 @@ impl Session {
         // "my controls" was taken at +0.0 and routed at +26.1 s, after the
         // crew's "request taxi" and the tower's whole taxi clearance.
         let pilot_waiting = || loop_owed(input.is_some());
+        // The waits on the frequency give way to a go-around queued behind
+        // them too: it goes out next (`crew_radio::priority_pending`).
+        let give_way = || pilot_waiting() || crew_radio::priority_pending();
         let calls = crew_radio::take_crew_radio();
+        let superseded =
+            crew_radio::superseded(&calls.iter().map(|q| (q.holds, q.at)).collect::<Vec<_>>());
         // A discarded transmission is never silent. The queue is drained
         // unconditionally, so a failed gate loses the call for good — and
         // the caller (full auto) reads the resulting silence as the TOWER
@@ -63,7 +68,19 @@ impl Session {
         }
         if !calls.is_empty() && mode::atc_enabled() && voice.radio_powered() {
             if let Some(st) = self.atc_station.as_mut() {
-                for queued in calls {
+                for (queued, superseded) in calls.into_iter().zip(superseded) {
+                    if superseded {
+                        blackbox::record(
+                            "crew_radio",
+                            serde_json::json!({
+                                "event": "crew_radio_stale",
+                                "call": crew_radio::call_words(&queued.call),
+                                "why": "superseded",
+                                "age_s": (queued.at.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+                            }),
+                        );
+                        continue;
+                    }
                     // A position report dies with the position it reports,
                     // judged as it is about to go out (each call waits
                     // behind the one before it): LEMG's "5 mile final"
@@ -173,6 +190,11 @@ impl Session {
                     let routed = st
                         .handle_transmission(&call.to_ascii_lowercase(), xplane.view())
                         .await;
+                    // The reply answers the state as it was routed: what the
+                    // controller says or orders before it is spoken
+                    // supersedes it (`crew_radio::reply_superseded`).
+                    let routed_at = Instant::now();
+                    let mut orders = crate::party_line::GoAroundOrders::arm();
                     if queued_readback {
                         crew_radio::note_readback_out(&call);
                     }
@@ -182,18 +204,32 @@ impl Session {
                         &reporter,
                         ui::LogKind::Readback,
                         &format!("{call}."),
-                        &pilot_waiting,
+                        &give_way,
                     );
                     if let Some((reply, who)) = routed {
-                        if !reply.is_empty() {
+                        let last_to_us = voice.last_controller_line().map(|l| l.at);
+                        if !reply.is_empty()
+                            && crew_radio::reply_superseded(
+                                routed_at,
+                                last_to_us,
+                                orders.take(),
+                                crate::party_line::readback_owed().is_some(),
+                            )
+                        {
+                            tracing::info!(target: "xflightcrew::radio", station = %who.tag(), reply = %reply, "reply superseded, not spoken");
+                            blackbox::record(
+                                "crew_radio",
+                                serde_json::json!({
+                                    "event": "reply_superseded",
+                                    "reply": reply,
+                                    "held_s":
+                                        (routed_at.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+                                }),
+                            );
+                        } else if !reply.is_empty() {
                             tracing::info!(target: "xflightcrew::radio", station = %who.tag(), reply = %reply, "rx");
                             reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
-                            voice.say_station_until(
-                                Priority::Readback,
-                                who,
-                                &reply,
-                                &pilot_waiting,
-                            );
+                            voice.say_station_until(Priority::Readback, who, &reply, &give_way);
                         }
                     }
                 }
