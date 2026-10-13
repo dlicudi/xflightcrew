@@ -33,6 +33,7 @@
 #include "common.h"
 #include "cursor.h"
 #include "drefs.h"
+#include "flightinit.h"
 #include "fms.h"
 #include "panel.h"
 #include "traffic.h"
@@ -82,4 +83,15 @@ PLUGIN_API void XPluginStop(void) {
 
 PLUGIN_API int XPluginEnable(void) { return 1; }
 PLUGIN_API void XPluginDisable(void) { traffic::disable(); }
-PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int, void*) {}
+PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void* param) {
+    // The user's aircraft is index 0; other planes loading (X-Plane's own AI)
+    // are no load of ours.
+    const bool user = reinterpret_cast<intptr_t>(param) == 0;
+    switch (msg) {
+        case XPLM_MSG_PLANE_UNLOADED: if (user) flightinit::sim_load_message("plane unloaded"); break;
+        case XPLM_MSG_PLANE_LOADED: if (user) flightinit::sim_load_message("plane loaded"); break;
+        case XPLM_MSG_AIRPORT_LOADED: flightinit::sim_load_message("airport loaded"); break;
+        case XPLM_MSG_SCENERY_LOADED: flightinit::sim_load_message("scenery loaded"); break;
+        default: break;
+    }
+}

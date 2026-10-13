@@ -198,4 +198,22 @@ void stop() {
 
 bool loading() { return ReadLoading(nullptr) != 0; }
 
+void sim_load_message(const char* what) {
+    // A load the pilot started from X-Plane's own menu (a new flight, an
+    // airport, an aircraft) opens the same quiet window as one through the
+    // mailbox: before 2026-10-13 only mailbox loads raised the flag, and a
+    // switch to LXGB from the menu hung X-Plane with xvl's two fleets still
+    // asking and drawing through the load. Every message restarts the
+    // window, so it closes 3 s of frames after the last of them.
+    g_loading = true;
+    g_after_call = true;
+    g_first_tick = false;
+    g_quiet_s = 0.0f;
+    g_quiet_frames = 0;
+    g_returned_at = std::chrono::steady_clock::now();
+    char msg[160];
+    std::snprintf(msg, sizeof msg, "XFlightCrew plugin: sim load (%s): quiet window open\n", what);
+    XPLMDebugString(msg);
+}
+
 } // namespace flightinit
