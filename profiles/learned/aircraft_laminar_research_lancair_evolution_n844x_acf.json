@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "acf": "Aircraft/Laminar Research/Lancair Evolution/N844X.acf",
+  "acf_fingerprint": "fnv64:316055a79dcbd6fc",
+  "measured_on": "2026-10-13",
+  "conditions": {
+    "ias_kts": 100.00733,
+    "alt_ft": 4959.620706594411,
+    "flap": 0.5
+  },
+  "pitch": {
+    "response": {
+      "b": 214.03385888898552,
+      "damping": 1.8784873322722166,
+      "stiffness": 11.093493292530631,
+      "path": 1.2561424442096163,
+      "cross": 0.0,
+      "delay_s": 0.0,
+      "ias_kts": 92.7183040156307,
+      "tas_kts": 98.8957188648565
+    },
+    "r2": 0.9723029983326537,
+    "segments": 2
+  },
+  "roll": null,
+  "yaw": {
+    "response": {
+      "b": 65.06585405555415,
+      "damping": 0.6503666198941694,
+      "stiffness": 5.505232385044009,
+      "path": 0.18716650759516396,
+      "cross": 0.0,
+      "delay_s": 0.05,
+      "ias_kts": 103.29949137239313,
+      "tas_kts": 112.97499862205254
+    },
+    "r2": 0.9785103734701328,
+    "segments": 2
+  },
+  "energy": null
+}

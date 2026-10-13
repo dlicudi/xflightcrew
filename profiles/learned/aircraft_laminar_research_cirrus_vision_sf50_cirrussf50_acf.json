@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "acf": "Aircraft/Laminar Research/Cirrus Vision SF50/CirrusSF50.acf",
+  "acf_fingerprint": "fnv64:288bfb89f8e428d0",
+  "measured_on": "2026-10-13",
+  "conditions": {
+    "ias_kts": 92.71132,
+    "alt_ft": 4992.566650826807,
+    "flap": 0.5
+  },
+  "pitch": {
+    "response": {
+      "b": 152.08471588581241,
+      "damping": 1.2698748939507374,
+      "stiffness": 6.484039135051821,
+      "path": 0.9799866066947414,
+      "cross": 0.0,
+      "delay_s": 0.0125,
+      "ias_kts": 92.00059725398691,
+      "tas_kts": 99.47010999390022
+    },
+    "r2": 0.9837001475370994,
+    "segments": 2
+  },
+  "roll": {
+    "response": {
+      "b": 136.35392122023,
+      "damping": 6.462503845091712,
+      "stiffness": 0.0,
+      "path": 0.0,
+      "cross": 13.872398235281171,
+      "delay_s": 0.025,
+      "ias_kts": 94.59591781930273,
+      "tas_kts": 103.47380216769642
+    },
+    "r2": 0.9472830255982997,
+    "segments": 2
+  },
+  "yaw": {
+    "response": {
+      "b": 50.14677596839098,
+      "damping": 0.5068659616472587,
+      "stiffness": 3.5599696154879643,
+      "path": 0.21738612293221443,
+      "cross": 0.0,
+      "delay_s": 0.05,
+      "ias_kts": 96.9492938582249,
+      "tas_kts": 106.1209448598215
+    },
+    "r2": 0.9975580303558522,
+    "segments": 2
+  },
+  "energy": null
+}

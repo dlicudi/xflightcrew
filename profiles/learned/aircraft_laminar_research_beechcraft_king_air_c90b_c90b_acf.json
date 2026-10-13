@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "acf": "Aircraft/Laminar Research/Beechcraft King Air C90B/C90B.acf",
+  "acf_fingerprint": "fnv64:cafa6f49267ebcc5",
+  "measured_on": "2026-10-13",
+  "conditions": {
+    "ias_kts": 104.45464,
+    "alt_ft": 5002.703720061572,
+    "flap": 0.5
+  },
+  "pitch": {
+    "response": {
+      "b": 70.50847550339313,
+      "damping": 1.0571170685874058,
+      "stiffness": 9.424188079993284,
+      "path": 1.7563735462598888,
+      "cross": 0.0,
+      "delay_s": 0.0125,
+      "ias_kts": 124.72780549938652,
+      "tas_kts": 135.52522052493828
+    },
+    "r2": 0.9588359610669661,
+    "segments": 2
+  },
+  "roll": {
+    "response": {
+      "b": 129.84624676530865,
+      "damping": 4.641373799244747,
+      "stiffness": 0.0,
+      "path": 0.0,
+      "cross": 10.418825363886587,
+      "delay_s": 0.05,
+      "ias_kts": 116.87607684515365,
+      "tas_kts": 128.43077974427885
+    },
+    "r2": 0.9783756378136355,
+    "segments": 2
+  },
+  "yaw": {
+    "response": {
+      "b": 66.21403654895572,
+      "damping": 0.8511562172181539,
+      "stiffness": 4.709851164463231,
+      "path": 0.2273139273206281,
+      "cross": 0.0,
+      "delay_s": 0.05,
+      "ias_kts": 119.1716903432872,
+      "tas_kts": 130.4497750891974
+    },
+    "r2": 0.9974632388985192,
+    "segments": 2
+  },
+  "energy": null
+}

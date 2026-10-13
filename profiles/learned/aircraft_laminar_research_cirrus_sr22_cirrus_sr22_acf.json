@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "acf": "Aircraft/Laminar Research/Cirrus SR22/Cirrus SR22.acf",
+  "acf_fingerprint": "fnv64:00025ca526a03f60",
+  "measured_on": "2026-10-13",
+  "conditions": {
+    "ias_kts": 86.27552,
+    "alt_ft": 5035.131955733812,
+    "flap": 0.5
+  },
+  "pitch": {
+    "response": {
+      "b": 168.71770946159288,
+      "damping": 1.5671421550762,
+      "stiffness": 8.144020691902494,
+      "path": 1.4267667575968743,
+      "cross": 0.0,
+      "delay_s": 0.0125,
+      "ias_kts": 74.45645673256729,
+      "tas_kts": 80.75482921941847
+    },
+    "r2": 0.9911519969451622,
+    "segments": 2
+  },
+  "roll": {
+    "response": {
+      "b": 301.53793897033086,
+      "damping": 9.120885187682507,
+      "stiffness": 0.0,
+      "path": 0.0,
+      "cross": 11.858265651984203,
+      "delay_s": 0.025,
+      "ias_kts": 75.46011422288244,
+      "tas_kts": 81.75573462376322
+    },
+    "r2": 0.9631820489130638,
+    "segments": 2
+  },
+  "yaw": {
+    "response": {
+      "b": 44.730194581326,
+      "damping": 0.6076646127798881,
+      "stiffness": 4.084456079127015,
+      "path": 0.17857283614638791,
+      "cross": 0.0,
+      "delay_s": 0.025,
+      "ias_kts": 76.7572261922782,
+      "tas_kts": 83.32850080074624
+    },
+    "r2": 0.9934584413699539,
+    "segments": 2
+  },
+  "energy": null
+}

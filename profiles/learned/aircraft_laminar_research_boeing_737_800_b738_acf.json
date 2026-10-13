@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "acf": "Aircraft/Laminar Research/Boeing 737-800/b738.acf",
+  "acf_fingerprint": "fnv64:ed12c47dffe951b6",
+  "measured_on": "2026-10-13",
+  "conditions": {
+    "ias_kts": 125.8799,
+    "alt_ft": 5296.178616484725,
+    "flap": 0.875
+  },
+  "pitch": {
+    "response": {
+      "b": 20.555525999972318,
+      "damping": 0.8395997055353426,
+      "stiffness": 0.8472905311926762,
+      "path": 0.448843136327449,
+      "cross": 0.0,
+      "delay_s": 0.0625,
+      "ias_kts": 116.14681984130443,
+      "tas_kts": 131.3680618933382
+    },
+    "r2": 0.9899107437577996,
+    "segments": 2
+  },
+  "roll": null,
+  "yaw": {
+    "response": {
+      "b": 11.544224442760218,
+      "damping": 0.30982541329799784,
+      "stiffness": 0.8768158522992757,
+      "path": 0.45523517866491237,
+      "cross": 0.0,
+      "delay_s": 0.15,
+      "ias_kts": 114.3202279982122,
+      "tas_kts": 142.5322010621964
+    },
+    "r2": 0.9959531760452074,
+    "segments": 2
+  },
+  "energy": null
+}
