@@ -1190,6 +1190,18 @@ impl Link {
     /// replies and handoffs name its radar unit "<field> Approach".
     fn call_text(&self, spoken: &str, call: &Call, runway: Option<&str>) -> String {
         let text = call.text(spoken, runway);
+        // Ground's calls name the position that takes them, as [`Self::channel`]
+        // routes them: Ground where the field has one, else the Tower. LEMG
+        // (2026-10-13): "Malaga Tower, Ryanair ..., request taxi" on Ground.
+        let text = if call.to_ground() {
+            let to = if self.has_ground { "Ground, " } else { "Tower, " };
+            match text.strip_prefix("Tower, ").or_else(|| text.strip_prefix("Ground, ")) {
+                Some(rest) => format!("{to}{rest}"),
+                None => text,
+            }
+        } else {
+            text
+        };
         if self.tower_name.is_empty() {
             return text;
         }
