@@ -21,7 +21,7 @@
 //! (`traffic_sink::DrawCull`), never TCAS targets for the station.
 
 use traffic::board::Dir;
-use traffic::track::{gc_dist_m, End, Fix, Stage, Whole, TAXI_IN_S, TAXI_OUT_S};
+use traffic::track::{gc_dist_m, End, Fix, Stage, Whole, TAXI_IN_S};
 use traffic::{FlightInfo, Kin, MovementKind, Phase, Plan, TrafficAircraft};
 
 use super::{Due, Link};
@@ -271,10 +271,11 @@ impl Link {
     }
 
     /// A departure gone before the start ([`traffic::Start::Away`]): from
-    /// the field at its wheels up, [`TAXI_OUT_S`] after its off-block, with
-    /// an id of its own. `None` once it is on the blocks at the other end.
+    /// the field at its wheels up (its own taxi after its off-block,
+    /// `traffic::midflow::out_times`), with an id of its own. `None` once
+    /// it is on the blocks at the other end.
     fn from_field(&self, m: traffic::Movement, now: f64) -> Option<Modeled> {
-        let Some(traffic::Start::Away { off_s }) = m.start else {
+        let Some(traffic::Start::Away { off_s, up_s }) = m.start else {
             return None;
         };
         let info = m.flight.clone()?;
@@ -286,7 +287,7 @@ impl Link {
             here,
             &info.other,
             End::field(here, elev, perf, true),
-            off_s + TAXI_OUT_S,
+            up_s,
             off_s,
             perf,
         )?;

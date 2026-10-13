@@ -54,8 +54,19 @@ pub const BOARDING_S: f64 = 40.0 * 60.0;
 /// A flight this late on its timetable is Delayed until it moves.
 pub const DELAYED_S: f64 = 15.0 * 60.0;
 
-/// A flight that left or landed this long ago leaves the board.
-pub const KEPT_S: f64 = 20.0 * 60.0;
+/// A departure that left this long ago leaves the board, as a FIDS drops
+/// it once its gate has closed behind it.
+pub const DEPARTED_KEPT_S: f64 = 30.0 * 60.0;
+
+/// An arrival that landed this long ago leaves the board: kept longer, for
+/// the people meeting it.
+pub const LANDED_KEPT_S: f64 = 60.0 * 60.0;
+
+/// The board shows the flights of the next twelve hours and no further, so
+/// every "HH:MM" on it names one time: today's or the next morning's
+/// (2026-10-13, LXGB at 17:48: the timetable's next 24 h put tomorrow's
+/// whole day on the board, read as today's flights still pending).
+pub const AHEAD_S: f64 = 12.0 * 3600.0;
 
 impl Status {
     pub fn word(self) -> &'static str {
@@ -138,7 +149,8 @@ impl Status {
         }
     }
 
-    /// Finished with: off the board once [`KEPT_S`] past.
+    /// Finished with: off the board once [`DEPARTED_KEPT_S`] or
+    /// [`LANDED_KEPT_S`] past.
     pub fn done(self) -> bool {
         matches!(self, Status::Departed | Status::Landed | Status::AtGate)
     }
@@ -165,8 +177,9 @@ pub const ROWS_EACH: usize = 10;
 /// only), then up to [`ROWS_EACH`] departures and as
 /// many arrivals, each "D" or "A"|sched|time|number|airline|city|type|
 /// stand|status|own, '\n'-separated, in timetable order; a flight finished
-/// more than [`KEPT_S`] ago is off. Times "HH:MM", a blank where unknown;
-/// a '|' in a name becomes '/'. Empty with no rows and no other field to
+/// more than [`DEPARTED_KEPT_S`] (a departure) or [`LANDED_KEPT_S`] (an
+/// arrival) ago is off, and one more than [`AHEAD_S`] ahead not yet on.
+/// Times "HH:MM", a blank where unknown; a '|' in a name becomes '/'. Empty with no rows and no other field to
 /// pick: the tab says so.
 pub fn payload(field: &str, now_s: f64, rows: &[Row], choices: &[String]) -> String {
     let clean = |s: &str| s.replace(['|', '\n', ','], "/");
@@ -184,7 +197,12 @@ pub fn payload(field: &str, now_s: f64, rows: &[Row], choices: &[String]) -> Str
             .filter(|r| r.flight.dir == dir)
             .filter(|r| {
                 let when = r.time_s.or(r.flight.info.est_s).or(r.flight.info.sched_s);
-                !(r.status.done() && when.is_some_and(|w| now_s - w > KEPT_S))
+                let kept = match dir {
+                    Dir::Departure => DEPARTED_KEPT_S,
+                    Dir::Arrival => LANDED_KEPT_S,
+                };
+                !(r.status.done() && when.is_some_and(|w| now_s - w > kept))
+                    && !when.is_some_and(|w| w - now_s > AHEAD_S)
             })
             .collect();
         half.sort_by(|a, b| {
@@ -376,6 +394,45 @@ mod tests {
         assert_eq!(p.lines().count(), 3);
         assert_eq!(payload("LXGB", now, &[], &picks), "H|LXGB|10:00|LEMG,LXGB");
         assert_eq!(payload("LEMG", now, &[], &picks[..1]), "");
+    }
+
+    /// A FIDS's window (LXGB at 17:48, 2026-10-13): a departure gone 20
+    /// minutes still reads Departed, one gone 40 is off; an arrival landed
+    /// 50 minutes still reads Landed; tomorrow's 11:05, 17 hours ahead, is
+    /// not on the board to be read as today's.
+    #[test]
+    fn the_board_shows_the_next_twelve_hours_and_drops_the_gone() {
+        let now = 17.0 * 3600.0 + 48.0 * 60.0;
+        let row = |dir, at: f64, status| Row {
+            flight: flight(dir, at, at),
+            status,
+            time_s: Some(at),
+            stand: None,
+        };
+        let rows = vec![
+            row(Dir::Departure, now - 20.0 * 60.0, Status::Departed),
+            row(Dir::Departure, now - 40.0 * 60.0, Status::Departed),
+            row(Dir::Departure, now + 3.0 * 3600.0, Status::Scheduled),
+            row(
+                Dir::Departure,
+                86_400.0 + 11.0 * 3600.0 + 300.0,
+                Status::Scheduled,
+            ),
+            row(Dir::Arrival, now - 50.0 * 60.0, Status::Landed),
+            row(Dir::Arrival, now - 70.0 * 60.0, Status::Landed),
+            row(
+                Dir::Arrival,
+                86_400.0 + 10.0 * 3600.0 + 1200.0,
+                Status::Scheduled,
+            ),
+        ];
+        let p = payload("LXGB", now, &rows, &[]);
+        let lines: Vec<&str> = p.lines().skip(1).collect();
+        assert_eq!(lines.len(), 3, "{p}");
+        assert!(lines[0].starts_with("D|17:28|17:28|") && lines[0].contains("|Departed|"));
+        assert!(lines[1].starts_with("D|20:48|"), "{p}");
+        assert!(lines[2].starts_with("A|16:58|16:58|") && lines[2].contains("|Landed|"));
+        assert!(!p.contains("11:05") && !p.contains("10:20"), "{p}");
     }
 
     /// A field nobody simulates goes by the clock: a departure inside 40
