@@ -281,7 +281,7 @@ impl Config {
 
         Ok(Self {
             xplane_base_url: env_or("XPLANE_BASE_URL", "http://127.0.0.1:8086"),
-            whisper_model_path: env_or("WHISPER_MODEL", "models/ggml-base.en.bin"),
+            whisper_model_path: env_or("WHISPER_MODEL", &model_path("ggml-base.en.bin")),
             whisper_gpu: env_or("XCOPILOT_WHISPER_GPU", "true") != "false",
             listen_mode: env_or("XCOPILOT_LISTEN", "continuous"),
             ptt_key: env_or("XCOPILOT_PTT_KEY", ""),
@@ -308,10 +308,13 @@ impl Config {
             // boot ("always end up back with ryan", 2026-07-23).
             piper_voice: crate::prefs::pilot_voice()
                 .or_else(|| std::env::var("PIPER_VOICE").ok())
-                .unwrap_or_else(|| "models/en_US-amy-medium.onnx".into()),
+                .unwrap_or_else(|| model_path("en_US-amy-medium.onnx")),
             // The panel's pick wins over the env default, as the pilot's does.
             cabin_piper_voice: crate::prefs::cabin_voice().unwrap_or_else(|| {
-                env_or("XCOPILOT_CABIN_VOICE", "models/en_US-hfc_female-medium.onnx")
+                env_or(
+                    "XCOPILOT_CABIN_VOICE",
+                    &model_path("en_US-hfc_female-medium.onnx"),
+                )
             }),
             // NOTE: a copilot/cabin collision is resolved after construction —
             // see `resolve_persona_voices`. The panel's voice picker can set
@@ -392,17 +395,20 @@ impl Config {
             efb_port: env_or("XCOPILOT_EFB_PORT", "8787").parse().unwrap_or(8787),
             efb_token: env_or("XCOPILOT_EFB_TOKEN", "").trim().to_string(),
             radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
-            atc_piper_voice: env_or("XCOPILOT_ATC_PIPER_VOICE", "models/en_GB-alba-medium.onnx"),
+            atc_piper_voice: env_or(
+                "XCOPILOT_ATC_PIPER_VOICE",
+                &model_path("en_GB-alba-medium.onnx"),
+            ),
             // ryan-high: the only high-quality model in the folder, and clearly
             // a different person from the tower (alba) and departure (northern
             // male). alan-medium read flat and got voted off (2026-07-09).
             atc_approach_piper_voice: env_or(
                 "XCOPILOT_ATC_APPROACH_PIPER_VOICE",
-                "models/en_US-ryan-high.onnx",
+                &model_path("en_US-ryan-high.onnx"),
             ),
             atc_departure_piper_voice: env_or(
                 "XCOPILOT_ATC_DEPARTURE_PIPER_VOICE",
-                "models/en_GB-northern_english_male-medium.onnx",
+                &model_path("en_GB-northern_english_male-medium.onnx"),
             ),
             // Empty = the tower's voice; ATIS on a real field is often the
             // same controller reading onto the loop anyway.
@@ -580,6 +586,20 @@ pub fn xplane_root() -> String {
 /// `xplane_path("Custom Data/CIFP")`.
 pub fn xplane_path(rel: &str) -> String {
     format!("{}/{rel}", xplane_root())
+}
+
+/// Where the voices and speech models live: `XCOPILOT_MODELS_DIR`, default
+/// `models` (relative, as every default path here is). The ONE owner of that
+/// folder: `xfc voices` installs into it and the defaults below are read from
+/// it, so moving it later (the user data folder) is a change here only.
+pub fn models_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env_or("XCOPILOT_MODELS_DIR", "models"))
+}
+
+/// A file in [`models_dir`], as the string a voice spec carries
+/// (`models/en_US-amy-medium.onnx` by default).
+pub fn model_path(file: &str) -> String {
+    models_dir().join(file).to_string_lossy().into_owned()
 }
 
 fn env_or(key: &str, default: &str) -> String {

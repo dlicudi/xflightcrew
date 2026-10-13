@@ -202,7 +202,7 @@ pub fn local_voices_on_disk(icao: &str) -> Vec<String> {
 /// Sorted so the panel index is stable across runs;
 /// entries are full model paths, display names are the file stems.
 pub fn pilot_voice_choices() -> Vec<String> {
-    let mut voices: Vec<String> = std::fs::read_dir("models")
+    let mut voices: Vec<String> = std::fs::read_dir(crate::config::models_dir())
         .into_iter()
         .flatten()
         .flatten()
