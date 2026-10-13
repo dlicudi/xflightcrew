@@ -734,7 +734,7 @@ pub(crate) async fn load_route_to_fms(
         .is_err()
         || xp.set_int("xcopilot/fms/load", 1).await.is_err()
     {
-        return "Couldn't reach the plugin to load the route. Is the XVoiceLayer plugin running?"
+        return "Couldn't reach the plugin to load the route. Is the XFlightCrew plugin running?"
             .to_string();
     }
     format!(

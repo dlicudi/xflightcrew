@@ -289,10 +289,11 @@ slots first; disable its AI-slot request (or LiveTraffic itself) if you want
 XFlightCrew traffic to appear on TCAS. Aircraft still render without TCAS
 ownership.
 
-The `xcopilot/*` datarefs, the `XCOPILOT_*` variables and the `xcopilot.xpl`
-plugin keep the project's old working name on purpose: they are wire contracts
-between the app, the plugin and your own config, and renaming them would break
-live installs for nothing.
+The `xcopilot/*` datarefs and the `XCOPILOT_*` variables keep the project's old
+working name on purpose: they are wire contracts between the app, the plugin
+and your own config, and renaming them would break live installs for nothing.
+The plugin itself is `xflightcrew.xpl`; `make -C plugin install` removes an old
+`plugins/xcopilot/` folder, since two copies would both load.
 
 ## Reference
 

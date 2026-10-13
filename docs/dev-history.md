@@ -14772,3 +14772,27 @@ the field the traffic runs at.
   Stand cell filled for departures, numbers only; the selector offering LXGB, its board by the
   clock, back to LEMG on "(our traffic)"; the log line `traffic: a board for another field`.
   Owed: the planned stand is not yet kept clear of a neighbour's way out (the two 18 m overlaps).
+
+### 2026-10-13: the landing set on measured responses, and the plugin renamed XFlightCrew
+
+Eight landings at LEMG from 5 nm on the rebuilt pilot controller and the identified responses
+(`profiles/learned/`), our traffic off, all PASS with no intervention: C172 ILS 70 fpm, C172
+visual 77, SR22 144, King Air 232, Evolution 165, Baron 195, SF50 135, stock 737 195 (it went
+around high that morning on the 737's old no-push limit, 1791838756). Sorties 1791884324 to
+1791886798. The rudder flew in the air for the first time: coordination down the final, the
+decrab in the last 2 ft (heading to track 1.2 to 0.6 deg on the C172).
+
+Seen, not chased (the pilot: only obvious flaws):
+- A short float at about 2 ft on the C172 ILS (+40 fpm before settling).
+- A brisk sidestep at minimums on the C172 visual: the GPS line 13 m off the paint, 5 deg of
+  bank each way, on the line by 160 ft.
+- The Evolution's rollout weaves +-5 to 7 deg: airframes without a measured `rollout_steer` fly
+  the takeoff roll's steer, undamped on yaw rate. Owed: measure the ground steering response.
+- The Baron's last 6 ft: the lever 0.26 to 0.08 took the slipstream's lift and tail authority,
+  the sink 33 to 162 fpm while the pull rose. Owed: keep power longer where the lift on the
+  lever is measured large (needs a power step that passes its bar).
+
+The plugin is XFlightCrew: `plugins/xflightcrew/mac_x64/xflightcrew.xpl`, source
+`plugin/src/xflightcrew.cpp`, its title, menu and log lines; the signature
+`com.dlicudi.xcopilot` and the `xcopilot/*` datarefs stay. `make -C plugin install` removes the
+old `plugins/xcopilot/` first (two copies would both load).

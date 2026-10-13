@@ -182,7 +182,7 @@ impl Tool for AutoTaxi {
         // No steering channel (plugin missing or old) — offer what still works.
         if !autotaxi::steer_channel_ok(ctx.xplane).await {
             return Ok(
-                "I can't steer. The XVoiceLayer plugin needs updating. I can hold the taxi speed while you steer."
+                "I can't steer. The XFlightCrew plugin needs updating. I can hold the taxi speed while you steer."
                     .to_string(),
             );
         }
@@ -366,7 +366,7 @@ impl Tool for LineUp {
         let heading = ctx.xplane.get_float(autotaxi::PSI_TRUE).await.ok();
         if !autotaxi::steer_channel_ok(ctx.xplane).await {
             return Ok(
-                "I can't steer. The XVoiceLayer plugin needs updating, so the line-up is yours."
+                "I can't steer. The XFlightCrew plugin needs updating, so the line-up is yours."
                     .to_string(),
             );
         }

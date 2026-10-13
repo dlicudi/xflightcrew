@@ -174,7 +174,7 @@ static void load_fms_route() {
         XPLMSetDestinationFMSFlightPlanEntry(xplm_Fpl_Pilot_Primary, 0);
     }
     char msg[96];
-    std::snprintf(msg, sizeof msg, "XVoiceLayer plugin: loaded %d FMS waypoints\n", idx);
+    std::snprintf(msg, sizeof msg, "XFlightCrew plugin: loaded %d FMS waypoints\n", idx);
     XPLMDebugString(msg);
 }
 
@@ -259,13 +259,13 @@ static void sequence_goto() {
     g_goto_lon = std::atof(slon);
     char msg[160];
     if (i < 0) {
-        std::snprintf(msg, sizeof msg, "XVoiceLayer plugin: fms/goto %s: no such entry in the loaded plan\n", ident);
+        std::snprintf(msg, sizeof msg, "XFlightCrew plugin: fms/goto %s: no such entry in the loaded plan\n", ident);
         XPLMDebugString(msg);
         return;
     }
     XPLMSetDestinationFMSEntry(i);
     XPLMSetDestinationFMSFlightPlanEntry(xplm_Fpl_Pilot_Primary, i);
-    std::snprintf(msg, sizeof msg, "XVoiceLayer plugin: fms/goto %s -> entry %d\n", ident, i);
+    std::snprintf(msg, sizeof msg, "XFlightCrew plugin: fms/goto %s -> entry %d\n", ident, i);
     XPLMDebugString(msg);
 }
 

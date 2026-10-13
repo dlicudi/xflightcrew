@@ -107,7 +107,7 @@ void play_pending() {
     float vol = 1.0f;
     char path[512] = {0};
     if (std::sscanf(buf, "%d|%f|%511[^\n]", &ch, &vol, path) != 3) {
-        XPLMDebugString("XVoiceLayer plugin: audio/play payload not understood\n");
+        XPLMDebugString("XFlightCrew plugin: audio/play payload not understood\n");
         return;
     }
     if (ch < 0 || ch >= kChannels) return;
@@ -115,7 +115,7 @@ void play_pending() {
     void* pcm = read_wav(path, &rate, &channels, &bytes);
     if (!pcm) {
         char msg[640];
-        std::snprintf(msg, sizeof msg, "XVoiceLayer plugin: audio/play could not read %s\n", path);
+        std::snprintf(msg, sizeof msg, "XFlightCrew plugin: audio/play could not read %s\n", path);
         XPLMDebugString(msg);
         return;
     }
@@ -125,7 +125,7 @@ void play_pending() {
                                        kBus[ch], OnComplete, pcm);
     if (!c) {
         std::free(pcm);
-        XPLMDebugString("XVoiceLayer plugin: XPLMPlayPCMOnBus refused the sample\n");
+        XPLMDebugString("XFlightCrew plugin: XPLMPlayPCMOnBus refused the sample\n");
         return;
     }
     if (vol < 0.0f) vol = 0.0f;

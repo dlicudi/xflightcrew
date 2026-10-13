@@ -186,7 +186,7 @@ impl Tool for AutoTakeoff {
         .await;
         if !crate::autotaxi::steer_channel_ok(ctx.xplane).await {
             return Ok(
-                "I can't steer. The XVoiceLayer plugin needs updating, so this takeoff is yours."
+                "I can't steer. The XFlightCrew plugin needs updating, so this takeoff is yours."
                     .to_string(),
             );
         }
@@ -200,7 +200,7 @@ impl Tool for AutoTakeoff {
         );
         if pp.is_err() || pr.is_err() {
             return Ok(
-                "I can't reach the yoke. The XVoiceLayer plugin needs updating, so this takeoff is yours."
+                "I can't reach the yoke. The XFlightCrew plugin needs updating, so this takeoff is yours."
                     .to_string(),
             );
         }
