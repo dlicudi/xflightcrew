@@ -329,9 +329,9 @@ pub(super) fn takeoff_hold_tick_for(
     }
     // The book: another strip cleared onto the held runway, or standing on
     // it, holds it like an occupant, whatever the replay shows; one cleared
-    // to land and still flying is an ARRIVAL, judged by the gap like any
-    // other (`DEPART_GAP_NM`). Asked before the hold's lock (for ours,
-    // nothing to ask with no traffic strip open).
+    // to land and still flying is an ARRIVAL, judged on TIME by the
+    // release's one rule ([`DepartureBlock::holds`]). Asked before the
+    // hold's lock (for ours, nothing to ask with no traffic strip open).
     let other_strip = if flight.is_own() && traffic_strips().is_empty() {
         None
     } else {
@@ -345,10 +345,9 @@ pub(super) fn takeoff_hold_tick_for(
     };
     let other_strip_holds = other_strip == Some(DepartureBlock::Occupied);
     let lander_nm = match other_strip {
-        Some(DepartureBlock::Lander(nm)) => Some(nm),
+        Some(DepartureBlock::Lander(l)) => Some(l.nm),
         _ => None,
     };
-    let lander_close = lander_nm.is_some_and(|nm| nm < DEPART_GAP_NM);
     let player_on_ground = state.on_ground;
     let mut guard = flight.takeoff_hold.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_mut()?;
@@ -409,6 +408,15 @@ pub(super) fn takeoff_hold_tick_for(
             .iter()
             .any(|t| t.on_ground && on_active_runway(t.lat, t.lon).is_some()),
     } || other_strip_holds;
+    // A lander the departure cannot be off the strip ahead of, judged from
+    // where the departure IS: lined up only when told so AND on the pavement
+    // (a position unknown is not).
+    let lined_up = hold.lined_up
+        && rwy
+            .as_ref()
+            .zip(own)
+            .is_some_and(|(r, (lat, lon))| on_runway_pavement(r, lat, lon).is_some());
+    let lander_close = other_strip.is_some_and(|b| b.holds(lined_up));
     // A CONDITIONAL line-up's condition, for the crew: the named arrival has
     // passed once it is off the final (down on the strip, or gone). Published
     // every tick, cleared with the hold. The Baron at Malaga crossed the hold

@@ -15139,3 +15139,62 @@ its own canvas (the route map in page.html, the diagram in `diagram.js`).
 - **UNFLOWN.** With `XCOPILOT_TRAFFIC=ours`, depart and fly by hand: two minutes after our
   liftoff a traffic departure on the same strip is released; no `departure still held ...
   on_strip=true` with an empty runway.
+
+## 2026-10-13: a release ahead of a lander is judged in TIME, as its go-around watch judges (LEMG 13)
+
+- **Live.** Our 737 cleared to land 13 at 14:37:17Z (t 1791902232.6). At t 2255.4 RYR5024 at the
+  holding point was "cleared for takeoff runway one three" (`atc` `TaxiCleared>TakeoffCleared`)
+  with us 4.0 nm out at 146.7 kt groundspeed (autoland `dist` 3.99, the watch's `own_nm` reads
+  about 0.03 nm more): 99 s. Its traffic phases: LineUp 2256.4, Roll 2299.5 (43 s to line up),
+  Climb 2335.3 (36 s roll). At t 2325.5 `go_around_judged` (along 824 m, `clear_s` 40.0 vs
+  `own_s` 35.0) sent us round, "traffic on the runway". The pilot: cleared to land, then a
+  takeoff clearance as I was about to land, then a go-around.
+- **Cause.** f72da68 released a departure ahead of a cleared lander by DISTANCE (`Lander(nm)`
+  inside `FINAL_NM` for the reply, `DEPART_GAP_NM` for the release watch) and assumed the roll
+  starts at once, while the lander's go-around watch judges by TIME (`go_around_due`). Worse,
+  our landing claim beyond `LANDING_CLAIM_NM` (4 nm) was `Sequenced` (direction only), so at 4.02
+  nm we were not in the departure's book AT ALL: the reply cleared it without a word about us.
+- **The rule (one function, both paths).** `DepartureBlock::Lander` now carries `Lander { nm,
+  secs }`, `secs` the lander's time to its threshold as the watch counts it (`lander_secs`:
+  distance over groundspeed, under 40 kt or unread is `DEFAULT_FINAL_KTS` 140, the fast side;
+  `None` once its state is older than `OWN_SEEN_FRESH`). `DepartureBlock::holds(lined_up)` is the
+  release rule the reply ctx (`make_ctx`, lined up = the FSM's `LinedUp`) and the release watch
+  (`takeoff_hold_tick_for`, lined up = told so AND on the pavement) both call. A lander holds
+  unless `departure_clears_lander(secs, line_up_s)`: the departure's predicted exits (lined up,
+  `StripExit::LinedUp(37.5)`, from the release until its roll; then `Clearing` the roll left) are
+  fed through `go_around_due` itself at every second of the approach, so the release can never
+  promise what the watch revokes. It works out to: lander seconds at least `line_up_s` + 37.5 s
+  roll (`roll_to_liftoff_s(0)`) + 10 s (`RUNWAY_CLEAR_MARGIN_S`).
+- **Numbers.** `LINE_UP_S` = 60 s from the holding point: measured on our traffic, 42 departures
+  in the blackbox (`traffic` phase LineUp to Roll) took 35 to 47 s, RYR5024 43 s; 60 is the safe
+  side and a pilot is slower. `LINED_UP_ROLL_S` = 10 s lined up (the readback and the spool-up;
+  our traffic rolls on the order). So from the holding point the lander must be 107.5 s out (4.2
+  nm at 140 kt, 3.3 nm at 110 kt), lined up 57.5 s (2.2 nm at 140 kt). The LEMG 13 case, 99 s:
+  held, "behind the landing traffic on 4 mile final, line up ... behind" or "hold position,
+  traffic on 4 mile final". An unknown time holds. A lander minutes out still blocks nothing.
+- **Our far-out landing is a lander.** `add_strip` keeps our far-out landing claim as
+  `ClaimKind::Landing` with `whole_strip: false` (it was `Sequenced`): the direction only, as
+  before, for every whole-strip query (`held_whole`, `blocked`, `runway_conflicts`), but
+  `departure_blocked` now reads EVERY landing claim on the strip, whole or not, as a lander.
+  The phrase is the lander's at its distance, any distance; "traffic on the runway" stays an
+  occupant's.
+- **Also seen, not changed here.** The go-around itself came from `strip_exit` reading the rolling
+  RYR5024 at 824 m (about 90 kt) as a ROLLOUT (`Clearing(ROLLOUT_CLEAR_S)` 40 s: fast and not
+  measured accelerating at 0.5 kt/s) where a roll would have given about 15 s; it lifted off 10 s
+  later, 25 s before our threshold. Under the new release it is not reached (no departure is
+  released inside 107.5 s), but a released departure misread in its roll can still send a lander
+  round. Candidate fix: the book knows a strip `TakeoffCleared` is a departure.
+- Tests: `a_release_ahead_of_a_lander_is_judged_as_the_go_around_watch_judges` (the trace's 99 s
+  held from the holding point; the 107.5 s boundary; lined up with a lander 6 nm out at 140 kt
+  released, and `go_around_due` on the predicted state never fires, every half second; 2 nm held
+  lined up; unknown holds), `a_traffic_departure_at_the_hold_is_not_released_ahead_of_our_landing`
+  (our clearance at 4.02 nm, 146.7 kt: the traffic's reply names the landing traffic at 4 mile,
+  never cleared, never "traffic on the runway"; its release watch holds),
+  `our_departure_ahead_of_a_traffic_lander_is_judged_in_time` (a traffic lander: held at the
+  hold, cleared lined up with it at 6 nm by the reply and the release watch, held lined up at 2
+  nm). `a_departure_reads_a_flying_lander_as_an_arrival` checks the seconds.
+- **UNFLOWN.** At LEMG with `XCOPILOT_TRAFFIC=ours`, cleared to land: no traffic `RequestTakeoff`
+  reply "cleared for takeoff" from a holding point (`TaxiCleared>TakeoffCleared`) while our
+  `own_s` (seconds from distance and groundspeed) is under about 108; such a departure is told
+  the landing traffic and goes after us. Any departure released ahead of us shows, in our
+  `go_around_deferred` records, `clear_s` + 10 under `own_s`, and no `go_around_judged` for it.

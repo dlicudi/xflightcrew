@@ -571,7 +571,8 @@ fn a_departure_reads_a_flying_lander_as_an_arrival() {
         "the book still holds it whole"
     );
     assert!(
-        matches!(dep(), Some(DepartureBlock::Lander(nm)) if (nm - 6.0).abs() < 0.1),
+        matches!(dep(), Some(DepartureBlock::Lander(Lander { nm, secs: Some(s) }))
+            if (nm - 6.0).abs() < 0.1 && (s - 6.0 * 3600.0 / 140.0).abs() < 3.0),
         "{:?}",
         dep()
     );
