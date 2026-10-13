@@ -1107,7 +1107,7 @@ fn paths_report() -> String {
     use sim::paths;
     let r = paths::roots();
     let mut out = format!("mode:       {}\n", r.mode.as_str());
-    out += &format!("resources:  {}\n", paths::shown(&r.resources));
+    out += &format!("resources:  {}\n", paths::resources_shown());
     if let Some(missing) = paths::missing_line() {
         out += &format!("            ({missing})\n");
     }

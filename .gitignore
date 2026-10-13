@@ -44,6 +44,9 @@ __pycache__/
 # recordings, generated/managed by voice/voices.py). Tooling + scripts are
 # tracked; the audio and the active-voice pointer stay local.
 *.wav
+# ...except the AFV-Native clicks (BSD-3, assets/afv/AFV_COPYING.md): built
+# into every xfc (crates/sim/build.rs), so a clean checkout must have them.
+!/assets/afv/*.wav
 voice/voices/
 .venv-spk
 
