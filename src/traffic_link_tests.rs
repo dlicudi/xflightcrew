@@ -1787,3 +1787,82 @@ fn a_board_for_a_field_nobody_flies() {
     assert!(later.starts_with("H|ULMM|10:30|"), "{later}");
     assert_ne!(p, later);
 }
+
+/// A test timetable at ULMM (its real layout from the fixtures): one A320
+/// route flown from 06:00 to 22:00.
+fn ulmm_table() -> traffic::routes::FieldRoutes {
+    use traffic::routes::{FieldRoutes, RouteRow};
+    let gibraltar = traffic::routes::field_routes("LXGB").unwrap().rows[0];
+    let rows: &'static [RouteRow] = Box::leak(Box::new([RouteRow {
+        summer: 42,
+        winter: 42,
+        windows: &[(6.0, 22.0)],
+        based: false,
+        types: &[("A320", 100)],
+        ..gibraltar
+    }]));
+    FieldRoutes {
+        icao: "ULMM",
+        utc_offset_h: 3.0,
+        rows,
+    }
+}
+
+/// ONE COUNTER, NO CLASHES (multi-field traffic stage 2, 2026-10-13): two
+/// fleets sharing the world's ids hand out every id once, whichever takes
+/// first; a counter of its own still starts at 1.
+#[test]
+fn every_fleet_takes_its_ids_from_one_counter() {
+    let ids = Ids::default();
+    let other = ids.clone();
+    assert_eq!(ids.peek(), 1);
+    let mut seen = HashSet::new();
+    for k in 0..50 {
+        let c = if k % 3 == 0 { &ids } else { &other };
+        assert!(seen.insert(c.peek()), "id {} twice", c.peek());
+        c.bump();
+    }
+    assert_eq!(ids.peek(), 51);
+    assert_eq!(Ids::default().peek(), 1);
+}
+
+/// A FIELD'S DAY IS ITS OWN (stage 2): the timetable start at a field with
+/// its seed (`traffic::field_seed`) is the same day however often it is
+/// built, and the board by the clock of that field (no fleet) shows the
+/// same flights as the fleet's own board.
+#[test]
+fn a_fields_day_is_the_same_whoever_builds_it() {
+    let table = ulmm_table();
+    let apt = format!("{}/ulmm.dat", fixtures());
+    let field = FieldModel::load(&apt, "ULMM").unwrap().unwrap();
+    let date = traffic::rotation::Date::ymd(2026, 7, 14);
+    let seed = traffic::field_seed("ULMM", SESSION_SEED);
+    // 10:00 local in summer at UTC+3: 06:00 zulu.
+    let zulu = Some(6.0 * 3600.0);
+    let start = |s: u64| {
+        timetable_start(
+            &field,
+            &table,
+            Density::Normal,
+            s,
+            zulu,
+            Some(date.ordinal),
+            None,
+        )
+    };
+    let (a, board_a, local_a) = start(seed);
+    let (b, board_b, _) = start(seed);
+    let key = |v: &[Movement]| {
+        v.iter()
+            .map(|m| (m.callsign.clone(), m.t_s.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    assert!(!board_a.is_empty());
+    assert_eq!(key(&a), key(&b), "the same field, the same day");
+    assert_eq!(board_a, board_b);
+    let remote = RemoteBoard::from_field(&field, &table, Density::Normal, date, local_a, 0.0);
+    assert_eq!(
+        remote.flights, board_a,
+        "the board by the clock is the fleet's"
+    );
+}

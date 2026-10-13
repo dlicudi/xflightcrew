@@ -414,7 +414,9 @@ struct Due {
 pub(crate) struct Link {
     fleet: Fleet,
     due: Vec<Due>,
-    next_id: u32,
+    /// Where its new aircraft take their ids: one counter shared by every
+    /// field's fleet ([`Ids`]).
+    ids: Ids,
     /// The field's spoken name, for the calls' address ("Malaga Tower").
     tower_name: String,
     /// The runway the tower last cleared anyone for: every movement spawns
@@ -448,6 +450,33 @@ pub(crate) struct Link {
     /// When each flight was seen to leave the runway or land on it, local
     /// seconds: the board's "actual" time.
     actual: HashMap<String, f64>,
+}
+
+/// Traffic ids from ONE counter for every field's fleet (multi-field
+/// traffic stage 2, 2026-10-13): each `Link` counted from 1, so two fleets
+/// at once handed out the same ids, and the party line's strips
+/// (`FlightId::Traffic(u32)`, no field in the key) and the plugin's roster
+/// would have mixed them. A clone shares the counter. Ids start at 1 and
+/// stay below the fleet's own picture ids (`u32::MAX - 1` and up).
+#[derive(Debug, Clone)]
+pub(crate) struct Ids(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl Default for Ids {
+    fn default() -> Ids {
+        Ids(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)))
+    }
+}
+
+impl Ids {
+    /// The id the next aircraft takes (a spawn may still be refused).
+    pub(crate) fn peek(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// That id was taken.
+    pub(crate) fn bump(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A departure waits this long for the airframe its rotation names (its
@@ -511,7 +540,7 @@ impl Link {
             has_ground,
             fleet,
             due,
-            next_id: 1,
+            ids: Ids::default(),
             tower_name: tower_name.to_string(),
             tower_runway: None,
             heartbeat_s: f64::NEG_INFINITY,
@@ -524,6 +553,12 @@ impl Link {
             t0_local_s: 0.0,
             actual: HashMap::new(),
         }
+    }
+
+    /// Take this link's ids from `ids`, shared with the other fields'
+    /// fleets ([`Ids`]). Before the first tick: nothing is spawned yet.
+    pub(crate) fn share_ids(&mut self, ids: &Ids) {
+        self.ids = ids.clone();
     }
 
     /// The board's flights and the local time of day at the fleet's start
@@ -925,11 +960,11 @@ impl Link {
                 continue;
             }
             let c = ctx(&self.fleet);
-            if let Ok(ac) = self.due[i].m.park(self.next_id, &self.fleet.field, &c) {
+            if let Ok(ac) = self.due[i].m.park(self.ids.peek(), &self.fleet.field, &c) {
                 let (id, cs) = (ac.id, ac.callsign.clone());
                 crate::world::note_traffic_type(&ac.callsign, &ac.icao_type);
                 if self.fleet.spawn(ac) {
-                    self.next_id += 1;
+                    self.ids.bump();
                     self.due[i].held = Some(id);
                     out.parked.push((id, cs));
                 }
@@ -937,11 +972,11 @@ impl Link {
         }
         for m in std::mem::take(&mut self.to_park) {
             let c = ctx(&self.fleet);
-            if let Ok(ac) = m.park(self.next_id, &self.fleet.field, &c) {
+            if let Ok(ac) = m.park(self.ids.peek(), &self.fleet.field, &c) {
                 let (id, cs) = (ac.id, ac.callsign.clone());
                 crate::world::note_traffic_type(&ac.callsign, &ac.icao_type);
                 if self.fleet.spawn(ac) {
-                    self.next_id += 1;
+                    self.ids.bump();
                     out.parked.push((id, cs));
                 }
             }
@@ -1180,7 +1215,7 @@ impl Link {
                     continue;
                 }
             }
-            let spawned = d.m.spawn(self.next_id, &self.fleet.field, &ctx);
+            let spawned = d.m.spawn(self.ids.peek(), &self.fleet.field, &ctx);
             if let Err(why) = &spawned {
                 tracing::info!(callsign = %d.m.callsign, kind = ?d.m.kind, runway = %d.m.runway,
                     tries = d.tries, "traffic: spawn refused ({why:?})");
@@ -1196,7 +1231,7 @@ impl Link {
                     let cs = ac.callsign.clone();
                     crate::world::note_traffic_type(&ac.callsign, &ac.icao_type);
                     if self.fleet.spawn(ac) {
-                        self.next_id += 1;
+                        self.ids.bump();
                         out.spawned.push((id, cs));
                     }
                 }
@@ -1445,8 +1480,9 @@ pub(crate) struct TrafficWorld {
     /// Generated schedules flown so far at this field (the next hour's seed
     /// and offset); `None` for the pilot's file.
     hours: Option<u32>,
-    /// Links built this session: each new field's seed.
-    built: u64,
+    /// Every fleet's ids, one counter for the session ([`Ids`]): a link
+    /// built later never reuses an id an earlier one handed out.
+    ids: Ids,
     /// The packed sink to the plugin, started with the first link.
     sink: Option<crate::traffic_sink::TrafficSink>,
     /// Who of the simulated aircraft the sink draws (stage 1 of
@@ -1569,8 +1605,11 @@ impl TrafficWorld {
         }
         if let Some(rx) = &self.loading {
             match rx.try_recv() {
-                Ok(link) => {
+                Ok(mut link) => {
                     self.loading = None;
+                    if let Some(l) = link.as_mut() {
+                        l.share_ids(&self.ids);
+                    }
                     self.link = link;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return None,
@@ -1851,8 +1890,7 @@ impl TrafficWorld {
             cfg.cifp_dir.clone(),
         );
         let (file, density) = (cfg.traffic_file.clone(), cfg.traffic_density.clone());
-        self.built += 1;
-        let seed = self.built;
+        let seed = traffic::field_seed(&icao, SESSION_SEED);
         // A field with a route table flies its timetable's day whole; the
         // rest generate an hour at a time.
         let table = traffic::routes::field_routes(&icao).is_some();
@@ -2094,10 +2132,12 @@ pub(crate) fn board_field<'a>(pick: Option<&str>, choices: &'a [String]) -> Opti
 /// A remote board is built again after this much sim time, seconds.
 const REMOTE_BOARD_REBUILD_S: f64 = 6.0 * 3600.0;
 
-/// The seed of a field the fleet does not fly: its timetable's delays are
-/// the first link's (the same seed the fleet gets when it is the first
-/// field of a session).
-const REMOTE_BOARD_SEED: u64 = 1;
+/// The session's seed, hashed with each field's ICAO into that field's
+/// day (`traffic::field_seed`, stage 2, 2026-10-13): a field's fleet and
+/// its board by the clock draw the same day, whichever was built first.
+/// A constant: the same field is the same day every session, as a sweep
+/// is.
+pub(crate) const SESSION_SEED: u64 = 1;
 
 /// The board of a field with a timetable that the fleet does not fly
 /// (2026-10-13, the Board tab's selector): its flights round the time it
@@ -2148,7 +2188,7 @@ impl RemoteBoard {
                 field,
                 table,
                 density,
-                REMOTE_BOARD_SEED,
+                traffic::field_seed(&field.icao, SESSION_SEED),
                 date,
                 local_s,
                 TIMETABLE_HORIZON_S,
