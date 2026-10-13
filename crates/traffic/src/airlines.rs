@@ -43,7 +43,7 @@ pub type Share = (Carrier, u32);
 // The carriers. A carrier flying different fleets or numbers at different
 // fields has one entry per use (BA's Gatwick 2xxx flights and long-haul
 // 777s are not its Heathrow ones).
-const fn c(
+pub(crate) const fn c(
     code: &'static str,
     telephony: &'static str,
     types: &'static [(&'static str, u32)],
@@ -58,20 +58,20 @@ const fn c(
 }
 
 const NARROW_A: &[(&str, u32)] = &[("A320", 45), ("A321", 20), ("A319", 15), ("A20N", 20)];
-const EZY: Carrier = c(
+pub(crate) const EZY: Carrier = c(
     "EZY",
     "Easy",
     &[("A320", 45), ("A319", 15), ("A20N", 25), ("A21N", 15)],
     (11, 8999),
 );
-const EZY_GATWICK: Carrier = c("EZY", "Easy", EZY.types, (8000, 8999));
-const BAW_EUROPE: Carrier = c(
+pub(crate) const EZY_GATWICK: Carrier = c("EZY", "Easy", EZY.types, (8000, 8999));
+pub(crate) const BAW_EUROPE: Carrier = c(
     "BAW",
     "Speedbird",
     &[("A320", 55), ("A319", 20), ("A321", 15), ("A20N", 10)],
     (300, 999),
 );
-const BAW_GATWICK: Carrier = c(
+pub(crate) const BAW_GATWICK: Carrier = c(
     "BAW",
     "Speedbird",
     &[
@@ -83,7 +83,7 @@ const BAW_GATWICK: Carrier = c(
     ],
     (2000, 2799),
 );
-const BAW_HEATHROW: Carrier = c(
+pub(crate) const BAW_HEATHROW: Carrier = c(
     "BAW",
     "Speedbird",
     &[
@@ -101,25 +101,25 @@ const BAW_HEATHROW: Carrier = c(
     ],
     (1, 999),
 );
-const BAW_LONG: Carrier = c(
+pub(crate) const BAW_LONG: Carrier = c(
     "BAW",
     "Speedbird",
     &[("B772", 30), ("B77W", 30), ("B789", 20), ("A388", 20)],
     (1, 299),
 );
-const RYR: Carrier = c(
+pub(crate) const RYR: Carrier = c(
     "RYR",
     "Ryanair",
     &[("B738", 75), ("B38M", 25)],
     (1000, 9999),
 );
-const WZZ: Carrier = c(
+pub(crate) const WZZ: Carrier = c(
     "WZZ",
     "Wizz Air",
     &[("A321", 50), ("A21N", 35), ("A320", 15)],
     (1000, 9999),
 );
-const VLG: Carrier = c(
+pub(crate) const VLG: Carrier = c(
     "VLG",
     "Vueling",
     &[
@@ -131,32 +131,32 @@ const VLG: Carrier = c(
     ],
     (1000, 8999),
 );
-const TOM: Carrier = c(
+pub(crate) const TOM: Carrier = c(
     "TOM",
     "Tomjet",
     &[("B738", 60), ("B38M", 25), ("B788", 10), ("B789", 5)],
     (1, 999),
 );
-const EXS: Carrier = c(
+pub(crate) const EXS: Carrier = c(
     "EXS",
     "Channex",
     &[("B738", 60), ("A321", 25), ("A21N", 15)],
     (100, 999),
 );
-const UAE: Carrier = c("UAE", "Emirates", &[("A388", 60), ("B77W", 40)], (1, 99));
-const VIR: Carrier = c(
+pub(crate) const UAE: Carrier = c("UAE", "Emirates", &[("A388", 60), ("B77W", 40)], (1, 99));
+pub(crate) const VIR: Carrier = c(
     "VIR",
     "Virgin",
     &[("A333", 20), ("A339", 30), ("B789", 35), ("A35K", 15)],
     (1, 499),
 );
-const EIN: Carrier = c(
+pub(crate) const EIN: Carrier = c(
     "EIN",
     "Shamrock",
     &[("A320", 60), ("A21N", 30), ("A321", 10)],
     (100, 999),
 );
-const DLH: Carrier = c(
+pub(crate) const DLH: Carrier = c(
     "DLH",
     "Lufthansa",
     &[
@@ -168,7 +168,7 @@ const DLH: Carrier = c(
     ],
     (1, 2999),
 );
-const DLH_FRANKFURT: Carrier = c(
+pub(crate) const DLH_FRANKFURT: Carrier = c(
     "DLH",
     "Lufthansa",
     &[
@@ -188,13 +188,13 @@ const DLH_FRANKFURT: Carrier = c(
     ],
     (1, 2999),
 );
-const AAL_LONG: Carrier = c(
+pub(crate) const AAL_LONG: Carrier = c(
     "AAL",
     "American",
     &[("B772", 45), ("B77W", 30), ("B788", 10), ("B789", 15)],
     (1, 299),
 );
-const AAL: Carrier = c(
+pub(crate) const AAL: Carrier = c(
     "AAL",
     "American",
     &[
@@ -208,13 +208,13 @@ const AAL: Carrier = c(
     ],
     (1, 2999),
 );
-const UAL_LONG: Carrier = c(
+pub(crate) const UAL_LONG: Carrier = c(
     "UAL",
     "United",
     &[("B772", 45), ("B763", 20), ("B789", 25), ("B788", 10)],
     (1, 999),
 );
-const UAL: Carrier = c(
+pub(crate) const UAL: Carrier = c(
     "UAL",
     "United",
     &[
@@ -231,13 +231,13 @@ const UAL: Carrier = c(
     ],
     (1, 2999),
 );
-const DAL_LONG: Carrier = c(
+pub(crate) const DAL_LONG: Carrier = c(
     "DAL",
     "Delta",
     &[("A333", 40), ("A339", 30), ("B763", 30)],
     (1, 499),
 );
-const DAL: Carrier = c(
+pub(crate) const DAL: Carrier = c(
     "DAL",
     "Delta",
     &[
@@ -252,56 +252,56 @@ const DAL: Carrier = c(
     ],
     (1, 2999),
 );
-const JBU: Carrier = c(
+pub(crate) const JBU: Carrier = c(
     "JBU",
     "JetBlue",
     &[("A320", 40), ("A321", 40), ("A21N", 10), ("BCS3", 10)],
     (1, 2999),
 );
-const SWA: Carrier = c(
+pub(crate) const SWA: Carrier = c(
     "SWA",
     "Southwest",
     &[("B737", 40), ("B738", 40), ("B38M", 20)],
     (100, 4999),
 );
-const ASA: Carrier = c(
+pub(crate) const ASA: Carrier = c(
     "ASA",
     "Alaska",
     &[("B739", 50), ("B738", 40), ("A320", 10)],
     (1, 1999),
 );
-const QTR: Carrier = c(
+pub(crate) const QTR: Carrier = c(
     "QTR",
     "Qatari",
     &[("A359", 40), ("B77W", 30), ("A388", 20), ("A35K", 10)],
     (1, 99),
 );
-const TAP: Carrier = c(
+pub(crate) const TAP: Carrier = c(
     "TAP",
     "Air Portugal",
     &[("A320", 40), ("A321", 30), ("A20N", 15), ("A21N", 15)],
     (1300, 1399),
 );
-const THY: Carrier = c(
+pub(crate) const THY: Carrier = c(
     "THY",
     "Turkish",
     &[("A321", 50), ("B738", 25), ("A333", 25)],
     (1960, 1999),
 );
-const ACA: Carrier = c(
+pub(crate) const ACA: Carrier = c(
     "ACA",
     "Air Canada",
     &[("B789", 50), ("B77W", 30), ("B788", 20)],
     (800, 899),
 );
-const SWR: Carrier = c(
+pub(crate) const SWR: Carrier = c(
     "SWR",
     "Swiss",
     &[("A320", 40), ("A321", 20), ("A20N", 20), ("BCS3", 20)],
     (300, 499),
 );
-const AFR: Carrier = c("AFR", "Air France", NARROW_A, (1000, 1999));
-const AFR_PARIS: Carrier = c(
+pub(crate) const AFR: Carrier = c("AFR", "Air France", NARROW_A, (1000, 1999));
+pub(crate) const AFR_PARIS: Carrier = c(
     "AFR",
     "Air France",
     &[
@@ -316,14 +316,14 @@ const AFR_PARIS: Carrier = c(
     ],
     (1, 1999),
 );
-const AFR_LONG: Carrier = c("AFR", "Air France", &[("B77W", 50), ("A359", 50)], (1, 99));
-const KLM: Carrier = c(
+pub(crate) const AFR_LONG: Carrier = c("AFR", "Air France", &[("B77W", 50), ("A359", 50)], (1, 99));
+pub(crate) const KLM: Carrier = c(
     "KLM",
     "KLM",
     &[("B738", 50), ("B739", 20), ("E190", 30)],
     (1000, 1999),
 );
-const KLM_AMSTERDAM: Carrier = c(
+pub(crate) const KLM_AMSTERDAM: Carrier = c(
     "KLM",
     "KLM",
     &[
@@ -339,13 +339,13 @@ const KLM_AMSTERDAM: Carrier = c(
     ],
     (1, 1999),
 );
-const IBE: Carrier = c(
+pub(crate) const IBE: Carrier = c(
     "IBE",
     "Iberia",
     &[("A320", 40), ("A321", 30), ("A20N", 20), ("A21N", 10)],
     (3000, 3999),
 );
-const IBE_MADRID: Carrier = c(
+pub(crate) const IBE_MADRID: Carrier = c(
     "IBE",
     "Iberia",
     &[
@@ -359,67 +359,99 @@ const IBE_MADRID: Carrier = c(
     ],
     (1, 3999),
 );
-const IBS: Carrier = c(
+pub(crate) const IBS: Carrier = c(
     "IBS",
     "Iberexpres",
     &[("A320", 60), ("A321", 25), ("A20N", 15)],
     (3800, 3999),
 );
-const AEA: Carrier = c(
+pub(crate) const AEA: Carrier = c(
     "AEA",
     "Air Europa",
     &[("B738", 60), ("B38M", 25), ("B789", 15)],
     (1000, 9999),
 );
-const NAX: Carrier = c(
+pub(crate) const NAX: Carrier = c(
     "NAX",
     "Nor Shuttle",
     &[("B738", 70), ("B38M", 30)],
     (1000, 7999),
 );
-const TRA: Carrier = c(
+pub(crate) const TRA: Carrier = c(
     "TRA",
     "Transavia",
     &[("B738", 75), ("A21N", 25)],
     (5000, 6999),
 );
-const TVF: Carrier = c(
+pub(crate) const TVF: Carrier = c(
     "TVF",
     "France Soleil",
     &[("B738", 80), ("A20N", 20)],
     (3000, 4999),
 );
-const EWG: Carrier = c(
+pub(crate) const EWG: Carrier = c(
     "EWG",
     "Eurowings",
     &[("A320", 50), ("A319", 30), ("A20N", 20)],
     (1000, 9999),
 );
-const CFG: Carrier = c(
+pub(crate) const CFG: Carrier = c(
     "CFG",
     "Condor",
     &[("A320", 40), ("A321", 30), ("A21N", 15), ("A339", 15)],
     (1000, 2999),
 );
-const ITY: Carrier = c(
+pub(crate) const ITY: Carrier = c(
     "ITY",
     "Itarrow",
     &[("A320", 50), ("A20N", 30), ("A21N", 20)],
     (1, 2999),
 );
-const ANE: Carrier = c(
+pub(crate) const ANE: Carrier = c(
     "ANE",
     "Air Nostrum",
     &[("AT76", 70), ("CRJ9", 30), ("SF34", 0)],
     (8000, 8999),
 );
-const LOG: Carrier = c("LOG", "Logan", &[("AT76", 50), ("SF34", 50)], (100, 999));
-const HOP: Carrier = c(
+pub(crate) const LOG: Carrier = c("LOG", "Logan", &[("AT76", 50), ("SF34", 50)], (100, 999));
+pub(crate) const HOP: Carrier = c(
     "HOP",
     "Air Hop",
     &[("AT76", 50), ("CRJ9", 25), ("E190", 25), ("SF34", 0)],
     (1000, 7999),
 );
+
+// The carriers only the route tables fly (`crate::routes`, 2026-10-13):
+// Malaga's scheduled mix past the leisure carriers. Each one's telephony is
+// the station's (`atc::callsign::TELEPHONY`).
+pub(crate) const BEL: Carrier = c(
+    "BEL",
+    "Bee-line",
+    &[("A320", 60), ("A319", 40)],
+    (3000, 3999),
+);
+pub(crate) const AUA: Carrier = c(
+    "AUA",
+    "Austrian",
+    &[("A320", 60), ("A321", 25), ("A20N", 15)],
+    (100, 999),
+);
+pub(crate) const SAS: Carrier = c(
+    "SAS",
+    "Scandinavian",
+    &[("A20N", 70), ("A320", 20), ("A21N", 10)],
+    (1000, 4999),
+);
+pub(crate) const FIN: Carrier = c(
+    "FIN",
+    "Finnair",
+    &[("A321", 50), ("A320", 30), ("A319", 20)],
+    (1000, 1999),
+);
+pub(crate) const ICE: Carrier = c("ICE", "Iceair", &[("B38M", 100)], (500, 599));
+pub(crate) const AEE: Carrier = c("AEE", "Aegean", &[("A20N", 60), ("A21N", 40)], (600, 699));
+pub(crate) const LOT: Carrier = c("LOT", "LOT", &[("B38M", 100)], (400, 499));
+pub(crate) const ETD: Carrier = c("ETD", "Etihad", &[("B789", 60), ("A321", 40)], (1, 199));
 
 /// The fields we fly, each its own mix.
 pub fn field_mix(icao: &str) -> Option<&'static [Share]> {
@@ -665,6 +697,7 @@ pub fn all_carriers() -> Vec<Carrier> {
         .chain(COUNTRIES.iter().filter_map(|f| country_mix(f)))
         .chain(std::iter::once(FALLBACK))
         .flat_map(|t| t.iter().map(|(c, _)| *c))
+        .chain(crate::routes::all_carriers())
         .collect()
 }
 

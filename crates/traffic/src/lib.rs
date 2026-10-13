@@ -19,6 +19,8 @@ pub mod perf;
 pub mod phase;
 pub mod rate;
 pub mod rng;
+pub mod rotation;
+pub mod routes;
 pub mod schedule;
 pub mod slot;
 pub mod spacing;
