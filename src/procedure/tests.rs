@@ -278,7 +278,7 @@
         let dirs = [
             std::env::var("XVL_SORTIE_DIR").unwrap_or_default(),
             format!("{}/logs/sorties", env!("CARGO_MANIFEST_DIR")),
-            format!("{}/GitHub/xvoicelayer/logs/sorties", std::env::var("HOME").unwrap_or_default()),
+            format!("{}/GitHub/xflightcrew/logs/sorties", std::env::var("HOME").unwrap_or_default()),
         ];
         let Some(text) = dirs
             .iter()

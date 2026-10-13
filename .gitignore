@@ -56,3 +56,6 @@ indexes/
 # Local agent settings (absolute paths, per machine)
 .claude/settings.json
 .claude/settings.local.json
+
+# macOS Finder metadata
+.DS_Store
