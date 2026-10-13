@@ -19,6 +19,7 @@ pub mod kin;
 pub mod midflow;
 pub mod perf;
 pub mod phase;
+pub mod places;
 pub mod rate;
 pub mod rng;
 pub mod rotation;
