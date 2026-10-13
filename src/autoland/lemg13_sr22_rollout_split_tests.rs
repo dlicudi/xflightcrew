@@ -222,7 +222,7 @@
                     }
                 } else {
                     let v = v_rec[k] + dv;
-                    bank_cmds.push((tk, crate::pilot::line::bank_for_line(x, v, phi, 5.0)));
+                    bank_cmds.push((tk, crate::pilot::line::bank_for_line(x, v, phi, 5.0, crate::pilot::line::period_s(1.0), 0.0)));
                     0.0
                 };
                 if on {

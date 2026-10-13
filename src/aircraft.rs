@@ -69,22 +69,11 @@ pub struct AircraftProfile {
     /// against the 172's 24 volt threshold (2026-09-11). `None` = 24.
     #[serde(default)]
     pub bus_volts_nominal: Option<f64>,
-    /// Optional progressive autoland power reduction; absent retains idle flare.
-    #[serde(default)]
-    pub flare_power: Option<FlarePowerProfile>,
     /// The least thrust (lever ratio) the autoland holds on a stabilised
     /// final, when not more than a few knots fast. Jets fly the approach on
     /// thrust; `None` lets the speed law idle the engines (the pistons).
     #[serde(default)]
     pub approach_thrust_min: Option<f64>,
-    /// How the landing arrest leads this autopilot's lag. `None` = the
-    /// 172's fitted numbers (see [`ArrestLeadProfile`]).
-    #[serde(default)]
-    pub arrest_lead: Option<ArrestLeadProfile>,
-    /// The attitude flare's elevator limits and ground pull, when the
-    /// defaults do not fit.
-    #[serde(default)]
-    pub flare_elevator: Option<FlareElevatorProfile>,
     /// The rudder's authority on the takeoff roll, when measured.
     #[serde(default)]
     pub roll_rudder: Option<RollRudderProfile>,
@@ -701,6 +690,7 @@ pub use facts::*;
 mod speeds;
 pub use speeds::*;
 mod generic;
+pub mod learned;
 pub use generic::*;
 mod builtin_profiles;
 use builtin_profiles::*;

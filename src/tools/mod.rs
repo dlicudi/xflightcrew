@@ -241,7 +241,6 @@ pub(crate) fn ap_config(profile: &AircraftProfile) -> Option<autopilot::ApConfig
         fd_commands: prep.flight_director,
         ac_powered: prep.ac_powered,
         service_ceiling_ft: ceiling,
-        flare_power: profile.flare_power,
         climb: autopilot::ClimbPerf::from_profile(profile),
     })
 }

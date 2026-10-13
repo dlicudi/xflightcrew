@@ -107,25 +107,7 @@ pub(super) fn cessna_172sp() -> AircraftProfile {
         autopilot_lands: None,
         approach_command: None,
         bus_volts_nominal: None,
-        // The stock profile carries the same continuous flare laws. Keep the
-        // builtin sound when profiles/ is unavailable.
-        flare_power: Some(FlarePowerProfile {
-            reduction_per_second: 0.10,
-            retard_below_ft: None,
-            retard_max_per_s: Some(0.10),
-            retard_slow_kts: None,
-            retard_at_s: None,
-            retard_fast_kts: None,
-            hold_from_s: None,
-            retard_float_per_s: None,
-        }),
         approach_thrust_min: None,
-        arrest_lead: None,
-        flare_elevator: Some(FlareElevatorProfile {
-            max: 0.5,
-            max_push: 0.10,
-            ground_pull: 0.0,
-        }),
         roll_rudder: None,
         rotate_elevator: None,
         ground_plant: None,
@@ -475,10 +457,8 @@ pub(super) fn cirrus_sr22() -> AircraftProfile {
         autopilot_lands: None,
         approach_command: None,
         bus_volts_nominal: None,
-        flare_power: None,
+
         approach_thrust_min: None,
-        arrest_lead: None,
-        flare_elevator: None,
         roll_rudder: None,
         rotate_elevator: None,
         ground_plant: None,

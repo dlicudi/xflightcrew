@@ -326,33 +326,10 @@ tail_strike_deg: 12.5
 # blackbox `autotakeoff` `climb_manual` `ias` 150-173 and `theta` under this.
 climb_pitch_max_deg: 17.5
 
-# The landing laws the 737 learned on the same stock autopilot (LFLL and
-# EGCC, 2026-09-17/19), absent here until the profile review: without them
-# the final is flown down to idle, the throttle is CUT at the flare, and the
-# arrest leads the AP with a 172's gain and cap. A big turbofan spools slowly
-# and the stock AP's VS mode lags its dial by seconds; these are the 737's
-# numbers as the starting hypothesis for a heavier aircraft. VERIFY on the
-# first landing, from the `cmd_vs` / `vs_dial` / `vvi` columns.
+# The approach is flown on thrust, the 737's floor as the starting
+# hypothesis for a bigger turbofan (a book "approach idle"). VERIFY on the
+# first landing, from the `power` ticks.
 approach_thrust_min: 0.3
-flare_power:
-  reduction_per_second: 0.08
-  # The Airbus "RETARD" call is at 20 ft; timed to the wheels from 2 s out
-  # (issue #76, the 737's keys). VERIFY: blackbox `power` `retard` on the
-  # next A330 landing.
-  retard_below_ft: 20.0
-  retard_at_s: 2.0
-  retard_fast_kts: 2.0
-arrest_lead:
-  gain: 1.5
-  max_climb_fpm: 100.0
-  trend_seconds: 1.5
-# The attitude flare's limits (#180): the sidestick with the servos out is
-# a RATE plant, a neutral stick HOLDS the sink it has, so the flare may push
-# to end a float. The old fitted rate model is in docs/dev-history.md
-# (2026-09-28). Unflown on the attitude flare.
-flare_elevator:
-  max: 0.4
-  max_push: 0.3
 # The circuit's final leads its offset by this many seconds of the ground
 # track (#189): the heading mode rolls at about 3 deg/s through a 2 s lag and
 # flies the bug two ticks late (fitted to the LEMG 30 circuits of 2026-09-29,

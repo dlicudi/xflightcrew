@@ -289,7 +289,7 @@
                 || (g.phase == ApproachPhase::Final && alt - rwy.elev_ft < VISUAL_MINIMUMS_FT);
             jet.bank_cmd = hand.then(|| {
                 let side = crate::pilot::line::side_velocity_m_s(Some(trk), rwy.course_deg, gs).unwrap_or(0.0);
-                crate::pilot::line::bank_for_line(xtk_m, side, jet.phi, alt - rwy.elev_ft)
+                crate::pilot::line::bank_for_line(xtk_m, side, jet.phi, alt - rwy.elev_ft, crate::pilot::line::period_s(1.0), 0.0)
             });
             self.t += dt;
             if hand {

@@ -79,24 +79,6 @@
         assert!(!xp.ran(super::CMD_SERVOS_FDIR_OFF));
     }
 
-    /// A declared block is used only when its numbers are sane; undeclared,
-    /// the attitude flare flies the defaults.
-    #[test]
-    fn a_flare_elevator_block_is_used_only_when_sane() {
-        use crate::aircraft::FlareElevatorProfile;
-        let p = FlareElevatorProfile {
-            max: 0.30,
-            max_push: 0.05,
-            ground_pull: 0.0,
-        };
-        assert_eq!(p.valid(), Some(p));
-        assert_eq!(FlareElevatorProfile { max: 2.0, ..p }.valid(), None);
-        assert_eq!(FlareElevatorProfile { max_push: 0.5, ..p }.valid(), None);
-        let d = FlareElevatorProfile::default();
-        assert_eq!((d.max, d.max_push, d.ground_pull), (0.35, 0.10, 0.0));
-        assert_eq!(d.valid(), Some(d));
-    }
-
     /// LSZS RNAV 03 (2026-09-24): the MAP is 1.98 nm from the threshold,
     /// 996 ft above it, 380 m right of the extended centreline. Handed the
     /// visual segment's 4.74 degrees, the landing takes it from there on its

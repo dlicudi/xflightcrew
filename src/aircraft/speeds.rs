@@ -1314,24 +1314,11 @@ pub fn approach_thrust_min() -> Option<f64> {
     airframe_facts().approach_thrust_min
 }
 
-/// The live airframe's arrest lead (see [`ArrestLeadProfile`]): an absent
-/// or malformed block is the default, never the previous airframe's.
-pub fn arrest_lead() -> ArrestLeadProfile {
-    airframe_facts().arrest_lead
-}
-
 /// The live airframe's whole profile, for the few consumers that need the
 /// tool surface itself away from the command loop (the stand shutdown builds
 /// the registry from it). Republished on EVERY swap by `publish_airframe`.
 pub fn live_profile() -> Option<std::sync::Arc<AircraftProfile>> {
     airframe_facts().profile.clone()
-}
-
-/// The flare's elevator law for the live airframe (see
-/// [`FlareElevatorProfile`]); `None` is the default law, never the previous
-/// airframe's.
-pub fn flare_elevator() -> Option<FlareElevatorProfile> {
-    airframe_facts().flare_elevator
 }
 
 /// The live airframe's rudder authority on the roll (see

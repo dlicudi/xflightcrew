@@ -1125,21 +1125,10 @@ pitch_authority_down: 0.5
 # full levers 3,490 (`a_derated_takeoff_hands_the_autopilot_a_sane_climb`).
 climb_pitch_max_deg: 15.0
 
-# The approach is flown on thrust; the flare retards progressively (the
-# type, from the stock 737). Through the fitted flare plant (the model
-# under `flare_elevator:`) the stock numbers stand: the retard's top at 15
-# ft or a cap of 0.03 to 0.06 moves no landing past 20 fpm, at 30 ft or a
-# float's 0.12 the still-air spread widens (7 to 11 of 36 out of 100 to
-# 250). VERIFY: autoland `power` `retard` keys.
+# The approach is flown on thrust (the type's, from the stock 737): the
+# lever's floor on a stabilised final. The flare's retard is TECS's, timed
+# on the engine's spool (`pilot::energy`).
 approach_thrust_min: 0.3
-flare_power:
-  reduction_per_second: 0.08
-  retard_below_ft: 20.0
-  retard_at_s: 2.0
-  retard_fast_kts: 0.0
-  retard_slow_kts: 5.0
-  retard_max_per_s: 0.04
-  retard_float_per_s: 0.08
 # The rudder on the takeoff roll (autotakeoff::RollSteer), fitted to THIS
 # aircraft: the pedal channel moves the rudder and zibomod's nosewheel, 7
 # degrees at full pedal. Fitted to all three LEMG 30 rolls of 2026-10-07
@@ -1192,22 +1181,6 @@ roll_rudder:
   dead_s: 1.0
   lag_s: 0.2
   track_lag_s: 0.75
-# The attitude flare's limits (our own flare: no ILS, or `autopilot_lands`
-# lost below `own_flare_below_agl_ft`), pull-only. The old fitted model of
-# 2026-10-07 and its replays (bench/landings/zibo_lemg30_flares.jsonl) are
-# in docs/dev-history.md. Unflown on the attitude flare.
-flare_elevator:
-  max: 0.45
-  max_push: 0.0
-# How the landing arrest leads the V/S mode: the stock 737's fit, a
-# hypothesis for this autopilot. The MCP V/S wheel here IS the stock
-# vvi_dial_fpm (B738_Datarefs.txt "MCP VVI"). Our own flare never flies
-# it: the arrest takes the servos out on the tick it begins
-# (`arrest_hands_step`), so the dial it leads has no autopilot behind it.
-arrest_lead:
-  gain: 1.5
-  max_climb_fpm: 100.0
-  trend_seconds: 1.5
 
 # Taxi pace: the type's.
 taxi:

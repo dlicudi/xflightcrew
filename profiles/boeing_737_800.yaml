@@ -65,46 +65,12 @@ altimeter:
   copilot_std_command: laminar/B738/EFIS_control/fo/push_button/std_press
 # The approach is flown ON thrust (about 55-60% N1 with flaps 40): the speed
 # law never pulls the lever under this on a stabilised final, and the flare
-# retards it progressively instead of cutting it (a swept wing at idle sinks
+# retards it on the engine's spool (TECS, `pilot::energy`), never a cut (a
+# swept wing at idle sinks
 # at once: the first landing here touched at -449 fpm and 128 kt after an
 # idle last mile and a throttle cut at 22 ft, 2026-09-17). Both VERIFY: the
 # 0.4 lever the speed law settled on at Vref that day is the only measurement.
 approach_thrust_min: 0.3
-flare_power:
-  reduction_per_second: 0.08
-  # The retard is keyed on height, time to the wheels and speed, never on
-  # the sink the arrest is removing (issue #76). Keyed on the sink it cut to
-  # idle in the float at LEMG 13 (-859 fpm, 2.4 g, 2026-09-26), and on
-  # 2026-09-28 it started when the arrest brought the sink inside 185 (15.8
-  # ft, mid-float in 1790589309) and stopped again when the sink it cost
-  # came back past 400. Nothing above 20 ft, as the crew does.
-  retard_below_ft: 20.0
-  # ...and below it, at or under the approach speed, not while more than
-  # 2 s from the wheels (radio over sink): LEMG 12 (2026-09-26) sinking 300
-  # at 20 ft is 4 s out, where the height retard walked 0.44 to 0.16 and
-  # landed at 407. Any faster than the approach speed it starts at 20 ft:
-  # a fast flare floats.
-  retard_at_s: 2.0
-  retard_fast_kts: 0.0
-  # A flare 5 kt under the approach speed keeps its thrust: a knot taken is
-  # 63 fpm at the wheels (the fitted plant). Only while it is still sinking
-  # and the retard has not begun: a FLOAT (under 100 fpm, now or 1.5 s
-  # ahead on the trend) takes the lever off at retard_float_per_s whatever
-  # the height or the speed. EGBB 15 (2026-09-28) floated 4 s at 22.7 ft on
-  # 0.30 held by height, time and then this key; replayed through that
-  # flare's own fit, the float key lands it with no float, 280 m shorter.
-  retard_slow_kts: 5.0
-  # No faster than 0.04 a second (0.08: 292 worst, 347 through the strong
-  # 17:25 plant). A lever still up at the wheels is the rollout's to close.
-  # Replayed through the fitted plant and the recorded air: the sixteen
-  # LEMG 13 approaches of 2026-09-28 at 238 fpm mean, 277 worst (the
-  # sink-keyed law: 268, 300); the gusty two through nine plants, 293, none
-  # climbing; the 2026-09-26 gates through every flare's plant, 316 worst.
-  retard_max_per_s: 0.04
-  # ...but a FLOAT's thrust comes off at twice that: at 0.04 LXGB 09's
-  # float (2026-10-06) walked 0.33 to 0.25 from 10.6 to 4.5 ft and held
-  # it up. The roundout's float takes the same rate.
-  retard_float_per_s: 0.08
 # The rudder on the takeoff roll (autotakeoff::RollSteer): yaw rate per unit
 # of steer, growing with the square of the speed. Fitted to both EGKK 26L
 # rolls of 2026-09-27 (8 kt crosswind from the left, 30 to 86 kt; 3 s
@@ -115,28 +81,6 @@ flare_power:
 roll_rudder:
   yaw_dps: 11.5
   at_kts: 80.0
-# The attitude flare's limits: the default 0.35 of pull ran out with the
-# nose at 1 degree at LEMG 13 (a 737 lands at 4 to 6, strikes its tail near
-# 11), and pull-only. The old fitted flare model and its replays are in
-# docs/dev-history.md (2026-09-26 to 2026-10-06). Unflown on the attitude
-# flare.
-flare_elevator:
-  max: 0.45
-  max_push: 0.0
-# How the landing arrest leads THIS autopilot. The 172's law (gain 2, dial
-# cap +300, no trend term) was fitted to a first-order 4.5 s lag; this
-# aircraft's VS mode, fitted to the EGCC 23L tick log (2026-09-19), is two
-# 1.5 s lags in series with two seconds of dead time, and the 172's numbers
-# pinned the dial at +300 for three seconds, levelled it at 30 ft, and
-# ballooned it to +160 fpm at ten feet into an overflight go-around. A
-# lower gain, a cap that can never command a real climb, and a trend term
-# for damping: through the fitted plant the arrest lands at 120-180 fpm
-# without a balloon (the sortie test in autoland.rs). VERIFY on the next
-# landing; the blackbox tick carries vs_dial, vvi and vvi_trend.
-arrest_lead:
-  gain: 1.5
-  max_climb_fpm: 100.0
-  trend_seconds: 1.5
 pitot_heat: true
 pitch_trim: true
 com_radio: true

@@ -101,7 +101,6 @@ pub struct ApConfig {
     /// Service ceiling (ft MSL) — altitude targets above it are refused. From the
     /// airframe's reference figures; falls back to the GA default.
     pub service_ceiling_ft: f64,
-    pub flare_power: Option<crate::aircraft::FlarePowerProfile>,
     /// The airframe's climb numbers for a pilot's "climb to X".
     pub climb: ClimbPerf,
 }
@@ -112,7 +111,6 @@ impl Default for ApConfig {
             fd_commands: Vec::new(),
             ac_powered: false,
             service_ceiling_ft: DEFAULT_SERVICE_CEILING_FT,
-            flare_power: None,
             climb: ClimbPerf::default(),
         }
     }

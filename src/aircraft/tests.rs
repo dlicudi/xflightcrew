@@ -77,8 +77,6 @@
             ("procedure", "NOT_CLIMBING_FPM", "a rate that is not a climb, any airframe"),
             ("pilot", "DEADBAND_FPM", "the energy throttle's hand: an energy-rate error it leaves alone (about 1.5 kt at a 172's approach speed), the learnt power still trims it; any airframe (2026-10-11)"),
             ("autoland", "LEVEL_RETURN_MAX_FPM", "the rate an engaged altitude hold may return to its altitude at and still be holding it, a watchdog band, not a commanded rate; any airframe (2026-10-11)"),
-            ("pilot", "SLOW_KTS", "a band under the airframe's own approach target where the energy throttle closes the deficit faster, not a commanded speed; any airframe (2026-10-12)"),
-            ("pilot", "URGENT_SLOW_KTS", "a band under the airframe's own approach target where the energy throttle's hand moves faster, not a commanded speed; any airframe (2026-10-12)"),
             ("autoland", "MAX_OFF_PATH_FPM", "how much steeper than the path's own rate a visual final's dial may go to rejoin it from above, a bound, not a commanded rate; any airframe (2026-10-12)"),
             ("pilot", "SPEED_TERM_MAX_FPM", "the most energy rate a speed error may ask of the energy throttle, a bound on the request, not a commanded rate; any airframe (2026-10-11)"),
             ("pilot", "REJOIN_MAX_FPM", "how far off the path's own sink the hand-flown segment may ask to rejoin it, a bound on the request, not a commanded rate; any airframe (2026-10-12)"),
@@ -238,11 +236,6 @@
             ),
             (
                 "autoland",
-                "VS_LEAD_MAX_CLIMB_FPM",
-                "default: ArrestLeadProfile overrides",
-            ),
-            (
-                "autoland",
                 "MAX_CLIMB_FPM",
                 "floor only: max_climb_fpm() takes the airframe's",
             ),
@@ -275,16 +268,6 @@
                 "autoland",
                 "APPROACH_FAST_KTS",
                 "MARGIN: over the approach speed",
-            ),
-            (
-                "autoland",
-                "RETARD_SLOW_KTS",
-                "MARGIN: default only; the profile's retard_slow_kts",
-            ),
-            (
-                "autoland",
-                "RETARD_SINK_FLOOR_FPM",
-                "floor only: time to the wheels is never infinite",
             ),
             (
                 "autoland",

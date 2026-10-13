@@ -29,13 +29,6 @@ match:
   acf: ["Laminar Research/Beechcraft Baron 58/"]
 pressurised: false
 
-# Experimental simulator tuning after two LEBL hard arrivals (2026-09-16).
-# Taper approach power from the flare gate, timed to the wheels at no more
-# than 0.04 a second, held only when 5 kt slow (issue #76: never on the sink).
-# FAA multiengine guidance calls for gradual reduction in roundout, not a step.
-flare_power:
-  reduction_per_second: 0.04
-
 # --- Capability flags: universal-dataref tools only ---
 autopilot: true        # set_heading / set_altitude / set_vertical_speed. VERIFY LIVE
                        # before trusting the automation: the acf's _autopilot_logic
@@ -246,15 +239,3 @@ lights:
 # No XChecklist file ships for this airframe, so there is no `checklist` /
 # `checklist_map` block and no `locations` — cockpit geography is answered from
 # a verified layout or not at all, never guessed.
-
-# The attitude flare: 186 fpm, then with its ground pull 76 and 119
-# (LEMG 13, 1791802802, 1791803088, 1791803366).
-flare_elevator:
-  # The attitude flare's pull limit: it holds the nose angle, the limit is
-  # the stop.
-  max: 0.8
-  # Its low wing's ground effect, measured: the pull went from 0.13 at 9 ft
-  # to 0.40 at the wheels with the nose 0.7 deg under its command and the
-  # sink rebuilt from 127 to 232 fpm (LEMG 13, 1791802802: 186 fpm). Fed
-  # forward along the ground effect's shape (`attitude_flare::ground_shape`).
-  ground_pull: 0.3

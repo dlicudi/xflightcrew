@@ -151,10 +151,6 @@ pub struct AirframeFacts {
     pub stall_curve: Option<StallCurve>,
     /// The approach thrust floor ([`approach_thrust_min_for`]).
     pub approach_thrust_min: Option<f64>,
-    /// The landing arrest's lead, the default when absent or malformed.
-    pub arrest_lead: ArrestLeadProfile,
-    /// The flare's elevator law, `None` the default law.
-    pub flare_elevator: Option<FlareElevatorProfile>,
     /// The roll's rudder authority, `None` the default roll law.
     pub roll_rudder: Option<RollRudderProfile>,
     /// The book landing distance, metres ([`landing_distance_m_for`]).
@@ -189,6 +185,11 @@ pub struct AirframeFacts {
     pub exterior: Exterior,
     /// The altimeter fast paths, `None` the stock knob alone.
     pub altimeter: Option<AltimeterProfile>,
+    /// The `.acf`'s model (the detector's): its ground geometry, its
+    /// engines and what an identification flight learned flying it
+    /// ([`learned::AcfModel`]). `None` until read: a new airframe starts
+    /// unmeasured.
+    pub acf_model: Option<learned::AcfModel>,
 }
 
 impl Default for AirframeFacts {
@@ -208,8 +209,6 @@ impl Default for AirframeFacts {
             approach_floor_kts: None,
             stall_curve: None,
             approach_thrust_min: None,
-            arrest_lead: ArrestLeadProfile::default(),
-            flare_elevator: None,
             roll_rudder: None,
             landing_distance_m: None,
             vs_limits: None,
@@ -224,6 +223,7 @@ impl Default for AirframeFacts {
             mode_knob: None,
             exterior: Exterior::default(),
             altimeter: None,
+            acf_model: None,
         }
     }
 }
