@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "acf": "Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP_G1000.acf",
+  "acf_fingerprint": "fnv64:d7abf25fa26be5f0",
+  "measured_on": "2026-10-13",
+  "conditions": {
+    "ias_kts": 60.1328,
+    "alt_ft": 4971.671505877838,
+    "flap": 0.6667
+  },
+  "pitch": {
+    "response": {
+      "b": 120.09659109659283,
+      "damping": 2.0673657732080466,
+      "stiffness": 6.310095875698506,
+      "path": 1.5696012681984268,
+      "cross": 0.0,
+      "delay_s": 0.0125,
+      "ias_kts": 62.94351737135312,
+      "tas_kts": 69.98688655401526
+    },
+    "r2": 0.9292783538853384,
+    "segments": 2
+  },
+  "roll": {
+    "response": {
+      "b": 271.00476332119524,
+      "damping": 9.838631740221912,
+      "stiffness": 0.0,
+      "path": 0.0,
+      "cross": 3.772737953360704,
+      "delay_s": 0.0125,
+      "ias_kts": 64.06734698334995,
+      "tas_kts": 71.29904767459387
+    },
+    "r2": 0.9423910751183571,
+    "segments": 2
+  },
+  "yaw": {
+    "response": {
+      "b": 52.491098516693235,
+      "damping": 0.7213011389340434,
+      "stiffness": 2.7447473164029814,
+      "path": 0.41295399577976527,
+      "cross": 0.0,
+      "delay_s": 0.0125,
+      "ias_kts": 63.51869207832107,
+      "tas_kts": 70.76040023932546
+    },
+    "r2": 0.9734397701160548,
+    "segments": 2
+  },
+  "energy": null
+}

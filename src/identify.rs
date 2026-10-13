@@ -196,6 +196,17 @@ async fn fly_input(
         Axis::Roll => ROLL_CH,
         Axis::Yaw => YAW_CH,
     };
+    // Every input is flown about the TRIMMED controls, as flight test flies
+    // them: the yoke the autopilot holds at the disconnect (its servos
+    // write the yoke). From centred controls the 172's nose moved 10 deg
+    // before the input began and the flight measured nothing (LEMG,
+    // 2026-10-13).
+    let held = |n: &'static str| async move { xp.get_float(n).await.unwrap_or(0.0) };
+    let (base_p, base_r, base_y) = tokio::join!(
+        held("sim/cockpit2/controls/yoke_pitch_ratio"),
+        held("sim/cockpit2/controls/yoke_roll_ratio"),
+        held("sim/cockpit2/controls/yoke_heading_ratio"),
+    );
     ap_off(xp).await;
     let start = loop {
         if let Some(k) = read_tick(xp, t0).await {
@@ -217,17 +228,25 @@ async fn fly_input(
             break;
         }
         let u = amplitude(axis) * sign * input_at(axis, now - 1.0);
-        // Every channel every tick: a 1 s heartbeat, the others at neutral.
+        // Every channel every tick: a 1 s heartbeat, the others held.
         let (a, b, c) = tokio::join!(
-            xp.set_float(PITCH_CH, if ch == PITCH_CH { u } else { 0.0 }),
-            xp.set_float(ROLL_CH, if ch == ROLL_CH { u } else { 0.0 }),
-            xp.set_float(YAW_CH, if ch == YAW_CH { u } else { 0.0 }),
+            xp.set_float(PITCH_CH, base_p + if ch == PITCH_CH { u } else { 0.0 }),
+            xp.set_float(ROLL_CH, base_r + if ch == ROLL_CH { u } else { 0.0 }),
+            xp.set_float(YAW_CH, base_y + if ch == YAW_CH { u } else { 0.0 }),
         );
         if a.is_err() || b.is_err() || c.is_err() {
             why = Some("a channel write failed (is the plugin loaded?)");
             break;
         }
         let Some(k) = read_tick(xp, t0).await else { continue };
+        // The tape: every tick of every input, so a fit or an abort can be
+        // read afterwards (the first runs aborted with nothing to read).
+        crate::blackbox::record(
+            "identify",
+            serde_json::json!({"event": "tick", "axis": format!("{axis:?}"), "sign": sign, "u": u,
+                "base": [base_p, base_r, base_y], "theta": k.theta, "phi": k.phi, "alpha": k.alpha,
+                "beta": k.beta, "p": k.p, "q": k.q, "r": k.r, "ias": k.ias, "vy": k.vy_fpm, "alt": k.alt_ft, "t": k.t}),
+        );
         if let Some(w) = abort_reason(&k, &start) {
             why = Some(w);
             break;
@@ -239,7 +258,18 @@ async fn fly_input(
     }
     // The channels stop: they expire within a second; the autopilot back.
     ap_on(xp).await;
+    // An input stopped by a limit keeps what it measured before the limit:
+    // the rudder's slip rolls a light aircraft past 20 deg in the hands-off
+    // seconds, and throwing the whole input away left the 172's yaw
+    // unmeasured on two runs (LEMG, 2026-10-13). Too short to fit, it is
+    // dropped.
+    const MIN_KEPT_S: f64 = 4.0;
+    let kept_s = match (out.first(), out.last()) {
+        (Some(a), Some(b)) => b.t - a.t,
+        _ => 0.0,
+    };
     Ok(match why {
+        Some(_) if kept_s >= MIN_KEPT_S => Ok((out, slip)),
         Some(w) => Err(w),
         None => Ok((out, slip)),
     })
@@ -266,6 +296,10 @@ async fn power_step(xp: &XPlaneClient, lever: &str, t0: std::time::Instant) -> V
         .clamp(0.0, 1.0);
         let _ = xp.set_float(lever, thr).await;
         let Some(k) = read_tick(xp, t0).await else { continue };
+        crate::blackbox::record(
+            "identify",
+            serde_json::json!({"event": "power", "thr": thr, "ias": k.ias, "vy": k.vy_fpm, "alt": k.alt_ft, "theta": k.theta, "t": k.t}),
+        );
         if let Some(p) = prev {
             let dt = (k.t - p.t).max(0.05);
             out.push(EnergySample { t: k.t, thr, ias_kts: k.ias, accel_kts_s: (k.ias - p.ias) / dt, vs_fpm: k.vy_fpm });
@@ -316,7 +350,10 @@ pub async fn main_cmd(args: &[String], base_url: &str) -> anyhow::Result<bool> {
         d.iter().rev().nth(1).copied().unwrap_or(0.0)
     });
     println!("# Identification: {} ({acf_rel})\n", p.display_name);
-    if crate::xplane::sim_frozen(&xp).await {
+    // Measuring the flight as it is needs it flying; an air start reloads
+    // the flight (and is unpaused after the load), so a pause before it,
+    // such as the one this tool leaves, is no reason to refuse.
+    if here && crate::xplane::sim_frozen(&xp).await {
         println!("Refused: the sim is paused or replaying.");
         return Ok(false);
     }
@@ -372,9 +409,15 @@ pub async fn main_cmd(args: &[String], base_url: &str) -> anyhow::Result<bool> {
                     slips.push(slip);
                 }
                 Err(why) => {
+                    // One input aborted skips its axis, not the flight: the
+                    // others are still measured. Only a height lost ends it.
                     println!("{axis:?} {sign:+.0}: ABORTED on {why}; the autopilot has it.");
-                    aborted = Some(why);
-                    break 'axes;
+                    settle(&xp, &lever, t0, ias, 20.0).await?;
+                    if why.contains("height") {
+                        aborted = Some(why);
+                        break 'axes;
+                    }
+                    break;
                 }
             }
             settle(&xp, &lever, t0, ias, 20.0).await?;
