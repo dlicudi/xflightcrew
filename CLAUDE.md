@@ -733,6 +733,12 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   (`profiles/learned/<acf>.json`, `aircraft::learned`): a property of the `.acf` like a profile
   line, written only by `xfc identify`, keyed to the `.acf`'s fingerprint (an edit retires it,
   said) and a schema version, reviewed and committed like a profile.
+- **Every file root has ONE owner** (`sim::paths`, pinned by
+  `every_file_root_goes_through_the_owner`): `resources()` ships (profiles, checklists, assets),
+  `data()` is the user's (models, logs, prefs, `.env`, `profiles/learned`; learned READ there
+  then shipped, WRITTEN there). Decided once, logged: `XCOPILOT_HOME` override, a dev checkout
+  (the cwd, kept relative so every path is the string it was, or the binary's own checkout),
+  installed (`~/Library/Application Support/XFlightCrew`, XDG on Linux). `xfc paths` says where.
 
 ## EFB: a page on the LAN (`src/efb/`, `docs/efb.md`)
 

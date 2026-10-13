@@ -17,7 +17,9 @@
 //! - versioned ([`VERSION`]): a file from another schema is not read,
 //! - written only by an identification flight, never by a flight's loop,
 //!   and kept under `profiles/learned/` beside the profiles, reviewed and
-//!   committed like them.
+//!   committed like them. Written to the data folder's
+//!   (`sim::paths::learned_write_dir`), read from it first and then from
+//!   the shipped ones (`learned_read_dirs`): one folder in a checkout.
 //!
 //! The online refinement while flying (`pilot::bank::RollResponse`) is per
 //! segment and never written back.
@@ -26,9 +28,6 @@ use serde::{Deserialize, Serialize};
 
 /// The schema this build reads and writes.
 pub const VERSION: u32 = 1;
-/// Where learned files live, relative to the working directory (the repo:
-/// `prefs.json` is there too).
-pub const DIR: &str = "profiles/learned";
 
 /// One axis' response, at the airspeeds it was measured at: the rate `x`
 /// answers the control `u`, `delay_s` late, as `x' = b u - damping x -
@@ -185,15 +184,21 @@ pub enum Refused {
 }
 
 impl Learned {
-    /// The file for an `.acf` path: its letters and digits, the rest `_`.
-    pub fn path_for(acf_rel: &str) -> std::path::PathBuf {
+    /// The file's name for an `.acf` path: its letters and digits, the
+    /// rest `_`.
+    pub fn file_name_for(acf_rel: &str) -> String {
         let slug: String = acf_rel
             .trim()
             .to_lowercase()
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        std::path::Path::new(DIR).join(format!("{}.json", slug.trim_matches('_')))
+        format!("{}.json", slug.trim_matches('_'))
+    }
+
+    /// Where `xfc identify` writes the file for an `.acf` path.
+    pub fn path_for(acf_rel: &str) -> std::path::PathBuf {
+        sim::paths::learned_write_dir().join(Self::file_name_for(acf_rel))
     }
 
     /// The learned file's text checked against this `.acf`. Pure.
@@ -209,12 +214,15 @@ impl Learned {
     }
 
     /// What was learned for the `.acf` at `acf_rel`, whose text is
-    /// `acf_text`, read from [`DIR`].
+    /// `acf_text`: the user's file first, then the shipped one.
     pub fn load_for(acf_rel: &str, acf_text: &str) -> Result<Learned, Refused> {
-        match std::fs::read_to_string(Self::path_for(acf_rel)) {
-            Ok(text) => Self::parse_for(&text, acf_text),
-            Err(_) => Err(Refused::Missing),
-        }
+        let name = Self::file_name_for(acf_rel);
+        sim::paths::learned_read_dirs()
+            .iter()
+            .find_map(|dir| std::fs::read_to_string(dir.join(&name)).ok())
+            .map_or(Err(Refused::Missing), |text| {
+                Self::parse_for(&text, acf_text)
+            })
     }
 
     /// Written whole, then renamed into place.
@@ -443,7 +451,8 @@ mod tests {
         assert!(matches!(Learned::parse_for(&old, acf), Err(Refused::Unreadable(_))));
         assert_eq!(
             Learned::path_for("Aircraft/Laminar Research/Boeing 737-800/b738.acf"),
-            std::path::Path::new(DIR).join("aircraft_laminar_research_boeing_737_800_b738_acf.json")
+            sim::paths::learned_write_dir()
+                .join("aircraft_laminar_research_boeing_737_800_b738_acf.json")
         );
     }
 

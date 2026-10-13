@@ -518,7 +518,8 @@ pub struct Checklist {
 }
 
 /// Read and interpret the airframe's XChecklist file into runnable checklists.
-/// `Ok(vec![])` if the profile names no checklist file.
+/// `Ok(vec![])` if the profile names no checklist file. A relative path
+/// (`checklists/<file>`) is a shipped file (`sim::paths::resource`).
 pub fn load(profile: &AircraftProfile) -> Result<Vec<Checklist>> {
     let Some(path) = &profile.checklist else {
         return Ok(Vec::new());
@@ -528,8 +529,8 @@ pub fn load(profile: &AircraftProfile) -> Result<Vec<Checklist>> {
             "the checklist is {file} in the aircraft's own folder, and no loaded aircraft named that folder"
         );
     }
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading checklist file {path}"))?;
+    let text = std::fs::read_to_string(sim::paths::resource(path))
+        .with_context(|| format!("reading checklist file {path}"))?;
     Ok(parse(&text, profile))
 }
 
@@ -564,7 +565,8 @@ pub fn unavailable_line(profile: &AircraftProfile) -> Option<String> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(file);
-    let readable = !path.starts_with(ACF_PREFIX) && std::fs::metadata(path).is_ok();
+    let readable =
+        !path.starts_with(ACF_PREFIX) && std::fs::metadata(sim::paths::resource(path)).is_ok();
     (!readable).then(|| {
         format!(
             "I can't find this aircraft's checklist file, {name}, so I won't run its checklists."

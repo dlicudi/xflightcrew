@@ -1,7 +1,7 @@
 //! Tiny persistent pilot-preferences store — the settings the in-sim panel can
 //! change at runtime and that must survive a restart (env vars can't carry a
-//! choice made mid-flight). One JSON file (`prefs.json`) in the working
-//! directory, read at startup and rewritten on change. Precedence is always
+//! choice made mid-flight). One JSON file (`prefs.json`) in the data folder
+//! (`sim::paths::prefs_file`), read at startup and rewritten on change. Precedence is always
 //! explicit env var > saved preference > built-in default, so a launch script
 //! that sets `PIPER_VOICE` still wins.
 //!
@@ -10,7 +10,10 @@
 
 use std::path::Path;
 
-const PREFS_PATH: &str = "prefs.json";
+/// `prefs.json` in the data folder (`sim::paths`).
+fn prefs_path() -> std::path::PathBuf {
+    sim::paths::prefs_file()
+}
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Prefs {
@@ -44,7 +47,7 @@ struct Prefs {
 }
 
 fn load() -> Prefs {
-    std::fs::read_to_string(PREFS_PATH)
+    std::fs::read_to_string(prefs_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -131,8 +134,9 @@ pub fn save_setting(key: &str, rendered: &str) {
 fn store(prefs: Prefs) {
     match serde_json::to_string_pretty(&prefs) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(PREFS_PATH, json) {
-                tracing::warn!("prefs: saving {PREFS_PATH} failed: {e}");
+            let path = prefs_path();
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("prefs: saving {} failed: {e}", path.display());
             }
         }
         Err(e) => tracing::warn!("prefs: serializing failed: {e}"),

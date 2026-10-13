@@ -4033,7 +4033,7 @@ async fn check_cmd(spec_path: &str) -> Result<bool> {
 pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<bool> {
     let mut spec_path = None;
     let mut repeat = 1u32;
-    let mut log = "logs/blackbox.jsonl".to_string();
+    let mut log = sim::paths::blackbox_file().to_string_lossy().into_owned();
     let mut check = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -4069,14 +4069,18 @@ pub async fn main_cmd(args: &[String], base_url: &str, apt_dat: &str) -> Result<
     }
     if !std::path::Path::new(&log).exists() {
         return Err(anyhow!(
-            "{log} not found: run from the xfc checkout the app writes into"
+            "{log} not found: run with the data folder the app writes into (xfc paths)"
         ));
     }
     let xp = crate::xplane::XPlaneClient::new(base_url.to_string());
     preflight(&xp).await?;
     let stamp = chrono_stamp();
-    let out_path = format!("logs/sorties/run-{stamp}.md");
-    let _ = std::fs::create_dir_all("logs/sorties");
+    let sorties = sim::paths::sorties_dir();
+    let out_path = sorties
+        .join(format!("run-{stamp}.md"))
+        .to_string_lossy()
+        .into_owned();
+    let _ = std::fs::create_dir_all(&sorties);
     eprintln!(
         "sortie run {stamp}: {} cases x {repeat}, table in {out_path}. Ctrl-C takes the aircraft back.",
         spec.cases.len()
