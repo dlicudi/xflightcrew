@@ -1449,6 +1449,10 @@ pub(crate) struct TrafficWorld {
     built: u64,
     /// The packed sink to the plugin, started with the first link.
     sink: Option<crate::traffic_sink::TrafficSink>,
+    /// Who of the simulated aircraft the sink draws (stage 1 of
+    /// multi-field traffic, 2026-10-13), and its counts for the blackbox.
+    cull: crate::traffic_sink::DrawCull,
+    draw_log: DrawLog,
     /// The Board tab as last sent, and when.
     board_last: String,
     board_sent: Option<Instant>,
@@ -1459,6 +1463,41 @@ pub(crate) struct TrafficWorld {
     /// The plugin has no field pick (an older one): not asked again before
     /// this.
     board_pick_quiet_until: Option<Instant>,
+}
+
+/// The draw cull's counts in the blackbox (`traffic` `draw`): simulated
+/// against drawn, the frame-cost side of multi-field traffic (stage 1,
+/// 2026-10-13), read beside `api_load` and the fps dataref. On a change at
+/// most every [`DRAW_LOG_GAP`], and every [`DRAW_LOG_EVERY`] regardless:
+/// the monitor ticks at about 3 Hz and a record a tick would drown the log.
+#[derive(Debug, Default)]
+struct DrawLog {
+    last: Option<(usize, usize, usize)>,
+    at: Option<Instant>,
+}
+
+const DRAW_LOG_GAP: std::time::Duration = std::time::Duration::from_secs(5);
+const DRAW_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl DrawLog {
+    fn note(&mut self, simulated: usize, drawn: &[&TrafficAircraft], now: Instant) {
+        let parked = drawn.iter().filter(|a| a.dormant()).count();
+        let counts = (simulated, drawn.len(), parked);
+        let since = self.at.map(|t| now.saturating_duration_since(t));
+        let due = match since {
+            None => true,
+            Some(d) => (self.last != Some(counts) && d >= DRAW_LOG_GAP) || d >= DRAW_LOG_EVERY,
+        };
+        if due {
+            self.last = Some(counts);
+            self.at = Some(now);
+            crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "draw", "simulated": simulated,
+                    "drawn": drawn.len(), "parked_drawn": parked }),
+            );
+        }
+    }
 }
 
 /// The Board tab is resent at most this often on a change, and this often
@@ -1623,7 +1662,10 @@ impl TrafficWorld {
             );
         }
         if let Some(sink) = self.sink.as_mut() {
-            sink.publish(link.fleet().aircraft(), self.last_sim_s.unwrap_or(0.0));
+            let all: Vec<&TrafficAircraft> = link.fleet().aircraft().iter().collect();
+            let drawn = self.cull.select(Some((snap.lat, snap.lon)), &all);
+            sink.publish(&drawn, self.last_sim_s.unwrap_or(0.0));
+            self.draw_log.note(all.len(), &drawn, now);
         }
         record(&out, link);
         // The frequencies: the tower's runway-watch lines in the tower's
@@ -1780,6 +1822,7 @@ impl TrafficWorld {
         if let Some(sink) = self.sink.as_mut() {
             sink.withdraw();
         }
+        self.cull.clear();
         // The board goes with the field (sent empty on the next tick that
         // has a link, or never while none).
         self.board_last.clear();
