@@ -389,6 +389,12 @@ pub fn env_file() -> PathBuf {
     data().join(".env")
 }
 
+/// Where `xfc plugin install` backs up the plugin it replaces: one folder
+/// per install, never under X-Plane's `plugins/` (every folder there loads).
+pub fn plugin_backups_dir() -> PathBuf {
+    data().join("plugin-backups")
+}
+
 /// Where `xfc identify` WRITES a learned model.
 pub fn learned_write_dir() -> PathBuf {
     data().join("profiles/learned")

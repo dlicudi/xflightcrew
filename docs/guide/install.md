@@ -8,7 +8,38 @@
 - Rust, to build the app
 - a whisper.cpp model and the Piper voices, in `models/` (see below)
 
-## Build and install
+## Install the single file
+
+A release is one file, `xfc`, with the profiles, checklists, radio sounds
+and the X-Plane plugin built in. Copy it anywhere (for example
+`~/bin/xfc`), then:
+
+```sh
+xfc plugin install
+xfc voices install ggml-base.en en_US-amy-medium en_US-hfc_female-medium
+xfc
+```
+
+`xfc plugin install` puts the plugin in `X-Plane 12/Resources/plugins/xflightcrew/`
+(`--xplane <dir>` or `XCOPILOT_XPLANE_ROOT` for another folder). It removes an
+old `plugins/xcopilot/` folder first, backs up the plugin it replaces to
+`plugin-backups/` in the data folder, and writes the new one in one step.
+`--dry-run` lists the steps and changes nothing. It refuses while X-Plane is
+running unless you pass `--while-running`, and it never reloads plugins: do
+that yourself, or restart X-Plane. `xfc plugin status` compares the installed
+plugin with the one the file carries. On first run the built-in files are
+unpacked to `resources/` in the data folder; `xfc paths` shows where.
+`xfc licenses` prints the licence notices.
+
+To build that file from the checkout (needs the X-Plane SDK in `plugin/SDK`):
+
+```sh
+scripts/build-release.sh
+```
+
+It builds the plugin, then `xfc` with the plugin inside, at `dist/xfc`.
+
+## Build and install from source
 
 ```sh
 cp .env.example .env
@@ -29,8 +60,10 @@ anywhere else keeps the user's files in `~/Library/Application
 Support/XFlightCrew` (`$XDG_DATA_HOME/xflightcrew`, default
 `~/.local/share/xflightcrew`, on Linux): `models/`, `logs/` (the log, the
 blackbox, the sorties), `prefs.json`, `.env` and `profiles/learned/`. The
-profiles, checklists and assets it ships with sit beside the binary or in
-`../share/xflightcrew/`. `XCOPILOT_HOME=<dir>` puts everything in one folder
+profiles, checklists and assets are read from beside the binary or
+`../share/xflightcrew/` when they are there, else from the copy built into
+`xfc`, unpacked once to `resources/` in the data folder (files on disk always
+win, so an edited profile is read as edited). `XCOPILOT_HOME=<dir>` puts everything in one folder
 instead. `xfc paths` prints which of the three it is and every location.
 
 ## Voices and the speech model

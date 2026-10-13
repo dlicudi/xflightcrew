@@ -135,3 +135,8 @@ default = ["onnx-tts"]
 # Opt out with `cargo build --no-default-features` to drop the onnxruntime link
 # (the voice then falls back to the `say`/`piper` subprocess backends).
 onnx-tts = ["dep:ort"]
+# The X-Plane plugin carried inside xfc for `xfc plugin install`
+# (src/plugin_install.rs): the build reads the .xpl from XFC_PLUGIN_XPL.
+# Off by default (cargo cannot build the plugin); scripts/build-release.sh
+# builds the plugin and turns it on.
+embed-plugin = []
