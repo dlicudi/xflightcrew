@@ -133,12 +133,16 @@ impl RunwayBook {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .map(|c| (c.state, c.runway_ident.clone(), c.holds_runway));
-        // A traffic flight known to be flying has USED its takeoff
-        // clearance, which holds the strip no more (it keeps the clearance
+        // A flight known to be flying has USED its takeoff clearance, which
+        // holds the strip no more (a traffic flight keeps the clearance
         // until it leaves the area, 12 nm out: held whole all that way, it
-        // closed the field behind it). Ours is unchanged: our next call
-        // moves our clearance on.
-        let airborne = !e.strip.is_own() && e.state.is_some_and(|s| !s.on_ground);
+        // closed the field behind it). Ours too, judged by the aircraft, not
+        // by a next call a hand-flown departure may never make: LEMG 12
+        // (2026-10-13), our 737 flown by hand after "contact Departure" kept
+        // TakeoffCleared and a traffic departure sat held "traffic on the
+        // runway" from 14:08Z. The next departure waits out the liftoff's
+        // wake ([`wake_remaining_for`]).
+        let airborne = e.state.is_some_and(|s| !s.on_ground);
         if let Some((state, ident, held)) = &clr {
             let kind = match state {
                 tower::State::LinedUp => Some((ClaimKind::LineUp, true)),
@@ -410,6 +414,66 @@ impl RunwayBook {
         })
     }
 
+    /// What holds a DEPARTURE off the strip `end` is on: [`Self::blocked`],
+    /// except that a flight cleared to land and still FLYING is an arrival,
+    /// judged by its distance (the nearest one's, to its threshold), never a
+    /// blanket occupant. LEMG 12 (2026-10-13): Air Nostrum cleared to land
+    /// held our 737 at HW1 "hold position, traffic on the runway" with
+    /// nothing on it and the lander well out. An unknown position, a lander
+    /// on the ground, or any other claim is an occupant as before.
+    pub(crate) fn departure_blocked(
+        &self,
+        end: &str,
+        except: Option<FlightId>,
+    ) -> Option<DepartureBlock> {
+        let ours = strip(&self.runways, end)?;
+        let mut lander: Option<f64> = None;
+        for c in self.claims.iter().filter(|c| {
+            matches!(&c.who, Claimant::Strip(f) if Some(*f) != except)
+                && strip(&self.runways, &c.end).is_some_and(|r| std::ptr::eq(r, ours))
+        }) {
+            let whole = c.whole_strip
+                && matches!(
+                    c.kind,
+                    ClaimKind::Landing
+                        | ClaimKind::LineUp
+                        | ClaimKind::Takeoff
+                        | ClaimKind::CrossingCleared
+                );
+            if !whole && c.kind != ClaimKind::Occupying {
+                continue;
+            }
+            match self.airborne_lander_nm(c) {
+                Some(nm) => lander = Some(lander.map_or(nm, |l: f64| l.min(nm))),
+                None => return Some(DepartureBlock::Occupied),
+            }
+        }
+        lander.map(DepartureBlock::Lander)
+    }
+
+    /// A landing claim whose flight is airborne at a known position: its
+    /// distance to the threshold it was cleared onto, nm.
+    fn airborne_lander_nm(&self, c: &Claim) -> Option<f64> {
+        let Claimant::Strip(id) = c.who else {
+            return None;
+        };
+        if c.kind != ClaimKind::Landing {
+            return None;
+        }
+        let (_, state) = self.states.iter().find(|(f, _)| *f == id)?;
+        if state.on_ground {
+            return None;
+        }
+        let (lat, lon) = state.position()?;
+        let r = strip(&self.runways, &c.end)?;
+        let (tlat, tlon) = if r.ident_a == c.end {
+            (r.lat_a, r.lon_a)
+        } else {
+            (r.lat_b, r.lon_b)
+        };
+        Some(nav::haversine_nm(lat, lon, tlat, tlon))
+    }
+
     /// Whether movement on `end` conflicts with this flight's strip claim:
     /// the same strip, and either the whole strip is claimed or the movement
     /// uses the other direction. One strip, one direction (LEMG 2026-09-28).
@@ -459,9 +523,36 @@ pub(super) fn strip_held_by_traffic(runways: &[nav::Runway], end: &str) -> bool 
 /// the state it was last seen in. For our strip, nothing is read past the
 /// map while no traffic strip is open.
 pub(super) fn strip_held_by_others(runways: &[nav::Runway], end: &str, me: &FlightStrip) -> bool {
+    book_of_others(runways, me).is_some_and(|b| b.blocked(end, None).is_some())
+}
+
+/// What another strip's claim means to a DEPARTURE from the strip `end` is
+/// on ([`RunwayBook::departure_blocked`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DepartureBlock {
+    /// On the pavement, cleared onto it, or a lander whose position is
+    /// unknown or on the ground: "traffic on the runway".
+    Occupied,
+    /// Only flights cleared to land, still flying: the nearest one's
+    /// distance to its threshold, nm, for the release's gap.
+    Lander(f64),
+}
+
+/// [`strip_held_by_others`] as a departure reads it.
+pub(super) fn departure_held_by_others(
+    runways: &[nav::Runway],
+    end: &str,
+    me: &FlightStrip,
+) -> Option<DepartureBlock> {
+    book_of_others(runways, me).and_then(|b| b.departure_blocked(end, None))
+}
+
+/// The book over every strip but `me` (see [`strip_held_by_others`]);
+/// `None` for ours while no traffic strip is open.
+fn book_of_others(runways: &[nav::Runway], me: &FlightStrip) -> Option<RunwayBook> {
     let traffic = traffic_strips();
     if me.is_own() && traffic.is_empty() {
-        return false;
+        return None;
     }
     let mut entries: Vec<BookEntry<'_>> = Vec::new();
     if !me.is_own() {
@@ -481,9 +572,7 @@ pub(super) fn strip_held_by_others(runways: &[nav::Runway], end: &str, me: &Flig
                 state: seen(s),
             }),
     );
-    RunwayBook::compute_on(runways.to_vec(), &entries)
-        .blocked(end, None)
-        .is_some()
+    Some(RunwayBook::compute_on(runways.to_vec(), &entries))
 }
 
 /// The strip the PLAYER holds for the party line: the one it stands on, or,
@@ -526,7 +615,9 @@ pub(crate) fn runway_occupancy_authorised(lat: f64, lon: f64, gs_kts: f64) -> bo
 /// Occupying 09"), with our state where the caller holds it. Two flights
 /// each holding the whole strip (lined up, cleared for takeoff, cleared to
 /// land and not reported off, cleared to cross), or one cleared for takeoff
-/// on a strip another stands on. Empty is a clean book. A read for tests and the
+/// on a strip another stands on; a takeoff beside a landing whose lander
+/// still flies is the release's anticipated separation, not a conflict.
+/// Empty is a clean book. A read for tests and the
 /// traffic harness (a field hour has zero), never a decision.
 pub fn runway_conflicts(own: Option<AircraftState>) -> Vec<String> {
     let book = RunwayBook::now(own);
@@ -570,10 +661,19 @@ pub fn runway_conflicts(own: Option<AircraftState>) -> Vec<String> {
             let lined_up_under = |x: &Claim, fx: &FlightId, y: &Claim, fy: &FlightId| {
                 conditional(x, y) && on_strip(fx) && flying(fy)
             };
+            // A departure released ahead of a lander still flying: the
+            // tower's anticipated separation (`departure_blocked`, the
+            // release's gap), judged on time by the lander's go-around
+            // watch. Both on the ground with their claims is a conflict.
+            let ahead = |x: &Claim, y: &Claim, fy: &FlightId| {
+                x.kind == ClaimKind::Takeoff && y.kind == ClaimKind::Landing && flying(fy)
+            };
             let both_whole = whole(a)
                 && whole(b)
                 && !((conditional(a, b) && !lined_up_under(a, fa, b, fb))
-                    || (conditional(b, a) && !lined_up_under(b, fb, a, fa)));
+                    || (conditional(b, a) && !lined_up_under(b, fb, a, fa))
+                    || ahead(a, b, fb)
+                    || ahead(b, a, fa));
             let rolls_into = |x: &Claim, y: &Claim| {
                 x.kind == ClaimKind::Takeoff && y.kind == ClaimKind::Occupying
             };

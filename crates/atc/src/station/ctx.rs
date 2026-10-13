@@ -217,7 +217,7 @@ impl Station {
             }
         }
         let wake_secs_left = if on_ground {
-            wake_remaining(&ident, now)
+            wake_remaining_for(&self.desk.strip, &ident, now)
         } else {
             None
         };
@@ -324,8 +324,31 @@ impl Station {
         // runway, or one standing on it, occupies it, by the book, before
         // any ghost is seen on the pavement: the caller's line-up, takeoff
         // and landing wait for it (ours for a traffic strip, theirs for us).
-        let runway_occupied =
-            runway_occupied || strip_held_by_others(&self.apt.runways, &runway, &self.desk.strip);
+        // For a caller on the ground a lander still flying is an ARRIVAL,
+        // as one in the picture is: traffic on final inside [`FINAL_NM`],
+        // nothing farther out (LEMG 12, 2026-10-13: "traffic on the runway"
+        // for an Air Nostrum cleared to land well out).
+        let block = if on_ground {
+            departure_held_by_others(&self.apt.runways, &runway, &self.desk.strip)
+        } else {
+            strip_held_by_others(&self.apt.runways, &runway, &self.desk.strip)
+                .then_some(DepartureBlock::Occupied)
+        };
+        let runway_occupied = runway_occupied || block == Some(DepartureBlock::Occupied);
+        let final_traffic = match block {
+            Some(DepartureBlock::Lander(nm)) if nm < FINAL_NM => Some(match final_traffic {
+                Some(f) if f.nm <= nm => f,
+                Some(f) => FinalTraffic { nm, ..f },
+                None => FinalTraffic {
+                    nm,
+                    callsign: None,
+                    count: 1,
+                    ghosts: Vec::new(),
+                    type_spoken: None,
+                },
+            }),
+            _ => final_traffic,
+        };
         // "With information X" matching the current broadcast: the clearance
         // skips the QNH — having the numbers is the whole point of an ATIS.
         // A stale or absent letter keeps them (safety over brevity).
