@@ -1,4 +1,4 @@
-//! The route map's basemap: water and coastlines from X-Plane's OWN map
+//! The map's basemap: water and coastlines from X-Plane's OWN map
 //! data, `Resources/map data/water/<+LL+LLL>/<+LL+LLL>.shp`, one ESRI
 //! Shapefile of water polygons per 1x1 degree tile (named by its south-west
 //! corner), grouped in 10x10 degree folders. An installed file like apt.dat,
@@ -13,7 +13,8 @@
 //! Served as `GET /basemap?bbox=lat0,lon0,lat1,lon1&px=<view width>`:
 //! rings simplified (Douglas-Peucker) to about one pixel of the view, flat
 //! `[lat, lon, ...]` arrays at 4 decimals, under a size cap (coarser until
-//! it fits), and the fields in the box when zoomed in enough.
+//! it fits), and the fields in the box when zoomed in enough (with or
+//! without the map data: the field directory is apt.dat's).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,8 +28,9 @@ pub(crate) const WATER_DIR: &str = "Resources/map data/water";
 /// The payload's ceiling; a view over it is redone coarser.
 pub(crate) const MAX_BYTES: usize = 400_000;
 
-/// A view over more tiles than this is not drawn (a continent: the route
-/// map never fits one).
+/// A view over more tiles than this is not drawn (a continent); the page
+/// never asks for one (`map.js` `MAX_TILES`, pinned by
+/// `the_page_asks_no_wider_than_the_server_draws`).
 pub(crate) const MAX_TILES: usize = 1_200;
 
 /// Fields are sent once the view is this narrow (degrees of latitude
@@ -444,11 +446,10 @@ pub(crate) fn tile_range(lat0: f64, lon0: f64, lat1: f64, lon1: f64) -> (i32, i3
 }
 
 /// Build (or recall) the answer for a view. Blocking: file reads. `None`
-/// when the map data is not installed or the view is too wide.
+/// when the view is too wide; no water (the fields only) when the map data
+/// is not installed.
 pub(crate) fn answer(dir: &Path, bbox: [f64; 4], px: f64) -> Option<Arc<Answer>> {
-    if !dir.is_dir() {
-        return None;
-    }
+    let have_water = dir.is_dir();
     let [lat0, lon0, lat1, lon1] = bbox;
     if !bbox.iter().all(|v| v.is_finite()) {
         return None;
@@ -466,7 +467,11 @@ pub(crate) fn answer(dir: &Path, bbox: [f64; 4], px: f64) -> Option<Arc<Answer>>
     let regions_ready = crate::party_line::region_loaded();
     let present = |a: i32, o: i32| tile_path(dir, a, o).is_file();
     let edge = |a: i32, o: i32, side: usize| edges(dir, a, o).map_or(0.0, |e| e[side]);
-    let wet = water_tiles((a0, a1), (o0, o1), &present, &edge);
+    let wet = if have_water {
+        water_tiles((a0, a1), (o0, o1), &present, &edge)
+    } else {
+        Vec::new()
+    };
     let span = (a1 - a0 + 1) as f64;
     let fields: Vec<(String, f64, f64, u8)> = if span <= TOWERED_SPAN_DEG {
         crate::party_line::fields_in_box(
@@ -490,7 +495,7 @@ pub(crate) fn answer(dir: &Path, bbox: [f64; 4], px: f64) -> Option<Arc<Answer>>
     loop {
         let mut water: Vec<Vec<f64>> = Vec::new();
         for a in a0..=a1 {
-            for o in o0..=o1 {
+            for o in (o0..=o1).filter(|_| have_water) {
                 if let Some(f) = simplified(dir, a, o, bucket) {
                     water.extend(f.iter().cloned());
                 }
@@ -668,6 +673,17 @@ mod tests {
         // Nothing to go on: open sea.
         let none = water_tiles((10, 11), (10, 11), &|_, _| false, &|_, _, _| 0.0);
         assert_eq!(none.len(), 4);
+    }
+
+    /// No map data installed: still an answer (the fields, no water); a
+    /// continent: none.
+    #[test]
+    fn no_map_data_is_no_water_and_a_continent_is_no_answer() {
+        let none = Path::new("/nonexistent/map data/water");
+        let a = answer(none, [-12.5, -150.5, -11.5, -149.5], 800.0).expect("an answer");
+        let v: serde_json::Value = serde_json::from_str(&a.json).unwrap();
+        assert_eq!(v["water"], serde_json::json!([]));
+        assert!(answer(none, [-60.0, -170.0, 60.0, 170.0], 800.0).is_none());
     }
 
     #[test]

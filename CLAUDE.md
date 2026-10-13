@@ -749,16 +749,18 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   `Priority::Warning`: a priority is how hard a line interrupts, not how bad it is. **The
   EFB's PTT is a heartbeat** (`efb::ptt`): held only while beats are fresh (600 ms), capped at
   60 s, OR'd into the intercom key.
-- **The Map tab** is the airport on the ground or near the drawn field (`efb::airport`): apt.dat
-  through the nav crate's parsers, built once per field in a LOCAL metric frame (`Frame`,
-  east/north metres) and served as `GET /airport` with its version as the ETag; the live overlay
-  (tick position, `party_line` taxi route, the guide's `TurnCard` via `feed::note_turn_card`, the
-  cleared runway) is one pure `airport::page`. The field is `airport::wanted_field`: destination
-  airborne, the field we are at on the ground. Airborne the diagram only within 15 nm below
-  3,000 ft AGL (`route_map::mode`); else the route (`efb::route_map`), FITTED to what matters
-  (`route_map::fit`: terminal within 40 nm, else the aircraft and the legs ahead; flown legs
-  never drive it) over water from X-Plane's INSTALLED map data (`efb::basemap`, `GET /basemap`,
-  only the tiles under the view, a file read like apt.dat, never a sim read).
+- **The Map tab is ONE world map** (`map.js`, 2026-10-13): Web Mercator, north up, pan, pinch,
+  wheel and double tap, from a region to a stand, FOLLOW on by default (a pan turns it off, its
+  button back on). Every layer in one world frame: X-Plane's INSTALLED water (`efb::basemap`,
+  `GET /basemap`, only the view's tiles, the page never asks wider than `MAX_TILES`), fields as
+  dots then labels, the plan (`efb::map`, lat/lon; `map::fit` is the Overview button), our
+  traffic and aircraft in lat/lon at every zoom, and closer in ANY field's diagram
+  (`efb::airport`, apt.dat in a LOCAL metric frame, `GET /airport?icao=` built on demand, 202
+  while building, cached, ETag'd), placed by ONE transform after its north is re-measured on
+  Mercator once at load (`fieldFrame`, pinned under node by
+  `the_page_places_a_field_where_the_server_measured_it`). The wanted field
+  (`airport::wanted_field`) carries the taxi route, `TurnCard` and runway (`airport::page`);
+  every known field's stands are `map.stands` (`airport::stands_by_field`).
 - Off by default (`XCOPILOT_EFB`, `_PORT`, `_TOKEN`; the registry's `efb*`); every request needs
   the token, a wrong one is a 403 blackboxed `efb` `auth_failed`; one line per 500 ms. Its own
   thread and runtime, never the command loop's; no lock held across an await.

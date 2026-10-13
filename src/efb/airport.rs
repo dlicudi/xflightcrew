@@ -1,6 +1,6 @@
-//! The Airport page: the field that matters now as a diagram, and the live
-//! picture over it (the aircraft, the taxi route held, the turn card, the
-//! cleared runway).
+//! The fields on the Map tab: any field's diagram, built on demand when the
+//! page's view comes close to it, and the live picture over the field that
+//! matters now (the taxi route held, the turn card, the cleared runway).
 //!
 //! Two halves, both readers of what the app already holds (CLAUDE.md "EFB",
 //! no new sim reads):
@@ -10,13 +10,16 @@
 //!   `nav::find_taxi_net` for the 110 pavement, the 120 centrelines, the
 //!   1201/1202 network with its 1204 zones, the 1300 stands), put in a LOCAL
 //!   metric frame (east and north metres from the field's reference point,
-//!   [`Frame`]) so the page does no geodesy. Built once per field off the
-//!   runtime's thread and kept ([`CACHE`]); a version (a hash of the
-//!   document) lets the page fetch it only when the field changes.
-//! - The OVERLAY ([`page`], pure, in the page state): the monitor's tick
-//!   position, the cleared or crew's own taxi route (`party_line`), the
-//!   taxi guide's turn card as the panel draws it (`taxi_guide::TurnCard`),
-//!   the cleared runway, projected into the same frame.
+//!   [`Frame`]) so the page places a whole field with one transform. Built
+//!   once per field off the runtime's thread, for the field that matters
+//!   ([`wanted_field`]) and for any field the page's view asks for
+//!   ([`request`]), and kept ([`CACHE`]); a version (a hash of the
+//!   document) is its ETag.
+//! - The OVERLAY ([`page`], pure, in the page state): the cleared or crew's
+//!   own taxi route (`party_line`), the taxi guide's turn card as the panel
+//!   draws it (`taxi_guide::TurnCard`), the cleared runway, in the wanted
+//!   field's frame. The aircraft and our traffic ride the map in lat/lon
+//!   (`efb::map`).
 //!
 //! Headings are TRUE, distances metres. Route lengths are magnitudes; the
 //! card's cross-track keeps its sign (positive right of the route).
@@ -37,8 +40,8 @@ const M_PER_DEG: f64 = 3440.065 * 1852.0 * std::f64::consts::PI / 180.0;
 /// On the ground within this of a field (its reference point), we are at it.
 pub(crate) const ON_FIELD_NM: f64 = 5.0;
 
-/// The aircraft is drawn on the diagram only within this of the reference
-/// point: further out the dot is off the chart anyway.
+/// The aircraft splits the taxi route and takes a stand only within this of
+/// the reference point.
 pub(crate) const OWN_MAX_M: f64 = 30_000.0;
 
 /// A route is drawn only when it starts within this of the reference point:
@@ -578,16 +581,19 @@ pub(crate) struct Ready {
     pub(crate) json: String,
 }
 
-/// The diagrams built, newest last, the one being built, and the fields
-/// that could not be (with when, to retry later).
+/// The diagrams built, the most recently asked last, the ones being built,
+/// and the fields that could not be (with when, to retry later).
 struct Cache {
     ready: Vec<Arc<Ready>>,
-    loading: Option<(String, Instant)>,
+    loading: Vec<(String, Instant)>,
     failed: Vec<(String, Instant)>,
 }
 
-/// Fields kept: the departure, the destination and one spare.
-const CACHE_FIELDS: usize = 3;
+/// Fields kept: every field a view of a busy area draws (LEMG is 76 kB).
+const CACHE_FIELDS: usize = 24;
+
+/// Builds at once: each is two scans of apt.dat on a blocking thread.
+const BUILDS_MAX: usize = 2;
 
 /// A field that could not be built is tried again after this.
 const RETRY: Duration = Duration::from_secs(120);
@@ -599,7 +605,7 @@ const BUILD_MAX: Duration = Duration::from_secs(60);
 /// flight fact, so it outlives every flight).
 static CACHE: Mutex<Cache> = Mutex::new(Cache {
     ready: Vec::new(),
-    loading: None,
+    loading: Vec::new(),
     failed: Vec::new(),
 });
 
@@ -607,13 +613,42 @@ fn cache() -> std::sync::MutexGuard<'static, Cache> {
     CACHE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The built diagram of a field, if it is.
+/// The built diagram of a field, if it is; asking keeps it (the state's
+/// poll asks for the wanted field twice a second, so it is never evicted).
 pub(crate) fn lookup(icao: &str) -> Option<Arc<Ready>> {
-    cache()
-        .ready
-        .iter()
-        .find(|r| r.reference.icao == icao)
-        .cloned()
+    let mut c = cache();
+    let i = c.ready.iter().position(|r| r.reference.icao == icao)?;
+    let r = c.ready.remove(i);
+    c.ready.push(r.clone());
+    Some(r)
+}
+
+/// A field name as the page may ask for it: letters and digits, 3 to 7,
+/// upper case. Pure.
+pub(crate) fn clean_icao(icao: &str) -> Option<String> {
+    let i = icao.trim().to_ascii_uppercase();
+    ((3..=7).contains(&i.len()) && i.chars().all(|c| c.is_ascii_alphanumeric())).then_some(i)
+}
+
+/// What the page's ask for a field's diagram gets (`GET /airport`).
+pub(crate) enum Requested {
+    Ready(Arc<Ready>),
+    /// Being built (or queued behind [`BUILDS_MAX`]): ask again shortly.
+    Building,
+    /// No diagram: not in apt.dat, or no runway. Not tried again for a while.
+    Unavailable,
+}
+
+/// The page's view came close to a field: its diagram, else built.
+pub(crate) fn request(icao: &str) -> Requested {
+    if let Some(r) = lookup(icao) {
+        return Requested::Ready(r);
+    }
+    if unavailable(icao) {
+        return Requested::Unavailable;
+    }
+    ensure(icao);
+    Requested::Building
 }
 
 /// The field could not be built (no apt.dat entry, no runway), lately.
@@ -626,9 +661,7 @@ pub(crate) fn unavailable(icao: &str) -> bool {
 
 fn store(icao: &str, built: Option<Diagram>) {
     let mut c = cache();
-    if c.loading.as_ref().is_some_and(|(i, _)| i == icao) {
-        c.loading = None;
-    }
+    c.loading.retain(|(i, _)| i != icao);
     match built {
         Some(d) => {
             let reference = DiagramRef {
@@ -663,22 +696,23 @@ pub(crate) fn load(apt_path: &str, icao: &str) -> Option<Diagram> {
     build_diagram(icao, &apt, net.as_ref())
 }
 
-/// Build the field's diagram unless it is built, building, or failed lately.
-/// Never waits: the page shows "loading" until it lands.
+/// Build the field's diagram unless it is built, building, failed lately,
+/// or [`BUILDS_MAX`] others are building. Never waits: the page shows
+/// "loading" (or asks again) until it lands.
 pub(crate) fn ensure(icao: &str) {
     {
         let mut c = cache();
+        c.loading.retain(|(_, at)| at.elapsed() < BUILD_MAX);
         if c.ready.iter().any(|r| r.reference.icao == icao)
-            || c.loading
-                .as_ref()
-                .is_some_and(|(_, at)| at.elapsed() < BUILD_MAX)
+            || c.loading.iter().any(|(i, _)| i == icao)
+            || c.loading.len() >= BUILDS_MAX
             || c.failed
                 .iter()
                 .any(|(i, at)| i == icao && at.elapsed() < RETRY)
         {
             return;
         }
-        c.loading = Some((icao.to_string(), Instant::now()));
+        c.loading.push((icao.to_string(), Instant::now()));
     }
     let icao = icao.to_string();
     let path = crate::settings::live().apt_data_path.clone();
@@ -865,18 +899,6 @@ pub(crate) fn wanted_field(
 // ---------------------------------------------------------------- overlay
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct Own {
-    pub(crate) x: f64,
-    pub(crate) y: f64,
-    /// True heading (the monitor's `psi`, best-effort: 0 on a failed read).
-    pub(crate) heading: f64,
-    /// Ground track, true, when the read held.
-    pub(crate) track: Option<f64>,
-    pub(crate) gs_kts: f64,
-    pub(crate) on_ground: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct Mark {
     pub(crate) x: f64,
     pub(crate) y: f64,
@@ -933,24 +955,24 @@ pub(crate) struct AirportOut {
     pub(crate) version: Option<String>,
     /// "ready", "loading", "unavailable" or "none".
     pub(crate) status: &'static str,
-    pub(crate) own: Option<Own>,
+    /// The aircraft on the ground, east and north metres, within
+    /// [`OWN_MAX_M`]: the stand it takes (`efb::map`). Not sent: the page
+    /// draws the aircraft from `map.own`.
+    #[serde(skip)]
+    pub(crate) own_on_ground: Option<(f64, f64)>,
     pub(crate) route: Option<RouteOut>,
     pub(crate) card: Option<CardOut>,
     pub(crate) runway: Option<RunwayMark>,
-    /// Our traffic on the drawn field and round it ([`traffic_out`]).
-    pub(crate) traffic: Vec<TrafficOut>,
-    /// The drawn field's stands, free or taken ([`stand_states`]).
-    pub(crate) stands: StandsOut,
     /// The last "Move here", for the page's toast.
     pub(crate) reposition: Option<crate::efb::feed::Reposition>,
 }
 
-/// One traffic aircraft on the diagram, with its card's words.
+/// One traffic aircraft on the map, with its card's words.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct TrafficOut {
     pub(crate) id: u32,
-    pub(crate) x: f64,
-    pub(crate) y: f64,
+    pub(crate) lat: f64,
+    pub(crate) lon: f64,
     /// Degrees true.
     pub(crate) hdg: f64,
     pub(crate) on_ground: bool,
@@ -979,11 +1001,12 @@ pub(crate) struct StandOut {
     pub(crate) how: &'static str,
 }
 
-/// The drawn field's stands: `known` only while our traffic world
-/// simulates the field (else unknown, never free); every stand not in
-/// `taken` is then free.
+/// A field's stands: `known` only while our traffic world simulates the
+/// field (else unknown, never free); every stand not in `taken` is then
+/// free.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub(crate) struct StandsOut {
+    pub(crate) icao: String,
     pub(crate) known: bool,
     pub(crate) taken: Vec<StandOut>,
 }
@@ -1017,57 +1040,56 @@ pub(crate) fn traffic_phase_words(p: traffic::Phase, dormant: bool) -> &'static 
     }
 }
 
-/// Our traffic within [`OWN_MAX_M`] of the drawn field, every simulated
-/// field's (a neighbour's arrivals fly past), in its frame. Pure.
-pub(crate) fn traffic_out(
-    fields: &[crate::efb::feed::TrafficField],
-    frame: &Frame,
-) -> Vec<TrafficOut> {
+/// A position on the wire: 6 decimals, a tenth of a metre.
+pub(crate) fn r6(v: f64) -> f64 {
+    (v * 1e6).round() / 1e6
+}
+
+/// Every aircraft of our traffic, every simulated field's, in lat/lon: the
+/// map draws them wherever its view is. Pure.
+pub(crate) fn traffic_out(fields: &[crate::efb::feed::TrafficField]) -> Vec<TrafficOut> {
     let some = |s: &str| (!s.trim().is_empty()).then(|| s.to_string());
     fields
         .iter()
         .flat_map(|f| f.aircraft.iter())
-        .filter_map(|a| {
-            let (x, y) = frame.xy(a.lat, a.lon);
-            (x.hypot(y) <= OWN_MAX_M).then(|| TrafficOut {
-                id: a.id,
-                x: r1(x),
-                y: r1(y),
-                hdg: r1(a.hdg.rem_euclid(360.0)),
-                on_ground: a.on_ground,
-                callsign: a.callsign.clone(),
-                spoken: a.spoken.clone(),
-                airline: a.airline.clone(),
-                icao_type: a.icao_type.clone(),
-                from: some(&a.from),
-                to: some(&a.to),
-                phase: a.phase,
-                stand: a.stand.clone(),
-                sched: a.sched.clone(),
-                est: a.est.clone(),
-                alt_ft: (!a.on_ground).then(|| (a.alt_ft / 10.0).round() * 10.0),
-                gs_kts: a.gs_kts.round(),
-            })
+        .map(|a| TrafficOut {
+            id: a.id,
+            lat: r6(a.lat),
+            lon: r6(a.lon),
+            hdg: r1(a.hdg.rem_euclid(360.0)),
+            on_ground: a.on_ground,
+            callsign: a.callsign.clone(),
+            spoken: a.spoken.clone(),
+            airline: a.airline.clone(),
+            icao_type: a.icao_type.clone(),
+            from: some(&a.from),
+            to: some(&a.to),
+            phase: a.phase,
+            stand: a.stand.clone(),
+            sched: a.sched.clone(),
+            est: a.est.clone(),
+            alt_ft: (!a.on_ground).then(|| (a.alt_ft / 10.0).round() * 10.0),
+            gs_kts: a.gs_kts.round(),
         })
         .collect()
 }
 
-/// Free or taken, for the drawn field's stands: our own aircraft on the
-/// ground within [`traffic::field::STAND_TAKEN_M`] of a stand takes it
-/// (whatever the traffic); our traffic's holds are the fleet's own
-/// ([`traffic::fleet::Fleet::stand_holder`], tapped). With no world
-/// simulating this field nothing is known free. Pure.
+/// Free or taken, for a field's stands: our own aircraft on the ground
+/// (`own`, in the field's frame) within [`traffic::field::STAND_TAKEN_M`]
+/// of a stand takes it (whatever the traffic); our traffic's holds are the
+/// fleet's own ([`traffic::fleet::Fleet::stand_holder`], tapped). With no
+/// world simulating this field nothing is known free. Pure.
 pub(crate) fn stand_states(
     icao: &str,
     stands: &[(String, f64, f64)],
     traffic: Option<&[crate::efb::feed::TrafficField]>,
-    own: Option<&Own>,
+    own: Option<(f64, f64)>,
 ) -> StandsOut {
     let field = traffic.and_then(|t| t.iter().find(|f| f.icao.eq_ignore_ascii_case(icao)));
-    let mine = own.filter(|o| o.on_ground).and_then(|o| {
+    let mine = own.and_then(|(ox, oy)| {
         stands
             .iter()
-            .map(|(n, x, y)| (n, (x - o.x).hypot(y - o.y)))
+            .map(|(n, x, y)| (n, (x - ox).hypot(y - oy)))
             .filter(|(_, d)| *d < traffic::field::STAND_TAKEN_M)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(n, _)| n.clone())
@@ -1093,9 +1115,33 @@ pub(crate) fn stand_states(
         );
     }
     StandsOut {
+        icao: icao.to_ascii_uppercase(),
         known: field.is_some(),
         taken,
     }
+}
+
+/// Every field's stands the map can colour: each field our traffic
+/// simulates, and the wanted field (`here`: its diagram and our aircraft
+/// on the ground in its frame) with ours on it. A field nobody knows
+/// anything of is left out (its stands are grey). Pure.
+pub(crate) fn stands_by_field(
+    traffic: Option<&[crate::efb::feed::TrafficField]>,
+    here: Option<(&DiagramRef, Option<(f64, f64)>)>,
+) -> Vec<StandsOut> {
+    let mut out: Vec<StandsOut> = traffic
+        .unwrap_or_default()
+        .iter()
+        .map(|f| stand_states(&f.icao, &[], traffic, None))
+        .collect();
+    if let Some((d, own)) = here {
+        let s = stand_states(&d.icao, &d.stands, traffic, own);
+        out.retain(|o| o.icao != s.icao);
+        if s.known || !s.taken.is_empty() {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// A polyline cut where the aircraft projects onto it: (driven, remaining,
@@ -1213,12 +1259,10 @@ pub(crate) fn page(
         name: None,
         version: None,
         status: "none",
-        own: None,
+        own_on_ground: None,
         route: None,
         card: None,
         runway: None,
-        traffic: Vec::new(),
-        stands: StandsOut::default(),
         reposition: a.reposition.clone(),
     };
     let Some(choice) = choice else {
@@ -1236,27 +1280,14 @@ pub(crate) fn page(
     out.name = Some(d.name.clone());
     out.version = Some(d.version.clone());
     let frame = Frame::new(d.lat0, d.lon0);
-    let at = tick.map(|t| frame.xy(t.lat, t.lon));
-    if let (Some(t), Some((x, y))) = (tick, at) {
-        if x.hypot(y) <= OWN_MAX_M {
-            out.own = Some(Own {
-                x: r1(x),
-                y: r1(y),
-                heading: r1(t.heading_deg.rem_euclid(360.0)),
-                track: t.track_deg.map(|v| r1(v.rem_euclid(360.0))),
-                gs_kts: r1(t.gs_kts.abs()),
-                on_ground: t.on_ground,
-            });
-        }
-    }
-    out.traffic = a
-        .traffic
-        .as_deref()
-        .map(|t| traffic_out(t, &frame))
-        .unwrap_or_default();
-    out.stands = stand_states(&d.icao, &d.stands, a.traffic.as_deref(), out.own.as_ref());
-    let own_at = out.own.as_ref().map(|o| (o.x, o.y));
-    out.route = a.route.as_ref().and_then(|r| route_out(r, &frame, own_at));
+    let own_at = tick
+        .map(|t| (frame.xy(t.lat, t.lon), t.on_ground))
+        .filter(|((x, y), _)| x.hypot(*y) <= OWN_MAX_M);
+    out.own_on_ground = own_at.filter(|(_, g)| *g).map(|(p, _)| p);
+    out.route = a
+        .route
+        .as_ref()
+        .and_then(|r| route_out(r, &frame, own_at.map(|(p, _)| p)));
     if out.route.is_some() {
         out.card = a.card.as_ref().map(|c| CardOut {
             kind: c.kind.to_string(),

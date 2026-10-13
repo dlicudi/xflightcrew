@@ -40,14 +40,11 @@
   --violet: #B9A6FF;
   --mono: 'B612 Mono', ui-monospace, Menlo, monospace;
   --sans: 'B612', system-ui, -apple-system, sans-serif;
-  /* The airport diagram's names for the same tokens (diagram.js). */
+  /* The map's names for the same tokens (map.js). */
   --line2: #2A3A4C;
   --cyan-bg: #10283A;
   --cyan-line: #2E6E8E;
   --red-line: #7A2620;
-  /* The route map: water over land (the page's own background), a faint coast. */
-  --water: #0F1B26;
-  --coast: #2A4256;
   --strip-h: 56px;
   --bar-h: 76px;
   --tabbar-h: 0px;
@@ -60,7 +57,6 @@
     --cyan: #0B6E99; --magenta: #A8279C; --green: #1D7A45; --green-bg: #E3F4EA;
     --amber: #9A5B00; --amber-bg: #FDF0DC; --red: #B3261E; --red-bg: #FBE4E2; --sel: #DCEEF8; --violet: #5B3FC4;
     --line2: #B9C4D0; --cyan-bg: #DCEEF8; --cyan-line: #7FB7D4; --red-line: #E3A29C;
-    --water: #C9D6E1; --coast: #98ADBF;
   }
 }
 :root[data-theme="light"] {
@@ -70,15 +66,16 @@
   --cyan: #0B6E99; --magenta: #A8279C; --green: #1D7A45; --green-bg: #E3F4EA;
   --amber: #9A5B00; --amber-bg: #FDF0DC; --red: #B3261E; --red-bg: #FBE4E2; --sel: #DCEEF8; --violet: #5B3FC4;
   --line2: #B9C4D0; --cyan-bg: #DCEEF8; --cyan-line: #7FB7D4; --red-line: #E3A29C;
-  --water: #C9D6E1; --coast: #98ADBF;
 }
 :root[data-theme="dark"] { color-scheme: dark; }
-/* The airport diagram is drawn in the night palette whatever the theme. */
+/* The map is drawn in the night palette whatever the theme: water over land
+   (the map's own background), a faint coast. */
 .night {
   --bg: #07090C; --surface: #0F141B; --raised: #151C25; --line: #222B36;
   --text: #E6EDF3; --soft: #B7C2CF; --muted: #8B98A8; --cyan: #7FD3F7; --magenta: #EB6EEB;
   --green: #7EE2A4; --amber: #FFC266; --red: #FF8A80; --red-bg: #2A0E0C; --violet: #B9A6FF;
   --line2: #2A3A4C; --cyan-bg: #10283A; --cyan-line: #2E6E8E; --red-line: #7A2620;
+  --water: #0F1B26; --coast: #2A4256;
   color: var(--text);
 }
 
@@ -307,12 +304,6 @@ button { touch-action: manipulation; }
 /* Map */
 .page.map { position: relative; padding: 0; height: calc(100dvh - var(--strip-h) - var(--bar-h) - var(--tabbar-h) - 40px); min-height: 280px; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); }
 #p-apt .apt-root { flex: 1 1 auto; }
-#route-root { position: absolute; inset: 0; background: var(--bg); touch-action: none; }
-#route-root canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-.map-ctl { position: absolute; top: 12px; left: 12px; z-index: 3; display: flex; gap: 8px; flex-wrap: wrap; }
-.map-ctl .seg { background: color-mix(in srgb, var(--surface) 92%, transparent); }
-.map-info { position: absolute; left: 12px; bottom: 12px; z-index: 2; padding: 8px 12px; border-radius: 10px; background: color-mix(in srgb, var(--surface) 92%, transparent); border: 1px solid var(--line); font-size: 13px; color: var(--soft); max-width: calc(100% - 24px); pointer-events: none; }
-.map-info b { color: var(--magenta); font-family: var(--mono); }
 
 /* Settings */
 .setrows { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--surface); }
@@ -455,17 +446,9 @@ form.say .send { min-height: 52px; }
         </section>
       </section>
 
-      <!-- MAP (the airport diagram is drawn by /diagram.js) -->
+      <!-- MAP (one world map, drawn by /map.js) -->
       <section class="page map" id="p-apt" aria-labelledby="t-map">
         <div class="apt-root night" id="apt-root"></div>
-        <div id="route-root" hidden><canvas id="route-canvas" aria-label="Route map"></canvas></div>
-        <div class="map-info" id="map-info" hidden></div>
-        <div class="map-ctl">
-          <div class="seg" role="group" aria-label="Map">
-            <button type="button" data-map="airport" aria-pressed="true">Airport</button>
-            <button type="button" data-map="route" aria-pressed="false">Route</button>
-          </div>
-        </div>
       </section>
 
       <!-- PLAN -->
@@ -556,7 +539,7 @@ form.say .send { min-height: 52px; }
   </div>
 </div>
 
-<script src="/diagram.js"></script>
+<script src="/map.js"></script>
 <script>
 (function () {
   'use strict';
@@ -620,7 +603,6 @@ form.say .send { min-height: 52px; }
       theme = b.getAttribute('data-theme-pick');
       try { localStorage.setItem(THEME_KEY, theme); } catch (e) {}
       applyTheme(theme);
-      if (last) drawRoute();
     });
   });
 
@@ -640,7 +622,6 @@ form.say .send { min-height: 52px; }
     $('main').classList.toggle('wide', id === 'map');
     window.scrollTo(0, 0);
     measure();
-    if (id === 'map') { showMap(); }
   }
   document.querySelectorAll('.tab').forEach(function (t) {
     t.addEventListener('click', function () { pick(t.getAttribute('data-tab')); });
@@ -670,7 +651,7 @@ form.say .send { min-height: 52px; }
       map.style.height = Math.max(280, Math.floor(window.innerHeight - top - bar - under - 8)) + 'px';
     }
   }
-  window.addEventListener('resize', function () { measure(); if (tab === 'map') drawRoute(); });
+  window.addEventListener('resize', measure);
 
   // ------------------------------------------------------------ sending
   var toastTimer = null;
@@ -1197,269 +1178,6 @@ form.say .send { min-height: 52px; }
     body.appendChild(boardTable('Arrivals', 'From', shown.arrivals));
   }
 
-  // ------------------------------------------------------------ map
-  // The airport diagram on the ground or low near the destination; the
-  // route elsewhere (`route_map::mode`). The pilot's pick holds until the
-  // copilot's choice changes.
-  var mapAuto = 'airport', mapPick = null;
-  document.querySelectorAll('[data-map]').forEach(function (b) {
-    b.addEventListener('click', function () { mapPick = b.getAttribute('data-map'); showMap(); });
-  });
-  function mapMode() { return mapPick || mapAuto; }
-  function showMap() {
-    var m = mapMode();
-    document.querySelectorAll('[data-map]').forEach(function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-map') === m)); });
-    $('apt-root').hidden = m !== 'airport';
-    $('route-root').hidden = m !== 'route';
-    $('map-info').hidden = m !== 'route';
-    if (m === 'airport' && window.XvlDiagram) window.dispatchEvent(new Event('resize'));
-    if (m === 'route') drawRoute();
-  }
-  // Redraw whenever the box changes size (a rotation, a rail, a banner).
-  if (window.ResizeObserver) {
-    new ResizeObserver(function () { if (tab === 'map' && mapMode() === 'route') drawRoute(); }).observe($('route-root'));
-  }
-
-  // The basemap: water, coast and fields from X-Plane's own map data
-  // (`/basemap`), asked again only once the view leaves the tiles held or
-  // its zoom moves by about a step. No data: the route alone, said nowhere.
-  var base = null, baseBusy = false, baseTimer = null, baseOffUntil = 0;
-  function wantBase(vb, k, sc, W) {
-    var dpp = 1 / sc;
-    var held = base && vb[0] >= base.bbox[0] && vb[1] >= base.bbox[1] && vb[2] <= base.bbox[2] + 1 && vb[3] <= base.bbox[3] + 1 &&
-      Math.abs(Math.log2(dpp) - base.want) < 0.85;
-    if (held || baseBusy || Date.now() < baseOffUntil) return;
-    if (baseTimer) clearTimeout(baseTimer);
-    baseTimer = setTimeout(function () {
-      baseTimer = null;
-      // A margin round the view, so the aircraft's progress asks rarely.
-      var mla = (vb[2] - vb[0]) * 0.3, mlo = (vb[3] - vb[1]) * 0.3;
-      var box = [vb[0] - mla, vb[1] - mlo, vb[2] + mla, vb[3] + mlo];
-      var px = Math.round((box[3] - box[1]) * k * sc);
-      baseBusy = true;
-      fetch(withT('/basemap?bbox=' + box.map(function (v) { return v.toFixed(3); }).join(',') + '&px=' + px), { headers: { 'X-EFB-Token': token }, credentials: 'same-origin' })
-        .then(function (r) { if (r.status === 404) return null; if (!r.ok) throw r.status; return r.json(); })
-        .then(function (j) {
-          baseBusy = false;
-          if (!j) { baseOffUntil = Date.now() + 60000; return; }
-          j.want = Math.log2(dpp);
-          base = j;
-          drawRoute();
-        })
-        .catch(function () { baseBusy = false; baseOffUntil = Date.now() + 15000; });
-    }, 250);
-  }
-  // Both ends on the same whole degree: a tile's side, not a coast.
-  function sameLine(a, b) { var r = Math.round(a); return r === Math.round(b) && Math.abs(a - r) < 2e-4 && Math.abs(b - r) < 2e-4; }
-  function drawBase(ctx, xy, WATER, COAST) {
-    if (!base || !base.water || !base.water.length) return;
-    ctx.beginPath();
-    base.water.forEach(function (r) {
-      for (var i = 0; i + 1 < r.length; i += 2) { var p = xy(r[i], r[i + 1]); if (i) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); }
-      ctx.closePath();
-    });
-    ctx.fillStyle = WATER; ctx.fill('evenodd');
-    // The coast: every edge but the tiles' own sides.
-    ctx.beginPath();
-    base.water.forEach(function (r) {
-      for (var i = 2; i + 1 < r.length; i += 2) {
-        var a0 = r[i - 2], o0 = r[i - 1], a1 = r[i], o1 = r[i + 1];
-        if (sameLine(a0, a1) || sameLine(o0, o1)) continue;
-        var a = xy(a0, o0), b = xy(a1, o1);
-        ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]);
-      }
-    });
-    ctx.strokeStyle = COAST; ctx.lineWidth = 1; ctx.stroke();
-  }
-
-  // Labels placed clear of one another: a few spots round each point, the
-  // first free one taken; a label with no free spot is dropped unless it
-  // must stay (the active fix, the destination, the top of descent).
-  function Placer(W, H, reserved) { this.W = W; this.H = H; this.boxes = reserved.slice(); }
-  Placer.prototype.free = function (b) {
-    if (b[0] < 2 || b[1] < 2 || b[2] > this.W - 2 || b[3] > this.H - 2) return false;
-    for (var i = 0; i < this.boxes.length; i++) {
-      var o = this.boxes[i];
-      if (b[0] < o[2] + 2 && b[2] + 2 > o[0] && b[1] < o[3] + 2 && b[3] + 2 > o[1]) return false;
-    }
-    return true;
-  };
-  Placer.prototype.place = function (x, y, w, h, must) {
-    var spots = [[x + 9, y - 8 - h], [x + 9, y + 6], [x - 9 - w, y - 8 - h], [x - 9 - w, y + 6], [x + 11, y - h / 2], [x - 11 - w, y - h / 2], [x - w / 2, y - 12 - h], [x - w / 2, y + 11]];
-    for (var i = 0; i < spots.length; i++) {
-      var b = [spots[i][0], spots[i][1], spots[i][0] + w, spots[i][1] + h];
-      if (this.free(b)) { this.boxes.push(b); return b; }
-    }
-    if (!must) return null;
-    var f = [spots[0][0], spots[0][1], spots[0][0] + w, spots[0][1] + h];
-    this.boxes.push(f);
-    return f;
-  };
-  function segDist(p, a, b) {
-    var dx = b[0] - a[0], dy = b[1] - a[1], l = dx * dx + dy * dy;
-    var t = l > 0 ? Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l)) : 0;
-    return Math.hypot(p[0] - a[0] - t * dx, p[1] - a[1] - t * dy);
-  }
-
-  function drawRoute() {
-    var root = $('route-root'), cv = $('route-canvas');
-    if (!last || root.hidden) return;
-    var map = last.map || {}, fixes = map.fixes || [], own = map.own, tod = map.tod, fields = map.fields || [], view = map.view;
-    var W = root.clientWidth, H = root.clientHeight, dpr = window.devicePixelRatio || 1;
-    if (!W || !H) return;
-    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
-    var ctx = cv.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    var cs = getComputedStyle(document.documentElement);
-    function c(n, d) { return cs.getPropertyValue(n).trim() || d; }
-    var BG = c('--bg', '#07090C'), MAG = c('--magenta', '#EB6EEB'), TXT = c('--text', '#E6EDF3'), MUT = c('--muted', '#8B98A8'), CY = c('--cyan', '#7FD3F7'), AMB = c('--amber', '#FFC266');
-    var WATER = c('--water', '#0F1B26'), COAST = c('--coast', '#2A4256'), SOFT = c('--soft', '#B7C2CF');
-    var MONO = c('--mono', 'monospace');
-    ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
-    var info = $('map-info');
-    if (!fixes.length) {
-      ctx.fillStyle = MUT; ctx.font = '15px ' + MONO; ctx.textAlign = 'center';
-      ctx.fillText('No route to draw: load a flight plan.', W / 2, H / 2);
-      info.hidden = true;
-      return;
-    }
-    // The fit is the state's (`route_map::fit`): what is ahead, the
-    // terminal near the field, the whole plan on the ground.
-    var la0, la1, lo0, lo1;
-    if (view) { la0 = view.lat0; la1 = view.lat1; lo0 = view.lon0; lo1 = view.lon1; } else {
-      la0 = Infinity; la1 = -Infinity; lo0 = Infinity; lo1 = -Infinity;
-      fixes.concat(own ? [own] : []).forEach(function (p) { la0 = Math.min(la0, p.lat); la1 = Math.max(la1, p.lat); lo0 = Math.min(lo0, p.lon); lo1 = Math.max(lo1, p.lon); });
-    }
-    var midLat = (la0 + la1) / 2, k = Math.cos(midLat * Math.PI / 180);
-    var spanX = Math.max(0.02, (lo1 - lo0) * k), spanY = Math.max(0.02, la1 - la0);
-    // Clear of the map's own controls above and the info box below.
-    var rootBox = root.getBoundingClientRect();
-    function rel(e) { var r = e.getBoundingClientRect(); return [r.left - rootBox.left, r.top - rootBox.top, r.right - rootBox.left, r.bottom - rootBox.top]; }
-    var ctl = rel(document.querySelector('#p-apt .map-ctl'));
-    var pad = 36, top = Math.max(56, ctl[3] + 16), bottom = 64;
-    var sc = Math.min((W - 2 * pad) / spanX, (H - top - bottom) / spanY);
-    var cx = (lo0 + lo1) / 2, cy = midLat, my = top + (H - top - bottom) / 2;
-    function xy(lat, lon) { return [W / 2 + (lon - cx) * k * sc, my - (lat - cy) * sc]; }
-    // What the canvas shows, for the basemap.
-    var vb = [cy - (H - my) / sc, cx - (W / 2) / (k * sc), cy + my / sc, cx + (W / 2) / (k * sc)];
-    wantBase(vb, k, sc, W);
-    drawBase(ctx, xy, WATER, COAST);
-    // The legs: flown ones dimmed, the rest magenta.
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    var ahead = [];
-    for (var i = 0; i + 1 < fixes.length; i++) {
-      var a = xy(fixes[i].lat, fixes[i].lon), b = xy(fixes[i + 1].lat, fixes[i + 1].lon);
-      var flown = fixes[i + 1].done;
-      if (!flown) ahead.push([a, b]);
-      ctx.strokeStyle = flown ? MUT : MAG;
-      ctx.globalAlpha = flown ? 0.45 : 1;
-      ctx.lineWidth = flown ? 2 : 3;
-      ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
-    function onScreen(p, m) { return p[0] >= -m && p[0] <= W + m && p[1] >= -m && p[1] <= H + m; }
-    // Labels, by priority: the active fix, the destination and the top of
-    // descent always; then the origin and alternate, the fixes ahead
-    // (nearest first), the towered fields near the route, the flown fixes.
-    var labels = [];
-    function label(p, text, color, font, rank, must) { labels.push({ p: p, text: text, color: color, font: font, rank: rank, must: must }); }
-    var planned = {};
-    fields.forEach(function (f) { planned[f.icao] = f; });
-    // Other fields: near a leg still to fly, or anywhere in a terminal view.
-    var terminal = view && view.kind === 'terminal';
-    ((base && base.fields) || []).forEach(function (f) {
-      if (planned[f[0]]) return;
-      var p = xy(f[1], f[2]);
-      if (!onScreen(p, 0)) return;
-      var near = terminal || ahead.some(function (s) { return segDist(p, s[0], s[1]) < 24; });
-      if (!near || (!f[3] && sc < 120)) return;
-      ctx.fillStyle = MUT; ctx.globalAlpha = f[3] ? 0.9 : 0.6;
-      ctx.beginPath(); ctx.arc(p[0], p[1], f[3] ? 2.5 : 1.8, 0, Math.PI * 2); ctx.fill();
-      ctx.globalAlpha = 1;
-      if (f[3]) label(p, f[0], MUT, '10px ' + MONO, 40, false);
-    });
-    var active = null, here = own ? xy(own.lat, own.lon) : null;
-    fixes.forEach(function (f, idx) {
-      var p = xy(f.lat, f.lon);
-      if (!onScreen(p, 50)) return;
-      if (f.active) active = f;
-      if (planned[f.id]) return;
-      ctx.fillStyle = f.done ? MUT : (f.active ? MAG : TXT);
-      ctx.globalAlpha = f.done ? 0.6 : 1;
-      ctx.beginPath(); ctx.arc(p[0], p[1], f.active ? 5 : 3, 0, Math.PI * 2); ctx.fill();
-      if (f.active) { ctx.strokeStyle = MAG; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(p[0], p[1], 10, 0, Math.PI * 2); ctx.stroke(); }
-      ctx.globalAlpha = 1;
-      var d = here ? Math.hypot(p[0] - here[0], p[1] - here[1]) : idx;
-      if (f.active) label(p, f.id, MAG, 'bold 12px ' + MONO, 0, true);
-      else if (f.done) label(p, f.id, MUT, '12px ' + MONO, 60 + idx * 0.001, false);
-      else label(p, f.id, TXT, '12px ' + MONO, 10 + Math.min(d, 9999) / 10000, false);
-    });
-    // The plan's fields: a ring, the ICAO always.
-    fields.forEach(function (f) {
-      var p = xy(f.lat, f.lon);
-      if (!onScreen(p, 40)) return;
-      var dest = f.role === 'destination', isActive = active && active.id === f.icao;
-      var col = isActive || dest ? MAG : (f.role === 'alternate' ? AMB : SOFT);
-      ctx.strokeStyle = col; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(p[0], p[1], 6, 0, Math.PI * 2); ctx.stroke();
-      ctx.fillStyle = col; ctx.beginPath(); ctx.arc(p[0], p[1], 2, 0, Math.PI * 2); ctx.fill();
-      if (isActive) { ctx.beginPath(); ctx.arc(p[0], p[1], 11, 0, Math.PI * 2); ctx.stroke(); }
-      label(p, f.icao, col, 'bold 12px ' + MONO, dest || isActive ? 0 : 5, dest || isActive);
-    });
-    var todShown = false;
-    if (tod && onScreen(xy(tod.lat, tod.lon), 0)) {
-      var t = xy(tod.lat, tod.lon);
-      todShown = true;
-      ctx.strokeStyle = AMB; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(t[0], t[1], 6, 0, Math.PI * 2); ctx.stroke();
-      label(t, tod.label || 'TOD', AMB, 'bold 12px ' + MONO, 1, true);
-    }
-    if (own) {
-      var o = here, h = ((own.track || 0) * Math.PI) / 180;
-      ctx.save(); ctx.translate(o[0], o[1]); ctx.rotate(h);
-      ctx.fillStyle = CY; ctx.strokeStyle = BG; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(0, -11); ctx.lineTo(8, 9); ctx.lineTo(0, 5); ctx.lineTo(-8, 9); ctx.closePath();
-      ctx.fill(); ctx.stroke(); ctx.restore();
-    }
-    // A scale bar.
-    var nmPx = sc / 60, step = [1, 2, 5, 10, 20, 50, 100, 200, 500].find(function (n) { return n * nmPx > 60; }) || 500;
-    var sx = W - 24 - step * nmPx, sy = H - 24;
-    // Reserved: the aircraft, the controls, the info box, the scale bar.
-    var reserved = [ctl, [sx - 4, sy - 22, W - 20, sy + 4]];
-    if (here) reserved.push([here[0] - 12, here[1] - 12, here[0] + 12, here[1] + 12]);
-    if (!info.hidden && info.firstChild) reserved.push(rel(info));
-    labels.sort(function (x, y) { return x.rank - y.rank; });
-    var placer = new Placer(W, H, reserved);
-    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    labels.forEach(function (l) {
-      ctx.font = l.font;
-      var w = ctx.measureText(l.text).width, hgt = parseInt(l.font.replace(/^bold /, ''), 10) + 2;
-      var b = placer.place(l.p[0], l.p[1], w, hgt, l.must);
-      if (!b) return;
-      // A halo, so a label reads over the coast and the legs.
-      ctx.lineWidth = 3; ctx.strokeStyle = BG; ctx.globalAlpha = 0.85;
-      ctx.strokeText(l.text, b[0], b[1] + 1);
-      ctx.globalAlpha = 1; ctx.fillStyle = l.color;
-      ctx.fillText(l.text, b[0], b[1] + 1);
-    });
-    ctx.font = '12px ' + MONO; ctx.textBaseline = 'middle';
-    ctx.strokeStyle = MUT; ctx.fillStyle = MUT; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(sx, sy - 5); ctx.lineTo(sx, sy); ctx.lineTo(W - 24, sy); ctx.lineTo(W - 24, sy - 5); ctx.stroke();
-    ctx.textAlign = 'right'; ctx.fillText(step + ' nm', W - 24, sy - 14);
-    info.hidden = false;
-    clear(info);
-    if (active) {
-      info.appendChild(document.createTextNode('Next '));
-      info.appendChild(el('b', null, active.id));
-    } else info.appendChild(document.createTextNode('Route ' + fixes[0].id + ' to ' + fixes[fixes.length - 1].id));
-    if (todShown) info.appendChild(document.createTextNode(', top of descent marked'));
-  }
-  function renderMap(s) {
-    var m = (s.map && s.map.mode) || 'airport';
-    if (m !== mapAuto) { mapAuto = m; mapPick = null; }
-    if (tab === 'map') showMap();
-  }
-
   // ------------------------------------------------------------ settings
   var setSig = '', setRows = {};
   function setMsg(row, ok, text) { row.msg.className = 'sm' + (ok === true ? ' ok' : ok === false ? ' err' : ''); row.msg.textContent = text || ''; }
@@ -1587,7 +1305,7 @@ form.say .send { min-height: 52px; }
   function render(s) {
     last = s;
     renderMove(s.airport && s.airport.reposition);
-    if (window.XvlDiagram) window.XvlDiagram.update(s);
+    if (window.XvlMap) window.XvlMap.update(s);
     renderHeader(s);
     renderAlerts(s.alerts);
     renderPtt(s.ptt);
@@ -1598,7 +1316,6 @@ form.say .send { min-height: 52px; }
     renderPlan(s);
     renderBoard(s.board);
     if (tab === 'map') measure();
-    renderMap(s);
     renderSettings(s.settings);
   }
 

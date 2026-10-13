@@ -27,9 +27,9 @@ pub(crate) mod basemap;
 pub(crate) mod board;
 pub(crate) mod feed;
 pub(crate) mod flight_tab;
+pub(crate) mod map;
 pub(crate) mod ptt;
 pub(crate) mod qr;
-pub(crate) mod route_map;
 pub(crate) mod state;
 pub(crate) mod transcript;
 
@@ -49,8 +49,9 @@ use crate::voice::Voice;
 /// The page, one self-contained file (vanilla JS, no build step).
 const PAGE: &str = include_str!("page.html");
 
-/// The Airport page's drawing code (vanilla JS, no library, no tiles).
-const DIAGRAM_JS: &str = include_str!("diagram.js");
+/// The Map tab's world map (vanilla JS, no library, nothing from the
+/// network but this server).
+const MAP_JS: &str = include_str!("map.js");
 
 /// The cookie that carries the token after the first `?t=` load.
 const COOKIE: &str = "xvl_efb";
@@ -722,9 +723,9 @@ struct AirportQuery {
     icao: Option<String>,
 }
 
-/// The diagram of a field the page state named (`airport.icao`), with its
-/// version as the ETag: the page fetches it once per field. 404 while it is
-/// still being built, or for a field nobody asked for.
+/// Any field's diagram, for the map's view (`airport::request`): built on
+/// demand off this thread and cached, its version as the ETag. 202 while
+/// it is being built (the page asks again), 404 for a field with none.
 async fn airport_route(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(q): Query<AirportQuery>,
@@ -733,9 +734,17 @@ async fn airport_route(
     if !authorised(&live_token(), &headers, q.t.as_deref()) {
         return refuse(peer, "/airport");
     }
-    let icao = q.icao.unwrap_or_default().trim().to_ascii_uppercase();
-    let Some(ready) = airport::lookup(&icao) else {
-        return (StatusCode::NOT_FOUND, "no diagram for that field yet").into_response();
+    let Some(icao) = airport::clean_icao(q.icao.as_deref().unwrap_or_default()) else {
+        return (StatusCode::BAD_REQUEST, "icao=XXXX").into_response();
+    };
+    let ready = match airport::request(&icao) {
+        airport::Requested::Ready(r) => r,
+        airport::Requested::Building => {
+            return (StatusCode::ACCEPTED, "building, ask again").into_response()
+        }
+        airport::Requested::Unavailable => {
+            return (StatusCode::NOT_FOUND, "no diagram for that field").into_response()
+        }
     };
     let etag = format!("\"{}\"", ready.reference.version);
     let fresh = headers
@@ -768,9 +777,9 @@ struct BasemapQuery {
     px: Option<f64>,
 }
 
-/// The route map's water and fields for a view (`basemap`): X-Plane's own
-/// installed map data, read off this thread. 404 when the data is not
-/// installed or the view is too wide: the page then draws the route alone.
+/// The map's water and fields for a view (`basemap`): X-Plane's own
+/// installed map data and the field directory, read off this thread. 404
+/// for a view wider than [`basemap::MAX_TILES`] (the page never asks).
 async fn basemap_route(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(q): Query<BasemapQuery>,
@@ -822,16 +831,16 @@ async fn basemap_route(
     r
 }
 
-/// The Airport page's script: code, no data, so like the icon it needs no
-/// token (a `<script src>` carries no header, and a home-screen app's first
-/// load must not depend on the cookie having landed).
-async fn diagram_js() -> Response {
+/// The Map tab's script: code, no data, so like the icon it needs no token
+/// (a `<script src>` carries no header, and a home-screen app's first load
+/// must not depend on the cookie having landed).
+async fn map_js() -> Response {
     (
         [
             (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        DIAGRAM_JS,
+        MAP_JS,
     )
         .into_response()
 }
@@ -1070,10 +1079,9 @@ pub(crate) const REPOSITION_MIN_GAP: Duration = Duration::from_secs(3);
 /// digits, 3 to 7) and a stand name (one line, 1 to 64 characters, no
 /// control character). Pure.
 pub(crate) fn reposition_request(icao: &str, stand: &str) -> Result<(String, String), &'static str> {
-    let icao = icao.trim().to_ascii_uppercase();
-    if !(3..=7).contains(&icao.len()) || !icao.chars().all(|c| c.is_ascii_alphanumeric()) {
+    let Some(icao) = airport::clean_icao(icao) else {
         return Err("no such field");
-    }
+    };
     let stand = stand.trim();
     if stand.is_empty() || stand.chars().count() > 64 || stand.chars().any(char::is_control) {
         return Err("no such stand");
@@ -1171,7 +1179,7 @@ pub(crate) fn router(server: Arc<Server>) -> Router {
         .route("/reposition", post(reposition_route))
         .route("/airport", get(airport_route))
         .route("/basemap", get(basemap_route))
-        .route("/diagram.js", get(diagram_js))
+        .route("/map.js", get(map_js))
         .route("/manifest.webmanifest", get(manifest_route))
         .route("/icon.svg", get(icon))
         .route("/apple-touch-icon.png", get(|| async { png(ICON_180) }))
@@ -1430,7 +1438,7 @@ mod tests {
         assert!(PAGE.contains("apple-mobile-web-app-capable"));
         assert!(PAGE.contains("viewport-fit=cover"));
         assert!(!PAGE.contains('\u{2014}') && !PAGE.contains('\u{2013}'));
-        assert!(PAGE.contains("<script src=\"/diagram.js\"></script>"));
+        assert!(PAGE.contains("<script src=\"/map.js\"></script>"));
         for tab in ["flight", "map", "plan", "radio", "board"] {
             assert!(
                 PAGE.contains(&format!("data-tab=\"{tab}\"")),
@@ -1442,9 +1450,20 @@ mod tests {
             "settings behind the gear"
         );
         assert!(!PAGE.contains("more-sheet"), "five tabs, no More sheet");
-        assert!(DIAGRAM_JS.contains("window.XvlDiagram"));
-        assert!(!DIAGRAM_JS.contains('\u{2014}') && !DIAGRAM_JS.contains('\u{2013}'));
-        assert!(!DIAGRAM_JS.contains("http"), "no tile, no CDN: this server only");
+        assert!(MAP_JS.contains("window.XvlMap"));
+        assert!(!MAP_JS.contains('\u{2014}') && !MAP_JS.contains('\u{2013}'));
+        assert!(
+            !MAP_JS.contains("http"),
+            "no tile, no CDN: this server only"
+        );
+    }
+
+    /// The page asks /basemap for no wider a view than it draws, and
+    /// measures a field's metres on the server's sphere.
+    #[test]
+    fn the_page_asks_no_wider_than_the_server_draws() {
+        assert!(MAP_JS.contains(&format!("var MAX_TILES = {};", basemap::MAX_TILES)));
+        assert!(MAP_JS.contains("var M_PER_DEG = 3440.065 * 1852 * Math.PI / 180;"));
     }
 
     /// The server against a fixture-free app: the page, the state and a
@@ -1503,7 +1522,7 @@ mod tests {
                 "no flight model: the ramp's layout"
             );
             assert!(v["transcript"].is_array());
-            assert!(v["map"]["mode"].is_string());
+            assert!(v["map"]["traffic"].is_array() && v["map"]["stands"].is_array());
             let say = |text: &str| {
                 http.post(format!("{base}/say?t=testtoken0123456"))
                     .json(&serde_json::json!({ "text": text }))
@@ -1563,8 +1582,19 @@ mod tests {
                 .await
                 .unwrap();
             let v: serde_json::Value = r.json().await.unwrap();
-            assert_eq!(v["airport"]["stands"]["known"], false, "no traffic: unknown");
-            assert!(v["airport"]["traffic"].is_array());
+            assert_eq!(
+                v["map"]["stands"],
+                serde_json::json!([]),
+                "no traffic: unknown"
+            );
+            // Any field's diagram, asked by the map's view: a name that is
+            // no field is refused, a field is built (or has none).
+            let apt = |icao: &str| {
+                http.get(format!("{base}/airport?t=testtoken0123456&icao={icao}"))
+                    .send()
+            };
+            assert_eq!(apt("E;GK").await.unwrap().status(), 400);
+            assert!([202, 404].contains(&apt("ZZZZ").await.unwrap().status().as_u16()));
             // Push to talk: refused while this run does not capture on it,
             // a release always taken.
             let ptt_post = |action: &str| {

@@ -534,7 +534,7 @@ fn taxi_legs(f: &Facts) -> Vec<LegRow> {
         crate::nav::haversine_nm(r.path[i].0, r.path[i].1, r.path[i + 1].0, r.path[i + 1].1)
             * 1852.0
     };
-    let nearest = at.and_then(|p| crate::efb::route_map::nearest_segment(&r.path, p));
+    let nearest = at.and_then(|p| crate::efb::map::nearest_segment(&r.path, p));
     let mut rows: Vec<(String, bool, f64, usize)> = Vec::new(); // name, runway, length, last seg
     for i in 0..r.path.len() - 1 {
         let (name, rwy) = r

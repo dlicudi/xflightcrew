@@ -14933,3 +14933,49 @@ is, see which stands are free, and move the aircraft to a free one from the page
   `move_readback` (`off_m` under 30), `flight_state` `flight_begins` `ramp`. Then refused: moving
   (gs over a knot), on a red stand (button greyed, and the server refuses it too), during a
   taxi ("I'm taxiing. Say my controls first, then move.").
+
+## 2026-10-13: the Map tab is one world map
+
+The pilot: "It should behave more like a world map." The Map tab had two pictures, the airport
+diagram (on the ground, or low within 15 nm of the destination) and the route map (elsewhere),
+switched by `route_map::mode` or the Airport and Route buttons, each with its own zoom bounds and
+its own canvas (the route map in page.html, the diagram in `diagram.js`).
+
+- **One map** (`src/efb/map.js`, served as `/map.js`; `diagram.js` and page.html's route map
+  removed, with `route_map::mode`, `AIRPORT_AGL_FT`, `AIRPORT_NM`, the switch and its test):
+  Web Mercator, north up, pan with a flick's inertia, pinch, wheel, double tap to zoom in,
+  zoom 5.5 (a region) to 20.5 (single stands). Follow on by default, off on a pan, back on by
+  its button; Overview fits `map::fit` (kept, it is the button now). Track up is gone (the ask
+  is north up), and double tap now zooms in rather than re-following.
+- **Why Mercator**: every world map uses it, and it is conformal, so a field's diagram drawn in
+  its own metres stays true and places with one transform at every zoom. The server's frame
+  (`airport::Frame`, equirectangular about the reference point) is exact east; north the page
+  re-measures once at load (`fieldFrame`), so a point 3 km out at 60 degrees north lands within a
+  centimetre (metres off without it). Each layer is a `Path2D` in its own small frame (no
+  world-sized offsets reach the canvas: no float32 jitter at stand zoom).
+- **Any field's diagram** (`airport::request`, `GET /airport?icao=`): built on demand when the
+  view comes within about 0.02 px a metre of it (a 3 km field 60 px across), 202 while building,
+  404 for none, two builds at a time, 24 kept (was 3; `lookup` now keeps what it is asked for, so
+  the wanted field is never evicted). Fields come from `/basemap`'s field list (now sent with or
+  without map data) and the plan's fields.
+- **The live picture is lat/lon** (`efb::map`, was `route_map`): `map.own` (heading, track, gs,
+  on the ground), `map.traffic` (every simulated field's aircraft wherever it is; was within
+  30 km of the drawn field, in its frame), `map.stands` (every simulated field's, the wanted one
+  with ours on a stand: `airport::stands_by_field`). `airport.own`, `airport.traffic` and
+  `airport.stands` left the wire; `AirportOut::own_on_ground` stays server-side for the stand we
+  take. Move here works on any field's stand (the setup tool's gates decide; its card names the
+  field when it is not the wanted one).
+- The page asks `/basemap` only once the view stands still, within `MAX_TILES` (30%, 10%, then
+  no margin; pinned to the server's by `the_page_asks_no_wider_than_the_server_draws`); the
+  stand card's action row no longer picks up the action bar's `.act` style.
+- Tests: `the_page_places_a_field_where_the_server_measured_it` (map.js under node: Mercator
+  round trip, the field transform, the basemap box; skipped without node),
+  `traffic_and_stands_ride_the_map_wherever_they_are`, `traffic_rides_the_map_in_lat_lon_with_its_card`,
+  `no_map_data_is_no_water_and_a_continent_is_no_answer`; the server test asks `/airport` for a
+  bad name (400) and an unknown field (202 or 404). Looked at headless (Chromium over CDP) on the
+  real EGKK diagram and basemap fixtures at iPad and iPhone sizes: wheel, drag, pinch, double
+  tap, follow, stand and traffic cards.
+- **UNFLOWN** on a real iPad and iPhone: the gestures' feel and frame rate over the LAN, the
+  diagrams of the fields round LEMG and EGKK appearing as the view comes close (blackbox `efb`
+  `diagram` per build), the taxi route and turn card following us, Move here from another
+  field's stand.
