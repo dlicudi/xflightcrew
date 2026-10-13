@@ -105,3 +105,33 @@ party_line: the installed station adopts its field's FieldDesk strips on install
 4. `FieldDesk` = the tower FSM per strip; the station adopts it on install; speech per
    field's frequency.
 5. (Later) hand a departure to its destination's link.
+
+## Code facts behind the design (read 2026-10-13)
+
+- One station: `Session.atc_station` (`src/main/station_work.rs`), swapped through the single
+  `party_line` `PENDING_STATION` by `region_tick` (`crates/atc/src/station/region.rs`,
+  `AT_FIELD_NM` 4 on the ground, `SWITCH_MARGIN_NM` 5), `arm_station_for_freq` (COM1) and
+  `arm_new_flight_at`. Every station static is a global singleton (`state.rs` lifetime
+  groups); `Station::install` resets `TrafficStrips`, and the reinstall rule then despawns
+  every moving traffic aircraft (`Link::tick`, `despawn_moving`).
+- Ids: `Link.next_id` starts at 1, `STRIPS` is `BTreeMap<u32, _>`: two links collide at once.
+  `RunwayBook::now` (`runway_book.rs`), the sequence number (`ctx.rs`), `stands_assigned` and
+  `takeoff_hold.rs` iterate EVERY traffic strip, whatever its field; `traffic_tick` takes AGL
+  from `active_field()`; `TOWER_WIND` and `TRAFFIC_TYPES` (keyed by callsign) are single.
+  Hence stage 3 keeps other fields' strips out of party_line entirely.
+- Speech: `Outbox` and `Voice::pump_overheard` key a line by `StationSpeaker` ROLE (Tower,
+  Ground, Approach), resolved through the installed field's `CONTROLLER_FREQS`: a second
+  field's "Tower" would play on our tower's frequency. Lines must carry the frequency (kHz).
+- Seeds: `TrafficWorld::build` seeds with `self.built` (links built this session), so a field
+  revisited gets another day: stage 2.
+- Render: `traffic_sink.rs` sends every fleet aircraft, parked included, no distance filter;
+  the wire caps at 341 roster / 409 frames (`wire.rs`, silently truncated); `FLAG_HIDDEN` is
+  defined and never set; `traffic.cpp` creates or destroys an XPMP2 aircraft per roster id
+  and probes terrain per ground aircraft per frame. The cull belongs in the sink (a roster
+  change destroys the plane), never by `FLAG_HIDDEN` (a hidden plane still costs its update).
+- Cost: `Fleet::step` substeps at 0.1 s; `spacing::apply` is all-pairs per field, so fields
+  apart cost the sum, not the square. `FieldModel::load` is two streaming scans of the 400 MB
+  apt.dat, uncached: build fields one at a time off the tick.
+- Monitor tick about 3 Hz nominal (`XCOPILOT_MONITOR_HZ`), 1.25 s seen live.
+- `docs/tasks/pillars-audit/stage-d-traffic.md` lists as not in v1 "strips re-adopted across a
+  reinstall; departure or approach handoff for traffic"; this design is that follow-up.
