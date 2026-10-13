@@ -285,12 +285,11 @@ fn the_route_is_drawn_in_the_frame_with_its_crossing_and_its_end() {
     assert_eq!(p.status, "ready");
     assert_eq!(p.icao.as_deref(), Some("EGKK"));
     assert_eq!(p.why, Some("here"));
-    let own = p.own.expect("own");
+    let own = p.own_on_ground.expect("on the ground on the field");
     assert!(
-        close(own.x, 2.0, 0.1) && close(own.y, -200.0, 0.1),
+        close(own.0, 2.0, 0.1) && close(own.1, -200.0, 0.1),
         "{own:?}"
     );
-    assert_eq!(own.heading, 359.0);
     let r = p.route.expect("route");
     assert_eq!(r.driven.len(), 4, "start and the foot: {:?}", r.driven);
     assert!(close(r.driven[3], -200.0, 0.1));
@@ -420,7 +419,7 @@ fn the_page_says_loading_until_the_wanted_field_is_built() {
     let out = page(&a, Some(&air), Some(&p), true);
     assert_eq!(out.icao.as_deref(), Some("EGKK"));
     assert_eq!(out.status, "loading");
-    assert!(out.version.is_none() && out.own.is_none());
+    assert!(out.version.is_none() && out.own_on_ground.is_none());
     // Built: the aircraft on final, the arrival runway marked.
     let a = AirportFacts {
         diagram: Some(diagram_ref("EGKK", &f)),
@@ -429,9 +428,7 @@ fn the_page_says_loading_until_the_wanted_field_is_built() {
     let out = page(&a, Some(&air), Some(&p), true);
     assert_eq!(out.status, "ready");
     assert_eq!(out.version.as_deref(), Some("0123456789abcdef"));
-    assert!(out
-        .own
-        .is_some_and(|o| !o.on_ground && close(o.y, -20_000.0, 0.1)));
+    assert!(out.own_on_ground.is_none(), "in the air: on no stand");
     let r = out.runway.unwrap();
     assert_eq!((r.ident.as_str(), r.why), ("08R", "arrival"));
     // Without full auto's runway, the plan's.
@@ -492,11 +489,11 @@ fn traffic_ac(f: &Frame, id: u32, x: f64, y: f64, on_ground: bool) -> crate::efb
     }
 }
 
-/// Our traffic is drawn in the diagram's frame, every field's, only near
-/// the drawn field; the card's words ride with it (an altitude only in the
-/// air, an end nobody knows is no end).
+/// Our traffic rides the map in lat/lon, every field's however far; the
+/// card's words ride with it (an altitude only in the air, an end nobody
+/// knows is no end).
 #[test]
-fn traffic_is_drawn_in_the_frame_near_the_field_with_its_card() {
+fn traffic_rides_the_map_in_lat_lon_with_its_card() {
     let f = Frame::new(36.675, -4.499);
     let fields = vec![
         crate::efb::feed::TrafficField {
@@ -513,19 +510,15 @@ fn traffic_is_drawn_in_the_frame_near_the_field_with_its_card() {
             taken: Vec::new(),
         },
     ];
-    let out = traffic_out(&fields, &f);
+    let out = traffic_out(&fields);
     assert_eq!(
         out.iter().map(|a| a.id).collect::<Vec<_>>(),
-        vec![1, 2],
-        "the far one is not drawn"
+        vec![1, 2, 3],
+        "the far one too: the map is the world"
     );
     let a = &out[0];
-    assert!(
-        close(a.x, 120.0, 0.2) && close(a.y, -40.0, 0.2),
-        "{} {}",
-        a.x,
-        a.y
-    );
+    let (x, y) = f.xy(a.lat, a.lon);
+    assert!(close(x, 120.0, 0.2) && close(y, -40.0, 0.2), "{x} {y}");
     assert_eq!(a.hdg, 10.0);
     assert_eq!(a.alt_ft, None, "on the ground: no altitude");
     assert_eq!(a.from.as_deref(), Some("EGKK"));
@@ -544,14 +537,7 @@ fn a_stand_is_free_or_taken_and_unknown_without_traffic() {
         ("22".to_string(), 150.0, 100.0),
         ("23".to_string(), 200.0, 100.0),
     ];
-    let own = |x: f64, on_ground: bool| Own {
-        x,
-        y: 104.0,
-        heading: 0.0,
-        track: None,
-        gs_kts: 0.0,
-        on_ground,
-    };
+    let own = |x: f64| (x, 104.0);
     let none = stand_states("LEMG", &stands, None, None);
     assert!(
         !none.known && none.taken.is_empty(),
@@ -582,7 +568,7 @@ fn a_stand_is_free_or_taken_and_unknown_without_traffic() {
             },
         ],
     }];
-    let s = stand_states("lemg", &stands, Some(&world), Some(&own(103.0, true)));
+    let s = stand_states("lemg", &stands, Some(&world), Some(own(103.0)));
     assert!(s.known);
     let by = |n: &str| {
         s.taken
@@ -598,10 +584,12 @@ fn a_stand_is_free_or_taken_and_unknown_without_traffic() {
     assert_eq!(s.taken.iter().filter(|t| t.name == "21").count(), 1);
     assert_eq!(by("22"), Some(("EZY1", "taxiing in")));
     assert_eq!(by("23"), None, "free");
-    // Airborne over a stand is on none; with no world, ours is still known.
-    let s = stand_states("LEMG", &stands, Some(&world), Some(&own(103.0, false)));
+    assert_eq!(s.icao, "LEMG");
+    // Not on the ground (no position given) is on none; with no world, ours
+    // is still known.
+    let s = stand_states("LEMG", &stands, Some(&world), None);
     assert_eq!(by_of(&s, "21"), Some("EZY2"));
-    let s = stand_states("LEMG", &stands, None, Some(&own(198.0, true)));
+    let s = stand_states("LEMG", &stands, None, Some(own(198.0)));
     assert!(!s.known);
     assert_eq!(by_of(&s, "23"), Some("us"));
 }
@@ -811,7 +799,7 @@ fn real_install_page_states() {
             s.airport.card.as_ref().map(|c| &c.text)
         );
         assert_eq!(s.airport.status, "ready");
-        assert!(s.airport.route.is_some() && s.airport.own.is_some());
+        assert!(s.airport.route.is_some() && s.map.own.is_some());
         std::fs::write(
             format!("{dir}/state_{icao}.json"),
             serde_json::to_string(&s).unwrap(),

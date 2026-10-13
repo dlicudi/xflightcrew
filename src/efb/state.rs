@@ -668,8 +668,8 @@ pub(crate) struct EfbState {
     pub(crate) action: Option<Button>,
     pub(crate) last_sent: Option<Sent>,
     pub(crate) airport: crate::efb::airport::AirportOut,
-    /// The Map tab's route picture (`efb::route_map`).
-    pub(crate) map: crate::efb::route_map::MapOut,
+    /// The Map tab's live picture in lat/lon (`efb::map`).
+    pub(crate) map: crate::efb::map::MapOut,
     /// The Plan tab's flight information board (`efb::board`).
     pub(crate) board: crate::efb::board::BoardOut,
 }
@@ -1444,7 +1444,7 @@ pub(crate) fn build(f: &Facts) -> EfbState {
     let airport =
         crate::efb::airport::page(&f.airport, f.tick.as_ref(), f.plan.as_ref(), airborne(f));
     let flight = crate::efb::flight_tab::build(f, &airport);
-    let map = crate::efb::route_map::build(f, &airport);
+    let map = crate::efb::map::build(f, &airport);
     EfbState {
         t: f.now_t,
         header,
@@ -1925,8 +1925,9 @@ pub(crate) mod tests {
             s.weather.metars[0].runway.as_deref(),
             Some("Runway 26L (full auto's arrival)")
         );
-        // The map: the route in the cruise.
-        assert_eq!(s.map.mode, "route");
+        // The map: the route ahead in the cruise, the aircraft on it.
+        assert_eq!(s.map.view.as_ref().map(|v| v.kind), Some("ahead"));
+        assert!(s.map.own.is_some());
         // The whole thing is JSON, the label flattened into each line.
         let j = serde_json::to_value(&s).unwrap();
         assert_eq!(j["transcript"][0]["from"], "YOU");
@@ -2056,7 +2057,7 @@ pub(crate) mod tests {
         assert!(s.plan.plan.is_none());
         assert!(s.radio.com1.is_none() && s.radio.last_call.is_none());
         assert!(s.transcript.is_empty());
-        assert_eq!(s.map.mode, "airport");
+        assert!(s.map.own.is_none() && s.map.fixes.is_empty());
         assert_eq!(s.action.map(|b| b.id), Some("fetch_plan".into()));
     }
 
@@ -2126,14 +2127,6 @@ pub(crate) mod tests {
         f.takeoff_need_m = Some(1_421.0);
         write("parked", &f);
         write("approach", &approach());
-        // The same approach with the Map tab's auto choice on the route (the
-        // basemap's terminal view): 12 nm out at 3,500 ft.
-        let mut f = approach();
-        let t = f.tick.as_mut().unwrap();
-        t.lon = -0.50;
-        t.alt_ft = 3_500.0;
-        t.agl_ft = 3_300.0;
-        write("approach_route", &f);
     }
 
     /// The pilot's screenshot, 2026-10-06: the 737 8 nm out of EGKK at

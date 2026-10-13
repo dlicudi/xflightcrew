@@ -1,16 +1,15 @@
-//! The Map tab's route picture, airborne away from a field: the plan's legs
-//! (flown ones marked), the active fix, our position as the monitor's tick
-//! read it, the top of descent where the follower or the plan puts it, the
-//! plan's fields, and the view to fit ([`fit`]). Pure; the page draws it
-//! over the water of X-Plane's own map data (`efb::basemap`). On the ground
-//! or low near the drawn destination the Map tab is the airport diagram
-//! instead ([`mode`]).
+//! The Map tab's live picture in lat/lon, for one continuous world map
+//! (`map.js`, Web Mercator): the plan's legs (flown ones marked), the active
+//! fix, our aircraft as the monitor's tick read it, our traffic, every
+//! field's stands free or taken, the top of descent where the follower or
+//! the plan puts it, the plan's fields, and the overview to fit ([`fit`]).
+//! Pure; the page draws it over the water of X-Plane's own map data
+//! (`efb::basemap`) and any field's diagram (`efb::airport`) once close.
 
 use serde::Serialize;
 
-use crate::efb::airport::AirportOut;
+use crate::efb::airport::{AirportOut, StandsOut, TrafficOut};
 use crate::efb::state::{airborne, Facts};
-use crate::flight::Phase;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct MapFix {
@@ -27,9 +26,20 @@ pub(crate) struct MapFix {
 pub(crate) struct MapPoint {
     pub(crate) lat: f64,
     pub(crate) lon: f64,
-    /// Track true, for the aircraft symbol.
-    pub(crate) track: Option<f64>,
     pub(crate) label: Option<String>,
+}
+
+/// Our aircraft, as the monitor's tick read it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct OwnOut {
+    pub(crate) lat: f64,
+    pub(crate) lon: f64,
+    /// True heading (the monitor's `psi`, best-effort: 0 on a failed read).
+    pub(crate) heading: f64,
+    /// Ground track, true, when the read held.
+    pub(crate) track: Option<f64>,
+    pub(crate) gs_kts: f64,
+    pub(crate) on_ground: bool,
 }
 
 /// A plan's field, labelled on the map whatever the zoom.
@@ -42,7 +52,8 @@ pub(crate) struct MapField {
     pub(crate) lon: f64,
 }
 
-/// What the route picture fits: a lat/lon box.
+/// The overview the map's button (and its first airborne view) fits: a
+/// lat/lon box.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct View {
     pub(crate) lat0: f64,
@@ -56,13 +67,16 @@ pub(crate) struct View {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct MapOut {
-    /// "airport" (the diagram) or "route".
-    pub(crate) mode: &'static str,
     pub(crate) fixes: Vec<MapFix>,
-    pub(crate) own: Option<MapPoint>,
+    pub(crate) own: Option<OwnOut>,
     pub(crate) tod: Option<MapPoint>,
     pub(crate) fields: Vec<MapField>,
     pub(crate) view: Option<View>,
+    /// Our traffic, every simulated field's (`airport::traffic_out`).
+    pub(crate) traffic: Vec<TrafficOut>,
+    /// The stands of every field anybody knows of, free or taken
+    /// (`airport::stands_by_field`).
+    pub(crate) stands: Vec<StandsOut>,
 }
 
 /// Near the destination: the route map fits the aircraft and the field
@@ -73,11 +87,6 @@ pub(crate) const TERMINAL_LOW_NM: f64 = 60.0;
 pub(crate) const TERMINAL_LOW_FT: f64 = 10_000.0;
 /// No view is narrower than this, either way.
 pub(crate) const MIN_SPAN_NM: f64 = 15.0;
-/// The Map tab turns to the destination's diagram below this, inside
-/// [`AIRPORT_NM`] of it: the terminal radius where the diagram still draws
-/// the aircraft (`airport::OWN_MAX_M`, 30 km).
-pub(crate) const AIRPORT_AGL_FT: f64 = 3_000.0;
-pub(crate) const AIRPORT_NM: f64 = 15.0;
 
 /// The box round some points, widened to [`MIN_SPAN_NM`] each way. Pure.
 fn bbox(pts: &[(f64, f64)], kind: &'static str) -> Option<View> {
@@ -173,35 +182,6 @@ fn destination_at(f: &Facts) -> Option<(f64, f64)> {
         })
 }
 
-/// The Map tab's own choice. On the ground: the airport. Airborne: the
-/// destination's diagram inside [`AIRPORT_NM`] of it below
-/// [`AIRPORT_AGL_FT`] (or in the landing, on the runway), the route
-/// otherwise; with no route to draw, the airport. Pure.
-pub(crate) fn mode(f: &Facts, a: &AirportOut) -> &'static str {
-    if !airborne(f) {
-        return "airport";
-    }
-    let has_route = f.plan.as_ref().is_some_and(|p| p.waypoints.len() >= 2);
-    if !has_route {
-        return "airport";
-    }
-    let drawn = a.why == Some("destination") && matches!(a.status, "ready" | "loading");
-    let near = match (f.tick.as_ref(), destination_at(f)) {
-        (Some(t), Some(d)) => crate::nav::haversine_nm(t.lat, t.lon, d.0, d.1) <= AIRPORT_NM,
-        _ => false,
-    };
-    let low = f.tick.as_ref().is_some_and(|t| t.agl_ft < AIRPORT_AGL_FT);
-    let landing = f
-        .flight
-        .as_ref()
-        .is_some_and(|s| matches!(s.phase, Phase::Landing | Phase::Rollout));
-    if drawn && near && (low || landing) {
-        "airport"
-    } else {
-        "route"
-    }
-}
-
 /// A local flat frame around a point, nautical miles east and north.
 fn flat(origin: (f64, f64), p: (f64, f64)) -> (f64, f64) {
     let k = origin.0.to_radians().cos();
@@ -263,7 +243,6 @@ pub(crate) fn point_along(path: &[(f64, f64)], i: usize, t: f64, nm: f64) -> Opt
 pub(crate) fn build(f: &Facts, a: &AirportOut) -> MapOut {
     let up = airborne(f);
     let plan = f.plan.as_ref();
-    let mode = mode(f, a);
     let path: Vec<(f64, f64)> = plan
         .map(|p| p.waypoints.iter().map(|w| (w.1, w.2)).collect())
         .unwrap_or_default();
@@ -289,11 +268,14 @@ pub(crate) fn build(f: &Facts, a: &AirportOut) -> MapOut {
                 .collect()
         })
         .unwrap_or_default();
-    let own = f.tick.as_ref().map(|t| MapPoint {
-        lat: t.lat,
-        lon: t.lon,
-        track: t.track_deg.or(Some(t.heading_deg)),
-        label: None,
+    let r1 = |v: f64| (v * 10.0).round() / 10.0;
+    let own = f.tick.as_ref().map(|t| OwnOut {
+        lat: (t.lat * 1e7).round() / 1e7,
+        lon: (t.lon * 1e7).round() / 1e7,
+        heading: r1(t.heading_deg.rem_euclid(360.0)),
+        track: t.track_deg.map(|v| r1(v.rem_euclid(360.0))),
+        gs_kts: r1(t.gs_kts.abs()),
+        on_ground: t.on_ground,
     });
     // The follower's own top of descent, ahead of us along the route; else
     // the plan's ring, measured back from the destination.
@@ -310,7 +292,6 @@ pub(crate) fn build(f: &Facts, a: &AirportOut) -> MapOut {
     .map(|(lat, lon)| MapPoint {
         lat,
         lon,
-        track: None,
         label: Some("TOD".into()),
     });
     let view = fit(
@@ -330,13 +311,24 @@ pub(crate) fn build(f: &Facts, a: &AirportOut) -> MapOut {
             lon: *lon,
         })
         .collect();
+    let traffic = f.airport.traffic.as_deref();
+    // The wanted field's stands take our own aircraft standing on one.
+    let here = f
+        .airport
+        .diagram
+        .as_ref()
+        .filter(|d| a.status == "ready" && a.icao.as_deref() == Some(d.icao.as_str()))
+        .map(|d| (d, a.own_on_ground));
     MapOut {
-        mode,
         fixes,
         own,
         tod,
         fields,
         view,
+        traffic: traffic
+            .map(crate::efb::airport::traffic_out)
+            .unwrap_or_default(),
+        stands: crate::efb::airport::stands_by_field(traffic, here),
     }
 }
 
@@ -358,14 +350,15 @@ mod tests {
         assert_eq!(point_along(&path, 0, 0.0, 999.0), Some((1.0, 1.0)));
     }
 
-    /// In the cruise, away from any field: the route, NORMI active, BELEN
-    /// flown, the follower's top of descent ahead of us.
+    /// In the cruise, away from any field: NORMI active, BELEN flown, the
+    /// follower's top of descent ahead of us, the aircraft in lat/lon.
     #[test]
-    fn the_cruise_map_is_the_route() {
+    fn the_cruise_map_marks_the_route() {
         let f = cruise();
         let a = crate::efb::airport::page(&f.airport, f.tick.as_ref(), f.plan.as_ref(), true);
         let m = build(&f, &a);
-        assert_eq!(m.mode, "route");
+        let own = m.own.as_ref().expect("the aircraft");
+        assert!(!own.on_ground && (own.lat - 45.0).abs() < 1e-6);
         assert!(m.fixes[0].done && !m.fixes[0].active);
         assert!(m.fixes[1].active);
         assert!(!m.fixes[2].done);
@@ -374,11 +367,74 @@ mod tests {
             tod.lat > 45.0,
             "ahead of the aircraft, north along the route"
         );
-        // On the ground: the airport diagram.
-        let mut g = cruise();
-        g.tick.as_mut().unwrap().on_ground = true;
-        let a = crate::efb::airport::page(&g.airport, g.tick.as_ref(), g.plan.as_ref(), false);
-        assert_eq!(build(&g, &a).mode, "airport");
+        assert!(
+            m.traffic.is_empty() && m.stands.is_empty(),
+            "no traffic world"
+        );
+    }
+
+    fn traffic_ac(id: u32, lat: f64, lon: f64) -> crate::efb::feed::TrafficAc {
+        crate::efb::feed::TrafficAc {
+            id,
+            callsign: format!("EZY{id}"),
+            spoken: format!("Easy {id}"),
+            airline: "easyJet".into(),
+            icao_type: "A320".into(),
+            from: "LEMG".into(),
+            to: "EGKK".into(),
+            phase: "inbound",
+            stand: None,
+            sched: None,
+            est: None,
+            lat,
+            lon,
+            hdg: 10.0,
+            alt_ft: 9_000.0,
+            on_ground: false,
+            gs_kts: 280.0,
+        }
+    }
+
+    /// One world: our traffic is on the map wherever it flies (a field 600
+    /// nm away too), and every simulated field's stands are known, the
+    /// wanted field's with our own aircraft on one.
+    #[test]
+    fn traffic_and_stands_ride_the_map_wherever_they_are() {
+        let mut f = approach();
+        f.airport.traffic = Some(vec![
+            crate::efb::feed::TrafficField {
+                icao: "EGKK".into(),
+                aircraft: vec![traffic_ac(1, 51.2, -0.1)],
+                taken: vec![crate::efb::feed::StandTaken {
+                    name: "12".into(),
+                    by: "EZY1".into(),
+                    how: "due",
+                }],
+            },
+            crate::efb::feed::TrafficField {
+                icao: "LEMG".into(),
+                aircraft: vec![traffic_ac(2, 36.7, -4.5)],
+                taken: Vec::new(),
+            },
+        ]);
+        let m = build(&f, &page_of(&f));
+        assert_eq!(m.traffic.len(), 2, "both fields', however far");
+        assert!((m.traffic[1].lat - 36.7).abs() < 1e-9);
+        let icaos: Vec<&str> = m.stands.iter().map(|s| s.icao.as_str()).collect();
+        assert_eq!(icaos, vec!["LEMG", "EGKK"]);
+        assert!(m.stands.iter().all(|s| s.known));
+        // On the ground on Gatwick's stand 12's spot: ours, never listed twice.
+        let t = f.tick.as_mut().unwrap();
+        t.on_ground = true;
+        t.lat = 51.148;
+        t.lon = -0.19;
+        f.airport.diagram.as_mut().unwrap().stands = vec![("12".into(), 1.0, 1.0)];
+        let mut a = page_of(&f);
+        a.icao = Some("EGKK".into());
+        let m = build(&f, &a);
+        let kk = m.stands.iter().find(|s| s.icao == "EGKK").unwrap();
+        assert_eq!(kk.taken.len(), 1);
+        assert_eq!(kk.taken[0].by, "us");
     }
 
     fn page_of(f: &Facts) -> AirportOut {
@@ -461,37 +517,67 @@ mod tests {
         assert!(contains(&v, (37.5, -4.5)) && contains(&v, (51.15, -0.19)));
     }
 
-    /// The Map tab's own choice: the diagram on the ground and low near the
-    /// destination, the route above or away.
+    /// The page's projection (`map.js`, run under node where it is
+    /// installed, else skipped): Web Mercator round-trips; a field's frame
+    /// placed with one scale lands within a centimetre of where the
+    /// server's `Frame` puts the point, 4 km out at 60 degrees north; the
+    /// basemap box keeps within the server's tile limit, and a continent
+    /// asks for none.
     #[test]
-    fn the_map_turns_to_the_field_low_near_it() {
-        // 8 nm out at 1,840 ft above the field: the diagram.
-        let f = approach();
-        assert_eq!(mode(&f, &page_of(&f)), "airport");
-        // The same place at 6,000 ft: the route.
-        let mut g = approach();
-        g.tick.as_mut().unwrap().agl_ft = 6_000.0;
-        assert_eq!(mode(&g, &page_of(&g)), "route");
-        // In the landing, whatever the height reads: the diagram.
-        g.flight.as_mut().unwrap().phase = Phase::Landing;
-        assert_eq!(mode(&g, &page_of(&g)), "airport");
-        // Low but 25 nm away (past where the diagram draws us), or 50: the
-        // route.
-        let mut far = approach();
-        far.tick.as_mut().unwrap().lon = -0.85;
-        assert_eq!(mode(&far, &page_of(&far)), "route");
-        far.tick.as_mut().unwrap().lon = -1.5;
-        assert_eq!(mode(&far, &page_of(&far)), "route");
-        // On the ground anywhere: the airport.
-        let mut gnd = cruise();
-        gnd.tick.as_mut().unwrap().on_ground = true;
-        assert_eq!(mode(&gnd, &page_of(&gnd)), "airport");
-        // Airborne with no route to draw: the airport.
-        let mut none = approach();
-        none.plan = None;
-        assert_eq!(mode(&none, &page_of(&none)), "airport");
-        // The cruise: the route.
-        let c = cruise();
-        assert_eq!(mode(&c, &page_of(&c)), "route");
+    fn the_page_places_a_field_where_the_server_measured_it() {
+        let js = concat!(env!("CARGO_MANIFEST_DIR"), "/src/efb/map.js");
+        let script = format!(
+            r#"global.window = {{}};
+            eval(require('fs').readFileSync({js:?}, 'utf8'));
+            const M = window.XvlMapMath, out = {{}};
+            out.lat = M.latOf(M.my(51.148));
+            out.lon = M.lonOf(M.mx(-0.19));
+            const lat0 = 60.3, lon0 = 5.2, x = 3000, y = -2800;
+            const lat = lat0 + y / M.M_PER_DEG;
+            const lon = lon0 + x / (M.M_PER_DEG * Math.cos(lat0 * Math.PI / 180));
+            const f = M.fieldFrame(lat0, lon0);
+            const k = M.kAt(lat);
+            const X = f.X0 + x * f.k, Y = f.Y0 - f.v(y) * f.k;
+            out.err_m = Math.hypot(X - M.mx(lon), Y - M.my(lat)) / k;
+            out.flat_m = Math.abs(f.Y0 - y * f.k - M.my(lat)) / k;
+            const b = M.baseBox(50.9, -0.7, 51.4, 0.3);
+            out.tiles = M.tileCount(b[0], b[1], b[2], b[3]);
+            out.wide = M.baseBox(40, -14, 56, 12);
+            out.wide_tiles = out.wide ? M.tileCount(out.wide[0], out.wide[1], out.wide[2], out.wide[3]) : 0;
+            out.continent = M.baseBox(-60, -170, 60, 170);
+            console.log(JSON.stringify(out));"#
+        );
+        let Ok(run) = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+        else {
+            eprintln!("node is not installed: the page's projection is not checked here");
+            return;
+        };
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+        let num = |k: &str| v[k].as_f64().unwrap_or(f64::NAN);
+        assert!((num("lat") - 51.148).abs() < 1e-9 && (num("lon") + 0.19).abs() < 1e-9);
+        assert!(num("err_m") < 0.01, "placed {} m off", num("err_m"));
+        assert!(
+            num("flat_m") > 1.0,
+            "without the north re-measure: {} m",
+            num("flat_m")
+        );
+        assert!(num("tiles") <= crate::efb::basemap::MAX_TILES as f64);
+        assert_eq!(
+            num("tiles"),
+            4.0,
+            "a margin round the view: 50.75 to 51.55, -1.0 to 0.6"
+        );
+        assert!(
+            num("wide_tiles") <= crate::efb::basemap::MAX_TILES as f64 && num("wide_tiles") > 459.0
+        );
+        assert!(v["continent"].is_null());
     }
 }
