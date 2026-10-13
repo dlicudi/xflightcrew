@@ -1316,6 +1316,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     radio_ft,
                     on_ground > 0.5,
                     runtime.go_around.active(),
+                    super::established_on_final(),
                 ) {
                     Some(UnclearedStep::Ask) => {
                         if runtime.going_around_callsign.is_none() {

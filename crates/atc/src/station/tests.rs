@@ -2906,10 +2906,14 @@ fn a_standing_occupant_resequences_to_another_strip_or_holds() {
         Err("no_other_runway")
     );
 
-    // Live: two strips, the squatter on 12/30.
+    // Live: two strips, the squatter on 12/30, standing there a minute
+    // through our approach (the clocks run from the first sight, high).
     lemg30_cleared(lemg_runways(), (310.0, 8.0));
-    own_on_lemg30_final(0.95, at(1.0));
-    let call = go_around_tick(std::slice::from_ref(&squatter), 380.0, false, true, at(1.0))
+    assert!(
+        go_around_tick(std::slice::from_ref(&squatter), 2000.0, false, true, at(0.0)).is_none()
+    );
+    own_on_lemg30_final(0.95, at(61.0));
+    let call = go_around_tick(std::slice::from_ref(&squatter), 380.0, false, true, at(61.0))
         .expect("the order");
     assert!(
         call.line.contains("expect runway three one"),
@@ -2923,8 +2927,11 @@ fn a_standing_occupant_resequences_to_another_strip_or_holds() {
 
     // One strip only: the order stands alone, nothing re-sequenced.
     lemg30_cleared(vec![lemg_runways()[0].clone()], (310.0, 8.0));
-    own_on_lemg30_final(0.95, at(1.0));
-    let call = go_around_tick(std::slice::from_ref(&squatter), 380.0, false, true, at(1.0))
+    assert!(
+        go_around_tick(std::slice::from_ref(&squatter), 2000.0, false, true, at(0.0)).is_none()
+    );
+    own_on_lemg30_final(0.95, at(61.0));
+    let call = go_around_tick(std::slice::from_ref(&squatter), 380.0, false, true, at(61.0))
         .expect("the order");
     assert_eq!(
         call.line,
@@ -10827,7 +10834,7 @@ fn lemg13_a_departure_rolling_is_judged_on_its_roll_not_as_a_rollout() {
         (lat, lon, s)
     };
     assert_eq!(
-        strip_exit_as(r, "13", &[p(1600.0, -2.0), p(1600.0, 0.0)], true),
+        strip_exit_as(r, "13", &[p(1600.0, -2.0), p(1600.0, 0.0)], true, 2.0),
         StripExit::LinedUp(roll_to_liftoff_s(0.0))
     );
     assert_eq!(
@@ -10837,4 +10844,155 @@ fn lemg13_a_departure_rolling_is_judged_on_its_roll_not_as_a_rollout() {
     reset();
     *OWN_STRIP.clearance.lock().unwrap() = None;
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+}
+
+/// LEMG 13 (sortie 1791917103-full_auto, 2026-10-13): EZY6957 rolled out
+/// judged "clearing" for a minute (1,556 to 1,848 m, about 31 s), then one
+/// sample stood 1 s at 1,919 m, 26 m off a 45 m runway's centreline, at its
+/// exit: "stays", and our go-around was ordered 47 s out. A pause is judged
+/// by the motion before it, and an occupant past the paved edge is on its
+/// exit: neither orders a go-around. A stop that lasts still stays.
+#[test]
+fn a_rollout_pausing_at_its_exit_is_clearing_never_a_go_around() {
+    let r = &lemg_runways()[1];
+    let at = |along: f64, cross: f64, t: f64| {
+        let (lat, lon) = lemg13_point(along, cross);
+        (lat, lon, t)
+    };
+    // The recorded samples: rolling out and turning off, then standing 1 s.
+    let ezy = [
+        at(1848.0, 10.0, -5.6),
+        at(1872.0, 15.0, -4.0),
+        at(1897.0, 21.0, -2.4),
+        at(1919.0, 26.0, -1.0),
+        at(1919.3, 26.0, 0.0),
+    ];
+    let exit = strip_exit_as(r, "13", &ezy, false, 1.0);
+    match exit {
+        StripExit::Clearing(s) => assert!(s < 2.0, "{s}"),
+        other => panic!("on its exit, not {other:?}"),
+    }
+    assert!(!go_around_due(Some(47.0), &[exit]), "the order was a one-sample flip");
+    // The same pause on the pavement: judged by its last motion, a slow
+    // rollout, still off in time.
+    let mid = [
+        at(1848.0, 0.0, -5.6),
+        at(1872.0, 0.0, -4.0),
+        at(1897.0, 0.0, -2.4),
+        at(1919.0, 0.0, -1.0),
+        at(1919.3, 0.0, 0.0),
+    ];
+    let exit = strip_exit_as(r, "13", &mid, false, 1.0);
+    match exit {
+        StripExit::Clearing(s) => assert!((25.0..35.0).contains(&s), "{s}"),
+        other => panic!("judged as it was moving, not {other:?}"),
+    }
+    assert!(!go_around_due(Some(47.0), &[exit]));
+    // A stop held past STAYS_AFTER_S on the pavement: it stays.
+    let stopped = [
+        at(1800.0, 0.0, -7.0),
+        at(1830.0, 0.0, -6.0),
+        at(1830.0, 0.0, -4.0),
+        at(1830.0, 0.0, -2.0),
+        at(1830.0, 0.0, 0.0),
+    ];
+    assert_eq!(strip_exit_as(r, "13", &stopped, false, 6.0), StripExit::Stays);
+    // Standing at the exit past EXIT_STAND_S: parked with a wing over the
+    // runway, it stays.
+    assert_eq!(
+        strip_exit_as(r, "13", &[at(1919.0, 26.0, -2.0), at(1919.0, 26.0, 0.0)], false, 31.0),
+        StripExit::Stays
+    );
+    // Moving off past the paved edge, at any angle: on its exit.
+    match strip_exit_as(r, "13", &[at(1890.0, 21.0, -1.0), at(1905.0, 24.0, 0.0)], false, 0.0) {
+        StripExit::Clearing(s) => assert!(s < 2.0, "{s}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The runway is turned for a BLOCKED runway only: an occupant stopped
+/// RESEQUENCE_STANDING_S, or traffic using the other direction while no
+/// arrival is committed to the runway in use. LEMG (sortie
+/// 1791917103-full_auto): EZY6957 standing 1 s turned the field from 13 to
+/// 12 and split the traffic across two runways.
+#[test]
+fn a_momentary_stop_never_turns_the_runway() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Pure.
+    assert_eq!(resequence_why(&[(StripExit::Stays, 1.0)], false), None);
+    assert_eq!(resequence_why(&[(StripExit::Clearing(0.3), 1.0)], false), None);
+    assert_eq!(resequence_why(&[(StripExit::Stays, 59.0)], false), None);
+    assert_eq!(resequence_why(&[(StripExit::Stays, 60.0)], false), Some("standing"));
+    assert_eq!(resequence_why(&[(StripExit::Stays, 90.0)], true), Some("standing"));
+    assert_eq!(resequence_why(&[(StripExit::Oncoming, 0.0)], false), Some("oncoming"));
+    assert_eq!(
+        resequence_why(&[(StripExit::Oncoming, 0.0)], true),
+        None,
+        "an arrival cleared to the runway in use holds its direction"
+    );
+    // Live: first seen standing as we arrive, the go-around is ordered
+    // but the field keeps its runway.
+    let base = Instant::now();
+    let at = |s: f64| base + std::time::Duration::from_secs_f64(s);
+    let squatter = ghost_at("EZY6957", lemg30_point(1400.0, 3.0));
+    lemg30_cleared(lemg_runways(), (310.0, 8.0));
+    own_on_lemg30_final(0.95, at(1.0));
+    let call = go_around_tick(std::slice::from_ref(&squatter), 380.0, false, true, at(1.0))
+        .expect("the order");
+    assert!(!call.line.contains("expect runway"), "{}", call.line);
+    assert!(OWN_STRIP.pending_resequence.lock().unwrap().is_none());
+    reset_runway_watch();
+}
+
+/// A withheld landing is released only to a flight ON the final. LEMG 12
+/// (sortie 1791917103-full_auto): "cleared to land" went out 545 m past the
+/// threshold at 1,190 ft, climbing in a reposition pattern.
+#[test]
+fn a_landing_release_waits_for_the_final() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let place = |along_m: f64, cross_m: f64, closing: Option<f64>, h: Option<f64>| FinalPlace {
+        along_m,
+        cross_m,
+        closing_mps: closing,
+        height_ft: h,
+    };
+    // The recorded release: past the threshold, high, climbing.
+    assert!(!on_the_final(place(545.0, 40.0, Some(10.0), Some(1190.0))));
+    // Short of it but far above the path: climbing away or in a pattern.
+    assert!(!on_the_final(place(-700.0, 0.0, Some(30.0), Some(1190.0))));
+    // Flying away from the threshold.
+    assert!(!on_the_final(place(-700.0, 0.0, Some(-30.0), Some(200.0))));
+    // Abeam on a downwind.
+    assert!(!on_the_final(place(-700.0, 1500.0, Some(30.0), None)));
+    // On the final, on the path or a little high; unknowns fail open.
+    assert!(on_the_final(place(-1760.0, 20.0, Some(50.0), Some(300.0))));
+    assert!(on_the_final(place(-1760.0, 20.0, Some(50.0), Some(600.0))));
+    assert!(on_the_final(place(-1760.0, 20.0, None, None)));
+    // Live: the hold waits while we are past the threshold, then goes.
+    let base = Instant::now();
+    let at = |s: f64| base + std::time::Duration::from_secs_f64(s);
+    lemg30_cleared(vec![lemg_runways()[0].clone()], (300.0, 4.0));
+    *OWN_STRIP.clearance.lock().unwrap() = Some(ClearanceSnap {
+        state: tower::State::Inbound,
+        callsign: SR22.into(),
+        runway_ident: "30".into(),
+        pending_readback: None,
+        holds_runway: false,
+    });
+    *OWN_STRIP.landing_hold.lock().unwrap() = Some(LandingHold {
+        callsign: SR22.into(),
+        runway: "three zero".into(),
+        runway_ident: "30".into(),
+        line: format!("{SR22}, runway three zero, cleared to land."),
+    });
+    let (lat, lon) = lemg30_point(500.0, 40.0);
+    note_own_fix(lat, lon, false, at(9.0));
+    let (lat, lon) = lemg30_point(545.0, 40.0);
+    note_own_fix(lat, lon, false, at(10.0));
+    assert!(landing_hold_tick(&[], false, at(10.0)).is_none(), "past the threshold");
+    assert!(crate::party_line::landing_hold_armed(), "the hold waits");
+    OWN_STRIP.own_fixes.lock().unwrap().clear();
+    own_on_lemg30_final(0.95, at(60.0));
+    assert!(landing_hold_tick(&[], false, at(60.0)).is_some(), "back on the final");
+    reset_runway_watch();
 }

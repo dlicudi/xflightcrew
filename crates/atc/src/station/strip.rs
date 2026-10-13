@@ -64,6 +64,28 @@ pub(super) const ROLLOUT_CLEAR_S: f64 = 40.0;
 pub(super) const LINED_UP_ZONE_M: f64 = 800.0;
 /// Under this a ghost is standing, not moving.
 pub(super) const MOVING_KTS: f64 = 3.0;
+/// A ghost seen MOVING that stops is judged by how it was moving until it
+/// has stood this long: one velocity window under [`MOVING_KTS`] is a
+/// pause (a turn onto the exit, a traffic step, the feed's noise), five
+/// independent windows ([`TRACK_MIN_DT_S`] each) are a stop. Shorter than
+/// [`TRACK_KEEP_S`] less one window, so the motion before the stop is still
+/// on file when it is asked. The cost is nothing near the threshold: a
+/// paused rollout is still judged a rollout, which sends an arrival round
+/// inside its own clear time anyway. LEMG 13 (sortie 1791917103-full_auto,
+/// 2026-10-13): EZY6957 rolling out at 1,919 m, one sample standing 1 s at
+/// its exit, was judged "stays" and our go-around ordered 47 s out.
+pub(super) const STAYS_AFTER_S: f64 = 5.0;
+/// An occupant whose position is past the PAVED edge (outside half the
+/// width, inside the [`OCCUPANT_EDGE_M`] capture) is on its exit: judged
+/// off at the capture's edge until it has stood there this long. Its
+/// vacate call and the taxi clearance it asks for are inside it (EZY6957
+/// called "runway vacated" 5.4 s after stopping at 26 m off a 45 m
+/// runway's centreline); past it the aircraft is parked with a wing over
+/// the runway, and it stays.
+pub(super) const EXIT_STAND_S: f64 = 30.0;
+/// The pace an occupant on its exit is assumed to make good across the
+/// last of the capture: a slow taxi.
+pub(super) const VACATE_KTS: f64 = 10.0;
 /// An occupant is ON the runway when its reported position is within the
 /// paved half-width plus this: a mainwheel on the edge line, never the
 /// holding point (90 m out on a code C strip). The runway judgement asks the
@@ -362,7 +384,36 @@ pub(crate) fn strip_exit(
     landing_end: &str,
     track: &[(f64, f64, f64)],
 ) -> StripExit {
-    strip_exit_as(r, landing_end, track, false)
+    strip_exit_as(r, landing_end, track, false, track_stood_s(track))
+}
+
+/// How long the track's newest position has stood within
+/// [`STANDING_RADIUS_M`]: the span back to the last sample farther away, or
+/// the whole track (a lower bound). The standing clock's answer when only
+/// the track is in hand.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn track_stood_s(track: &[(f64, f64, f64)]) -> f64 {
+    let Some(&(lat, lon, t)) = track.last() else {
+        return 0.0;
+    };
+    let from = track
+        .iter()
+        .rev()
+        .find(|p| metres_between(lat, lon, p.0, p.1) > STANDING_RADIUS_M)
+        .map(|p| p.2)
+        .or_else(|| track.first().map(|p| p.2))
+        .unwrap_or(t);
+    (t - from).max(0.0)
+}
+
+/// The newest sample at which the track was MOVING (its velocity, over at
+/// least [`TRACK_MIN_DT_S`], at or above [`MOVING_KTS`]), before the
+/// newest one.
+fn last_moving(f: &LandingFrame, track: &[(f64, f64, f64)]) -> Option<usize> {
+    (1..track.len().saturating_sub(1)).rev().find(|&j| {
+        track_velocity(f, track, j)
+            .is_some_and(|((va, vc), _)| (va * va + vc * vc).sqrt() * 1.943_844 >= MOVING_KTS)
+    })
 }
 
 /// [`strip_exit`] knowing whether the occupant is a DEPARTURE the tower
@@ -374,19 +425,31 @@ pub(crate) fn strip_exit(
 /// rolling at about 90 kt 824 m down, was read as a rollout (40 s) instead
 /// of about 15 s from liftoff, and we were sent round; it lifted off 25 s
 /// before our threshold.
+///
+/// A STOP is judged only once it is one: an occupant seen moving that
+/// stands is judged by its last motion until it has stood
+/// [`STAYS_AFTER_S`], and one past the paved edge is on its exit, off at
+/// the capture's edge, until it has stood there [`EXIT_STAND_S`]
+/// (`stood_s`, the standing clock). A single sample never makes "stays".
 pub(crate) fn strip_exit_as(
     r: &nav::Runway,
     landing_end: &str,
     track: &[(f64, f64, f64)],
     departing: bool,
+    stood_s: f64,
 ) -> StripExit {
     let Some(f) = LandingFrame::new(r, landing_end) else {
         return StripExit::Stays;
     };
-    let Some(&(lat, lon, _)) = track.last() else {
+    let Some(&(lat, lon, now_t)) = track.last() else {
         return StripExit::Stays;
     };
     let (along, cross) = f.place(lat, lon);
+    let half = strip_half_width_m(r);
+    // Past the painted edge, inside the capture: on its exit.
+    let past_edge = r.width_m > 1.0 && cross.abs() > r.width_m / 2.0;
+    let edge_s =
+        |speed_mps: f64| (half - cross.abs()).max(0.0) / speed_mps.max(VACATE_KTS / 1.943_844);
     let standing = || {
         if departing || along < LINED_UP_ZONE_M {
             StripExit::LinedUp(roll_to_liftoff_s(0.0))
@@ -400,7 +463,23 @@ pub(crate) fn strip_exit_as(
     };
     let kts = (va * va + vc * vc).sqrt() * 1.943_844;
     if kts < MOVING_KTS {
+        if !departing && along >= LINED_UP_ZONE_M {
+            if past_edge && stood_s < EXIT_STAND_S {
+                return StripExit::Clearing(edge_s(0.0));
+            }
+            if let Some(j) = last_moving(&f, track) {
+                if now_t - track[j].2 < STAYS_AFTER_S {
+                    // A pause: judged as it was moving, its clock paused.
+                    return strip_exit_as(r, landing_end, &track[..=j], departing, 0.0);
+                }
+            }
+        }
         return standing();
+    }
+    // Past the paved edge and moving away from the centreline: on its exit,
+    // whatever the angle (a rapid exit leaves at 30 degrees).
+    if !departing && past_edge && vc != 0.0 && vc.signum() == cross.signum() {
+        return StripExit::Clearing(edge_s(vc.abs()));
     }
     let angle = vc.abs().atan2(va.abs()).to_degrees();
     if angle <= 30.0 {
@@ -422,7 +501,6 @@ pub(crate) fn strip_exit_as(
         };
     }
     // Across the strip: crossing or vacating, off at the edge it heads for.
-    let half = strip_half_width_m(r);
     let dist = if vc.signum() == cross.signum() {
         half - cross.abs()
     } else {
@@ -482,6 +560,98 @@ pub(crate) fn go_around_due(own_s: Option<f64>, exits: &[StripExit]) -> bool {
         && exits
             .iter()
             .any(|e| e.secs().is_none_or(|s| s + RUNWAY_CLEAR_MARGIN_S > t))
+}
+
+/// Where a flight is against the final it would be cleared to land on, from
+/// its strip's fixes: metres along the landing direction from the threshold
+/// (negative short of it), metres off the centreline, the rate it closes
+/// along the final (m/s, positive toward the threshold; `None` with one
+/// fix) and its height over the field (ft; `None` when the altitude or the
+/// field's elevation did not read).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FinalPlace {
+    pub(crate) along_m: f64,
+    pub(crate) cross_m: f64,
+    pub(crate) closing_mps: Option<f64>,
+    pub(crate) height_ft: Option<f64>,
+}
+
+/// Off the final's centreline by more than this angle seen from the
+/// threshold is not on the final: the final's own intercept cut is 35
+/// degrees (`final_report_due` lines up within 30).
+pub(super) const FINAL_CONE_DEG: f64 = 35.0;
+/// ...plus this, so the last few hundred metres are not judged on an angle.
+pub(super) const FINAL_CONE_BASE_M: f64 = 150.0;
+/// Above twice a 3 degree path plus this is not on the final: climbing
+/// away, or in a pattern over the field.
+pub(super) const FINAL_HIGH_MARGIN_FT: f64 = 300.0;
+
+/// Is a flight ON the final, for the landing release? Short of the
+/// threshold, inside the final's cone ([`FINAL_CONE_DEG`]), closing on it
+/// when the rate is known, and not above twice a 3 degree path plus
+/// [`FINAL_HIGH_MARGIN_FT`] when the height is known. LEMG 12 (sortie
+/// 1791917103-full_auto, 2026-10-13): "cleared to land" went out 545 m past
+/// the threshold at 1,190 ft, climbing in a reposition pattern after two
+/// go-arounds, and the crew read it back. Pure.
+pub(crate) fn on_the_final(p: FinalPlace) -> bool {
+    if p.along_m >= 0.0 {
+        return false;
+    }
+    let out = -p.along_m;
+    if p.cross_m.abs() > out * FINAL_CONE_DEG.to_radians().tan() + FINAL_CONE_BASE_M {
+        return false;
+    }
+    if p.closing_mps.is_some_and(|v| v <= 0.0) {
+        return false;
+    }
+    let path_ft = out * 3.28084 * 3.0_f64.to_radians().tan();
+    !p.height_ft
+        .is_some_and(|h| h > 2.0 * path_ft + FINAL_HIGH_MARGIN_FT)
+}
+
+/// [`FinalPlace`] for one flight's strip from its fresh fixes and its last
+/// seen altitude. `None` without a fresh fix: no measurement, no verdict.
+pub(super) fn final_place_for(
+    flight: &FlightStrip,
+    r: &nav::Runway,
+    landing_end: &str,
+    now: Instant,
+) -> Option<FinalPlace> {
+    let f = LandingFrame::new(r, landing_end)?;
+    let (along_m, cross_m, closing_mps) = {
+        let fixes = flight.own_fixes.lock().unwrap_or_else(|e| e.into_inner());
+        let &(lat, lon, at) = fixes.back()?;
+        if now.saturating_duration_since(at).as_secs_f64() > 3.0 {
+            return None;
+        }
+        let (along, cross) = f.place(lat, lon);
+        let closing = fixes
+            .iter()
+            .rev()
+            .find(|p| at.saturating_duration_since(p.2).as_secs_f64() >= TRACK_MIN_DT_S)
+            .map(|p| {
+                let dt = at.saturating_duration_since(p.2).as_secs_f64();
+                (along - f.place(p.0, p.1).0) / dt
+            });
+        (along, cross, closing)
+    };
+    let elev = ACTIVE_PANEL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|p| p.1);
+    let height_ft = seen(flight)
+        .filter(|s| {
+            now.saturating_duration_since(s.at).as_secs_f64() <= 10.0 && s.alt_ft.is_finite()
+        })
+        .zip(elev)
+        .map(|(s, e)| s.alt_ft - e);
+    Some(FinalPlace {
+        along_m,
+        cross_m,
+        closing_mps,
+        height_ft,
+    })
 }
 
 /// A withheld landing clearance may go out: the strip is clear, or every
@@ -616,7 +786,13 @@ pub(super) fn strip_exits_unnoted(
                         .iter()
                         .map(|p| (p.0, p.1, -now.saturating_duration_since(p.2).as_secs_f64()))
                         .collect();
-                    strip_exit_as(r, landing_end, &track, departing)
+                    strip_exit_as(
+                        r,
+                        landing_end,
+                        &track,
+                        departing,
+                        standing_secs(&t.callsign, now),
+                    )
                 }
                 _ => StripExit::Stays,
             };
@@ -990,6 +1166,63 @@ pub(crate) fn resequence_runway(
         .ok_or("no_other_runway")
 }
 
+/// A stop on the runway turns the field's runway only once it is a BLOCKED
+/// runway: stood this long. The go-around itself sends the arrival round a
+/// circuit, longer than this, so an occupant stopped less is judged gone by
+/// its return (the arrival is held on its runway, the next final report
+/// withheld while the strip is occupied). LEMG 13 (sortie
+/// 1791917103-full_auto, 2026-10-13): EZY6957, standing 1 s at its exit,
+/// turned the field to 12 and split the traffic across two runways.
+pub(super) const RESEQUENCE_STANDING_S: f64 = 60.0;
+
+/// Why the go-around watch re-sequences an arrival to another runway, if
+/// it does: `"standing"` for an occupant stopped [`RESEQUENCE_STANDING_S`]
+/// or more ([`StripExit::Stays`]), `"oncoming"` for traffic using the other
+/// direction, but never while another arrival is cleared to land (or held
+/// for it) on the runway in use (`arrivals_committed`): one aircraft's
+/// direction does not turn the field under the stream. Each occupant is
+/// (how it leaves, seconds standing). Pure.
+pub(crate) fn resequence_why(
+    exits: &[(StripExit, f64)],
+    arrivals_committed: bool,
+) -> Option<&'static str> {
+    if exits
+        .iter()
+        .any(|(e, stood)| *e == StripExit::Stays && *stood >= RESEQUENCE_STANDING_S)
+    {
+        return Some("standing");
+    }
+    if !arrivals_committed && exits.iter().any(|(e, _)| *e == StripExit::Oncoming) {
+        return Some("oncoming");
+    }
+    None
+}
+
+/// Another flight than `me` is cleared to land on `end`, or held for its
+/// landing clearance there: the runway in use has arrivals committed to it.
+pub(super) fn arrivals_committed_to(end: &str, me: &FlightStrip) -> bool {
+    let committed = |s: &FlightStrip| {
+        let cleared = s
+            .clearance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|c| c.state == tower::State::ClearedToLand && c.runway_ident == end);
+        cleared
+            || s.landing_hold
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|h| h.runway_ident == end)
+    };
+    if !me.is_own() && committed(&OWN_STRIP) {
+        return true;
+    }
+    traffic_strips()
+        .iter()
+        .any(|(_, s)| !std::ptr::eq(s.as_ref(), me) && committed(s))
+}
+
 /// The go-around watch's re-sequence: when an occupant of our strip will not
 /// leave on its own clock (standing, or oncoming), pick the runway to offer
 /// ([`resequence_runway`]) and hand it to the FSM sync; else the arrival is
@@ -1002,11 +1235,9 @@ pub(super) fn resequence_after_go_around(
     exits: &[Occupant],
     now: Instant,
 ) -> Option<String> {
-    let oncoming = exits.iter().any(|o| o.exit == StripExit::Oncoming);
-    let standing = exits.iter().any(|o| o.exit == StripExit::Stays);
-    if !oncoming && !standing {
-        return None;
-    }
+    let judged: Vec<(StripExit, f64)> = exits.iter().map(|o| (o.exit, o.standing_s)).collect();
+    let why = resequence_why(&judged, arrivals_committed_to(runway_ident, flight))?;
+    let oncoming = why == "oncoming";
     let runways = ACTIVE_RUNWAYS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1034,7 +1265,7 @@ pub(super) fn resequence_after_go_around(
         "atc",
         serde_json::json!({"event": "resequenced", "from": runway_ident,
             "to": pick.as_ref().ok(), "hold": pick.is_err(),
-            "why": if oncoming { "oncoming" } else { "standing" },
+            "why": why,
             "refused": pick.as_ref().err(), "occupied": occupied,
             "arrival_end": arrival, "departure_end": departure,
             "wind_from": wind.map(|w| w.0.round()),
@@ -1106,6 +1337,15 @@ pub(super) fn landing_hold_tick_for(
     let plain: Vec<StripExit> = exits.iter().map(|e| e.exit).collect();
     if !landing_release_due(own.map(|o| o.1), &plain) {
         return None;
+    }
+    // Released only to a flight ON the final: never one climbing away,
+    // repositioning or past the threshold. The hold waits for its return.
+    if let Some(r) = ours.as_ref() {
+        if let Some(place) = final_place_for(flight, r, &hold.runway_ident, now) {
+            if !on_the_final(place) {
+                return None;
+            }
+        }
     }
     let hold = guard.take()?;
     let (own_nm, own_s) = own_json(own);

@@ -654,6 +654,7 @@ impl UnclearedWatch {
         radio_ft: f64,
         on_ground: bool,
         missed: bool,
+        established: bool,
     ) -> Option<UnclearedStep> {
         if missed {
             // The next approach asks again.
@@ -666,7 +667,13 @@ impl UnclearedWatch {
         if working && radio_ft <= UNCLEARED_GO_AROUND_FT {
             return Some(UnclearedStep::GoAround);
         }
-        if radio_ft <= CLEARANCE_QUERY_FT && !self.asked {
+        // The ask is a FINAL report ("final runway one two, request landing
+        // clearance"): made only ESTABLISHED on the final
+        // (`established_on_final`, the last tick's), never going around,
+        // climbing away or in a reposition pattern. LEMG 12 (sortie
+        // 1791917103-full_auto, 2026-10-13): asked on the first tick of a
+        // re-arm 0.46 nm out, 640 ft above the path, the tick it went round.
+        if radio_ft <= CLEARANCE_QUERY_FT && !self.asked && established {
             self.asked = true;
             return Some(UnclearedStep::Ask);
         }

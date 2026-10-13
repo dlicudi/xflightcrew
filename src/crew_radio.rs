@@ -54,11 +54,25 @@ pub enum Holds {
     },
     /// True while on the ground, for `max_age_s` ("runway vacated").
     OnGround { max_age_s: f64 },
+    /// "Going around" / "missed approach": PRIORITY, it goes out next
+    /// ([`enqueue_as`] puts it at the front), and true for as long as the
+    /// go-around is: never aged out, it dies only on the ground, once a new
+    /// final is established ([`RadioFacts::on_final`]), or once a later
+    /// position report has been made ([`superseded`]). LEMG 13 (sortie
+    /// 1791917103-full_auto, 2026-10-13): queued behind a held exchange, it
+    /// aged out twice at 30 s (42.8 and 39.3 s) and the tower never knew.
+    GoAround,
 }
 
 /// A position report is not made in the flare: the last 100 ft is the
 /// flight model's landing phase.
 pub const REPORT_LANDING_AGL_FT: f64 = crate::flight::LANDING_AGL_FT;
+
+/// A final established within this of a go-around call is the approach the
+/// go-around is leaving (the established flag lags the run's tick), never a
+/// new one: no aircraft climbs out, turns round and re-establishes on a
+/// final in 20 s.
+pub const NEW_FINAL_AFTER_S: f64 = 20.0;
 
 /// One entry in the crew radio queue: the call, what it holds for, and when
 /// it was queued.
@@ -137,6 +151,9 @@ pub struct RadioFacts {
     pub on_ground: Option<bool>,
     pub agl_ft: Option<f64>,
     pub gs_kts: Option<f64>,
+    /// An approach is established on its final (`autoland::
+    /// established_on_final`): a go-around reported before it is over.
+    pub on_final: Option<bool>,
 }
 
 /// What a crew call holds for, from its words. The words are matched per
@@ -192,13 +209,7 @@ pub fn holds_for(call: &CrewCall) -> Holds {
                     before_landing: true,
                 }
             }
-            ("going", "around") | ("missed", "approach") => {
-                return Holds::Airborne {
-                    max_age_s: 30.0,
-                    max_travel_nm: None,
-                    before_landing: false,
-                }
-            }
+            ("going", "around") | ("missed", "approach") => return Holds::GoAround,
             ("inbound", "for") => {
                 return Holds::Airborne {
                     max_age_s: 120.0,
@@ -219,6 +230,15 @@ pub fn holds_for(call: &CrewCall) -> Holds {
 pub fn stale_reason(holds: Holds, age_s: f64, facts: &RadioFacts) -> Option<&'static str> {
     match holds {
         Holds::Always => None,
+        Holds::GoAround => {
+            if facts.on_ground == Some(true) {
+                Some("on_ground")
+            } else if facts.on_final == Some(true) && age_s > NEW_FINAL_AFTER_S {
+                Some("go_around_over")
+            } else {
+                None
+            }
+        }
         Holds::OnGround { max_age_s } => {
             if facts.on_ground == Some(false) {
                 Some("airborne")
@@ -316,12 +336,77 @@ fn enqueue_as(call: CrewCall, readback: Readback) {
         return;
     }
     let holds = holds_for(&call);
-    q.push_back(Queued {
+    let queued = Queued {
         call,
         holds,
         at: std::time::Instant::now(),
         readback,
-    });
+    };
+    // A go-around goes out NEXT: ahead of every report and request queued,
+    // never ahead of an earlier go-around or a READBACK (an instruction
+    // already given is answered first, on the frequency it came on).
+    if holds == Holds::GoAround {
+        let at = q
+            .iter()
+            .rposition(|c| c.holds == Holds::GoAround || c.readback != Readback::No)
+            .map_or(0, |i| i + 1);
+        q.insert(at, queued);
+    } else {
+        q.push_back(queued);
+    }
+}
+
+/// A priority call (a go-around) is queued and not yet drained: the main
+/// loop's waits on the frequency give way to it, so it goes out next.
+pub fn priority_pending() -> bool {
+    CREW_RADIO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|c| c.holds == Holds::GoAround)
+}
+
+/// Which calls of a drained batch another call has made untrue, by index.
+/// A go-around reported and then a later position report (the next
+/// circuit's downwind, a new final): the go-around is over. A position
+/// report made before a go-around in the batch: the position it reports
+/// was left. Pure: each call's holds and when it was queued.
+pub fn superseded(calls: &[(Holds, std::time::Instant)]) -> Vec<bool> {
+    let report = |h: &Holds| {
+        matches!(
+            h,
+            Holds::Airborne {
+                before_landing: true,
+                ..
+            }
+        )
+    };
+    calls
+        .iter()
+        .map(|(h, at)| match h {
+            Holds::GoAround => calls.iter().any(|(o, t)| report(o) && t > at),
+            o if report(o) => calls.iter().any(|(g, t)| *g == Holds::GoAround && t > at),
+            _ => false,
+        })
+        .collect()
+}
+
+/// A controller's reply to a crew call, held while the frequency was busy,
+/// is no longer true once the controller has ordered a go-around since
+/// (`order_since`), or said anything newer to us (`last_to_us`, after
+/// `routed_at`) while no readback is owed (`readback_owed`: a clearance the
+/// tower waits to hear read back is never silently dropped, only an order
+/// voids it): it answered a state that is gone. LEMG 13 (sortie
+/// 1791917103-full_auto, 2026-10-13): "continue approach runway one three,
+/// expect late landing clearance", routed at +673.3, was spoken at +707.1,
+/// 32 s after the tower's own go-around order, as we climbed away. Pure.
+pub fn reply_superseded(
+    routed_at: std::time::Instant,
+    last_to_us: Option<std::time::Instant>,
+    order_since: bool,
+    readback_owed: bool,
+) -> bool {
+    order_since || (!readback_owed && last_to_us.is_some_and(|t| t > routed_at))
 }
 
 /// Queue a radio call for the main loop to transmit. Public so the full-auto
