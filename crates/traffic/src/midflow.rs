@@ -60,8 +60,9 @@ pub const FINAL_GAP_NM: f64 = 4.0;
 pub const TAXI_IN_S: f64 = 8.0 * 60.0;
 
 /// A departure off the blocks this recently is pushing (released now); then
-/// taxiing until [`TAXI_OUT_S`], holding short until [`HOLD_S`], climbing
-/// out until [`CLIMB_S`]; earlier it has gone.
+/// taxiing until [`TAXI_OUT_S`] at most, holding short for
+/// `HOLD_S - TAXI_OUT_S`, climbing out for `CLIMB_S - HOLD_S`; earlier it
+/// has gone ([`out_times`]: the taxi is its own way's).
 pub const PUSH_S: f64 = 2.0 * 60.0;
 pub const TAXI_OUT_S: f64 = 9.0 * 60.0;
 pub const HOLD_S: f64 = 11.0 * 60.0;
@@ -201,6 +202,27 @@ fn taxi_out_way(
     way.extend(plan.path.into_iter().skip_while(|p| dist_m(*p, from) < 1.0));
     (way.len() >= 2).then_some((way, plan.lead_on))
 }
+
+/// A departure's moments after its off-block, seconds: the end of its taxi
+/// (the push, then `way` at its pace; [`TAXI_OUT_S`] at most, and with no
+/// way), its wheels up (a hold and a minute to line up and roll), the end
+/// of its climb out. One rule for the start's placing and the model's
+/// wheels up: LXGB (2026-10-13) flew a departure from its stand to 12 nm
+/// in 6.5 min, and the flat 14 min of the old clocks placed it again,
+/// holding short, at a rebuild 10 min after its off-block.
+pub fn out_times(way: Option<&[LatLon]>, icao_type: &str) -> (f64, f64, f64) {
+    let pace = class_for_type(icao_type).0.taxi_kts.min(12.0) * 0.514 * TAXI_PACE;
+    let taxi_end = way.map_or(TAXI_OUT_S, |w| {
+        let m: f64 = w.windows(2).map(|p| dist_m(p[0], p[1])).sum();
+        (PUSH_S + m / pace.max(1.0)).min(TAXI_OUT_S)
+    });
+    let hold_end = taxi_end + (HOLD_S - TAXI_OUT_S);
+    (taxi_end, hold_end + 60.0, hold_end + (CLIMB_S - HOLD_S))
+}
+
+/// The share of its taxi speed a taxi averages over its way (the turns, the
+/// crossings).
+const TAXI_PACE: f64 = 0.7;
 
 /// The movement of one leg, before its start is decided.
 #[allow(clippy::too_many_arguments)]
@@ -580,11 +602,14 @@ pub fn plan(
         let s = field.stand(&stand).cloned();
         let gone = -etd;
         let way = s.as_ref().and_then(|s| taxi_out_way(field, &end, s));
+        let (taxi_end, up, climb_end) =
+            out_times(way.as_ref().map(|(w, _)| w.as_slice()), r.icao_type);
+        let hold_end = up - 60.0;
         let start = if gone <= PUSH_S {
             None
-        } else if gone <= TAXI_OUT_S {
+        } else if gone <= taxi_end {
             way.as_ref().and_then(|(w, _)| {
-                let frac = ((gone - PUSH_S) / (TAXI_OUT_S - PUSH_S)).clamp(0.2, 0.85);
+                let frac = ((gone - PUSH_S) / (taxi_end - PUSH_S).max(1.0)).clamp(0.2, 0.85);
                 let (pos, ahead) = along(w, frac)?;
                 let me = Mover { pos, ahead };
                 (!field.on_runway(pos) && !near_own(pos) && movers.iter().all(|o| o.clear_of(&me)))
@@ -593,7 +618,7 @@ pub fn plan(
                         Start::TaxiOut { frac }
                     })
             })
-        } else if gone <= HOLD_S && !held_short {
+        } else if gone <= hold_end && !held_short {
             way.as_ref().and_then(|(w, _)| {
                 let pos = *w.last()?;
                 let me = Mover {
@@ -606,11 +631,11 @@ pub fn plan(
                     Start::HoldShort
                 })
             })
-        } else if gone <= CLIMB_S && gone > HOLD_S && !climbing {
+        } else if gone <= climb_end && gone > hold_end && !climbing {
             climbing = true;
             let p = class_for_type(r.icao_type).0;
             Some(Start::Climb {
-                past_end_m: ((gone - HOLD_S - 60.0).max(20.0)) * p.climb_kts * 0.514,
+                past_end_m: ((gone - up).max(20.0)) * p.climb_kts * 0.514,
             })
         } else {
             // Its moment has gone and its way is taken: it pushes now.
@@ -628,9 +653,9 @@ pub fn plan(
                 out.movements.push(m);
             }
             _ => {
-                if gone > HOLD_S {
+                if gone > hold_end {
                     // Long gone and nowhere to put it: off the board's
-                    // aircraft, its flight flown.
+                    // aircraft, its flight flown (the model's, below).
                     if let Some(s) = &s {
                         taken.retain(|p| dist_m(*p, (s.lat, s.lon)) > 0.5);
                     }
@@ -725,13 +750,20 @@ pub fn plan(
         }
         let mut quiet = XorShift64::new(r.seed);
         let mut m = movement(&r, false, 0.0, &runway, field, ctx, &mut quiet);
+        // Its stand only on the board: it stands on none now.
+        let stand = stand_plan.get(&m.callsign).cloned();
+        let way = stand
+            .as_deref()
+            .and_then(|n| field.stand(n))
+            .and_then(|s| taxi_out_way(field, &end, s));
+        let off_s = r.dep.est_s - now_s;
         m.start = Some(Start::Away {
-            off_s: r.dep.est_s - now_s,
+            off_s,
+            up_s: off_s + out_times(way.as_ref().map(|(w, _)| w.as_slice()), r.icao_type).1,
         });
-        m.stand = stand_plan.get(&m.callsign).cloned();
         if let Some(f) = m.flight.as_mut() {
             f.inbound = None;
-            f.stand.clone_from(&m.stand);
+            f.stand = stand;
         }
         out.movements.push(m);
     }

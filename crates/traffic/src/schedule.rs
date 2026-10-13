@@ -184,10 +184,11 @@ pub enum Start {
     HoldShort,
     /// Climbing out, this far past the runway's far end, metres.
     Climb { past_end_m: f64 },
-    /// Off the blocks `off_s` seconds before the start (negative) and gone:
+    /// Off the blocks `off_s` seconds before the start (negative), wheels
+    /// up at `up_s` (its own taxi, [`crate::midflow`]'s moments) and gone:
     /// flown by the whole-flight model to its destination
     /// ([`crate::track`]), never spawned.
-    Away { off_s: f64 },
+    Away { off_s: f64, up_s: f64 },
 }
 
 /// What the world looks like at generation or spawn time.
@@ -780,6 +781,11 @@ pub fn park_at_start(
     let mut order: Vec<&mut Movement> = schedule
         .iter_mut()
         .filter(|m| m.kind == MovementKind::Departure && m.stand.is_some() && m.start.is_none())
+        // Never a rotation's departure whose inbound is still to come: its
+        // airframe is that arrival's (LXGB at 17:48, 2026-10-13: tomorrow's
+        // 11:05 parked on stand 4 seventeen hours early, the board's
+        // "Delayed").
+        .filter(|m| m.flight.as_ref().is_none_or(|f| f.inbound.is_none()))
         .collect();
     order.sort_by(|a, b| a.t_s.total_cmp(&b.t_s));
     for m in order {

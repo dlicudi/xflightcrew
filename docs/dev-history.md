@@ -15292,3 +15292,51 @@ before `places`). The design, its cost and its tests are in
   in the sim beyond 12 nm (TCAS keeps it to 40 nm), on the EFB on to its destination, the card's
   Arrives time on the destination's clock. `traffic` `draw` now carries `modeled`; read it beside
   `api_load` and fps.
+
+## 2026-10-13: the day's past is history at an evening start (LXGB)
+
+The pilot's Board tab at LXGB, 18:23 local after a restart of the app (the world rebuilt at 17:48
+local, zulu 15:48, sim and wall clocks agreeing): six departures 11:05 to 17:25 and six arrivals
+10:20 to 16:45, none Departed or Landed, BA 491 "Delayed"; the blackbox had `parked` BAW491 on stand
+4 and EZY2102 spawned `from: new` for 09 although the run before had flown it (pushed 17:38, `despawn`
+`left_the_area` 17:44:31). Not the whole-flight merge (23914b6); three older rules:
+
+- **The board read tomorrow as today.** The timetable start flies the next 24 h
+  (`TIMETABLE_HORIZON_S`, b76186c) and the board's "HH:MM" wraps: at 17:48 every row was TOMORROW's
+  (BA 491 at 127,288 s, 11:21 tomorrow), today's long gone by the 20 min rule. Now `board::payload`
+  shows the next 12 h and no further (`AHEAD_S`: every "HH:MM" on it names one time, today's or the
+  next morning's), keeps a departure 30 min after it left (`DEPARTED_KEPT_S`, as a FIDS drops it
+  once the gate closes) and an arrival 60 (`LANDED_KEPT_S`, for the people meeting it); statuses
+  unchanged (`Status::of`, and by the clock where no aircraft is seen: past its estimate Departed or
+  Landed). At 17:48 the LXGB board is today's 17:38 U2 2102, Departed.
+- **Tomorrow's departure parked seventeen hours early.** `schedule::park_at_start` parks the
+  earliest departures that have a stand; since every departure carries its planned stand (03c5913)
+  that included a rotation's departure whose inbound is still to come: BA 491, its BA 490 due at
+  10:17 tomorrow. A departure waiting for its inbound is never parked from the start: its airframe
+  is that arrival's.
+- **A departure placed after the simulation would have flown it.** The mid-flow start placed a
+  departure by flat clocks (taxiing to 9 min after its off-block, holding to 11, climbing to 14);
+  LXGB's taxi is 600 m, and the simulation had EZY2102 12 nm out 6.5 min after its push, so a
+  rebuild 10 min after its off-block put it holding short again. Now one rule
+  (`midflow::out_times`): the push, then its own way at 0.7 of its taxi speed (capped by the old 9
+  min), a 2 min hold, a minute to roll, 3 min climbing; past that it is `Start::Away`, flown by the
+  model from its wheels up (`Away { off_s, up_s }`, the same moment; `traffic_whole::from_field`
+  no longer assumes the model's flat `TAXI_OUT_S`). An Away flight stands on no stand (its stand
+  stays on its board line only), so the start's parked fill no longer keeps stands for flights
+  gone hours ago.
+
+Measured against the install (LXGB at zulu 56887.85, seed as live): before, 1 parked (BAW491),
+EZY2102 `HoldShort`, the board 13 rows of tomorrow; after, nothing parked for the timetable,
+EZY2102 `Away` (off 10 min ago, wheels up 3 min ago), the board one row, `D|17:35|17:38|U2 2102|...
+|Departed`. Tests: `an_evening_start_holds_the_days_past_as_history` (LXGB's table on ULMM's apron
+at 18:22: nothing parked for a departure whose inbound is to come, it fails on BAW491 without the
+rule; no departure on the ground past its wheels up; the board by the clock Departed within 30
+min, Landed within 60, nothing beyond 12 h), `a_departure_is_off_the_ground_when_its_own_taxi_says`,
+`the_board_shows_the_next_twelve_hours_and_drops_the_gone`.
+
+- **UNFLOWN.** Restart the app at LXGB in the evening (`XCOPILOT_TRAFFIC=ours`): the Board tab
+  shows no flight of tomorrow's day, today's last ones Departed or Landed until 30 or 60 min past;
+  the blackbox `traffic` `up` then no `parked` for a timetable departure whose arrival is still to
+  come; a departure off its blocks 6 or more minutes before the restart not `spawn`ed but drawn by
+  the model (the EFB map, `draw` `modeled`). At LEMG in the morning the board still fills both
+  halves and the mid-flow start still places taxiing and holding departures (its taxis are long).

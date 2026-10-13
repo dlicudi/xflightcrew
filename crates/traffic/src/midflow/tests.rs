@@ -275,3 +275,124 @@ fn every_flight_on_the_board_has_its_planned_stand() {
         }
     }
 }
+
+/// A world built in the evening (LXGB, 2026-10-13: the traffic rebuilt at
+/// 17:48 local) holds the day's past as history. Gibraltar's own table on
+/// ULMM's apron, 18:22 local on that Tuesday, its 24 h of timetable:
+/// nothing parked for a departure whose inbound is still to come (it parked
+/// tomorrow's 11:05 on stand 4 seventeen hours early); no departure put on
+/// the ground past the moment its own taxi would have flown it, the rest
+/// the model's from their wheels up after their off-block; and the board by
+/// the clock reads every past flight Departed or Landed, keeps it a while,
+/// and shows nothing of tomorrow it could be read as today's.
+#[test]
+fn an_evening_start_holds_the_days_past_as_history() {
+    use crate::board::{payload, Row, Status};
+    let f = ulmm();
+    let t = crate::routes::field_routes("LXGB").expect("Gibraltar's table");
+    let now = 18.0 * 3600.0 + 22.0 * 60.0;
+    let ctx = SpawnCtx {
+        runway: Some("31".into()),
+        ..SpawnCtx::default()
+    };
+    let end = f.end("31").unwrap();
+    let mut away = 0;
+    for seed in 1..6 {
+        let p = plan(
+            &f,
+            t,
+            Density::Normal,
+            seed,
+            Date::ymd(2026, 10, 13),
+            now,
+            24.0 * 3600.0,
+            &ctx,
+        );
+        let mut schedule = p.movements.clone();
+        let _ = crate::schedule::park_at_start(&f, Density::Light, seed, &ctx, &mut schedule);
+        for m in schedule.iter().filter(|m| m.parked_from_start) {
+            let info = m.flight.as_ref().unwrap();
+            assert!(
+                info.inbound.is_none(),
+                "{} waits for its inbound",
+                m.callsign
+            );
+            assert!(
+                m.t_s < 12.0 * 3600.0,
+                "{} parked {} s early",
+                m.callsign,
+                m.t_s
+            );
+        }
+        for m in schedule
+            .iter()
+            .filter(|m| m.kind == MovementKind::Departure)
+        {
+            let est = m.flight.as_ref().and_then(|i| i.est_s).unwrap();
+            let gone = now - est;
+            let way = m
+                .stand
+                .as_deref()
+                .and_then(|n| f.stand(n))
+                .and_then(|s| taxi_out_way(&f, &end, s));
+            let (_, up, climb_end) =
+                out_times(way.as_ref().map(|(w, _)| w.as_slice()), &m.icao_type);
+            match &m.start {
+                Some(Start::Away { off_s, up_s }) => {
+                    away += 1;
+                    assert!(*off_s < 0.0 && up_s > off_s, "{}", m.callsign);
+                    assert!(m.stand.is_none(), "{} gone, on no stand", m.callsign);
+                }
+                Some(Start::Climb { .. }) => assert!(gone <= climb_end, "{}", m.callsign),
+                Some(_) => assert!(gone < up, "{} on the ground past its wheels up", m.callsign),
+                None => assert!(
+                    gone < up,
+                    "{} spawns {gone:.0} s past its off-block",
+                    m.callsign
+                ),
+            }
+        }
+        let rows: Vec<Row> = p
+            .board
+            .iter()
+            .map(|b| Row {
+                flight: b.clone(),
+                status: Status::by_clock(b, now),
+                time_s: b.info.est_s,
+                stand: None,
+            })
+            .collect();
+        let text = payload("LXGB", now, &rows, &[]);
+        let mins = |hhmm: &str| {
+            let (h, m) = hhmm.split_once(':').unwrap();
+            h.parse::<i64>().unwrap() * 60 + m.parse::<i64>().unwrap()
+        };
+        let now_min = (now / 60.0) as i64;
+        for l in text.lines().skip(1) {
+            let c: Vec<&str> = l.split('|').collect();
+            let at = mins(c[2]);
+            match c[8] {
+                "Departed" => assert!((now_min - at).rem_euclid(1440) <= 30, "{l}"),
+                "Landed" => assert!((now_min - at).rem_euclid(1440) <= 60, "{l}"),
+                _ => assert!((at - now_min).rem_euclid(1440) <= 12 * 60, "{l}"),
+            }
+        }
+    }
+    assert!(away > 0, "the day's departures flown by the model");
+}
+
+/// A departure's moments are its own way's: a short taxi is off the
+/// ground minutes before the old flat clocks said, a long one capped by
+/// them.
+#[test]
+fn a_departure_is_off_the_ground_when_its_own_taxi_says() {
+    let short = [(36.15, -5.35), (36.15, -5.343)];
+    let (taxi, up, climb) = out_times(Some(&short), "A320");
+    assert!(
+        taxi < 5.0 * 60.0 && up < 8.0 * 60.0 && climb < 10.0 * 60.0,
+        "{taxi} {up} {climb}"
+    );
+    let long = [(36.15, -5.35), (36.15, -5.25)];
+    assert_eq!(out_times(Some(&long), "A320"), out_times(None, "A320"));
+    assert_eq!(out_times(None, "A320").2, CLIMB_S);
+}
