@@ -257,6 +257,7 @@ fn diagram_ref(icao: &str, f: &Frame) -> DiagramRef {
         lat0: f.lat0,
         lon0: f.lon0,
         runways: Vec::new(),
+        stands: Vec::new(),
     }
 }
 
@@ -468,6 +469,162 @@ fn a_card_reads_like_the_panel() {
     assert_eq!(c('X', 0.0, "off route"), "Off the route");
 }
 
+fn traffic_ac(f: &Frame, id: u32, x: f64, y: f64, on_ground: bool) -> crate::efb::feed::TrafficAc {
+    let t = tick_at(f, x, y, on_ground);
+    crate::efb::feed::TrafficAc {
+        id,
+        callsign: format!("EZY{id}"),
+        spoken: format!("Easy {id}"),
+        airline: "easyJet".into(),
+        icao_type: "A320".into(),
+        from: "EGKK".into(),
+        to: String::new(),
+        phase: if on_ground { "taxiing in" } else { "on final" },
+        stand: Some("21".into()),
+        sched: Some("14:05".into()),
+        est: None,
+        lat: t.lat,
+        lon: t.lon,
+        hdg: 370.0,
+        alt_ft: 1_234.0,
+        on_ground,
+        gs_kts: 141.6,
+    }
+}
+
+/// Our traffic is drawn in the diagram's frame, every field's, only near
+/// the drawn field; the card's words ride with it (an altitude only in the
+/// air, an end nobody knows is no end).
+#[test]
+fn traffic_is_drawn_in_the_frame_near_the_field_with_its_card() {
+    let f = Frame::new(36.675, -4.499);
+    let fields = vec![
+        crate::efb::feed::TrafficField {
+            icao: "LEMG".into(),
+            aircraft: vec![
+                traffic_ac(&f, 1, 120.0, -40.0, true),
+                traffic_ac(&f, 2, 9_000.0, 0.0, false),
+            ],
+            taken: Vec::new(),
+        },
+        crate::efb::feed::TrafficField {
+            icao: "LEGR".into(),
+            aircraft: vec![traffic_ac(&f, 3, 90_000.0, 0.0, false)],
+            taken: Vec::new(),
+        },
+    ];
+    let out = traffic_out(&fields, &f);
+    assert_eq!(
+        out.iter().map(|a| a.id).collect::<Vec<_>>(),
+        vec![1, 2],
+        "the far one is not drawn"
+    );
+    let a = &out[0];
+    assert!(
+        close(a.x, 120.0, 0.2) && close(a.y, -40.0, 0.2),
+        "{} {}",
+        a.x,
+        a.y
+    );
+    assert_eq!(a.hdg, 10.0);
+    assert_eq!(a.alt_ft, None, "on the ground: no altitude");
+    assert_eq!(a.from.as_deref(), Some("EGKK"));
+    assert_eq!(a.to, None);
+    assert_eq!(a.gs_kts, 142.0);
+    assert_eq!(out[1].alt_ft, Some(1_230.0));
+    assert_eq!(out[1].phase, "on final");
+}
+
+/// A stand is free or taken by the traffic world's own holds and our own
+/// aircraft on it; with no world simulating the field nothing is free.
+#[test]
+fn a_stand_is_free_or_taken_and_unknown_without_traffic() {
+    let stands = vec![
+        ("21".to_string(), 100.0, 100.0),
+        ("22".to_string(), 150.0, 100.0),
+        ("23".to_string(), 200.0, 100.0),
+    ];
+    let own = |x: f64, on_ground: bool| Own {
+        x,
+        y: 104.0,
+        heading: 0.0,
+        track: None,
+        gs_kts: 0.0,
+        on_ground,
+    };
+    let none = stand_states("LEMG", &stands, None, None);
+    assert!(
+        !none.known && none.taken.is_empty(),
+        "no world: unknown, never free"
+    );
+    let other = vec![crate::efb::feed::TrafficField {
+        icao: "LEGR".into(),
+        aircraft: Vec::new(),
+        taken: Vec::new(),
+    }];
+    assert!(
+        !stand_states("LEMG", &stands, Some(&other), None).known,
+        "a world that does not simulate this field knows nothing of it"
+    );
+    let world = vec![crate::efb::feed::TrafficField {
+        icao: "LEMG".into(),
+        aircraft: Vec::new(),
+        taken: vec![
+            crate::efb::feed::StandTaken {
+                name: "22".into(),
+                by: "EZY1".into(),
+                how: "taxiing in",
+            },
+            crate::efb::feed::StandTaken {
+                name: "21".into(),
+                by: "EZY2".into(),
+                how: "parked",
+            },
+        ],
+    }];
+    let s = stand_states("lemg", &stands, Some(&world), Some(&own(103.0, true)));
+    assert!(s.known);
+    let by = |n: &str| {
+        s.taken
+            .iter()
+            .find(|t| t.name == n)
+            .map(|t| (t.by.as_str(), t.how))
+    };
+    assert_eq!(
+        by("21"),
+        Some(("us", "our aircraft")),
+        "ours, never listed twice"
+    );
+    assert_eq!(s.taken.iter().filter(|t| t.name == "21").count(), 1);
+    assert_eq!(by("22"), Some(("EZY1", "taxiing in")));
+    assert_eq!(by("23"), None, "free");
+    // Airborne over a stand is on none; with no world, ours is still known.
+    let s = stand_states("LEMG", &stands, Some(&world), Some(&own(103.0, false)));
+    assert_eq!(by_of(&s, "21"), Some("EZY2"));
+    let s = stand_states("LEMG", &stands, None, Some(&own(198.0, true)));
+    assert!(!s.known);
+    assert_eq!(by_of(&s, "23"), Some("us"));
+}
+
+fn by_of<'a>(s: &'a StandsOut, n: &str) -> Option<&'a str> {
+    s.taken.iter().find(|t| t.name == n).map(|t| t.by.as_str())
+}
+
+#[test]
+fn a_traffic_phase_reads_as_a_pilot_says_it() {
+    use traffic::{Leg, Phase as P};
+    assert_eq!(traffic_phase_words(P::Parked, true), "parked");
+    assert_eq!(traffic_phase_words(P::Parked, false), "starting up");
+    assert_eq!(traffic_phase_words(P::HoldShort, false), "holding short");
+    assert_eq!(traffic_phase_words(P::LineUp, false), "lined up");
+    assert_eq!(
+        traffic_phase_words(P::Pattern { leg: Leg::Base }, false),
+        "base"
+    );
+    assert_eq!(traffic_phase_words(P::Final, false), "on final");
+    assert_eq!(traffic_phase_words(P::TaxiIn, false), "taxiing in");
+}
+
 /// The real install's LEMG and EGKK, written as the page fetches them, for
 /// the headless look: `EFB_DIAGRAM_OUT=target/efb cargo test -- --ignored
 /// real_install_diagrams --nocapture`.
@@ -629,6 +786,7 @@ fn real_install_page_states() {
                 lat0: d.ref_lat,
                 lon0: d.ref_lon,
                 runways: runway_ends(&d),
+                stands: stand_points(&d),
             }),
             unavailable: false,
             route: Some(RouteFacts {
@@ -642,6 +800,8 @@ fn real_install_page_states() {
             card,
             cleared_runway: outbound.then(|| rwy.to_string()),
             arrival_runway: None,
+            traffic: None,
+            reposition: None,
         };
         let s = build(&f);
         println!(

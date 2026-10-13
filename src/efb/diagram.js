@@ -56,6 +56,38 @@
       moving: k < 1
     };
   }
+  // Our traffic glides the same way, each by its id (state.airport.traffic).
+  var tr = {};      // id -> { from, to, t0, dur, d }
+  function trNow(s, t) {
+    if (!s) return null;
+    var k = s.dur > 0 ? Math.min(1, (t - s.t0) / s.dur) : 1;
+    return {
+      x: s.from.x + (s.to.x - s.from.x) * k,
+      y: s.from.y + (s.to.y - s.from.y) * k,
+      h: (s.from.h + angDiff(s.from.h, s.to.h) * k + 360) % 360,
+      moving: k < 1
+    };
+  }
+  function updateTraffic(list, t) {
+    var seen = {};
+    (list || []).forEach(function (a) {
+      seen[a.id] = 1;
+      var was = tr[a.id];
+      var to = { x: a.x, y: a.y, h: a.hdg };
+      var cur = trNow(was, t);
+      var from = cur ? { x: cur.x, y: cur.y, h: cur.h } : to;
+      if (Math.hypot(to.x - from.x, to.y - from.y) > 400) from = to;
+      tr[a.id] = { from: from, to: to, t0: t, dur: was ? Math.min(1500, Math.max(300, t - was.t0)) : 0, d: a };
+    });
+    Object.keys(tr).forEach(function (k) { if (!seen[k]) delete tr[k]; });
+  }
+
+  // The card a tap opens: an aircraft of our traffic, or a stand.
+  var sel = null;          // { kind: 'ac', id } or { kind: 'stand', name }
+  var confirming = false;  // the stand card asks before it moves us
+  var popNote = '', popSig = '';
+  var popBox = null, popTitle = null, popSub = null, popRows = null, popAct = null;
+
   // ------------------------------------------------------------ frame
 
   function toScreen(x, y) {
@@ -167,6 +199,22 @@
     '.apt-north svg{width:28px;height:28px}',
     '.apt-status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:var(--muted);font-size:16px;line-height:1.5;pointer-events:none}',
     '.apt-status[hidden]{display:none}',
+    '.apt-pop{position:absolute;left:12px;top:12px;width:min(340px,calc(100% - 24px));max-height:calc(100% - 24px);overflow:auto;display:flex;flex-direction:column;gap:6px;padding:12px 14px;border-radius:12px;background:rgba(13,17,23,0.96);border:1px solid var(--line2);box-shadow:0 6px 24px rgba(0,0,0,0.5);color:var(--text);z-index:2}',
+    '.apt-pop[hidden]{display:none}',
+    '.apt-pop .hd{display:flex;align-items:flex-start;gap:8px}',
+    '.apt-pop .ttl{flex:1 1 auto;min-width:0;font-size:19px;font-weight:700;overflow-wrap:anywhere}',
+    '.apt-pop .x{flex:0 0 auto;width:36px;height:36px;margin:-6px -8px 0 0;border:0;background:none;color:var(--muted);font-size:22px;cursor:pointer;touch-action:manipulation}',
+    '.apt-pop .sub{font-size:14px;color:var(--muted);overflow-wrap:anywhere}',
+    '.apt-pop dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:2px 0 0;font-size:14px}',
+    '.apt-pop dt{color:var(--muted)}',
+    '.apt-pop dd{margin:0;overflow-wrap:anywhere}',
+    '.apt-pop .act{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:4px}',
+    '.apt-pop .act span{flex:1 1 100%;font-size:14px;color:var(--amber)}',
+    '.apt-pop .note{font-size:13px;color:var(--soft)}',
+    '.apt-pop button.go{min-height:44px;padding:0 16px;border-radius:10px;border:1px solid var(--cyan-line);background:var(--cyan-bg);color:var(--cyan);font-size:15px;font-weight:700;cursor:pointer;touch-action:manipulation}',
+    '.apt-pop button.go.warn{border-color:var(--amber);background:var(--amber-bg);color:var(--amber)}',
+    '.apt-pop button.go.plain{border-color:var(--line2);background:none;color:var(--soft);font-weight:400}',
+    '.apt-pop button.go:disabled{opacity:0.4;cursor:default}',
     '@media (max-width:700px){.apt-card .main{font-size:19px}.apt-card .arrow{width:46px;height:46px}.apt-card .arrow svg{width:36px;height:36px}.apt-info{bottom:12px}.apt-north{top:auto;bottom:290px}}',
     '@media (max-height:500px){.apt-card{top:8px;padding:6px 12px 6px 6px;width:min(520px,calc(100% - 76px));left:8px;transform:none}.apt-card .main{font-size:18px}.apt-card .arrow{width:40px;height:40px}.apt-card .arrow svg{width:32px;height:32px}.apt-ctl{bottom:8px;right:8px;gap:6px}.apt-ctl .zoom{display:none}.apt-btn{width:44px;height:44px}.apt-info{bottom:8px;left:8px;padding:6px 10px}.apt-info .s{display:none}.apt-north{top:8px;bottom:auto;right:10px}}'
   ].join('\n');
@@ -246,6 +294,26 @@
     info.appendChild(infoSub);
     info.appendChild(scaleBar);
     root.appendChild(info);
+
+    popBox = el('div', 'apt-pop');
+    popBox.hidden = true;
+    popBox.setAttribute('role', 'dialog');
+    var hd = el('div', 'hd');
+    popTitle = el('div', 'ttl', '');
+    var shut = el('button', 'x', '×');
+    shut.type = 'button';
+    shut.setAttribute('aria-label', 'Close');
+    shut.addEventListener('click', function () { select(null); });
+    hd.appendChild(popTitle);
+    hd.appendChild(shut);
+    popSub = el('div', 'sub', '');
+    popRows = el('dl');
+    popAct = el('div', 'act');
+    popBox.appendChild(hd);
+    popBox.appendChild(popSub);
+    popBox.appendChild(popRows);
+    popBox.appendChild(popAct);
+    root.appendChild(popBox);
 
     var ctlBox = el('div', 'apt-ctl');
     btnFollow = ctl('follow', 'Follow the aircraft', function () {
@@ -378,6 +446,7 @@
           lastTap.t = 0;
         } else {
           lastTap = { t: t, x: p[0], y: p[1] };
+          select(hitAt(p[0], p[1]));
         }
       }
       if (!ids().length) gesture = null;
@@ -395,6 +464,33 @@
     ['gesturestart', 'gesturechange'].forEach(function (n) {
       canvas.addEventListener(n, function (e) { e.preventDefault(); });
     });
+  }
+  // What a tap at screen (sx, sy) lands on: our traffic first (the nearest
+  // within 22 px), then a stand while the stands are drawn (16 px), else
+  // nothing (the card closes).
+  function hitAt(sx, sy) {
+    var t = performance.now(), best = null, bd = 22;
+    Object.keys(tr).forEach(function (k) {
+      var n = trNow(tr[k], t);
+      var p = toScreen(n.x, n.y);
+      var d = Math.hypot(p[0] - sx, p[1] - sy);
+      if (d < bd) { bd = d; best = { kind: 'ac', id: tr[k].d.id }; }
+    });
+    if (best || !geo || view.s <= STAND_SCALE) return best;
+    bd = 16;
+    geo.stands.forEach(function (s) {
+      var p = toScreen(s.x, s.y);
+      var d = Math.hypot(p[0] - sx, p[1] - sy);
+      if (d < bd) { bd = d; best = { kind: 'stand', name: s.name }; }
+    });
+    return best;
+  }
+  function select(s) {
+    var same = sel && s && sel.kind === s.kind && sel.id === s.id && sel.name === s.name;
+    if (!same) { confirming = false; popNote = ''; }
+    sel = s;
+    renderPop();
+    dirty = true;
   }
   function recenter() {
     if (st && st.own) {
@@ -619,16 +715,82 @@
         ctx.fillRect(p[0] - 3, p[1] - 3, 6, 6);
       });
     }
-    // Stands: dots, then names when close.
-    if (view.s > 0.3) {
+    // Stand names when close (the markers are drawn under the aircraft).
+    if (view.s > 1.1) {
       geo.stands.forEach(function (s) {
         var p = toScreen(s.x, s.y);
-        if (p[0] < -10 || p[1] < -10 || p[0] > W + 10 || p[1] > H + 10) return;
-        ctx.fillStyle = C.stand;
-        ctx.beginPath(); ctx.arc(p[0], p[1], 2.5, 0, Math.PI * 2); ctx.fill();
-        if (view.s > 1.1 && s.name) tag(p[0], p[1] + 11, s.name, { size: 11, color: C.muted });
+        if (!s.name || p[0] < -10 || p[1] < -10 || p[0] > W + 10 || p[1] > H + 10) return;
+        tag(p[0], p[1] + 12, s.name, { size: 11, color: C.muted });
       });
     }
+    // Our traffic's callsigns: always in the air, on the ground when close.
+    var t = performance.now();
+    Object.keys(tr).forEach(function (k) {
+      var a = tr[k].d, n = trNow(tr[k], t);
+      if (a.on_ground && view.s <= 0.5) return;
+      var p = toScreen(n.x, n.y);
+      tag(p[0], p[1] + 16, a.callsign, { size: 11, bold: true, color: C.violet, bg: 'rgba(7,9,12,0.75)' });
+    });
+  }
+
+  // A stand's state from the page state: 'ours', 'taken', 'free', or
+  // 'unknown' while no traffic world simulates the field (never free).
+  function standState(name) {
+    var s = st && st.stands;
+    var hit = s && (s.taken || []).filter(function (x) { return x.name === name; })[0];
+    if (hit) return { state: hit.by === 'us' ? 'ours' : 'taken', by: hit.by, how: hit.how };
+    return { state: s && s.known ? 'free' : 'unknown' };
+  }
+  var STAND_SCALE = 0.25;
+  function drawStands() {
+    if (view.s <= STAND_SCALE) return;
+    screenTransform();
+    var col = { free: C.green, taken: C.red, ours: '#FFFFFF', unknown: C.stand };
+    var r = view.s > 1.1 ? 5 : 3.5;
+    geo.stands.forEach(function (s) {
+      var p = toScreen(s.x, s.y);
+      if (p[0] < -10 || p[1] < -10 || p[0] > W + 10 || p[1] > H + 10) return;
+      var k = standState(s.name).state;
+      ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, Math.PI * 2);
+      ctx.fillStyle = col[k];
+      ctx.fill();
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
+      if (sel && sel.kind === 'stand' && sel.name === s.name) {
+        ctx.beginPath(); ctx.arc(p[0], p[1], r + 6, 0, Math.PI * 2);
+        ctx.strokeStyle = C.cyan; ctx.lineWidth = 2.5; ctx.stroke();
+      }
+    });
+  }
+
+  // Our traffic: an airliner's plan form, violet, smaller than our own white
+  // chevron, nose along its heading.
+  function drawTraffic(t) {
+    screenTransform();
+    Object.keys(tr).forEach(function (k) {
+      var a = tr[k].d, n = trNow(tr[k], t);
+      var p = toScreen(n.x, n.y);
+      if (p[0] < -30 || p[1] < -30 || p[0] > W + 30 || p[1] > H + 30) return;
+      var z = view.s > 1.1 ? 1.25 : 1;
+      ctx.save();
+      ctx.translate(p[0], p[1]);
+      ctx.rotate((n.h * Math.PI / 180) - view.rot);
+      ctx.scale(z, z);
+      ctx.beginPath();
+      ctx.moveTo(0, -11); ctx.lineTo(1.6, -7); ctx.lineTo(1.6, -2); ctx.lineTo(10, 3); ctx.lineTo(10, 5);
+      ctx.lineTo(1.6, 2.5); ctx.lineTo(1.3, 7); ctx.lineTo(4, 9); ctx.lineTo(4, 10.5); ctx.lineTo(0, 9.5);
+      ctx.lineTo(-4, 10.5); ctx.lineTo(-4, 9); ctx.lineTo(-1.3, 7); ctx.lineTo(-1.6, 2.5); ctx.lineTo(-10, 5);
+      ctx.lineTo(-10, 3); ctx.lineTo(-1.6, -2); ctx.lineTo(-1.6, -7);
+      ctx.closePath();
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.fillStyle = a.on_ground ? '#9C8CD8' : C.violet;
+      ctx.fill();
+      ctx.restore();
+      if (sel && sel.kind === 'ac' && sel.id === a.id) {
+        ctx.beginPath(); ctx.arc(p[0], p[1], 16 * z, 0, Math.PI * 2);
+        ctx.strokeStyle = C.cyan; ctx.lineWidth = 2.5; ctx.stroke();
+      }
+    });
   }
 
   function drawOwn(o) {
@@ -668,7 +830,7 @@
   // claimed before any label is placed.
   function overlayRects() {
     var out = [], base = root.getBoundingClientRect();
-    root.querySelectorAll('.apt-card, .apt-info, .apt-ctl, .apt-north').forEach(function (e) {
+    root.querySelectorAll('.apt-card, .apt-info, .apt-ctl, .apt-north, .apt-pop').forEach(function (e) {
       if (e.hidden || e.offsetParent === null) return;
       var r = e.getBoundingClientRect();
       if (!r.width) return;
@@ -682,6 +844,7 @@
     if (!root || !W || !H || !root.offsetParent) return;
     var o = ownNow(t);
     var moving = o && o.moving;
+    Object.keys(tr).forEach(function (k) { if (trNow(tr[k], t).moving) moving = true; });
     var fb = fieldBounds();
     if (follow && o && st && st.own && !st.own.on_ground && fb) {
       // Airborne on the approach: the field and the aircraft together,
@@ -706,6 +869,8 @@
     if (geo) {
       drawGeometry();
       drawRoute();
+      drawStands();
+      drawTraffic(t);
       drawOwn(o);
       drawLabels();
       niceScale();
@@ -753,6 +918,95 @@
     bits.push(distWords(c.remaining_m) + ' to go');
     if (st.route && st.route.via) bits.push('via ' + st.route.via);
     cardSub.textContent = bits.join(', ');
+  }
+
+  // ------------------------------------------------------------ the tap card
+
+  var KIND = { gate: 'Gate', tie_down: 'Tie down', hangar: 'Hangar', misc: 'Other' };
+  function clearEl(e) { while (e.firstChild) e.removeChild(e.firstChild); }
+  function row(dt, dd) {
+    if (dd === null || dd === undefined || dd === '') return;
+    popRows.appendChild(el('dt', null, dt));
+    popRows.appendChild(el('dd', null, String(dd)));
+  }
+  function button(text, cls, onClick, disabled) {
+    var b = el('button', 'go' + (cls ? ' ' + cls : ''), text);
+    b.type = 'button';
+    b.disabled = !!disabled;
+    b.addEventListener('click', function (e) { e.stopPropagation(); onClick(); });
+    popAct.appendChild(b);
+    return b;
+  }
+  function standWords(name) { return /^\d/.test(name) ? 'Stand ' + name : name; }
+  function renderPop() {
+    if (!popBox) return;
+    var a = sel && sel.kind === 'ac' && tr[sel.id] ? tr[sel.id].d : null;
+    var s = null;
+    if (sel && sel.kind === 'stand' && geo && st && geo.icao === st.icao) {
+      s = geo.stands.filter(function (x) { return x.name === sel.name; })[0] || null;
+    }
+    if (!a && !s) { popBox.hidden = true; popSig = ''; if (sel && sel.kind === 'ac') sel = null; return; }
+    // Rebuilt only when what it says changed: a button rebuilt under a
+    // finger would lose its tap.
+    var sig = JSON.stringify(a ? [a.callsign, a.phase, a.stand, a.alt_ft, a.gs_kts, a.est]
+      : [s.name, standState(s.name), confirming, popNote, st.reposition]);
+    if (sig === popSig && !popBox.hidden) return;
+    popSig = sig;
+    popBox.hidden = false;
+    clearEl(popRows);
+    clearEl(popAct);
+    if (a) {
+      popTitle.textContent = a.callsign;
+      popSub.textContent = [a.airline, a.spoken && a.spoken !== a.callsign ? '"' + a.spoken + '"' : ''].filter(Boolean).join(', ');
+      row('Type', a.icao_type);
+      row('Route', (a.from || '?') + ' to ' + (a.to || '?'));
+      row('Doing', a.phase);
+      row('Stand', a.stand);
+      row('Slot', a.sched ? a.sched + (a.est && a.est !== a.sched ? ', expected ' + a.est : '') : null);
+      row('Altitude', a.alt_ft !== null && a.alt_ft !== undefined ? Math.round(a.alt_ft).toLocaleString('en-GB') + ' ft' : null);
+      row('Speed', a.gs_kts > 1 ? a.gs_kts + ' kt' : null);
+      return;
+    }
+    var ss = standState(s.name);
+    popTitle.textContent = standWords(s.name);
+    popSub.textContent = st.icao + (st.name ? ' ' + st.name : '');
+    row('Kind', KIND[s.kind] || s.kind);
+    row('Takes', s.accepts && s.accepts.length ? s.accepts.join(', ') : 'any type');
+    row('Size', s.size ? 'up to code ' + s.size : null);
+    row('Status', ss.state === 'free' ? 'Free'
+      : ss.state === 'ours' ? 'Our aircraft is on it'
+      : ss.state === 'taken' ? 'Taken: ' + ss.by + ', ' + ss.how
+      : 'Not known (no traffic of ours here)');
+    var mv = st.reposition;
+    if (mv && mv.stand === s.name) popAct.appendChild(el('div', 'note', mv.text));
+    else if (popNote) popAct.appendChild(el('div', 'note', popNote));
+    var taken = ss.state === 'taken' || ss.state === 'ours';
+    if (confirming && !taken) {
+      popAct.appendChild(el('span', null, 'Move to ' + standWords(s.name) + '? The flight reloads.'));
+      button('Move', 'warn', function () { moveTo(s.name); });
+      button('Cancel', 'plain', function () { confirming = false; renderPop(); });
+    } else {
+      button('Move here', '', function () { confirming = true; popNote = ''; renderPop(); }, taken);
+    }
+  }
+  // "Move here" is sim management: its own endpoint, never a spoken line.
+  function moveTo(name) {
+    confirming = false;
+    popNote = 'Asking...';
+    renderPop();
+    var url = '/reposition' + (token ? '?t=' + encodeURIComponent(token) : '');
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-EFB-Token': token },
+      credentials: 'same-origin',
+      body: JSON.stringify({ icao: geo.icao, stand: name })
+    }).then(function (r) {
+      popNote = r.status === 202 ? 'Asked. The copilot checks the move, then the flight reloads.'
+        : r.status === 429 ? 'One move at a time. Try again in a moment.'
+        : r.status === 403 ? 'Refused: the link token is wrong.'
+        : 'Not sent (' + r.status + ').';
+      renderPop();
+    }).catch(function () { popNote = 'Not sent: xfc unreachable.'; renderPop(); });
   }
 
   // ------------------------------------------------------------ state
@@ -825,8 +1079,10 @@
     } else {
       own = null;
     }
+    updateTraffic(a && geo && a.icao === geo.icao ? a.traffic : [], t);
     renderInfo();
     renderCard();
+    renderPop();
     dirty = true;
   }
 

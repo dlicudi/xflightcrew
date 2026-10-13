@@ -8,7 +8,10 @@
 //!   typed line (`pollers::queue_command`, blackbox `typed` `taken`, source
 //!   `efb`): the grammar picks the tool, its gates and readback included. A
 //!   button can never do what the voice cannot ([`state::PHRASES`], pinned
-//!   to the routing the loop does).
+//!   to the routing the loop does). Sim management is the one other door:
+//!   the Map tab's "Move here" calls the owning tool's gated function
+//!   (`tools::setup::reposition_to_stand`) through its own endpoint
+//!   (`/reposition`), never a raw dataref write and never an invented phrase.
 //! - **No new sim reads.** The page is built from what the app already holds
 //!   (`gather`: the flight model, the owners, the shelf's plan, the follower,
 //!   the party line, the voice's last controller line, the monitor's tick as
@@ -167,6 +170,7 @@ pub(crate) struct Server {
     last_say: Mutex<Option<Instant>>,
     last_setting: Mutex<Option<Instant>>,
     last_ptt: Mutex<Option<Instant>>,
+    last_reposition: Mutex<Option<Instant>>,
     sent: Mutex<Option<(f64, String)>>,
     metar: Mutex<MetarCache>,
 }
@@ -179,6 +183,7 @@ impl Server {
             last_say: Mutex::new(None),
             last_setting: Mutex::new(None),
             last_ptt: Mutex::new(None),
+            last_reposition: Mutex::new(None),
             sent: Mutex::new(None),
             metar: Mutex::new(MetarCache::default()),
         })
@@ -541,6 +546,8 @@ fn airport_facts() -> airport::AirportFacts {
         card: feed::turn_card(),
         cleared_runway: crate::party_line::clearance_runway(),
         arrival_runway: crate::full_auto::arrival_runway(),
+        traffic: feed::traffic(),
+        reposition: feed::reposition(),
     }
 }
 
@@ -1047,6 +1054,111 @@ async fn ptt_route(
     Json(serde_json::json!({ "held": held })).into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct RepositionBody {
+    /// The field the diagram draws.
+    icao: String,
+    /// The stand's apt.dat name, as the diagram drew it.
+    stand: String,
+}
+
+/// One move per this long, at most (a double tap on "Move here"): the move
+/// reloads the flight, and its own gate refuses a second under way.
+pub(crate) const REPOSITION_MIN_GAP: Duration = Duration::from_secs(3);
+
+/// A move asked from the page, cleaned: an ICAO-like field (letters and
+/// digits, 3 to 7) and a stand name (one line, 1 to 64 characters, no
+/// control character). Pure.
+pub(crate) fn reposition_request(icao: &str, stand: &str) -> Result<(String, String), &'static str> {
+    let icao = icao.trim().to_ascii_uppercase();
+    if !(3..=7).contains(&icao.len()) || !icao.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("no such field");
+    }
+    let stand = stand.trim();
+    if stand.is_empty() || stand.chars().count() > 64 || stand.chars().any(char::is_control) {
+        return Err("no such stand");
+    }
+    Ok((icao, stand.to_string()))
+}
+
+/// "Move here" on the Map tab's stand card (2026-10-13): SIM MANAGEMENT,
+/// not a crew action, so not pilot English on `/say` and no phrase in the
+/// grammar. The owning tool's gated function does the work
+/// (`tools::setup::reposition_to_stand`: every gate, the ramp start through
+/// the plugin's mailbox, the readback); this answers "accepted" at once and
+/// runs it on its own thread and runtime (the load takes tens of seconds),
+/// the outcome to the page through `feed::note_reposition` and, once the
+/// flight has moved or failed to, said on the intercom as a status line.
+async fn reposition_route(
+    State(server): State<Arc<Server>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+    body: Option<Json<RepositionBody>>,
+) -> Response {
+    if !authorised(&live_token(), &headers, q.t.as_deref()) {
+        return refuse(peer, "/reposition");
+    }
+    let Some(Json(body)) = body else {
+        return (StatusCode::BAD_REQUEST, "expected {\"icao\": ..., \"stand\": ...}").into_response();
+    };
+    let (icao, stand) = match reposition_request(&body.icao, &body.stand) {
+        Ok(x) => x,
+        Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
+    };
+    {
+        let mut last = server
+            .last_reposition
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < REPOSITION_MIN_GAP) {
+            return (StatusCode::TOO_MANY_REQUESTS, "one move at a time").into_response();
+        }
+        *last = Some(Instant::now());
+    }
+    tracing::info!(%icao, %stand, "EFB move to a stand");
+    crate::blackbox::record(
+        "efb",
+        serde_json::json!({ "event": "reposition", "icao": icao, "stand": stand, "outcome": "asked" }),
+    );
+    feed::note_reposition(&stand, "asked", "Checking the move.");
+    let voice = server.voice.clone();
+    let (base, apt) = {
+        let live = crate::settings::live();
+        (live.xplane_base_url.clone(), live.apt_data_path.clone())
+    };
+    let (job_icao, job_stand) = (icao.clone(), stand.clone());
+    crate::tools::setup::spawn_off_loop(async move {
+        use crate::tools::setup::MoveOutcome;
+        let xp = crate::xplane::XPlaneClient::new(base);
+        let started = |line: &str| feed::note_reposition(&job_stand, "moving", line);
+        let out = crate::tools::setup::reposition_to_stand(&xp, &apt, &job_icao, &job_stand, &started)
+            .await;
+        let (state, text, said) = match out {
+            MoveOutcome::Done(t) => ("done", t, true),
+            MoveOutcome::Failed(t) => ("failed", t, true),
+            MoveOutcome::Refused(t) => ("refused", t, false),
+        };
+        tracing::info!(icao = %job_icao, stand = %job_stand, state, %text, "EFB move to a stand");
+        crate::blackbox::record(
+            "efb",
+            serde_json::json!({ "event": "reposition", "icao": job_icao, "stand": job_stand,
+                                "outcome": state, "text": text }),
+        );
+        feed::note_reposition(&job_stand, state, &text);
+        if said {
+            if let Some(v) = &voice {
+                v.alert(crate::voice::Priority::Advisory, text);
+            }
+        }
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "accepted": true, "icao": icao, "stand": stand })),
+    )
+        .into_response()
+}
+
 /// The routes, on a server.
 pub(crate) fn router(server: Arc<Server>) -> Router {
     Router::new()
@@ -1056,6 +1168,7 @@ pub(crate) fn router(server: Arc<Server>) -> Router {
         .route("/say", post(say))
         .route("/setting", post(setting))
         .route("/ptt", post(ptt_route))
+        .route("/reposition", post(reposition_route))
         .route("/airport", get(airport_route))
         .route("/basemap", get(basemap_route))
         .route("/diagram.js", get(diagram_js))
@@ -1190,6 +1303,29 @@ pub fn serving_url() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_move_names_a_field_and_a_stand() {
+        assert_eq!(
+            reposition_request(" lemg ", " Gate 21 "),
+            Ok(("LEMG".into(), "Gate 21".into()))
+        );
+        assert_eq!(reposition_request("LE", "21"), Err("no such field"));
+        assert_eq!(reposition_request("LE MG", "21"), Err("no such field"));
+        assert_eq!(reposition_request("LEMG", ""), Err("no such stand"));
+        assert_eq!(reposition_request("LEMG", "2\n1"), Err("no such stand"));
+        assert_eq!(reposition_request("LEMG", &"9".repeat(65)), Err("no such stand"));
+    }
+
+    /// The move is sim management: no phrase for it anywhere the grammar or
+    /// the buttons read, so no spoken line can ever start one.
+    #[test]
+    fn no_phrase_moves_the_aircraft_to_a_stand() {
+        for p in state::PHRASES {
+            let w = format!("{} {}", p.label, p.words).to_ascii_lowercase();
+            assert!(!w.contains("move") && !w.contains("reposition"), "{w}");
+        }
+    }
 
     #[test]
     fn tokens_are_fresh_and_well_formed() {
@@ -1404,6 +1540,31 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(r.status(), 403, "no token, no setting");
+            // A move to a stand: its own door, token-checked and judged
+            // before anything runs (a good one is not sent here: it would
+            // reach for the sim).
+            let r = http
+                .post(format!("{base}/reposition"))
+                .json(&serde_json::json!({ "icao": "LEMG", "stand": "24" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403, "no token, no move");
+            let r = http
+                .post(format!("{base}/reposition?t=testtoken0123456"))
+                .json(&serde_json::json!({ "icao": "LEMG", "stand": "  " }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 400, "no stand, no move");
+            let r = http
+                .get(format!("{base}/state?t=testtoken0123456"))
+                .send()
+                .await
+                .unwrap();
+            let v: serde_json::Value = r.json().await.unwrap();
+            assert_eq!(v["airport"]["stands"]["known"], false, "no traffic: unknown");
+            assert!(v["airport"]["traffic"].is_array());
             // Push to talk: refused while this run does not capture on it,
             // a release always taken.
             let ptt_post = |action: &str| {

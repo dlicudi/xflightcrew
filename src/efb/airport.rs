@@ -214,6 +214,12 @@ pub(crate) struct StandGeo {
     pub(crate) hdg: f64,
     /// apt.dat location type: gate, hangar, tie_down, misc.
     pub(crate) kind: String,
+    /// The categories it takes (1300: heavy, jets, turboprops, props,
+    /// helos, fighters); empty where the file says "all".
+    pub(crate) accepts: Vec<String>,
+    /// The biggest aircraft it takes as its ICAO size letter (1301), when
+    /// the file gives one.
+    pub(crate) size: Option<char>,
 }
 
 /// Where each layer came from, said on the page.
@@ -455,6 +461,8 @@ pub(crate) fn build_diagram(
                     y: r1(y),
                     hdg: r1(s.heading.rem_euclid(360.0)),
                     kind: s.kind.clone(),
+                    accepts: s.accepts.clone(),
+                    size: s.width,
                 }
             })
             .collect();
@@ -508,6 +516,17 @@ pub(crate) struct DiagramRef {
     /// Every runway end of the field, as drawn (the Flight tab's available
     /// length and the wind's components).
     pub(crate) runways: Vec<RunwayEnd>,
+    /// Every stand of the field by its apt.dat name, east and north metres:
+    /// the stand our own aircraft stands on is taken.
+    pub(crate) stands: Vec<(String, f64, f64)>,
+}
+
+/// Every stand of a diagram, named, in its frame. Pure.
+pub(crate) fn stand_points(d: &Diagram) -> Vec<(String, f64, f64)> {
+    d.stands
+        .iter()
+        .map(|s| (s.name.clone(), s.x, s.y))
+        .collect()
 }
 
 /// One runway end of a drawn field: its ident, the strip's length and the
@@ -619,6 +638,7 @@ fn store(icao: &str, built: Option<Diagram>) {
                 lat0: d.ref_lat,
                 lon0: d.ref_lon,
                 runways: runway_ends(&d),
+                stands: stand_points(&d),
             };
             let json = serde_json::to_string(&d).unwrap_or_default();
             c.ready.retain(|r| r.reference.icao != icao);
@@ -742,6 +762,11 @@ pub(crate) struct AirportFacts {
     pub(crate) cleared_runway: Option<String>,
     /// Full auto's arrival runway (`full_auto::arrival_runway`).
     pub(crate) arrival_runway: Option<String>,
+    /// Our traffic world's fields as last tapped (`feed::traffic`); `None`:
+    /// no world ticking, so every stand is unknown.
+    pub(crate) traffic: Option<Vec<crate::efb::feed::TrafficField>>,
+    /// The last "Move here" and how it went (`feed::reposition`).
+    pub(crate) reposition: Option<crate::efb::feed::Reposition>,
 }
 
 // ---------------------------------------------------------------- choice
@@ -912,6 +937,165 @@ pub(crate) struct AirportOut {
     pub(crate) route: Option<RouteOut>,
     pub(crate) card: Option<CardOut>,
     pub(crate) runway: Option<RunwayMark>,
+    /// Our traffic on the drawn field and round it ([`traffic_out`]).
+    pub(crate) traffic: Vec<TrafficOut>,
+    /// The drawn field's stands, free or taken ([`stand_states`]).
+    pub(crate) stands: StandsOut,
+    /// The last "Move here", for the page's toast.
+    pub(crate) reposition: Option<crate::efb::feed::Reposition>,
+}
+
+/// One traffic aircraft on the diagram, with its card's words.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct TrafficOut {
+    pub(crate) id: u32,
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    /// Degrees true.
+    pub(crate) hdg: f64,
+    pub(crate) on_ground: bool,
+    pub(crate) callsign: String,
+    pub(crate) spoken: String,
+    pub(crate) airline: String,
+    pub(crate) icao_type: String,
+    pub(crate) from: Option<String>,
+    pub(crate) to: Option<String>,
+    pub(crate) phase: &'static str,
+    pub(crate) stand: Option<String>,
+    pub(crate) sched: Option<String>,
+    pub(crate) est: Option<String>,
+    /// Feet, only in the air.
+    pub(crate) alt_ft: Option<f64>,
+    pub(crate) gs_kts: f64,
+}
+
+/// A stand somebody holds.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct StandOut {
+    pub(crate) name: String,
+    /// A callsign, or "us".
+    pub(crate) by: String,
+    /// "parked", "taxiing in", "due", or "our aircraft".
+    pub(crate) how: &'static str,
+}
+
+/// The drawn field's stands: `known` only while our traffic world
+/// simulates the field (else unknown, never free); every stand not in
+/// `taken` is then free.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub(crate) struct StandsOut {
+    pub(crate) known: bool,
+    pub(crate) taken: Vec<StandOut>,
+}
+
+/// A traffic aircraft's phase as a pilot would say it. Pure.
+pub(crate) fn traffic_phase_words(p: traffic::Phase, dormant: bool) -> &'static str {
+    use traffic::{Leg, Phase as P};
+    match p {
+        P::Parked if dormant => "parked",
+        P::Parked => "starting up",
+        P::TaxiOut => "taxiing out",
+        P::HoldShort => "holding short",
+        P::LineUp => "lined up",
+        P::Roll => "taking off",
+        P::Climb => "climbing out",
+        P::Leave => "departing",
+        P::Arrive => "inbound",
+        P::Pattern { leg: Leg::Downwind } => "downwind",
+        P::Pattern { leg: Leg::Base } => "base",
+        P::Pattern {
+            leg: Leg::Crosswind,
+        } => "crosswind",
+        P::Pattern { leg: Leg::Upwind } => "upwind",
+        P::Pattern { .. } => "in the circuit",
+        P::Final => "on final",
+        P::Landing => "landing",
+        P::Vacate => "vacating",
+        P::TaxiIn => "taxiing in",
+        P::GoAround => "going around",
+        P::Gone => "gone",
+    }
+}
+
+/// Our traffic within [`OWN_MAX_M`] of the drawn field, every simulated
+/// field's (a neighbour's arrivals fly past), in its frame. Pure.
+pub(crate) fn traffic_out(
+    fields: &[crate::efb::feed::TrafficField],
+    frame: &Frame,
+) -> Vec<TrafficOut> {
+    let some = |s: &str| (!s.trim().is_empty()).then(|| s.to_string());
+    fields
+        .iter()
+        .flat_map(|f| f.aircraft.iter())
+        .filter_map(|a| {
+            let (x, y) = frame.xy(a.lat, a.lon);
+            (x.hypot(y) <= OWN_MAX_M).then(|| TrafficOut {
+                id: a.id,
+                x: r1(x),
+                y: r1(y),
+                hdg: r1(a.hdg.rem_euclid(360.0)),
+                on_ground: a.on_ground,
+                callsign: a.callsign.clone(),
+                spoken: a.spoken.clone(),
+                airline: a.airline.clone(),
+                icao_type: a.icao_type.clone(),
+                from: some(&a.from),
+                to: some(&a.to),
+                phase: a.phase,
+                stand: a.stand.clone(),
+                sched: a.sched.clone(),
+                est: a.est.clone(),
+                alt_ft: (!a.on_ground).then(|| (a.alt_ft / 10.0).round() * 10.0),
+                gs_kts: a.gs_kts.round(),
+            })
+        })
+        .collect()
+}
+
+/// Free or taken, for the drawn field's stands: our own aircraft on the
+/// ground within [`traffic::field::STAND_TAKEN_M`] of a stand takes it
+/// (whatever the traffic); our traffic's holds are the fleet's own
+/// ([`traffic::fleet::Fleet::stand_holder`], tapped). With no world
+/// simulating this field nothing is known free. Pure.
+pub(crate) fn stand_states(
+    icao: &str,
+    stands: &[(String, f64, f64)],
+    traffic: Option<&[crate::efb::feed::TrafficField]>,
+    own: Option<&Own>,
+) -> StandsOut {
+    let field = traffic.and_then(|t| t.iter().find(|f| f.icao.eq_ignore_ascii_case(icao)));
+    let mine = own.filter(|o| o.on_ground).and_then(|o| {
+        stands
+            .iter()
+            .map(|(n, x, y)| (n, (x - o.x).hypot(y - o.y)))
+            .filter(|(_, d)| *d < traffic::field::STAND_TAKEN_M)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(n, _)| n.clone())
+    });
+    let mut taken: Vec<StandOut> = mine
+        .iter()
+        .map(|n| StandOut {
+            name: n.clone(),
+            by: "us".into(),
+            how: "our aircraft",
+        })
+        .collect();
+    if let Some(f) = field {
+        taken.extend(
+            f.taken
+                .iter()
+                .filter(|t| mine.as_deref() != Some(t.name.as_str()))
+                .map(|t| StandOut {
+                    name: t.name.clone(),
+                    by: t.by.clone(),
+                    how: t.how,
+                }),
+        );
+    }
+    StandsOut {
+        known: field.is_some(),
+        taken,
+    }
 }
 
 /// A polyline cut where the aircraft projects onto it: (driven, remaining,
@@ -1033,6 +1217,9 @@ pub(crate) fn page(
         route: None,
         card: None,
         runway: None,
+        traffic: Vec::new(),
+        stands: StandsOut::default(),
+        reposition: a.reposition.clone(),
     };
     let Some(choice) = choice else {
         return out;
@@ -1062,6 +1249,12 @@ pub(crate) fn page(
             });
         }
     }
+    out.traffic = a
+        .traffic
+        .as_deref()
+        .map(|t| traffic_out(t, &frame))
+        .unwrap_or_default();
+    out.stands = stand_states(&d.icao, &d.stands, a.traffic.as_deref(), out.own.as_ref());
     let own_at = out.own.as_ref().map(|o| (o.x, o.y));
     out.route = a.route.as_ref().and_then(|r| route_out(r, &frame, own_at));
     if out.route.is_some() {

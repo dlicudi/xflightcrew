@@ -1499,6 +1499,7 @@ mod tests {
                 length_m: 3_159.0,
                 heading_true: 257.8,
             }],
+            stands: Vec::new(),
         });
         let a = crate::efb::airport::page(&f.airport, f.tick.as_ref(), f.plan.as_ref(), true);
         let out = build(&f, &a);

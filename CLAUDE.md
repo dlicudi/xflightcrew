@@ -717,7 +717,14 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
 - **No new actuation path**: a button or the typed box POSTs pilot English (`/say`) onto the
   command channel exactly like the panel's typed line (`pollers::queue_command`, blackbox `typed`
   `taken` `source: efb`); the grammar picks the tool, gates and readback included. Phrases live in
-  `efb::state::PHRASES`, each pinned to its route (`every_button_routes_where_it_says`).
+  `efb::state::PHRASES`, each pinned to its route (`every_button_routes_where_it_says`). That is
+  for CREW actions; SIM MANAGEMENT (the Map tab's "Move here" to a stand) calls the owning tool's
+  gated function directly through its own endpoint (`POST /reposition` ->
+  `tools::setup::reposition_to_stand`: its gates, the mailbox, the readback), never a raw dataref
+  write and never via an invented phrase (`no_phrase_moves_the_aircraft_to_a_stand`).
+- **The Map tab's traffic and stands are the traffic world's** (`TrafficWorld::note_efb_traffic`,
+  1 s while serving): free or taken is the fleet's own `Fleet::stand_holder`, plus our aircraft on
+  one; no world simulating the field is UNKNOWN, never free (`airport::stand_states`).
 - **No new sim reads**: the page is ONE pure `state::build` over `Facts` gathered from what the app
   holds (flight model, owners, the shelf's plan, the follower, the party line, the voice's last
   controller line, the METAR file); `efb::feed` taps the speakers, the command loop and the monitor's
