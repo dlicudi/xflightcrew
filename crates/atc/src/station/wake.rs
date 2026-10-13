@@ -227,35 +227,6 @@ pub fn wake_note_targets(targets: &[TcasTarget], now: Instant) {
 /// Seconds of wake separation still to run behind the last departure from
 /// THIS strip (end ident). `None` = clock expired, other strip, or no
 /// departure seen.
-/// [`wake_remaining`] as one flight's departure reads it: a TRAFFIC flight
-/// also waits out OUR liftoff off the strip or its twin (the compliance
-/// watch's memory, [`own_departure_spacing`]'s), which no picture of ghosts
-/// shows. Ours reads the ghosts' clock as before.
-pub(super) fn wake_remaining_for(
-    flight: &FlightStrip,
-    runway_ident: &str,
-    now: Instant,
-) -> Option<u64> {
-    let ghosts = wake_remaining(runway_ident, now);
-    if flight.is_own() {
-        return ghosts;
-    }
-    let liftoff = OWN_STRIP
-        .compliance_flight
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .liftoff
-        .clone();
-    let ours = liftoff
-        .filter(|(strip, _)| {
-            let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
-            same_strip_or_twin(&runways, runway_ident, strip)
-        })
-        .map(|(_, at)| WAKE_SECS.saturating_sub(now.saturating_duration_since(at).as_secs()))
-        .filter(|s| *s > 0);
-    ghosts.max(ours)
-}
-
 pub fn wake_remaining(runway_ident: &str, now: Instant) -> Option<u64> {
     let guard = WAKE.lock().unwrap_or_else(|e| e.into_inner());
     let w = guard.as_ref()?;

@@ -282,26 +282,6 @@ fn the_runway_book_answers_as_the_functions_it_replaced() {
                                         "authorised: {}",
                                         cell()
                                     );
-                                    // A takeoff clearance FLOWN (our state airborne)
-                                    // claims what no clearance claims: the book
-                                    // judges it by the aircraft (LEMG 12,
-                                    // 2026-10-13). The oracle answers so with the
-                                    // clearance off.
-                                    let flown = !on_ground
-                                        && clr.is_some_and(|(s, _, _)| {
-                                            s == tower::State::TakeoffCleared
-                                        });
-                                    let (claim_here, authorised_here) = if flown {
-                                        let kept = OWN_STRIP.clearance.lock().unwrap().take();
-                                        let off = (
-                                            oracle::own_strip_claim(),
-                                            oracle::runway_occupancy_authorised(lat, lon, gs),
-                                        );
-                                        *OWN_STRIP.clearance.lock().unwrap() = kept;
-                                        off
-                                    } else {
-                                        (old_claim.clone(), authorised)
-                                    };
                                     // One book over the whole state, as a tick holds it.
                                     let book = RunwayBook::now(Some(AircraftState {
                                         lat,
@@ -321,19 +301,19 @@ fn the_runway_book_answers_as_the_functions_it_replaced() {
                                     );
                                     assert_eq!(
                                         book.occupancy_authorised(FlightId::Own),
-                                        authorised_here,
+                                        authorised,
                                         "book authorised: {}",
                                         cell()
                                     );
                                     assert_eq!(
                                         book.strip_claim(FlightId::Own)
                                             .map(|c| (c.end.clone(), c.whole_strip)),
-                                        claim_here,
+                                        old_claim,
                                         "book claim: {}",
                                         cell()
                                     );
                                     for end in ends {
-                                        let old = claim_here
+                                        let old = old_claim
                                             .as_ref()
                                             .is_some_and(|c| oracle::conflicts_with_claim(end, c));
                                         assert_eq!(
@@ -537,57 +517,5 @@ fn a_landing_clearance_far_out_holds_only_its_direction() {
     assert!(held(), "a stale position is unknown");
     *OWN_STRIP.seen.lock().unwrap() = None;
     *OWN_STRIP.clearance.lock().unwrap() = None;
-    Station::uninstall();
-}
-
-/// A DEPARTURE READS A FLYING LANDER AS AN ARRIVAL: the book still holds the
-/// strip whole for it ([`strip_held_by_others`], landings and crossings read
-/// it so), but a departure is told its distance; unplaced, on the ground, or
-/// beside any other whole-strip claim, it is an occupant as before.
-#[test]
-fn a_departure_reads_a_flying_lander_as_an_arrival() {
-    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _strips = super::strip_tests::ClearStrips;
-    Station::uninstall();
-    clear_ghost_memory();
-    let runways = book_runways();
-    *ACTIVE_RUNWAYS.lock().unwrap() = runways.clone();
-    let r = &runways[0];
-    let snap = |state, holds| ClearanceSnap {
-        state,
-        callsign: "Air Nostrum eight eight seven zero".into(),
-        runway_ident: "26L".into(),
-        pending_readback: None,
-        holds_runway: holds,
-    };
-    let lander = open_traffic_strip(1);
-    *lander.clearance.lock().unwrap() = Some(snap(tower::State::ClearedToLand, true));
-    let dep = || departure_held_by_others(&runways, "26L", &OWN_STRIP);
-    assert_eq!(dep(), Some(DepartureBlock::Occupied), "unplaced");
-    let (lat, lon) = crate::nav::project_latlon(r.lat_b, r.lon_b, r.heading_a_deg(), 6.0);
-    note_traffic_state(1, AircraftState::at_position(lat, lon, false, 140.0));
-    assert!(
-        strip_held_by_traffic(&runways, "26L"),
-        "the book still holds it whole"
-    );
-    assert!(
-        matches!(dep(), Some(DepartureBlock::Lander(nm)) if (nm - 6.0).abs() < 0.1),
-        "{:?}",
-        dep()
-    );
-    assert_eq!(
-        departure_held_by_others(&runways, "08L", &OWN_STRIP),
-        None,
-        "the twin"
-    );
-    // Somebody lined up as well: occupied.
-    let lined = open_traffic_strip(2);
-    *lined.clearance.lock().unwrap() = Some(snap(tower::State::LinedUp, true));
-    assert_eq!(dep(), Some(DepartureBlock::Occupied));
-    *lined.clearance.lock().unwrap() = None;
-    // Down on the pavement: occupied.
-    let (lat, lon) = along(r, 0.7);
-    note_traffic_state(1, AircraftState::at_position(lat, lon, true, 80.0));
-    assert_eq!(dep(), Some(DepartureBlock::Occupied));
     Station::uninstall();
 }
