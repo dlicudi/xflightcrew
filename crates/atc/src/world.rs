@@ -57,5 +57,5 @@ pub use crate::station::{runway_conflicts, traffic_compliance_oracle};
 /// traffic advisory.
 pub use crate::station::{
     advisory_line, is_near_miss, near_miss_line, nearest_traffic_factor, note_traffic_type,
-    spoken_type, targets, traffic_worth_recalling, TcasTarget, TrafficFactor,
+    spoken_type, targets, traffic_type, traffic_worth_recalling, TcasTarget, TrafficFactor,
 };

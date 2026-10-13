@@ -300,7 +300,8 @@ impl EngineClass {
 
 /// The attitudes the airframe's geometry allows on the runway, degrees,
 /// from its `.acf`: the gear's contact points on extended struts and the
-/// fuselage's skin.
+/// fuselage's skin; and how far the nose reaches ahead of the point the
+/// sim positions the aircraft by.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GroundGeometry {
     /// Pitch at which the nosewheel and the mains touch together: below
@@ -309,6 +310,12 @@ pub struct GroundGeometry {
     /// Pitch at which the fuselage's lowest aft point meets the runway
     /// with the mains on it: the tail strike.
     pub tail_strike_deg: Option<f64>,
+    /// The fuselage's foremost point ahead of the aircraft's origin,
+    /// metres. X-Plane places an aircraft by its default centre of gravity
+    /// (`acf/_cgZ`, feet aft of the `.acf`'s reference point), not by its
+    /// middle: the stock 737-800's nose is 18.1 m ahead of it, the A330's
+    /// 29.6 m, the 172's 1.9 m. `None` without a fuselage or a CG.
+    pub nose_m: Option<f64>,
 }
 
 /// Margins kept inside the geometry, degrees: the mains first by a degree,
@@ -338,12 +345,24 @@ impl GroundGeometry {
                 continue;
             }
             let (Some(k), Some(v)) = (it.next(), it.next()) else { continue };
-            if k.starts_with("_gear/") || k.starts_with("_body/0/") {
+            if k.starts_with("_gear/") || k.starts_with("_body/0/") || k == "acf/_cgZ" {
                 if let Ok(v) = v.parse::<f64>() {
                     vals.insert(k, v);
                 }
             }
         }
+        // The nose: the fuselage's foremost section point, ahead of the CG
+        // the sim places the aircraft by.
+        let nose_z = vals
+            .iter()
+            .filter(|(k, _)| k.starts_with("_body/0/_geo_xyz/") && k.ends_with(",2"))
+            .map(|(_, z)| z + vals.get("_body/0/_part_z").copied().unwrap_or(0.0))
+            .min_by(f64::total_cmp);
+        let nose_m = vals
+            .get("acf/_cgZ")
+            .zip(nose_z)
+            .map(|(cg, nz)| (cg - nz) * 0.3048)
+            .filter(|n| *n > 0.0);
         // Gear contacts: (z, y, braked).
         let mut gears: Vec<(f64, f64, bool)> = Vec::new();
         for i in 0..16 {
@@ -362,7 +381,7 @@ impl GroundGeometry {
         // them is a tailwheel, which has no nosewheel to protect.
         let mains = gears.iter().filter(|g| g.2).max_by(|a, b| a.0.total_cmp(&b.0));
         let Some(&(zm, ym, _)) = mains.or_else(|| gears.iter().max_by(|a, b| a.0.total_cmp(&b.0))) else {
-            return GroundGeometry { level_deg: None, tail_strike_deg: None };
+            return GroundGeometry { level_deg: None, tail_strike_deg: None, nose_m };
         };
         let tailwheel = gears.iter().any(|g| g.0 > zm + 2.0);
         let nose = gears.iter().filter(|g| g.0 < zm - 2.0).min_by(|a, b| a.0.total_cmp(&b.0));
@@ -391,7 +410,7 @@ impl GroundGeometry {
                 }
             }
         }
-        GroundGeometry { level_deg, tail_strike_deg: strike.filter(|_| !tailwheel) }
+        GroundGeometry { level_deg, tail_strike_deg: strike.filter(|_| !tailwheel), nose_m }
     }
 }
 
@@ -448,5 +467,23 @@ mod tests {
         let tail = g.tail_strike_deg.expect("a tail");
         assert!((9.0..13.0).contains(&tail), "{g:?}");
         assert_eq!(GroundGeometry::from_acf("").tail_strike_deg, None);
+    }
+
+    /// The nose reaches ahead of the CG the sim places the aircraft by: the
+    /// stock 737-800's fuselage runs from z 0 to 124.8 ft with its CG at
+    /// 59.5 ft (the installed `.acf`, 2026-10-13), so the nose is 18.1 m
+    /// ahead; without a CG there is no reading, never a guess.
+    #[test]
+    fn the_nose_is_measured_from_the_cg() {
+        let b738 = "P acf/_cgZ 59.5\nP _body/0/_part_z 0\n\
+                    P _body/0/_geo_xyz/0,0,1 0.0\nP _body/0/_geo_xyz/0,0,2 -0.017\n\
+                    P _body/0/_geo_xyz/19,9,1 1.5\nP _body/0/_geo_xyz/19,9,2 124.84\n";
+        let nose = GroundGeometry::from_acf(b738).nose_m.expect("a nose");
+        assert!((nose - 18.14).abs() < 0.05, "{nose}");
+        // A fuselage part placed aft of the reference point moves its nose.
+        let moved = b738.replace("_part_z 0", "_part_z 10");
+        let nose = GroundGeometry::from_acf(&moved).nose_m.expect("a nose");
+        assert!((nose - 15.09).abs() < 0.05, "{nose}");
+        assert_eq!(GroundGeometry::from_acf(&b738.replace("P acf/_cgZ 59.5\n", "")).nose_m, None);
     }
 }

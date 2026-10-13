@@ -14979,3 +14979,42 @@ is, see which stands are free, and move the aircraft to a free one from the page
   `new_flight_here` (with `traffic_strips` above zero) and NO burst of `traffic` `despawn`
   `removed`/`reinstalled`; the moving traffic keeps calling and being answered. A later approach
   to the field must not hear "you landed without clearance".
+
+## 2026-10-13: the taxi stop behind traffic allows for the governor's lag, and real lengths (LEMG)
+
+- **The flight.** LEMG, our 737-800 (auto taxi) closing on TRA6502, one of our own fleet's
+  737-800s standing ahead. The pilot: "the copilot stops way too close to the aircraft in front".
+  Blackbox `autotaxi` `drive` records with a `traffic` object, t 1791892420 to 1791892450: the
+  guard planned the stop 18 m nose to tail (`own.gap_m`), the speed capped by the stop ramp
+  (`stop_ramp_kts`, 0.25 m/s^2). The governor rode the cap late: 0.6 to 0.8 kt over it early in
+  the closure, 2 to 4 kt over in the last seven seconds (it idles and brakes only once a couple
+  of knots over, by design, `speedhold::taxi_control`). It reached the cap's zero
+  (`traffic_hold` Began, `stop_in_m` 0.99) still at 5.86 kt and rolled from 56.99 to 46.81 m
+  along before it stood: 8.8 m nose to tail.
+- **The lag, fitted twice.** A least-squares fit of `gs(t) = cap(t - L)` gives L 2.3 s over the
+  whole closure (t 420 to 442) and 3.5 s over its last seven seconds (t 435 to 442); the hold's
+  rollout, 10.18 m at 3.02 m/s, is 3.4 s of that speed (0.44 m/s^2 average). One number:
+  `traffic_guard::GOVERNOR_LAG_S` 3.5 s. The stop point is planned back by the ground covered in
+  it: `stop_in = gap - own.gap_m - gs * GOVERNOR_LAG_S` (`traffic_stop_in_m`). The governor and
+  `STOP_DECEL_MS2` are NOT retuned: the line-up depends on them, and CLAUDE.md says never "fix" a
+  stop by tuning the governor. A fixed stop distance at one speed would be wrong at another; the
+  lag scales with the speed the aircraft actually carries into the stop.
+- **Lengths, measured.** Ours: the `.acf`'s fuselage (`_body/0` section points, offset by
+  `_part_z`) ahead of `acf/_cgZ`, the default CG X-Plane places the aircraft by
+  (`GroundGeometry::nose_m`; the installed 737-800 18.1 m, A330 29.6, MD-82 22.9, 172 1.9, SR22
+  2.1), else the MTOW class's half span as before. The target's: half its type's length
+  (`traffic::perf::length_of`, a new manufacturer table beside the span table, the class's
+  `length_m` for an unknown type), by the type our own fleet notes (`world::traffic_type`, now an
+  accessor); the fleet publishes each aircraft at mid-length. LiveTraffic and multiplayer carry no
+  type and keep the 20 m default. The 737's own numbers were close already (18 vs 18.1, 20 vs
+  19.75): the lag was the cause, the lengths matter for every other pair.
+- `own.gap_m` stays 18 m for airliners, 8 m for light aircraft: no published standard found that
+  says otherwise for a stop behind a standing aircraft.
+- Tests: `the_lemg_closure_stops_the_taxi_gap_behind_with_the_lag` (the recorded hold speed's
+  allowance covers the recorded 10.18 m rollout; the closure from the recorded state through a
+  plant fitted to the trace, 3.5 s delay and the hold's 0.44 m/s^2: planned without the lag it
+  ends about 12 m behind, with it about 21), `the_target_stops_us_behind_its_own_tail`,
+  `the_nose_is_measured_from_the_cg`, `every_spanned_type_has_its_length`.
+- **UNFLOWN.** Next taxi behind traffic: blackbox `autotaxi` `traffic_hold` `gap_m` at Began
+  should read about 18 + 1 + 3.5 x the speed (m/s) carried into it (now also `nose_m`), and the
+  last `drive` `traffic.gap_m` once `gs` reads 0 should be 18 m or more (it was 8.8).

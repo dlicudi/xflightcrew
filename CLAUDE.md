@@ -339,6 +339,10 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   nosewheels brake-steer through the PLUGIN channels only (REST brake writes are re-driven by
   hardware), the rollout too (`autoland::RolloutBrakeSteer`).
 - **A drive is judged by the ground it makes, never a flat clock** (`autotaxi::ProgressWatch`).
+- **Traffic ahead is stopped behind its TAIL, planned for the governor's lag**
+  (`traffic_guard::traffic_stop_in_m`, `GOVERNOR_LAG_S`): the gap less the ground covered in 3.5 s
+  at our speed; our nose from the `.acf` (`GroundGeometry::nose_m`, ahead of the CG), the target's
+  tail from its type (`traffic::perf::length_of`).
 - **The sim brakes against hard rudder**, so the plugin holds `override_toe_brakes` while steering;
   a pilot brake latches `xcopilot/brake_yield`. Never "fix" a corner that stops the aircraft by
   tuning the governor.
