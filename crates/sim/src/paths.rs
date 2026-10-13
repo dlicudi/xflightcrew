@@ -139,7 +139,7 @@ pub fn resolve(i: &Inputs) -> Roots {
             resources_missing: !dir.join("profiles").is_dir(),
         };
     }
-    if is_checkout(&i.cwd) {
+    if is_checkout(&i.cwd) && is_our_manifest(&i.cwd) {
         return Roots {
             mode: Mode::DevCheckout,
             resources: PathBuf::new(),
@@ -387,6 +387,14 @@ mod tests {
         let r = resolve(&Inputs {
             cwd: away,
             exe: Some(d.join("bin/xfc")),
+            home: Some("/h".into()),
+            macos: true,
+            ..Default::default()
+        });
+        assert_eq!(r.mode, Mode::Installed);
+        // Started FROM another project's folder: still not our checkout.
+        let r = resolve(&Inputs {
+            cwd: d.clone(),
             home: Some("/h".into()),
             macos: true,
             ..Default::default()
