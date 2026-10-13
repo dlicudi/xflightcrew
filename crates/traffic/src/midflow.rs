@@ -71,6 +71,10 @@ pub const CLIMB_S: f64 = 14.0 * 60.0;
 /// way ahead, metres (a wingspan each side and a margin).
 pub const WAY_CLEAR_M: f64 = 60.0;
 
+/// A stand handed out at the start is this far from any stand already
+/// held, where the apron has one, metres.
+pub const BESIDE_M: f64 = 80.0;
+
 /// A placed aircraft never starts this close to our own on the ground,
 /// metres.
 pub const OWN_GROUND_CLEAR_M: f64 = 150.0;
@@ -302,7 +306,36 @@ pub fn plan(
         .filter(|s| field.takes(s, "A320") || field.takes(s, crate::schedule::REGIONAL))
         .count();
     let take_stand = |t: &str, taken: &mut Vec<LatLon>, rng: &mut XorShift64| -> Option<String> {
-        let free = free_stands(field, t, taken);
+        // An aircraft turning round stands there for up to two hours: a
+        // stand clear of the lanes others taxi along first, as a parked
+        // one's (the mid-flow harness, 2026-10-13: a taxi-out passed 18.6 m
+        // from one turning round beside its way).
+        let all = free_stands(field, t, taken);
+        let clear: Vec<String> = all
+            .iter()
+            .filter(|n| {
+                field.stand(n).is_some_and(|s| {
+                    field.lane_clearance_m((s.lat, s.lon))
+                        >= crate::schedule::parked_lane_clear_m(t)
+                })
+            })
+            .cloned()
+            .collect();
+        let pool = if clear.is_empty() { all } else { clear };
+        // ...and no nearer a stand somebody already stands on than a
+        // departure's way off its own runs past (`JET_BESIDE_MOVER_M`'s 80
+        // m): the same harness had a departure leave stand 95 past the
+        // aircraft turning round on 97, 18.6 m apart.
+        let apart: Vec<String> = pool
+            .iter()
+            .filter(|n| {
+                field
+                    .stand(n)
+                    .is_some_and(|s| taken.iter().all(|p| dist_m(*p, (s.lat, s.lon)) >= BESIDE_M))
+            })
+            .cloned()
+            .collect();
+        let free = if apart.is_empty() { pool } else { apart };
         // Room kept for the arrivals still to come.
         let held = field
             .net
@@ -516,6 +549,20 @@ pub fn plan(
         last = Some((d, wake));
         m.start = Some(Start::Approach { to_thr_m: d });
         out.movements.push(m);
+    }
+    // The arrivals still to enter come no closer than a runway lands
+    // ([`crate::rate::MIN_GAP_S`]), the later one held back: four in 45 s
+    // at Malaga's 10:00 bank (the harness, 2026-10-13) orbited.
+    let mut last_entry = f64::NEG_INFINITY;
+    let mut entering: Vec<&mut Movement> = out
+        .movements
+        .iter_mut()
+        .filter(|m| m.kind == MovementKind::Arrival && m.start.is_none())
+        .collect();
+    entering.sort_by(|a, b| a.t_s.total_cmp(&b.t_s));
+    for m in entering {
+        m.t_s = m.t_s.max(last_entry + crate::rate::MIN_GAP_S);
+        last_entry = m.t_s;
     }
     out.movements.sort_by(|a, b| a.t_s.total_cmp(&b.t_s));
     let _ = OWN_CLEAR_NM;

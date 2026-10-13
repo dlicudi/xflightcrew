@@ -751,7 +751,7 @@ pub fn park_at_start(
     let mut budget = ((share * suitable.len() as f64).floor() as usize).min(PARKED_MAX);
     let mut order: Vec<&mut Movement> = schedule
         .iter_mut()
-        .filter(|m| m.kind == MovementKind::Departure && m.stand.is_some())
+        .filter(|m| m.kind == MovementKind::Departure && m.stand.is_some() && m.start.is_none())
         .collect();
     order.sort_by(|a, b| a.t_s.total_cmp(&b.t_s));
     for m in order {

@@ -201,12 +201,14 @@ pub fn daily_count(row: &RouteRow, date: Date) -> u32 {
 }
 
 /// The local second of the day of rotation `k` of `n`: evenly through the
-/// row's windows, nudged by a stable fraction of a slot so two rows do not
-/// land together.
+/// row's windows, each row offset by its own stable share of a slot. With
+/// the offset a fixed half slot every once-a-day route landed mid-way
+/// through its windows, at 15:00, and 10:00 at Malaga had six rotations in
+/// the hour round it (the mid-flow harness, 2026-10-13).
 fn slot_s(row: &RouteRow, k: u32, n: u32) -> f64 {
     let total: f64 = row.windows.iter().map(|(a, b)| b - a).sum();
-    let nudge = (row_hash(row, u64::from(k)) % 1000) as f64 / 1000.0 - 0.5;
-    let mut at = total * ((f64::from(k) + 0.5 + 0.6 * nudge) / f64::from(n)).clamp(0.0, 1.0);
+    let offset = (row_hash(row, 0x51_07) % 1000) as f64 / 1000.0;
+    let mut at = total * ((f64::from(k) + offset) / f64::from(n)).clamp(0.0, 1.0);
     for (a, b) in row.windows {
         if at <= b - a {
             return (a + at) * 3600.0;
