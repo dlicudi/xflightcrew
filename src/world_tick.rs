@@ -880,7 +880,7 @@ impl WorldTick {
         let sim_speed = crate::climb_watch::sim_speed_now();
         let _ = self
             .traffic
-            .tick(t.xp, t.voice, t.snap, sim_speed, t.now)
+            .tick(t.xp, t.voice, t.snap, sim_speed, t.now, t.status.as_ref())
             .await;
         // The frequency the fleet and the tower made, aired as it may be:
         // the tower tuned, never over our PTT or a pilot's line waiting,

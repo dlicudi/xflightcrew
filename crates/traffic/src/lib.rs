@@ -11,14 +11,18 @@
 pub mod aircraft;
 pub mod airlines;
 pub mod arrival;
+pub mod board;
 pub mod clock;
 pub mod field;
 pub mod fleet;
 pub mod kin;
+pub mod midflow;
 pub mod perf;
 pub mod phase;
 pub mod rate;
 pub mod rng;
+pub mod rotation;
+pub mod routes;
 pub mod schedule;
 pub mod slot;
 pub mod spacing;
@@ -33,7 +37,8 @@ pub use perf::{class_for_type, Perf, Wake, JET_HEAVY, JET_MED, PISTON_SINGLE, TU
 pub use phase::{Call, Despawn, Event, Leg, Order, OwnTarget, Phase, Plan, RadioState, TowerState};
 pub use rng::XorShift64;
 pub use schedule::{
-    generate, park_at_start, Density, FileEntry, Movement, MovementKind, Refusal, SpawnCtx,
+    generate, park_at_start, Density, FileEntry, FlightInfo, Movement, MovementKind, Refusal,
+    SpawnCtx, Start,
 };
 
 #[cfg(test)]

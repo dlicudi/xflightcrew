@@ -138,6 +138,49 @@ pub struct Movement {
     /// fleet's start until its time, and starts up there
     /// ([`park_at_start`]); else it appears on its stand at its time.
     pub parked_from_start: bool,
+    /// The flight as a board shows it (a route table's rotation, or a
+    /// traffic file row that names its ends); `None` for a generated hour.
+    pub flight: Option<FlightInfo>,
+    /// Where it already is when the fleet starts (the mid-flow start,
+    /// [`crate::midflow`]); `None` starts it the usual way at its time.
+    pub start: Option<Start>,
+}
+
+/// A flight as a flight information board shows it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FlightInfo {
+    /// The board's flight number ("U2 8901"); the callsign where the
+    /// airline has no designator here.
+    pub number: String,
+    /// The airline's name ("easyJet"); empty for none.
+    pub airline: String,
+    /// The other end: its ICAO code and its name.
+    pub other: String,
+    pub city: String,
+    /// The timetable's time and today's estimate, LOCAL seconds after the
+    /// reference midnight (below 0 the evening before, past 86,400
+    /// tomorrow); `None` where the file gave none.
+    pub sched_s: Option<f64>,
+    pub est_s: Option<f64>,
+    /// A departure flown by the airframe that arrives as this callsign
+    /// (its rotation's inbound): it leaves from wherever that one parked.
+    pub inbound: Option<String>,
+}
+
+/// Where a movement already is at the fleet's start ([`crate::midflow`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Start {
+    /// On its instrument approach, this far along it from the threshold,
+    /// metres.
+    Approach { to_thr_m: f64 },
+    /// Landed and taxiing in to `stand`, `frac` of the way from the runway.
+    TaxiIn { stand: String, frac: f64 },
+    /// Taxiing out from its stand, `frac` of the way to the holding point.
+    TaxiOut { frac: f64 },
+    /// Holding short of its runway, ready.
+    HoldShort,
+    /// Climbing out, this far past the runway's far end, metres.
+    Climb { past_end_m: f64 },
 }
 
 /// What the world looks like at generation or spawn time.
@@ -193,6 +236,9 @@ impl Movement {
     ) -> Result<TrafficAircraft, Refusal> {
         if self.kind == MovementKind::Parked {
             return self.park(id, field, ctx);
+        }
+        if let Some(start) = &self.start {
+            return self.place(id, field, ctx, start);
         }
         let plan = self.plan(field)?;
         if let Plan::Arrival { entry, .. } = &plan {
@@ -336,7 +382,7 @@ pub fn default_runway(field: &FieldModel) -> Option<String> {
 /// when none of its own size is; of those, the ones with nobody beside them
 /// ([`neighbour_taken`]) when there are any. Empty when none fits: no
 /// spawn, never a stand too small.
-fn free_stands(field: &FieldModel, icao_type: &str, taken: &[LatLon]) -> Vec<String> {
+pub(crate) fn free_stands(field: &FieldModel, icao_type: &str, taken: &[LatLon]) -> Vec<String> {
     let fits = tightest_first(
         field
             .net
@@ -416,7 +462,7 @@ fn parks_at(field: &FieldModel, icao_type: &str) -> bool {
 }
 
 /// A seed for the field: the same field and seed, the same schedule.
-fn field_seed(icao: &str, seed: u64) -> u64 {
+pub(crate) fn field_seed(icao: &str, seed: u64) -> u64 {
     icao.bytes().fold(seed ^ 0xCBF2_9CE4_8422_2325, |h, b| {
         (h ^ b as u64).wrapping_mul(0x0100_0000_01B3)
     })
@@ -493,6 +539,8 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
                 exit_bearing: 0.0,
                 seed: rng.next_u64(),
                 parked_from_start: false,
+                flight: None,
+                start: None,
             });
             t += rng.range_f64(120.0, 420.0);
         }
@@ -569,6 +617,8 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
                 exit_bearing: rng.range_f64(0.0, 360.0),
                 seed: rng.next_u64(),
                 parked_from_start: false,
+                flight: None,
+                start: None,
             });
         }
     }
@@ -607,6 +657,8 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
                 exit_bearing: 0.0,
                 seed: rng.next_u64(),
                 parked_from_start: false,
+                flight: None,
+                start: None,
             });
         }
     }
@@ -699,7 +751,7 @@ pub fn park_at_start(
     let mut budget = ((share * suitable.len() as f64).floor() as usize).min(PARKED_MAX);
     let mut order: Vec<&mut Movement> = schedule
         .iter_mut()
-        .filter(|m| m.kind == MovementKind::Departure && m.stand.is_some())
+        .filter(|m| m.kind == MovementKind::Departure && m.stand.is_some() && m.start.is_none())
         .collect();
     order.sort_by(|a, b| a.t_s.total_cmp(&b.t_s));
     for m in order {
@@ -803,6 +855,8 @@ pub fn park_at_start(
             exit_bearing: 0.0,
             seed: rng.next_u64(),
             parked_from_start: false,
+            flight: None,
+            start: None,
         });
     }
     out
@@ -882,7 +936,7 @@ fn airline_pool(field: &FieldModel, runway_m: f64) -> Vec<(Carrier, &'static str
 /// An entry [`ENTRY_NM`] out, within 50 degrees of the extended
 /// centreline, clear of us by [`OWN_CLEAR_NM`]; turned further round when
 /// we are in the way, `None` if nowhere is clear.
-fn entry_clear_of_own(
+pub(crate) fn entry_clear_of_own(
     end: &RunwayEnd,
     own: Option<LatLon>,
     rng: &mut XorShift64,
@@ -1009,7 +1063,13 @@ fn phonetic(c: char) -> &'static str {
 ///   stand: W4            # optional: a free stand
 ///   laps: 3              # optional, circuits (default 3)
 ///   spoken: Cessna three four five   # optional
+///   origin: EGKK         # optional: an arrival's origin, for the board
+///   destination: EGKK    # optional: a departure's destination
+///   scheduled: "10:35"   # optional: the timetable's local time
 /// ```
+///
+/// The board fields (2026-10-13) are optional: a file written before them
+/// reads as it did.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileEntry {
@@ -1026,6 +1086,48 @@ pub struct FileEntry {
     pub laps: Option<u32>,
     #[serde(default)]
     pub spoken: Option<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub destination: Option<String>,
+    #[serde(default)]
+    pub scheduled: Option<String>,
+}
+
+/// "10:35" as local seconds after midnight; `None` for anything else.
+pub fn parse_hhmm(s: &str) -> Option<f64> {
+    let (h, m) = s.trim().split_once(':')?;
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    (h < 24 && m < 60).then(|| f64::from(h * 3600 + m * 60))
+}
+
+/// A file row's board line: where it names an end or a time.
+fn file_flight(r: &FileEntry) -> Option<FlightInfo> {
+    let other = match r.kind {
+        MovementKind::Arrival => r.origin.clone(),
+        MovementKind::Departure => r.destination.clone(),
+        _ => None,
+    };
+    let sched = r.scheduled.as_deref().and_then(parse_hhmm);
+    if other.is_none() && sched.is_none() {
+        return None;
+    }
+    let cs = r.callsign.trim();
+    let (airline, iata) = cs.get(..3).map_or(("", ""), crate::routes::airline_name);
+    let number = match cs.get(3..) {
+        Some(n) if !iata.is_empty() => format!("{iata} {n}"),
+        _ => cs.to_string(),
+    };
+    let other = other.unwrap_or_default().trim().to_ascii_uppercase();
+    Some(FlightInfo {
+        number,
+        airline: airline.to_string(),
+        city: other.clone(),
+        other,
+        sched_s: sched,
+        est_s: sched,
+        inbound: None,
+    })
 }
 
 /// Parse a traffic file. Refused whole on any bad row, with the row named:
@@ -1083,6 +1185,8 @@ pub fn from_file(
                 exit_bearing: rng.range_f64(0.0, 360.0),
                 seed: rng.next_u64(),
                 parked_from_start: false,
+                flight: file_flight(r),
+                start: None,
             })
         })
         .collect();

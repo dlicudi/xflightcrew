@@ -721,6 +721,10 @@ protected:
                 mTab = 5;
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("Board")) {
+                mTab = 7;
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("Settings")) {
                 mTab = 6;
                 ImGui::EndTabItem();
@@ -746,6 +750,7 @@ protected:
             case 3: buildRouteTab(); break;
             case 4: buildBriefTab(); break;
             case 5: buildStateTab(); break;
+            case 7: buildBoardTab(); break;
             default: buildSettingsTab(); break;
         }
         ImGui::EndChild();
@@ -1236,6 +1241,91 @@ protected:
             ImGui::PopStyleColor();
             start = end + 1;
         }
+    }
+
+    // The flight information board (2026-10-13): Departures then Arrivals,
+    // one table each, as an airport's FIDS shows them. Rows are
+    // "D|sched|time|number|airline|city|type|stand|status|own"; the status
+    // is coloured (green moving or done, amber delayed, cyan approaching
+    // or boarding), our own flight in magenta.
+    static ImU32 boardColour(const std::string& status) {
+        if (status == "Delayed") return COL_AMBER;
+        if (status == "Boarding" || status == "Approaching") return COL_CYAN;
+        if (status == "Scheduled") return COL_WHITE;
+        if (status == "At gate") return COL_DIM;
+        return COL_GREEN;
+    }
+    static std::vector<std::string> splitBar(const std::string& line) {
+        std::vector<std::string> out;
+        size_t start = 0;
+        while (true) {
+            size_t bar = line.find('|', start);
+            out.push_back(line.substr(start, bar == std::string::npos ? std::string::npos : bar - start));
+            if (bar == std::string::npos) break;
+            start = bar + 1;
+        }
+        return out;
+    }
+    void buildBoardTab() {
+        const TextRef& feed = drefs::board();
+        if (feed.len <= 0 || !drefs::board_fresh()) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "No board. It shows our own traffic at a field with a timetable");
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "(LXGB, LEMG) with XCOPILOT_TRAFFIC=ours and ATC on.");
+            return;
+        }
+        std::vector<std::vector<std::string>> deps, arrs;
+        std::string header;
+        std::string text(feed.buf, feed.len);
+        size_t start = 0;
+        while (start < text.size()) {
+            size_t end = text.find('\n', start);
+            if (end == std::string::npos) end = text.size();
+            std::vector<std::string> f = splitBar(text.substr(start, end - start));
+            start = end + 1;
+            if (f.empty()) continue;
+            if (f[0] == "H" && f.size() >= 3) {
+                header = f[1] + "   local " + f[2];
+            } else if (f.size() >= 10 && f[0] == "D") {
+                deps.push_back(f);
+            } else if (f.size() >= 10 && f[0] == "A") {
+                arrs.push_back(f);
+            }
+        }
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", header.c_str());
+        boardTable("DEPARTURES", "To", "board_dep", deps);
+        ImGui::Spacing();
+        boardTable("ARRIVALS", "From", "board_arr", arrs);
+    }
+    void boardTable(const char* title, const char* place, const char* id,
+                    const std::vector<std::vector<std::string>>& rows) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE), "%s", title);
+        if (rows.empty()) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "  none");
+            return;
+        }
+        const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit
+            | ImGuiTableFlags_BordersInnerH;
+        if (!ImGui::BeginTable(id, 8, flags)) return;
+        const char* heads[8] = {"Time", "Exp", "Flight", "Airline", place, "Type", "Stand", "Status"};
+        for (const char* h : heads) ImGui::TableSetupColumn(h);
+        ImGui::TableHeadersRow();
+        for (const auto& r : rows) {
+            const bool own = r[9] == "1";
+            ImGui::TableNextRow();
+            for (int c = 0; c < 7; ++c) {
+                ImGui::TableSetColumnIndex(c);
+                // The expected time only where it differs from the timetable.
+                const std::string& v = (c == 1 && r[2] == r[1]) ? std::string() : r[c + 1];
+                const ImU32 col = own ? COL_MAGENTA : (c == 1 ? COL_AMBER : COL_WHITE);
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%s", v.c_str());
+            }
+            ImGui::TableSetColumnIndex(7);
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(own ? COL_MAGENTA : boardColour(r[8])),
+                               "%s", r[8].c_str());
+        }
+        ImGui::EndTable();
     }
 
     // The latest long report, read rather than recited: its first line is

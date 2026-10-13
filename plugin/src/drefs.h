@@ -75,6 +75,10 @@ const TextRef& load_sheet();
 const TextRef& brief();
 // The State tab: the flight model and the duty engine, '\n'-separated lines.
 const TextRef& state_lines();
+// The Board tab's flight information board (see drefs.cpp), and whether it
+// was written in the last 30 s.
+const TextRef& board();
+bool board_fresh();
 const std::vector<AtcField>& atc_fields();
 
 // COM1, for the ATC tab: khz read (0 if the sim dataref is missing) and the

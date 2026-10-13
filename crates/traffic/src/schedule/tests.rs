@@ -408,6 +408,31 @@ fn the_traffic_file_parses_and_resolves_at_the_field() {
     assert_eq!(ac.stand.as_deref(), Some("GA2"));
 }
 
+/// The board's fields (2026-10-13) are optional: an old file reads as
+/// before with no board line; a row naming its other end and its time is
+/// on the board, under the airline's designator.
+#[test]
+fn a_traffic_file_names_its_board_line_or_not() {
+    let f = fixtures::xtst();
+    let old =
+        parse_file("- t_s: 0\n  callsign: EZY8123\n  type: A320\n  kind: departure\n").unwrap();
+    assert!(from_file(&old, &f, 1, &SpawnCtx::default())[0]
+        .flight
+        .is_none());
+    let new = parse_file(
+        "- t_s: 0\n  callsign: EZY8123\n  type: A320\n  kind: departure\n  destination: egkk\n  scheduled: '10:35'\n",
+    )
+    .unwrap();
+    let info = from_file(&new, &f, 1, &SpawnCtx::default())[0]
+        .flight
+        .clone()
+        .unwrap();
+    assert_eq!(info.number, "U2 8123");
+    assert_eq!(info.other, "EGKK");
+    assert_eq!(info.sched_s, Some(10.0 * 3600.0 + 35.0 * 60.0));
+    assert_eq!(parse_hhmm("25:00"), None);
+}
+
 #[test]
 fn a_bad_traffic_file_is_refused_whole() {
     assert!(parse_file("- t_s: 0\n  callsign: X\n  type: C172\n  kind: hover\n").is_err());

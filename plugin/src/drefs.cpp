@@ -248,6 +248,15 @@ static XPLMDataRef g_auto_dref = nullptr;
 static XPLMDataRef g_loadsheet_dref = nullptr;
 static XPLMDataRef g_brief_dref = nullptr;
 static XPLMDataRef g_state_dref = nullptr;
+// The Board tab's flight information board (xcopilot/status/board,
+// 2026-10-13): "H|field|HH:MM" then "D" or "A" rows, written every few
+// seconds by an app running our own traffic at a timetable field. Its
+// write time is kept: a board not refreshed for 30 s (the app stopped, the
+// traffic stood down, an app older than the board never writing it) is
+// stale and the tab says so.
+static TextRef g_board = {{0}, 0};
+static double g_board_at = -1.0;
+static XPLMDataRef g_board_dref = nullptr;
 // COM1 active frequency (integer kHz despite the sim's `hz` name) — read for
 // the ATC tab's tuned highlight, written by its click-to-tune.
 static XPLMDataRef g_com1_dref = nullptr;
@@ -1064,6 +1073,10 @@ static void WriteBrief(void*, void* in, int offset, int len) {
 static void WriteState(void*, void* in, int offset, int len) {
     StoreText(&g_state, in, offset, len);
 }
+static void WriteBoard(void*, void* in, int offset, int len) {
+    StoreText(&g_board, in, offset, len);
+    g_board_at = XPLMGetElapsedTime();
+}
 // Radio row — refreshed continuously like the strip, not logged.
 static void WriteRadio(void*, void* in, int offset, int len) {
     StoreText(&g_radio, in, offset, len);
@@ -1512,6 +1525,10 @@ void start() {
         "xcopilot/status/state", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteState, &g_state, &g_state);
+    g_board_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/board", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteBoard, &g_board, &g_board);
     g_opt_ui_scale_dref = XPLMRegisterDataAccessor(
         "xcopilot/opt/ui_scale", xplmType_Int, 1,
         ReadOptUiScale, WriteOptUiScale, nullptr, nullptr, nullptr, nullptr,
@@ -1703,6 +1720,7 @@ void stop_first() {
     if (g_loadsheet_dref) { XPLMUnregisterDataAccessor(g_loadsheet_dref); g_loadsheet_dref = nullptr; }
     if (g_brief_dref) { XPLMUnregisterDataAccessor(g_brief_dref); g_brief_dref = nullptr; }
     if (g_state_dref) { XPLMUnregisterDataAccessor(g_state_dref); g_state_dref = nullptr; }
+    if (g_board_dref) { XPLMUnregisterDataAccessor(g_board_dref); g_board_dref = nullptr; }
     if (g_auto_dref) { XPLMUnregisterDataAccessor(g_auto_dref); g_auto_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }
@@ -1759,6 +1777,10 @@ const TextRef& auto_status() { return g_auto; }
 const TextRef& load_sheet() { return g_loadsheet; }
 const TextRef& brief() { return g_brief; }
 const TextRef& state_lines() { return g_state; }
+const TextRef& board() { return g_board; }
+bool board_fresh() {
+    return g_board_at >= 0.0 && XPLMGetElapsedTime() - g_board_at < 30.0;
+}
 bool auto_active() { return g_auto_active; }
 const std::vector<AtcField>& atc_fields() { return g_atc_fields; }
 

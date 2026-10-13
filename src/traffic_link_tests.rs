@@ -182,6 +182,37 @@ pub(super) fn fly_field(
     fly_field_hours(station, field, schedule, max_s, false)
 }
 
+/// The day the timetable fields fly in a harness: a summer Tuesday.
+fn sweep_date() -> traffic::rotation::Date {
+    traffic::rotation::Date::ymd(2026, 7, 14)
+}
+
+/// A timetable field's start as the live link builds it
+/// (`timetable_start`), at the sweep's local hour (else 10:00) on
+/// [`sweep_date`]: the schedule (placed flights, the parked fill) and the
+/// board's flights.
+fn timetable_schedule(
+    field: &FieldModel,
+    table: &traffic::routes::FieldRoutes,
+) -> (Vec<Movement>, Vec<traffic::board::BoardFlight>, f64) {
+    let local_h = std::env::var("XVL_TRAFFIC_SWEEP_LOCAL_H")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(10.0);
+    let date = sweep_date();
+    let dst = if date.summer() { 1.0 } else { 0.0 };
+    let zulu = (local_h - table.utc_offset_h - dst).rem_euclid(24.0) * 3600.0;
+    timetable_start(
+        field,
+        table,
+        Density::Normal,
+        sweep_seed(),
+        Some(zulu),
+        Some(date.ordinal),
+        None,
+    )
+}
+
 /// [`fly_field`], and with `more_hours` the next generated hours too while
 /// `max_s` lasts, as the live link flies them (the world sweep's longer
 /// windows: the turnarounds leave in them).
@@ -193,14 +224,19 @@ pub(super) fn fly_field_hours(
     more_hours: bool,
 ) -> HarnessScore {
     let name = crate::party_line::spoken_airport(station.airport_name()).to_string();
-    let parked = traffic::park_at_start(
-        &field,
-        Density::Normal,
-        sweep_seed(),
-        &sweep_ctx(&field),
-        &mut schedule,
-    );
-    schedule.extend(parked);
+    // A timetable's schedule comes with its own stands filled
+    // (`timetable_start`).
+    let timetable = schedule.iter().any(|m| m.flight.is_some());
+    if !timetable {
+        let parked = traffic::park_at_start(
+            &field,
+            Density::Normal,
+            sweep_seed(),
+            &sweep_ctx(&field),
+            &mut schedule,
+        );
+        schedule.extend(parked);
+    }
     let zulu0 = sweep_ctx(&field).zulu_s;
     let mut hours: u32 = 1;
     let mut link = Link::new(field, schedule, &name);
@@ -1278,7 +1314,12 @@ fn real_install_traffic_world_sweep_inner() {
         let net = crate::nav::find_taxi_net(&apt, &icao).ok().flatten();
         let has_stands = net.as_ref().is_some_and(|n| !n.stands.is_empty());
         let field = FieldModel::new(&icao, a.clone(), net).with_cifp(&cifp);
-        let schedule = traffic::generate(&field, Density::Normal, sweep_seed(), &sweep_ctx(&field));
+        // A field with a route table starts mid-flow on its timetable, as
+        // the live link does (2026-10-13); the rest generate their hour.
+        let schedule = match traffic::routes::field_routes(&icao) {
+            Some(t) => timetable_schedule(&field, t).0,
+            None => traffic::generate(&field, Density::Normal, sweep_seed(), &sweep_ctx(&field)),
+        };
         let Some(st) = Station::from_airport(a) else {
             continue;
         };
@@ -1554,5 +1595,121 @@ fn every_traffic_carrier_has_its_telephony_at_the_station() {
             "{}",
             c.code
         );
+    }
+}
+
+/// THE MID-FLOW START against the real station (2026-10-13): LXGB and LEMG
+/// started at 10:00 local on a summer Tuesday on their timetables, flown
+/// for half an hour. At the first tick nothing is on the runway, the
+/// arrivals placed on the approach are spaced on it, the ground movers
+/// keep apart; through the half hour the book never holds two claims, the
+/// oracle stays silent and every readback is taken; the board has both
+/// halves and statuses from the start.
+#[test]
+#[ignore = "needs X-Plane's Global Airports apt.dat; run with -- --ignored"]
+fn real_install_midflow_start() {
+    in_own_process("traffic_link::tests::real_install_midflow_start_inner");
+}
+
+#[test]
+#[ignore = "run in its own process by real_install_midflow_start"]
+fn real_install_midflow_start_inner() {
+    if std::env::var(HARNESS_ENV).is_err() {
+        return;
+    }
+    let apt = install_apt();
+    let cifp = crate::nav::test_xplane_path("Custom Data/CIFP");
+    for icao in ["LXGB", "LEMG"] {
+        let Ok(Some(field)) = FieldModel::load(&apt, icao) else {
+            println!("no install, no verdict");
+            return;
+        };
+        let field = field.with_cifp(&cifp);
+        let table = traffic::routes::field_routes(icao).expect("a table");
+        let st = installed_station(&apt, icao);
+        note_station_runway(st.runway_for_now().as_deref());
+        let runway = st.runway_for_now();
+        let (schedule, board, local_s) = {
+            let (s, b, l) = timetable_schedule(&field, table);
+            // The placement on the station's runway, as the live link
+            // reads it before the first call.
+            let _ = &runway;
+            (s, b, l)
+        };
+        let placed: Vec<String> = schedule
+            .iter()
+            .filter_map(|m| m.start.as_ref().map(|s| format!("{} {s:?}", m.callsign)))
+            .collect();
+        println!(
+            "{icao} at {}: {} placed: {placed:#?}",
+            traffic::rotation::hhmm(local_s),
+            placed.len()
+        );
+        // At the first tick: the picture.
+        let mut link = Link::new(field.clone(), schedule.clone(), "");
+        link.set_board(board.clone(), local_s);
+        let epoch = Instant::now();
+        let _ = link.tick(None, 0.25, epoch);
+        let fleet = link.fleet();
+        let on_runway: Vec<&str> = fleet
+            .aircraft()
+            .iter()
+            .filter(|a| a.kin.on_ground && fleet.field.on_runway(a.kin.pos()))
+            .map(|a| a.callsign.as_str())
+            .collect();
+        assert!(
+            on_runway.is_empty(),
+            "{icao}: on the runway at the start {on_runway:?}"
+        );
+        let payload = link.board_payload(None);
+        println!("{icao} board:\n{payload}");
+        assert!(
+            payload.lines().any(|l| l.starts_with("D|")),
+            "{icao} departures"
+        );
+        assert!(
+            payload.lines().any(|l| l.starts_with("A|")),
+            "{icao} arrivals"
+        );
+        drop(link);
+        Station::uninstall();
+        let mut st = installed_station(&apt, icao);
+        let s = fly_field(&mut st, field, schedule, 1800.0);
+        println!(
+            "{icao} mid-flow: {} scheduled, {} completed, {} calls, {} readbacks ({} accepted), \
+             {} conflicts, {} oracle, spacing {}/{}/{} rerouted/towed/held, {} overlaps, \
+             {} go-arounds, final gap {:.1}/{:.1} nm min/median over {}; mix {}",
+            s.movements,
+            s.completed,
+            s.calls,
+            s.readbacks,
+            s.readbacks_accepted,
+            s.conflicts.len(),
+            s.oracle.len(),
+            s.spacing_rerouted,
+            s.spacing_cleared,
+            s.spacing_held,
+            s.overlaps.len(),
+            s.go_arounds,
+            min_median(&s.final_gap_nm).0,
+            min_median(&s.final_gap_nm).1,
+            s.final_gap_nm.len(),
+            mix_line(&s.mix)
+        );
+        for l in s
+            .conflicts
+            .iter()
+            .chain(&s.oracle)
+            .chain(&s.overlaps)
+            .take(10)
+        {
+            println!("    {l}");
+        }
+        assert!(s.conflicts.is_empty(), "{icao}: {:?}", s.conflicts);
+        assert!(s.oracle.is_empty(), "{icao}: {:?}", s.oracle);
+        assert_eq!(s.readbacks, s.readbacks_accepted, "{icao}: readbacks");
+        assert_paced(&s, icao);
+        let _ = st;
+        Station::uninstall();
     }
 }
