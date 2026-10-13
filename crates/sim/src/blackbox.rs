@@ -1,6 +1,6 @@
 //! Black-box flight recorder — structured JSONL for post-flight analysis.
 //!
-//! One line per event in `logs/blackbox.jsonl`: `{"t": <unix secs>, "kind":
+//! One line per event in `logs/blackbox.jsonl` (under `paths::data`): `{"t": <unix secs>, "kind":
 //! "state" | "autoland" | "recover" | ..., ...fields}`. The monitor records the
 //! aircraft state ~1/s; the autoland/recover watchers record their per-tick
 //! guidance and control commands. Unlike the tracing log this is machine-parsable
@@ -77,11 +77,12 @@ pub fn begin_sortie(label: &str, detail: serde_json::Value) -> String {
     let id = format!("{secs}-{label}");
     let file = enabled()
         .then(|| {
-            let _ = std::fs::create_dir_all("logs/sorties");
+            let dir = crate::paths::sorties_dir();
+            let _ = std::fs::create_dir_all(&dir);
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(format!("logs/sorties/{id}.jsonl"))
+                .open(dir.join(format!("{id}.jsonl")))
                 .ok()
         })
         .flatten();
@@ -114,12 +115,16 @@ fn open_main() -> Option<std::fs::File> {
     if !enabled() {
         return None;
     }
-    let _ = std::fs::create_dir_all("logs");
-    let path = std::path::Path::new("logs/blackbox.jsonl");
-    if std::fs::metadata(path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
-        let _ = std::fs::rename(path, format!("logs/blackbox.{}.jsonl", now_s() as u64));
+    let logs = crate::paths::logs_dir();
+    let _ = std::fs::create_dir_all(&logs);
+    let path = crate::paths::blackbox_file();
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
+        let _ = std::fs::rename(
+            &path,
+            logs.join(format!("blackbox.{}.jsonl", now_s() as u64)),
+        );
     }
-    std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+    std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()
 }
 
 /// Append one whole line to an append-mode file: one `write_all` of the

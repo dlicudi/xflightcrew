@@ -206,11 +206,18 @@ async fn main() -> Result<()> {
         let ok = voices::main_cmd(rest, config)?;
         std::process::exit(if ok { 0 } else { 1 });
     }
+    // `xfc paths`: where every file lives (the mode and both roots,
+    // `sim::paths`), the models, the log and the prefs. Never talks to the sim.
+    if std::env::args().nth(1).as_deref() == Some("paths") {
+        print!("{}", paths_report());
+        return Ok(());
+    }
     let tui = config.ui == "tui";
 
     // Always log to a daily-rolling file. In TUI mode the stderr layer would
     // scribble over the dashboard, so it's omitted there (file only).
-    let file_appender = tracing_appender::rolling::daily("logs", "xflightcrew.log");
+    let file_appender =
+        tracing_appender::rolling::daily(sim::paths::logs_dir(), sim::paths::LOG_FILE_NAME);
     let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
     // Every workspace crate, not just the crew: since the 2026-07-14 split the
     // world's tracing lives in `atc` and the Web API client's in `sim`, and a
@@ -250,6 +257,11 @@ async fn main() -> Result<()> {
         profile = env!("XVL_PROFILE"),
         "XFlightCrew starting"
     );
+    // Where every file lives, decided once (`sim::paths`).
+    tracing::info!(paths = %sim::paths::summary(), "file roots");
+    if let Some(missing) = sim::paths::missing_line() {
+        tracing::warn!("{missing}");
+    }
 
     // Publish the configuration to the live store and let saved preferences
     // fill in every registry knob the environment is silent about (env still
@@ -395,7 +407,8 @@ async fn main() -> Result<()> {
         }
         let mut samples = v.render(&text)?;
         if radio {
-            match radiofx::load_tail_wav("assets/afv/Click_f32.wav", v.sample_rate()) {
+            let click = sim::paths::asset("afv/Click_f32.wav");
+            match radiofx::load_tail_wav(&click.to_string_lossy(), v.sample_rate()) {
                 Ok(tail) => radiofx::radioize_with_tail(&mut samples, v.sample_rate(), 1, &tail),
                 Err(_) => radiofx::radioize_variant(&mut samples, v.sample_rate(), 1),
             }
@@ -418,7 +431,7 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("debrief") {
         let path = std::env::args()
             .nth(2)
-            .unwrap_or_else(|| "logs/blackbox.jsonl".to_string());
+            .unwrap_or_else(|| sim::paths::blackbox_file().to_string_lossy().into_owned());
         let text = std::fs::read_to_string(&path).map_err(|e| anyhow!("reading {path}: {e}"))?;
         print!("{}", debrief::report(text.lines()));
         return Ok(());
@@ -1088,6 +1101,28 @@ fn load_wav_16k(input: &str) -> Result<Vec<f32>> {
         .map_err(|e| anyhow!("decoding samples: {e}"))
 }
 
+/// `xfc paths`: the mode, both roots, the models, the log and the prefs,
+/// each absolute (`sim::paths::shown`).
+fn paths_report() -> String {
+    use sim::paths;
+    let r = paths::roots();
+    let mut out = format!("mode:       {}\n", r.mode.as_str());
+    out += &format!("resources:  {}\n", paths::shown(&r.resources));
+    if let Some(missing) = paths::missing_line() {
+        out += &format!("            ({missing})\n");
+    }
+    out += &format!("data:       {}\n", paths::shown(&r.data));
+    out += &format!("models:     {}\n", paths::shown(&config::models_dir()));
+    out += &format!(
+        "log:        {} (daily, dated suffix)\n",
+        paths::shown(&paths::logs_dir().join(paths::LOG_FILE_NAME))
+    );
+    out += &format!("blackbox:   {}\n", paths::shown(&paths::blackbox_file()));
+    out += &format!("prefs:      {}\n", paths::shown(&paths::prefs_file()));
+    out += &format!("env:        {}\n", paths::shown(&paths::env_file()));
+    out
+}
+
 fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
     let samples = load_wav_16k(input)?;
     // Offline one-shot — GPU is fine here (not competing with the sim loop).
@@ -1109,7 +1144,7 @@ fn analyze_commands() -> Result<()> {
     let (mut fast, mut miss) = (0u32, 0u32);
     let mut tail: HashMap<String, u32> = HashMap::new();
 
-    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("logs")
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(sim::paths::logs_dir())
         .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
         .unwrap_or_default();
     paths.sort();

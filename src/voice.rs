@@ -88,20 +88,20 @@ fn local_accents_for(icao: &str) -> &'static [&'static str] {
         // Spain + Canaries: davefx, rejected on 2026-07-12 without the radio
         // effect and passed through it on 2026-09-22. sharvard (both
         // speakers) failed both times.
-        "LE" | "GC" => &["models/es_ES-davefx-medium.onnx"],
+        "LE" | "GC" => &["es_ES-davefx-medium.onnx"],
         // Germany: none. thorsten passed the 2026-09-22 audition and failed
         // in service at EDDV the next day (the pilot: "accent /
         // intelligibility"), so German fields cast from the neutral pool.
         // The Netherlands: two, so the tower and the ATIS differ.
         "EH" => &[
-            "models/nl_NL-pim-medium.onnx",
-            "models/nl_NL-ronnie-medium.onnx",
+            "nl_NL-pim-medium.onnx",
+            "nl_NL-ronnie-medium.onnx",
         ],
         // Portugal, Madeira and the Azores (Brazil is SB: a different
         // accent, and stays neutral).
-        "LP" => &["models/pt_PT-tugao-medium.onnx"],
+        "LP" => &["pt_PT-tugao-medium.onnx"],
         // Argentina. Never Spain: geography, as the es_MX rule was.
-        "SA" => &["models/es_AR-daniela-high.onnx"],
+        "SA" => &["es_AR-daniela-high.onnx"],
         // Mexico and the rest of Spanish Latin America: empty since
         // 2026-07-12 (ald and claude-high failed; claude-high again
         // 2026-09-22).
@@ -118,7 +118,10 @@ fn local_accents_for(icao: &str) -> &'static [&'static str] {
 fn station_pace(model: &str) -> f32 {
     if is_accent_model(model) {
         1.1
-    } else if let Some((_, pace)) = MEASURED_PACE.iter().find(|(spec, _)| *spec == model) {
+    } else if let Some((_, pace)) = MEASURED_PACE
+        .iter()
+        .find(|(spec, _)| *spec == model.rsplit('/').next().unwrap_or(model))
+    {
         *pace
     } else if model.contains("en_GB-vctk") {
         1.15
@@ -135,44 +138,44 @@ fn station_pace(model: &str) -> f32 {
 /// VCTK #58, #80 and #96, pool members from before it that were not rated.
 #[cfg_attr(not(feature = "onnx-tts"), allow(dead_code))] // the onnx voice's only
 const MEASURED_PACE: &[(&str, f32)] = &[
-    ("models/en_GB-vctk-medium.onnx#0", 1.15),
-    ("models/en_GB-vctk-medium.onnx#1", 0.99),
-    ("models/en_GB-vctk-medium.onnx#2", 0.83),
-    ("models/en_GB-vctk-medium.onnx#3", 0.94),
-    ("models/en_GB-vctk-medium.onnx#4", 0.79),
-    ("models/en_GB-vctk-medium.onnx#5", 0.85),
-    ("models/en_GB-vctk-medium.onnx#6", 0.82),
-    ("models/en_GB-vctk-medium.onnx#7", 0.94),
-    ("models/en_GB-vctk-medium.onnx#8", 0.95),
-    ("models/en_GB-vctk-medium.onnx#9", 0.72),
-    ("models/en_GB-vctk-medium.onnx#14", 0.82),
-    ("models/en_GB-vctk-medium.onnx#15", 1.16),
-    ("models/en_GB-vctk-medium.onnx#18", 1.21),
-    ("models/en_GB-vctk-medium.onnx#19", 0.94),
-    ("models/en_GB-vctk-medium.onnx#20", 0.97),
-    ("models/en_GB-vctk-medium.onnx#22", 0.9),
-    ("models/en_GB-vctk-medium.onnx#27", 0.79),
-    ("models/en_GB-vctk-medium.onnx#34", 0.98),
-    ("models/en_GB-vctk-medium.onnx#37", 0.81),
-    ("models/en_GB-vctk-medium.onnx#58", 0.73),
-    ("models/en_GB-vctk-medium.onnx#80", 0.79),
-    ("models/en_GB-vctk-medium.onnx#96", 0.96),
-    ("models/en_GB-aru-medium.onnx#0", 0.77),
-    ("models/en_GB-aru-medium.onnx#1", 0.95),
-    ("models/en_GB-aru-medium.onnx#2", 1.0),
-    ("models/en_GB-aru-medium.onnx#3", 0.66),
-    ("models/en_GB-aru-medium.onnx#4", 0.88),
-    ("models/en_GB-aru-medium.onnx#5", 0.9),
-    ("models/en_GB-aru-medium.onnx#6", 0.78),
-    ("models/en_GB-aru-medium.onnx#7", 0.94),
-    ("models/en_GB-aru-medium.onnx#8", 0.99),
-    ("models/en_GB-aru-medium.onnx#9", 0.91),
-    ("models/en_GB-aru-medium.onnx#10", 0.95),
-    ("models/en_GB-aru-medium.onnx#11", 0.82),
-    ("models/en_GB-semaine-medium.onnx#0", 0.77),
-    ("models/en_GB-semaine-medium.onnx#1", 0.74),
-    ("models/en_GB-semaine-medium.onnx#2", 0.67),
-    ("models/en_GB-jenny_dioco-medium.onnx", 0.65),
+    ("en_GB-vctk-medium.onnx#0", 1.15),
+    ("en_GB-vctk-medium.onnx#1", 0.99),
+    ("en_GB-vctk-medium.onnx#2", 0.83),
+    ("en_GB-vctk-medium.onnx#3", 0.94),
+    ("en_GB-vctk-medium.onnx#4", 0.79),
+    ("en_GB-vctk-medium.onnx#5", 0.85),
+    ("en_GB-vctk-medium.onnx#6", 0.82),
+    ("en_GB-vctk-medium.onnx#7", 0.94),
+    ("en_GB-vctk-medium.onnx#8", 0.95),
+    ("en_GB-vctk-medium.onnx#9", 0.72),
+    ("en_GB-vctk-medium.onnx#14", 0.82),
+    ("en_GB-vctk-medium.onnx#15", 1.16),
+    ("en_GB-vctk-medium.onnx#18", 1.21),
+    ("en_GB-vctk-medium.onnx#19", 0.94),
+    ("en_GB-vctk-medium.onnx#20", 0.97),
+    ("en_GB-vctk-medium.onnx#22", 0.9),
+    ("en_GB-vctk-medium.onnx#27", 0.79),
+    ("en_GB-vctk-medium.onnx#34", 0.98),
+    ("en_GB-vctk-medium.onnx#37", 0.81),
+    ("en_GB-vctk-medium.onnx#58", 0.73),
+    ("en_GB-vctk-medium.onnx#80", 0.79),
+    ("en_GB-vctk-medium.onnx#96", 0.96),
+    ("en_GB-aru-medium.onnx#0", 0.77),
+    ("en_GB-aru-medium.onnx#1", 0.95),
+    ("en_GB-aru-medium.onnx#2", 1.0),
+    ("en_GB-aru-medium.onnx#3", 0.66),
+    ("en_GB-aru-medium.onnx#4", 0.88),
+    ("en_GB-aru-medium.onnx#5", 0.9),
+    ("en_GB-aru-medium.onnx#6", 0.78),
+    ("en_GB-aru-medium.onnx#7", 0.94),
+    ("en_GB-aru-medium.onnx#8", 0.99),
+    ("en_GB-aru-medium.onnx#9", 0.91),
+    ("en_GB-aru-medium.onnx#10", 0.95),
+    ("en_GB-aru-medium.onnx#11", 0.82),
+    ("en_GB-semaine-medium.onnx#0", 0.77),
+    ("en_GB-semaine-medium.onnx#1", 0.74),
+    ("en_GB-semaine-medium.onnx#2", 0.67),
+    ("en_GB-jenny_dioco-medium.onnx", 0.65),
 ];
 
 /// A non-English model reading English: an accent, voiced at the measured
@@ -188,11 +191,11 @@ fn is_accent_model(spec: &str) -> bool {
 pub fn local_voices_on_disk(icao: &str) -> Vec<String> {
     local_accents_for(icao)
         .iter()
+        .map(|spec| crate::config::model_path(spec))
         .filter(|spec| {
             let path = spec.split('#').next().unwrap_or(spec);
             std::path::Path::new(path).exists()
         })
-        .map(|s| s.to_string())
         .collect()
 }
 

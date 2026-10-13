@@ -276,8 +276,12 @@ impl Config {
     /// Build a [`Config`] from environment variables, applying sensible defaults.
     /// Everything is local, so there are no required secrets.
     pub fn from_env() -> Result<Self> {
-        // Best-effort: load a local .env if present. Missing file is fine.
+        // Best-effort: load a local .env if present (the working directory's
+        // or a parent's). Missing file is fine. Then the data folder's
+        // (`sim::paths`, resolved now so `XCOPILOT_HOME` may come from the
+        // first): the first loaded wins, as dotenvy never overrides.
         let _ = dotenvy::dotenv();
+        let _ = dotenvy::from_path(sim::paths::env_file());
 
         Ok(Self {
             xplane_base_url: env_or("XPLANE_BASE_URL", "http://127.0.0.1:8086"),
@@ -441,48 +445,12 @@ impl Config {
             // the British passes: 22 VCTK, all 12 aru, three semaine and
             // jenny_dioco, each at a measured pace (`voice::MEASURED_PACE`),
             // which keeps the pool well over its one-third-British rule.
-            atc_voice_pool: env_or(
-                "XCOPILOT_ATC_VOICE_POOL",
-                "models/en_GB-vctk-medium.onnx#0,models/en_GB-vctk-medium.onnx#1,\
-                 models/en_GB-vctk-medium.onnx#2,models/en_GB-vctk-medium.onnx#3,\
-                 models/en_GB-vctk-medium.onnx#4,models/en_GB-vctk-medium.onnx#5,\
-                 models/en_GB-vctk-medium.onnx#6,models/en_GB-vctk-medium.onnx#7,\
-                 models/en_GB-vctk-medium.onnx#8,models/en_GB-vctk-medium.onnx#9,\
-                 models/en_GB-vctk-medium.onnx#14,models/en_GB-vctk-medium.onnx#15,\
-                 models/en_GB-vctk-medium.onnx#18,models/en_GB-vctk-medium.onnx#19,\
-                 models/en_GB-vctk-medium.onnx#20,models/en_GB-vctk-medium.onnx#22,\
-                 models/en_GB-vctk-medium.onnx#27,models/en_GB-vctk-medium.onnx#34,\
-                 models/en_GB-vctk-medium.onnx#37,models/en_GB-vctk-medium.onnx#58,\
-                 models/en_GB-vctk-medium.onnx#80,models/en_GB-vctk-medium.onnx#96,\
-                 models/en_GB-aru-medium.onnx#0,models/en_GB-aru-medium.onnx#1,\
-                 models/en_GB-aru-medium.onnx#2,models/en_GB-aru-medium.onnx#3,\
-                 models/en_GB-aru-medium.onnx#4,models/en_GB-aru-medium.onnx#5,\
-                 models/en_GB-aru-medium.onnx#6,models/en_GB-aru-medium.onnx#7,\
-                 models/en_GB-aru-medium.onnx#8,models/en_GB-aru-medium.onnx#9,\
-                 models/en_GB-aru-medium.onnx#10,models/en_GB-aru-medium.onnx#11,\
-                 models/en_GB-semaine-medium.onnx#0,models/en_GB-semaine-medium.onnx#1,\
-                 models/en_GB-semaine-medium.onnx#2,\
-                 models/en_GB-jenny_dioco-medium.onnx,models/en_GB-cori-medium.onnx,\
-                 models/en_GB-southern_english_female-low.onnx,\
-                 models/en_US-joe-medium.onnx,models/en_US-danny-low.onnx,\
-                 models/en_US-bryce-medium.onnx,models/en_US-john-medium.onnx,\
-                 models/en_US-norman-medium.onnx,models/en_US-kusal-medium.onnx,\
-                 models/en_US-lessac-medium.onnx,models/en_US-hfc_male-medium.onnx,\
-                 models/en_US-reza_ibrahim-medium.onnx,models/en_US-mike-medium.onnx,\
-                 models/en_US-sam-medium.onnx,models/en_US-kathleen-low.onnx,\
-                 models/en_US-libritts_r-medium.onnx#0,\
-                 models/en_US-libritts_r-medium.onnx#90,\
-                 models/en_US-libritts_r-medium.onnx#180,\
-                 models/en_US-libritts_r-medium.onnx#270,\
-                 models/en_US-libritts_r-medium.onnx#360,\
-                 models/en_US-libritts_r-medium.onnx#450,\
-                 models/en_US-libritts_r-medium.onnx#540,\
-                 models/en_US-libritts_r-medium.onnx#630,\
-                 models/en_US-libritts_r-medium.onnx#720,\
-                 models/en_US-libritts_r-medium.onnx#810",
-            ),
+            atc_voice_pool: env_or("XCOPILOT_ATC_VOICE_POOL", &default_atc_voice_pool()),
             atc_voice_shift: env_or("XCOPILOT_ATC_VOICE_SHIFT", "true") != "false",
-            atc_squelch_wav: env_or("XCOPILOT_SQUELCH_WAV", "assets/afv/Click_f32.wav"),
+            atc_squelch_wav: env_or(
+                "XCOPILOT_SQUELCH_WAV",
+                &sim::paths::asset("afv/Click_f32.wav").to_string_lossy(),
+            ),
             atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
             atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),
         }
@@ -503,14 +471,17 @@ impl Config {
     fn resolve_persona_voices(mut self) -> Self {
         // Fallbacks in preference order. Any voice here must be one nothing
         // else claims by default.
-        const ALTERNATES: &[&str] = &[
-            "models/en_GB-jenny_dioco-medium.onnx",
-            "models/en_US-kristin-medium.onnx",
-            "models/en_GB-southern_english_female-low.onnx",
-            "models/en_US-hfc_female-medium.onnx",
-            "models/en_GB-cori-high.onnx",
-            "models/en_US-lessac-high.onnx",
-        ];
+        let alternates: Vec<String> = [
+            "en_GB-jenny_dioco-medium.onnx",
+            "en_US-kristin-medium.onnx",
+            "en_GB-southern_english_female-low.onnx",
+            "en_US-hfc_female-medium.onnx",
+            "en_GB-cori-high.onnx",
+            "en_US-lessac-high.onnx",
+        ]
+        .iter()
+        .map(|f| model_path(f))
+        .collect();
 
         // The PILOT never moves: it is an explicit choice made in the panel
         // and must be honoured exactly. Everything else yields to it, and to
@@ -525,11 +496,10 @@ impl Config {
                 taken.push(slot.clone());
                 return;
             }
-            if let Some(alt) = ALTERNATES
-                .iter()
-                .find(|v| !taken.iter().any(|t| t == *v) && !self.atc_voice_pool.contains(**v))
-            {
-                *slot = (*alt).to_string();
+            if let Some(alt) = alternates.iter().find(|v| {
+                !taken.iter().any(|t| t == *v) && !self.atc_voice_pool.contains(v.as_str())
+            }) {
+                *slot = alt.clone();
                 taken.push(slot.clone());
             }
         };
@@ -551,6 +521,81 @@ impl Config {
         self.atc_voice_pool = pool_without(&self.atc_voice_pool, &personas);
         self
     }
+}
+
+/// The away-field controllers' default pool (see `atc_voice_pool` above for
+/// who is in it and why), each a file in [`models_dir`], `#N` a speaker.
+const ATC_VOICE_POOL: &[&str] = &[
+    "en_GB-vctk-medium.onnx#0",
+    "en_GB-vctk-medium.onnx#1",
+    "en_GB-vctk-medium.onnx#2",
+    "en_GB-vctk-medium.onnx#3",
+    "en_GB-vctk-medium.onnx#4",
+    "en_GB-vctk-medium.onnx#5",
+    "en_GB-vctk-medium.onnx#6",
+    "en_GB-vctk-medium.onnx#7",
+    "en_GB-vctk-medium.onnx#8",
+    "en_GB-vctk-medium.onnx#9",
+    "en_GB-vctk-medium.onnx#14",
+    "en_GB-vctk-medium.onnx#15",
+    "en_GB-vctk-medium.onnx#18",
+    "en_GB-vctk-medium.onnx#19",
+    "en_GB-vctk-medium.onnx#20",
+    "en_GB-vctk-medium.onnx#22",
+    "en_GB-vctk-medium.onnx#27",
+    "en_GB-vctk-medium.onnx#34",
+    "en_GB-vctk-medium.onnx#37",
+    "en_GB-vctk-medium.onnx#58",
+    "en_GB-vctk-medium.onnx#80",
+    "en_GB-vctk-medium.onnx#96",
+    "en_GB-aru-medium.onnx#0",
+    "en_GB-aru-medium.onnx#1",
+    "en_GB-aru-medium.onnx#2",
+    "en_GB-aru-medium.onnx#3",
+    "en_GB-aru-medium.onnx#4",
+    "en_GB-aru-medium.onnx#5",
+    "en_GB-aru-medium.onnx#6",
+    "en_GB-aru-medium.onnx#7",
+    "en_GB-aru-medium.onnx#8",
+    "en_GB-aru-medium.onnx#9",
+    "en_GB-aru-medium.onnx#10",
+    "en_GB-aru-medium.onnx#11",
+    "en_GB-semaine-medium.onnx#0",
+    "en_GB-semaine-medium.onnx#1",
+    "en_GB-semaine-medium.onnx#2",
+    "en_GB-jenny_dioco-medium.onnx",
+    "en_GB-cori-medium.onnx",
+    "en_GB-southern_english_female-low.onnx",
+    "en_US-joe-medium.onnx",
+    "en_US-danny-low.onnx",
+    "en_US-bryce-medium.onnx",
+    "en_US-john-medium.onnx",
+    "en_US-norman-medium.onnx",
+    "en_US-kusal-medium.onnx",
+    "en_US-lessac-medium.onnx",
+    "en_US-hfc_male-medium.onnx",
+    "en_US-reza_ibrahim-medium.onnx",
+    "en_US-mike-medium.onnx",
+    "en_US-sam-medium.onnx",
+    "en_US-kathleen-low.onnx",
+    "en_US-libritts_r-medium.onnx#0",
+    "en_US-libritts_r-medium.onnx#90",
+    "en_US-libritts_r-medium.onnx#180",
+    "en_US-libritts_r-medium.onnx#270",
+    "en_US-libritts_r-medium.onnx#360",
+    "en_US-libritts_r-medium.onnx#450",
+    "en_US-libritts_r-medium.onnx#540",
+    "en_US-libritts_r-medium.onnx#630",
+    "en_US-libritts_r-medium.onnx#720",
+    "en_US-libritts_r-medium.onnx#810",
+];
+
+fn default_atc_voice_pool() -> String {
+    ATC_VOICE_POOL
+        .iter()
+        .map(|f| model_path(f))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The voice pool with every voice in `taken` removed (empty entries in
@@ -589,11 +634,14 @@ pub fn xplane_path(rel: &str) -> String {
 }
 
 /// Where the voices and speech models live: `XCOPILOT_MODELS_DIR`, default
-/// `models` (relative, as every default path here is). The ONE owner of that
-/// folder: `xfc voices` installs into it and the defaults below are read from
-/// it, so moving it later (the user data folder) is a change here only.
+/// `models/` in the data folder (`sim::paths::models_default`; plain
+/// `models` in a checkout). The ONE owner of that folder: `xfc voices`
+/// installs into it and the defaults below are read from it.
 pub fn models_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env_or("XCOPILOT_MODELS_DIR", "models"))
+    match std::env::var("XCOPILOT_MODELS_DIR") {
+        Ok(dir) => std::path::PathBuf::from(dir),
+        Err(_) => sim::paths::models_default(),
+    }
 }
 
 /// A file in [`models_dir`], as the string a voice spec carries

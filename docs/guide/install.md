@@ -21,6 +21,18 @@ cargo run
 `plugins/xcopilot/` folder if there is one, since two copies would both load.
 Install it with X-Plane closed, or reload plugins afterwards.
 
+## Where files live
+
+Run from the checkout, everything stays in the checkout as before: `models/`,
+`logs/`, `prefs.json` and `.env` beside `profiles/`. A copied `xfc` run from
+anywhere else keeps the user's files in `~/Library/Application
+Support/XFlightCrew` (`$XDG_DATA_HOME/xflightcrew`, default
+`~/.local/share/xflightcrew`, on Linux): `models/`, `logs/` (the log, the
+blackbox, the sorties), `prefs.json`, `.env` and `profiles/learned/`. The
+profiles, checklists and assets it ships with sit beside the binary or in
+`../share/xflightcrew/`. `XCOPILOT_HOME=<dir>` puts everything in one folder
+instead. `xfc paths` prints which of the three it is and every location.
+
 ## Voices and the speech model
 
 `xfc voices` fetches them from Hugging Face into `models/` (or

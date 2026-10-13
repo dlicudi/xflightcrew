@@ -10,17 +10,20 @@ pub fn load(id: &str) -> Option<AircraftProfile> {
 /// [`load`], with or without the "loaded from YAML" log line (the matcher
 /// sweep reads every profile and would print one per file).
 pub(super) fn read_profile(id: &str, log: bool) -> Option<AircraftProfile> {
-    let path = format!("profiles/{id}.yaml");
+    let path = sim::paths::profiles_dir().join(format!("{id}.yaml"));
     match std::fs::read_to_string(&path) {
         Ok(text) => match serde_yaml::from_str::<AircraftProfile>(&text) {
             Ok(profile) => {
                 if log {
-                    tracing::info!(path = %path, "loaded aircraft profile from YAML");
+                    tracing::info!(path = %path.display(), "loaded aircraft profile from YAML");
                 }
                 Some(profile)
             }
             Err(e) => {
-                tracing::error!("failed to parse {path}: {e:#}; falling back to built-in");
+                tracing::error!(
+                    "failed to parse {}: {e:#}; falling back to built-in",
+                    path.display()
+                );
                 builtin(id)
             }
         },
@@ -65,7 +68,7 @@ impl ProfileMatch {
 /// YAMLs in `profiles/` (read the way [`load`] reads them), and a built-in
 /// whose YAML is missing. A profile without a block is left out.
 pub fn profile_matchers() -> Vec<(String, ProfileMatch)> {
-    let mut ids: Vec<String> = std::fs::read_dir("profiles")
+    let mut ids: Vec<String> = std::fs::read_dir(sim::paths::profiles_dir())
         .into_iter()
         .flatten()
         .flatten()

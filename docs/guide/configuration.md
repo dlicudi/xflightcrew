@@ -1,7 +1,8 @@
 # Configuration
 
 Settings come from the environment or `.env`, then `prefs.json`, then the
-defaults. [.env.example](../../.env.example) lists them all. Most can also be
+defaults. The `.env` is the working directory's (or a parent's), then the
+data folder's; `xfc paths` shows where the data folder and `prefs.json` are. [.env.example](../../.env.example) lists them all. Most can also be
 changed live from the panel's Settings tab or the terminal; one set in the
 environment is fixed and the screen says which variable to change.
 
@@ -19,7 +20,8 @@ environment is fixed and the screen says which variable to change.
 | `XCOPILOT_SIMBRIEF_ID` | | your SimBrief username |
 | `XCOPILOT_TRAFFIC` | `off` | `ours`, `real`, or `off` |
 | `XCOPILOT_EFB` | `false` | serve the EFB page on your network |
-| `XCOPILOT_MODELS_DIR` | `models` | where voices and speech models live |
+| `XCOPILOT_HOME` | | one folder for everything (see [install](install.md#where-files-live)) |
+| `XCOPILOT_MODELS_DIR` | `models` in the data folder | where voices and speech models live |
 
 ## Voices and speech models
 
