@@ -989,6 +989,8 @@ pub(crate) struct TrafficOut {
     /// Feet, only in the air.
     pub(crate) alt_ft: Option<f64>,
     pub(crate) gs_kts: f64,
+    /// The route still ahead, [lat, lon] pairs: drawn for the selected one.
+    pub(crate) ahead: Vec<[f64; 2]>,
 }
 
 /// A stand somebody holds.
@@ -1070,6 +1072,7 @@ pub(crate) fn traffic_out(fields: &[crate::efb::feed::TrafficField]) -> Vec<Traf
             est: a.est.clone(),
             alt_ft: (!a.on_ground).then(|| (a.alt_ft / 10.0).round() * 10.0),
             gs_kts: a.gs_kts.round(),
+            ahead: a.ahead.iter().map(|&(la, lo)| [r6(la), r6(lo)]).collect(),
         })
         .collect()
 }

@@ -156,6 +156,9 @@
   var own = null;   // our aircraft's glide, and `ownD` its last state
   var ownD = null;
   var tr = {};      // id -> glide with `d`, the traffic's state
+  // Where each aircraft has been since the page saw it: one point a second
+  // at most, the last TRAIL_MAX; drawn for the selected one only.
+  var TRAIL_MAX = 300, trails = {};
   function updateTraffic(list, t) {
     var seen = {};
     (list || []).forEach(function (a) {
@@ -163,8 +166,39 @@
       var g = glideTo(tr[a.id], a.lat, a.lon, a.hdg, t);
       g.d = a;
       tr[a.id] = g;
+      var tl = trails[a.id] || (trails[a.id] = []);
+      var last = tl[tl.length - 1];
+      if (!last || last.lat !== a.lat || last.lon !== a.lon) {
+        tl.push({ lat: a.lat, lon: a.lon });
+        if (tl.length > TRAIL_MAX) tl.shift();
+      }
     });
-    Object.keys(tr).forEach(function (k) { if (!seen[k]) delete tr[k]; });
+    Object.keys(tr).forEach(function (k) { if (!seen[k]) { delete tr[k]; delete trails[k]; } });
+  }
+  // The selected aircraft's trail behind it (fading) and its route ahead
+  // (dashed), under the symbols.
+  function drawSelectedPath(t) {
+    if (!sel || sel.kind !== 'ac' || !tr[sel.id]) return;
+    var a = tr[sel.id].d, n = glideNow(tr[sel.id], t);
+    screenTransform();
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    var tl = trails[sel.id] || [];
+    for (var i = 1; i < tl.length; i++) {
+      ctx.beginPath();
+      ctx.moveTo(sx(mx(tl[i - 1].lon)), sy(my(tl[i - 1].lat)));
+      ctx.lineTo(sx(mx(tl[i].lon)), sy(my(tl[i].lat)));
+      ctx.globalAlpha = 0.15 + 0.75 * i / tl.length;
+      ctx.strokeStyle = C.cyan; ctx.lineWidth = 3; ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    if (a.ahead && a.ahead.length) {
+      ctx.beginPath();
+      ctx.moveTo(sx(n.X), sy(n.Y));
+      a.ahead.forEach(function (p) { ctx.lineTo(sx(mx(p[1])), sy(my(p[0]))); });
+      ctx.setLineDash([8, 6]);
+      ctx.strokeStyle = C.violet; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.setLineDash([]);
+    }
   }
 
   // ------------------------------------------------------------ the fields' diagrams
@@ -1287,6 +1321,7 @@
     drawTaxiRoute();
     drawFieldMarks(shown);
     vis.forEach(drawStands);
+    drawSelectedPath(t);
     drawTraffic(t);
     drawOwn(o);
     drawLabels(t, o, vis, alpha);

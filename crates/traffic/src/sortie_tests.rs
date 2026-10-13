@@ -2553,3 +2553,19 @@ fn without_turnarounds_a_finished_arrival_still_goes() {
         .any(|(k, r, _)| *k == crate::schedule::MovementKind::Arrival
             && *r == crate::phase::Despawn::Parked));
 }
+
+/// The way still ahead (the EFB's selected aircraft): past the segment
+/// being flown, thinned with the last point kept, empty once done.
+#[test]
+fn the_route_ahead_is_what_is_left_of_it() {
+    let path: Vec<LatLon> = (0..50).map(|i| (36.0 + i as f64 * 0.001, -4.0)).collect();
+    let mut r = crate::aircraft::Route::taxi(path.clone());
+    r.follow.seg = 9;
+    assert_eq!(r.ahead(100), path[10..].to_vec());
+    let thin = r.ahead(5);
+    assert_eq!(thin.len(), 5);
+    assert_eq!(thin[0], path[10]);
+    assert_eq!(*thin.last().unwrap(), path[49]);
+    r.follow.done = true;
+    assert!(r.ahead(5).is_empty());
+}

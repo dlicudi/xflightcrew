@@ -373,6 +373,8 @@ pub(crate) struct TrafficAc {
     pub(crate) alt_ft: f64,
     pub(crate) on_ground: bool,
     pub(crate) gs_kts: f64,
+    /// The route still ahead (lat, lon), thinned ([`traffic::aircraft::Route::ahead`]).
+    pub(crate) ahead: Vec<(f64, f64)>,
 }
 
 /// A stand one of our traffic holds ([`traffic::fleet::Fleet::stand_holder`]).
