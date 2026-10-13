@@ -14772,3 +14772,45 @@ the field the traffic runs at.
   Stand cell filled for departures, numbers only; the selector offering LXGB, its board by the
   clock, back to LEMG on "(our traffic)"; the log line `traffic: a board for another field`.
   Owed: the planned stand is not yet kept clear of a neighbour's way out (the two 18 m overlaps).
+
+## 2026-10-13: several fields at once, drawn within 40 nm (multi-field traffic stages 1 to 3)
+
+The pilot's ask: every timetable field within about 100 nm simulated, aircraft drawn within
+about 40 nm (TCAS range), drawing being the frame cost. Built from
+`docs/tasks/multi-field-traffic/DESIGN.md` (its "Built" section has the detail), offline.
+
+- **The cull** (`traffic_sink::DrawCull`): the sink sends the plugin only the aircraft within
+  40 nm, kept to 44 nm once drawn (no flicker on the ring: every roster change destroys and
+  recreates the XPMP2 plane), at most 120, parked ones beyond 15 nm dropped first. The
+  blackbox `traffic` `draw` record counts `simulated`, `drawn`, `parked_drawn`. No plugin
+  change.
+- **Seeds and ids**: a field's day was seeded by the count of fields built this session (a
+  revisit drew another day; two fleets' days hung on build order); now
+  `traffic::field_seed(icao, SESSION_SEED)`, and the board by the clock uses the same seed.
+  Every `Link` counted ids from 1, so two fleets would have shared ids in the party line's
+  strips and the plugin's roster; now one counter (`traffic_link::Ids`).
+- **Several fleets**: `TrafficWorld` keeps a link per field: the installed station's, worked
+  as before, and every timetable field within 100 nm (kept to 120), each worked by a runway
+  desk of its own (`traffic::FieldDesk`: one landing or departure on the runway at a time,
+  claims computed from the fleet each tick, no readbacks), silent and never through the party
+  line (the station's statics are one field's: `RunwayBook::now`, the sequence numbers and
+  the holds iterate every traffic strip, whatever its field). The station moving hands the old
+  field's fleet to a desk (adopted where each flight's phase says it was cleared) and the new
+  one's to the station (its moving aircraft leave the frequency, the reinstall rule). Every
+  `traffic` record names its `field`.
+- **The board**: the selector's LXGB is the LIVE board of LXGB's fleet once it is simulated,
+  the clock board only while it loads.
+- **Harness**: `two_fields_fly_at_once_on_their_desks` (XTST and ULMM generated, 0 conflicts,
+  0 overlaps, every movement done); `real_install_two_fields_at_once`, LEMG's station and
+  LXGB's desk from the 10:00 mid-flow start: 30 min LEMG 6 completed, 10 touchdowns, 0
+  conflicts, 1 overlap, 0 go-arounds, 9 tows; LXGB 1 completed, 1 touchdown, 0 conflicts, 0
+  overlaps, 0 go-arounds, 0 tows. 3 h: LEMG 26, 42, 0, 6, 11, 56; LXGB 3, 2, 0, 1, 0, 0. LEMG
+  alone flies the same (asserted).
+
+- **UNFLOWN.** Next session with `XCOPILOT_TRAFFIC=ours` at LEMG (no plugin reload needed):
+  the log's `traffic: the fleet is up` twice (LEMG, then LXGB), the blackbox `traffic` `draw`
+  counts (`simulated` above `drawn`; LXGB's aircraft drawn as they come within 40 nm, e.g. an
+  arrival or departure over the Strait, none of LXGB's parked ones from LEMG's 54 nm), fps and
+  `api_load` beside them; the Board tab's LXGB live (statuses moving with LXGB's own aircraft,
+  "At gate" once one parks). Owed: stage 4 (the station adopts a desk's strips; speech by
+  frequency), stage 5.
