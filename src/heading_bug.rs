@@ -391,6 +391,7 @@ mod tests {
         ("autoland", "spawn_autoland", 1, "the keyed knob is bug_toward through BugHold, the final in whole degrees no oftener than every ten seconds; hand flown from minimums, never written"),
         ("autotakeoff", "fly", 1, "setup: the runway heading preset on the brakes before the roll"),
         ("tools/autopilot", "execute", 1, "the pilot's own heading selection"),
+        ("identify", "main_cmd", 1, "setup: the bug on the nose before the measurement flight engages HDG, wings level"),
         ("tools/recover", "hold_heading_and_altitude", 1, "the recovery's hold on the heading of the moment (the nose)"),
     ];
 

@@ -45,6 +45,7 @@ mod failures;
 mod flight;
 mod duty;
 mod handover;
+mod identify;
 mod flight_state;
 mod scoped;
 mod lifetimes;
@@ -434,6 +435,15 @@ async fn main() -> Result<()> {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         let passed = conform::main_cmd(&rest, &config.xplane_base_url, &config.aircraft).await?;
         std::process::exit(if passed { 0 } else { 1 });
+    }
+
+    // `xvl identify`: the measurement flight that teaches the pilot
+    // controller the loaded airframe (src/identify.rs), its fits stored per
+    // .acf in profiles/learned/. A second process like conform: xvl stopped.
+    if std::env::args().nth(1).as_deref() == Some("identify") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        let stored = identify::main_cmd(&rest, &config.xplane_base_url).await?;
+        std::process::exit(if stored { 0 } else { 1 });
     }
 
     // `cargo run -- analyze` mines the logs for fast-path coverage and the
