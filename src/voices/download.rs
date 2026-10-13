@@ -51,9 +51,24 @@ pub fn list_dir(dir: &Path) -> BTreeMap<String, u64> {
         .collect()
 }
 
-/// Remove leftover `.part` files from an interrupted run.
+/// A `.part` written to within this long may be another run's download in
+/// progress (a live stream writes every few milliseconds): left alone.
+const PART_IDLE: Duration = Duration::from_secs(10 * 60);
+
+/// Remove leftover `.part` files from an interrupted run, never one still
+/// being written by a second `xfc voices`.
 pub fn clean_stale_parts(dir: &Path) -> Vec<String> {
-    let stale = catalogue::stale_parts(&list_dir(dir));
+    let idle = |name: &String| {
+        std::fs::metadata(dir.join(name))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= PART_IDLE)
+    };
+    let stale: Vec<String> = catalogue::stale_parts(&list_dir(dir))
+        .into_iter()
+        .filter(idle)
+        .collect();
     for name in &stale {
         let _ = std::fs::remove_file(dir.join(name));
     }
@@ -398,9 +413,19 @@ mod tests {
     fn stale_parts_are_cleaned_and_remove_takes_both_files() {
         let dir = scratch("clean");
         std::fs::write(dir.join("a.onnx.part"), b"x").unwrap();
+        // A part still being written (fresh) is another run's: kept.
+        std::fs::write(dir.join("b.onnx.part"), b"x").unwrap();
+        let old = std::time::SystemTime::now() - PART_IDLE - Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("a.onnx.part"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         std::fs::write(dir.join("k.onnx"), b"x").unwrap();
         std::fs::write(dir.join("k.onnx.json"), b"x").unwrap();
         assert_eq!(clean_stale_parts(&dir), ["a.onnx.part"]);
+        std::fs::remove_file(dir.join("b.onnx.part")).unwrap();
         remove(Kind::Piper, "k", &dir).unwrap();
         assert!(list_dir(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
