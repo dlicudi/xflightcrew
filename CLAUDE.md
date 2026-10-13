@@ -483,8 +483,10 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   `xcopilot/pitch`, handed over after 10 s (`ap_not_engaged`). **The VS watchdog excuses a slow
   autopilot, never a dead one** (`vs_not_held`).
 - **A mountain field is a flyable approach or a hand-over** (`mountain_field`); **a MAP on the
-  runway fix is a landing** (`map_short_of_runway`). **The ILS is tuned, watched and, per airframe,
-  flown** (`src/ils.rs`, `ils_coupled`); **a positive `vdef` is ABOVE the beam**
+  runway fix is a landing** (`map_short_of_runway`). **The ILS is tuned, watched and flown
+  coupled wherever the airframe's autopilot has an approach mode** (`src/ils.rs`,
+  `coupled_allowed`: the profile's `ils_coupled` when declared, else the survey's
+  `ApType::has_approach`); **a positive `vdef` is ABOVE the beam**
   (`ils::above_glideslope`). A declared MCP course window is the OBS's source (`windows.course`).
 - **Where the airframe declares it, its autopilot LANDS and the crew monitors**
   (`autopilot_lands:`, `src/ap_lands.rs`, the Zibo): APP from below the beam, the captures the
@@ -514,10 +516,22 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   where coupled, else HDG set by `FinalHeading`: course, crab and a cut, whole degrees, no oftener
   than every 10 s, less the autopilot's own standing error, learnt); FROM MINIMUMS
   (`arrest::minimums_ft`: the coupled ILS's `ils_decouple_agl_ft`, else 200; any other final 300)
-  the servos come out and `src/pilot` hand-flies to the wheels: bank through the ailerons on the
-  roll response measured in flight (`pilot::bank`) to the PAINTED centreline (`pilot::line`; a
-  coupled line was 8 to 23 m off it), the attitude law for the path then the flare, power on total
-  energy. The heading bug is never a control stick: nothing writes it below minimums.
+  the servos come out and `src/pilot` hand-flies to the wheels: bank through the ailerons to the
+  PAINTED centreline (`pilot::line`, NPFG; a coupled line was 8 to 23 m off it), the rudder
+  coordinating then DECRABBING before the wheels (`pilot::yaw`: the wing down into the wind with
+  it), the attitude law for the path then the flare, power on TECS (`pilot::energy`). The heading
+  bug is never a control stick: nothing writes it below minimums.
+- **The pilot flies on MEASURED responses, never typed gains** (2026-10-13): each axis' response
+  (`aircraft::learned::Response`: effectiveness, damping, the airflow angle's spring and path,
+  delay) is an identification's (`xvl identify`, `src/identify.rs`, stored per `.acf` in
+  `profiles/learned/`, keyed by the `.acf`'s fingerprint and a schema version, loaded by the
+  detector into the facts' `acf_model`), else the fleet's prior; scaled by the air
+  (`Response::at`); every loop's gains by ONE rule (`pilot::response::design`, McRuer's
+  crossover at a 50 degree margin); the roll refined in flight (`RollResponse`). TECS's
+  `K_thr2STE` and spool are measured or the book's (twice `best_climb_fpm`, the engine class).
+  The NOSE is limited by the `.acf`'s geometry (tail strike, mains first; else the profile's
+  `tail_strike_deg`), never the elevator. A profile never declares `flare_elevator`,
+  `flare_power`, `arrest_lead` or `final_track` (`no_profile_types_the_pilots_numbers`).
 - **Autoland core**: a sticky `MissedStage`; give-ups hand back a FLYABLE aircraft; the glidepath
   aims at the pavement (`aim_elevation_ft`). **The crab is LOW-PASSED** (`CrabFilter`, 5 s).
 - **A tower's go-around order outranks everything, and reaches whoever flies the final**
@@ -526,16 +540,18 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   go-around pitches for speed** (`go_around_vs_fpm`).
 - **The servos come out at minimums** (`arrest_hands_step`): an engaged servo writes the yoke
   back. **The AP comes out at the wheels** (`disconnect_autopilot`). **Once taken, the servos stay
-  out** (`hold_roundout`). The VS dial above minimums leads the AP's lag (`ArrestLeadProfile`).
-- **The flare is the attitude law** (`autoland::attitude_flare`), one law for every fixed-wing
-  airframe: the nose angle for the path (gamma = theta - alpha) from a gate of the sink times 3 s,
-  a smoothstep to a -70 fpm hold-off, a disturbance observer for the elevator the nose needs, a
-  declared `ground_pull` where a low wing's ground effect was measured; its path trim closes inside
-  the flare and never winds below zero (a gust wound it down: 441 fpm). Tested on plants FITTED to
-  five airframes' recorded flares (`attitude_flare_tests`, the roll plants in `pilot::plants_tests`),
-  never on an invented plant (one with a lift slope five times too steep hid the windy sag).
-- **The retard is keyed on height, time and speed, never on the sink the arrest removes**
-  (`FlarePower`); **a FLOAT takes the thrust off** (at its own `retard_float_per_s`).
+  out** (`hold_roundout`).
+- **The flare is the attitude law** (`pilot::attitude`), one law for every fixed-wing airframe:
+  the nose angle for the path (gamma = theta - alpha) from a gate of the sink times 3 s, a
+  smoothstep to a -70 fpm hold-off, a disturbance observer for the elevator the nose needs (it
+  finds the low wings' ground effect: no declared pull); its path trim closes inside the flare and
+  never winds below zero (a gust wound it down: 441 fpm). Tested on plants FITTED to recorded
+  flights (`pilot::plants_tests`: six airframes' flares and arrests, the 737's identification),
+  each IDENTIFIED first as `xvl identify` flies it, never on an invented plant (one with a lift
+  slope five times too steep hid the windy sag).
+- **The flare's power is TECS's**: height first, the lever only back, at idle with the engine
+  spooled down as the wheels the flare PLANS arrive (`attitude::planned_s`); underspeed and bad
+  descent protections on the hand-flown path.
 - **A low flare with room to stop is COMMITTED** (`autoland::commit_flare`) and **stays committed**
   (`commit_flare_latched`). **The go/no-go is decided at the roundout gate, never at 4 ft**
   (`landing_call`, where `landing_roll_ft` is declared): the predicted touchdown must leave the ROLL,
@@ -685,7 +701,10 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   env-pinned knob is REFUSED on screen, naming the variable. A panel toggle is a pick only when it
   differs from our LAST PUBLISH (`pollers::panel_sync`); else a terminal or EFB change is published.
 - **Only settings persist** (`prefs.json`, env, geometry). Never a state dump: persisted facts
-  outlive their context.
+  outlive their context. The one other file is an airframe's MEASURED model
+  (`profiles/learned/<acf>.json`, `aircraft::learned`): a property of the `.acf` like a profile
+  line, written only by `xvl identify`, keyed to the `.acf`'s fingerprint (an edit retires it,
+  said) and a schema version, reviewed and committed like a profile.
 
 ## EFB: a page on the LAN (`src/efb/`, `docs/efb.md`)
 
