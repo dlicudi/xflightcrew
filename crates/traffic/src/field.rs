@@ -363,9 +363,11 @@ impl FieldModel {
     /// forward vacate rolled 1.2 km to the far end, waited there for a
     /// crossing and was cleared 1,850 m back down the whole runway: the
     /// strip held for minutes, 22 go-arounds in the hour. A real crew turns
-    /// round and backtracks as it slows. The backtrack is taken when its
-    /// drive to the stand is under [`BACKTRACK_SAVES`] of the forward one,
-    /// or when there is no exit ahead at all. The parking is the one an
+    /// round and backtracks as it slows. The backtrack is taken only when
+    /// no exit ahead leads to the parking without crossing a runway: a
+    /// shorter drive is no reason to turn round on a runway with good exits
+    /// ahead (LEMG 12, 2026-10-13: arrivals slowed, turned round and drove
+    /// back to a rapid exit built for runway 30). The parking is the one an
     /// `icao_type` takes ([`FieldModel::parking_near`]).
     ///
     /// It never ends where somebody stands (`standing`, the aircraft
@@ -478,15 +480,17 @@ impl FieldModel {
         let behind = plan((hdg + 180.0).rem_euclid(360.0), None);
         let ahead = ahead.map(|v| self.off_the_strip(v, stand));
         let behind = behind.map(|v| self.off_the_strip(v, stand));
-        // The whole drive to the parking: the vacate, then the stand route.
-        let drive_m = |v: &VacatePlan| -> Option<f64> {
+        // A way off that reaches the parking, and whether it crosses a
+        // runway to get there.
+        let reaches = |v: &VacatePlan| -> Option<bool> {
             let off = *v.path.last()?;
             let route = self.net.plan_to_stand(off.0, off.1, stand)?;
-            Some(path_m(&v.path) + path_m(&route.path))
+            Some(route.crossings.is_empty())
         };
         match (ahead, behind) {
-            (Some(a), Some(b)) => match (drive_m(&a), drive_m(&b)) {
-                (Some(da), Some(db)) if db < BACKTRACK_SAVES * da => Some(b),
+            (Some(a), Some(b)) => match (reaches(&a), reaches(&b)) {
+                (Some(true), _) => Some(a),
+                (_, Some(true)) | (None, Some(false)) => Some(b),
                 _ => Some(a),
             },
             (a, b) => a.or(b),
@@ -917,11 +921,6 @@ const APRON_SPOT_GAP_M: f64 = 40.0;
 /// A field without stands gets at most this many.
 const APRON_SPOTS_MAX: usize = 12;
 
-/// A backtrack vacate is taken when its drive to the parking is under this
-/// share of the forward one's ([`FieldModel::vacate`]): a turn round on the
-/// runway is paid for only by a real saving.
-pub const BACKTRACK_SAVES: f64 = 0.6;
-
 /// A way off picked at speed runs on a runway past its junction no further
 /// than this, metres (the turn off the pavement, a jet's wide one included):
 /// more is a drive along the strip ([`FieldModel::vacate_at_speed`]).
@@ -1151,6 +1150,35 @@ mod tests {
             e09.frame(*v.path.last().unwrap()).0 > 500.0,
             "forward to the next exit"
         );
+    }
+
+    /// LEMG (2026-10-13): arrivals on 12 slowed, turned round on the
+    /// runway and drove back to a rapid exit built for 30, with good exits
+    /// ahead. On every end, a rollout anywhere from 600 to 2,000 m vacates
+    /// FORWARD: a backtrack is only for a field with no way to the parking
+    /// ahead (BIEG).
+    #[test]
+    #[ignore] // needs the X-Plane install; run with --ignored
+    fn real_install_lemg_never_backtracks_past_exits_ahead() {
+        let apt = nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let Ok(Some(f)) = FieldModel::load(&apt, "LEMG") else {
+            return;
+        };
+        let mut back = Vec::new();
+        for ident in ["12", "30", "13", "31"] {
+            let Some(e) = f.end(ident) else { continue };
+            for along in (600..=2000).step_by(100) {
+                let here = e.at(along as f64, 0.0);
+                let Some(v) = f.vacate(here, e.course_deg, &e, "A320", &[]) else {
+                    continue;
+                };
+                let off = e.frame(*v.path.last().unwrap()).0;
+                if off < along as f64 {
+                    back.push(format!("{ident} at {along} m: off at {off:.0} m ({})", v.exit_name));
+                }
+            }
+        }
+        assert!(back.is_empty(), "backtracked:\n{}", back.join("\n"));
     }
 
     #[test]
