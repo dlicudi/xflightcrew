@@ -3541,6 +3541,30 @@
         assert!(d.stuck(151.0));
     }
 
+    /// Queued behind traffic, every tick notes its fix THEN holds (LEMG
+    /// 2026-10-13): the hold excuses the whole tick, so a wait far longer
+    /// than the route's deadline is never a stall, and the deadline counts
+    /// again from the moment the queue moves.
+    #[test]
+    fn a_hold_after_each_note_excuses_the_whole_wait() {
+        let mut w = ProgressWatch::start(0.0, 100.0);
+        let mut t = 0.0;
+        while t < 1000.0 {
+            w.note(50.0, t);
+            w.hold(t + 0.001);
+            t += 0.2;
+        }
+        assert!(!w.stuck(t), "a 1,000 s queue against a 100 s deadline");
+        // Moving again: the 100 s are spent from here, on ground made.
+        let t0 = t;
+        while t < t0 + 99.0 {
+            w.note(50.0 + 25.0 * (t - t0), t);
+            t += 0.2;
+        }
+        assert!(!w.stuck(t));
+        assert!(w.stuck(t0 + 101.0));
+    }
+
     /// A route that doubles back (LFRG 12, 2026-10-05: down the strip, a
     /// turn-round, back up it) jumps its projection ahead at the turn and
     /// back: neither is ground, and the drive back up the strip IS.

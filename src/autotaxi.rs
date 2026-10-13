@@ -470,6 +470,11 @@ pub struct ProgressWatch {
     /// When the route's deadline falls, and the last time seen.
     deadline: Option<f64>,
     last_t: Option<f64>,
+    /// The last tick was held: the time to the next one is excused too. A
+    /// tick notes, THEN holds, so the note had already moved `last_t` to
+    /// now and the hold alone excused nothing (LEMG 2026-10-13: queued
+    /// behind traffic, the deadline gave the taxi up at 656 s).
+    held: bool,
     /// The last progress noted and when, to tell a re-projection from a
     /// movement.
     last_p: Option<(f64, f64)>,
@@ -482,10 +487,14 @@ impl ProgressWatch {
             best: Some((f64::NEG_INFINITY, t_s)),
             deadline: Some(t_s + deadline_s),
             last_t: Some(t_s),
+            held: false,
             last_p: None,
         }
     }
     pub fn note(&mut self, progress_m: f64, t_s: f64) {
+        if std::mem::take(&mut self.held) {
+            self.excuse_to(t_s);
+        }
         self.last_t = Some(t_s);
         let jumped = self.last_p.is_some_and(|(p, t)| {
             (progress_m - p).abs() > PROJECTION_JUMP_M + PROJECTION_JUMP_MPS * (t_s - t).max(0.0)
@@ -511,12 +520,17 @@ impl ProgressWatch {
     /// Standing still for a reason that is not a stall: the clock restarts
     /// and the deadline moves on by the time held.
     pub fn hold(&mut self, t_s: f64) {
-        if let (Some(d), Some(l)) = (self.deadline.as_mut(), self.last_t) {
-            *d += (t_s - l).max(0.0);
-        }
+        self.excuse_to(t_s);
+        self.held = true;
         self.last_t = Some(t_s);
         if let Some((_, t)) = self.best.as_mut() {
             *t = t_s;
+        }
+    }
+    /// The deadline moved on by the time since the last tick seen.
+    fn excuse_to(&mut self, t_s: f64) {
+        if let (Some(d), Some(l)) = (self.deadline.as_mut(), self.last_t) {
+            *d += (t_s - l).max(0.0);
         }
     }
     /// Seconds since the route last gave up a step, 0 before the first fix.
@@ -535,6 +549,7 @@ static PROGRESS: std::sync::Mutex<ProgressWatch> = std::sync::Mutex::new(Progres
     best: None,
     deadline: None,
     last_t: None,
+    held: false,
     last_p: None,
 });
 static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
