@@ -356,10 +356,29 @@ pub(super) fn track_velocity(
 /// How a ghost on our strip will leave it, from its track (lat, lon, seconds;
 /// oldest first, the last is now). Pure: the go-around judgement's and the
 /// landing release's one question.
+#[cfg_attr(not(test), allow(dead_code))] // the judgements ask `strip_exit_as`
 pub(crate) fn strip_exit(
     r: &nav::Runway,
     landing_end: &str,
     track: &[(f64, f64, f64)],
+) -> StripExit {
+    strip_exit_as(r, landing_end, track, false)
+}
+
+/// [`strip_exit`] knowing whether the occupant is a DEPARTURE the tower
+/// cleared for takeoff ([`departures_on_the_ground`]): standing anywhere it
+/// is lined up, and moving our way it is rolling, off at its liftoff from
+/// the speed it has ([`roll_to_liftoff_s`]), whatever its acceleration reads.
+/// Only an unknown occupant fast and not seen accelerating is a lander
+/// rolling out. LEMG 13 (2026-10-13): RYR5024, cleared for takeoff and
+/// rolling at about 90 kt 824 m down, was read as a rollout (40 s) instead
+/// of about 15 s from liftoff, and we were sent round; it lifted off 25 s
+/// before our threshold.
+pub(crate) fn strip_exit_as(
+    r: &nav::Runway,
+    landing_end: &str,
+    track: &[(f64, f64, f64)],
+    departing: bool,
 ) -> StripExit {
     let Some(f) = LandingFrame::new(r, landing_end) else {
         return StripExit::Stays;
@@ -369,7 +388,7 @@ pub(crate) fn strip_exit(
     };
     let (along, cross) = f.place(lat, lon);
     let standing = || {
-        if along < LINED_UP_ZONE_M {
+        if departing || along < LINED_UP_ZONE_M {
             StripExit::LinedUp(roll_to_liftoff_s(0.0))
         } else {
             StripExit::Stays
@@ -396,7 +415,7 @@ pub(crate) fn strip_exit(
             let prev_kts = (pa * pa + pc * pc).sqrt() * 1.943_844;
             (kts - prev_kts) / (track[track.len() - 1].2 - track[older].2)
         });
-        return if kts < 40.0 || accel.is_some_and(|a| a >= 0.5) {
+        return if departing || kts < 40.0 || accel.is_some_and(|a| a >= 0.5) {
             StripExit::Clearing(roll_to_liftoff_s(kts))
         } else {
             StripExit::Clearing(ROLLOUT_CLEAR_S)
@@ -541,6 +560,8 @@ pub(crate) fn departure_clears_lander(lander_s: Option<f64>, line_up_s: f64) -> 
 pub(super) struct Occupant {
     callsign: String,
     pub(super) exit: StripExit,
+    /// A flight the tower cleared for takeoff ([`departures_on_the_ground`]).
+    departing: bool,
     /// Metres past our landing threshold along the landing direction, and
     /// off the centreline (left positive). `None` without our strip.
     along_m: Option<f64>,
@@ -579,18 +600,23 @@ pub(super) fn strip_exits_unnoted(
             .clone(),
     };
     let frame = ours.and_then(|r| LandingFrame::new(r, landing_end));
+    // Asked before the ghost memory's lock: the strips' cells, one at a time.
+    let departures = departures_on_the_ground();
     let guard = STRIP_SEEN.lock().unwrap_or_else(|e| e.into_inner());
     targets
         .iter()
         .filter(|t| runways.iter().any(|r| occupies(r, t, now).is_some()))
         .map(|t| {
+            let departing = departures.iter().any(|&(lat, lon)| {
+                crate::nav::haversine_nm(lat, lon, t.lat, t.lon) * 1852.0 < DEPARTURE_MATCH_M
+            });
             let exit = match (ours, guard.as_ref().and_then(|g| g.get(&t.callsign))) {
                 (Some(r), Some(tr)) => {
                     let track: Vec<(f64, f64, f64)> = tr
                         .iter()
                         .map(|p| (p.0, p.1, -now.saturating_duration_since(p.2).as_secs_f64()))
                         .collect();
-                    strip_exit(r, landing_end, &track)
+                    strip_exit_as(r, landing_end, &track, departing)
                 }
                 _ => StripExit::Stays,
             };
@@ -598,12 +624,46 @@ pub(super) fn strip_exits_unnoted(
             Occupant {
                 callsign: t.callsign.clone(),
                 exit,
+                departing,
                 along_m: place.map(|p| p.0),
                 cross_m: place.map(|p| p.1),
                 standing_s: standing_secs(&t.callsign, now),
             }
         })
         .collect()
+}
+
+/// A runway occupant is the flight a strip cleared for takeoff when it stands
+/// this close to where that strip was last seen (the same traffic step feeds
+/// both; a roll at 90 kt moves 46 m a second).
+pub(super) const DEPARTURE_MATCH_M: f64 = 100.0;
+
+/// Where every flight the tower has cleared for takeoff, still on the
+/// ground, was last seen: ours (the traffic link's fresh note) and each
+/// traffic strip's. The runway judgement reads an occupant there as a
+/// departure ([`strip_exit_as`]). Each cell locked alone.
+pub(super) fn departures_on_the_ground() -> Vec<(f64, f64)> {
+    let cleared = |s: &FlightStrip| {
+        s.clearance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|c| c.state == tower::State::TakeoffCleared)
+    };
+    let mut out = Vec::new();
+    if cleared(&OWN_STRIP) {
+        out.extend(
+            own_seen()
+                .filter(|s| s.on_ground)
+                .and_then(|s| s.position()),
+        );
+    }
+    for (_, s) in traffic_strips() {
+        if cleared(&s) {
+            out.extend(seen(&s).filter(|s| s.on_ground).and_then(|s| s.position()));
+        }
+    }
+    out
 }
 
 /// The last "go-around deferred" record: the judgement is logged at a
@@ -627,7 +687,7 @@ pub(super) fn exits_json(exits: &[Occupant]) -> serde_json::Value {
                     "clear_s": s.map(|s| (s * 10.0).round() / 10.0),
                     "along_m": o.along_m.map(f64::round),
                     "cross_m": o.cross_m.map(f64::round),
-                    "standing_s": o.standing_s.round()})
+                    "standing_s": o.standing_s.round(), "departing": o.departing})
             })
             .collect(),
     )

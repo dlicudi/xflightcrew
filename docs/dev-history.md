@@ -15198,3 +15198,36 @@ its own canvas (the route map in page.html, the diagram in `diagram.js`).
   `own_s` (seconds from distance and groundspeed) is under about 108; such a departure is told
   the landing traffic and goes after us. Any departure released ahead of us shows, in our
   `go_around_deferred` records, `clear_s` + 10 under `own_s`, and no `go_around_judged` for it.
+
+## 2026-10-13: a departure cleared for takeoff is judged on its roll, never as a rollout (LEMG 13)
+
+- **Live.** The go-around itself (`go_around_judged` t 1791902325.5): RYR5024, cleared for
+  takeoff, 824 m down runway 13 at cross 0 and about 90 kt, read `clear_s` 40.0, the rollout
+  figure (`ROLLOUT_CLEAR_S`), against our `own_s` 35.0. Ten seconds earlier at 564 m it read 18.1
+  (a roll). `strip_exit` calls a mover our way a roll only while slow (under 40 kt) or seen
+  accelerating 0.5 kt/s; fast and not seen accelerating it is "the lander ahead rolling out". As
+  a departure it was about 15 s from liftoff (`roll_to_liftoff_s(90)`); it lifted off at t 2335.3,
+  25 s before our threshold. A departure released correctly and then misread mid-roll sent a
+  lander round.
+- **The rule.** The judgement knows who the tower cleared: `departures_on_the_ground` is where
+  every flight cleared for takeoff (`TakeoffCleared`) and still on the ground was last seen, ours
+  (`own_seen`) and each traffic strip's (`seen`), each cell locked alone, asked before the ghost
+  memory's lock. An occupant within `DEPARTURE_MATCH_M` (100 m) of one is a departure
+  (`strip_exits_unnoted`), and `strip_exit_as(.., departing: true)` judges it: moving our way it
+  is rolling, `Clearing(roll_to_liftoff_s(kts))` whatever its acceleration reads; standing
+  anywhere on the strip it is lined up, `LinedUp(37.5)` (an intersection departure was `Stays`).
+  Oncoming and crossing readings are unchanged. An occupant nobody cleared keeps every old
+  reading, the rollout included (`strip_exit` is `strip_exit_as(.., false)`). The blackbox
+  occupant carries `departing`.
+- Test: `lemg13_a_departure_rolling_is_judged_on_its_roll_not_as_a_rollout` (the recorded
+  numbers: us 1.3 nm and 35 s out, RYR5024 rolling steadily at 90 kt to 824 m; uncleared it reads
+  `Clearing(40)` and the order goes, as recorded; its strip `TakeoffCleared` and seen there, it
+  reads about 15 s and no go-around; a cleared departure standing 1,600 m down is lined up, an
+  uncleared one stays).
+- Seen while testing, not changed: `the_frequency_briefing_reads_the_fields_dialect` sets the
+  dialect without `SIDE_STATE_LOCK`, and once in four runs the coach's dialect tests read "point"
+  for "decimal" beside it.
+- **UNFLOWN.** At LEMG with `XCOPILOT_TRAFFIC=ours`, a traffic departure rolling ahead of our
+  landing: our `go_around_deferred` records show it `"departing": true`, `exit` `clearing` with
+  `clear_s` falling to 0 as it lifts off (never 40.0 while it rolls), and no `go_around_judged`
+  while `clear_s` + 10 is under `own_s`.

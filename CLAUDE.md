@@ -277,7 +277,9 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   a next call a hand-flown departure may not make; departure clears no higher than the FILED cruise
   (`capped_departure_climb`).
 - **A landing is never cleared onto an occupied runway, and the go-around is judged on time**
-  (`LANDING_HOLD`, `landing_release_due`, `go_around_due`, `strip_exit`). **An occupant is the
+  (`LANDING_HOLD`, `landing_release_due`, `go_around_due`, `strip_exit`); **an occupant the tower
+  cleared for takeoff is a DEPARTURE, judged on its roll, never as a rollout**
+  (`departures_on_the_ground`, `strip_exit_as`). **An occupant is the
   PAVEMENT's** (`on_runway_pavement`); traffic that will not leave re-sequences
   (`resequence_runway`).
 - **Taxi routes**: Dijkstra over apt.dat 1201/1202; crossings from strip GEOMETRY, never network
