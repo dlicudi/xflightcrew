@@ -518,7 +518,7 @@ pub(super) const OWN_SEEN_FRESH: std::time::Duration = std::time::Duration::from
 const LANDING_CLAIM_NM: f64 = 4.0;
 
 /// Our own position as the traffic link last noted it, while fresh.
-fn own_seen() -> Option<AircraftState> {
+pub(super) fn own_seen() -> Option<AircraftState> {
     seen(&OWN_STRIP).filter(|s| s.at.elapsed() < OWN_SEEN_FRESH)
 }
 

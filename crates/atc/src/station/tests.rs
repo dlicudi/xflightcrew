@@ -10743,3 +10743,94 @@ fn the_frequency_briefing_reads_the_fields_dialect() {
     let b = st.briefing_text(None);
     assert!(b.contains("point") && !b.contains("decimal"), "{b}");
 }
+
+/// A DEPARTURE CLEARED FOR TAKEOFF AND ROLLING IS JUDGED ON ITS ROLL, never
+/// as a lander rolling out. LEMG 13 (2026-10-13) `go_around_judged` at t
+/// 1791902325.5: RYR5024 (cleared for takeoff) 824 m down at about 90 kt,
+/// cross 0, read `clear_s` 40.0 (a rollout: fast, not seen accelerating)
+/// against our `own_s` 35.0, and we were sent round; it lifted off at t
+/// 2335.3, 25 s before our threshold. As a departure it is about 15 s from
+/// liftoff: no go-around. An occupant nobody cleared keeps the rollout
+/// reading.
+#[test]
+fn lemg13_a_departure_rolling_is_judged_on_its_roll_not_as_a_rollout() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = super::strip_tests::ClearStrips;
+    let reset = || {
+        *OWN_STRIP.go_around_last.lock().unwrap() = None;
+        *OWN_STRIP.pending_go_around.lock().unwrap() = false;
+        *OWN_STRIP.landing_hold.lock().unwrap() = None;
+        *STRIP_SEEN.lock().unwrap() = None;
+        OWN_STRIP.own_fixes.lock().unwrap().clear();
+    };
+    reset();
+    *ACTIVE_RUNWAYS.lock().unwrap() = lemg_runways();
+    let cleared = |state, callsign: &str| ClearanceSnap {
+        state,
+        callsign: callsign.into(),
+        runway_ident: "13".into(),
+        pending_readback: None,
+        holds_runway: true,
+    };
+    *OWN_STRIP.clearance.lock().unwrap() = Some(cleared(
+        tower::State::ClearedToLand,
+        "November eight one six November November",
+    ));
+    let base = Instant::now();
+    let at = |s: f64| base + std::time::Duration::from_secs_f64(s);
+    // Rolling steadily at 90 kt (46.3 m/s): 731, 777, 824 m down.
+    let ryr = |along: f64| ghost_at("RYR5024", lemg13_point(along, 0.0));
+    // Us 1.3 nm out at 134 kt: 35 s.
+    let own_at = |t: f64| {
+        let d = 1.3 * 1852.0 + (2.0 - t) * 68.9;
+        let (lat, lon) = lemg13_point(-d, 0.0);
+        note_own_fix(lat, lon, false, at(t));
+    };
+    let judge = || {
+        note_ground_traffic(&[ryr(731.4)], at(0.0));
+        note_ground_traffic(&[ryr(777.7)], at(1.0));
+        own_at(1.0);
+        own_at(2.0);
+        let exits = strip_exits(&[ryr(824.0)], Some(&lemg_runways()[1]), "13", at(2.0));
+        let own = own_time_to_threshold(&lemg_runways()[1], "13", at(2.0)).unwrap();
+        assert!((34.0..36.0).contains(&own.1), "{own:?}");
+        let call = go_around_tick(&[ryr(824.0)], 300.0, false, true, at(2.0));
+        (exits[0].exit, call)
+    };
+    // Nobody cleared it: the recorded reading, and the recorded order.
+    let (exit, call) = judge();
+    assert_eq!(exit, StripExit::Clearing(ROLLOUT_CLEAR_S));
+    assert!(call.is_some_and(|c| c.line.contains("go around")));
+    reset();
+    // Its strip cleared for takeoff, seen where it rolls: its roll.
+    let t = open_traffic_strip(2);
+    *t.clearance.lock().unwrap() = Some(cleared(
+        tower::State::TakeoffCleared,
+        "Ryanair five zero two four",
+    ));
+    let (lat, lon) = lemg13_point(824.0, 0.0);
+    note_traffic_state(2, AircraftState::at_position(lat, lon, true, 90.0));
+    let (exit, call) = judge();
+    match exit {
+        StripExit::Clearing(s) => assert!((13.0..17.0).contains(&s), "{s}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(call.is_none(), "{:?}", call.map(|c| c.line));
+    // Standing anywhere, a departure cleared for takeoff is lined up.
+    let r = &lemg_runways()[1];
+    let p = |along: f64, s: f64| {
+        let (lat, lon) = lemg13_point(along, 0.0);
+        (lat, lon, s)
+    };
+    assert_eq!(
+        strip_exit_as(r, "13", &[p(1600.0, -2.0), p(1600.0, 0.0)], true),
+        StripExit::LinedUp(roll_to_liftoff_s(0.0))
+    );
+    assert_eq!(
+        strip_exit(r, "13", &[p(1600.0, -2.0), p(1600.0, 0.0)]),
+        StripExit::Stays
+    );
+    reset();
+    *OWN_STRIP.clearance.lock().unwrap() = None;
+    *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+}
