@@ -10,7 +10,16 @@
 //! frame the writer had no time for is replaced, never queued), which makes
 //! at most one round of writes per [`WRITE_EVERY`]. No per-aircraft requests,
 //! no reads.
+//!
+//! THE DRAW CULL (multi-field traffic, stage 1, 2026-10-13): the plugin's
+//! cost is per DRAWN aircraft (an XPMP2 plane each, a terrain probe per
+//! ground one per frame), the fleet's is Rust-side and small. So only the
+//! aircraft within [`DRAW_RANGE_NM`] of us are sent ([`DrawCull`]), at most
+//! [`DRAW_MAX`], the rest simulated but not drawn; TCAS sees what is drawn.
+//! The cull is a roster change (the plugin destroys the plane), never
+//! `FLAG_HIDDEN` (a hidden plane still costs its update).
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use traffic::wire::{self, RosterEntry};
@@ -32,6 +41,74 @@ const BACKOFF: Duration = Duration::from_secs(10);
 /// link loaded and the plugin sat disabled with frames still arriving, LEMG
 /// 2026-10-08). Two small writes per period.
 const REASSERT_EVERY: Duration = Duration::from_secs(5);
+
+/// Aircraft within this of us are drawn, nm (TCAS range; the pilot's ask,
+/// 2026-10-13: simulated within 100 nm, drawn within 40).
+pub(crate) const DRAW_RANGE_NM: f64 = 40.0;
+
+/// A drawn aircraft stays drawn until this far, nm: one flying along the
+/// ring does not flicker in and out (the plugin destroys and recreates
+/// the plane on every roster change).
+pub(crate) const DRAW_OUT_NM: f64 = 44.0;
+
+/// At most this many aircraft drawn, nearest first (the design's budget:
+/// LEMG's 10:00 start draws about 40 moving plus up to 80 parked,
+/// `schedule::PARKED_MAX`). Frame cost past 60 drawn is unmeasured: raise
+/// it only on `api_load` and the fps dataref.
+pub(crate) const DRAW_MAX: usize = 120;
+
+/// A parked (dormant) aircraft farther than this, nm, is the first to go
+/// when [`DRAW_MAX`] binds: a dark aircraft on a stand 15 nm away is
+/// invisible, a moving one is TCAS traffic.
+pub(crate) const PARKED_FAR_NM: f64 = 15.0;
+
+/// Which simulated aircraft are drawn (module docs): within
+/// [`DRAW_RANGE_NM`] of us, kept to [`DRAW_OUT_NM`] once drawn, at most
+/// [`DRAW_MAX`] (far parked ones dropped first, then the farthest). Pure
+/// but for its memory of who was drawn.
+#[derive(Debug, Default)]
+pub(crate) struct DrawCull {
+    drawn: BTreeSet<u32>,
+}
+
+impl DrawCull {
+    /// The aircraft to draw of `fleet`, seen from `own` (lat, lon), in id
+    /// order (a stable roster: the same set is the same roster). With no
+    /// position of ours, the first [`DRAW_MAX`] by id.
+    pub(crate) fn select<'a>(
+        &mut self,
+        own: Option<(f64, f64)>,
+        fleet: &[&'a traffic::TrafficAircraft],
+    ) -> Vec<&'a traffic::TrafficAircraft> {
+        let mut near: Vec<(bool, f64, &'a traffic::TrafficAircraft)> = fleet
+            .iter()
+            .filter_map(|a| {
+                let d = own.map_or(0.0, |o| traffic::places::dist_nm(o, a.kin.pos()));
+                let reach = if self.drawn.contains(&a.id) {
+                    DRAW_OUT_NM
+                } else {
+                    DRAW_RANGE_NM
+                };
+                (d <= reach).then_some((a.dormant() && d > PARKED_FAR_NM, d, *a))
+            })
+            .collect();
+        near.sort_by(|x, y| {
+            x.0.cmp(&y.0)
+                .then(x.1.total_cmp(&y.1))
+                .then(x.2.id.cmp(&y.2.id))
+        });
+        near.truncate(DRAW_MAX);
+        let mut out: Vec<&'a traffic::TrafficAircraft> = near.into_iter().map(|n| n.2).collect();
+        out.sort_by_key(|a| a.id);
+        self.drawn = out.iter().map(|a| a.id).collect();
+        out
+    }
+
+    /// Nobody drawn (our traffic withdrawn).
+    pub(crate) fn clear(&mut self) {
+        self.drawn.clear();
+    }
+}
 
 /// What the writer is to make true, the latest only.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -71,16 +148,17 @@ impl TrafficSink {
         }
     }
 
-    /// The fleet now, taken at the sim's running time `sim_time_s`: a new
-    /// roster when who is flying changed, the frames every time.
-    pub(crate) fn publish(&mut self, fleet: &[traffic::TrafficAircraft], sim_time_s: f64) {
-        let roster: Vec<RosterEntry> = fleet.iter().map(wire::roster_entry).collect();
+    /// The aircraft drawn now (after [`DrawCull`]), taken at the sim's
+    /// running time `sim_time_s`: a new roster when who is drawn changed,
+    /// the frames every time.
+    pub(crate) fn publish(&mut self, fleet: &[&traffic::TrafficAircraft], sim_time_s: f64) {
+        let roster: Vec<RosterEntry> = fleet.iter().map(|a| wire::roster_entry(a)).collect();
         if roster != self.roster {
             self.roster = roster;
             self.roster_seq = self.roster_seq.wrapping_add(1);
         }
         self.frame_seq = self.frame_seq.wrapping_add(1);
-        let frames: Vec<wire::FrameEntry> = fleet.iter().map(wire::frame_entry).collect();
+        let frames: Vec<wire::FrameEntry> = fleet.iter().map(|a| wire::frame_entry(a)).collect();
         let packet = Packet {
             enabled: true,
             roster: Some((
@@ -200,8 +278,8 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(Packet::default());
         let mut sink = TrafficSink::with_sender(tx);
         let (_field, mut acs) = fleet();
-        sink.publish(&acs, 100.0);
-        sink.publish(&acs, 100.25);
+        sink.publish(&acs.iter().collect::<Vec<_>>(), 100.0);
+        sink.publish(&acs.iter().collect::<Vec<_>>(), 100.25);
         let p = rx.borrow().clone();
         assert!(p.enabled);
         let (seq, roster) = p.roster.clone().unwrap();
@@ -216,7 +294,7 @@ mod tests {
             "the latest frame only"
         );
         acs.pop();
-        sink.publish(&acs, 100.5);
+        sink.publish(&acs.iter().collect::<Vec<_>>(), 100.5);
         assert_eq!(
             rx.borrow().roster.as_ref().unwrap().0,
             2,
@@ -247,11 +325,105 @@ mod tests {
             .collect();
         let (tx, rx) = tokio::sync::watch::channel(Packet::default());
         let mut sink = TrafficSink::with_sender(tx);
-        sink.publish(&many, 1.0);
+        sink.publish(&many.iter().collect::<Vec<_>>(), 1.0);
         let p = rx.borrow().clone();
         let frames = p.frames.unwrap();
         assert_eq!(frames.len(), wire::FRAME_HEADER + 60 * wire::FRAME_ENTRY);
         assert!(frames.len() * 4 / 3 < 3_400, "{} bytes", frames.len());
         assert!(p.roster.unwrap().1.len() <= wire::BUF_BYTES);
+    }
+
+    /// `one` as aircraft `id`, `nm` north of `at`: parked (dormant) or
+    /// flying a circuit.
+    fn north_of(
+        one: &traffic::TrafficAircraft,
+        id: u32,
+        at: (f64, f64),
+        nm: f64,
+        parked: bool,
+    ) -> traffic::TrafficAircraft {
+        let mut a = one.clone();
+        a.id = id;
+        a.kin.lat = at.0 + nm / 60.0;
+        a.kin.lon = at.1;
+        a.plan = if parked {
+            traffic::Plan::Parked
+        } else {
+            traffic::Plan::Circuit {
+                runway: "09".into(),
+                laps: 1,
+                left: true,
+            }
+        };
+        a
+    }
+
+    fn ids(v: &[&traffic::TrafficAircraft]) -> Vec<u32> {
+        v.iter().map(|a| a.id).collect()
+    }
+
+    /// THE RING (multi-field traffic stage 1, 2026-10-13): an aircraft is
+    /// drawn from inside 40 nm, stays drawn out to 44 nm (one flying along
+    /// the ring does not flicker), goes past it, and is not drawn again
+    /// before it is back inside 40.
+    #[test]
+    fn the_draw_ring_has_hysteresis() {
+        let (_field, one) = fleet();
+        let own = (36.0, -4.5);
+        let mut cull = DrawCull::default();
+        let mut at = |nm: f64| {
+            let a = [north_of(&one[0], 7, own, nm, false)];
+            ids(&cull.select(Some(own), &a.iter().collect::<Vec<_>>()))
+        };
+        assert!(at(42.0).is_empty(), "42 nm coming in");
+        assert_eq!(at(39.0), [7]);
+        assert_eq!(at(43.5), [7], "kept on the ring");
+        assert!(at(44.5).is_empty(), "gone past 44 nm");
+        assert!(at(43.0).is_empty(), "not back before 40 nm");
+    }
+
+    /// THE CAP (stage 1): past [`DRAW_MAX`] the parked aircraft beyond
+    /// 15 nm go first, then the farthest; the roster is in id order
+    /// whatever the distances.
+    #[test]
+    fn the_draw_cap_keeps_the_nearest_and_drops_far_parked_first() {
+        let (_field, one) = fleet();
+        let own = (36.0, -4.5);
+        let mut acs = Vec::new();
+        // 100 moving within 30 nm, 30 parked at 20 nm, 10 parked at 1 nm.
+        for i in 0..100u32 {
+            let nm = 30.0 * f64::from(i) / 100.0;
+            acs.push(north_of(&one[0], 1000 - i, own, nm, false));
+        }
+        for i in 0..30u32 {
+            acs.push(north_of(&one[0], 2000 + i, own, 20.0, true));
+        }
+        for i in 0..10u32 {
+            acs.push(north_of(&one[0], 3000 + i, own, 1.0, true));
+        }
+        let mut cull = DrawCull::default();
+        let drawn = cull.select(Some(own), &acs.iter().collect::<Vec<_>>());
+        assert_eq!(drawn.len(), DRAW_MAX);
+        let far_parked = drawn
+            .iter()
+            .filter(|a| (2000..3000).contains(&a.id))
+            .count();
+        assert_eq!(far_parked, DRAW_MAX - 110, "far parked fill what is left");
+        assert_eq!(
+            drawn.iter().filter(|a| a.id >= 3000).count(),
+            10,
+            "near parked stay"
+        );
+        assert!(drawn.windows(2).all(|w| w[0].id < w[1].id), "id order");
+        // Over the cap with moving aircraft alone: the nearest win.
+        let moving: Vec<traffic::TrafficAircraft> = (0..130u32)
+            .map(|i| north_of(&one[0], i + 1, own, 0.2 * f64::from(i), false))
+            .collect();
+        let drawn = DrawCull::default().select(Some(own), &moving.iter().collect::<Vec<_>>());
+        assert_eq!(drawn.len(), DRAW_MAX);
+        assert!(
+            drawn.iter().all(|a| a.id as usize <= DRAW_MAX),
+            "the nearest 120"
+        );
     }
 }

@@ -55,9 +55,37 @@ impl XorShift64 {
     }
 }
 
+/// A field's seed for its day: its ICAO (any case) hashed with the
+/// session's seed (multi-field traffic stage 2, 2026-10-13). Each field
+/// draws the same day whichever field was built first and however often
+/// it is revisited, where the seed was the count of fields built this
+/// session (a revisit drew another day, and a second fleet's day hung on
+/// the order the two were built). FNV-1a, then one splitmix round.
+pub fn field_seed(icao: &str, session: u64) -> u64 {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for b in icao.trim().bytes() {
+        h ^= u64::from(b.to_ascii_uppercase());
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    let mut z = (h ^ session).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FIELD'S DAY IS ITS OWN (stage 2): the same field and session is
+    /// the same seed, any case; two fields differ, and so does a session.
+    #[test]
+    fn a_fields_seed_is_its_own() {
+        assert_eq!(field_seed("LEMG", 1), field_seed("lemg ", 1));
+        assert_ne!(field_seed("LEMG", 1), field_seed("LXGB", 1));
+        assert_ne!(field_seed("LEMG", 1), field_seed("LEMG", 2));
+        assert_ne!(field_seed("LEMG", 1), 0);
+    }
 
     #[test]
     fn the_same_seed_is_the_same_sequence() {

@@ -751,7 +751,7 @@ pub struct CutRoute {
 
 impl FieldModel {
     /// The strip under `p`, by index, and the nearer end's ident.
-    fn strip_at(&self, p: LatLon) -> Option<(usize, String)> {
+    pub fn strip_at(&self, p: LatLon) -> Option<(usize, String)> {
         self.airport
             .runways
             .iter()
