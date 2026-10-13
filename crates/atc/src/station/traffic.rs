@@ -60,8 +60,10 @@ pub fn note_traffic_type(callsign: &str, icao_type: &str) {
         .insert(cs.to_string(), ty.to_ascii_uppercase());
 }
 
-/// A traffic aircraft's type designator, when known.
-pub(crate) fn traffic_type(callsign: &str) -> Option<String> {
+/// A traffic aircraft's type designator, when known (our own fleet notes
+/// it; the sim's TCAS carries none). The crew's taxi guard reads it through
+/// `world` for the length it stops behind.
+pub fn traffic_type(callsign: &str) -> Option<String> {
     TRAFFIC_TYPES
         .lock()
         .unwrap_or_else(|e| e.into_inner())

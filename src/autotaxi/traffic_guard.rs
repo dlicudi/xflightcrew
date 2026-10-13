@@ -18,13 +18,28 @@
 
 use super::*;
 
-/// A target's wingspan when we cannot know it, m: the TCAS picture carries
-/// no type, and an A320 or a 737 (34 to 36 m) is the aircraft a holding
+/// A target's wingspan when we cannot know it, m: the sim's TCAS picture
+/// carries no type, and an A320 or a 737 (34 to 36 m) is the aircraft a holding
 /// point most often has on it. Conservative for anything smaller.
 pub const TRAFFIC_SPAN_DEFAULT_M: f64 = 36.0;
 /// ...and its half length, centre to tail, m (an A320 is 37.6 m long, a
-/// 737-800 39.5 m).
+/// 737-800 39.5 m), when its type is unknown (LiveTraffic, multiplayer):
+/// our own fleet's types are known ([`target_tail_m`]).
 pub const TRAFFIC_HALF_LEN_DEFAULT_M: f64 = 20.0;
+/// How late the taxi governor follows the stop ramp, s: the stop point is
+/// planned back by the ground covered in it at the current speed
+/// ([`traffic_stop_in_m`]).
+///
+/// LEMG, 2026-10-13, our 737-800 behind TRA6502 (blackbox `autotaxi`
+/// `drive`, t 1791892420 to 1791892450): the governor rides the ramp's cap
+/// late (it idles and only brakes once a couple of knots over, by design,
+/// `speedhold::taxi_control`), 2.3 s over the whole closure and 3.5 s over
+/// its last seven seconds, so it reached the cap's zero still at 5.9 kt
+/// (3.02 m/s) and rolled another 10.2 m to a stop (3.4 s of its speed):
+/// 8.8 m nose to tail against the 18 planned. Two fits, one number: the
+/// governor and [`STOP_DECEL_MS2`] stay as the line-up needs them, and the
+/// traffic stop is planned 3.5 s of speed early.
+pub const GOVERNOR_LAG_S: f64 = 3.5;
 /// Wingtip margin on top of both half spans, m. Small on purpose: code C
 /// parallel taxiways are 44 m apart and two 36 m spans plus this still
 /// clears them, so a pass on the next taxiway is no hold.
@@ -62,12 +77,14 @@ pub const TRAFFIC_READ_S: f64 = 1.0;
 /// progress.
 pub const TRAFFIC_EXCUSES_BELOW_KTS: f64 = 2.0;
 
-/// Our own size for the guard, from the maximum takeoff mass (the drive
-/// reads it already for its join turns).
+/// Our own size for the guard: the span from the maximum takeoff mass (the
+/// drive reads it already for its join turns), the nose MEASURED from the
+/// `.acf` where it was read ([`OwnSize::with_nose`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OwnSize {
     pub half_span_m: f64,
-    pub half_len_m: f64,
+    /// Our nose ahead of the point the sim places us by, m.
+    pub nose_m: f64,
     /// Nose to the leader's tail when stopped, m: a real taxi gap.
     pub gap_m: f64,
 }
@@ -85,8 +102,17 @@ impl OwnSize {
         };
         OwnSize {
             half_span_m: span / 2.0,
-            half_len_m: span / 2.0,
+            nose_m: span / 2.0,
             gap_m: if span >= 24.0 { 18.0 } else { 8.0 },
+        }
+    }
+
+    /// The nose as the `.acf` measures it (`GroundGeometry::nose_m`: ahead
+    /// of the CG the sim places us by), else the class's half span.
+    pub fn with_nose(self, nose_m: Option<f64>) -> OwnSize {
+        OwnSize {
+            nose_m: nose_m.unwrap_or(self.nose_m),
+            ..self
         }
     }
 
@@ -96,8 +122,9 @@ impl OwnSize {
     }
 }
 
-/// One on-ground target as the guard sees it: where, and how it moves
-/// (m/s east and north; zero until it has been seen twice).
+/// One on-ground target as the guard sees it: where, how it moves (m/s
+/// east and north; zero until it has been seen twice), and how far its
+/// tail reaches behind its position.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Seen {
     pub callsign: String,
@@ -105,6 +132,23 @@ pub struct Seen {
     pub lon: f64,
     pub v_east: f64,
     pub v_north: f64,
+    pub tail_m: f64,
+}
+
+/// A target's tail behind its position, m: half its type's length where
+/// the type is known (our own fleet, published at mid-length,
+/// `traffic::perf::length_of`), else [`TRAFFIC_HALF_LEN_DEFAULT_M`].
+pub fn target_tail_m(icao_type: Option<&str>) -> f64 {
+    icao_type.map_or(TRAFFIC_HALF_LEN_DEFAULT_M, |t| {
+        ::traffic::perf::length_of(t) / 2.0
+    })
+}
+
+/// How far we may still roll before the taxi gap is reached, m: the gap
+/// less the taxi gap, less the ground the governor covers in its lag
+/// ([`GOVERNOR_LAG_S`]) at our groundspeed. Stopped, the lag costs nothing.
+pub fn traffic_stop_in_m(gap_m: f64, own: &OwnSize, gs_ms: f64) -> f64 {
+    gap_m - own.gap_m - gs_ms.abs() * GOVERNOR_LAG_S
 }
 
 /// The targets between reads, for their velocities.
@@ -115,9 +159,15 @@ pub struct TrafficTrack {
 
 impl TrafficTrack {
     /// The on-ground targets of a fresh picture read at `t_s`, with each
-    /// one's velocity from its last reading. Airborne targets are dropped:
-    /// a taxi stops for nothing in the air.
-    pub fn update(&mut self, picture: &[crate::world::TcasTarget], t_s: f64) -> Vec<Seen> {
+    /// one's velocity from its last reading and its tail from `tail_of`
+    /// (by callsign, [`target_tail_m`]). Airborne targets are dropped: a
+    /// taxi stops for nothing in the air.
+    pub fn update(
+        &mut self,
+        picture: &[crate::world::TcasTarget],
+        t_s: f64,
+        tail_of: impl Fn(&str) -> f64,
+    ) -> Vec<Seen> {
         let mut next = std::collections::HashMap::new();
         let seen = picture
             .iter()
@@ -138,6 +188,7 @@ impl TrafficTrack {
                     lon: t.lon,
                     v_east: ve,
                     v_north: vn,
+                    tail_m: tail_of(&t.callsign),
                 }
             })
             .collect();
@@ -154,7 +205,8 @@ pub struct Ahead {
     pub along_m: f64,
     /// Our nose to their tail, m.
     pub gap_m: f64,
-    /// How far we may still roll before the taxi gap is reached, m.
+    /// How far we may still roll before the taxi gap is reached, m
+    /// ([`traffic_stop_in_m`]).
     pub stop_in_m: f64,
     /// Not on the route yet, crossing onto it.
     pub crossing: bool,
@@ -239,12 +291,12 @@ impl Route {
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(t, along, crossing)| {
-                let gap = along - own.half_len_m - TRAFFIC_HALF_LEN_DEFAULT_M;
+                let gap = along - own.nose_m - t.tail_m;
                 Ahead {
                     callsign: t.callsign.clone(),
                     along_m: along,
                     gap_m: gap,
-                    stop_in_m: gap - own.gap_m,
+                    stop_in_m: traffic_stop_in_m(gap, own, gs_ms),
                     crossing,
                 }
             })
@@ -377,6 +429,7 @@ mod tests {
             lon,
             v_east: 0.0,
             v_north: 0.0,
+            tail_m: TRAFFIC_HALF_LEN_DEFAULT_M,
         }
     }
     fn jet() -> OwnSize {
@@ -389,9 +442,10 @@ mod tests {
             .traffic_ahead(0.0, 4.0, &jet(), &[at("EZY12", 2.0, 120.0)])
             .expect("ahead");
         assert!((a.along_m - 120.0).abs() < 1.0, "{a:?}");
-        // 120 m centre to centre less 18 m of us and 20 m of them.
+        // 120 m centre to centre less 18 m of us and 20 m of them; the
+        // stop 18 m behind, less 3.5 s of our 4 m/s.
         assert!((a.gap_m - 82.0).abs() < 1.0, "{a:?}");
-        assert!((a.stop_in_m - 64.0).abs() < 1.0, "{a:?}");
+        assert!((a.stop_in_m - 50.0).abs() < 1.0, "{a:?}");
         assert!(!a.crossing);
     }
 
@@ -426,7 +480,7 @@ mod tests {
             on_ground: false,
             vs_fpm: 0.0,
         };
-        assert!(track.update(&[air], 0.0).is_empty());
+        assert!(track.update(&[air], 0.0, |_| 20.0).is_empty());
     }
 
     #[test]
@@ -441,7 +495,7 @@ mod tests {
             .expect("at the hold");
         let stop_at = 250.0 + a.stop_in_m;
         assert!(
-            (stop_at - (400.0 - 20.0 - 18.0 - 18.0)).abs() < 1.0,
+            (stop_at - (400.0 - 20.0 - 18.0 - 18.0 - 4.0 * GOVERNOR_LAG_S)).abs() < 1.0,
             "stops at {stop_at:.0}"
         );
         // A little past the hold point (its nose on the line) still counts.
@@ -494,8 +548,8 @@ mod tests {
                 vs_fpm: 0.0,
             }
         };
-        track.update(&[tgt(-60.0)], 10.0);
-        let s = track.update(&[tgt(-54.0)], 11.0);
+        track.update(&[tgt(-60.0)], 10.0, |_| 20.0);
+        let s = track.update(&[tgt(-54.0)], 11.0, |_| 20.0);
         assert!(
             (s[0].v_east - 6.0).abs() < 0.1 && s[0].v_north.abs() < 0.1,
             "{s:?}"
@@ -509,7 +563,7 @@ mod tests {
         let leader = |y: f64| [at("EZY12", 0.0, y)];
         // Far: the drive's own stop ramp, falling as we close.
         let far = r.traffic_ahead(0.0, 4.0, &own, &leader(140.0)).unwrap();
-        let near = r.traffic_ahead(70.0, 4.0, &own, &leader(140.0)).unwrap();
+        let near = r.traffic_ahead(70.0, 2.0, &own, &leader(140.0)).unwrap();
         assert!(traffic_cap_kts(&far) > traffic_cap_kts(&near) && traffic_cap_kts(&near) > 0.0);
         // At the gap: zero, and the hold begins, said once.
         let mut hold = TrafficHold::default();
@@ -556,5 +610,78 @@ mod tests {
         let unread = OwnSize::from_mtow(None);
         assert_eq!(unread, jet());
         assert_eq!(unread.gap_m, 18.0);
+        // The nose is the `.acf`'s where it was read, the class's if not.
+        assert_eq!(jet().with_nose(Some(18.14)).nose_m, 18.14);
+        assert_eq!(jet().with_nose(None), jet());
+    }
+
+    /// The target's tail is its type's half length where the type is
+    /// known, the narrowbody default where it is not.
+    #[test]
+    fn the_target_stops_us_behind_its_own_tail() {
+        assert_eq!(target_tail_m(Some("B738")), 39.5 / 2.0);
+        assert_eq!(target_tail_m(Some("C172")), 8.3 / 2.0);
+        assert_eq!(target_tail_m(Some("B77W")), 73.9 / 2.0);
+        assert_eq!(target_tail_m(None), TRAFFIC_HALF_LEN_DEFAULT_M);
+        let r = route();
+        let own = jet();
+        let mut big = at("BAW1", 0.0, 120.0);
+        big.tail_m = target_tail_m(Some("B77W"));
+        let a = r.traffic_ahead(0.0, 0.0, &own, &[big]).unwrap();
+        assert!((a.gap_m - (120.0 - 18.0 - 36.95)).abs() < 0.5, "{a:?}");
+    }
+
+    /// LEMG, 2026-10-13: our 737-800 closing on TRA6502, a 737-800 standing
+    /// ahead (blackbox `autotaxi` `drive`, t 1791892420 on). Recorded: the
+    /// hold began at 5.86 kt with 0.99 m to the planned stop, and the
+    /// aircraft rolled 56.99 to 46.81 m along before it stood, 8.8 m nose
+    /// to tail. The lag's allowance at that speed covers that rollout.
+    /// Then the closure from the recorded state (175.27 m along at
+    /// 15.66 kt) through a plant fitted to the trace: the speed follows the
+    /// cap [`GOVERNOR_LAG_S`] late, and once held it stops at the 0.44 m/s^2
+    /// the hold measured (3.02 m/s in 10.18 m). Planned without the lag it
+    /// ends inside the taxi gap; planned with it, at the gap or behind.
+    #[test]
+    fn the_lemg_closure_stops_the_taxi_gap_behind_with_the_lag() {
+        let (hold_gs_ms, rollout_m) = (5.86 / MS_TO_KTS, 56.99 - 46.81);
+        assert!(hold_gs_ms * GOVERNOR_LAG_S >= rollout_m, "{hold_gs_ms} m/s");
+
+        let own = jet().with_nose(Some(18.14));
+        let mut leader = at("TRA6502", 0.0, 380.0);
+        leader.tail_m = target_tail_m(Some("B738"));
+        let start = 380.0 - 175.27;
+        let closure = |with_lag: bool| -> f64 {
+            let (dt, hold_decel) = (0.2, 0.44);
+            let delay = (GOVERNOR_LAG_S / dt).round() as usize;
+            let r = route();
+            let mut caps = vec![15.66; delay];
+            let (mut progress, mut v, mut held) = (start, 15.66 / MS_TO_KTS, false);
+            for _ in 0..2000 {
+                let a = r
+                    .traffic_ahead(progress, v, &own, &[leader.clone()])
+                    .unwrap();
+                let stop_in = if with_lag {
+                    a.stop_in_m
+                } else {
+                    a.gap_m - own.gap_m
+                };
+                held |= stop_ramp_kts(stop_in) == 0.0;
+                if held {
+                    v = (v - hold_decel * dt).max(0.0);
+                    if v == 0.0 {
+                        return a.gap_m;
+                    }
+                } else {
+                    caps.push(stop_ramp_kts(stop_in));
+                    v = caps[caps.len() - 1 - delay] / MS_TO_KTS;
+                }
+                progress += v * dt;
+            }
+            panic!("never stopped");
+        };
+        let (old, new) = (closure(false), closure(true));
+        assert!(old < own.gap_m, "the old plan ends {old:.1} m behind");
+        assert!(new >= own.gap_m, "the lag's plan ends {new:.1} m behind");
+        assert!(new < own.gap_m + 8.0, "and not far short: {new:.1} m");
     }
 }

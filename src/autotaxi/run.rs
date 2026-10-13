@@ -436,15 +436,17 @@ pub(super) async fn drive(
     // A join the nose cannot point at is judged once, at the first fix
     // ([`JoinTurn`]).
     let mut join_turn_judged = false;
-    // The traffic guard (`traffic_guard`): our size from the mass the join
-    // turn reads too, the picture read once a second (the sim's TCAS table
-    // is five Web API reads), the hold's state. No picture, no guard.
+    // The traffic guard (`traffic_guard`): our span from the mass the join
+    // turn reads too, our nose from the `.acf`, the picture read once a
+    // second (the sim's TCAS table is five Web API reads), the hold's
+    // state. No picture, no guard.
     let own_size = OwnSize::from_mtow(
         xp.get_float(crate::datarefs::ACF_M_MAX_KG)
             .await
             .ok()
             .map(f64::from),
-    );
+    )
+    .with_nose(crate::aircraft::learned::acf_model().and_then(|m| m.geometry.nose_m));
     let mut traffic_track = TrafficTrack::default();
     let mut traffic_seen: Vec<Seen> = Vec::new();
     let mut traffic_read_at: Option<std::time::Instant> = None;
@@ -677,7 +679,9 @@ pub(super) async fn drive(
         if traffic_read_at.is_none_or(|t| t.elapsed().as_secs_f64() >= TRAFFIC_READ_S) {
             traffic_read_at = Some(std::time::Instant::now());
             let picture = crate::world::targets(xp.view()).await;
-            traffic_seen = traffic_track.update(&picture, clock_s());
+            traffic_seen = traffic_track.update(&picture, clock_s(), |cs| {
+                target_tail_m(crate::world::traffic_type(cs).as_deref())
+            });
         }
         let traffic_ahead = route.traffic_ahead(progress, gs_ms, &own_size, &traffic_seen);
         let (traffic_cap, traffic_ev) = traffic_hold.step(traffic_ahead.as_ref(), clock_s());
@@ -691,7 +695,7 @@ pub(super) async fn drive(
                 } => serde_json::json!({
                     "event": "traffic_hold", "callsign": callsign, "gap_m": gap_m,
                     "along_m": along_m, "crossing": crossing, "progress_m": progress,
-                    "remaining_m": remaining, "gs": gs_ms * MS_TO_KTS}),
+                    "remaining_m": remaining, "gs": gs_ms * MS_TO_KTS, "nose_m": own_size.nose_m}),
                 HoldEvent::Long { callsign, held_s } => serde_json::json!({
                     "event": "traffic_hold_long", "callsign": callsign, "held_s": held_s}),
                 HoldEvent::Cleared { callsign, held_s } => serde_json::json!({

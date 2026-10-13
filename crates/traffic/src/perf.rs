@@ -406,6 +406,76 @@ pub fn type_wheelbase_m(icao_type: &str) -> Option<f64> {
         .map(|&(_, w)| w)
 }
 
+/// Overall length, nose to tail, metres, from the manufacturers' figures
+/// (rounded). `None` for a type not in the table: its class's
+/// [`Perf::length_m`] stands.
+fn type_length_m(icao_type: &str) -> Option<f64> {
+    let len = match icao_type {
+        "C152" => 7.3,
+        "C172" => 8.3,
+        "PA28" => 7.3,
+        "SR22" => 7.9,
+        "B350" => 14.2,
+        "BE20" => 13.3,
+        "BE9L" => 10.8,
+        "C208" => 11.5,
+        "PC12" => 14.4,
+        "SF34" => 19.7,
+        "D328" => 21.3,
+        "JS41" => 19.3,
+        "AT43" | "AT45" => 22.7,
+        "AT72" | "AT76" => 27.2,
+        "DH8A" | "DH8B" => 22.3,
+        "DH8C" => 25.7,
+        "DH8D" => 32.8,
+        "CRJ7" => 32.5,
+        "CRJ9" => 36.2,
+        "E170" => 29.9,
+        "E175" => 31.7,
+        "E190" => 36.2,
+        "E195" => 38.7,
+        "BCS1" => 35.0,
+        "BCS3" => 38.7,
+        "A318" => 31.4,
+        "A319" | "A19N" => 33.8,
+        "A320" | "A20N" => 37.6,
+        "A321" | "A21N" => 44.5,
+        "B736" => 31.2,
+        "B737" => 33.6,
+        "B738" | "B38M" => 39.5,
+        "B739" | "B39M" => 42.1,
+        "MD82" | "MD83" | "MD88" => 45.1,
+        "B752" => 47.3,
+        "B753" => 54.4,
+        "B763" => 54.9,
+        "B764" => 61.4,
+        "MD11" => 61.6,
+        "A332" => 58.8,
+        "A333" | "A339" | "A343" => 63.7,
+        "A346" => 75.4,
+        "A359" => 66.8,
+        "A35K" => 73.8,
+        "B772" | "B77L" => 63.7,
+        "B77W" => 73.9,
+        "B788" => 56.7,
+        "B789" => 62.8,
+        "B78X" => 68.3,
+        "B744" => 70.7,
+        "B748" => 76.3,
+        "A388" => 72.7,
+        _ => return None,
+    };
+    Some(len)
+}
+
+/// A type's overall length, metres: its own ([`type_length_m`]), else its
+/// class's. Our own fleet publishes each aircraft at mid-length (see
+/// [`Perf::mains_aft_m`]), so half of it is the reach to the tail.
+pub fn length_of(icao_type: &str) -> f64 {
+    let t = icao_type.trim().to_ascii_uppercase();
+    type_length_m(&t).unwrap_or_else(|| class_for_type(&t).0.length_m)
+}
+
 /// The taxi geometry of `icao_type` flying `perf`: its own wheelbase where
 /// the table has it, the class's mains and pace.
 pub fn gear_for(icao_type: &str, perf: &Perf) -> crate::kin::Gear {
@@ -440,6 +510,30 @@ mod tests {
         assert_eq!(span_code(14.9), 'A');
         assert_eq!(span_code(15.0), 'B');
         assert_eq!(span_code(36.0), 'D');
+    }
+
+    /// Every type the span table names has its own length, and an unknown
+    /// type takes its class's: the taxi guard stops behind the TAIL.
+    #[test]
+    fn every_spanned_type_has_its_length() {
+        for t in [
+            "C152", "C172", "PA28", "SR22", "B350", "BE20", "BE9L", "C208", "PC12", "SF34", "D328",
+            "JS41", "AT43", "AT45", "AT72", "AT76", "DH8A", "DH8B", "DH8C", "DH8D", "CRJ7", "CRJ9",
+            "E170", "E175", "E190", "E195", "BCS1", "BCS3", "A318", "A319", "A320", "A321", "A19N",
+            "A20N", "A21N", "B736", "B737", "B738", "B739", "B38M", "B39M", "MD82", "MD83", "MD88",
+            "B752", "B753", "B763", "B764", "MD11", "A332", "A333", "A343", "A346", "A339", "A359",
+            "A35K", "B772", "B77L", "B77W", "B788", "B789", "B78X", "B744", "B748", "A388",
+        ] {
+            assert!(
+                type_span_m(t).is_some() && type_length_m(t).is_some(),
+                "{t}"
+            );
+        }
+        assert_eq!(length_of("b738"), 39.5);
+        assert_eq!(length_of("A320"), 37.6);
+        assert_eq!(length_of("C172"), 8.3);
+        assert_eq!(length_of("B77W"), 73.9);
+        assert_eq!(length_of("ZZZZ"), class_for_type("ZZZZ").0.length_m);
     }
 
     #[test]
