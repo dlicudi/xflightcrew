@@ -146,6 +146,15 @@ traffic flight through a separate per-flight strip:
   Approach. You hear them only when your COM1 is tuned to that frequency.
 - Native rendering through XPMP2 and user-installed CSL models, with animated
   gear, flaps, lights and engines plus optional TCAS publication.
+- At Gibraltar (LXGB) and Malaga (LEMG), a built-in timetable of the airlines,
+  routes and aircraft that really fly there: each aircraft arrives, turns round
+  on its stand and leaves as its next flight number, in the day's waves, by
+  weekday and season, reproducible from the seed and the sim's date. The world
+  is already moving when you start: arrivals on the approach, a landing taxiing
+  in, departures boarding, pushing, taxiing or climbing out. The plugin's
+  **Board** tab shows the field's departures and arrivals as an airport
+  flight information display, with live statuses (and your own flight, from
+  its plan). No schedule is ever fetched.
 
 Set `XCOPILOT_TRAFFIC=ours` to use this fleet, `real` to retain read-only
 narration of X-Plane/LiveTraffic targets, or `off` (the current default). The

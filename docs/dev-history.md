@@ -14581,3 +14581,74 @@ minimums it is hand flown to the wheels as one segment, all three controls ours.
   on the path and `att_gamma` following it from minimums; no `vs_dial` or `heading_set`
   under `hands`; the touchdown sink and the rollout's offset; and no `going_around`
   `off_centreline_low` or `unstabilised_below_floor`.
+
+## 2026-10-13: the timetable, the mid-flow start and the flight information board (LXGB, LEMG)
+
+The pilot asked for realistic traffic at Gibraltar and Malaga first, synthetic, and a
+flight information board. Before: every field drew independent departures and arrivals an
+hour at a time from its carrier mix (`schedule::generate`), and the fleet started with
+everything parked (`park_at_start`): at LEMG 10:00 the first arrival was ten minutes out and
+the first movement on the ground a minute in.
+
+- **Route tables** (`crates/traffic/src/routes.rs`, a Rust table so every row names a
+  carrier constant of `airlines.rs` and a typo is a test failure): LXGB is BA to Heathrow
+  (BA490/491, BA492/493) and easyJet to Gatwick, Manchester, Bristol and Birmingham;
+  LEMG about 230 routes (the busiest-route tables plus the long tail of Wikipedia's
+  destinations), weekly frequencies by IATA season from the 2025 passenger counts over a
+  150-seat aircraft 85% full. Sources: Wikipedia "Gibraltar International Airport" and
+  "Malaga Airport" (read 2026-10-13), flightradar24 BA493. New carriers BEL, AUA, SAS, FIN,
+  ICE, AEE, LOT, ETD (all in the station's telephony table).
+- **Rotations** (`rotation.rs`): flight N in, a type's turnaround (ATR 25 to 35 min,
+  narrowbody 40 to 55, widebody 90 to 120), N+1 out; based rows night-stop (in 22:30 to
+  23:45, out 06:15 to 07:45); delays drawn per day and knocked on (never below the type's
+  minimum turnaround). Deterministic per seed, field and date. A summer Tuesday at LEMG:
+  about 450 scheduled movements (Aena's 2025 average 512 counts charters, GA and cargo),
+  a 06:00 to 08:00 departure wave, banks through the day, none 03:00 to 05:00; LXGB 3 to 7
+  rotations a day, about 3,000 movements a year. First cut put every once-a-day route mid
+  way through its windows (15:00) and 10:00 at Malaga had six rotations round it: each row
+  now has its own stable offset.
+- **Mid-flow start** (`midflow.rs`): each rotation where it is at the start's local time
+  (`sim/time/local_date_days` and the zulu time; the system clock without them): an arrival
+  due within its approach time on its instrument approach (no nearer than 5 nm, spaced by
+  wake plus a runway's time, 4 nm at least; inside the tower's call distance it calls the
+  tower established, further out it checks in with approach); landed in the last 8 minutes
+  taxiing in; on its stand turning round; a departure due later boarding there (parked
+  from the start); off the blocks in the last 2 minutes pushing, then taxiing (to 9),
+  holding short (one, to 11), climbing out (one, to 14). Nothing on the runway; no two
+  ground movers whose ways cross; stands clear of the lanes and 80 m from one held where
+  the apron allows; arrivals still to enter no closer than 90 s. The station learns of
+  every placed flight through its own first call. A departure is flown by its inbound's
+  airframe (`FlightInfo::inbound`, `Link::take_parked`), waiting up to 3 h for it.
+- **The board** (`board.rs`, `xcopilot/status/board`, the plugin's Board tab): departures
+  and arrivals, timetable and expected or actual time, flight, airline, city, type, stand,
+  status (Scheduled, Boarding inside 40 min, Taxiing, Departed, Approaching, Landed, At
+  gate, Delayed 15 min late); our own flight from the plan on the shelf. Sent on a change
+  at most every 2 s and every 10 s regardless; the plugin calls a board 30 s old stale, so
+  an older app shows "No board".
+- **The YAML file** gains optional `origin`, `destination` and `scheduled` (HH:MM) for the
+  board; a file written before reads as it did.
+- **Harness** (`real_install_midflow_start`, and the world sweep now starts LXGB and LEMG
+  on their timetables): numbers in the report below.
+
+  The world sweep at 10:00 local for an hour, before (the hour generator, everything parked
+  at the start) and after (the timetable, started mid-flow; a summer Tuesday): LEMG 16
+  movements, 7 landings, 0 conflicts, 0 oracle, 0 overlaps, 0 go-arounds, 2 towed, final
+  gap 14.7 nm least, 62 on stands at the start; after 21 landings in the hour (Malaga's real
+  10:00 bank), 0 conflicts, 0 oracle, 24 of 24 readbacks taken, 1 overlap, 2 go-arounds, 23
+  towed and 12 rerouted by the ground guard, final gap 4.9 nm median and 1.0 nm least (one
+  pair the tower sent round), 31 on stands at the start. LXGB 6 movements, 0 go-arounds
+  before; after 12 timetable movements over the day, 1 go-around (the arrival spawned for 27
+  while the tower worked 09, the runway in use unknown at spawn as before). The first half
+  hour of the mid-flow start (`real_install_midflow_start`): LEMG 6 placed (two arrivals on
+  the approach at 5 and 18.6 nm, a landing taxiing in, three taxiing out), nothing on the
+  runway, 0 conflicts, 0 oracle, 10 of 10 readbacks, 0 overlaps, 0 go-arounds; LXGB
+  nothing to place at 10:00 (its first arrival 10:17), clean but the one go-around above.
+
+- **UNFLOWN.** Check on the next session at LEMG and LXGB with `XCOPILOT_TRAFFIC=ours`:
+  blackbox `traffic` `up` with `source: timetable`; `spawn` records at fleet time 0 with the
+  placed flights (`from` absent) and `from: rotation` for departures off their inbound's
+  airframe; the first `call`s from the placed arrivals (an `Established` to the tower inside
+  9 nm) answered with a landing clearance; no `spawn_refused` `NearOwn` storm round our own
+  stand; the Board tab against the arrivals seen on final. Owed: the LXGB arrival flew 27
+  while the tower worked 09 in the harness (the runway in use not known at spawn, as
+  before this change).
