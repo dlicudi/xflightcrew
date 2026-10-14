@@ -1119,6 +1119,9 @@ pub use crate::station::{
 ///   `first_designator`, `reciprocal_end`.
 /// - Our own traffic, the ONE way the crew sees it: `traffic_picture`; the
 ///   installed field it flies at: `installed_icao`.
+/// - Our arrival as the station has armed it, for the traffic link to put
+///   our slot in the traffic's picture: `own_arrival_plan`.
+pub use crate::station::{own_arrival_plan, OwnArrivalPlan};
 pub use crate::station::{
     active_field, active_icao, active_station_in_range, active_station_range_nm, climb_announced,
     coach_query, coach_yes_no, departure_station, dialect_for, field_position, field_under,

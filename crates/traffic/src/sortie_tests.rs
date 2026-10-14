@@ -1209,6 +1209,8 @@ fn our_own_aircraft_on_the_path_stops_a_taxiing_aircraft() {
         pos: own_at,
         alt_ft: field.elev_ft(),
         on_ground: true,
+        gs_kts: 0.0,
+        slot: None,
     };
     let gap = spacing_m(&crate::perf::PISTON_SINGLE, &crate::perf::JET_MED);
     let mut closest = f64::INFINITY;
@@ -1495,6 +1497,8 @@ fn our_own_aircraft_is_gone_round_or_waited_for_never_passed() {
         pos: own_at,
         alt_ft: field.elev_ft(),
         on_ground: true,
+        gs_kts: 0.0,
+        slot: None,
     };
     let gap = spacing_m(&crate::perf::PISTON_SINGLE, &crate::perf::JET_MED);
     let (mut closest, mut t, mut all) = (f64::INFINITY, 0.0, Vec::new());
@@ -2706,4 +2710,185 @@ fn a_departure_leaves_the_simulation_where_the_model_takes_it() {
     assert!(turn < 15.0, "{turn} degrees off its heading");
     assert!(w.at(at_s + 120.0).unwrap().alt_ft > gone.kin.alt_ft);
     assert!(w.on_block_s > at_s + 3600.0, "an hour or more to Paris");
+}
+
+/// What one traffic arrival did behind OUR aircraft flown down the final:
+/// when we were off the runway again (as our slot predicted it at our
+/// touchdown), when it crossed the threshold, its orbits and go-arounds.
+#[derive(Debug, Default)]
+struct BehindUs {
+    own_off_s: f64,
+    thr_s: Option<f64>,
+    orbits: u32,
+    go_arounds: usize,
+}
+
+/// Fly our own `ours` down the final of XTST 27 from `own_nm` out,
+/// starting `own_at` seconds in, with `traffic` from the start; our slot
+/// in the picture when `in_picture`. We fly the type's schedule (an
+/// airliner's bands, a light aircraft its approach speed), roll out on the
+/// strip and are gone off it when our slot said at touchdown.
+fn fly_behind_us(
+    field: &FieldModel,
+    ours: &str,
+    own_nm: f64,
+    own_at: f64,
+    traffic: TrafficAircraft,
+    in_picture: bool,
+) -> BehindUs {
+    use crate::phase::OwnTarget;
+    use crate::slot::{own_slot, OwnArrival};
+    let end = field.end("27").unwrap();
+    let (perf, _) = crate::perf::class_for_type(ours);
+    let id = traffic.id;
+    let mut fleet = Fleet::new(field.clone());
+    fleet.spawn(traffic);
+    let tower = RefCell::new(ScriptedTower::default());
+    let mut out = BehindUs::default();
+    let mut along = -own_nm * 1852.0;
+    let mut gs = 0.0;
+    let mut off_at: Option<f64> = None;
+    let mut t = 0.0;
+    while t < 3600.0 {
+        let own = if t < own_at || off_at.is_some_and(|o| t >= o) {
+            None
+        } else {
+            let on_ground = along >= 0.0;
+            gs = if on_ground {
+                (gs - perf.decel_kts_s * 0.1).max(perf.taxi_kts)
+            } else if crate::arrival::is_instrument(perf) {
+                crate::arrival::scheduled_kts(perf, -along)
+            } else {
+                perf.app_kts
+            };
+            let pos = end.at(along, 0.0);
+            let alt_ft = if on_ground {
+                end.elev_ft
+            } else {
+                end.elev_ft + 50.0 - along * 3.28084 * 3f64.to_radians().tan()
+            };
+            let slot = own_slot(
+                field,
+                &OwnArrival {
+                    pos,
+                    alt_ft,
+                    gs_kts: gs,
+                    on_ground,
+                    icao_type: ours.into(),
+                    runway: "27".into(),
+                    join_m: None,
+                    cleared: false,
+                },
+            );
+            if on_ground && off_at.is_none() {
+                let s = slot.expect("our slot on the runway");
+                off_at = Some(t + s.clear_s);
+                out.own_off_s = t + s.clear_s;
+            }
+            along += gs * crate::kin::KT_TO_MS * 0.1;
+            Some(OwnTarget {
+                pos,
+                alt_ft,
+                on_ground,
+                gs_kts: gs,
+                slot: slot.filter(|_| in_picture),
+            })
+        };
+        let events = fleet.step(0.1, own, &|i| tower.borrow().orders.get(&i).cloned());
+        t += 0.1;
+        for e in &events {
+            tower.borrow_mut().hear(e);
+            if let Event::Call {
+                id: i,
+                call: Call::GoingAround,
+            } = e
+            {
+                if *i == id {
+                    out.go_arounds += 1;
+                }
+            }
+        }
+        let Some(ac) = fleet.get(id) else { break };
+        out.orbits = out.orbits.max(ac.orbits);
+        if out.thr_s.is_none() && !ac.kin.on_ground && end.frame(ac.kin.pos()).0 >= 0.0 {
+            out.thr_s = Some(t);
+        }
+        if out.thr_s.is_some() && off_at.is_some_and(|o| t > o) {
+            break;
+        }
+    }
+    out
+}
+
+/// Seconds from the start to the threshold for `ac` flown alone.
+fn threshold_alone(field: &FieldModel, ac: TrafficAircraft) -> f64 {
+    let end = field.end("27").unwrap();
+    let id = ac.id;
+    let mut fleet = Fleet::new(field.clone());
+    fleet.spawn(ac);
+    let tower = RefCell::new(ScriptedTower::default());
+    let mut t = 0.0;
+    while t < 3600.0 {
+        for e in fleet.step(0.1, None, &|i| tower.borrow().orders.get(&i).cloned()) {
+            tower.borrow_mut().hear(&e);
+        }
+        t += 0.1;
+        let a = fleet.get(id).unwrap();
+        if end.frame(a.kin.pos()).0 >= 0.0 {
+            return t;
+        }
+    }
+    panic!("never reached the threshold");
+}
+
+/// ARRIVAL SEQUENCING (2026-10-14): our own aircraft was never in the
+/// traffic's slot picture (`OwnTarget` carried a position for the ground
+/// spacing only), so a traffic arrival close behind us on the final flew
+/// on into our rollout and the tower sent one of us round. Our slot is in
+/// the picture now and the traffic yields to it: a straight-in behind our
+/// 8 nm final orbits or slows and reaches the threshold no sooner than
+/// [`crate::slot::FOLLOW_GAP_S`] after we are off the runway, with no
+/// go-around; without our slot it reached it inside the gap. An airliner a
+/// minute behind ours, a light single half a minute behind ours (two
+/// minutes is room already by the traffic's own rule: our 737 was off
+/// 43 s after touchdown, its wake gap 82 s).
+#[test]
+fn traffic_behind_our_final_yields_to_us_and_never_lands_on_us() {
+    use crate::slot::FOLLOW_GAP_S;
+    let field = fixtures::xtst();
+    for (ours, theirs, behind_s) in [("B738", "B738", 60.0), ("C172", "PA28", 30.0)] {
+        let (perf, _) = crate::perf::class_for_type(ours);
+        let traffic = || entering(&field, 7, theirs, true, 16.0, 90.0);
+        let alone = threshold_alone(&field, traffic());
+        // Our 8 nm final, flown at the type's schedule.
+        let own_final_s = if crate::arrival::is_instrument(perf) {
+            crate::arrival::scheduled_time_s(perf, 8.0 * 1852.0)
+        } else {
+            8.0 * 1852.0 / (perf.app_kts * crate::kin::KT_TO_MS)
+        };
+        // We reach the threshold `behind_s` before it would.
+        let own_at = alone - behind_s - own_final_s;
+        assert!(own_at > 0.0, "{theirs} alone at {alone:.0} s");
+        let with = fly_behind_us(&field, ours, 8.0, own_at, traffic(), true);
+        let without = fly_behind_us(&field, ours, 8.0, own_at, traffic(), false);
+        println!(
+            "{ours} ahead of {theirs}: alone {alone:.0} s, with {with:?}, without {without:?}"
+        );
+        let thr = with.thr_s.expect("it landed");
+        assert_eq!(with.go_arounds, 0, "{ours}/{theirs}: no go-around");
+        assert!(
+            thr >= with.own_off_s + FOLLOW_GAP_S,
+            "{ours}/{theirs}: at the threshold {thr:.0} s, we were off at {:.0} s",
+            with.own_off_s
+        );
+        assert!(
+            with.orbits > 0 || thr > alone + 30.0,
+            "{ours}/{theirs}: neither orbited nor slowed"
+        );
+        let blind = without.thr_s.unwrap_or(f64::INFINITY);
+        assert!(
+            blind < without.own_off_s + FOLLOW_GAP_S,
+            "{ours}/{theirs}: the test would pass without our slot ({blind:.0} s)"
+        );
+    }
 }

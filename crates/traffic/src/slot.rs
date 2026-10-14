@@ -179,6 +179,127 @@ pub fn slot_free(me: u32, own: &RunwaySlot, others: &[Seen], yields: bool) -> bo
         })
 }
 
+/// Our own aircraft arriving at the field, as the bin's link sees it
+/// (2026-10-14, arrival sequencing): where we are, our type, the runway end
+/// we land on and, while the vectors still have us short of the final,
+/// where they join it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnArrival {
+    pub pos: LatLon,
+    /// Feet MSL.
+    pub alt_ft: f64,
+    pub gs_kts: f64,
+    pub on_ground: bool,
+    /// Our ICAO type designator: the runway time is the type's
+    /// ([`crate::perf::class_for_type`], a piston single when unknown).
+    pub icao_type: String,
+    /// The runway END we land on.
+    pub runway: String,
+    /// Where the final is joined, metres from the threshold, while we are
+    /// not yet on it (the vectors' join, the approach's).
+    pub join_m: Option<f64>,
+    /// Cleared to land.
+    pub cleared: bool,
+}
+
+/// On the final: on the approach side, inside the join (or with no join),
+/// within the final's wedge (10 degrees of the centreline plus 150 m).
+fn on_final(end: &RunwayEnd, pos: LatLon, join_m: Option<f64>) -> bool {
+    let (along, right) = end.frame(pos);
+    let out = -along;
+    out > 0.0
+        && join_m.is_none_or(|j| out <= j + 0.5 * 1852.0)
+        && right.abs() <= out * 10f64.to_radians().tan() + 150.0
+}
+
+/// The runway end whose final we are inside, by position alone: 0.3 to
+/// 10 nm out, in the final's wedge ([`on_final`]), no higher than twice
+/// the 3 degree path plus 300 ft, and flying its course when the track
+/// read (within 30 degrees). The arrival a crew flies with no controller
+/// arming anything (a visual straight-in, the circuit's final).
+pub fn final_wedge_end(
+    field: &FieldModel,
+    pos: LatLon,
+    alt_ft: f64,
+    track_deg: Option<f64>,
+) -> Option<RunwayEnd> {
+    field.ends().into_iter().find(|end| {
+        let out = -end.frame(pos).0;
+        let path_ft = out * FT_PER_M * GLIDE_DEG.to_radians().tan();
+        (0.3 * 1852.0..=10.0 * 1852.0).contains(&out)
+            && on_final(end, pos, None)
+            && alt_ft - end.elev_ft <= 2.0 * path_ft + 300.0
+            && track_deg
+                .is_none_or(|t| crate::kin::signed_diff_deg(t, end.course_deg).abs() <= 30.0)
+    })
+}
+
+/// OUR slot at the runway, worked out by the traffic's own rule
+/// ([`TrafficAircraft::slot_now`]) for an aircraft of our type flying the
+/// path we will fly: from where we are to the join (when not yet on the
+/// final), down the final at the type's legs' speeds (an airliner on the
+/// radar unit's schedule, [`crate::arrival::scheduled_kts`]), our first
+/// stretch at the groundspeed we hold; the runway time the type's, its way
+/// off at this field DRIVEN. On the ground on the strip: the rollout and
+/// the way off left. `None` for a runway the field does not have, or off
+/// the strip on the ground.
+///
+/// It is COMMITTED once we are on the final inside [`ORBIT_MIN_M`] or
+/// cleared to land. Before that it is no departure WAITING either: we are
+/// the player, and the traffic yields to us as it does on the ground
+/// ([`crate::fleet::Fleet::step`] puts it in the picture as committed).
+pub fn own_slot(field: &FieldModel, a: &OwnArrival) -> Option<RunwaySlot> {
+    let end = field.end(&a.runway)?;
+    let mut kin = Kin::parked(a.pos, a.alt_ft, end.course_deg);
+    kin.on_ground = a.on_ground;
+    kin.gs_kts = a.gs_kts.max(0.0);
+    let plan = Plan::Arrival {
+        entry: a.pos,
+        star: None,
+        runway: end.ident.clone(),
+        straight_in: true,
+    };
+    let established = on_final(&end, a.pos, a.join_m);
+    let (phase, path, legs) = if a.on_ground {
+        if !field.on_runway(a.pos) {
+            return None;
+        }
+        (Phase::Landing, vec![a.pos, end.far], vec![Leg::Runway])
+    } else if established {
+        (
+            Phase::Final,
+            vec![a.pos, end.thr, end.far],
+            vec![Leg::Final, Leg::Runway],
+        )
+    } else {
+        let join = end.at(-a.join_m.unwrap_or(0.0).max(0.0), 0.0);
+        (
+            Phase::Arrive,
+            vec![a.pos, join, end.thr, end.far],
+            vec![Leg::Inbound, Leg::Final, Leg::Runway],
+        )
+    };
+    let thr_idx = (!a.on_ground).then(|| path.len() - 2);
+    let mut ac = TrafficAircraft::new(
+        crate::fleet::OWN_ID,
+        "",
+        "",
+        &a.icao_type,
+        plan,
+        kin,
+        phase,
+        0,
+    );
+    ac.route = crate::aircraft::Route::new(path, legs, thr_idx);
+    let slot = ac.slot_now(field, &end)?;
+    let out = -end.frame(a.pos).0;
+    Some(RunwaySlot {
+        committed: a.on_ground || a.cleared || (established && out < ORBIT_MIN_M),
+        waiting: false,
+        ..slot
+    })
+}
+
 /// What a landing on one runway end costs this aircraft, worked out once
 /// per end and lap (the way off is a plan on the network, driven).
 #[derive(Debug, Clone, Copy, PartialEq)]

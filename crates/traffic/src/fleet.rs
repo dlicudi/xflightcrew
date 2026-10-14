@@ -10,8 +10,9 @@ use crate::rng::XorShift64;
 use std::collections::HashMap;
 
 /// Our own aircraft's id in the picture the fleet's aircraft see: no
-/// traffic id (those count up from 1).
-const OWN_ID: u32 = u32::MAX;
+/// traffic id (those count up from 1). The tower naming US as the leader
+/// a traffic flight follows maps to it (`Order::follow`).
+pub const OWN_ID: u32 = u32::MAX;
 
 /// The id of a stand an arrival is taxiing in to, in the picture: no
 /// aircraft stands there yet, but the stand is taken.
@@ -430,16 +431,37 @@ impl Fleet {
         let end_s = self.clock.now_s();
         for k in 0..n {
             let mut picture = self.picture();
-            // Our own aircraft on the ground takes a stand like a parked
-            // one: an arrival never picks the stand we stand on.
-            if let Some(o) = own.filter(|o| o.on_ground) {
-                picture.push(Seen {
-                    id: OWN_ID,
-                    phase: Phase::Parked,
-                    pos: o.pos,
-                    gs_kts: 0.0,
-                    slot: None,
-                });
+            // Our own aircraft arriving holds its slot at the runway like
+            // any traffic arrival, and the traffic yields to it: we are the
+            // player, never told to wait by the fleet, so the slot is in the
+            // picture as committed (2026-10-14, arrival sequencing). On the
+            // ground otherwise it takes a stand like a parked one: an
+            // arrival never picks the stand we stand on.
+            if let Some(o) = own {
+                if let Some(slot) = o.slot {
+                    picture.push(Seen {
+                        id: OWN_ID,
+                        phase: if o.on_ground {
+                            Phase::Landing
+                        } else {
+                            Phase::Final
+                        },
+                        pos: o.pos,
+                        gs_kts: o.gs_kts,
+                        slot: Some(crate::slot::RunwaySlot {
+                            committed: true,
+                            ..slot
+                        }),
+                    });
+                } else if o.on_ground {
+                    picture.push(Seen {
+                        id: OWN_ID,
+                        phase: Phase::Parked,
+                        pos: o.pos,
+                        gs_kts: 0.0,
+                        slot: None,
+                    });
+                }
             }
             // A stand somebody is taxiing in to is taken already.
             let claimed: Vec<LatLon> = self.stands_claimed().collect();
