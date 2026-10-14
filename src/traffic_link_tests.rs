@@ -2378,6 +2378,7 @@ fn our_arrival_is_the_armed_runway_or_the_final_we_fly() {
             vs_fpm: 0.0,
             gs_kts: 120.0,
             slot: None,
+            route: Vec::new(),
         }
     };
     let five_out = at(-5.0 * 1852.0, 1600.0, false);

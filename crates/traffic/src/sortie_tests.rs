@@ -1211,13 +1211,14 @@ fn our_own_aircraft_on_the_path_stops_a_taxiing_aircraft() {
         on_ground: true,
         gs_kts: 0.0,
         slot: None,
+        route: Vec::new(),
     };
     let gap = spacing_m(&crate::perf::PISTON_SINGLE, &crate::perf::JET_MED);
     let mut closest = f64::INFINITY;
     let mut t = 0.0;
     // Standing there 80 s: less than the gridlock guard once it has stopped.
     while t < 80.0 {
-        let ev = fleet.step(0.1, Some(us), &|_| None);
+        let ev = fleet.step(0.1, Some(us.clone()), &|_| None);
         assert!(!ev.iter().any(|e| matches!(
             e,
             Event::SpacingRerouted { .. }
@@ -1242,7 +1243,7 @@ fn our_own_aircraft_on_the_path_stops_a_taxiing_aircraft() {
     };
     let mut t = 0.0;
     while t < 200.0 && fleet.get(1).unwrap().phase == Phase::TaxiOut {
-        fleet.step(0.1, Some(moved), &|_| None);
+        fleet.step(0.1, Some(moved.clone()), &|_| None);
         t += 0.1;
     }
     assert_eq!(fleet.get(1).unwrap().phase, Phase::HoldShort, "went on");
@@ -1632,6 +1633,81 @@ fn head_on_at_a_junction_the_one_giving_way_holds_short_of_it() {
     assert_eq!(guard_events(&all), (0, 0, 0), "no guard needed");
 }
 
+/// OUR AUTO TAXI'S ROUTE IS GIVEN WAY TO (EGKK, 2026-10-14: a 737 cleared
+/// to Mike drove onto the stretch our A330 was about to taxi, unseen, and
+/// the two stood nose to nose 44 m apart for good). We taxi east along the
+/// line, standing for anything just ahead of us as our own guard does; [1]
+/// comes up a side branch to turn west down the same line, straight at us.
+/// With our route published it holds short on the branch until we are
+/// through, then goes; without it (the old picture) it drives onto our
+/// stretch and both stand nose to nose.
+#[test]
+fn traffic_holds_short_of_the_stretch_our_auto_taxi_is_driving() {
+    use crate::phase::OwnTarget;
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    let junction = end.at(400.0, -150.0);
+    let run = |publish: bool| {
+        let mut fleet = Fleet::new(field.clone());
+        fleet.spawn(taxiing(
+            &field,
+            1,
+            "C172",
+            vec![end.at(400.0, -300.0), junction, end.at(100.0, -150.0)],
+        ));
+        let taxi = Order {
+            state: TowerState::TaxiCleared,
+            ..Default::default()
+        };
+        let (mut x, mut t, mut on_our_stretch, mut stood) = (100.0, 0.0, false, 0.0);
+        while t < 300.0 && x < 700.0 {
+            let us = end.at(x, -150.0);
+            let own = OwnTarget {
+                pos: us,
+                alt_ft: field.elev_ft(),
+                on_ground: true,
+                gs_kts: 8.0,
+                slot: None,
+                route: if publish {
+                    vec![us, end.at(700.0, -150.0)]
+                } else {
+                    Vec::new()
+                },
+            };
+            fleet.step(0.1, Some(own), &|_| Some(taxi.clone()));
+            t += 0.1;
+            let Some(a) = fleet.get(1) else { break };
+            let (along, right) = end.frame(a.kin.pos());
+            // On the line ahead of us, between us and the junction.
+            if (right + 150.0).abs() < 20.0 && along > x && x < 400.0 {
+                on_our_stretch = true;
+            }
+            // Our own guard: we stand for anything on the line just ahead.
+            let blocked = (right + 150.0).abs() < 25.0 && along > x && along - x < 80.0;
+            if blocked {
+                stood += 0.1;
+            } else {
+                x += 8.0 * crate::kin::KT_TO_MS * 0.1;
+            }
+        }
+        let held = fleet.get(1).map(|a| end.frame(a.kin.pos()));
+        println!(
+            "published {publish}: we reached {x:.0} m in {t:.0} s, stood {stood:.0} s, it on \
+             our stretch {on_our_stretch}, it at {held:?}"
+        );
+        (x, stood, on_our_stretch)
+    };
+    let (x, stood, entered) = run(true);
+    assert!(!entered, "held short of our stretch");
+    assert!(
+        x >= 700.0 && stood == 0.0,
+        "we taxied through: {x:.0} m, stood {stood:.0} s"
+    );
+    // Unseen, it met us nose to nose and we stood until the guard moved it.
+    let (_, stood, entered) = run(false);
+    assert!(entered && stood > 60.0, "stood {stood:.0} s");
+}
+
 /// HEAD ON ON A DEAD END: a 172 taxiing up a line with a 737 PARKED on it,
 /// facing it, and nothing else to the way. It stops short by the spacing
 /// and waits; after the guard it is planned another way round on the
@@ -1702,11 +1778,12 @@ fn our_own_aircraft_is_gone_round_or_waited_for_never_passed() {
         on_ground: true,
         gs_kts: 0.0,
         slot: None,
+        route: Vec::new(),
     };
     let gap = spacing_m(&crate::perf::PISTON_SINGLE, &crate::perf::JET_MED);
     let (mut closest, mut t, mut all) = (f64::INFINITY, 0.0, Vec::new());
     while t < 900.0 && fleet.get(1).unwrap().phase == Phase::TaxiOut {
-        all.extend(fleet.step(0.1, Some(us), &|_| None));
+        all.extend(fleet.step(0.1, Some(us.clone()), &|_| None));
         t += 0.1;
         closest = closest.min(dist_m(fleet.get(1).unwrap().kin.pos(), own_at));
     }
@@ -2995,6 +3072,7 @@ fn fly_behind_us(
                 on_ground,
                 gs_kts: gs,
                 slot: slot.filter(|_| in_picture),
+                route: Vec::new(),
             })
         };
         let events = fleet.step(0.1, own, &|i| tower.borrow().orders.get(&i).cloned());

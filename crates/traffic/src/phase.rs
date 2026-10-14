@@ -417,8 +417,10 @@ pub enum Event {
         id: u32,
         removed: u32,
         /// What made the guard act: `runway` (stopped on one), `junction`
-        /// (giving way to one standing still), `parked`, or `facing` (one
-        /// standing nose to it).
+        /// (giving way to one standing still), `parked`, `facing` (one
+        /// standing nose to it), or `own`: `removed` stood in the way of our
+        /// own auto taxi while we stood too, and `id` is
+        /// [`crate::fleet::OWN_ID`].
         why: &'static str,
         /// The mover's and the removed one's place and heading, the removed
         /// one's phase as it went, and how long it had stood: the case is
@@ -456,7 +458,7 @@ pub enum Despawn {
 
 /// Our own aircraft, as the fleet needs it: where not to spawn, whom to
 /// keep the ground spacing from and, arriving, our place at the runway.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OwnTarget {
     pub pos: LatLon,
     pub alt_ft: f64,
@@ -467,6 +469,10 @@ pub struct OwnTarget {
     /// the traffic sequences round it and yields to it. `None` when we are
     /// not arriving at this field.
     pub slot: Option<crate::slot::RunwaySlot>,
+    /// The ground route still ahead of us, from where we are, while our own
+    /// auto taxi drives it; empty otherwise. The traffic gives way to it as
+    /// to one of its own movers, always ([`crate::spacing::apply`]).
+    pub route: Vec<LatLon>,
 }
 
 /// The radio half of one traffic aircraft: what it has said, so a call is

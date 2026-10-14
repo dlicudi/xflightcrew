@@ -27,9 +27,13 @@
 //! ([`TrafficAircraft::reroute_around`]); with none, a traffic aircraft
 //! that will not move is towed clear ([`Event::SpacingCleared`]). Our own
 //! aircraft is never towed and never driven through: traffic waits for us.
+//! On our auto taxi our route is known ([`OwnTarget::route`]) and we are a
+//! mover in the meetings, always the one with the right of way; a traffic
+//! aircraft standing in our way while we stand too is towed off it.
 
 use crate::aircraft::TrafficAircraft;
 use crate::field::FieldModel;
+use crate::fleet::OWN_ID;
 use crate::kin::{bearing, dist_m, offset_m, project_m, signed_diff_deg, LatLon};
 use crate::perf::{Perf, JET_MED};
 use crate::phase::{Despawn, Event, OwnTarget, Phase};
@@ -133,7 +137,7 @@ pub struct GroundSpacing {
     /// it, and the one giving way was let go up the very lane it had
     /// stopped short of (ENAT 11, the hour sweep, 2026-10-09). The hold
     /// never runs toward it now; it moves on only when the stretch does.
-    pub giving_way: Vec<(u32, Option<HoldAt>)>,
+    pub giving_way: Vec<(Blocker, Option<HoldAt>)>,
     /// The blocker the guard found no way round and nothing to tow: it
     /// waits, said once ([`Event::SpacingHeld`]).
     pub no_way: Option<Blocker>,
@@ -195,9 +199,18 @@ fn route_ahead(ac: &TrafficAircraft, len_m: f64) -> Option<Vec<LatLon>> {
     if !taxi_phase(ac.phase) || r.follow.done || r.path.len() < 2 || !ac.kin.on_ground {
         return None;
     }
-    let mut way = vec![ac.kin.pos()];
+    cut(
+        ac.kin.pos(),
+        r.path.get(r.follow.seg + 1..).unwrap_or(&[]),
+        len_m,
+    )
+}
+
+/// The way from `from` along `rest`, cut at `len_m`.
+fn cut(from: LatLon, rest: &[LatLon], len_m: f64) -> Option<Vec<LatLon>> {
+    let mut way = vec![from];
     let mut left = len_m;
-    for &p in r.path.iter().skip(r.follow.seg + 1) {
+    for &p in rest {
         let last = *way.last().unwrap_or(&p);
         let d = dist_m(last, p);
         if d >= left {
@@ -428,10 +441,12 @@ struct Stop {
 pub fn apply(
     fleet: &mut [TrafficAircraft],
     field: &FieldModel,
-    own: Option<&OwnTarget>,
+    own: Option<(&OwnTarget, f64)>,
     dt: f64,
     events: &mut Vec<Event>,
 ) {
+    // Our own aircraft standing still `own_still_s`.
+    let (own, own_still_s) = (own.map(|(o, _)| o), own.map_or(0.0, |(_, s)| s));
     for ac in fleet.iter_mut() {
         if ac.kin.on_ground && ac.kin.gs_kts < 0.5 {
             ac.spacing.still_s += dt;
@@ -606,10 +621,59 @@ pub fn apply(
     // a mover has the right of way; both outside, a line-up or a vacate
     // first, then the nearer to it, then the lower id. Both inside: met too
     // late, both stop by the spacing above, and the guard below sorts it.
+    // OUR OWN AIRCRAFT ON ITS AUTO TAXI is a mover too, the last party
+    // (index `n`), and always has the right of way: EGKK (2026-10-14), a
+    // 737 cleared to Mike drove onto the stretch our A330 was about to
+    // taxi (we carried no route, so it never gave way) and the two stood
+    // nose to nose 44 m apart for good.
     let origin = fleet.first().map(|a| a.kin.pos()).unwrap_or((0.0, 0.0));
-    let long: Vec<Option<Vec<LatLon>>> = fleet
+    let own_way = own
+        .filter(|o| o.on_ground)
+        .and_then(|o| cut(o.pos, &o.route, MEETING_LOOKAHEAD_M));
+    let own_hdg = own_way.as_ref().and_then(|w| {
+        w.iter()
+            .find(|&&p| dist_m(w[0], p) > 1.0)
+            .map(|&p| bearing(w[0], p))
+    });
+    let mut long: Vec<Option<Vec<LatLon>>> = fleet
         .iter()
         .map(|a| route_ahead(a, MEETING_LOOKAHEAD_M))
+        .collect();
+    long.push(own_way.clone());
+    let perf_of = |p: usize| fleet.get(p).map_or(OWN_PERF, |a| a.perf);
+    let who_of = |p: usize| {
+        fleet
+            .get(p)
+            .map_or(Blocker::Own, |a| Blocker::Traffic(a.id))
+    };
+    let gs_of = |p: usize| {
+        fleet
+            .get(p)
+            .map_or(own.map_or(0.0, |o| o.gs_kts), |a| a.kin.gs_kts)
+    };
+    let pos_of = |p: usize| {
+        fleet
+            .get(p)
+            .map_or(own.map_or(origin, |o| o.pos), |a| a.kin.pos())
+    };
+    let hdg_of = |p: usize| {
+        fleet
+            .get(p)
+            .map_or(own_hdg.unwrap_or(0.0), |a| a.kin.hdg_deg)
+    };
+    // Which of the fleet stand in our own way: ahead of us on the route we
+    // taxi, inside the wider of the two corridors.
+    let in_own_way: Vec<bool> = fleet
+        .iter()
+        .map(|a| {
+            let (Some(w), Some(h)) = (&own_way, own_hdg) else {
+                return false;
+            };
+            let corridor = corridor_m(OWN_PERF) + (a.perf.span_m - OWN_PERF.span_m).max(0.0) / 2.0;
+            a.kin.on_ground
+                && signed_diff_deg(bearing(w[0], a.kin.pos()), h).abs() < 90.0
+                && project(w, a.kin.pos()).is_some_and(|(_, off, _)| off <= corridor)
+        })
         .collect();
     let mine: Vec<Option<Vec<(f64, f64)>>> = long
         .iter()
@@ -619,10 +683,10 @@ pub fn apply(
     // whole aircraft is past its junction.
     let theirs: Vec<Option<Vec<(f64, f64)>>> = long
         .iter()
-        .zip(fleet.iter())
-        .map(|(w, a)| {
+        .enumerate()
+        .map(|(p, w)| {
             w.as_ref().map(|w| {
-                let tail = project_m(a.kin.pos(), a.kin.hdg_deg + 180.0, a.perf.length_m / 2.0);
+                let tail = project_m(pos_of(p), hdg_of(p) + 180.0, perf_of(p).length_m / 2.0);
                 metres(origin, &[&[tail][..], w].concat())
             })
         })
@@ -632,18 +696,18 @@ pub fn apply(
             spans[i] = Some(runway_span(field, w));
         }
     }
-    let mut giving: Vec<Vec<(u32, Option<HoldAt>)>> = vec![Vec::new(); n];
+    let mut giving: Vec<Vec<(Blocker, Option<HoldAt>)>> = vec![Vec::new(); n];
     for i in 0..n {
-        for j in i + 1..n {
+        for j in i + 1..long.len() {
             let (Some(mi), Some(mj), Some(ti), Some(tj)) =
                 (&mine[i], &mine[j], &theirs[i], &theirs[j])
             else {
                 continue;
             };
-            if dist_m(fleet[i].kin.pos(), fleet[j].kin.pos()) > 2.0 * MEETING_LOOKAHEAD_M {
+            if dist_m(pos_of(i), pos_of(j)) > 2.0 * MEETING_LOOKAHEAD_M {
                 continue;
             }
-            let need = (fleet[i].perf.span_m + fleet[j].perf.span_m) / 2.0 + LATERAL_MARGIN_M;
+            let need = (fleet[i].perf.span_m + perf_of(j).span_m) / 2.0 + LATERAL_MARGIN_M;
             let (Some(ei), Some(ej)) =
                 (meeting_entry_m(mi, tj, need), meeting_entry_m(mj, ti, need))
             else {
@@ -653,13 +717,13 @@ pub fn apply(
             // whole spacing from it, never just a wingtip. Once giving way,
             // at the point first set ([`GroundSpacing::giving_way`]).
             let hold = |k: usize, e: f64, other: usize| {
-                let back = spacing_m(fleet[k].perf, fleet[other].perf) - need;
+                let back = spacing_m(fleet[k].perf, perf_of(other)) - need;
                 let short = e - back.max(fleet[k].perf.length_m / 2.0 + HOLD_MARGIN_M);
                 let set = fleet[k]
                     .spacing
                     .giving_way
                     .iter()
-                    .find(|(id, _)| *id == fleet[other].id)
+                    .find(|(who, _)| *who == who_of(other))
                     .and_then(|(_, at)| *at)
                     .filter(|a| fleet[k].route.path.first() == Some(&a.from));
                 match set {
@@ -670,8 +734,9 @@ pub fn apply(
             // Standing still and not in the other's way (a departure just
             // started up on its stand beside the lane an arrival is taxiing
             // in along, XNOC 2026-10-09), it can simply stay where it is.
-            let in_way = |k: usize, other: usize| {
-                stops[other].is_some_and(|s| obstacles[s.obstacle].idx == Some(k))
+            let in_way = |k: usize, other: usize| match stops.get(other) {
+                Some(s) => s.is_some_and(|s| obstacles[s.obstacle].idx == Some(k)),
+                None => in_own_way[k],
             };
             // Never held ON a runway, nor short of a stretch beyond one: it
             // would stand on the strip (EFMA, the hour sweep, 2026-10-09).
@@ -687,13 +752,12 @@ pub fn apply(
                     .spacing
                     .giving_way
                     .iter()
-                    .any(|(id, _)| *id == fleet[other].id);
+                    .any(|(who, _)| *who == who_of(other));
                 // Standing where the other has stopped for it, it gives way
                 // to nobody: it is in the way, for the guard below (held to
                 // its hold point it would stand there for good, the other
                 // waiting on it: USRK, the hour sweep, 2026-10-09).
-                let blocking =
-                    fleet[k].kin.gs_kts < 0.5 && fleet[other].kin.gs_kts < 0.5 && in_way(k, other);
+                let blocking = fleet[k].kin.gs_kts < 0.5 && gs_of(other) < 0.5 && in_way(k, other);
                 if !off_runways(k, e, other) || blocking {
                     false
                 } else if fleet[k].kin.gs_kts < 0.5 && !in_way(k, other) {
@@ -710,8 +774,12 @@ pub fn apply(
                     hold(k, e, other) >= v * v / (2.0 * SPACING_DECEL_MS2)
                 }
             };
-            let (hi, hj) = (can_hold(i, ei, j), can_hold(j, ej, i));
+            let hi = can_hold(i, ei, j);
+            // Ours is never the one giving way: the traffic holds short when
+            // it can, else goes on and the spacing stops it.
+            let hj = j < n && can_hold(j, ej, i);
             let giver = match (hi, hj) {
+                _ if j == n => hi.then_some(i),
                 (true, false) => Some(i),
                 (false, true) => Some(j),
                 // Neither can stop short comfortably: one crossing a runway
@@ -730,7 +798,7 @@ pub fn apply(
                             .spacing
                             .giving_way
                             .iter()
-                            .any(|(id, _)| *id == fleet[to].id)
+                            .any(|(who, _)| *who == who_of(to))
                     };
                     let (was_i, was_j) = (gives(i, j), gives(j, i));
                     if was_i != was_j {
@@ -751,7 +819,7 @@ pub fn apply(
                 let (other, e) = if g == i { (j, ei) } else { (i, ej) };
                 let ob = obstacles
                     .iter()
-                    .position(|o| o.idx == Some(other))
+                    .position(|o| o.who == who_of(other))
                     .expect("a mover is an obstacle");
                 // A departure still on its stand gives way ON it: held at a
                 // junction down the lane, it met the arrival in a dead-end
@@ -767,10 +835,11 @@ pub fn apply(
                 // other's way runs on past what is seen of it: the hold then
                 // never runs toward it (it moves on only when the stretch
                 // does, away).
-                let unseen = {
-                    let r = &fleet[other].route.path;
-                    let whole: f64 = r.windows(2).map(|w| dist_m(w[0], w[1])).sum();
-                    whole - route_s(&fleet[other]) > MEETING_LOOKAHEAD_M
+                let length =
+                    |r: &[LatLon]| -> f64 { r.windows(2).map(|w| dist_m(w[0], w[1])).sum() };
+                let unseen = match fleet.get(other) {
+                    Some(a) => length(&a.route.path) - route_s(a) > MEETING_LOOKAHEAD_M,
+                    None => own.is_some_and(|o| length(&o.route) > MEETING_LOOKAHEAD_M),
                 };
                 let at = fleet[g]
                     .route
@@ -781,7 +850,7 @@ pub fn apply(
                         s_m: route_s(&fleet[g]) + free,
                         from,
                     });
-                giving[g].push((fleet[other].id, at));
+                giving[g].push((who_of(other), at));
                 keep(
                     &mut stops,
                     g,
@@ -814,6 +883,19 @@ pub fn apply(
         ac.spacing.blocker = Some(ob.who);
         ac.spacing.free_m = Some(s.free_m);
         let stopped = ac.kin.gs_kts < 0.5 && s.free_m < 1.0;
+        // STANDING IN OUR WAY WHILE WE STAND TOO: neither will ever move
+        // (we wait for it, it for us), so it is towed off our route, ours
+        // never. EGKK (2026-10-14): a 737 met nose to nose on our way to
+        // Mike, no way round it, held us 68 m from our hold for good.
+        if ob.who == Blocker::Own
+            && in_own_way[i]
+            && ac.spacing.still_s >= STUCK_S
+            && own_still_s >= 2.0 * STUCK_S
+        {
+            let us = own.map_or(origin, |o| o.pos);
+            tow(ac, (OWN_ID, (us, own_hdg.unwrap_or(0.0))), "own", events);
+            continue;
+        }
         // Waiting on one that will never move for it: bounded. Off the
         // runway only behind one that will not come on (a queue moves up
         // in its own time); on it, behind anybody.
@@ -946,8 +1028,6 @@ pub fn apply(
                         || b.spacing.blocker == Some(me)))
         });
         if let Some(j) = towable {
-            let from = fleet[j].phase;
-            let removed = fleet[j].id;
             let why = if on_strip[i] {
                 "runway"
             } else if s.junction {
@@ -957,29 +1037,8 @@ pub fn apply(
             } else {
                 "facing"
             };
-            let at = [
-                (fleet[i].kin.pos(), fleet[i].kin.hdg_deg),
-                (fleet[j].kin.pos(), fleet[j].kin.hdg_deg),
-            ];
-            let still_s = fleet[j].spacing.still_s;
-            fleet[j].phase = Phase::Gone;
-            events.push(Event::Phase {
-                id: removed,
-                from,
-                to: Phase::Gone,
-            });
-            events.push(Event::Despawn {
-                id: removed,
-                reason: Despawn::Towed,
-            });
-            events.push(Event::SpacingCleared {
-                id: fleet[i].id,
-                removed,
-                why,
-                at,
-                phase: from,
-                still_s,
-            });
+            let mover = (fleet[i].id, (fleet[i].kin.pos(), fleet[i].kin.hdg_deg));
+            tow(&mut fleet[j], mover, why, events);
             fleet[i].spacing.no_way = None;
             continue;
         }
@@ -991,6 +1050,35 @@ pub fn apply(
             });
         }
     }
+}
+
+/// Tow `b` clear of the way of `mover` (its id, place and heading), the
+/// guard having acted for `why` ([`Event::SpacingCleared`]).
+fn tow(
+    b: &mut TrafficAircraft,
+    mover: (u32, (LatLon, f64)),
+    why: &'static str,
+    events: &mut Vec<Event>,
+) {
+    let from = b.phase;
+    b.phase = Phase::Gone;
+    events.push(Event::Phase {
+        id: b.id,
+        from,
+        to: Phase::Gone,
+    });
+    events.push(Event::Despawn {
+        id: b.id,
+        reason: Despawn::Towed,
+    });
+    events.push(Event::SpacingCleared {
+        id: mover.0,
+        removed: b.id,
+        why,
+        at: [mover.1, (b.kin.pos(), b.kin.hdg_deg)],
+        phase: from,
+        still_s: b.spacing.still_s,
+    });
 }
 
 #[cfg(test)]
@@ -1053,6 +1141,85 @@ mod tests {
         // The parallel the other way, 45 m off.
         let parallel = vec![(-300.0, 45.0), (300.0, 45.0)];
         assert_eq!(meeting_entry_m(&parallel, &other, 25.0), None);
+    }
+
+    /// THE LAST RESORT FOR US (EGKK, 2026-10-14): a traffic aircraft
+    /// standing nose to nose in the way of our auto taxi, with no way round
+    /// it, is towed off our route once we too have stood twice the guard's
+    /// patience; never while we move, never sooner, never when we are not
+    /// driving a route (it then simply waits for us), and ours never.
+    #[test]
+    fn traffic_standing_in_our_way_while_we_stand_is_towed_never_us() {
+        use crate::aircraft::{Route, TrafficAircraft};
+        use crate::kin::{shift, Kin};
+        use crate::phase::Plan;
+        let field = crate::field::fixtures::xtst();
+        // Well clear of the field's network: no way round.
+        let o = shift(
+            (field.net.stands[0].lat, field.net.stands[0].lon),
+            5000.0,
+            5000.0,
+        );
+        // We stand at `o` on a route east; it stands 60 m ahead, facing us,
+        // its own route west through us.
+        let it_at = shift(o, 60.0, 0.0);
+        let traffic = || {
+            let mut a = TrafficAircraft::new(
+                1,
+                "A",
+                "A",
+                "B738",
+                Plan::Parked,
+                Kin::parked(it_at, 0.0, 270.0),
+                Phase::TaxiOut,
+                1,
+            );
+            a.route = Route::taxi(vec![it_at, shift(o, -300.0, 0.0)]);
+            a
+        };
+        // (our groundspeed, our route published): when it was towed.
+        let towed_after = |gs_kts: f64, route: bool| {
+            let us = OwnTarget {
+                pos: o,
+                alt_ft: 0.0,
+                on_ground: true,
+                gs_kts,
+                slot: None,
+                route: if route {
+                    vec![o, shift(o, 300.0, 0.0)]
+                } else {
+                    Vec::new()
+                },
+            };
+            let mut fleet = vec![traffic()];
+            let mut t: f64 = 0.0;
+            while t < 3.0 * STUCK_S {
+                let still = if gs_kts < 1.0 { t } else { 0.0 };
+                let mut events = Vec::new();
+                apply(&mut fleet, &field, Some((&us, still)), 0.1, &mut events);
+                t += 0.1;
+                let cleared = events.iter().find_map(|e| match e {
+                    Event::SpacingCleared {
+                        id, removed, why, ..
+                    } => Some((*id, *removed, *why)),
+                    _ => None,
+                });
+                if let Some(c) = cleared {
+                    assert_eq!(c, (OWN_ID, 1, "own"), "the traffic towed, for us");
+                    assert_eq!(fleet[0].phase, Phase::Gone);
+                    return Some(t);
+                }
+            }
+            None
+        };
+        let at = towed_after(0.0, true).expect("towed off our way");
+        assert!(at >= 2.0 * STUCK_S, "only after we stood {at:.0} s");
+        assert_eq!(towed_after(5.0, true), None, "never while we move");
+        assert_eq!(
+            towed_after(0.0, false),
+            None,
+            "not driving: it waits for us"
+        );
     }
 
     /// One standing right in front of a mover's nose stops it, whatever its

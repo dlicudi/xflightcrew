@@ -29,6 +29,9 @@ pub struct Fleet {
     pending: Vec<Event>,
     /// Our own aircraft as last seen.
     own: Option<OwnTarget>,
+    /// Seconds our own aircraft has stood still on the ground, for the
+    /// spacing's last resort ([`crate::spacing::apply`]).
+    own_still_s: f64,
     /// TURNAROUNDS (realism review, 2026-10-09): an arrival that parks
     /// stays on its stand, dark, and flies again as a departure once it
     /// has turned round ([`Fleet::ready_to_leave`]), where it vanished
@@ -73,6 +76,7 @@ impl Fleet {
             aircraft: Vec::new(),
             pending: Vec::new(),
             own: None,
+            own_still_s: 0.0,
             turn_round: false,
             ready_at: HashMap::new(),
             finished: Vec::new(),
@@ -335,7 +339,7 @@ impl Fleet {
 
     /// Our own aircraft as last given to [`Fleet::step`].
     pub fn own(&self) -> Option<OwnTarget> {
-        self.own
+        self.own.clone()
     }
 
     /// Where the fleet's aircraft stand on the ground, and the stands those
@@ -425,7 +429,7 @@ impl Fleet {
         own: Option<OwnTarget>,
         orders: &dyn Fn(u32) -> Option<Order>,
     ) -> Vec<Event> {
-        self.own = own;
+        self.own = own.clone();
         let mut events = std::mem::take(&mut self.pending);
         let n = self.clock.advance(dt);
         let end_s = self.clock.now_s();
@@ -437,7 +441,7 @@ impl Fleet {
             // picture as committed (2026-10-14, arrival sequencing). On the
             // ground otherwise it takes a stand like a parked one: an
             // arrival never picks the stand we stand on.
-            if let Some(o) = own {
+            if let Some(o) = &own {
                 if let Some(slot) = o.slot {
                     picture.push(Seen {
                         id: OWN_ID,
@@ -472,10 +476,16 @@ impl Fleet {
                 gs_kts: 0.0,
                 slot: None,
             }));
+            let standing = own.as_ref().is_some_and(|o| o.on_ground && o.gs_kts < 1.0);
+            self.own_still_s = if standing {
+                self.own_still_s + SUBSTEP_S
+            } else {
+                0.0
+            };
             crate::spacing::apply(
                 &mut self.aircraft,
                 &self.field,
-                own.as_ref(),
+                own.as_ref().map(|o| (o, self.own_still_s)),
                 SUBSTEP_S,
                 &mut events,
             );

@@ -368,6 +368,7 @@ pub(super) async fn drive(
     gen: &sim::run::Lease<'_>,
 ) {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
+    let published = super::RouteAheadGuard;
     // The landing light over runway spans, decided once for the drive: none
     // when the airframe's landing lamp is already its taxi light tonight.
     let crossing_light = if route.runway_spans.is_empty() {
@@ -666,6 +667,7 @@ pub(super) async fn drive(
         last_lateral = Some(lateral);
         let remaining = route.remaining(progress);
         progress_note(progress);
+        published.publish(route.path_ahead(progress));
         if ext_stopped {
             // Held by a spoken "stop" (or both pedals): a stop somebody
             // asked for is not a stall.
