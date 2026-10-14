@@ -282,7 +282,13 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     // controller terminating a service it never provided (heard live
     // 2026-07-11: app start near Sevilla answered by "radar services
     // terminated" from a departure position never called).
-    let had_contact = OWN_STRIP.clearance
+    // An IFR flight in the air is always some unit's: `Station::install`
+    // clears the clearance and the squawk watch, but never the IFR flight,
+    // so without it every switch after the first airborne handoff fell to
+    // the crew's note and the cruise went silent (LEMG-EGKK 2026-10-14:
+    // Granada Departure the last word, five switches to Bilbao unspoken).
+    let had_contact = ifr_airborne
+        || OWN_STRIP.clearance
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_some()
@@ -301,11 +307,10 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         }
     } else if !had_contact {
         // First fix of the session: the copilot orients, no radar theatre.
-        // Also every switch AFTER an airborne handoff: `Station::install`
-        // clears the clearance and the squawk watch, so the new station has
-        // "never worked" us (EGBB-EGKK 2026-09-27: four of these after the
-        // Oxford handoff). The crew speaks the note only when it is worth
-        // volunteering (`monitor::region_note_said`).
+        // Also every switch AFTER a VFR flight's airborne handoff: its
+        // service ended there, and `Station::install` cleared the clearance
+        // and the squawk watch. The crew speaks the note only when it is
+        // worth volunteering (`monitor::region_note_said`).
         RegionSwitch {
             line: format!(
                 "Closest field is {}, tower is on {}.",

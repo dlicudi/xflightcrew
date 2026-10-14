@@ -5175,6 +5175,19 @@ fn region_hands_off_to_the_decisively_nearer_tower() {
             ifr_code: Some(4503),
         }
     );
+    // The next unit's install cleared the clearance and the squawk watch,
+    // never the IFR flight: the following switch is still a handoff, never
+    // the crew's note (LEMG-EGKK 2026-10-14, five silent switches at FL340).
+    *PENDING_STATION.lock().unwrap() = None;
+    *LAST_REGION_SWITCH.lock().unwrap() = None;
+    *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
+    *OWN_STRIP.clearance.lock().unwrap() = None;
+    *OWN_STRIP.squawk_watch.lock().unwrap() = None;
+    let sw = region_tick(36.6, -4.6, false, t0).expect("IFR handoff after an install");
+    assert!(!sw.crew, "{}", sw.line);
+    assert!(sw.line.contains("contact Malaga Approach"), "{}", sw.line);
+    let h = crate::party_line::take_region_handoff().expect("published for the crew");
+    assert_eq!(h.ifr_code, Some(4503));
     // The pinned arrival keeps its tower (the inbound call goes there),
     // tower-only or not.
     *PENDING_STATION.lock().unwrap() = None;
