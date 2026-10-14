@@ -69,6 +69,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("climb_watch::SIM_SPEED", 'S'),
     ("climb_watch::TELEMETRY", 'S'),
     ("cockpit_auto::PILOT_MOVED_LIGHTS", 'F'),
+    ("config::BOOT_PREFS", 'P'),
     ("crew_radio::CREW_RADIO", 'F'),
     ("crew_radio::LAST_READBACK", 'F'),
     ("detect::PROBE_INDEX", 'S'),

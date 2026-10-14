@@ -1491,7 +1491,7 @@ pub const ALL: &[Setting] = &[
         kind: Kind::Path { dir: true },
         tier: Tier::Restart,
         section: Section::Paths,
-        get: || Value::Text(crate::config::xplane_root()),
+        get: || Value::Text(crate::config::xplane_root_next()),
         apply: |v| v.as_text().is_some(),
         ..BASE
     },
@@ -1503,7 +1503,7 @@ pub const ALL: &[Setting] = &[
         kind: Kind::Path { dir: false },
         tier: Tier::Restart,
         section: Section::Paths,
-        get: || Value::Text(crate::config::apt_dat_path()),
+        get: || Value::Text(crate::config::apt_dat_path_next()),
         apply: |v| v.as_text().is_some(),
         ..BASE
     },
@@ -1515,7 +1515,7 @@ pub const ALL: &[Setting] = &[
         kind: Kind::Path { dir: true },
         tier: Tier::Restart,
         section: Section::Paths,
-        get: || Value::Text(crate::config::models_dir().to_string_lossy().into_owned()),
+        get: || Value::Text(crate::config::models_dir_next().to_string_lossy().into_owned()),
         apply: |v| v.as_text().is_some(),
         ..BASE
     },
@@ -1588,7 +1588,7 @@ pub const ALL: &[Setting] = &[
         tier: Tier::Restart,
         section: Section::Engine,
         get: || {
-            let n = crate::config::knob("XCOPILOT_TTS_THREADS")
+            let n = crate::config::knob_next("XCOPILOT_TTS_THREADS")
                 .and_then(|v| v.trim().parse::<f64>().ok())
                 .filter(|n| *n >= 1.0)
                 .unwrap_or(4.0);
@@ -1738,7 +1738,7 @@ fn text(v: &Value) -> Option<String> {
 /// `Config` field of its own (the TTS scales, the thread count).
 fn knob_text(env: &str) -> Value {
     Value::Text(
-        crate::config::knob(env)
+        crate::config::knob_next(env)
             .unwrap_or_default()
             .trim()
             .to_string(),

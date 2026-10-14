@@ -282,6 +282,8 @@ impl Config {
         // first): the first loaded wins, as dotenvy never overrides.
         let _ = dotenvy::dotenv();
         let _ = dotenvy::from_path(sim::paths::env_file());
+        // The boot knobs' prefs as THIS start reads them (`knob`).
+        reload_boot_knobs();
 
         Ok(Self {
             xplane_base_url: env_or("XPLANE_BASE_URL", "http://127.0.0.1:8086"),
@@ -608,16 +610,37 @@ fn pool_without(pool: &str, taken: &[String]) -> String {
 /// Where the Global Airports apt.dat lives: `XCOPILOT_APT_DAT` overrides the
 /// standard install path.
 pub fn apt_dat_path() -> String {
-    if let Some(p) = knob("XCOPILOT_APT_DAT").filter(|p| !p.trim().is_empty()) {
+    apt_dat_by(knob)
+}
+
+/// [`apt_dat_path`] as the next start will have it (a screen's value).
+pub fn apt_dat_path_next() -> String {
+    apt_dat_by(knob_next)
+}
+
+fn apt_dat_by(k: fn(&str) -> Option<String>) -> String {
+    if let Some(p) = k("XCOPILOT_APT_DAT").filter(|p| !p.trim().is_empty()) {
         return p;
     }
-    xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat")
+    format!(
+        "{}/Global Scenery/Global Airports/Earth nav data/apt.dat",
+        xplane_root_by(k)
+    )
 }
 
 /// The X-Plane install the sim is running from: `XCOPILOT_XPLANE_ROOT`
 /// overrides the standard location, `$HOME/X-Plane 12`.
 pub fn xplane_root() -> String {
-    if let Some(p) = knob("XCOPILOT_XPLANE_ROOT").filter(|p| !p.trim().is_empty()) {
+    xplane_root_by(knob)
+}
+
+/// [`xplane_root`] as the next start will have it (a screen's value).
+pub fn xplane_root_next() -> String {
+    xplane_root_by(knob_next)
+}
+
+fn xplane_root_by(k: fn(&str) -> Option<String>) -> String {
+    if let Some(p) = k("XCOPILOT_XPLANE_ROOT").filter(|p| !p.trim().is_empty()) {
         return p;
     }
     let home = std::env::var("HOME").unwrap_or_default();
@@ -635,7 +658,16 @@ pub fn xplane_path(rel: &str) -> String {
 /// `models` in a checkout). The ONE owner of that folder: `xfc voices`
 /// installs into it and the defaults below are read from it.
 pub fn models_dir() -> std::path::PathBuf {
-    match knob("XCOPILOT_MODELS_DIR").filter(|d| !d.trim().is_empty()) {
+    models_dir_by(knob)
+}
+
+/// [`models_dir`] as the next start will have it (a screen's value).
+pub fn models_dir_next() -> std::path::PathBuf {
+    models_dir_by(knob_next)
+}
+
+fn models_dir_by(k: fn(&str) -> Option<String>) -> std::path::PathBuf {
+    match k("XCOPILOT_MODELS_DIR").filter(|d| !d.trim().is_empty()) {
         Some(dir) => std::path::PathBuf::from(dir),
         None => sim::paths::models_default(),
     }
@@ -698,12 +730,56 @@ pub const BOOT_KNOBS: &[(&str, &str)] = &[
 /// A boot knob's value by env > saved preference: the variable when set,
 /// else the pref saved under its [`BOOT_KNOBS`] key, else `None` (the
 /// caller's default). A name not in the table is the environment only.
+///
+/// The pref half is the SNAPSHOT [`Config::from_env`] took
+/// ([`reload_boot_knobs`]): a boot knob is in force from the start, never
+/// half-way through a run (the airports file read by one loop and not the
+/// next), and a loop asking for it reads no file. [`knob_next`] is what the
+/// next start will use, for a screen.
 pub fn knob(env: &str) -> Option<String> {
     if let Ok(v) = std::env::var(env) {
         return Some(v);
     }
     let key = BOOT_KNOBS.iter().find(|(e, _)| *e == env)?.1;
+    if boot_snapshot()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none()
+    {
+        reload_boot_knobs();
+    }
+    boot_snapshot()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(key).cloned())
+}
+
+/// A boot knob as the NEXT start will read it: the variable, else the pref
+/// as saved now (read from prefs.json). What a settings screen shows.
+pub fn knob_next(env: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(env) {
+        return Some(v);
+    }
+    let key = BOOT_KNOBS.iter().find(|(e, _)| *e == env)?.1;
     crate::prefs::setting(key)
+}
+
+/// The boot knobs' saved prefs as this run took them.
+type BootPrefs = std::sync::RwLock<Option<std::collections::BTreeMap<String, String>>>;
+
+/// Process lifetime, replaced only by [`reload_boot_knobs`] (each
+/// `Config::from_env`).
+fn boot_snapshot() -> &'static BootPrefs {
+    static BOOT_PREFS: BootPrefs = std::sync::RwLock::new(None);
+    &BOOT_PREFS
+}
+
+/// Take the boot knobs' prefs afresh: the start of every `Config::from_env`
+/// (a boot, or the in-process boot after the home screen).
+pub fn reload_boot_knobs() {
+    let map = crate::prefs::settings_map();
+    *boot_snapshot().write().unwrap_or_else(|e| e.into_inner()) = Some(map);
 }
 
 /// The built-in voice of a role's slot, by its variable (the copilot's
@@ -738,10 +814,7 @@ pub fn flag(env: &str, default: bool) -> bool {
     if let Ok(v) = std::env::var(env) {
         return if default { v != "false" } else { v == "true" };
     }
-    let saved = BOOT_KNOBS
-        .iter()
-        .find(|(e, _)| *e == env)
-        .and_then(|(_, key)| crate::prefs::setting(key));
+    let saved = knob(env);
     match saved.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
         Some(s) if matches!(s.as_str(), "on" | "true" | "yes" | "1") => true,
         Some(s) if matches!(s.as_str(), "off" | "false" | "no" | "0") => false,

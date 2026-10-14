@@ -129,6 +129,11 @@ pub fn setting(key: &str) -> Option<String> {
     load().settings.get(key).cloned()
 }
 
+/// Every saved registry setting, as stored (one read of the file).
+pub fn settings_map() -> std::collections::BTreeMap<String, String> {
+    load().settings
+}
+
 /// Persist one registry setting. Best-effort like the rest: a read-only
 /// working directory costs the persistence, never the live change.
 pub fn save_setting(key: &str, rendered: &str) {
