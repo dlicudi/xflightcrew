@@ -16,10 +16,9 @@
 //! charged to X-Plane's frame loop (see the load panel for why that matters).
 
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::crossterm::event::KeyCode;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
@@ -60,6 +59,11 @@ pub enum Report {
     /// Boxed: the health snapshot dwarfs every other variant, and this channel
     /// carries a mic report every 30 ms.
     Health(Box<health::Live>),
+    /// The crew is up (the app's in-process boot, `crate::spawn_tui_crew`):
+    /// the session's settled facts.
+    Booted(Box<health::Boot>),
+    /// The crew's boot failed, said as the error says it.
+    BootFailed(String),
 }
 
 /// Where log/status output goes: plain stdout or the TUI channel.
@@ -204,53 +208,54 @@ fn color(k: LogKind) -> Color {
     }
 }
 
-/// The screens. Events (a blackbox tail) is the next one.
-#[derive(Clone, Copy, PartialEq)]
-enum Tab {
+/// The Flight tab's two views. Events (a blackbox tail) is the next one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum View {
     Health,
-    Settings,
     Transcript,
 }
 
-impl Tab {
-    const ALL: [Tab; 3] = [Tab::Health, Tab::Settings, Tab::Transcript];
-    fn label(self) -> &'static str {
+impl View {
+    pub const ALL: [View; 2] = [View::Health, View::Transcript];
+    pub fn label(self) -> &'static str {
         match self {
-            Tab::Health => "Health",
-            Tab::Settings => "Settings",
-            Tab::Transcript => "Transcript",
+            View::Health => "Health",
+            View::Transcript => "Transcript",
         }
     }
 }
 
-/// Dashboard UI state.
-struct App {
+/// The running crew's dashboard: the Flight tab of the one app
+/// (`src/app.rs`). Fed by the crew's [`Report`]s, drawn into an area.
+pub struct Dashboard {
     /// Session facts settled at boot.
-    boot: health::Boot,
+    pub boot: health::Boot,
     /// Live dependency/flight state, refreshed by the poll thread.
     health: health::Live,
     log: Vec<(LogKind, String)>,
     phase: Phase,
     mic: f32,
-    tab: Tab,
+    /// The last drawn mic deadband bucket (see [`MIC_REDRAW_STEP`]).
+    mic_bucket: i32,
+    pub view: View,
     /// Rows scrolled back from the bottom of the transcript. 0 = following the
     /// tail, which is where it stays unless you deliberately scroll up.
     scrollback: usize,
-    /// The Settings screen: its cursor, notice and open text field.
-    settings: SettingsPane,
     /// Typed-command line (you can type a command instead of speaking it).
     input: String,
-    /// Text mode: Enter enters it, Esc leaves. In command mode `q` quits; in text
-    /// mode every key types (so `q` is a normal letter, e.g. "qnh 2992").
+    /// Text mode: Enter enters it, Esc leaves. In text mode every key types
+    /// (so `q` is a normal letter, e.g. "qnh 2992").
     editing: bool,
 }
 
-/// The settings registry as a screen, shared by the dashboard's Settings tab
-/// and the home screen (`src/home.rs`): every edit goes through
-/// `settings::set`, so a pinned knob is refused the same way in both.
+/// The settings registry as a screen: every edit goes through
+/// `settings::set`, so a pinned knob is refused the same way on every tab
+/// of the app (`src/app.rs`), whichever [`Scope`] shows it.
 #[derive(Default)]
 pub struct SettingsPane {
-    /// Selected row.
+    /// Which settings this pane lists.
+    pub scope: Scope,
+    /// Selected row, in [`SettingsPane::rows`].
     pub cursor: usize,
     /// What the last settings edit did, shown under the list: an accepted
     /// change or, more usefully, the reason one was refused.
@@ -260,7 +265,53 @@ pub struct SettingsPane {
     pub edit: Option<String>,
     /// The `.env` move was asked for: the list is shown, `y` makes it.
     pub confirm_import: bool,
+    /// A save whose check is slow (the home field's apt.dat scan) runs on a
+    /// worker; its answer arrives here ([`SettingsPane::poll`]).
+    pending: Option<Receiver<SlowSave>>,
 }
+
+/// A slow save's answer: the setting, then the line to show or the refusal.
+type SlowSave = (&'static settings::Setting, Result<String, String>);
+
+/// Which settings a [`SettingsPane`] lists.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Scope {
+    /// Every setting, grouped by section.
+    #[default]
+    All,
+    /// One section's (a tab of the app).
+    Section(settings::Section),
+    /// Every setting whose label, help, key or variable holds every word
+    /// of `query`; only the env-pinned ones when `pinned`.
+    Search { query: String, pinned: bool },
+}
+
+impl Scope {
+    /// Whether a setting is listed (pure over the setting and its pin).
+    pub fn admits(&self, s: &settings::Setting, pinned: bool) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Section(sec) => s.section == *sec,
+            Scope::Search {
+                query,
+                pinned: only,
+            } => {
+                if *only && !pinned {
+                    return false;
+                }
+                let hay = format!("{} {} {} {}", s.label, s.help, s.key, s.env).to_lowercase();
+                query
+                    .to_lowercase()
+                    .split_whitespace()
+                    .all(|w| hay.contains(w))
+            }
+        }
+    }
+}
+
+/// The settings whose check is too slow for the UI thread: the home
+/// field's reads the ~400 MB apt.dat (`settings::check_icao`).
+const SLOW_SAVES: &[&str] = &["atc_airport"];
 
 const MAX_LOG: usize = 500;
 
@@ -274,193 +325,249 @@ const MAX_LOG: usize = 500;
 /// meter, more idle redraws.
 const MIC_REDRAW_STEP: f32 = 0.002;
 
-/// Run the dashboard on the calling (main) thread until the user quits. Drains
-/// `rx` for updates and polls the keyboard for `q`/Esc/Ctrl-C.
-pub fn run_dashboard(
-    boot: health::Boot,
-    rx: Receiver<Report>,
-    cmd_tx: Sender<String>,
-) -> std::io::Result<()> {
-    let mut terminal = ratatui::init();
-    let mut app = App {
-        boot,
-        health: health::Live::default(),
-        log: Vec::new(),
-        phase: Phase::Idle,
-        mic: 0.0,
-        tab: Tab::Health,
-        scrollback: 0,
-        settings: SettingsPane::default(),
-        input: String::new(),
-        editing: false,
-    };
-
-    // Redraw only when something visibly changed, not on a fixed timer — a full
-    // ratatui render every iteration was the dashboard's steady-state CPU cost.
-    // `dirty` starts true to paint the first frame.
-    let mut dirty = true;
-    let mut mic_bucket = i32::MIN; // last drawn mic deadband bucket
-    let res = loop {
-        // Drain everything queued from the voice/poll threads, marking the frame
-        // dirty only when the update actually changes what's on screen.
-        while let Ok(r) = rx.try_recv() {
-            match r {
-                Report::Log { kind, text } => {
-                    app.log.push((kind, text));
-                    if app.log.len() > MAX_LOG {
-                        app.log.drain(0..app.log.len() - MAX_LOG);
-                    }
-                    dirty = true;
-                }
-                Report::Status(p) => {
-                    if app.phase != p {
-                        app.phase = p;
-                        dirty = true;
-                    }
-                }
-                Report::Mic(l) => {
-                    // Keep the latest value for the label, but only repaint when
-                    // the meter crosses a deadband bucket (see MIC_REDRAW_STEP).
-                    app.mic = l;
-                    let bucket = (l / MIC_REDRAW_STEP).round() as i32;
-                    if bucket != mic_bucket {
-                        mic_bucket = bucket;
-                        dirty = true;
-                    }
-                }
-                Report::Health(h) => {
-                    if app.health != *h {
-                        app.health = *h;
-                        dirty = true;
-                    }
-                }
-            }
+impl Dashboard {
+    pub fn new(boot: health::Boot) -> Self {
+        Dashboard {
+            boot,
+            health: health::Live::default(),
+            log: Vec::new(),
+            phase: Phase::Idle,
+            mic: 0.0,
+            mic_bucket: i32::MIN,
+            view: View::Health,
+            scrollback: 0,
+            input: String::new(),
+            editing: false,
         }
+    }
 
-        if dirty {
-            if let Err(e) = terminal.draw(|f| draw(f, &app)) {
-                break Err(e);
-            }
-            dirty = false;
-        }
-
-        // Block up to 50 ms for input — this also paces the drain loop without a
-        // busy-wait. A keypress that isn't quit, or a resize, just needs a repaint.
-        if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    let ctrl = k.modifiers.contains(event::KeyModifiers::CONTROL);
-                    if ctrl && k.code == KeyCode::Char('c') {
-                        break Ok(()); // Ctrl-C always quits
-                    }
-                    if app.settings.edit.is_some() {
-                        // A text setting's field: keys type, Enter saves it
-                        // through the registry, Esc drops the edit.
-                        app.settings.edit_key(k.code, ctrl);
-                        dirty = true;
-                    } else if app.settings.confirming() {
-                        // The .env move asked: every key answers it.
-                        app.settings.key(k.code);
-                        dirty = true;
-                    } else if app.editing {
-                        // Text mode: keys type; Enter runs the command (staying in
-                        // text mode for the next one); Esc leaves text mode.
-                        match k.code {
-                            KeyCode::Esc => {
-                                app.editing = false;
-                                app.input.clear();
-                                dirty = true;
-                            }
-                            KeyCode::Enter => {
-                                let cmd = app.input.trim().to_string();
-                                app.input.clear();
-                                if !cmd.is_empty() {
-                                    // Stamped like the panel's lines; loop
-                                    // gone = quitting anyway.
-                                    let _ = crate::pollers::queue_command(&cmd_tx, cmd);
-                                }
-                                dirty = true;
-                            }
-                            KeyCode::Backspace => {
-                                app.input.pop();
-                                dirty = true;
-                            }
-                            KeyCode::Char(c) if !ctrl => {
-                                app.input.push(c);
-                                dirty = true;
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        // Command mode: q/Esc quit, Enter opens the text line,
-                        // Tab and the digits switch screens. Everything else is
-                        // the screen's own — Left/Right edits a setting where
-                        // it would only change tabs elsewhere, because on the
-                        // Settings screen that is the obvious key for it.
-                        match k.code {
-                            KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                            KeyCode::Enter => {
-                                app.editing = true;
-                                dirty = true;
-                            }
-                            KeyCode::Tab => {
-                                app.tab = next_tab(app.tab);
-                                dirty = true;
-                            }
-                            KeyCode::Char(c @ '1'..='3') => {
-                                let i = c as usize - '1' as usize;
-                                app.tab = Tab::ALL[i];
-                                dirty = true;
-                            }
-                            other => {
-                                dirty |= tab_key(&mut app, other);
-                            }
-                        }
-                    }
+    /// One report from the crew's threads. Returns whether the screen
+    /// changed (redraw only then: a full render every iteration was the
+    /// dashboard's steady-state CPU cost).
+    pub fn take(&mut self, r: Report) -> bool {
+        match r {
+            Report::Log { kind, text } => {
+                self.log.push((kind, text));
+                if self.log.len() > MAX_LOG {
+                    self.log.drain(0..self.log.len() - MAX_LOG);
                 }
-                Event::Resize(_, _) => dirty = true,
-                _ => {}
-            }
-        }
-    };
-
-    ratatui::restore();
-    res
-}
-
-fn next_tab(current: Tab) -> Tab {
-    let i = Tab::ALL.iter().position(|t| *t == current).unwrap_or(0);
-    Tab::ALL[(i + 1) % Tab::ALL.len()]
-}
-
-/// A key the active screen owns. Returns whether anything changed on screen.
-fn tab_key(app: &mut App, key: KeyCode) -> bool {
-    match app.tab {
-        Tab::Settings => app.settings.key(key),
-        Tab::Transcript => match key {
-            KeyCode::Down | KeyCode::Char('j') => {
-                app.scrollback = app.scrollback.saturating_sub(1);
                 true
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.scrollback = (app.scrollback + 1).min(app.log.len().saturating_sub(1));
+            Report::Status(p) => {
+                let changed = self.phase != p;
+                self.phase = p;
+                changed
+            }
+            Report::Mic(l) => {
+                // Keep the latest value for the label, but only repaint when
+                // the meter crosses a deadband bucket (see MIC_REDRAW_STEP).
+                self.mic = l;
+                let bucket = (l / MIC_REDRAW_STEP).round() as i32;
+                let changed = bucket != self.mic_bucket;
+                self.mic_bucket = bucket;
+                changed
+            }
+            Report::Health(h) => {
+                let changed = self.health != *h;
+                self.health = *h;
+                changed
+            }
+            Report::Booted(b) => {
+                self.boot = *b;
                 true
             }
-            KeyCode::End => {
-                app.scrollback = 0;
+            Report::BootFailed(_) => false,
+        }
+    }
+
+    /// The typed-command line is open: every key types.
+    pub fn editing(&self) -> bool {
+        self.editing
+    }
+
+    /// Open the typed-command line.
+    pub fn start_editing(&mut self) {
+        self.editing = true;
+    }
+
+    /// A key while the typed-command line is open: keys type; Enter runs
+    /// the command (staying in text mode for the next one), stamped like
+    /// the panel's lines; Esc leaves text mode.
+    pub fn edit_key(&mut self, key: KeyCode, ctrl: bool, cmd_tx: Option<&Sender<String>>) {
+        match key {
+            KeyCode::Esc => {
+                self.editing = false;
+                self.input.clear();
+            }
+            KeyCode::Enter => {
+                let cmd = self.input.trim().to_string();
+                self.input.clear();
+                if let (false, Some(tx)) = (cmd.is_empty(), cmd_tx) {
+                    // Loop gone = quitting anyway.
+                    let _ = crate::pollers::queue_command(tx, cmd);
+                }
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) if !ctrl => self.input.push(c),
+            _ => {}
+        }
+    }
+
+    /// A key the Flight tab owns when not typing: Left/Right switch the
+    /// view, Up/Down/End scroll the transcript. Returns whether anything
+    /// changed on screen.
+    pub fn key(&mut self, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Left | KeyCode::Right => {
+                self.view = match self.view {
+                    View::Health => View::Transcript,
+                    View::Transcript => View::Health,
+                };
                 true
             }
+            _ if self.view == View::Transcript => match key {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scrollback = self.scrollback.saturating_sub(1);
+                    true
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scrollback = (self.scrollback + 1).min(self.log.len().saturating_sub(1));
+                    true
+                }
+                KeyCode::End => {
+                    self.scrollback = 0;
+                    true
+                }
+                _ => false,
+            },
             _ => false,
-        },
-        Tab::Health => false,
+        }
+    }
+
+    /// The Flight tab's body: the view bar, then the view.
+    pub fn draw(&self, f: &mut Frame, area: Rect) {
+        let [bar, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
+        let mut spans = vec![Span::raw(" ")];
+        for v in View::ALL {
+            let style = if v == self.view {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(v.label(), style));
+            spans.push(Span::raw("   "));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), bar);
+        match self.view {
+            View::Health => draw_health(f, self, body),
+            View::Transcript => draw_transcript(f, self, body),
+        }
+    }
+
+    /// The typed-command line as the bottom line, while it is open.
+    pub fn input_line(&self) -> Option<Line<'static>> {
+        if !self.editing {
+            return None;
+        }
+        Some(Line::from(vec![
+            Span::styled(
+                " › ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(self.input.clone()),
+            Span::styled("▏", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "   Enter run · Esc done",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+    }
+
+    /// The phase dot and its word (left), the mic meter and the aircraft
+    /// (right): the app's status bar while the crew is up. The mic rides
+    /// the status bar because it is the one thing you want visible on
+    /// every screen: a dead mic looks exactly like a copilot ignoring you.
+    pub fn status(&self) -> (Span<'static>, String) {
+        let (dot, label, c) = match self.phase {
+            Phase::Listening => ("●", "listening", Color::Green),
+            Phase::Thinking => ("◐", "thinking", Color::Yellow),
+            Phase::Speaking => ("◑", "speaking", Color::Cyan),
+            Phase::Idle => ("○", "idle", Color::DarkGray),
+        };
+        (
+            Span::styled(format!("{dot} {label}"), Style::default().fg(c)),
+            format!("{}  {}", mic_bar(self.mic), self.health.profile),
+        )
     }
 }
 
 impl SettingsPane {
-    /// The setting under the cursor, in the screen's order (grouped by
+    /// A pane listing these settings.
+    pub fn scoped(scope: Scope) -> Self {
+        SettingsPane {
+            scope,
+            ..Default::default()
+        }
+    }
+
+    /// The settings this pane lists, in the screen's order (grouped by
     /// section, `settings::by_section`).
+    pub fn rows(&self) -> Vec<&'static settings::Setting> {
+        settings::by_section()
+            .into_iter()
+            .filter(|s| self.scope.admits(s, s.env_pinned()))
+            .collect()
+    }
+
+    /// Change what the pane lists; the cursor back to the top.
+    pub fn set_scope(&mut self, scope: Scope) {
+        if self.scope != scope {
+            self.scope = scope;
+            self.cursor = 0;
+        }
+    }
+
+    /// The setting under the cursor.
     pub fn selected(&self) -> Option<&'static settings::Setting> {
-        settings::by_section().get(self.cursor).copied()
+        self.rows().get(self.cursor).copied()
+    }
+
+    /// A slow save is out (its field stays open, its keys wait).
+    pub fn saving(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// A slow save's answer, when it has come. Returns whether anything
+    /// changed on screen.
+    pub fn poll(&mut self) -> bool {
+        let Some(rx) = self.pending.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok((s, Ok(shown))) => {
+                self.pending = None;
+                self.notice = Some((changed_line(s, &shown), true));
+                self.edit = None;
+                true
+            }
+            Ok((_, Err(e))) => {
+                self.pending = None;
+                self.notice = Some((e, false));
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending = None;
+                self.notice = Some(("the save stopped before it answered".into(), false));
+                true
+            }
+        }
     }
 
     /// A question is open (the `.env` move): every key answers it, so `q`
@@ -485,7 +592,7 @@ impl SettingsPane {
         }
         match key {
             KeyCode::Down | KeyCode::Char('j') => {
-                self.cursor = (self.cursor + 1).min(settings::ALL.len().saturating_sub(1));
+                self.cursor = (self.cursor + 1).min(self.rows().len().saturating_sub(1));
                 self.notice = None;
                 true
             }
@@ -513,6 +620,10 @@ impl SettingsPane {
     /// A key while a text field is open: keys type, Enter saves through the
     /// registry, Esc drops the edit.
     pub fn edit_key(&mut self, key: KeyCode, ctrl: bool) {
+        if self.saving() {
+            // A slow save is out: the field waits for its answer.
+            return;
+        }
         let Some(buf) = self.edit.as_mut() else {
             return;
         };
@@ -562,16 +673,36 @@ impl SettingsPane {
 
     /// Save the text setting being edited through the registry (validate, apply
     /// live, persist), saying what happened. A refusal keeps the field open.
-    fn save_text(&mut self) {
+    /// A setting whose check is slow ([`SLOW_SAVES`]) is saved on a worker,
+    /// the field held open until it answers ([`SettingsPane::poll`]): the
+    /// screen never blocks on an apt.dat scan.
+    pub fn save_text(&mut self) {
         let (Some(buf), Some(s)) = (self.edit.as_ref(), self.selected()) else {
             self.edit = None;
             return;
         };
-        let result = s
+        let parsed = s
             .kind
             .parse(buf)
-            .ok_or_else(|| format!("{} is too long or not one line", s.label))
-            .and_then(|v| settings::set(s.key, &v));
+            .ok_or_else(|| format!("{} is too long or not one line", s.label));
+        if SLOW_SAVES.contains(&s.key) {
+            let v = match parsed {
+                Ok(v) => v,
+                Err(e) => {
+                    self.notice = Some((e, false));
+                    return;
+                }
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.pending = Some(rx);
+            self.notice = Some((format!("checking {} ...", s.kind.render(&v)), true));
+            std::thread::spawn(move || {
+                let answer = settings::set(s.key, &v).map(|()| s.rendered());
+                let _ = tx.send((s, answer));
+            });
+            return;
+        }
+        let result = parsed.and_then(|v| settings::set(s.key, &v));
         match result {
             Ok(()) => {
                 self.notice = Some((changed_line(s, &s.rendered()), true));
@@ -585,6 +716,11 @@ impl SettingsPane {
     pub fn edit_line(&self) -> Option<Line<'static>> {
         let buf = self.edit.as_ref()?;
         let label = self.selected().map_or("", |s| s.label);
+        let hint = if self.saving() {
+            "   checking..."
+        } else {
+            "   Enter save · Esc cancel"
+        };
         Some(Line::from(vec![
             Span::styled(
                 format!(" {label}: "),
@@ -594,107 +730,20 @@ impl SettingsPane {
             ),
             Span::raw(buf.clone()),
             Span::styled("▏", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "   Enter save · Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(hint, Style::default().fg(Color::DarkGray)),
         ]))
     }
 }
 
 /// What an accepted change says: the new value, and for a boot knob that
-/// it waits for the next start.
+/// it waits for the crew's next start.
 fn changed_line(s: &settings::Setting, shown: &str) -> String {
     match s.tier {
         settings::Tier::Live => format!("{} → {shown}", s.label),
-        settings::Tier::Restart => format!("{} → {shown} (applies on restart)", s.label),
+        settings::Tier::Restart => {
+            format!("{} → {shown} (applies when the crew restarts)", s.label)
+        }
     }
-}
-
-fn draw(f: &mut Frame, app: &App) {
-    let [status, tabs, body, hint] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(1),
-    ])
-    .areas(f.area());
-
-    draw_status_bar(f, app, status);
-    draw_tab_bar(f, app, tabs);
-    match app.tab {
-        Tab::Health => draw_health(f, app, body),
-        Tab::Settings => draw_settings(f, &app.settings, body),
-        Tab::Transcript => draw_transcript(f, app, body),
-    }
-
-    // --- bottom line: command-mode hint, or the text input when editing ---
-    let input_line = if let Some(line) = app.settings.edit_line() {
-        line
-    } else if app.editing {
-        Line::from(vec![
-            Span::styled(
-                " › ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(app.input.as_str()),
-            Span::styled("▏", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "   Enter run · Esc done",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
-    } else {
-        Line::from(Span::styled(
-            " q quit · Tab screen · Enter to type a command · or just speak",
-            Style::default().fg(Color::DarkGray),
-        ))
-    };
-    f.render_widget(Paragraph::new(input_line), hint);
-}
-
-/// Title and phase on the left, the live mic level and the active aircraft on
-/// the right. The mic rides the status bar rather than a panel because it is
-/// the one thing you want visible on every screen: a dead mic looks exactly
-/// like a copilot ignoring you.
-fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    let (dot, label, c) = match app.phase {
-        Phase::Listening => ("●", "listening", Color::Green),
-        Phase::Thinking => ("◐", "thinking", Color::Yellow),
-        Phase::Speaking => ("◑", "speaking", Color::Cyan),
-        Phase::Idle => ("○", "idle", Color::DarkGray),
-    };
-    let right = format!("{}  {}", mic_bar(app.mic), app.health.profile);
-    let [left, rightarea] = Layout::horizontal([
-        Constraint::Min(20),
-        Constraint::Length(right.chars().count() as u16 + 1),
-    ])
-    .areas(area);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" XFlightCrew {} ", app.boot.version),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("({}) ", app.boot.build),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(" "),
-            Span::styled(format!("{dot} {label}"), Style::default().fg(c)),
-        ])),
-        left,
-    );
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            format!("{right} "),
-            Style::default().fg(Color::DarkGray),
-        ))
-        .alignment(Alignment::Right),
-        rightarea,
-    );
 }
 
 /// Eight cells of mic level, so speech is visible without reading a number.
@@ -708,26 +757,9 @@ fn mic_bar(level: f32) -> String {
     )
 }
 
-fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![Span::raw(" ")];
-    for (i, t) in Tab::ALL.iter().enumerate() {
-        let style = if *t == app.tab {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        spans.push(Span::styled(format!(" {} {} ", i + 1, t.label()), style));
-        spans.push(Span::raw(" "));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
 /// The health screen: dependencies on the left, what we are costing the sim on
 /// the right, the session's settled facts underneath.
-fn draw_health(f: &mut Frame, app: &App, area: Rect) {
+fn draw_health(f: &mut Frame, app: &Dashboard, area: Rect) {
     let [top, bottom] = Layout::vertical([Constraint::Length(10), Constraint::Min(3)]).areas(area);
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(top);
@@ -953,11 +985,12 @@ pub fn draw_settings(f: &mut Frame, app: &SettingsPane, area: Rect) {
         Title(&'static str),
         Knob(usize, &'static settings::Setting),
     }
-    let ordered = settings::by_section();
+    let ordered = app.rows();
+    let titled = !matches!(app.scope, Scope::Section(_));
     let mut rows_all: Vec<Row> = Vec::new();
     let mut last = None;
     for (i, s) in ordered.iter().enumerate() {
-        if last != Some(s.section) {
+        if titled && last != Some(s.section) {
             rows_all.push(Row::Title(s.section.title()));
             last = Some(s.section);
         }
@@ -1026,10 +1059,26 @@ pub fn draw_settings(f: &mut Frame, app: &SettingsPane, area: Rect) {
             }
         })
         .collect();
+    let name = match &app.scope {
+        Scope::All => "settings".to_string(),
+        Scope::Section(sec) => sec.title().to_string(),
+        Scope::Search { query, pinned } => {
+            let what = if *pinned { "pinned" } else { "search" };
+            format!("{what}: {query}▏ {} found", ordered.len())
+        }
+    };
     let title = if rows_all.len() > rows {
-        format!(" settings · {}/{} ", app.cursor + 1, settings::ALL.len())
+        format!(" {name} · {}/{} ", app.cursor + 1, ordered.len())
     } else {
-        " settings ".to_string()
+        format!(" {name} ")
+    };
+    let items = if ordered.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "  nothing matches",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        items
     };
     f.render_widget(
         List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
@@ -1073,7 +1122,7 @@ pub fn draw_settings(f: &mut Frame, app: &SettingsPane, area: Rect) {
 /// The transcript, full width, with the mic meter under it. Scrolled back, the
 /// title says so — a screen that has silently stopped following the tail reads
 /// exactly like a copilot that has stopped talking.
-fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
+fn draw_transcript(f: &mut Frame, app: &Dashboard, area: Rect) {
     let [logarea, micarea] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(area);
 
@@ -1155,9 +1204,10 @@ fn kv(k: &str, v: String) -> Line<'static> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use std::time::Duration;
 
-    fn app_with(log: Vec<(LogKind, String)>) -> App {
-        App {
+    fn app_with(log: Vec<(LogKind, String)>) -> Dashboard {
+        Dashboard {
             boot: health::Boot {
                 version: "2026.9.22".into(),
                 build: "abc1234, release".into(),
@@ -1192,17 +1242,17 @@ mod tests {
             log,
             phase: Phase::Listening,
             mic: 0.03,
-            tab: Tab::Health,
+            mic_bucket: i32::MIN,
+            view: View::Health,
             scrollback: 0,
-            settings: SettingsPane::default(),
             input: String::new(),
             editing: false,
         }
     }
 
-    fn render(app: &App, w: u16, h: u16) -> String {
+    fn render(app: &Dashboard, w: u16, h: u16) -> String {
         let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).expect("test terminal");
-        terminal.draw(|f| draw(f, app)).expect("draw");
+        terminal.draw(|f| app.draw(f, f.area())).expect("draw");
         let buf = terminal.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -1241,7 +1291,7 @@ mod tests {
             .map(|i| (LogKind::Info, format!("line {i}")))
             .collect();
         let mut app = app_with(log);
-        app.tab = Tab::Transcript;
+        app.view = View::Transcript;
         for back in [0usize, 3, 500] {
             app.scrollback = back;
             let out = render(&app, 80, 20);
@@ -1259,36 +1309,153 @@ mod tests {
     fn a_cramped_terminal_still_renders() {
         for (w, h) in [(40u16, 10u16), (20, 6), (200, 60)] {
             let mut app = app_with(vec![(LogKind::Heard, "flaps ten".into())]);
-            for tab in Tab::ALL {
-                app.tab = tab;
-                // Also with the cursor at the far end of the settings list, so
-                // the window arithmetic is exercised at both ends.
-                app.settings.cursor = settings::ALL.len().saturating_sub(1);
+            for view in View::ALL {
+                app.view = view;
                 render(&app, w, h);
             }
+            // The settings list too, with the cursor at the far end, so the
+            // window arithmetic is exercised at both ends.
+            let mut pane = SettingsPane {
+                cursor: settings::ALL.len().saturating_sub(1),
+                ..Default::default()
+            };
+            render_settings(&pane, w, h);
+            pane.cursor = 0;
+            render_settings(&pane, w, h);
         }
+    }
+
+    fn render_settings(pane: &SettingsPane, w: u16, h: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        terminal
+            .draw(|f| draw_settings(f, pane, f.area()))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The settings screen shows the live value and the help for the selected
     /// row, and every declared knob is reachable with the cursor.
     #[test]
     fn the_settings_screen_lists_every_knob_with_its_value() {
-        let mut app = app_with(Vec::new());
-        app.tab = Tab::Settings;
-        let out = render(&app, 100, 24);
+        let mut pane = SettingsPane::default();
+        let out = render_settings(&pane, 100, 22);
         assert!(out.contains("app mode"), "{out}");
         assert!(out.contains(settings::by_section()[0].help), "{out}");
         assert!(out.contains("applies immediately"), "{out}");
         // Walking down past the end parks on the last row rather than running off.
         for _ in 0..settings::ALL.len() + 5 {
-            tab_key(&mut app, KeyCode::Down);
+            pane.key(KeyCode::Down);
         }
-        assert_eq!(app.settings.cursor, settings::ALL.len() - 1);
-        let out = render(&app, 100, 24);
+        assert_eq!(pane.cursor, settings::ALL.len() - 1);
+        let out = render_settings(&pane, 100, 22);
         assert!(
             out.contains(settings::by_section()[settings::ALL.len() - 1].label),
             "the last row must be visible once selected: {out}"
         );
+    }
+
+    /// A section's pane lists that section only, without section titles,
+    /// and its cursor stops at its own last row.
+    #[test]
+    fn a_section_pane_lists_its_own_settings_only() {
+        let mut pane = SettingsPane::scoped(Scope::Section(settings::Section::Atc));
+        let rows = pane.rows();
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|s| s.section == settings::Section::Atc));
+        assert_eq!(
+            rows.len(),
+            settings::ALL
+                .iter()
+                .filter(|s| s.section == settings::Section::Atc)
+                .count()
+        );
+        for _ in 0..50 {
+            pane.key(KeyCode::Down);
+        }
+        assert_eq!(pane.cursor, rows.len() - 1);
+        let out = render_settings(&pane, 100, 20);
+        assert!(out.contains(rows[0].label), "{out}");
+        assert!(!out.contains("app mode"), "{out}");
+    }
+
+    /// Search matches every word against the label, the help, the key and
+    /// the variable; the pinned filter keeps only what the environment pins.
+    #[test]
+    fn search_finds_by_label_help_and_variable_and_filters_pinned() {
+        let _guard = settings::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let search = |q: &str, pinned: bool| {
+            SettingsPane::scoped(Scope::Search {
+                query: q.into(),
+                pinned,
+            })
+            .rows()
+            .iter()
+            .map(|s| s.key)
+            .collect::<Vec<_>>()
+        };
+        assert!(search("callsign", false).contains(&"callsign"));
+        // By the variable, in any case.
+        assert!(search("xcopilot_atc_chatter", false).contains(&"atc_chatter"));
+        // Every word must hold.
+        assert!(search("radio volume", false).contains(&"atc_volume"));
+        assert!(search("radio zzzz", false).is_empty());
+        // SAFETY: the lock above serialises every env-mutating test.
+        unsafe { std::env::set_var("XCOPILOT_ATC_CHATTER", "true") };
+        let pinned = search("", true);
+        assert!(pinned.contains(&"atc_chatter"), "{pinned:?}");
+        assert!(pinned
+            .iter()
+            .all(|k| settings::ALL.iter().any(|s| s.key == *k && s.env_pinned())));
+        unsafe { std::env::remove_var("XCOPILOT_ATC_CHATTER") };
+        let out = render_settings(
+            &SettingsPane::scoped(Scope::Search {
+                query: "zzzz".into(),
+                pinned: false,
+            }),
+            80,
+            12,
+        );
+        assert!(out.contains("nothing matches"), "{out}");
+    }
+
+    /// The home field's check scans apt.dat: its save runs on a worker, the
+    /// field held open and its keys ignored until the answer comes.
+    #[test]
+    fn the_home_field_is_saved_off_the_screen_thread() {
+        let mut pane = SettingsPane::scoped(Scope::Section(settings::Section::Atc));
+        pane.cursor = pane
+            .rows()
+            .iter()
+            .position(|s| s.key == "atc_airport")
+            .expect("declared");
+        // Refused by its own shape, so nothing is written to prefs.json.
+        pane.edit = Some("X1-".into());
+        pane.save_text();
+        assert!(pane.saving());
+        pane.edit_key(KeyCode::Char('z'), false);
+        assert_eq!(pane.edit.as_deref(), Some("X1-"), "keys wait for the save");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pane.poll() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the save never answered"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!pane.saving());
+        assert!(pane.edit.is_some(), "a refusal keeps the field");
+        let (text, ok) = pane.notice.clone().unwrap();
+        assert!(!ok && text.contains("ICAO"), "{text}");
     }
 
     /// A refused edit says why. Silently ignoring the key is how a settings
@@ -1302,13 +1469,14 @@ mod tests {
         let _guard = settings::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let mut app = app_with(Vec::new());
-        app.tab = Tab::Settings;
-        app.settings.cursor = s;
+        let mut pane = SettingsPane {
+            cursor: s,
+            ..Default::default()
+        };
         // SAFETY: the lock above serialises every env-mutating test.
         unsafe { std::env::set_var("XCOPILOT_ATC_CHATTER", "true") };
-        assert!(tab_key(&mut app, KeyCode::Right));
-        let out = render(&app, 100, 24);
+        assert!(pane.key(KeyCode::Right));
+        let out = render_settings(&pane, 100, 22);
         assert!(out.contains("pinned by XCOPILOT_ATC_CHATTER"), "{out}");
         unsafe { std::env::remove_var("XCOPILOT_ATC_CHATTER") };
     }
@@ -1325,30 +1493,30 @@ mod tests {
             .iter()
             .position(|s| s.key == "callsign")
             .expect("declared");
-        let mut app = app_with(Vec::new());
-        app.tab = Tab::Settings;
-        app.settings.cursor = i;
+        let mut pane = SettingsPane {
+            cursor: i,
+            ..Default::default()
+        };
         // SAFETY: the lock above serialises every env-mutating test.
         unsafe { std::env::remove_var("XCOPILOT_CALLSIGN") };
         settings::update(|c| c.callsign = "WAT2516".into());
-        assert!(tab_key(&mut app, KeyCode::Right));
-        assert_eq!(app.settings.edit.as_deref(), Some("WAT2516"));
-        let out = render(&app, 100, 24);
-        assert!(out.contains("callsign: WAT2516"), "{out}");
-        assert!(out.contains("Enter save"), "{out}");
-        app.settings.edit = None;
+        assert!(pane.key(KeyCode::Right));
+        assert_eq!(pane.edit.as_deref(), Some("WAT2516"));
+        let line = pane.edit_line().expect("the field").to_string();
+        assert!(line.contains("callsign: WAT2516"), "{line}");
+        assert!(line.contains("Enter save"), "{line}");
+        pane.edit = None;
 
         unsafe { std::env::set_var("XCOPILOT_CALLSIGN", "BAW306") };
-        assert!(tab_key(&mut app, KeyCode::Right));
-        assert!(app.settings.edit.is_none());
-        let out = render(&app, 100, 24);
+        assert!(pane.key(KeyCode::Right));
+        assert!(pane.edit.is_none());
+        let out = render_settings(&pane, 100, 22);
         assert!(out.contains("pinned by XCOPILOT_CALLSIGN"), "{out}");
         // A refused save (pinned) keeps the field and says why.
-        app.settings.edit = Some("WAT2516".into());
-        app.settings.save_text();
-        assert!(app.settings.edit.is_some());
-        assert!(app
-            .settings
+        pane.edit = Some("WAT2516".into());
+        pane.save_text();
+        assert!(pane.edit.is_some());
+        assert!(pane
             .notice
             .as_ref()
             .is_some_and(|(n, ok)| !ok && n.contains("XCOPILOT_CALLSIGN")));

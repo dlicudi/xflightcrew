@@ -1,98 +1,139 @@
-//! The home screen's TUI, in the house style of `src/ui.rs` and
-//! `src/voices/screen.rs`: the checks with their fixes, the voices, the
-//! settings registry (the dashboard's own Settings view, lifted) and the
-//! files. Live facts arrive from worker threads; nothing is polled.
+//! The Checks tab of the one app (`src/app.rs`): the setup checks with
+//! their fixes, in the house style of `src/ui.rs` and
+//! `src/voices/screen.rs`. Live facts arrive from worker threads; nothing
+//! is polled but the file checks the app asks for while the crew waits.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::crossterm::event::KeyCode;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::{Check, Facts, Fix, Leave, Mark, Summary};
+use super::{Check, Facts, Fix, Mark, Summary};
 use crate::config::Config;
-use crate::ui::SettingsPane;
 use crate::voices::catalogue;
 use crate::voices::download::{self, Progress};
 use crate::voices::Store;
 
-/// From the worker threads to the screen.
+/// From the worker threads to the tab.
 enum Msg {
     WebApi(Result<(), String>),
     Mic(Option<String>),
-    Store(Box<Store>),
     /// key, progress, which item (from 0), of how many.
     Progress(String, Progress, usize, usize),
     Installed(String, Result<(), String>),
     StarterDone,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum View {
-    Home,
-    Settings,
-    Files,
-}
-
-/// What a key asks of the event loop.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Act {
-    None,
-    Leave(Leave),
-    OpenVoices,
-    Recheck,
-    AskWebApi,
-    InstallStarter,
-}
-
-/// The rows: the five checks, then these.
-const VOICES_ROW: usize = 5;
-const SETTINGS_ROW: usize = 6;
-const FILES_ROW: usize = 7;
-const ROWS: usize = 8;
-
-struct App {
+/// The checks, their facts and their fixes.
+pub struct Checks {
     config: Config,
-    facts: Facts,
-    summary: Summary,
-    sel: usize,
-    view: View,
-    settings: SettingsPane,
+    pub facts: Facts,
+    pub summary: Summary,
+    pub sel: usize,
+    /// The voice catalogue, for the starter's size and its install: the
+    /// app's one load (`Store::load` cleans stale download parts, so it
+    /// is never loaded twice beside a running download).
     store: Option<Store>,
     /// key, progress, which item, of how many.
-    downloading: Option<(String, Progress, usize, usize)>,
-    notice: Option<(String, bool)>,
-    /// `r` with a red check warns once; the second `r` runs.
-    warned_run: bool,
+    pub downloading: Option<(String, Progress, usize, usize)>,
+    pub notice: Option<(String, bool)>,
+    /// The model files changed (a starter install): the Voices tab
+    /// refreshes. Taken by [`Checks::take_models_changed`].
+    models_changed: bool,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
 }
 
-impl App {
-    fn new(config: Config, facts: Facts, summary: Summary) -> Self {
-        App {
-            config,
+impl Checks {
+    /// The offline facts now; the two live ones asked on workers.
+    pub fn new(config: &Config) -> Self {
+        let mut c = Checks::with_facts(config, super::offline(config), super::summary());
+        c.ask_live();
+        c
+    }
+
+    /// The tab over given facts (nothing asked).
+    pub fn with_facts(config: &Config, facts: Facts, summary: Summary) -> Self {
+        let (tx, rx) = channel();
+        Checks {
+            config: config.clone(),
             facts,
             summary,
             sel: 0,
-            view: View::Home,
-            settings: SettingsPane::default(),
             store: None,
             downloading: None,
             notice: None,
-            warned_run: false,
+            models_changed: false,
+            tx,
+            rx,
         }
     }
 
-    fn checks(&self) -> Vec<Check> {
+    pub fn checks(&self) -> Vec<Check> {
         super::checks(&self.facts)
     }
 
-    /// The offline facts again (after a fix, an install, the voices
-    /// screen), keeping what was asked live.
-    fn refresh_offline(&mut self) {
+    /// The required checks that are red: what the crew waits on.
+    pub fn waiting_on(&self) -> Vec<String> {
+        if !super::needs_home(&self.facts) {
+            return Vec::new();
+        }
+        self.checks()
+            .into_iter()
+            .filter(|c| c.required)
+            .map(|c| c.text)
+            .collect()
+    }
+
+    /// The catalogue has come (the app's one load).
+    pub fn set_store(&mut self, store: Store) {
+        self.facts.starter = Some(store.starter_status());
+        if let Some(note) = &store.note {
+            if self.notice.is_none() {
+                self.notice = Some((note.clone(), false));
+            }
+        }
+        self.store = Some(store);
+    }
+
+    /// The configuration the checks judge (the waiting crew's settings
+    /// re-read by the app).
+    pub fn set_config(&mut self, config: &Config) {
+        self.config = config.clone();
+    }
+
+    /// Install the plugin this build carries; its own refusal while
+    /// X-Plane runs stands, said as it says it. The Checks fix and the
+    /// Plugin tab's `i`.
+    pub fn install_plugin(&mut self) -> (String, bool) {
+        let mut out = String::new();
+        let ok = crate::plugin_install::install_to(
+            &self.facts.xplane,
+            crate::plugin_install::embedded(),
+            false,
+            false,
+            &mut out,
+        );
+        let said = match ok {
+            Ok(done) => (out.trim().replace('\n', " · "), done),
+            Err(e) => (format!("{} · install failed: {e:#}", out.trim()), false),
+        };
+        self.refresh_offline();
+        said
+    }
+
+    /// Whether a starter install changed the model files since last asked.
+    pub fn take_models_changed(&mut self) -> bool {
+        std::mem::take(&mut self.models_changed)
+    }
+
+    /// The offline facts again (after a fix, an install, a setting),
+    /// keeping what was asked live.
+    pub fn refresh_offline(&mut self) {
         let fresh = super::offline(&self.config);
         let web_api = self.facts.web_api.take();
         let mic = self.facts.mic.take();
@@ -105,327 +146,212 @@ impl App {
         self.summary = super::summary();
     }
 
-    /// The red checks, by name, for the warning on `r`.
-    fn red(&self) -> Vec<String> {
-        self.checks()
-            .iter()
-            .filter(|c| c.mark == Mark::Bad || c.required)
-            .map(|c| c.text.clone())
-            .collect()
+    /// The two live facts, each on its own worker: ONE Web API GET and the
+    /// microphone's name. Only on open and on `c`, never polled.
+    fn ask_live(&mut self) {
+        self.ask_web_api();
+        let t = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = t.send(Msg::Mic(super::mic_name()));
+        });
     }
-}
 
-/// Run the screen until `r` or `q`.
-pub fn run(config: &Config) -> std::io::Result<Leave> {
-    let (tx, rx) = channel();
-    let mut app = App::new(config.clone(), super::offline(config), super::summary());
-    ask_live(&app.config, &tx);
-    load_store(&app.config, &tx);
-    let mut terminal = ratatui::init();
-    let res = event_loop(&mut terminal, &mut app, &tx, &rx);
-    ratatui::restore();
-    if app.downloading.is_some() {
-        eprintln!(
-            "left with a download unfinished: nothing half-installed, the parts are cleaned on the next run"
-        );
+    fn ask_web_api(&mut self) {
+        self.facts.web_api = None;
+        let base = self.config.xplane_base_url.clone();
+        let t = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = t.send(Msg::WebApi(super::ask_web_api(&base)));
+        });
     }
-    res
-}
 
-/// The two live facts, each on its own worker: ONE Web API GET and the
-/// microphone's name. Only on open and on `c`, never polled.
-fn ask_live(config: &Config, tx: &Sender<Msg>) {
-    ask_web_api(config, tx);
-    ask_mic(tx);
-}
-
-fn ask_web_api(config: &Config, tx: &Sender<Msg>) {
-    let base = config.xplane_base_url.clone();
-    let t = tx.clone();
-    std::thread::spawn(move || {
-        let _ = t.send(Msg::WebApi(super::ask_web_api(&base)));
-    });
-}
-
-fn ask_mic(tx: &Sender<Msg>) {
-    let t = tx.clone();
-    std::thread::spawn(move || {
-        let _ = t.send(Msg::Mic(super::mic_name()));
-    });
-}
-
-/// The catalogue, for the starter's size and its install: the same store
-/// `xfc voices` loads (a day's cache, else one fetch), on a worker.
-fn load_store(config: &Config, tx: &Sender<Msg>) {
-    let config = config.clone();
-    let t = tx.clone();
-    std::thread::spawn(move || {
-        let _ = t.send(Msg::Store(Box::new(Store::load(&config))));
-    });
-}
-
-fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
-    app: &mut App,
-    tx: &Sender<Msg>,
-    rx: &Receiver<Msg>,
-) -> std::io::Result<Leave> {
-    let mut dirty = true;
-    loop {
-        while let Ok(m) = rx.try_recv() {
+    /// The workers' news. Returns whether anything changed on screen.
+    pub fn poll(&mut self) -> bool {
+        let mut dirty = false;
+        while let Ok(m) = self.rx.try_recv() {
             dirty = true;
-            take(app, m);
+            self.take(m);
         }
-        if dirty {
-            terminal.draw(|f| draw(f, app))?;
-            dirty = false;
-        }
-        if !event::poll(Duration::from_millis(80))? {
-            continue;
-        }
-        let k = match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => k,
-            Event::Resize(_, _) => {
-                dirty = true;
-                continue;
+        dirty
+    }
+
+    fn take(&mut self, m: Msg) {
+        match m {
+            Msg::WebApi(r) => self.facts.web_api = Some(r),
+            Msg::Mic(name) => self.facts.mic = Some(name),
+            Msg::Progress(key, p, i, n) => self.downloading = Some((key, p, i, n)),
+            Msg::Installed(key, r) => {
+                self.notice = Some(match r {
+                    Ok(()) => (format!("{key} installed, size and checksum verified"), true),
+                    Err(e) => (
+                        format!("{key}: install failed, nothing installed: {e}"),
+                        false,
+                    ),
+                });
+                self.models_changed = true;
+                self.refresh_offline();
             }
-            _ => continue,
+            Msg::StarterDone => {
+                self.downloading = None;
+                self.refresh_offline();
+                if self.facts.starter_missing == 0 {
+                    self.notice = Some(("the starter set is installed".into(), true));
+                }
+            }
+        }
+    }
+
+    /// One key: move, fix, check again. Returns whether anything changed.
+    pub fn key(&mut self, code: KeyCode) -> bool {
+        let n = self.checks().len();
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => self.sel = (self.sel + 1).min(n - 1),
+            KeyCode::Up | KeyCode::Char('k') => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Char('c') => {
+                self.notice = None;
+                self.facts.mic = None;
+                self.refresh_offline();
+                self.ask_live();
+            }
+            KeyCode::Enter => self.enter(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Enter on the selected check: its fix.
+    fn enter(&mut self) {
+        let Some(check) = self.checks().into_iter().nth(self.sel) else {
+            return;
         };
-        dirty = true;
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && k.code == KeyCode::Char('c') {
-            return Ok(Leave::Quit);
-        }
-        match key(app, k.code, ctrl) {
-            Act::None => {}
-            Act::Leave(l) => return Ok(l),
-            Act::Recheck => {
-                app.facts.web_api = None;
-                app.facts.mic = None;
-                app.refresh_offline();
-                ask_live(&app.config, tx);
+        match check.fix {
+            Fix::None => {}
+            Fix::XPlaneHint | Fix::PluginHint | Fix::MicHint => {
+                self.notice = Some((super::hint_text(check.fix), true));
             }
-            Act::AskWebApi => {
-                app.facts.web_api = None;
-                ask_web_api(&app.config, tx);
-            }
-            Act::OpenVoices => {
-                ratatui::restore();
-                let opened = crate::voices::open_screen(&app.config);
-                *terminal = ratatui::init();
-                if let Err(e) = opened {
-                    app.notice = Some((format!("the voices screen failed: {e:#}"), false));
-                }
-                app.refresh_offline();
-                load_store(&app.config, tx);
-            }
-            Act::InstallStarter => start_starter(app, tx),
+            Fix::Recheck => self.ask_web_api(),
+            Fix::InstallPlugin => self.notice = Some(self.install_plugin()),
+            Fix::InstallStarter => self.start_starter(),
         }
     }
-}
 
-/// One message from a worker.
-fn take(app: &mut App, m: Msg) {
-    match m {
-        Msg::WebApi(r) => app.facts.web_api = Some(r),
-        Msg::Mic(name) => app.facts.mic = Some(name),
-        Msg::Store(store) => {
-            app.facts.starter = Some(store.starter_status());
-            if let Some(note) = &store.note {
-                if app.notice.is_none() {
-                    app.notice = Some((note.clone(), false));
-                }
-            }
-            app.store = Some(*store);
+    /// The starter set, one item after another on ONE worker, progress on
+    /// the screen, through the same verified, atomic install as `xfc voices`.
+    pub fn start_starter(&mut self) {
+        if self.downloading.is_some() {
+            return;
         }
-        Msg::Progress(key, p, i, n) => app.downloading = Some((key, p, i, n)),
-        Msg::Installed(key, r) => {
-            app.notice = Some(match r {
-                Ok(()) => (format!("{key} installed, size and checksum verified"), true),
-                Err(e) => (
-                    format!("{key}: install failed, nothing installed: {e}"),
-                    false,
-                ),
-            });
-            app.refresh_offline();
-        }
-        Msg::StarterDone => {
-            app.downloading = None;
-            app.refresh_offline();
-            if app.facts.starter_missing == 0 {
-                app.notice = Some(("the starter set is installed".into(), true));
-            }
-        }
-    }
-}
-
-/// One key. The Settings view owns its keys; Esc or q goes home.
-fn key(app: &mut App, code: KeyCode, ctrl: bool) -> Act {
-    match app.view {
-        View::Settings => {
-            if app.settings.edit.is_some() {
-                app.settings.edit_key(code, ctrl);
-            } else if !app.settings.confirming()
-                && matches!(code, KeyCode::Esc | KeyCode::Char('q'))
-            {
-                app.view = View::Home;
-                app.summary = super::summary();
-            } else {
-                app.settings.key(code);
-            }
-            return Act::None;
-        }
-        View::Files => {
-            if matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
-                app.view = View::Home;
-            }
-            return Act::None;
-        }
-        View::Home => {}
-    }
-    match code {
-        KeyCode::Char('q') | KeyCode::Esc => Act::Leave(Leave::Quit),
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.sel = (app.sel + 1).min(ROWS - 1);
-            Act::None
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.sel = app.sel.saturating_sub(1);
-            Act::None
-        }
-        KeyCode::Char('c') => {
-            app.notice = None;
-            Act::Recheck
-        }
-        KeyCode::Char('r') => {
-            let red = app.red();
-            if red.is_empty() || app.warned_run {
-                return Act::Leave(Leave::Run);
-            }
-            app.warned_run = true;
-            app.notice = Some((
-                format!(
-                    "not ready: {}. r again starts the crew anyway",
-                    red.join("; ")
-                ),
-                false,
+        let Some(store) = self.store.as_ref() else {
+            self.notice = Some((
+                "fetching the voice catalogue, a moment, then enter again".into(),
+                true,
             ));
-            Act::None
-        }
-        KeyCode::Enter => enter(app),
-        _ => Act::None,
-    }
-}
-
-/// Enter on the selected row: its fix, or open it.
-fn enter(app: &mut App) -> Act {
-    match app.sel {
-        VOICES_ROW => return Act::OpenVoices,
-        SETTINGS_ROW => {
-            app.view = View::Settings;
-            return Act::None;
-        }
-        FILES_ROW => {
-            app.view = View::Files;
-            return Act::None;
-        }
-        _ => {}
-    }
-    let Some(check) = app.checks().into_iter().nth(app.sel) else {
-        return Act::None;
-    };
-    match check.fix {
-        Fix::None => Act::None,
-        Fix::XPlaneHint | Fix::PluginHint | Fix::MicHint => {
-            app.notice = Some((super::hint_text(check.fix), true));
-            Act::None
-        }
-        Fix::Recheck => Act::AskWebApi,
-        Fix::InstallPlugin => {
-            // Its own refusal while X-Plane runs stands, said as it says it.
-            let mut out = String::new();
-            let ok = crate::plugin_install::install_to(
-                &app.facts.xplane,
-                crate::plugin_install::embedded(),
-                false,
-                false,
-                &mut out,
-            );
-            app.notice = Some(match ok {
-                Ok(done) => (out.trim().replace('\n', " · "), done),
-                Err(e) => (format!("{} · install failed: {e:#}", out.trim()), false),
+            return;
+        };
+        let status = store.starter_status();
+        let rows = store.starter_rows();
+        if rows.is_empty() {
+            self.notice = Some(if status.complete() {
+                ("the starter set is complete".into(), true)
+            } else {
+                (
+                    format!(
+                        "{} not in the catalogue: nothing to download (offline?)",
+                        status.unknown.join(", ")
+                    ),
+                    false,
+                )
             });
-            app.refresh_offline();
-            Act::None
+            return;
         }
-        Fix::InstallStarter => Act::InstallStarter,
-    }
-}
-
-/// The starter set, one item after another on ONE worker, progress on the
-/// screen, through the same verified, atomic install as `xfc voices`.
-fn start_starter(app: &mut App, tx: &Sender<Msg>) {
-    if app.downloading.is_some() {
-        return;
-    }
-    let Some(store) = app.store.as_ref() else {
-        app.notice = Some((
-            "fetching the voice catalogue, a moment, then enter again".into(),
+        let n = rows.len();
+        self.notice = Some((
+            format!(
+                "downloading the starter set: {n} item(s), {}",
+                catalogue::human_size(status.bytes)
+            ),
             true,
         ));
-        return;
-    };
-    let status = store.starter_status();
-    let rows = store.starter_rows();
-    if rows.is_empty() {
-        app.notice = Some(if status.complete() {
-            ("the starter set is complete".into(), true)
-        } else {
-            (
-                format!(
-                    "{} not in the catalogue: nothing to download (offline?)",
-                    status.unknown.join(", ")
-                ),
-                false,
-            )
+        self.downloading = Some((
+            rows[0].entry.key.clone(),
+            Progress {
+                file: 0,
+                files: rows[0].entry.files.len(),
+                done: 0,
+                total: rows[0].entry.download_size(),
+            },
+            0,
+            n,
+        ));
+        let dir = store.dir.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            for (i, r) in rows.iter().enumerate() {
+                let key = r.entry.key.clone();
+                let mut last = u8::MAX;
+                let result = download::install(&r.entry, &dir, &mut |p| {
+                    if p.percent() != last {
+                        last = p.percent();
+                        let _ = tx.send(Msg::Progress(key.clone(), p, i, n));
+                    }
+                });
+                let _ = tx.send(Msg::Installed(key, result.map_err(|e| format!("{e:#}"))));
+            }
+            let _ = tx.send(Msg::StarterDone);
         });
-        return;
     }
-    let n = rows.len();
-    app.notice = Some((
-        format!(
-            "downloading the starter set: {n} item(s), {}",
-            catalogue::human_size(status.bytes)
-        ),
-        true,
-    ));
-    app.downloading = Some((
-        rows[0].entry.key.clone(),
-        Progress {
-            file: 0,
-            files: rows[0].entry.files.len(),
-            done: 0,
-            total: rows[0].entry.download_size(),
-        },
-        0,
-        n,
-    ));
-    let dir = store.dir.clone();
-    let tx = tx.clone();
-    std::thread::spawn(move || {
-        for (i, r) in rows.iter().enumerate() {
-            let key = r.entry.key.clone();
-            let mut last = u8::MAX;
-            let result = download::install(&r.entry, &dir, &mut |p| {
-                if p.percent() != last {
-                    last = p.percent();
-                    let _ = tx.send(Msg::Progress(key.clone(), p, i, n));
-                }
-            });
-            let _ = tx.send(Msg::Installed(key, result.map_err(|e| format!("{e:#}"))));
+
+    /// The notice line: a download's progress, else the last notice.
+    pub fn notice_line(&self) -> Option<Line<'static>> {
+        match (&self.downloading, &self.notice) {
+            (Some((key, p, i, n)), _) => Some(Line::styled(
+                format!(
+                    "  downloading {key}  {}% of {}  ({} of {n})",
+                    p.percent(),
+                    catalogue::human_size(p.total),
+                    i + 1
+                ),
+                Style::default().fg(Color::Yellow),
+            )),
+            (None, Some((text, ok))) => Some(Line::styled(
+                format!("  {text}"),
+                Style::default().fg(if *ok { Color::Green } else { Color::Yellow }),
+            )),
+            (None, None) => None,
         }
-        let _ = tx.send(Msg::StarterDone);
-    });
+    }
+
+    /// The checks, then the summary lines under them.
+    pub fn draw(&self, f: &mut Frame, area: Rect) {
+        let width = area.width as usize;
+        let mut lines: Vec<Line> = self
+            .checks()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                row(
+                    if i == 0 { "Setup" } else { "" },
+                    Some(c.mark),
+                    &c.text,
+                    c.hint,
+                    self.sel == i,
+                    width,
+                )
+            })
+            .collect();
+        lines.push(Line::raw(""));
+        lines.push(row("Voices", None, &self.summary.voices, "", false, width));
+        lines.push(row(
+            "Settings",
+            None,
+            &self.summary.settings,
+            "",
+            false,
+            width,
+        ));
+        lines.push(row("Files", None, &self.summary.files, "", false, width));
+        f.render_widget(Paragraph::new(lines), area);
+    }
 }
 
 const LABEL_W: usize = 11;
@@ -477,137 +403,6 @@ fn row(
     Line::from(spans)
 }
 
-fn rule(width: u16) -> Line<'static> {
-    Line::styled(
-        format!(" {}", "─".repeat(width.saturating_sub(2) as usize)),
-        Style::default().fg(Color::DarkGray),
-    )
-}
-
-fn draw(f: &mut Frame, app: &App) {
-    let [head, top, body, bottom, notice, hint] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(1),
-        Constraint::Length(3),
-        Constraint::Length(1),
-    ])
-    .areas(f.area());
-    let width = f.area().width;
-
-    let title = " XFlightCrew";
-    let build = format!("build {} ", app.summary.version);
-    let pad = (width as usize).saturating_sub(title.len() + build.chars().count());
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                title,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(build, Style::default().fg(Color::DarkGray)),
-        ])),
-        head,
-    );
-    f.render_widget(Paragraph::new(rule(width)), top);
-    f.render_widget(Paragraph::new(rule(width)), bottom);
-
-    match app.view {
-        View::Home => draw_home(f, app, body),
-        View::Settings => crate::ui::draw_settings(f, &app.settings, body),
-        View::Files => {
-            let lines: Vec<Line> = crate::paths_report()
-                .lines()
-                .map(|l| Line::raw(format!("  {l}")))
-                .collect();
-            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
-        }
-    }
-
-    let notice_line = match (&app.downloading, &app.notice) {
-        (Some((key, p, i, n)), _) => Line::styled(
-            format!(
-                "  downloading {key}  {}% of {}  ({} of {n})",
-                p.percent(),
-                catalogue::human_size(p.total),
-                i + 1
-            ),
-            Style::default().fg(Color::Yellow),
-        ),
-        (None, Some((text, ok))) => Line::styled(
-            format!("  {text}"),
-            Style::default().fg(if *ok { Color::Green } else { Color::Yellow }),
-        ),
-        (None, None) => Line::raw(""),
-    };
-    f.render_widget(
-        Paragraph::new(notice_line).wrap(Wrap { trim: false }),
-        notice,
-    );
-
-    let hint_line = match app.view {
-        View::Settings => app.settings.edit_line().unwrap_or_else(|| {
-            Line::styled(
-                "  ←/→ change   ↑↓ select   esc back",
-                Style::default().fg(Color::DarkGray),
-            )
-        }),
-        View::Files => Line::styled("  esc back", Style::default().fg(Color::DarkGray)),
-        View::Home => Line::styled(
-            "  r run   ↑↓ move   enter fix/open   c check again   q quit",
-            Style::default().fg(Color::DarkGray),
-        ),
-    };
-    f.render_widget(Paragraph::new(hint_line), hint);
-}
-
-fn draw_home(f: &mut Frame, app: &App, area: Rect) {
-    let width = area.width as usize;
-    let mut lines: Vec<Line> = app
-        .checks()
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            row(
-                if i == 0 { "Setup" } else { "" },
-                Some(c.mark),
-                &c.text,
-                c.hint,
-                app.sel == i,
-                width,
-            )
-        })
-        .collect();
-    lines.push(row(
-        "Voices",
-        None,
-        &app.summary.voices,
-        "enter: open",
-        app.sel == VOICES_ROW,
-        width,
-    ));
-    lines.push(row(
-        "Settings",
-        None,
-        &app.summary.settings,
-        "enter: open",
-        app.sel == SETTINGS_ROW,
-        width,
-    ));
-    lines.push(row(
-        "Files",
-        None,
-        &app.summary.files,
-        "enter: open",
-        app.sel == FILES_ROW,
-        width,
-    ));
-    f.render_widget(Paragraph::new(lines), area);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,9 +418,9 @@ mod tests {
         }
     }
 
-    fn render(app: &App) -> String {
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(78, 16)).unwrap();
-        terminal.draw(|f| draw(f, app)).unwrap();
+    fn render(c: &Checks) -> String {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(78, 12)).unwrap();
+        terminal.draw(|f| c.draw(f, f.area())).unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -639,14 +434,14 @@ mod tests {
             .join("\n")
     }
 
-    fn app(facts: Facts) -> App {
-        App::new(Config::default(), facts, summary())
+    fn checks(facts: Facts) -> Checks {
+        Checks::with_facts(&Config::default(), facts, summary())
     }
 
     #[test]
-    fn all_green_renders_every_check_ticked() {
-        let a = app(super::super::tests::green());
-        let screen = render(&a);
+    fn all_green_renders_every_check_ticked_and_waits_on_nothing() {
+        let c = checks(super::super::tests::green());
+        let screen = render(&c);
         println!("{screen}");
         assert!(
             screen.contains("✓ X-Plane found  /Users/pilot/X-Plane 12"),
@@ -663,41 +458,36 @@ mod tests {
             screen.contains("Voices     35 installed · 2.5 GB"),
             "{screen}"
         );
-        assert!(screen.contains("r run"), "{screen}");
         assert!(!screen.contains('✗'), "{screen}");
+        assert!(c.waiting_on().is_empty());
     }
 
     #[test]
-    fn a_red_plugin_offers_its_update_and_r_warns_once() {
-        let mut a = app(Facts {
+    fn a_red_plugin_offers_its_update_without_holding_the_crew() {
+        let c = checks(Facts {
             plugin: Verdict::Older,
             plugin_installed: Some("2026.10.13".into()),
             ..super::super::tests::green()
         });
-        let screen = render(&a);
-        println!("{screen}");
+        let screen = render(&c);
         assert!(
             screen.contains("✗ Plugin older than this build (2026.10.13)"),
             "{screen}"
         );
         assert!(screen.contains("enter: update"), "{screen}");
-        // A red check never blocks the run: it warns once.
-        assert_eq!(key(&mut a, KeyCode::Char('r'), false), Act::None);
-        let warned = &a.notice.as_ref().unwrap().0;
-        assert!(warned.contains("Plugin older"), "{warned}");
-        assert!(
-            warned.contains("r again starts the crew anyway"),
-            "{warned}"
-        );
-        assert_eq!(
-            key(&mut a, KeyCode::Char('r'), false),
-            Act::Leave(Leave::Run)
-        );
+        // Red but not required: the crew boots anyway.
+        assert!(c.waiting_on().is_empty());
+        // A missing one is required: the crew waits on it, by name.
+        let c = checks(Facts {
+            plugin: Verdict::Missing,
+            ..super::super::tests::green()
+        });
+        assert_eq!(c.waiting_on(), vec!["Plugin not installed".to_string()]);
     }
 
     #[test]
     fn a_missing_starter_set_is_offered_with_its_size() {
-        let mut a = app(Facts {
+        let mut c = checks(Facts {
             starter_missing: 2,
             starter: Some(catalogue::StarterStatus {
                 missing: vec![
@@ -717,40 +507,32 @@ mod tests {
             }),
             ..super::super::tests::green()
         });
-        let screen = render(&a);
+        let screen = render(&c);
         println!("{screen}");
         assert!(
             screen.contains("! Starter voices: 2 missing, 211 MB"),
             "{screen}"
         );
         assert!(screen.contains("enter: get them"), "{screen}");
+        assert_eq!(c.waiting_on().len(), 1);
         // Enter on it asks for the install (the catalogue still loading here).
-        a.sel = 4;
-        assert_eq!(key(&mut a, KeyCode::Enter, false), Act::InstallStarter);
-        let (tx, _rx) = channel();
-        start_starter(&mut a, &tx);
-        assert!(render(&a).contains("fetching the voice catalogue"));
+        c.sel = 4;
+        assert!(c.key(KeyCode::Enter));
+        let line = c.notice_line().expect("a notice").to_string();
+        assert!(line.contains("fetching the voice catalogue"), "{line}");
     }
 
     #[test]
-    fn settings_and_files_open_and_close() {
-        let mut a = app(super::super::tests::green());
-        a.sel = SETTINGS_ROW;
-        assert_eq!(key(&mut a, KeyCode::Enter, false), Act::None);
-        assert_eq!(a.view, View::Settings);
-        let screen = render(&a);
-        assert!(screen.contains("app mode"), "{screen}");
-        assert_eq!(key(&mut a, KeyCode::Esc, false), Act::None);
-        assert_eq!(a.view, View::Home);
-        a.sel = FILES_ROW;
-        key(&mut a, KeyCode::Enter, false);
-        assert!(render(&a).contains("mode:"));
-        key(&mut a, KeyCode::Esc, false);
-        a.sel = VOICES_ROW;
-        assert_eq!(key(&mut a, KeyCode::Enter, false), Act::OpenVoices);
-        assert_eq!(
-            key(&mut a, KeyCode::Char('q'), false),
-            Act::Leave(Leave::Quit)
-        );
+    fn the_cursor_stays_on_the_checks() {
+        let mut c = checks(super::super::tests::green());
+        for _ in 0..10 {
+            c.key(KeyCode::Down);
+        }
+        assert_eq!(c.sel, 4);
+        for _ in 0..10 {
+            c.key(KeyCode::Up);
+        }
+        assert_eq!(c.sel, 0);
+        assert!(!c.key(KeyCode::Char('x')));
     }
 }

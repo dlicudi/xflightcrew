@@ -162,58 +162,85 @@ impl App {
     }
 }
 
+/// The screen as a pane of the one app (`src/app.rs`): its state and its
+/// workers' channel, drawn into an area, fed its keys. `xfc voices` runs
+/// the same pane full screen ([`run`]).
+pub struct Pane {
+    app: App,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+}
+
+impl Pane {
+    pub fn new(store: Store) -> Self {
+        let (tx, rx) = channel();
+        Pane {
+            app: App::new(store),
+            tx,
+            rx,
+        }
+    }
+
+    /// The workers' news (downloads, previews). Returns whether anything
+    /// changed on screen.
+    pub fn poll(&mut self) -> bool {
+        let mut dirty = false;
+        while let Ok(m) = self.rx.try_recv() {
+            dirty = true;
+            take(&mut self.app, m);
+        }
+        dirty
+    }
+
+    pub fn draw(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        draw_in(f, &mut self.app, area);
+    }
+
+    /// One key. Returns true for the screen's own quit (q, Esc at the top).
+    pub fn key(&mut self, code: KeyCode) -> bool {
+        key(&mut self.app, code, &self.tx)
+    }
+
+    /// A field, a picker or a question is open: every key is the pane's.
+    pub fn capturing(&self) -> bool {
+        self.app.editing_filter || self.app.pick.is_some() || self.app.prompt.is_some()
+    }
+
+    /// The model files changed elsewhere (the starter set installed from
+    /// the Checks tab): the rows and the cast again.
+    pub fn refresh(&mut self) {
+        self.app.store.refresh_uses();
+        self.app.refresh();
+    }
+
+    /// Downloads still running, for the line printed at quit.
+    pub fn downloads(&self) -> usize {
+        self.app.downloads.len()
+    }
+}
+
 /// Run the screen until q.
 pub fn run(store: Store) -> std::io::Result<()> {
-    let (tx, rx) = channel();
-    let mut app = App::new(store);
+    let mut pane = Pane::new(store);
     let mut terminal = ratatui::init();
-    let res = event_loop(&mut terminal, &mut app, &tx, &rx);
+    let res = event_loop(&mut terminal, &mut pane);
     ratatui::restore();
-    if !app.downloads.is_empty() {
+    if pane.downloads() > 0 {
         eprintln!(
             "left with {} download(s) unfinished: nothing half-installed, \
              the parts are cleaned on the next run",
-            app.downloads.len()
+            pane.downloads()
         );
     }
     res
 }
 
-fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
-    app: &mut App,
-    tx: &Sender<Msg>,
-    rx: &Receiver<Msg>,
-) -> std::io::Result<()> {
+fn event_loop(terminal: &mut ratatui::DefaultTerminal, pane: &mut Pane) -> std::io::Result<()> {
     let mut dirty = true;
     loop {
-        while let Ok(m) = rx.try_recv() {
-            dirty = true;
-            match m {
-                Msg::Progress(key, p) => {
-                    app.downloads.insert(key, p);
-                }
-                Msg::Installed(key, r) => {
-                    app.downloads.remove(&key);
-                    app.notice = Some(match r {
-                        Ok(()) => (format!("{key} installed, size and checksum verified"), true),
-                        Err(e) => (
-                            format!("{key}: install failed, nothing installed: {e}"),
-                            false,
-                        ),
-                    });
-                    app.refresh();
-                }
-                Msg::Previewed(key, r) => {
-                    app.previewing = None;
-                    if let Err(e) = r {
-                        app.notice = Some((format!("{key}: preview failed: {e}"), false));
-                    }
-                }
-            }
-        }
+        dirty |= pane.poll();
         if dirty {
-            terminal.draw(|f| draw(f, app))?;
+            terminal.draw(|f| pane.draw(f, f.area()))?;
             dirty = false;
         }
         if !event::poll(Duration::from_millis(80))? {
@@ -225,12 +252,38 @@ fn event_loop(
                 if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
                     return Ok(());
                 }
-                if key(app, k.code, tx) {
+                if pane.key(k.code) {
                     return Ok(());
                 }
             }
             Event::Resize(_, _) => dirty = true,
             _ => {}
+        }
+    }
+}
+
+/// One message from a worker.
+fn take(app: &mut App, m: Msg) {
+    match m {
+        Msg::Progress(key, p) => {
+            app.downloads.insert(key, p);
+        }
+        Msg::Installed(key, r) => {
+            app.downloads.remove(&key);
+            app.notice = Some(match r {
+                Ok(()) => (format!("{key} installed, size and checksum verified"), true),
+                Err(e) => (
+                    format!("{key}: install failed, nothing installed: {e}"),
+                    false,
+                ),
+            });
+            app.refresh();
+        }
+        Msg::Previewed(key, r) => {
+            app.previewing = None;
+            if let Err(e) = r {
+                app.notice = Some((format!("{key}: preview failed: {e}"), false));
+            }
         }
     }
 }
@@ -584,14 +637,19 @@ fn start_preview(app: &mut App, r: Row, tx: &Sender<Msg>) {
     });
 }
 
+#[cfg(test)]
 fn draw(f: &mut Frame, app: &mut App) {
+    draw_in(f, app, f.area());
+}
+
+fn draw_in(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let [head, body, notice, hint] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(2),
         Constraint::Length(1),
     ])
-    .areas(f.area());
+    .areas(area);
 
     let tab = |t: Tab, name: &'static str| {
         let style = if app.tab == t {
@@ -684,9 +742,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else if app.tab == Tab::Cast && app.pool_open {
         " ↑↓ move  a add a voice  d take it out  esc back"
     } else if app.tab == Tab::Cast {
-        " ↑↓ move  enter pick a voice (the pool: edit it)  i install a missing one  tab switch  q quit"
+        " ↑↓ move  enter pick a voice (the pool: edit it)  i install a missing one  ←/→ switch  q quit"
     } else {
-        " ↑↓ move  tab switch  / filter  enter install  s starter  d uninstall  p preview  u use as  q quit"
+        " ↑↓ move  ←/→ switch  / filter  enter install  s starter  d uninstall  p preview  u use as  q quit"
     };
     f.render_widget(
         Paragraph::new(hint_text).style(Style::default().fg(Color::DarkGray)),

@@ -282,6 +282,15 @@ impl Config {
         // first): the first loaded wins, as dotenvy never overrides.
         let _ = dotenvy::dotenv();
         let _ = dotenvy::from_path(sim::paths::env_file());
+        Self::from_loaded_env()
+    }
+
+    /// [`Config::from_env`] without loading the `.env` files again: the
+    /// app's in-process crew boot (`crate::spawn_tui_crew`), whose process
+    /// loaded them at its start. Never sets a variable, so no other thread
+    /// reading the environment races it. The boot knobs' prefs are taken
+    /// afresh: what the crew starts with.
+    pub fn from_loaded_env() -> Result<Self> {
         // The boot knobs' prefs as THIS start reads them (`knob`).
         reload_boot_knobs();
 
@@ -765,6 +774,34 @@ pub fn knob_next(env: &str) -> Option<String> {
     crate::prefs::setting(key)
 }
 
+/// The boot knobs whose next start differs from this one: the variables
+/// whose saved pref changed since the snapshot (`taken`) this start read,
+/// the variable unset (a set one pins both starts alike). Pure.
+pub fn pending_in(
+    taken: &std::collections::BTreeMap<String, String>,
+    saved: &std::collections::BTreeMap<String, String>,
+    env: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    BOOT_KNOBS
+        .iter()
+        .filter(|(e, key)| !env(e) && taken.get(*key) != saved.get(*key))
+        .map(|(e, _)| *e)
+        .collect()
+}
+
+/// [`pending_in`] for this process: the snapshot its start took against
+/// prefs.json now (one read of the file).
+pub fn restart_pending() -> Vec<&'static str> {
+    let taken = boot_snapshot()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
+    pending_in(&taken, &crate::prefs::settings_map(), |e| {
+        std::env::var_os(e).is_some()
+    })
+}
+
 /// The boot knobs' saved prefs as this run took them.
 type BootPrefs = std::sync::RwLock<Option<std::collections::BTreeMap<String, String>>>;
 
@@ -837,6 +874,33 @@ fn default_ui() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boot knob waits for a restart when its saved pref differs from
+    /// the snapshot this start took (added, changed or removed), never
+    /// when its variable pins both starts alike.
+    #[test]
+    fn a_boot_knob_waits_when_its_pref_moved_since_the_start() {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let taken = map(&[("whisper_model", "a.bin"), ("chime", "on")]);
+        assert!(pending_in(&taken, &taken, |_| false).is_empty());
+        let saved = map(&[
+            ("whisper_model", "b.bin"),
+            ("atc_airport", "LXGB"),
+            ("callsign", "not a boot knob"),
+        ]);
+        let p = pending_in(&taken, &saved, |_| false);
+        assert_eq!(
+            p,
+            vec!["WHISPER_MODEL", "XCOPILOT_ATC_AIRPORT", "XCOPILOT_CHIME"]
+        );
+        let p = pending_in(&taken, &saved, |e| e == "WHISPER_MODEL");
+        assert!(!p.contains(&"WHISPER_MODEL"), "{p:?}");
+    }
 
     /// A pilot voice picked from the pool leaves the pool, the rest stays in
     /// order, and an empty persona slot (inherit) removes nothing.
