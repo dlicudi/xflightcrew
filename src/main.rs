@@ -449,6 +449,13 @@ async fn main() -> Result<()> {
     // blackbox: the read a pilot gets after the sortie, and the one the
     // fly-fix-fly loop starts from.
     if std::env::args().nth(1).as_deref() == Some("debrief") {
+        // `--sortie <id|path|last>` / `--airframe <profile> [--since
+        // YYYY-MM-DD]`: one sortie's file, or one airframe's sorties.
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        if let Some(page) = debrief::sortie::main_cmd(&rest)? {
+            print!("{page}");
+            return Ok(());
+        }
         let path = std::env::args()
             .nth(2)
             .unwrap_or_else(|| sim::paths::blackbox_file().to_string_lossy().into_owned());

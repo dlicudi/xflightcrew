@@ -11,6 +11,14 @@
 //! Pure over the lines, so it tests on a handful of synthetic events and runs
 //! on the flights already on disk. Flights are split on a gap of
 //! [`FLIGHT_GAP_SECS`] between events; the report is the LAST flight.
+//!
+//! One sortie's own file is read by [`sortie`]: `xfc debrief --sortie
+//! <id|path|last>` says why it ended (the moment, the decisions 30 s before
+//! it, contradiction flags, the stage verdicts) and `xfc debrief --airframe
+//! <profile> [--since YYYY-MM-DD]` lists one airframe's sorties with their
+//! failures grouped.
+
+pub mod sortie;
 
 use serde_json::Value;
 use std::collections::BTreeMap;
