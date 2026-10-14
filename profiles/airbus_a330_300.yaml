@@ -294,6 +294,14 @@ seat_belt_signs:
 # leaves ALT for the base leg's descent (blackbox `circuit` `leg`: `ap_level`
 # true on the downwind, false with `vs_on` true on base).
 ap_altitude_capture: true
+# The thrust levers' A/THR instinctive disconnect (A333.autopilot.lua: it
+# fires autothrottle_hard_off, autothrottle_enabled -1). The stock
+# autothrottle_off leaves it ARMED (0, probed parked 2026-10-14), and the
+# script keeps an armed A/THR the FADEC's: twice airborne the governor's
+# take "would not stay off" (#295). VERIFY airborne: `autoflight`
+# `thrust_taken` `at_mode` then no `thrust_not_taken`.
+autoflight:
+  autothrottle_off_command: laminar/A333/autopilot/a_thr_off_eng1
 takeoff_config:
   arm_spoilers: true
   autobrake_rto: true
