@@ -770,6 +770,14 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
 - **Settings are a registry** (`src/settings.rs`, `settings::live()`): env > pref > default; an
   env-pinned knob is REFUSED on screen, naming the variable. A panel toggle is a pick only when it
   differs from our LAST PUBLISH (`pollers::panel_sync`); else a terminal or EFB change is published.
+  **Every pilot-facing variable is a setting** (2026-10-14, `every_environment_variable_is_a_setting_or_named_env_only`;
+  developer knobs and `XCOPILOT_HOME` on its `ENV_ONLY` list with a reason), in a `Section`.
+  **A boot knob (`Tier::Restart`) reads its pref where boot reads it** (`config::knob`,
+  `BOOT_KNOBS`), never in `install`: the voices and home screens run first. Pinned by
+  `every_setting_survives_a_restart` (two processes, a temp `XCOPILOT_HOME`). The copilot's and
+  cabin's voices keep "a pick beats `PIPER_VOICE`" (`pick_beats_env`). **Who speaks with what is
+  ONE function** (`voice::cast`, over the radio's own casting); every voice pick goes through
+  `settings::set`. `.env` pins move into prefs only on the pilot's word (`env_import`, backed up).
 - **Only settings persist** (`prefs.json`, env, geometry). Never a state dump: persisted facts
   outlive their context. The one other file is an airframe's MEASURED model
   (`profiles/learned/<acf>.json`, `aircraft::learned`): a property of the `.acf` like a profile

@@ -427,7 +427,7 @@ pub fn summary() -> Summary {
 pub fn hint_text(fix: Fix) -> String {
     match fix {
         Fix::XPlaneHint => format!(
-            "set XCOPILOT_XPLANE_ROOT=<your X-Plane 12 folder> in {} (or the shell), then c to check again",
+            "set the X-Plane folder in Settings (Paths), or XCOPILOT_XPLANE_ROOT=<your X-Plane 12 folder> in {}; then c to check again",
             tilde(&sim::paths::env_file())
         ),
         Fix::PluginHint => "this build carries no plugin: from a source checkout, make -C plugin install; or a release build (scripts/build-release.sh) installs it from here".into(),
