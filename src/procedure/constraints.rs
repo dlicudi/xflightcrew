@@ -775,6 +775,114 @@ pub fn arrival_handoff_cap(
     begun.then_some(handoff_kts)
 }
 
+/// What an instrument approach's final can absorb at its FAF, planned BACK
+/// from the stabilised gate on the airframe's own energy model
+/// (`approach_energy`): the fastest speed the path from the FAF to the gate
+/// still slows to the gate speed from, and the path that is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FafEnergy {
+    /// The FAF crossing speed, kt: never faster (`on_path_max_kts`).
+    pub join_kts: f64,
+    /// The path from the FAF down to the gate, nm.
+    pub path_nm: f64,
+}
+
+/// The FAF's energy for a final whose FAF is `faf_to_threshold_nm` from
+/// the threshold: the gate where autoland judges it (`gate_ft` on the
+/// standard path, [`crate::autoland::TOUCHDOWN_AIM_NM`] past the threshold,
+/// as `autoland`'s `gate_nm`), the same curve autoland's ask flies from
+/// there. Pure.
+pub fn faf_energy(
+    m: &crate::approach_energy::EnergyModel,
+    gate_kts: f64,
+    faf_to_threshold_nm: f64,
+    gate_ft: f64,
+) -> FafEnergy {
+    let gate_nm = gate_ft / crate::autoland::GLIDEPATH_FT_PER_NM - crate::autoland::TOUCHDOWN_AIM_NM;
+    let path_nm = (faf_to_threshold_nm - gate_nm).max(0.0);
+    FafEnergy {
+        join_kts: crate::approach_energy::on_path_max_kts(m, gate_kts, path_nm),
+        path_nm,
+    }
+}
+
+/// The FAF's distance from the threshold along the approach's legs: the
+/// FAF (`hi`) to the first runway leg after it. `None` with no runway leg
+/// or an unresolved fix: no plan, the clean approach speed flies. Pure.
+pub fn faf_to_threshold_nm(legs: &[ProcLeg], hi: usize) -> Option<f64> {
+    let rw = (hi + 1..legs.len()).find(|&k| legs[k].fix_ident.starts_with("RW"))?;
+    legs[rw].fix.as_ref()?;
+    let from = legs[hi].fix.as_ref()?;
+    Some(distance_to_leg_nm(from.lat, from.lon, legs, hi + 1, rw))
+}
+
+/// The route the slow-down to the FAF needs, nm. Speed first
+/// (`speed_protected_vs`: over its target the descent gives way): the level
+/// slow-down (`approach_energy::level_slow_nm`, the configuration each
+/// speed allows out), then the descent still owed to the FAF's altitude at
+/// the FAF speed, no steeper than `descent_fpm` nor than idle holds that
+/// speed on (`approach_energy::idle_descent_ft_per_nm`: with the flap out
+/// the speedbrake is barred, `drag_barred`), then
+/// [`crate::approach_energy::CONFIGURE_AHEAD_S`] of settling and the FAF's
+/// capture radius (autoland takes it there). Pure.
+pub fn faf_slowdown_nm(
+    m: &crate::approach_energy::EnergyModel,
+    ias_kts: f64,
+    join_kts: f64,
+    gs_kts: f64,
+    above_faf_ft: f64,
+    descent_fpm: f64,
+) -> f64 {
+    let gs = gs_kts.max(60.0);
+    let descend_nm = if above_faf_ft > 0.0 && descent_fpm > 0.0 {
+        let by_rate = descent_fpm * 60.0 / join_kts.max(60.0);
+        let by_idle = crate::approach_energy::idle_descent_ft_per_nm(m, join_kts);
+        above_faf_ft / by_rate.min(by_idle).max(1.0)
+    } else {
+        0.0
+    };
+    crate::approach_energy::level_slow_nm(m, ias_kts, join_kts)
+        + descend_nm
+        + gs * crate::approach_energy::CONFIGURE_AHEAD_S / 3600.0
+        + CAPTURE_NM
+}
+
+/// The FAF's speed as a limit, slowed for in time ([`faf_slowdown_nm`]
+/// before the FAF along `to_faf_nm`) and held once begun (`begun`), as
+/// [`arrival_handoff_cap`] holds the arrival's. `None` while the slow-down
+/// is still ahead. Pure.
+///
+/// EGKK 26L, 737 (2026-10-14, sortie 1791979030-full_auto): the follower
+/// flew CF26L and FF26L at the clean approach speed, 210 kt flaps up, from
+/// 13.6 nm and 6,400 ft to the handoff 0.8 nm before FF26L; autoland's plan
+/// joined there at 168 and predicted 215 kt at the 1,000 ft gate against
+/// 145 from its first tick. Flaps 25 at 184 by the gate: a go-around.
+#[allow(clippy::too_many_arguments)]
+pub fn faf_speed_cap(
+    m: &crate::approach_energy::EnergyModel,
+    faf: FafEnergy,
+    to_faf_nm: f64,
+    ias_kts: f64,
+    gs_kts: f64,
+    above_faf_ft: f64,
+    descent_fpm: f64,
+    begun: &mut bool,
+) -> Option<f64> {
+    if !*begun {
+        *begun = to_faf_nm
+            <= faf_slowdown_nm(m, ias_kts, faf.join_kts, gs_kts, above_faf_ft, descent_fpm);
+    }
+    begun.then_some(faf.join_kts)
+}
+
+/// The flap the slow-down to the FAF puts out at `ias_kts`: the plan's own
+/// configuration for the speed (`EnergyModel::flap_for`, autoland's
+/// extension rule), never more than the FAF speed's, never less than is
+/// already out. Pure.
+pub fn faf_flap(m: &crate::approach_energy::EnergyModel, ias_kts: f64, join_kts: f64, out: f64) -> f64 {
+    m.flap_for(ias_kts.max(join_kts)).max(out)
+}
+
 /// The true great-circle bearing to a leg's fix, or `None` for a to-altitude
 /// leg (no fix to steer at). Pure — the lateral-steering decision, testable
 /// without a sim.

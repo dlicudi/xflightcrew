@@ -247,6 +247,21 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
     let arrival_handoff_kts = arrival_handoff_for(arrival_handoff_kts, &end);
     let mut handoff_begun = false;
     let mut said_handoff = false;
+    // An instrument approach's slow-down to its FAF (`faf_speed_cap`),
+    // planned on the airframe's energy model (`approach_energy`; `None`
+    // where it declares none: the clean approach speed flies as before),
+    // whether it has begun, the flap out when it began, and the FAF speed
+    // this tick for the log.
+    let faf_model = match &end {
+        EndAction::Approach { approach_ias, .. } => crate::aircraft::live_profile()
+            .and_then(|p| crate::approach_energy::EnergyModel::from_profile(&p, 3.0))
+            .map(|m| (m, crate::approach_energy::gate_kts(*approach_ias))),
+        _ => None,
+    };
+    let mut faf_begun = false;
+    let mut faf_said = false;
+    let mut faf_flap_out: Option<f64> = None;
+    let mut faf_now: Option<FafEnergy> = None;
     // The speedbrake's last change and which changes are said (`descent_drag`,
     // `DragVoice`).
     let mut drag_changed: Option<std::time::Instant> = None;
@@ -670,10 +685,98 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
                 }
                 _ => planned,
             };
+            // An instrument approach crosses its FAF at a speed and flap the
+            // final can absorb (`faf_speed_cap`): planned back from the
+            // 1,000 ft gate on the airframe's own deceleration, slowed for in
+            // time (the descent owed first, then idle level), configured as
+            // the speed allows. Autoland, handed a clean 737 at 210 a mile
+            // before FF26L, could not make its gate (EGKK, 2026-10-14).
+            let on_map_final = legs[idx].is_map;
+            faf_now = None;
+            let planned = match (&faf_model, handoff) {
+                (Some((m, gate_kts)), Some(hi)) if idx <= hi && !on_map_final && !map_short_of_runway(&legs[hi]) => {
+                    match faf_to_threshold_nm(&legs, hi) {
+                        Some(faf_thr_nm) => {
+                            let faf = faf_energy(
+                                m,
+                                *gate_kts,
+                                faf_thr_nm,
+                                crate::stable_approach::GateKind::Instrument.gate_ft(),
+                            );
+                            faf_now = Some(faf);
+                            // Round a pattern to the IF, its miles (as the
+                            // descent is paced), then the legs on to the FAF.
+                            let to_faf = final_join
+                                .pattern_to_go_nm(&legs, idx, lat, lon, gs * MS_TO_KTS, mag_var)
+                                .zip(legs[idx].fix.as_ref())
+                                .map(|(p, f)| p + distance_to_leg_nm(f.lat, f.lon, &legs, idx + 1, hi))
+                                .unwrap_or_else(|| distance_to_leg_nm(lat, lon, &legs, idx, hi));
+                            let above_faf = legs[hi].alt1_ft.map_or(0.0, |a| alt_ft - a);
+                            match faf_speed_cap(m, faf, to_faf, ias, gs * MS_TO_KTS, above_faf, descent_fpm(), &mut faf_begun)
+                                .filter(|cap| *cap < planned)
+                            {
+                                Some(cap) => {
+                                    if !faf_said {
+                                        faf_said = true;
+                                        // The flap already out stays out.
+                                        faf_flap_out = crate::tools::flaps::read_handle(&xp).await.ok();
+                                        crate::blackbox::record(
+                                            "procedure",
+                                            serde_json::json!({"event": "faf_slowdown", "kts": cap,
+                                                "fix": legs[hi].fix_ident, "to_faf_nm": to_faf,
+                                                "faf_path_nm": faf.path_nm, "gate_kts": gate_kts,
+                                                "above_faf_ft": above_faf, "ias": ias, "planned": planned,
+                                                "flap_out": faf_flap_out,
+                                                "need_nm": faf_slowdown_nm(m, ias, cap, gs * MS_TO_KTS, above_faf, descent_fpm())}),
+                                        );
+                                        alert(
+                                            &voice,
+                                            Priority::Advisory,
+                                            &format!("Slowing to {cap:.0} knots for the final approach fix."),
+                                        );
+                                    }
+                                    // The configuration for the speed, extended as
+                                    // it comes off, the gear with it (the plan's
+                                    // own rule and its gear, `approach_energy`).
+                                    // Never on an unread lever: a flap out it did
+                                    // not see could be taken back in.
+                                    let out = last_flap.or(faf_flap_out);
+                                    let more = out.map(|o| faf_flap(m, ias, cap, o)).filter(|f| out.is_some_and(|o| *f > o + 0.01));
+                                    if let Some(flap) = more {
+                                        if crate::tools::flaps::set_handle(&xp, flap).await.is_ok() {
+                                            last_flap = Some(flap);
+                                            crate::blackbox::record(
+                                                "procedure",
+                                                serde_json::json!({"event": "faf_config", "flap": flap, "ias": ias,
+                                                    "kts": cap, "to_faf_nm": to_faf, "gear": gear_set}),
+                                            );
+                                        }
+                                    }
+                                    let flap_now = last_flap.or(faf_flap_out).unwrap_or(0.0);
+                                    if !gear_set
+                                        && crate::approach_energy::gear_with_flap(flap_now)
+                                        && crate::autoland::gear_may_extend(ias, crate::aircraft::gear_limit_kts())
+                                    {
+                                        gear_set = crate::tools::gear::set_handle(&xp, false).await.is_ok();
+                                        crate::blackbox::record(
+                                            "procedure",
+                                            serde_json::json!({"event": "faf_config", "flap": flap_now, "ias": ias,
+                                                "kts": cap, "to_faf_nm": to_faf, "gear": gear_set}),
+                                        );
+                                    }
+                                    cap
+                                }
+                                None => planned,
+                            }
+                        }
+                        None => planned,
+                    }
+                }
+                _ => planned,
+            };
             // On the final to a MAP: landing speed and configuration, so the
             // visual segment is flown stabilised (a jet cannot slow down and
             // go down 4.7 degrees in two miles).
-            let on_map_final = legs[idx].is_map;
             let planned = match (&end, on_map_final) {
                 (EndAction::Approach { approach_ias, .. }, true) => *approach_ias,
                 _ => planned,
@@ -723,8 +826,14 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
             // (landing on the final to a MAP, clean otherwise), and compared
             // floored: comparing the raw 87 with the governor's floored 96
             // re-armed, and re-said the floor, every tick (LSZS, 2026-09-24).
+            // The slow-down to the FAF flies the floor of the flap it put out.
             let floor = if on_map_final {
                 crate::aircraft::approach_floor_kts()
+            } else if faf_begun && faf_now.is_some() {
+                last_flap
+                    .or(faf_flap_out)
+                    .and_then(crate::aircraft::config_floor_kts)
+                    .or_else(crate::aircraft::speed_floor_kts)
             } else {
                 crate::aircraft::speed_floor_kts()
             };
@@ -1782,6 +1891,8 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
                 // The vertical as commanded: the law's want, the speed's
                 // hold on it (`speed_protected_vs`), the wheel.
                 "vs_want": vs_want, "vs_cmd": vs_cmd, "ias": ias, "spd_tgt": target_kts,
+                // The FAF speed the approach slows to (`faf_speed_cap`).
+                "faf_join": faf_now.map(|f| f.join_kts), "faf_begun": faf_begun,
                 "agl_ft": agl_ft, "crab": crab, "psi": psi_v, "bug": bug_mag, "tgt": target_mag,
                 // How the lateral is flown and where on the course it is
                 // (`course_leg`): the FAF's line during a final's join.
@@ -1808,7 +1919,15 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
             if idx >= hi && done {
                 crate::blackbox::record(
                     "procedure",
-                    serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft}),
+                    // The FAF speed planned for, and the gate the energy
+                    // model predicts from the speed handed over (autoland's
+                    // `e_gate`): over the gate speed here, the final is lost
+                    // before autoland has it.
+                    serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft,
+                        "ias": ias, "faf_join": faf_now.map(|f| f.join_kts),
+                        "e_gate": faf_model.as_ref().zip(faf_now).map(|((m, gate_kts), f)|
+                            crate::approach_energy::predicted_gate_kts(m, *gate_kts, ias, f.path_nm, f.path_nm)),
+                        "gate_kts": faf_model.as_ref().map(|(_, g)| *g)}),
                 );
                 if map_short_of_runway(leg) && !MAP_AUTOLAND {
                     // The visual segment is the pilot's, talked down: the
