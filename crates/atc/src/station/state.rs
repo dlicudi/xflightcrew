@@ -268,6 +268,7 @@ pub(crate) const SESSION: &[(&str, &str)] = &[
         "crew provider, registered once at boot",
     ),
     ("FILED_ROUTE", "crew provider, registered once at boot"),
+    ("APPROACH_SPEEDS", "crew provider, registered once at boot"),
     (
         "GO_AROUND_ORDERS",
         "a counter; watchers snapshot it, never reset",
@@ -681,6 +682,9 @@ mod tests {
             "WORKING",
             "POSITION_HANDOFF",
             "PUSH_APPROVED",
+            // New with arrival sequencing (2026-10-14): the speed approach
+            // assigned us, a strip `facts` cell.
+            "ASSIGNED_SPEED",
         ];
         let station_flight = [
             "SQUAWK_WATCH",
@@ -696,6 +700,8 @@ mod tests {
             // New with arrival sequencing (2026-10-14): the landing order
             // as it was spoken to us, a strip `worksheet` cell.
             "ARRIVAL_ORDER",
+            // ...and what approach last said of it, a strip `worksheet` cell.
+            "APPROACH_SAID",
         ];
         // INSTRUMENT_DECLARED (2026-10-10): the crew flies a published
         // approach, declared before the destination's station installs.

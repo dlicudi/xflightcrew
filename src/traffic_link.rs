@@ -1806,6 +1806,7 @@ pub(crate) fn runway_times(
         runway: end.ident,
         to_thr_s: slot.to_thr_s,
         clear_s: slot.clear_s,
+        needs_clear_s: slot.needs_clear_s,
         dist_nm: dist_m / 1852.0,
         callsign: callsign.to_string(),
         icao_type: icao_type.map(str::to_string),

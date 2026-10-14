@@ -34,8 +34,8 @@ use std::time::Instant;
 
 use crate::nav;
 use crate::station::{
-    ApproachWatch, ClearanceSnap, ComplianceFlight, Handoff, LandingHold, SquawkWatch,
-    TakeoffHold, VectorPlan,
+    ApproachSaid, ApproachWatch, AssignedSpeed, ClearanceSnap, ComplianceFlight, Handoff,
+    LandingHold, SquawkWatch, TakeoffHold, VectorPlan,
 };
 use crate::speaker::StationSpeaker;
 use crate::tower;
@@ -231,6 +231,13 @@ flight_strip! {
             /// (`None` inside the `Some`: approved without a facing, no drawn
             /// lane to read one from).
             push_approved: Mutex<Option<Option<f64>>> = Mutex::new(None),
+            /// The speed approach assigned us ("reduce speed to one eight zero
+            /// knots", "maintain one six zero knots to four DME"), and whether it
+            /// was read back: a readback item like a heading or a level. Set by
+            /// approach's sequencing (`station::approach_sequence_lines`),
+            /// cleared on the handoff to the tower, a go-around and a new
+            /// flight. The crew reads it through [`assigned_speed`].
+            assigned_speed: Mutex<Option<AssignedSpeed>> = Mutex::new(None),
         },
         /// The station's own worksheets for this flight at this field: reset by
         /// `install`, `uninstall` and `retire_for_new_flight`. `self_taxi` is the
@@ -264,6 +271,9 @@ flight_strip! {
             /// said holds unless the gap reverses by more than
             /// `station::SEQUENCE_REVERSE_S` (`station::own_ahead`).
             arrival_order: Mutex<Option<SpokenOrder>> = Mutex::new(None),
+            /// What approach last SAID about the sequence and the speed, so each
+            /// is said once per change (`station::approach_sequence_lines`).
+            approach_said: Mutex<Option<ApproachSaid>> = Mutex::new(None),
         },
         /// The FLIGHT's, carried across a region handoff: reset by `uninstall`
         /// and `retire_for_new_flight`, never by `install` (the main loop installs
@@ -444,6 +454,9 @@ pub struct RunwayTimes {
     pub to_thr_s: f64,
     /// Seconds until it is off the runway again.
     pub clear_s: f64,
+    /// How long before its threshold it needs the runway clear (its landing
+    /// clearance is due), seconds.
+    pub needs_clear_s: f64,
     /// Its distance to the threshold along that path, nm.
     pub dist_nm: f64,
     /// Its raw callsign.
@@ -548,6 +561,42 @@ pub struct FiledRoute {
 /// Register the crew's provider of [`FiledRoute`]. Called once at boot.
 pub fn provide_filed_route(f: fn() -> Option<FiledRoute>) {
     *lock(&FILED_ROUTE) = Some(f);
+}
+
+/// The crew's provider of the speeds our type can fly on an approach
+/// ([`provide_approach_speeds`], registered once at boot): its minimum
+/// approach speed (the type's approach speed plus ten) and its ceiling,
+/// read when approach would assign a speed. `None`: unknown, and no speed
+/// is ever assigned. A function for the same reason as [`CALLSIGN_INPUTS`].
+type ApproachSpeedsProvider = fn() -> Option<ApproachSpeeds>;
+pub(crate) static APPROACH_SPEEDS: Mutex<Option<ApproachSpeedsProvider>> = Mutex::new(None);
+
+/// What our type can fly on an approach, knots.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApproachSpeeds {
+    /// The type's approach speed plus ten: never assigned slower.
+    pub min_kts: f64,
+    /// Never assigned faster; `None` when the type declares no limit.
+    pub max_kts: Option<f64>,
+}
+
+/// Register the crew's provider of [`ApproachSpeeds`]. Called once at boot.
+pub fn provide_approach_speeds(f: fn() -> Option<ApproachSpeeds>) {
+    *lock(&APPROACH_SPEEDS) = Some(f);
+}
+
+/// Our type's approach speeds, from the crew's provider (`None`: none
+/// registered, or unknown).
+pub(crate) fn approach_speeds() -> Option<ApproachSpeeds> {
+    let f = *lock(&APPROACH_SPEEDS);
+    f.and_then(|f| f())
+}
+
+/// The speed approach assigned us, knots, while it stands (2026-10-14,
+/// arrival sequencing): the crew's follower obeying it is owed. `None`
+/// with none assigned, after the handoff to the tower and a go-around.
+pub fn assigned_speed() -> Option<f64> {
+    lock(&OWN_STRIP.assigned_speed).as_ref().map(|a| a.kts)
 }
 
 /// The filed route from `origin` to `dest` right now; `None` without a
@@ -1164,6 +1213,10 @@ pub use crate::station::{
 ///   our slot in the traffic's picture: `own_arrival_plan`; our place in
 ///   the landing sequence it computes: `own_number`, `own_leader`.
 pub use crate::station::{own_arrival_plan, own_leader, own_number, OwnArrivalPlan};
+/// - The numbers approach sequences by, the traffic's own (the crew pins
+///   them equal to `traffic`'s: the crates never name each other):
+///   `APPROACH_SPEED_BANDS`, `SEQUENCE_GAP_S`, `RADAR_SPACING_NM`.
+pub use crate::station::{APPROACH_SPEED_BANDS, RADAR_SPACING_NM, SEQUENCE_GAP_S};
 pub use crate::station::{
     active_field, active_icao, active_station_in_range, active_station_range_nm, climb_announced,
     coach_query, coach_yes_no, departure_station, dialect_for, field_position, field_under,

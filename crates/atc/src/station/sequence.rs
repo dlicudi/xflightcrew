@@ -247,3 +247,409 @@ pub(crate) fn note_order_spoken(now: Instant) {
         ahead: ahead.into_iter().map(|(id, _)| id).collect(),
     });
 }
+
+// ---- approach: the sequence spoken, the speed controlled ----
+
+/// The radar unit's speed schedule, nm from the threshold and knots: 250
+/// below FL100 beyond 20 nm, 210 to 15, 180 to the join (11), 160 to 4 nm.
+/// The SAME bands the traffic flies (`traffic::arrival::SPEED_BANDS`, the
+/// crew pins the two equal: the crates never name each other).
+pub const APPROACH_SPEED_BANDS: [(f64, f64); 4] =
+    [(20.0, 250.0), (15.0, 210.0), (11.0, 180.0), (4.0, 160.0)];
+
+/// The gap between the one ahead reporting off the runway and us needing
+/// it, seconds: the traffic's own (`traffic::slot::FOLLOW_GAP_S`, pinned
+/// equal by the crew).
+pub const SEQUENCE_GAP_S: f64 = 20.0;
+
+/// The least radar spacing behind the one ahead on final, nm: 3 nm and a
+/// controller's buffer (`traffic::arrival::WAKE_BUFFER_NM`).
+pub const RADAR_SPACING_NM: f64 = 3.3;
+
+/// A spacing reduction stands until we are this far ahead of our place,
+/// seconds: slowed, we make the gap back, and a speed that flips back the
+/// moment the gap closes is worse than none.
+const SPACING_RELEASE_S: f64 = 15.0;
+
+/// The base is delayed only once slowing to our minimum would still leave
+/// us short by this much, seconds.
+const DELAY_MARGIN_S: f64 = 15.0;
+
+/// The join is never moved further out than this, nm.
+const JOIN_MAX_NM: f64 = 20.0;
+
+/// An owed speed readback is asked for again after this, seconds.
+const SPEED_READBACK_S: f64 = 20.0;
+
+/// The speed approach assigned, and its readback.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssignedSpeed {
+    pub kts: f64,
+    /// "band" (the schedule) or "spacing" (behind the one ahead).
+    pub why: &'static str,
+    /// The instruction as said, without the callsign.
+    pub words: String,
+    pub read_back: bool,
+    pub at: Instant,
+    /// The readback has been asked for again.
+    pub nudged: bool,
+}
+
+/// What approach last said about our sequence and speed.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ApproachSaid {
+    /// Our number and the flight we follow, as last said.
+    pub order: Option<(u8, FlightId)>,
+    /// The speed last assigned, and why.
+    pub speed: Option<(f64, &'static str)>,
+    /// The join was moved out to this, nm.
+    pub join_nm: Option<f64>,
+}
+
+/// The speed approach wants of us `dist_nm` from the threshold at `alt_ft`:
+/// the schedule's band ([`APPROACH_SPEED_BANDS`], the 250 only below
+/// FL100), only when the type can fly it (`min_kts` to `max_kts`); behind
+/// a leader and short of our place by `short_s`, our minimum approach speed
+/// instead (`was_spacing`: one already given stands until we are
+/// [`SPACING_RELEASE_S`] ahead of our place). Inside 4 nm nothing: the 160
+/// simply ends. Pure.
+pub fn wanted_speed(
+    dist_nm: f64,
+    alt_ft: f64,
+    speeds: crate::party_line::ApproachSpeeds,
+    short_s: f64,
+    was_spacing: bool,
+) -> Option<(f64, &'static str)> {
+    if !dist_nm.is_finite() || dist_nm <= 4.0 {
+        return None;
+    }
+    let band = APPROACH_SPEED_BANDS
+        .iter()
+        .find(|(from, _)| dist_nm > *from)
+        .map(|(_, k)| *k)?;
+    let min = speeds.min_kts.round();
+    let spacing = if was_spacing {
+        short_s > -SPACING_RELEASE_S
+    } else {
+        short_s > 0.0
+    };
+    if spacing && min < band {
+        return Some((min, "spacing"));
+    }
+    if band >= 250.0 && alt_ft >= 10_000.0 {
+        return None;
+    }
+    if band < min || speeds.max_kts.is_some_and(|m| band > m) {
+        return None;
+    }
+    Some((band, "band"))
+}
+
+/// Seconds we are short of our place behind `leader`: it off the runway
+/// [`SEQUENCE_GAP_S`] before our landing clearance is due, and at least
+/// [`RADAR_SPACING_NM`] behind it at our own pace. Negative: room to spare.
+pub(crate) fn spacing_short_s(own: &RunwayTimes, leader: &Leader) -> f64 {
+    let leader_s = own.to_thr_s - leader.gap_s;
+    let kts = if own.to_thr_s > 0.0 {
+        own.dist_nm / own.to_thr_s * 3600.0
+    } else {
+        f64::NAN
+    };
+    let mut need = leader.clear_s + SEQUENCE_GAP_S + own.needs_clear_s;
+    if kts.is_finite() && kts > 40.0 {
+        need = need.max(leader_s + RADAR_SPACING_NM / kts * 3600.0);
+    }
+    need - own.to_thr_s
+}
+
+/// "number two, following a Boeing 737 on 8 mile final" in the dialect
+/// (CAP 413 6.5: "number two, following ..."; FAA 7110.65 5-9: "number
+/// two, follow ..."). An unknown type is "traffic".
+pub fn sequence_words(
+    dialect: Dialect,
+    number: u8,
+    icao_type: Option<&str>,
+    dist_nm: f64,
+) -> String {
+    let what = match icao_type.and_then(crate::station::spoken_type) {
+        Some(t) => {
+            let an = t
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c.to_ascii_uppercase(), 'A' | 'E' | 'I' | 'O' | 'U'));
+            format!("{} {t}", if an { "an" } else { "a" })
+        }
+        None => "traffic".to_string(),
+    };
+    let fin = tower::spoken_final(dist_nm);
+    let n = tower::sequence_number(number);
+    match dialect {
+        Dialect::Icao => format!("number {n}, following {what} on {fin}"),
+        Dialect::Faa => format!("number {n}, follow {what}, {fin}"),
+    }
+}
+
+/// A speed instruction in the dialect: the 160 to 4 nm says where it ends
+/// ("maintain one six zero knots to four DME"; FAA "until four mile
+/// final"), a reduction "reduce speed to ..." (`reducing`), else
+/// "maintain ... knots".
+pub fn speed_words(dialect: Dialect, kts: f64, reducing: bool) -> String {
+    let k = atis::spoken_digits(&format!("{:03}", kts.round() as i64));
+    if (kts - 160.0).abs() < 0.5 {
+        return match dialect {
+            Dialect::Icao => format!("maintain {k} knots to four DME"),
+            Dialect::Faa => format!("maintain {k} knots until four mile final"),
+        };
+    }
+    if reducing {
+        format!("reduce speed to {k} knots")
+    } else {
+        format!("maintain {k} knots")
+    }
+}
+
+/// Approach's sequencing for OUR flight, one tick (`vector_tick_for`, the
+/// approach watch): our number and the traffic we follow, ONCE per change;
+/// a speed on the schedule's band when the band changes, or the minimum
+/// approach speed behind a leader we are short of; still short beyond the
+/// join with the speed spent, the join moved out (`plan`: the vectors'),
+/// "extend downwind" on a downwind-shaped leg; an owed speed readback asked
+/// for once. The words without the callsign, `None` with nothing to say.
+/// Blackbox `atc` `sequence`, `speed_assigned`, `downwind_extended`.
+pub(crate) fn approach_sequence_lines(
+    flight: &FlightStrip,
+    state: &AircraftState,
+    track_deg: Option<f64>,
+    plan: Option<&mut VectorPlan>,
+    dialect: Dialect,
+    now: Instant,
+) -> Option<String> {
+    if !flight.is_own() || state.on_ground {
+        return None;
+    }
+    let own = fresh_times(flight, now).filter(|t| t.to_thr_s > 0.0)?;
+    let number = own_number_at(now)?;
+    let leader = own_leader_at(now);
+    let mut said_guard = flight
+        .approach_said
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let said = said_guard.get_or_insert_with(ApproachSaid::default);
+    let mut parts: Vec<String> = Vec::new();
+    // The number and the traffic, once per change.
+    if let Some(l) = &leader {
+        let key = (number, l.id);
+        if said.order != Some(key) {
+            said.order = Some(key);
+            parts.push(sequence_words(
+                dialect,
+                number,
+                l.icao_type.as_deref(),
+                l.dist_nm,
+            ));
+            sim::blackbox::record(
+                "atc",
+                serde_json::json!({"event": "sequence", "number": number,
+                    "leader": l.callsign, "gap_s": l.gap_s.round(),
+                    "leader_nm": (l.dist_nm * 10.0).round() / 10.0, "runway": own.runway}),
+            );
+        }
+    }
+    // The speed.
+    let short = leader
+        .as_ref()
+        .map_or(f64::NEG_INFINITY, |l| spacing_short_s(&own, l));
+    if let Some(speeds) = crate::party_line::approach_speeds() {
+        let was_spacing = said.speed.is_some_and(|(_, w)| w == "spacing");
+        let want = wanted_speed(own.dist_nm, state.alt_ft, speeds, short, was_spacing);
+        match want {
+            Some((kts, why)) if said.speed != Some((kts, why)) => {
+                let reducing = state.gs_kts.is_finite() && state.gs_kts > kts + 10.0;
+                let words = speed_words(dialect, kts, reducing);
+                said.speed = Some((kts, why));
+                *flight
+                    .assigned_speed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(AssignedSpeed {
+                    kts,
+                    why,
+                    words: words.clone(),
+                    read_back: false,
+                    at: now,
+                    nudged: false,
+                });
+                publish_speed_readback(flight, kts);
+                sim::blackbox::record(
+                    "atc",
+                    serde_json::json!({"event": "speed_assigned", "kts": kts, "why": why,
+                        "dist_nm": (own.dist_nm * 10.0).round() / 10.0}),
+                );
+                parts.push(words);
+            }
+            Some(_) => {}
+            // Inside 4 nm the 160 simply ends: nothing said, nothing owed.
+            None if own.dist_nm <= 4.0 => {
+                said.speed = None;
+                *flight
+                    .assigned_speed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            None => {}
+        }
+        // Still short beyond the join with the speed spent: the base is
+        // delayed, the join moved out along the final.
+        if let Some(plan) = plan {
+            let min = speeds.min_kts.max(40.0);
+            let can_add = (own.dist_nm / min * 3600.0 - own.to_thr_s).max(0.0);
+            let beyond = own.dist_nm > plan.join_nm + 1.0;
+            if beyond && short > can_add + DELAY_MARGIN_S {
+                let out = ((short - can_add) * min / 3600.0).max(1.0);
+                let join = (plan.join_nm + out).min(JOIN_MAX_NM);
+                if join > plan.join_nm + 0.5 {
+                    plan.join_nm = join;
+                    said.join_nm = Some(join);
+                    sim::blackbox::record(
+                        "atc",
+                        serde_json::json!({"event": "downwind_extended",
+                            "join_nm": (join * 10.0).round() / 10.0,
+                            "short_s": short.round()}),
+                    );
+                    let downwind = track_deg.is_some_and(|t| {
+                        sim::angles::abs_diff_deg(t, plan.course_deg + 180.0) <= 45.0
+                    });
+                    if downwind {
+                        parts.push("extend downwind".to_string());
+                    }
+                }
+            }
+        }
+    }
+    drop(said_guard);
+    // An owed speed readback, asked for once.
+    if parts.is_empty() {
+        let mut g = flight
+            .assigned_speed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(a) = g.as_mut().filter(|a| !a.read_back && !a.nudged) {
+            if now.saturating_duration_since(a.at).as_secs_f64() >= SPEED_READBACK_S {
+                a.nudged = true;
+                parts.push(format!("read back the speed, {}", a.words));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    // Spoken: the order holds from here until the gap reverses.
+    note_order_spoken(now);
+    Some(parts.join(", "))
+}
+
+/// The crew's readback of an assigned speed ("one six zero knots"), with
+/// approach's clearance readback when one is owed too.
+fn publish_speed_readback(flight: &FlightStrip, kts: f64) {
+    let words = format!(
+        "{} knots",
+        atis::spoken_digits(&format!("{:03}", kts.round() as i64))
+    );
+    let mut g = flight
+        .approach_readback
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let next = match g.take() {
+        Some(prev) => format!("{prev}, {words}"),
+        None => words,
+    };
+    *g = Some(next);
+}
+
+/// The speed and what approach said of the sequence are over: the handoff
+/// to the tower, the landing.
+pub(crate) fn retire_approach_speed(flight: &FlightStrip) {
+    *flight
+        .assigned_speed
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *flight
+        .approach_said
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// A go-around: the speed and the order spoken are void (the arrival is
+/// sequenced afresh when it comes back round).
+pub(crate) fn retire_sequence(flight: &FlightStrip) {
+    retire_approach_speed(flight);
+    *flight
+        .arrival_order
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Our transmission to approach while a speed readback is owed: the right
+/// speed is the readback (silence), a different one is corrected; no speed
+/// heard is no readback (the call is answered as before). `None` with no
+/// readback owed or no speed heard.
+pub(crate) fn judge_speed_readback(transcript: &str, callsign: &str) -> Option<String> {
+    let mut g = OWN_STRIP
+        .assigned_speed
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let a = g.as_mut().filter(|a| !a.read_back)?;
+    let heard = tower::heard_speed_kts(transcript)?;
+    if (heard as f64 - a.kts).abs() < 0.5 {
+        a.read_back = true;
+        sim::blackbox::record(
+            "atc",
+            serde_json::json!({"event": "speed_read_back", "kts": a.kts}),
+        );
+        return Some(String::new());
+    }
+    sim::blackbox::record(
+        "atc",
+        serde_json::json!({"event": "speed_readback_wrong", "kts": a.kts, "heard": heard}),
+    );
+    Some(format!("{callsign}, negative, {}.", a.words))
+}
+
+/// The sequence as it stands for us now, in the dialect, for a reply that
+/// arms our approach (the vectors' opening): `None` with no leader.
+pub(crate) fn sequence_clause_now(dialect: Dialect, now: Instant) -> Option<String> {
+    let number = own_number_at(now)?;
+    let l = own_leader_at(now)?;
+    let words = sequence_words(dialect, number, l.icao_type.as_deref(), l.dist_nm);
+    OWN_STRIP
+        .approach_said
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(ApproachSaid::default)
+        .order = Some((number, l.id));
+    note_order_spoken(now);
+    Some(words)
+}
+
+/// A line of approach's: `msg` (a heading, a clearance) with the
+/// sequencing's words after it, or the sequencing's words alone, to
+/// `callsign`.
+pub(crate) fn with_sequence(
+    callsign: &str,
+    msg: Option<String>,
+    extra: Option<String>,
+) -> Option<String> {
+    match (msg, extra) {
+        (Some(m), Some(e)) => Some(format!("{m} {}.", capitalise(&e))),
+        (Some(m), None) => Some(m),
+        (None, Some(e)) => Some(format!("{callsign}, {e}.")),
+        (None, None) => None,
+    }
+}
+
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}

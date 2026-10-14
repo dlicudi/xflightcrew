@@ -565,7 +565,7 @@ fn title_case(w: &str) -> String {
 /// Spoken position of traffic on final: "short final" inside 1.5 nm, else
 /// "N mile final".
 /// A landing sequence number as the tower says it.
-fn sequence_number(n: u8) -> String {
+pub(crate) fn sequence_number(n: u8) -> String {
     match n {
         1 => "one".into(),
         2 => "two".into(),
@@ -577,7 +577,7 @@ fn sequence_number(n: u8) -> String {
     }
 }
 
-fn spoken_final(nm: f64) -> String {
+pub(crate) fn spoken_final(nm: f64) -> String {
     if nm < 1.5 {
         "short final".to_string()
     } else {
@@ -1629,6 +1629,27 @@ pub fn heard_squawk(transcript: &str) -> Option<i64> {
             if d.len() == 4 {
                 return d.parse().ok();
             }
+        }
+    }
+    None
+}
+
+/// The speed a readback says, knots: three digits before "knots" ("one
+/// six zero knots", "160 knots") or after "speed" ("speed one eight
+/// zero"). `None` when no speed was said.
+pub fn heard_speed_kts(transcript: &str) -> Option<i64> {
+    let toks = number_tokens(&transcript.to_lowercase());
+    for i in 0..toks.len() {
+        let (d, n) = digits_at(&toks, i, 3);
+        if d.len() < 2 || n == 0 {
+            continue;
+        }
+        let knots = toks
+            .get(i + n)
+            .is_some_and(|w| matches!(w.as_str(), "knots" | "knot" | "kts"));
+        let speed = i > 0 && toks[i - 1] == "speed";
+        if knots || speed {
+            return d.parse().ok();
         }
     }
     None

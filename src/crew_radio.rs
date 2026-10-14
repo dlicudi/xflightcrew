@@ -464,6 +464,19 @@ pub fn callsign_inputs() -> crate::callsign::Inputs {
     }
 }
 
+/// The speeds our type can fly on an approach, for approach's speed
+/// control (`party_line::provide_approach_speeds`): the live profile's
+/// approach speed plus ten as the least, its speed ceiling as the most.
+/// `None` without an approach speed: approach then assigns none.
+pub fn approach_speeds() -> Option<crate::party_line::ApproachSpeeds> {
+    let p = crate::aircraft::live_profile()?;
+    let app = crate::aircraft::approach_kts(&p)?;
+    Some(crate::party_line::ApproachSpeeds {
+        min_kts: app + 10.0,
+        max_kts: crate::aircraft::speed_ceiling_kts(),
+    })
+}
+
 /// A plan's callsign, only from a SimBrief plan (a local one names no flight).
 pub(crate) fn plan_callsign(
     plan: Option<&crate::simbrief::FlightPlan>,

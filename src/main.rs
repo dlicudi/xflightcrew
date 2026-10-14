@@ -257,6 +257,9 @@ async fn main() -> Result<()> {
     // ...and the route we filed, so an IFR clearance names the SID that
     // joins it, by the crew's own rule (#152).
     party_line::provide_filed_route(simbrief::filed_route);
+    // ...and the speeds our type can fly on an approach, so approach never
+    // assigns one it cannot (2026-10-14, arrival sequencing).
+    party_line::provide_approach_speeds(crew_radio::approach_speeds);
 
     // Initial app mode: explicit env > the panel's saved pick > both. The
     // panel's Settings tab can change it live from here on (mode.rs).

@@ -2343,3 +2343,21 @@ fn our_arrival_is_the_armed_runway_or_the_final_we_fly() {
     };
     assert!(own_arrival(&field, None, &off, None, Some("27"), "C172").is_none());
 }
+
+/// Approach sequences by the traffic's own numbers (2026-10-14): the speed
+/// bands it assigns us are the bands the traffic flies, the runway gap the
+/// traffic's, the radar spacing the traffic's wake minimum plus its
+/// buffer. The two crates never name each other, so the pin is here.
+#[test]
+fn approach_sequences_by_the_traffics_own_numbers() {
+    assert_eq!(
+        crate::party_line::APPROACH_SPEED_BANDS,
+        traffic::arrival::SPEED_BANDS
+    );
+    assert_eq!(crate::party_line::SEQUENCE_GAP_S, traffic::slot::FOLLOW_GAP_S);
+    assert_eq!(
+        crate::party_line::RADAR_SPACING_NM,
+        traffic::arrival::wake_gap_nm(traffic::Wake::Medium, traffic::Wake::Medium)
+            + traffic::arrival::WAKE_BUFFER_NM
+    );
+}
