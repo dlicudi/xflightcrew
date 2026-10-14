@@ -1872,9 +1872,16 @@ async fn fly(
         serde_json::json!({ "event": "start", "points": route.points.iter().map(|p| &p.0).collect::<Vec<_>>(), "cruise_alt_ft": cruise_alt_ft, "terrain_ft": terrain_ft, "samples": samples.len() }),
     );
 
-    publish_fms(&xp, &route, cruise_alt_ft).await;
-    if !route.arrive_only {
-        fms_goto(&xp, &route, 1).await;
+    // An airborne resume's route starts at the joined fix: loaded, X-Plane
+    // takes that fix for the departure airport and refuses the plan (LUNUM,
+    // LEMG-LXGB 2026-10-14). The plan aboard stays; the GPS is sent to the fix.
+    if route.resume {
+        fms_goto(&xp, &route, 0).await;
+    } else {
+        publish_fms(&xp, &route, cruise_alt_ft).await;
+        if !route.arrive_only {
+            fms_goto(&xp, &route, 1).await;
+        }
     }
     if !route.arrive_only {
     say(
