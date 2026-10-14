@@ -1,23 +1,23 @@
-//! `xfc home` (alias `xfc setup`): the screen a new user lands on. Setup
-//! checks with a fix each, the voices, the settings and the files, and `r`
-//! to start the crew in the same process.
+//! The setup checks: what the one app (`src/app.rs`) shows on its Checks
+//! tab and waits on before the crew boots, and `xfc home --print`.
 //!
 //! ```text
-//! xfc home | xfc setup     the screen
+//! xfc                      the app; the crew boots at once when every
+//!                          REQUIRED check passes (X-Plane folder, plugin
+//!                          missing, starter set incomplete), else the app
+//!                          opens on Checks and boots the moment they pass
+//! xfc home | xfc setup     the app, opened on Checks (hidden aliases)
 //! xfc home --print         the checks as text (for support, and no TTY)
-//! xfc run                  the crew, never the screen
-//! xfc                      the crew; the screen first only on a TTY with a
-//!                          REQUIRED check red (X-Plane folder, plugin
-//!                          missing, starter set incomplete)
+//! xfc run                  the crew, headless, never the app
 //! ```
 //!
 //! The boot's decision is offline and cheap ([`offline`]: file checks only).
-//! The screen adds the two live facts when it opens or on `c`, never
+//! The Checks tab adds the two live facts when it opens or on `c`, never
 //! polled: ONE Web API GET ([`ask_web_api`]) and the default microphone's
 //! NAME ([`mic_name`], nothing recorded). Every verdict is pure ([`checks`]);
-//! the TUI is [`screen`].
+//! the tab is [`screen`].
 
-mod screen;
+pub mod screen;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,15 +27,6 @@ use anyhow::{anyhow, Result};
 use crate::config::Config;
 use crate::plugin_install::{self, Verdict};
 use crate::voices::catalogue::{self, Kind, StarterStatus};
-
-/// What the screen does when it closes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Leave {
-    /// `r`: start the crew, as plain `xfc` does.
-    Run,
-    /// `q`: nothing more.
-    Quit,
-}
 
 /// What the checks are judged from: gathered by the shell, judged pure.
 #[derive(Clone, Debug)]
@@ -311,7 +302,7 @@ pub fn checks(f: &Facts) -> Vec<Check> {
     ]
 }
 
-/// Plain `xfc` shows the screen first only for these.
+/// The crew waits for these (the app opens on Checks for them).
 pub fn needs_home(f: &Facts) -> bool {
     checks(f).iter().any(|c| c.required)
 }
@@ -346,15 +337,6 @@ pub fn offline(config: &Config) -> Facts {
         api_port: api_port(&config.xplane_base_url),
         mic: None,
     }
-}
-
-/// Whether plain `xfc` shows the screen first: an interactive terminal
-/// (stdin and stdout) and a required check red.
-pub fn wanted_at_boot(config: &Config) -> bool {
-    use std::io::IsTerminal;
-    std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && needs_home(&offline(config))
 }
 
 /// ONE GET to the Web API, a short timeout: any HTTP answer means it is up.
@@ -427,7 +409,7 @@ pub fn summary() -> Summary {
 pub fn hint_text(fix: Fix) -> String {
     match fix {
         Fix::XPlaneHint => format!(
-            "set the X-Plane folder in Settings (Paths), or XCOPILOT_XPLANE_ROOT=<your X-Plane 12 folder> in {}; then c to check again",
+            "set the X-Plane folder on the Paths tab, or XCOPILOT_XPLANE_ROOT=<your X-Plane 12 folder> in {}; then c to check again",
             tilde(&sim::paths::env_file())
         ),
         Fix::PluginHint => "this build carries no plugin: from a source checkout, make -C plugin install; or a release build (scripts/build-release.sh) installs it from here".into(),
@@ -448,7 +430,7 @@ pub fn print_fix(fix: Fix) -> Option<String> {
 
 /// Settings and the mode as boot has them: the registry with its saved
 /// picks, the mode and the cabin staffing (env > prefs > default). Run
-/// before the screen so its Settings view shows what the crew will use.
+/// before the app opens so its settings tabs show what the crew will use.
 pub fn prepare_settings(config: &Config) {
     let config = (*crate::settings::install(config.clone())).clone();
     crate::boot_mode_and_staffing(&config);
@@ -485,30 +467,15 @@ pub fn print_report(config: &Config) -> String {
     out
 }
 
-/// `xfc home [--print]`: the screen on its own thread (the catalogue and
-/// the downloads are blocking HTTP, never inside the async runtime).
-pub fn main_cmd(args: &[String], config: &Config) -> Result<Leave> {
-    if args.iter().any(|a| a == "--print") {
-        let config = config.clone();
-        let text = std::thread::spawn(move || print_report(&config))
-            .join()
-            .map_err(|_| anyhow!("xfc home --print panicked"))?;
-        print!("{text}");
-        return Ok(Leave::Quit);
-    }
-    if let Some(other) = args.first() {
-        return Err(anyhow!(
-            "unknown option {other}\nusage: xfc home [--print]  (alias xfc setup)"
-        ));
-    }
+/// `xfc home --print`: the checks as text, on its own thread (the
+/// catalogue is blocking HTTP, never inside the async runtime).
+pub fn print_cmd(config: &Config) -> Result<()> {
     let config = config.clone();
-    std::thread::spawn(move || {
-        prepare_settings(&config);
-        screen::run(&config)
-    })
-    .join()
-    .map_err(|_| anyhow!("xfc home panicked"))?
-    .map_err(|e| anyhow!("xfc home: {e}"))
+    let text = std::thread::spawn(move || print_report(&config))
+        .join()
+        .map_err(|_| anyhow!("xfc home --print panicked"))?;
+    print!("{text}");
+    Ok(())
 }
 
 #[cfg(test)]

@@ -37,6 +37,8 @@ mod crew_radio;
 mod debrief;
 mod heading_bug;
 mod home;
+mod app;
+mod restart;
 mod sortie_runner;
 mod conform;
 mod test_card;
@@ -201,6 +203,9 @@ async fn main() -> Result<()> {
     // Every blackbox record through the live scorer: `stage_result` beside
     // the ticks, `sortie_result` at each mission's end.
     blackbox::set_tap(scorecard::tap);
+    // The shell's environment, before any `.env` is loaded: what a crew
+    // restart starts again with (src/restart.rs).
+    restart::capture_original_env();
     let config = Config::from_env()?;
     // `xfc voices [list|install|remove]`: the voice and speech-model manager
     // (src/voices.rs). First, before the log is set up: its screen owns the
@@ -229,26 +234,32 @@ async fn main() -> Result<()> {
         print!("{}", licenses::text(full));
         return Ok(());
     }
-    // `xfc home` (alias `xfc setup`): the setup screen (src/home.rs); `r`
-    // falls through to the boot below, in this process. Plain `xfc` shows it
-    // first only on a TTY with a REQUIRED check red (file checks only);
-    // `xfc run` never does. First, before the log: it owns the terminal.
+    // Plain `xfc` on a terminal is the one app (src/app.rs): the crew's
+    // dashboard, the checks, the voices and every setting, the crew
+    // booting itself once the required checks pass. `xfc home` / `xfc
+    // setup` open it on Checks (`--print`, or no terminal: the checks as
+    // text). `xfc run` is the crew headless, never the app.
     let arg = std::env::args().nth(1);
-    let home_args: Option<Vec<String>> = match arg.as_deref() {
-        Some("home" | "setup") => Some(std::env::args().skip(2).collect()),
-        None if home::wanted_at_boot(&config) => Some(Vec::new()),
+    if matches!(arg.as_deref(), Some("home" | "setup")) {
+        use std::io::IsTerminal;
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        if let Some(other) = rest.iter().find(|a| *a != "--print") {
+            return Err(anyhow!(
+                "unknown option {other}\nusage: xfc home [--print]  (alias xfc setup)"
+            ));
+        }
+        let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        if !rest.is_empty() || !tty {
+            home::print_cmd(&config)?;
+            return Ok(());
+        }
+    }
+    let open = match arg.as_deref() {
+        Some("home" | "setup") => Some(app::Open::Checks),
+        None if config.ui == "tui" => Some(app::Open::Default),
         _ => None,
     };
-    let config = match home_args {
-        Some(args) => match home::main_cmd(&args, &config)? {
-            home::Leave::Quit => return Ok(()),
-            // The screen may have changed prefs (a voice pick, a setting)
-            // and installed models: the boot reads them afresh.
-            home::Leave::Run => Config::from_env()?,
-        },
-        None => config,
-    };
-    let tui = config.ui == "tui";
+    let tui = open.is_some() || (config.ui == "tui" && arg.as_deref() != Some("run"));
 
     // Always log to a daily-rolling file. In TUI mode the stderr layer would
     // scribble over the dashboard, so it's omitted there (file only).
@@ -522,6 +533,84 @@ async fn main() -> Result<()> {
         return stt_eval::run(&config.whisper_model_path, &profile, &manifest);
     }
 
+    // The one app: the screen on this thread, the crew booted on its own
+    // when the checks pass (`spawn_tui_crew`). A restart (on the ground
+    // only, `restart::verdict`) starts this process again in place.
+    // The settings are installed and the mode set above, so its tabs show
+    // what the crew will use.
+    if let Some(open) = open {
+        match app::run(config, open, spawn_tui_crew)? {
+            app::Exit::Quit => return Ok(()),
+            app::Exit::Restart => {
+                // The log flushed first: exec runs no destructor.
+                drop(_log_guard);
+                let e = restart::exec_again();
+                return Err(anyhow!("restarting the crew failed ({e}): start xfc again"));
+            }
+        }
+    }
+
+    // Headless (`xfc run`, no terminal, `XCOPILOT_UI=plain`).
+    let crew = boot_crew(config).await?;
+    let Crew {
+        config,
+        profile,
+        stt,
+        live_profile,
+        voice,
+        continuous,
+        explicit,
+        ptt,
+        status_sink,
+        cabin_state,
+    } = crew;
+    println!(
+        "\n  XFlightCrew: {} ({}). Ctrl-C to quit.\n",
+        profile.display_name, config.listen_mode
+    );
+    let mut reporter = Reporter::plain();
+    if let Some(s) = status_sink {
+        reporter = reporter.with_status(s);
+    }
+    // No typed input in plain mode, but the panel's emergency buttons still
+    // need a way in: same channel, same consumer.
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+    efb::spawn(voice.clone(), cmd_tx.clone(), true);
+    spawn_panel_request_poller(config.xplane_base_url.clone(), cmd_tx);
+    run_session(
+        config,
+        stt,
+        live_profile,
+        voice,
+        continuous,
+        explicit,
+        ptt,
+        reporter,
+        Some(cmd_rx),
+        cabin_state,
+    )
+    .await
+}
+
+/// What the boot hands the command loop.
+struct Crew {
+    config: Config,
+    profile: aircraft::AircraftProfile,
+    stt: Stt,
+    live_profile: std::sync::Arc<LiveProfile>,
+    voice: Voice,
+    continuous: bool,
+    explicit: bool,
+    ptt: Option<Ptt>,
+    status_sink: Option<plugin_status::StatusSink>,
+    cabin_state: std::sync::Arc<std::sync::Mutex<cabin::Cabin>>,
+}
+
+/// The crew's boot, both UIs: the aircraft, the speech model, the
+/// capture, the voice arbiter, and every background thread (the pollers,
+/// the radio panel, the detector, the monitor, the safe hold). The command
+/// loop is the caller's (`run_session`).
+async fn boot_crew(config: Config) -> Result<Crew> {
     // Resolve the aircraft profile: auto-detect from the loaded MODEL (its
     // acf_ICAO and .acf path against every profile's `match:` block, never
     // the ICAO alone) when configured as "auto", otherwise use the configured
@@ -799,57 +888,93 @@ async fn main() -> Result<()> {
         status_sink.clone(),
     );
 
-    if config.ui == "tui" {
-        // TUI: the voice loop and the health poll run on background threads,
-        // each with its own runtime; the dashboard renders on the main thread.
-        let (tx, rx) = std::sync::mpsc::channel::<ui::Report>();
-        let boot_facts = boot_health(&config);
+    Ok(Crew {
+        config,
+        profile,
+        stt,
+        live_profile,
+        voice,
+        continuous,
+        explicit,
+        ptt,
+        status_sink,
+        cabin_state,
+    })
+}
 
-        let tx_poll = tx.clone();
-        let mut collector = health::Collector::new(
-            XPlaneClient::new(config.xplane_base_url.clone()),
-            live_profile.clone(),
-            &config,
-        );
-        std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            rt.block_on(async move {
-                loop {
-                    if tx_poll
-                        .send(ui::Report::Health(Box::new(collector.poll().await)))
-                        .is_err()
-                    {
-                        break; // dashboard gone
+/// The one app's crew (`app::Spawn`): booted on its own thread and
+/// runtime, never the screen's. The settings as they are saved NOW (the
+/// boot knobs' snapshot taken afresh, `Config::from_loaded_env`), then the
+/// boot, the health poll, the panel's and the EFB's lines, and the command
+/// loop on this thread. Its news reaches the Flight tab through `tx`.
+fn spawn_tui_crew(
+    tx: std::sync::mpsc::Sender<ui::Report>,
+    cmd_tx: std::sync::mpsc::Sender<String>,
+    cmd_rx: std::sync::mpsc::Receiver<String>,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            let _ = tx.send(ui::Report::BootFailed("no runtime for the crew".into()));
+            return;
+        };
+        let failed = tx.clone();
+        let result = rt.block_on(async move {
+            let config = Config::from_loaded_env()?;
+            let config: Config = (*settings::install(config)).clone();
+            boot_mode_and_staffing(&config);
+            let Crew {
+                config,
+                profile: _,
+                stt,
+                live_profile,
+                voice,
+                continuous,
+                explicit,
+                ptt,
+                status_sink,
+                cabin_state,
+            } = boot_crew(config).await?;
+            let _ = tx.send(ui::Report::Booted(Box::new(boot_health(&config))));
+
+            let tx_poll = tx.clone();
+            let mut collector = health::Collector::new(
+                XPlaneClient::new(config.xplane_base_url.clone()),
+                live_profile.clone(),
+                &config,
+            );
+            std::thread::spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async move {
+                    loop {
+                        if tx_poll
+                            .send(ui::Report::Health(Box::new(collector.poll().await)))
+                            .is_err()
+                        {
+                            break; // the app is gone
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                }
+                });
             });
-        });
 
-        // Typed-command channel: the dashboard (main thread) sends commands the
-        // pilot types; the voice loop picks them up alongside spoken utterances.
-        // The plugin panel's emergency buttons feed the same channel.
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
-        spawn_panel_request_poller(config.xplane_base_url.clone(), cmd_tx.clone());
-        // The EFB's lines ride the same channel (off unless XCOPILOT_EFB).
-        efb::spawn(voice.clone(), cmd_tx.clone(), false);
-        let mut reporter = Reporter::tui(tx);
-        if let Some(s) = status_sink.clone() {
-            reporter = reporter.with_status(s);
-        }
-        std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            if let Err(e) = rt.block_on(run_session(
+            // The typed line: the app's Flight tab sends what the pilot
+            // types; the plugin panel's buttons and the EFB feed the same
+            // channel.
+            spawn_panel_request_poller(config.xplane_base_url.clone(), cmd_tx.clone());
+            efb::spawn(voice.clone(), cmd_tx.clone(), false);
+            let mut reporter = Reporter::tui(tx);
+            if let Some(s) = status_sink.clone() {
+                reporter = reporter.with_status(s);
+            }
+            run_session(
                 config,
                 stt,
                 live_profile,
@@ -860,41 +985,14 @@ async fn main() -> Result<()> {
                 reporter,
                 Some(cmd_rx),
                 cabin_state,
-            )) {
-                tracing::error!("voice loop ended: {e:#}");
-            }
+            )
+            .await
         });
-
-        ui::run_dashboard(boot_facts, rx, cmd_tx)?; // blocks until the user quits
-        Ok(())
-    } else {
-        println!(
-            "\n  XFlightCrew — {} ({}). Ctrl-C to quit.\n",
-            profile.display_name, config.listen_mode
-        );
-        let mut reporter = Reporter::plain();
-        if let Some(s) = status_sink {
-            reporter = reporter.with_status(s);
+        if let Err(e) = result {
+            tracing::error!("crew ended: {e:#}");
+            let _ = failed.send(ui::Report::BootFailed(format!("{e:#}")));
         }
-        // No typed input in plain mode, but the panel's emergency buttons still
-        // need a way in — same channel, same consumer.
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
-        efb::spawn(voice.clone(), cmd_tx.clone(), true);
-        spawn_panel_request_poller(config.xplane_base_url.clone(), cmd_tx);
-        run_session(
-            config,
-            stt,
-            live_profile,
-            voice,
-            continuous,
-            explicit,
-            ptt,
-            reporter,
-            Some(cmd_rx),
-            cabin_state,
-        )
-        .await
-    }
+    });
 }
 
 /// The voice loop: listen → transcribe → pick a tool → confirm → execute → read

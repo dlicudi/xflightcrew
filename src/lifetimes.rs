@@ -193,6 +193,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("rapport::OFFER", 'F'),
     ("readback::LAST", 'C'),
     ("readback::STATE", 'C'),
+    ("restart::ORIGINAL_ENV", 'P'),
     ("runway::RUNWAY_WIDTHS", 'C'),
     ("scorecard::LIVE", 'M'),
     ("settings::LIVE", 'P'),
