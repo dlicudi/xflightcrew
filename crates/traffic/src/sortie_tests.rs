@@ -1501,6 +1501,59 @@ fn an_unanswered_ready_call_is_made_again() {
     assert_eq!(readies(behind), 1, "answered: one call");
 }
 
+/// A HOLD IS AN ANSWER (#286, LEMG 2026-10-14): EZY2264 called ready, was
+/// held 117 s for a lander, and the hold lifted one tick before its takeoff
+/// clearance arrived; counted from the first call it was "90 s unanswered"
+/// and called ready again after reading back cleared for takeoff. The
+/// retry counts from the release.
+#[test]
+fn a_released_hold_is_not_an_unanswered_ready() {
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    let mut fleet = Fleet::new(field.clone());
+    let mut ac = taxiing(
+        &field,
+        1,
+        "A320",
+        vec![end.at(300.0, -150.0), end.at(300.0, -100.0)],
+    );
+    ac.phase = Phase::HoldShort;
+    fleet.spawn(ac);
+    let taxi = Order {
+        state: TowerState::TaxiCleared,
+        ..Default::default()
+    };
+    let held = Order {
+        hold: true,
+        ..taxi.clone()
+    };
+    let cleared = Order {
+        state: TowerState::TakeoffCleared,
+        ..Default::default()
+    };
+    let mut readies = 0;
+    let mut t = 0.0;
+    // Called, then held for the lander, released, cleared a tick later.
+    while t < 140.0 {
+        let order = if t < 1.0 {
+            taxi.clone()
+        } else if t < 118.0 {
+            held.clone()
+        } else if t < 118.2 {
+            taxi.clone()
+        } else {
+            cleared.clone()
+        };
+        for e in fleet.step(0.1, None, &|_| Some(order.clone())) {
+            if matches!(e, Event::Call { call: Call::Ready, .. }) {
+                readies += 1;
+            }
+        }
+        t += 0.1;
+    }
+    assert_eq!(readies, 1, "one ready, answered by the hold and the clearance");
+}
+
 /// HEAD ON AT A JUNCTION (the pass-through, 2026-10-09: the one with the
 /// right of way drove THROUGH the other). [2] taxis east along the line;
 /// [1] comes up a side branch and would turn west down the same line,
