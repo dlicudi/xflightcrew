@@ -653,3 +653,95 @@ fn capitalise(s: &str) -> String {
         None => String::new(),
     }
 }
+
+// ---- the tower: number two, never a clearance it must cancel (#237) ----
+
+/// A lander the tower knows nothing more of (the sim's traffic, a ghost)
+/// is off the runway this long after its threshold, seconds: a jet's flare
+/// and rollout to a turn-off (our own 737 was off 43 s after touchdown at
+/// XTST, `traffic`'s slot test).
+pub const GHOST_RUNWAY_S: f64 = 50.0;
+
+/// Our landing clearance is due this far out, nm: 300 ft on a 3 degree
+/// path (the traffic's `NO_CLEARANCE_AGL_FT`).
+const CLEARANCE_LEAD_NM: f64 = 0.94;
+
+/// The flight ahead of us on our final that will NOT be off the runway
+/// [`SEQUENCE_GAP_S`] before we need it (our landing clearance is due):
+/// the tower says "continue approach, number two, traffic ..." and holds
+/// the clearance. With our own times in the landing sequence, the
+/// sequence's leader and its runway time ([`own_leader_at`]); else (the
+/// sim's traffic, no producer) the nearest flight airborne on our final
+/// between us and the threshold, timed at [`DEFAULT_FINAL_KTS`] with
+/// [`GHOST_RUNWAY_S`] on the runway. Our strip only. `None`: nobody ahead
+/// that the runway is not clear of in time. LEMG 30 (#237, 2026-10-07):
+/// "cleared to land" at our 997 ft final report with live traffic landing
+/// 1.4 nm ahead, then "go around, traffic on the runway" twice.
+pub(crate) fn landing_leader_blocking(
+    flight: &FlightStrip,
+    runway_ident: &str,
+    targets: &[TcasTarget],
+    now: Instant,
+) -> Option<tower::LandingLeader> {
+    if !flight.is_own() {
+        return None;
+    }
+    let own_times = fresh_times(flight, now)
+        .filter(|t| t.runway.eq_ignore_ascii_case(runway_ident) && t.to_thr_s > 0.0);
+    if let Some(own) = own_times {
+        let l = own_leader_at(now)?;
+        let needs_runway_in = own.to_thr_s - own.needs_clear_s;
+        if l.clear_s + SEQUENCE_GAP_S <= needs_runway_in {
+            return None;
+        }
+        return Some(tower::LandingLeader {
+            number: own_number_at(now).unwrap_or(2),
+            type_spoken: l.icao_type.as_deref().and_then(crate::station::spoken_type),
+            dist_nm: l.dist_nm,
+        });
+    }
+    let r = {
+        let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+        strip(&runways, runway_ident).cloned()
+    }?;
+    let (own_nm, own_s) = time_to_threshold_for(flight, &r, runway_ident, now)?;
+    let f = LandingFrame::new(&r, runway_ident)?;
+    let elev = ACTIVE_PANEL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|p| p.1);
+    let ahead: Vec<(f64, &TcasTarget)> = targets
+        .iter()
+        .filter(|t| !t.on_ground && t.vs_fpm <= CLIMBOUT_FPM)
+        .filter_map(|t| {
+            let (along, cross) = f.place(t.lat, t.lon);
+            let out = -along;
+            if out <= 0.0
+                || cross.abs() > out * FINAL_CONE_DEG.to_radians().tan() + FINAL_CONE_BASE_M
+            {
+                return None;
+            }
+            let path_ft = out * 3.28084 * 3.0_f64.to_radians().tan();
+            if elev.is_some_and(|e| t.ele_ft - e > 2.0 * path_ft + FINAL_HIGH_MARGIN_FT) {
+                return None;
+            }
+            let nm = out / 1852.0;
+            (nm < own_nm - 0.2).then_some((nm, t))
+        })
+        .collect();
+    let needs_runway_in = own_s - own_s * CLEARANCE_LEAD_NM / own_nm.max(CLEARANCE_LEAD_NM);
+    let (nm, t) = ahead
+        .iter()
+        .filter(|(nm, _)| {
+            nm / DEFAULT_FINAL_KTS * 3600.0 + GHOST_RUNWAY_S + SEQUENCE_GAP_S > needs_runway_in
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0))?;
+    Some(tower::LandingLeader {
+        number: u8::try_from(ahead.len() + 1).unwrap_or(u8::MAX),
+        type_spoken: crate::station::traffic_type(&t.callsign)
+            .as_deref()
+            .and_then(crate::station::spoken_type),
+        dist_nm: *nm,
+    })
+}

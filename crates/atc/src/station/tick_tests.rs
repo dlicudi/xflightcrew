@@ -137,6 +137,7 @@ fn a_traffic_landing_hold_moves_only_its_strip() {
         runway: "two six left".into(),
         runway_ident: "26L".into(),
         line: "Easy four five six, runway two six left, cleared to land.".into(),
+        behind_lander: false,
     });
     // Ours cleared to land on 26L: the book holds the traffic's release.
     *OWN_STRIP.clearance.lock().unwrap() = Some(cleared_to_land("26L"));

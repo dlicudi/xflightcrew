@@ -1289,6 +1289,9 @@ pub struct LandingHold {
     pub(super) runway_ident: String,
     /// The clearance as it will be spoken (the wind of the final report).
     pub(super) line: String,
+    /// Held behind traffic LANDING ahead of us (#237): released only once
+    /// the runway is clear, never on a rollout judged to be leaving in time.
+    pub(super) behind_lander: bool,
 }
 
 /// One pass of the withheld-landing watch: once our strip is clear, or its
@@ -1326,6 +1329,11 @@ pub(super) fn landing_hold_tick_for(
     if strip_held_by_others(&runways, &hold.runway_ident, flight) {
         return None;
     }
+    // Traffic still landing ahead of us that will not be off in time: the
+    // clearance waits for it to land and be off (#237).
+    if landing_leader_blocking(flight, &hold.runway_ident, targets, now).is_some() {
+        return None;
+    }
     let exits = if flight.is_own() {
         strip_exits(targets, ours.as_ref(), &hold.runway_ident, now)
     } else {
@@ -1335,7 +1343,7 @@ pub(super) fn landing_hold_tick_for(
         .as_ref()
         .and_then(|r| time_to_threshold_for(flight, r, &hold.runway_ident, now));
     let plain: Vec<StripExit> = exits.iter().map(|e| e.exit).collect();
-    if !landing_release_due(own.map(|o| o.1), &plain) {
+    if !landing_release_due(own.map(|o| o.1), &plain) || (hold.behind_lander && !plain.is_empty()) {
         return None;
     }
     // Released only to a flight ON the final: never one climbing away,

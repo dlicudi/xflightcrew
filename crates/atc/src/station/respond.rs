@@ -200,19 +200,28 @@ impl Station {
             if intent == tower::Intent::ReportFinal
                 && self.desk.twr.state == tower::State::Inbound
                 && !ctx.on_ground
-                && ctx.runway_occupied
+                && (ctx.runway_occupied || ctx.landing_leader.is_some())
             {
                 let ident = self.runway_in_use.clone().unwrap_or_default();
+                let why = if ctx.runway_occupied {
+                    "runway_occupied"
+                } else {
+                    "leader_on_final"
+                };
+                let leader = ctx.landing_leader.as_ref();
                 sim::blackbox::record(
                     "atc",
                     serde_json::json!({"event": "landing_withheld", "runway": ident,
-                        "why": "runway_occupied"}),
+                        "why": why, "number": leader.map(|l| l.number),
+                        "leader_nm": leader.map(|l| (l.dist_nm * 10.0).round() / 10.0),
+                        "leader_type": leader.and_then(|l| l.type_spoken.clone())}),
                 );
                 *self.desk.strip.landing_hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(LandingHold {
                     callsign: ctx.callsign.clone(),
                     runway: ctx.runway.clone(),
                     runway_ident: ident,
                     line: self.desk.twr.landing_clearance_line(ctx),
+                    behind_lander: !ctx.runway_occupied,
                 });
             }
         }

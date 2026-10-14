@@ -334,6 +334,7 @@ fn main() -> Result<()> {
                     uk: false,
                     missed_approach: None,
                     final_traffic_type: None,
+                    landing_leader: None,
                     crossing: None,
                     on_ground: false,
                     own_on_runway: false,
