@@ -301,6 +301,23 @@ pub struct Ctx {
     /// A320 on short final, line up runway one three behind"), never by a
     /// callsign the departure is not working.
     pub final_traffic_type: Option<String>,
+    /// A final report's leader: the flight ahead of us on our final that
+    /// will not be off the runway in time for our landing clearance
+    /// (`station::landing_leader_blocking`). `Some` turns "cleared to land"
+    /// into "continue approach, number two, traffic ..." with the clearance
+    /// held until it is off (#237). `None` on every other call.
+    pub landing_leader: Option<LandingLeader>,
+}
+
+/// The flight ahead of us on final, as a final report's answer names it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LandingLeader {
+    /// Our number in the landing sequence.
+    pub number: u8,
+    /// Its type as a controller says it ("Boeing 737"), when known.
+    pub type_spoken: Option<String>,
+    /// Its distance to the threshold, nm.
+    pub dist_nm: f64,
 }
 
 /// What a go-around flies when the arrival is an instrument one: the
@@ -565,7 +582,7 @@ fn title_case(w: &str) -> String {
 /// Spoken position of traffic on final: "short final" inside 1.5 nm, else
 /// "N mile final".
 /// A landing sequence number as the tower says it.
-fn sequence_number(n: u8) -> String {
+pub(crate) fn sequence_number(n: u8) -> String {
     match n {
         1 => "one".into(),
         2 => "two".into(),
@@ -577,7 +594,7 @@ fn sequence_number(n: u8) -> String {
     }
 }
 
-fn spoken_final(nm: f64) -> String {
+pub(crate) fn spoken_final(nm: f64) -> String {
     if nm < 1.5 {
         "short final".to_string()
     } else {
@@ -1629,6 +1646,27 @@ pub fn heard_squawk(transcript: &str) -> Option<i64> {
             if d.len() == 4 {
                 return d.parse().ok();
             }
+        }
+    }
+    None
+}
+
+/// The speed a readback says, knots: three digits before "knots" ("one
+/// six zero knots", "160 knots") or after "speed" ("speed one eight
+/// zero"). `None` when no speed was said.
+pub fn heard_speed_kts(transcript: &str) -> Option<i64> {
+    let toks = number_tokens(&transcript.to_lowercase());
+    for i in 0..toks.len() {
+        let (d, n) = digits_at(&toks, i, 3);
+        if d.len() < 2 || n == 0 {
+            continue;
+        }
+        let knots = toks
+            .get(i + n)
+            .is_some_and(|w| matches!(w.as_str(), "knots" | "knot" | "kts"));
+        let speed = i > 0 && toks[i - 1] == "speed";
+        if knots || speed {
+            return d.parse().ok();
         }
     }
     None
@@ -3040,6 +3078,31 @@ impl Tower {
                     "{}, continue approach runway {}, traffic on the runway. \
                      Expect late landing clearance.",
                     ctx.callsign, ctx.runway
+                )
+            }
+            // Traffic landing ahead that will not be off the runway in time:
+            // number two, and the clearance follows once it is off (the
+            // station arms the release watch, `landing_hold_tick`). LEMG 30
+            // (#237, 2026-10-07): "cleared to land" with traffic landing
+            // 1.4 nm ahead, then "go around, traffic on the runway" twice.
+            Intent::ReportFinal if ctx.landing_leader.is_some() && !ctx.on_ground => {
+                self.state = State::Inbound;
+                self.pending = None;
+                let l = ctx.landing_leader.clone().unwrap_or(LandingLeader {
+                    number: 2,
+                    type_spoken: None,
+                    dist_nm: 1.0,
+                });
+                let what = match &l.type_spoken {
+                    Some(t) => format!("traffic {t} on"),
+                    None => "traffic on".to_string(),
+                };
+                format!(
+                    "{}, continue approach runway {}, number {}, {what} {}.",
+                    ctx.callsign,
+                    ctx.runway,
+                    sequence_number(l.number.max(2)),
+                    spoken_final(l.dist_nm)
                 )
             }
             Intent::ReportFinal => {

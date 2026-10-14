@@ -454,12 +454,19 @@ pub enum Despawn {
     Towed,
 }
 
-/// Our own aircraft, as the fleet needs it: where not to spawn.
+/// Our own aircraft, as the fleet needs it: where not to spawn, whom to
+/// keep the ground spacing from and, arriving, our place at the runway.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OwnTarget {
     pub pos: LatLon,
     pub alt_ft: f64,
     pub on_ground: bool,
+    /// Groundspeed, knots.
+    pub gs_kts: f64,
+    /// Our slot at the runway while we arrive ([`crate::slot::own_slot`]):
+    /// the traffic sequences round it and yields to it. `None` when we are
+    /// not arriving at this field.
+    pub slot: Option<crate::slot::RunwaySlot>,
 }
 
 /// The radio half of one traffic aircraft: what it has said, so a call is

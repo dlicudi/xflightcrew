@@ -42,8 +42,9 @@ pub use crate::station::{
 /// (`traffic_order`), its runway watch is `traffic_tick`, and a despawn
 /// closes its strip (`retire_traffic`).
 pub use crate::station::{
-    note_own_state, note_traffic_state, post_traffic_call, retire_traffic, take_traffic_calls,
-    traffic_order, traffic_tick, TrafficCall, TrafficOrder, TrafficReply, TrafficTarget,
+    note_own_state, note_own_times, note_traffic_state, note_traffic_times, post_traffic_call,
+    retire_traffic, take_traffic_calls, traffic_order, traffic_tick, TrafficCall, TrafficOrder,
+    TrafficReply, TrafficTarget,
 };
 
 /// Audits for tests and the traffic harness, never decisions: the book's

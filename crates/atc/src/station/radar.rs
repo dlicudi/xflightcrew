@@ -324,6 +324,7 @@ pub(super) fn approach_watch_tick_for(
     let w = guard.as_ref()?;
     if state.on_ground {
         *guard = None;
+        retire_approach_speed(flight);
         return None;
     }
     let (lat, lon) = state.position()?;
@@ -333,8 +334,14 @@ pub(super) fn approach_watch_tick_for(
     let aligned = track_deg.is_none_or(|t| sim::angles::abs_diff_deg(t, w.course_deg) <= 30.0);
     if !established_on_course(dist_thr, off_course, aligned, state.alt_ft, w.target_alt_ft, w.join_nm)
     {
-        return None;
+        // Not yet established: the sequence and the speed (2026-10-14).
+        let dialect = crate::station::active_icao()
+            .map_or(Dialect::Icao, |(icao, ..)| crate::station::dialect_for(&icao));
+        let extra =
+            approach_sequence_lines(flight, state, track_deg, None, dialect, Instant::now());
+        return with_sequence(&w.callsign, None, extra);
     }
+    retire_approach_speed(flight);
     let (name, spoken, khz) = w.tower.clone();
     let line = format!("{}, contact {name} {spoken}.", w.callsign);
     *flight.arrival_handoff.lock().unwrap_or_else(|e| e.into_inner()) = Some(ArrivalHandoff {
@@ -373,6 +380,7 @@ pub(super) fn vector_tick_for(
     let plan = guard.as_mut()?;
     if state.on_ground {
         *guard = None; // landed (or armed on the ramp by mistake): vectors over
+        retire_approach_speed(flight);
         return None;
     }
 
@@ -433,16 +441,23 @@ pub(super) fn vector_tick_for(
             *flight.landing_handoff.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(plan.runway_spoken.clone());
         }
+        // Handed to the tower: approach's speed is over.
+        retire_approach_speed(flight);
         *guard = None; // approach's job is done
         return Some(msg);
     }
+
+    // The sequence and the speed (2026-10-14): said with the heading when
+    // one is due, alone when it is not.
+    let dialect = plan.dialect;
+    let extra = approach_sequence_lines(flight, state, track_deg, Some(&mut *plan), dialect, now);
 
     // Inside a mile and not (yet) landing: no heading. Any vector from here
     // aims at a join point BEHIND the aircraft — a reversal at circuit
     // height. Stay quiet and let the geometry develop; if they blow through
     // final, steering resumes beyond the mile.
     if dist_thr < 1.0 {
-        return None;
+        return with_sequence(&plan.callsign, None, extra);
     }
 
     // Steering, two regimes. Near the extended centerline on the approach
@@ -465,7 +480,7 @@ pub(super) fn vector_tick_for(
     // flying its direction — a pilot sailing through the localizer on the
     // cut heading still gets the correction.
     if plan.ils && plan.cleared && capturing && xtk_nm.abs() <= 1.5 && aligned {
-        return None;
+        return with_sequence(&plan.callsign, None, extra);
     }
     let desired = if capturing {
         if xtk_nm.abs() <= 0.4 {
@@ -514,7 +529,7 @@ pub(super) fn vector_tick_for(
         || (elapsed >= 25.0 && moved >= 20.0)
         || (elapsed >= 8.0 && moved >= 30.0);
     if !due {
-        return None;
+        return with_sequence(&plan.callsign, None, extra);
     }
     plan.last_tx = Some(now);
     plan.last_heading = Some(heading10);
@@ -560,5 +575,5 @@ pub(super) fn vector_tick_for(
             ),
         });
     }
-    Some(msg)
+    with_sequence(&plan.callsign, Some(msg), extra)
 }

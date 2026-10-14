@@ -268,6 +268,7 @@ pub(crate) const SESSION: &[(&str, &str)] = &[
         "crew provider, registered once at boot",
     ),
     ("FILED_ROUTE", "crew provider, registered once at boot"),
+    ("APPROACH_SPEEDS", "crew provider, registered once at boot"),
     (
         "GO_AROUND_ORDERS",
         "a counter; watchers snapshot it, never reset",
@@ -681,6 +682,9 @@ mod tests {
             "WORKING",
             "POSITION_HANDOFF",
             "PUSH_APPROVED",
+            // New with arrival sequencing (2026-10-14): the speed approach
+            // assigned us, a strip `facts` cell.
+            "ASSIGNED_SPEED",
         ];
         let station_flight = [
             "SQUAWK_WATCH",
@@ -693,6 +697,11 @@ mod tests {
             // circuit, for the go-around order's words, a strip `worksheet`
             // cell.
             "CIRCUITS",
+            // New with arrival sequencing (2026-10-14): the landing order
+            // as it was spoken to us, a strip `worksheet` cell.
+            "ARRIVAL_ORDER",
+            // ...and what approach last said of it, a strip `worksheet` cell.
+            "APPROACH_SAID",
         ];
         // INSTRUMENT_DECLARED (2026-10-10): the crew flies a published
         // approach, declared before the destination's station installs.
@@ -730,6 +739,9 @@ mod tests {
         install.extend(names(&["TRAFFIC_PICTURE"]));
         // ...and where its parked aircraft stand (#243), published with it.
         install.extend(names(&["STANDS_TAKEN"]));
+        // ...and each flight's place at its landing runway, from its
+        // producer (arrival sequencing, 2026-10-14), a strip `watch` cell.
+        install.extend(names(&["RUNWAY_TIMES"]));
         assert_eq!(door_cells(INSTALL_RESETS), install, "install");
 
         let mut uninstall = install.clone();
@@ -746,7 +758,12 @@ mod tests {
         // `install`, never the field's watches nor the traffic's strips.
         let mut here = names(&party_line_facts);
         here.extend(names(&station_flight));
-        here.extend(names(&["GO_AROUND_LAST", "COMPLIANCE_FLIGHT", "SEEN"]));
+        here.extend(names(&[
+            "GO_AROUND_LAST",
+            "COMPLIANCE_FLIGHT",
+            "SEEN",
+            "RUNWAY_TIMES",
+        ]));
         assert_eq!(door_cells(NEW_FLIGHT_HERE_RESETS), here, "new_flight_here");
     }
 

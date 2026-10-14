@@ -872,7 +872,13 @@ fn an_order_maps_onto_the_fleet() {
         follow: Some(crate::party_line::FlightId::Own),
         ..o
     };
-    assert_eq!(map_order(&ours).follow, None, "ours is no traffic id");
+    // Behind US: our own slot in the fleet's picture is the leader
+    // (2026-10-14, arrival sequencing; it was no leader at all).
+    assert_eq!(
+        map_order(&ours).follow,
+        Some(traffic::fleet::OWN_ID),
+        "ours is our slot's id in the picture"
+    );
 }
 
 /// THE FREQUENCY'S TURNS (#260): a call keys only once the exchange ahead
@@ -2350,4 +2356,79 @@ fn a_field_without_routes_has_no_traffic() {
     for icao in ["EGKK", "LEMG", "LXGB"] {
         assert!(traffic::routes::field_routes(icao).is_some(), "{icao} has its routes");
     }
+}
+
+/// Our arrival for the traffic's slot picture (2026-10-14): the runway the
+/// station armed for us, else the final whose wedge we fly; nothing
+/// crossing the final at 90 degrees or far above the path; on the ground,
+/// only the strip we landed on while we are still on it.
+#[test]
+fn our_arrival_is_the_armed_runway_or_the_final_we_fly() {
+    let apt = format!("{}/xtst.dat", fixtures());
+    let field = FieldModel::load(&apt, "XTST").unwrap().unwrap();
+    let end = field.end("27").unwrap();
+    let at = |along: f64, agl: f64, on_ground: bool| {
+        let (lat, lon) = end.at(along, 0.0);
+        OwnState {
+            callsign: OWN_KEY.into(),
+            lat,
+            lon,
+            alt_ft: end.elev_ft + agl,
+            on_ground,
+            vs_fpm: 0.0,
+            gs_kts: 120.0,
+            slot: None,
+        }
+    };
+    let five_out = at(-5.0 * 1852.0, 1600.0, false);
+    // On the final, nothing armed: the wedge's runway.
+    let a = own_arrival(&field, None, &five_out, Some(end.course_deg), None, "C172").unwrap();
+    assert_eq!(
+        (a.runway.as_str(), a.join_m, a.cleared),
+        ("27", None, false)
+    );
+    // Crossing it, or far above it: no arrival.
+    let across = (end.course_deg + 90.0) % 360.0;
+    assert!(own_arrival(&field, None, &five_out, Some(across), None, "C172").is_none());
+    let high = at(-5.0 * 1852.0, 6000.0, false);
+    assert!(own_arrival(&field, None, &high, None, None, "C172").is_none());
+    // Vectored: the station's runway and join, wherever we are.
+    let plan = crate::party_line::OwnArrivalPlan {
+        runway_ident: "27".into(),
+        join_nm: Some(8.0),
+        cleared: false,
+    };
+    let a = own_arrival(&field, Some(&plan), &high, Some(across), None, "B738").unwrap();
+    assert_eq!(a.join_m, Some(8.0 * 1852.0));
+    assert!(traffic::slot::own_slot(&field, &a).is_some());
+    // Rolling out on the strip we landed on, then off it.
+    let rolling = at(400.0, 0.0, true);
+    let a = own_arrival(&field, None, &rolling, None, Some("27"), "C172").unwrap();
+    assert!(a.on_ground && a.cleared);
+    assert!(own_arrival(&field, None, &rolling, None, None, "C172").is_none());
+    let (lat, lon) = end.at(400.0, -200.0);
+    let off = OwnState {
+        lat,
+        lon,
+        ..rolling
+    };
+    assert!(own_arrival(&field, None, &off, None, Some("27"), "C172").is_none());
+}
+
+/// Approach sequences by the traffic's own numbers (2026-10-14): the speed
+/// bands it assigns us are the bands the traffic flies, the runway gap the
+/// traffic's, the radar spacing the traffic's wake minimum plus its
+/// buffer. The two crates never name each other, so the pin is here.
+#[test]
+fn approach_sequences_by_the_traffics_own_numbers() {
+    assert_eq!(
+        crate::party_line::APPROACH_SPEED_BANDS,
+        traffic::arrival::SPEED_BANDS
+    );
+    assert_eq!(crate::party_line::SEQUENCE_GAP_S, traffic::slot::FOLLOW_GAP_S);
+    assert_eq!(
+        crate::party_line::RADAR_SPACING_NM,
+        traffic::arrival::wake_gap_nm(traffic::Wake::Medium, traffic::Wake::Medium)
+            + traffic::arrival::WAKE_BUFFER_NM
+    );
 }

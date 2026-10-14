@@ -29,6 +29,25 @@ pub fn note_own_state(state: AircraftState) {
     *OWN_STRIP.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
 }
 
+/// Traffic flight `id`'s place at its landing runway, from its producer
+/// (`None`: not landing, or over the threshold): its strip's
+/// [`FlightStrip::runway_times`] cell. A strip not open is not opened for
+/// it (its state opens it first).
+pub fn note_traffic_times(id: u32, times: Option<RunwayTimes>) {
+    if let Some(strip) = traffic_strip(id) {
+        *strip.runway_times.lock().unwrap_or_else(|e| e.into_inner()) = times;
+    }
+}
+
+/// OUR place at the landing runway, from the traffic link's tick (`None`:
+/// not arriving): our strip's [`FlightStrip::runway_times`] cell.
+pub fn note_own_times(times: Option<RunwayTimes>) {
+    *OWN_STRIP
+        .runway_times
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = times;
+}
+
 /// One aircraft in a traffic flight's picture: who it is and where, as the
 /// tower's radar shows it. Ours is `FlightId::Own`.
 #[derive(Clone)]

@@ -3019,6 +3019,7 @@ fn a_ghost_standing_on_the_runway_for_five_minutes_is_stale() {
         runway: "three zero".into(),
         runway_ident: "30".into(),
         line: format!("{SR22}, runway three zero, cleared to land."),
+        behind_lander: false,
     });
     own_on_lemg30_final(0.95, at(301.0));
     assert!(
@@ -3063,6 +3064,7 @@ fn a_withheld_landing_is_ordered_around_or_retired() {
         runway: "one three".into(),
         runway_ident: "13".into(),
         line: "cleared to land.".into(),
+        behind_lander: false,
     };
     *OWN_STRIP.landing_hold.lock().unwrap() = Some(hold());
     let base = Instant::now();
@@ -8296,6 +8298,7 @@ fn takeoff_clearance_arms_the_departure_handoff() {
         uk: false,
         missed_approach: None,
         final_traffic_type: None,
+        landing_leader: None,
         crossing: None,
         on_ground: false,
     };
@@ -9411,6 +9414,7 @@ fn lxgb_vectored_arrival_flies_to_a_landing_clearance() {
             uk: false,
             missed_approach: None,
             final_traffic_type: None,
+            landing_leader: None,
             crossing: None,
             on_ground: false,
         },
@@ -9684,6 +9688,7 @@ fn lxgb_vectored_arrival_flies_to_a_landing_clearance() {
         uk: false,
         missed_approach: None,
         final_traffic_type: None,
+        landing_leader: None,
         crossing: None,
         on_ground: false,
     };
@@ -11013,6 +11018,7 @@ fn a_landing_release_waits_for_the_final() {
         runway: "three zero".into(),
         runway_ident: "30".into(),
         line: format!("{SR22}, runway three zero, cleared to land."),
+        behind_lander: false,
     });
     let (lat, lon) = lemg30_point(500.0, 40.0);
     note_own_fix(lat, lon, false, at(9.0));
@@ -11083,4 +11089,111 @@ fn live_lemg_taxi_clearance_never_backtracks_a_runway() {
     assert_eq!(new.path, old.path, "the reversal: {:?}", new.via);
     assert_eq!(new.via, vec!["D", "Q", "A", "HN1"]);
     assert!(new.crossings.is_empty(), "no runway: {:?}", new.crossings);
+}
+
+/// ISSUE #237 (LEMG 30, 2026-10-07): the crew's final report at 997 ft was
+/// answered "cleared to land" with live traffic landing 1.4 nm ahead of us
+/// on 30, then "go around, traffic on the runway" at 436 and 349 ft. Now a
+/// final report with traffic landing ahead that will not be off in time is
+/// "continue approach, number two, traffic ...", the clearance is held
+/// while it is still in the air ahead of us and comes through the landing
+/// hold once it is off, and no go-around is ordered. Our 100 kt final from
+/// 2.97 nm (997 ft over the field's 52), the Dash 8 ahead at 140 kt,
+/// landing, rolling out and turning off 17 s after its threshold.
+#[test]
+fn issue_237_a_final_report_behind_landing_traffic_is_number_two_not_cleared() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_runway_watch();
+    *ACTIVE_RUNWAYS.lock().unwrap() = lemg_runways();
+    let mut st = lxgb();
+    st.apt.name = "Malaga".into();
+    st.apt.elev_ft = 52.0;
+    st.apt.runways = lemg_runways();
+    st.runway_in_use = Some("30".into());
+    st.desk.circuits = true;
+    st.desk.twr.state = tower::State::Inbound;
+    let wx = Wx {
+        wind_from_deg: 300.0,
+        wind_kts: 4.0,
+    };
+    note_traffic_type("LG662", "DH8D");
+    let base = Instant::now();
+    let at = |s: f64| base + std::time::Duration::from_secs_f64(s + 10.0);
+    // Us at 100 kt (51.4 m/s) from 2.97 nm; the Dash 8 1.4 nm ahead at
+    // 140 kt (72 m/s) on the path, on the runway from its threshold.
+    let own_m = |t: f64| 2.97 * 1852.0 - 51.4 * t;
+    let thr_s = (2.97 - 1.4) * 1852.0 / 72.0;
+    let dash8 = |t: f64| {
+        if t < thr_s {
+            let out = (2.97 - 1.4) * 1852.0 - 72.0 * t;
+            let (lat, lon) = lemg30_point(-out, 0.0);
+            TcasTarget {
+                ele_ft: 52.0 + 50.0 + out * 3.28084 * 3f64.to_radians().tan(),
+                on_ground: false,
+                vs_fpm: -750.0,
+                ..ghost_at("LG662", (lat, lon))
+            }
+        } else {
+            let dt = t - thr_s;
+            let along = 72.0 * dt - 1.25 * dt * dt;
+            let cross = if dt < 17.0 { 0.0 } else { 40.0 * (dt - 16.0) };
+            ghost_at("LG662", lemg30_point(along.min(900.0), cross))
+        }
+    };
+    let own_fix = |t: f64| {
+        let (lat, lon) = lemg30_point(-own_m(t), 0.0);
+        note_own_fix(lat, lon, false, at(t));
+    };
+    own_fix(-1.0);
+    own_fix(0.0);
+    // The final report: the leader is found, and it will not be off in time.
+    let leader = landing_leader_blocking(&OWN_STRIP, "30", &[dash8(0.0)], at(0.0))
+        .expect("the Dash 8 ahead holds our clearance");
+    assert_eq!(leader.number, 2);
+    assert_eq!(leader.type_spoken.as_deref(), Some("Dash 8"));
+    assert!((leader.dist_nm - 1.57).abs() < 0.05, "{leader:?}");
+    let mut ctx = st.make_ctx(wx, "QNH one zero one five".into(), SR22.into(), false, false, None, false, None);
+    // The old answer, without the leader: the clearance it then cancelled.
+    let mut blind = tower::Tower::new();
+    blind.state = tower::State::Inbound;
+    assert!(blind.handle(tower::Intent::ReportFinal, &ctx).contains("cleared to land"));
+    ctx.landing_leader = Some(leader);
+    let r = st.route_keyed(
+        "november five five zero charlie romeo, final runway three zero",
+        Service::Tower,
+        &ctx,
+        wx,
+    );
+    assert_eq!(
+        r,
+        format!("{SR22}, continue approach runway three zero, number two, traffic Dash 8 on 2 mile final.")
+    );
+    assert!(crate::party_line::landing_hold_armed());
+    assert_eq!(crate::party_line::clearance_state(), Some(tower::State::Inbound));
+    // Fly it: one look a second until we are over the threshold.
+    let mut released = None;
+    let mut t = 1.0;
+    while own_m(t) > 0.0 {
+        own_fix(t);
+        let g = dash8(t);
+        let agl = own_m(t) * 3.28084 * 3f64.to_radians().tan() + 50.0;
+        assert!(
+            go_around_tick(std::slice::from_ref(&g), agl, false, true, at(t)).is_none(),
+            "no go-around ordered at {t} s"
+        );
+        if let Some(line) = landing_hold_tick(std::slice::from_ref(&g), false, at(t)) {
+            released.get_or_insert((t, line));
+        }
+        t += 1.0;
+    }
+    let (t, line) = released.expect("cleared once the Dash 8 is off");
+    println!("cleared at {t} s, {:.0} s out; the Dash 8 over its threshold at {thr_s:.0} s", own_m(t) / 51.4);
+    assert!(
+        t >= thr_s + 17.0,
+        "cleared at {t} s with the Dash 8 still in the air or on the runway ahead"
+    );
+    assert!(line.contains("cleared to land"), "{line}");
+    assert!(!*OWN_STRIP.pending_go_around.lock().unwrap());
+    reset_runway_watch();
+    *TRAFFIC_TYPES.lock().unwrap() = None;
 }

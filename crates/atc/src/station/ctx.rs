@@ -313,6 +313,11 @@ impl Station {
             ctx.crossing = self.judge_crossing(targets, pos, now);
         }
         ctx.helicopter = state.helicopter;
+        // A final report with traffic landing ahead that will not be off in
+        // time: number two, never a clearance the tower must cancel (#237).
+        if intent == tower::Intent::ReportFinal && !on_ground {
+            ctx.landing_leader = landing_leader_blocking(&self.desk.strip, &ident, targets, now);
+        }
         (ctx, wx)
     }
 
@@ -381,6 +386,7 @@ impl Station {
             uk: self.speaks_cap413(),
             missed_approach,
             final_traffic_type: final_traffic.as_ref().and_then(|f| f.type_spoken.clone()),
+            landing_leader: None,
             callsign,
             airport: self.apt.radio_name(),
             runway: atis::spoken_runway(&runway),

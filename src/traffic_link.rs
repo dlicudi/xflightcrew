@@ -59,6 +59,12 @@ pub(crate) struct OwnState {
     pub(crate) alt_ft: f64,
     pub(crate) on_ground: bool,
     pub(crate) vs_fpm: f64,
+    /// Groundspeed, knots.
+    pub(crate) gs_kts: f64,
+    /// Our slot at the active field's runway while we arrive
+    /// ([`own_arrival`]): in every fleet's picture, where only the field
+    /// whose strip it is sequences round it.
+    pub(crate) slot: Option<traffic::slot::RunwaySlot>,
 }
 
 impl OwnState {
@@ -81,6 +87,8 @@ impl OwnState {
             pos: (self.lat, self.lon),
             alt_ft: self.alt_ft,
             on_ground: self.on_ground,
+            gs_kts: self.gs_kts,
+            slot: self.slot,
         }
     }
 }
@@ -1180,6 +1188,23 @@ impl Link {
         // is released and calls.
         for ac in self.fleet.aircraft().iter().filter(|a| !a.dormant()) {
             crate::world::note_traffic_state(ac.id, aircraft_state(ac, now));
+            // Its place at the runway, for the station's landing sequence.
+            let dist_m = ac
+                .route
+                .thr_idx
+                .map(|i| ac.route.dist_to(ac.kin.pos(), i));
+            let times = ac.slot().filter(|_| !ac.kin.on_ground).and_then(|slot| {
+                runway_times(
+                    &self.fleet.field,
+                    &slot,
+                    ac.kin.pos(),
+                    dist_m,
+                    &ac.callsign,
+                    Some(&ac.icao_type),
+                    now,
+                )
+            });
+            crate::world::note_traffic_times(ac.id, times);
         }
         self.noted = self
             .fleet
@@ -1822,9 +1847,11 @@ pub(crate) fn map_order(o: &TrafficOrder) -> Order {
         runway: some(&o.runway),
         taxi_path: (!o.taxi_path.is_empty()).then(|| o.taxi_path.clone()),
         holding_point: some(&o.holding_point),
+        // Behind US, the leader is our own slot in the fleet's picture.
         follow: match o.follow {
             Some(FlightId::Traffic(n)) => Some(n),
-            _ => None,
+            Some(FlightId::Own) => Some(traffic::fleet::OWN_ID),
+            None => None,
         },
         hold: o.hold,
         line_up_behind: o.line_up_condition == Some(false),
@@ -1834,6 +1861,115 @@ pub(crate) fn map_order(o: &TrafficOrder) -> Order {
         push_approved: o.push.is_some(),
         push_facing: o.push.flatten(),
     }
+}
+
+/// Our own arrival at `field`, as the traffic's slot rule needs it
+/// (2026-10-14, arrival sequencing): airborne, the runway the station armed
+/// for us (`plan`: cleared to land, vectors with their join, approach's
+/// watch, a withheld clearance, Inbound), else the final whose wedge we fly
+/// (`traffic::slot::final_wedge_end`); on the ground, the strip we landed
+/// on (`landed`, or the landing clearance's) while we are still on it.
+/// `None` when we are not arriving here.
+pub(crate) fn own_arrival(
+    field: &FieldModel,
+    plan: Option<&crate::party_line::OwnArrivalPlan>,
+    own: &OwnState,
+    track_deg: Option<f64>,
+    landed: Option<&str>,
+    icao_type: &str,
+) -> Option<traffic::slot::OwnArrival> {
+    let pos = (own.lat, own.lon);
+    let planned = plan.filter(|p| field.end(&p.runway_ident).is_some());
+    let (runway, join_m, cleared) = if own.on_ground {
+        let ident = landed.map(str::to_string).or_else(|| {
+            planned
+                .filter(|p| p.cleared)
+                .map(|p| p.runway_ident.clone())
+        })?;
+        let end = field.end(&ident)?;
+        // On ITS strip: a runway crossed on the way in is not a rollout.
+        let on = field.strip_at(pos).is_some_and(|(_, id)| {
+            id.eq_ignore_ascii_case(&end.ident) || id.eq_ignore_ascii_case(&end.reciprocal)
+        });
+        if !on {
+            return None;
+        }
+        (ident, None, true)
+    } else if let Some(p) = planned {
+        (
+            p.runway_ident.clone(),
+            p.join_nm.map(|nm| nm * 1852.0),
+            p.cleared,
+        )
+    } else {
+        let end = traffic::slot::final_wedge_end(field, pos, own.alt_ft, track_deg)?;
+        (end.ident, None, false)
+    };
+    Some(traffic::slot::OwnArrival {
+        pos,
+        alt_ft: own.alt_ft,
+        gs_kts: own.gs_kts,
+        on_ground: own.on_ground,
+        icao_type: icao_type.to_string(),
+        runway,
+        join_m,
+        cleared,
+    })
+}
+
+/// A slot as the station's runway times: its landing end (the field's end
+/// whose threshold it is), its times and its distance to go. `None` over
+/// the threshold or for a threshold the field has no end at.
+pub(crate) fn runway_times(
+    field: &FieldModel,
+    slot: &traffic::slot::RunwaySlot,
+    pos: traffic::LatLon,
+    dist_m: Option<f64>,
+    callsign: &str,
+    icao_type: Option<&str>,
+    at: Instant,
+) -> Option<crate::party_line::RunwayTimes> {
+    if slot.to_thr_s <= 0.0 {
+        return None;
+    }
+    let end = field
+        .ends()
+        .into_iter()
+        .find(|e| traffic::kin::dist_m(e.thr, slot.thr) < 1.0)?;
+    let dist_m = dist_m.unwrap_or_else(|| traffic::kin::dist_m(pos, end.thr));
+    Some(crate::party_line::RunwayTimes {
+        runway: end.ident,
+        to_thr_s: slot.to_thr_s,
+        clear_s: slot.clear_s,
+        needs_clear_s: slot.needs_clear_s,
+        dist_nm: dist_m / 1852.0,
+        callsign: callsign.to_string(),
+        icao_type: icao_type.map(str::to_string),
+        at,
+    })
+}
+
+/// Our type for the traffic's runway time: the live profile's ICAO type
+/// where the traffic's tables know it, else by the profile's class (an
+/// approach at 100 kt or more flies as a medium jet, slower as a piston
+/// single, the tables' own default).
+pub(crate) fn own_icao_type() -> String {
+    let profile = crate::aircraft::live_profile();
+    let icao = profile
+        .as_ref()
+        .and_then(|p| p.matcher.as_ref())
+        .and_then(|m| m.icao.first().cloned())
+        .unwrap_or_default();
+    let known = traffic::class_for_type(&icao).0.name != traffic::PISTON_SINGLE.name
+        || matches!(icao.as_str(), "C172" | "C152" | "PA28" | "SR22");
+    if known {
+        return icao;
+    }
+    let fast = profile
+        .as_deref()
+        .and_then(crate::aircraft::approach_kts)
+        .is_some_and(|k| k >= 100.0);
+    if fast { "B738" } else { "C172" }.to_string()
 }
 
 /// A traffic aircraft as the station's state for it.
@@ -1961,6 +2097,9 @@ pub(crate) struct TrafficWorld {
     /// When the sim's clock was last compared with the timetables'
     /// ([`TrafficWorld::follow_sim_clock`]).
     clock_checked: Option<Instant>,
+    /// The runway end our arrival was last seen on, so the rollout keeps
+    /// its slot once the plan that armed it is gone ([`own_arrival`]).
+    own_arrival_end: Option<String>,
 }
 
 /// The draw cull's counts in the blackbox (`traffic` `draw`): simulated
@@ -2143,14 +2282,51 @@ impl TrafficWorld {
         if sim_s.is_some() {
             self.last_sim_s = sim_s;
         }
-        let own = OwnState {
+        let mut own = OwnState {
             callsign: OWN_KEY.to_string(),
             lat: snap.lat,
             lon: snap.lon,
             alt_ft,
             on_ground: snap.on_ground,
             vs_fpm: snap.vs_fpm.unwrap_or(0.0),
+            gs_kts: snap.groundspeed_kts,
+            slot: None,
         };
+        // Our place at the active field's runway while we arrive: the
+        // traffic sequences round it and yields to it (2026-10-14).
+        if let Some(link) = self.links.get(&active) {
+            let arrival = own_arrival(
+                &link.fleet().field,
+                crate::party_line::own_arrival_plan().as_ref(),
+                &own,
+                snap.track_deg,
+                self.own_arrival_end.as_deref(),
+                &own_icao_type(),
+            );
+            self.own_arrival_end = match &arrival {
+                Some(a) => Some(a.runway.clone()),
+                // Off the strip on the ground: the arrival is over.
+                None if own.on_ground => None,
+                None => self.own_arrival_end.take(),
+            };
+            own.slot = arrival
+                .as_ref()
+                .and_then(|a| traffic::slot::own_slot(&link.fleet().field, a));
+            // ...and the same place for the station's landing sequence.
+            let times = own.slot.filter(|_| !own.on_ground).and_then(|slot| {
+                let field = &link.fleet().field;
+                let pos = (own.lat, own.lon);
+                let end = arrival.as_ref().and_then(|a| field.end(&a.runway))?;
+                let dist_m = match arrival.as_ref().and_then(|a| a.join_m) {
+                    Some(j) if -end.frame(pos).0 > j => {
+                        traffic::kin::dist_m(pos, end.at(-j, 0.0)) + j
+                    }
+                    _ => traffic::kin::dist_m(pos, end.thr),
+                };
+                runway_times(field, &slot, pos, Some(dist_m), OWN_KEY, Some(&own_icao_type()), now)
+            });
+            crate::world::note_own_times(times);
+        }
         // Our position for the tower's book, which asks for a traffic
         // flight's holds without it: how far out our landing clearance is.
         crate::world::note_own_state(crate::party_line::AircraftState {

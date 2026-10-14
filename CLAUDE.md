@@ -239,6 +239,11 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   its clearance and position, plus the ghost memory; `own_strip_claim`, `player_blocked_strip`,
   `runway_occupancy_authorised` and the holds' releases are its queries (pinned to the old
   functions by `the_runway_book_answers_as_the_functions_it_replaced`).
+- **The landing sequence is COMPUTED too** (`station::landing_sequence`, 2026-10-14): every
+  strip's runway times as its producer works them out (`party_line::RunwayTimes`, a strip
+  `watch` cell fed by `world::note_traffic_times` / `note_own_times`), ordered by time to the
+  threshold; `own_number`, `own_leader` its accessors. **An order once SPOKEN to us holds unless
+  the gap reverses by more than 30 s** (`SEQUENCE_REVERSE_S`, `arrival_order`).
 - Tests touching a process-wide static hold `SIDE_STATE_LOCK` (a test opening a traffic strip
   clears `STRIPS` through a drop guard, `strip_tests::ClearStrips`); setting the mode,
   `mode::TEST_LOCK`.
@@ -286,6 +291,22 @@ Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
   (`departures_on_the_ground`, `strip_exit_as`). **An occupant is the
   PAVEMENT's** (`on_runway_pavement`); traffic that will not leave re-sequences
   (`resequence_runway`).
+- **Our arrival is in the traffic's slot picture and the traffic yields to it**
+  (`traffic::slot::own_slot`, `traffic_link::own_arrival`): the traffic's own slot rule for our
+  type down the path we fly, committed in the picture (we are the player); a straight-in behind
+  orbits or slows, a circuit extends (`slot_free`, `off_before`, `leader_ready`, no second fit
+  test). The tower naming US as a leader is `traffic::fleet::OWN_ID`.
+- **Approach says our number and the traffic we follow ONCE per change, and controls our speed on
+  the traffic's own bands** (`station::approach_sequence_lines`, `APPROACH_SPEED_BANDS` pinned to
+  `traffic::arrival::SPEED_BANDS`): a band only where our type can fly it (the crew's
+  `provide_approach_speeds`; unknown, none), the minimum approach speed behind a leader we are
+  short of, then the join moved out ("extend downwind"); the 160 simply ends at 4 nm. **A speed
+  is a readback item** (`judge_speed_readback`, `party_line::assigned_speed`), void at the tower
+  handoff and a go-around. Blackbox `sequence`, `speed_assigned`, `downwind_extended`.
+- **A final report behind traffic landing ahead is number two, never a clearance the tower must
+  cancel** (#237, `station::landing_leader_blocking`, `tower::LandingLeader`): "continue
+  approach, number two, traffic ...", the clearance held (`LandingHold::behind_lander`) until
+  the runway is CLEAR.
 - **Taxi routes**: Dijkstra over apt.dat 1201/1202; crossings from strip GEOMETRY, never network
   flags; a runway destination snaps to a node ON THE DESTINATION STRIP's pavement. A refusing gate
   names strip and distance (`NoFit::NoneNear`).

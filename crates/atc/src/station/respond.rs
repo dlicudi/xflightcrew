@@ -200,19 +200,28 @@ impl Station {
             if intent == tower::Intent::ReportFinal
                 && self.desk.twr.state == tower::State::Inbound
                 && !ctx.on_ground
-                && ctx.runway_occupied
+                && (ctx.runway_occupied || ctx.landing_leader.is_some())
             {
                 let ident = self.runway_in_use.clone().unwrap_or_default();
+                let why = if ctx.runway_occupied {
+                    "runway_occupied"
+                } else {
+                    "leader_on_final"
+                };
+                let leader = ctx.landing_leader.as_ref();
                 sim::blackbox::record(
                     "atc",
                     serde_json::json!({"event": "landing_withheld", "runway": ident,
-                        "why": "runway_occupied"}),
+                        "why": why, "number": leader.map(|l| l.number),
+                        "leader_nm": leader.map(|l| (l.dist_nm * 10.0).round() / 10.0),
+                        "leader_type": leader.and_then(|l| l.type_spoken.clone())}),
                 );
                 *self.desk.strip.landing_hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(LandingHold {
                     callsign: ctx.callsign.clone(),
                     runway: ctx.runway.clone(),
                     runway_ident: ident,
                     line: self.desk.twr.landing_clearance_line(ctx),
+                    behind_lander: !ctx.runway_occupied,
                 });
             }
         }
@@ -438,6 +447,8 @@ impl Station {
 
     pub fn apply_monitor_go_around(&mut self) {
         self.desk.twr.apply_go_around();
+        // The speed and the order spoken are void off a go-around.
+        retire_sequence(&self.desk.strip);
         // The re-sequence the order announced ("expect runway one two"):
         // the runway in use moves with it, and the published clearance
         // names it, so the crew's approach follows once its missed approach
@@ -489,6 +500,7 @@ impl Station {
                 let reply = self.desk.twr.handle(intent.clone(), ctx);
                 if going_around {
                     self.missed_approach_handoff(ctx);
+                    retire_sequence(&self.desk.strip);
                 }
                 // The crew's "going around" after a re-sequenced order is
                 // answered with the runway it is re-sequenced to, once.
@@ -517,7 +529,19 @@ impl Station {
                 }
                 reply
             }
-            Service::Approach => self.respond_approach(intent, ctx, wx),
+            Service::Approach => {
+                // A speed readback owed (2026-10-14): the right speed is
+                // the readback, a wrong one corrected.
+                if !self.desk.strip.is_traffic() {
+                    if let Some(line) = judge_speed_readback(transcript, &ctx.callsign) {
+                        return line;
+                    }
+                }
+                if intent == tower::Intent::GoAround {
+                    retire_sequence(&self.desk.strip);
+                }
+                self.respond_approach(intent, ctx, wx)
+            }
             Service::Departure => self.respond_departure(intent, ctx, wx),
         }
     }
@@ -1271,6 +1295,8 @@ impl Station {
     /// retired, and (cleared on our own navigation) the landing-clearance
     /// coach armed as the watch's own handoff arms it.
     fn publish_tower_handoff(&mut self, ctx: &tower::Ctx, why: &str) {
+        // Handed to the tower: approach's speed is over.
+        retire_approach_speed(&self.desk.strip);
         let watch = self
             .desk
             .strip
@@ -1516,8 +1542,18 @@ impl Station {
                 runway_spoken,
             ),
         };
+        // Already behind traffic on our runway: the sequence with it.
+        let sequence = (!self.desk.strip.is_traffic())
+            .then(|| sequence_clause_now(self.dialect, Instant::now()))
+            .flatten()
+            .map(|w| {
+                let mut c = w.chars();
+                let first = c.next().map(|f| f.to_uppercase().collect::<String>());
+                format!(" {}{}.", first.unwrap_or_default(), c.as_str())
+            })
+            .unwrap_or_default();
         format!(
-            "{}, {} Approach, squawk {}. {}",
+            "{}, {} Approach, squawk {}. {}{sequence}",
             ctx.callsign, ctx.airport, squawk, plan_phrase
         )
     }
