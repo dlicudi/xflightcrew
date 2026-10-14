@@ -1010,6 +1010,22 @@ impl SpeechMemory {
     }
 }
 
+/// The crew's running arbiter, for the settings registry's voice picks (a
+/// live swap, as the panel's picker makes). Registered once by boot; absent
+/// in the screens that run without a crew (`xfc voices`, `xfc home`), where
+/// a pick is only saved. Process lifetime, like the arbiter itself.
+static RUNNING: std::sync::OnceLock<Voice> = std::sync::OnceLock::new();
+
+/// Register the running arbiter (boot, once).
+pub fn register_running(v: &Voice) {
+    let _ = RUNNING.set(v.clone());
+}
+
+/// The running arbiter, when a crew is up.
+pub fn running() -> Option<&'static Voice> {
+    RUNNING.get()
+}
+
 /// Handle to the speech arbiter. Cheap to clone — hand one to every thread that
 /// needs to speak.
 #[derive(Clone)]
@@ -2904,8 +2920,7 @@ fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
 /// An env-tunable f32 with a default (station cadence knobs).
 #[cfg(feature = "onnx-tts")]
 fn env_f32(name: &str, default: f32) -> f32 {
-    std::env::var(name)
-        .ok()
+    crate::config::knob(name)
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }

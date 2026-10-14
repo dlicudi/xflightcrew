@@ -565,7 +565,7 @@ pub async fn main_cmd(args: &[String], base_url: &str) -> anyhow::Result<bool> {
 }
 
 /// Today's date, UTC, YYYY-MM-DD (civil from days, Hinnant's algorithm).
-fn today() -> String {
+pub(crate) fn today() -> String {
     let days = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) / 86_400) as i64;
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

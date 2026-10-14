@@ -379,18 +379,16 @@ fn build_session(model_path: &str, threads: Option<usize>, what: &str) -> Result
 }
 
 fn session_threads() -> usize {
-    std::env::var("XCOPILOT_TTS_THREADS")
-        .ok()
+    crate::config::knob("XCOPILOT_TTS_THREADS")
         .and_then(|v| v.trim().parse().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(4)
 }
 
 /// A VITS scale: the env override (`name`) if set and parseable, else the voice's
-/// own value. Lets the voice be tuned from `.env` without editing the model json.
+/// own value (env > saved setting, `config::knob`). Tunes the voice without editing the model json.
 fn env_scale(name: &str, default: f64) -> f32 {
-    std::env::var(name)
-        .ok()
+    crate::config::knob(name)
         .and_then(|v| v.trim().parse::<f32>().ok())
         .unwrap_or(default as f32)
 }

@@ -285,24 +285,24 @@ impl Config {
 
         Ok(Self {
             xplane_base_url: env_or("XPLANE_BASE_URL", "http://127.0.0.1:8086"),
-            whisper_model_path: env_or("WHISPER_MODEL", &model_path("ggml-base.en.bin")),
-            whisper_gpu: env_or("XCOPILOT_WHISPER_GPU", "true") != "false",
+            whisper_model_path: knob_or("WHISPER_MODEL", &model_path("ggml-base.en.bin")),
+            whisper_gpu: flag("XCOPILOT_WHISPER_GPU", true),
             listen_mode: env_or("XCOPILOT_LISTEN", "continuous"),
-            ptt_key: env_or("XCOPILOT_PTT_KEY", ""),
-            ptt_dataref: env_or("XCOPILOT_PTT_DATAREF", "xcopilot/ptt_active"),
+            ptt_key: knob_or("XCOPILOT_PTT_KEY", ""),
+            ptt_dataref: knob_or("XCOPILOT_PTT_DATAREF", "xcopilot/ptt_active"),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
             stt_confirm_floor: env_or("XCOPILOT_STT_CONFIRM_FLOOR", "0.22").parse().unwrap_or(0.22),
             end_silence_ms: env_or("XCOPILOT_END_SILENCE_MS", "900").parse().unwrap_or(900),
             mic_gate_tail_ms: env_or("XCOPILOT_MIC_GATE_TAIL_MS", "900").parse().unwrap_or(900),
             ui: env_or("XCOPILOT_UI", default_ui()),
-            tts_backend: env_or("XCOPILOT_TTS", "onnx"),
+            tts_backend: knob_or("XCOPILOT_TTS", "onnx"),
             voice_volume: env_or("XCOPILOT_VOICE_VOL", "1.0").parse().unwrap_or(1.0),
             atc_volume: env_or("XCOPILOT_ATC_VOL", "1.0").parse().unwrap_or(1.0),
-            say_voice: env_or("XCOPILOT_SAY_VOICE", ""),
-            say_rate: env_or("XCOPILOT_SAY_RATE", ""),
-            chime_path: env_or("XCOPILOT_CHIME", ""),
-            negative_tone_path: env_or("XCOPILOT_NEGATIVE_TONE", ""),
+            say_voice: knob_or("XCOPILOT_SAY_VOICE", ""),
+            say_rate: knob_or("XCOPILOT_SAY_RATE", ""),
+            chime_path: knob_or("XCOPILOT_CHIME", ""),
+            negative_tone_path: knob_or("XCOPILOT_NEGATIVE_TONE", ""),
             piper_binary: env_or("PIPER_BIN", "piper"),
             // Explicit env beats the panel-saved pick beats the default (see
             // crate::prefs — the Settings tab's voice picker persists there).
@@ -312,12 +312,12 @@ impl Config {
             // boot ("always end up back with ryan", 2026-07-23).
             piper_voice: crate::prefs::pilot_voice()
                 .or_else(|| std::env::var("PIPER_VOICE").ok())
-                .unwrap_or_else(|| model_path("en_US-amy-medium.onnx")),
+                .unwrap_or_else(|| voice_default("PIPER_VOICE")),
             // The panel's pick wins over the env default, as the pilot's does.
             cabin_piper_voice: crate::prefs::cabin_voice().unwrap_or_else(|| {
                 env_or(
                     "XCOPILOT_CABIN_VOICE",
-                    &model_path("en_US-hfc_female-medium.onnx"),
+                    &voice_default("XCOPILOT_CABIN_VOICE"),
                 )
             }),
             // NOTE: a copilot/cabin collision is resolved after construction —
@@ -371,16 +371,16 @@ impl Config {
                 "XPLANE_APT_DATA",
                 &xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat"),
             ),
-            aircraft: env_or("XCOPILOT_AIRCRAFT", "auto"),
+            aircraft: knob_or("XCOPILOT_AIRCRAFT", "auto"),
             confirm_critical: env_or("XCOPILOT_CONFIRM", "true") != "false",
-            monitor_enabled: env_or("XCOPILOT_MONITOR", "true") != "false",
+            monitor_enabled: flag("XCOPILOT_MONITOR", true),
             audio_bus: env_or("XCOPILOT_AUDIO_BUS", "false") == "true",
             monitor_hz: env_or("XCOPILOT_MONITOR_HZ", "3").parse().unwrap_or(3.0),
             plugin_status: env_or("XCOPILOT_PLUGIN_STATUS", "true") != "false",
             simbrief_id: env_or("XCOPILOT_SIMBRIEF_ID", ""),
             mode: env_or("XCOPILOT_MODE", ""),
-            atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
-            atc_region: env_or("XCOPILOT_ATC_REGION", "auto"),
+            atc_airport: knob_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
+            atc_region: knob_or("XCOPILOT_ATC_REGION", "auto"),
             atc_chatter: env_or("XCOPILOT_ATC_CHATTER", "true") != "false",
             traffic: env_or("XCOPILOT_TRAFFIC", "off"),
             traffic_density: env_or("XCOPILOT_TRAFFIC_DENSITY", "normal"),
@@ -392,31 +392,28 @@ impl Config {
             copilot_name: env_or("XCOPILOT_COPILOT_NAME", "").trim().to_string(),
             callsign: env_or("XCOPILOT_CALLSIGN", "").trim().to_string(),
             airline_telephony: env_or("XCOPILOT_AIRLINE_TELEPHONY", "").trim().to_string(),
-            mute_xp_radio: env_or("XCOPILOT_MUTE_XP_RADIO", "true") != "false",
+            mute_xp_radio: flag("XCOPILOT_MUTE_XP_RADIO", true),
             atc_readback: env_or("XCOPILOT_ATC_READBACK", "true") != "false",
             taxi_guide: env_or("XCOPILOT_TAXI_GUIDE", "true") != "false",
             efb: env_or("XCOPILOT_EFB", "false") == "true",
             efb_port: env_or("XCOPILOT_EFB_PORT", "8787").parse().unwrap_or(8787),
             efb_token: env_or("XCOPILOT_EFB_TOKEN", "").trim().to_string(),
-            radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
-            atc_piper_voice: env_or(
+            radio_ptt_dataref: knob_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
+            atc_piper_voice: knob_or(
                 "XCOPILOT_ATC_PIPER_VOICE",
-                &model_path("en_GB-alba-medium.onnx"),
+                &voice_default("XCOPILOT_ATC_PIPER_VOICE"),
             ),
-            // ryan-high: the only high-quality model in the folder, and clearly
-            // a different person from the tower (alba) and departure (northern
-            // male). alan-medium read flat and got voted off (2026-07-09).
-            atc_approach_piper_voice: env_or(
+            atc_approach_piper_voice: knob_or(
                 "XCOPILOT_ATC_APPROACH_PIPER_VOICE",
-                &model_path("en_US-ryan-high.onnx"),
+                &voice_default("XCOPILOT_ATC_APPROACH_PIPER_VOICE"),
             ),
-            atc_departure_piper_voice: env_or(
+            atc_departure_piper_voice: knob_or(
                 "XCOPILOT_ATC_DEPARTURE_PIPER_VOICE",
-                &model_path("en_GB-northern_english_male-medium.onnx"),
+                &voice_default("XCOPILOT_ATC_DEPARTURE_PIPER_VOICE"),
             ),
             // Empty = the tower's voice; ATIS on a real field is often the
             // same controller reading onto the loop anyway.
-            atc_atis_piper_voice: env_or("XCOPILOT_ATC_ATIS_PIPER_VOICE", ""),
+            atc_atis_piper_voice: knob_or("XCOPILOT_ATC_ATIS_PIPER_VOICE", ""),
             // The pool every field OTHER than home draws its controller from.
             //
             // It used to be nine American voices, which meant a British field
@@ -445,14 +442,14 @@ impl Config {
             // the British passes: 22 VCTK, all 12 aru, three semaine and
             // jenny_dioco, each at a measured pace (`voice::MEASURED_PACE`),
             // which keeps the pool well over its one-third-British rule.
-            atc_voice_pool: env_or("XCOPILOT_ATC_VOICE_POOL", &default_atc_voice_pool()),
-            atc_voice_shift: env_or("XCOPILOT_ATC_VOICE_SHIFT", "true") != "false",
-            atc_squelch_wav: env_or(
+            atc_voice_pool: knob_or("XCOPILOT_ATC_VOICE_POOL", &default_atc_voice_pool()),
+            atc_voice_shift: flag("XCOPILOT_ATC_VOICE_SHIFT", true),
+            atc_squelch_wav: knob_or(
                 "XCOPILOT_SQUELCH_WAV",
                 &sim::paths::asset("afv/Click_f32.wav").to_string_lossy(),
             ),
-            atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
-            atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),
+            atc_voice: knob_or("XCOPILOT_ATC_VOICE", "Daniel"),
+            atc_rate: knob_or("XCOPILOT_ATC_RATE", "165"),
         }
         .resolve_persona_voices())
     }
@@ -611,7 +608,7 @@ fn pool_without(pool: &str, taken: &[String]) -> String {
 /// Where the Global Airports apt.dat lives: `XCOPILOT_APT_DAT` overrides the
 /// standard install path.
 pub fn apt_dat_path() -> String {
-    if let Ok(p) = std::env::var("XCOPILOT_APT_DAT") {
+    if let Some(p) = knob("XCOPILOT_APT_DAT").filter(|p| !p.trim().is_empty()) {
         return p;
     }
     xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat")
@@ -620,7 +617,7 @@ pub fn apt_dat_path() -> String {
 /// The X-Plane install the sim is running from: `XCOPILOT_XPLANE_ROOT`
 /// overrides the standard location, `$HOME/X-Plane 12`.
 pub fn xplane_root() -> String {
-    if let Ok(p) = std::env::var("XCOPILOT_XPLANE_ROOT") {
+    if let Some(p) = knob("XCOPILOT_XPLANE_ROOT").filter(|p| !p.trim().is_empty()) {
         return p;
     }
     let home = std::env::var("HOME").unwrap_or_default();
@@ -638,9 +635,9 @@ pub fn xplane_path(rel: &str) -> String {
 /// `models` in a checkout). The ONE owner of that folder: `xfc voices`
 /// installs into it and the defaults below are read from it.
 pub fn models_dir() -> std::path::PathBuf {
-    match std::env::var("XCOPILOT_MODELS_DIR") {
-        Ok(dir) => std::path::PathBuf::from(dir),
-        Err(_) => sim::paths::models_default(),
+    match knob("XCOPILOT_MODELS_DIR").filter(|d| !d.trim().is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => sim::paths::models_default(),
     }
 }
 
@@ -652,6 +649,104 @@ pub fn model_path(file: &str) -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// The knobs read ONCE, at boot, and the prefs.json key each one's saved
+/// value lives under: `(environment variable, settings key)`. These are the
+/// settings registry's `Tier::Restart` entries (`settings::ALL`, pinned both
+/// ways by `every_restart_knob_is_resolved_where_boot_reads_it`). Their pref
+/// is read HERE, inside [`Config::from_env`] or the direct reader, never by
+/// `settings::install`: their consumers run before that line (the voices
+/// screen, the home screen) or capture the value into a thread at boot, so a
+/// pref applied later would be in force for the screen and not for the crew.
+pub const BOOT_KNOBS: &[(&str, &str)] = &[
+    ("WHISPER_MODEL", "whisper_model"),
+    ("XCOPILOT_WHISPER_GPU", "whisper_gpu"),
+    ("XCOPILOT_TTS", "tts"),
+    ("XCOPILOT_TTS_THREADS", "tts_threads"),
+    ("XCOPILOT_TTS_LENGTH", "tts_length"),
+    ("XCOPILOT_TTS_NOISE", "tts_noise"),
+    ("XCOPILOT_TTS_NOISE_W", "tts_noise_w"),
+    ("XCOPILOT_SAY_VOICE", "say_voice"),
+    ("XCOPILOT_SAY_RATE", "say_rate"),
+    ("XCOPILOT_ATC_VOICE", "atc_say_voice"),
+    ("XCOPILOT_ATC_RATE", "atc_say_rate"),
+    ("XCOPILOT_ATC_PIPER_VOICE", "atc_tower_voice"),
+    ("XCOPILOT_ATC_APPROACH_PIPER_VOICE", "atc_approach_voice"),
+    ("XCOPILOT_ATC_DEPARTURE_PIPER_VOICE", "atc_departure_voice"),
+    ("XCOPILOT_ATC_ATIS_PIPER_VOICE", "atc_atis_voice"),
+    ("XCOPILOT_ATC_VOICE_POOL", "atc_voice_pool"),
+    ("XCOPILOT_ATC_VOICE_SHIFT", "atc_voice_shift"),
+    ("XCOPILOT_ATC_TTS_LENGTH", "atc_tts_length"),
+    ("XCOPILOT_ATC_TTS_NOISE_W", "atc_tts_noise_w"),
+    ("XCOPILOT_ATC_AIRPORT", "atc_airport"),
+    ("XCOPILOT_ATC_REGION", "atc_region"),
+    ("XCOPILOT_PTT_KEY", "ptt_key"),
+    ("XCOPILOT_PTT_DATAREF", "ptt_dataref"),
+    ("XCOPILOT_RADIO_PTT_DATAREF", "radio_ptt_dataref"),
+    ("XCOPILOT_MUTE_XP_RADIO", "mute_xp_radio"),
+    ("XCOPILOT_CHIME", "chime"),
+    ("XCOPILOT_NEGATIVE_TONE", "negative_tone"),
+    ("XCOPILOT_SQUELCH_WAV", "squelch_wav"),
+    ("XCOPILOT_AIRCRAFT", "aircraft"),
+    ("XCOPILOT_MONITOR", "monitor"),
+    ("XCOPILOT_XPLANE_ROOT", "xplane_root"),
+    ("XCOPILOT_APT_DAT", "apt_dat"),
+    ("XCOPILOT_MODELS_DIR", "models_dir"),
+];
+
+/// A boot knob's value by env > saved preference: the variable when set,
+/// else the pref saved under its [`BOOT_KNOBS`] key, else `None` (the
+/// caller's default). A name not in the table is the environment only.
+pub fn knob(env: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(env) {
+        return Some(v);
+    }
+    let key = BOOT_KNOBS.iter().find(|(e, _)| *e == env)?.1;
+    crate::prefs::setting(key)
+}
+
+/// The built-in voice of a role's slot, by its variable (the copilot's
+/// `PIPER_VOICE`, the ATC positions' `XCOPILOT_ATC_*_PIPER_VOICE`): the
+/// spec in [`models_dir`]. Empty for a slot whose default is to inherit
+/// (ATIS reads in the tower's voice) or an unknown name.
+pub fn voice_default(env: &str) -> String {
+    // ryan-high for approach: the only high-quality model in the folder,
+    // and clearly a different person from the tower (alba) and departure
+    // (northern male). alan-medium read flat and got voted off (2026-07-09).
+    let file = match env {
+        "PIPER_VOICE" => "en_US-amy-medium.onnx",
+        "XCOPILOT_CABIN_VOICE" => "en_US-hfc_female-medium.onnx",
+        "XCOPILOT_ATC_PIPER_VOICE" => "en_GB-alba-medium.onnx",
+        "XCOPILOT_ATC_APPROACH_PIPER_VOICE" => "en_US-ryan-high.onnx",
+        "XCOPILOT_ATC_DEPARTURE_PIPER_VOICE" => "en_GB-northern_english_male-medium.onnx",
+        _ => return String::new(),
+    };
+    model_path(file)
+}
+
+/// [`knob`] with its default.
+pub fn knob_or(env: &str, default: &str) -> String {
+    knob(env).unwrap_or_else(|| default.to_string())
+}
+
+/// A boot knob that is a switch. The variable keeps its historical reading
+/// (a default-on switch is off only for "false", a default-off one on only
+/// for "true"); a saved pref is read in the registry's spellings (on/off,
+/// true/false, yes/no, 1/0), an unreadable one keeping the default.
+pub fn flag(env: &str, default: bool) -> bool {
+    if let Ok(v) = std::env::var(env) {
+        return if default { v != "false" } else { v == "true" };
+    }
+    let saved = BOOT_KNOBS
+        .iter()
+        .find(|(e, _)| *e == env)
+        .and_then(|(_, key)| crate::prefs::setting(key));
+    match saved.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if matches!(s.as_str(), "on" | "true" | "yes" | "1") => true,
+        Some(s) if matches!(s.as_str(), "off" | "false" | "no" | "0") => false,
+        _ => default,
+    }
 }
 
 /// Default UI when `XCOPILOT_UI` is unset: the dashboard on an interactive

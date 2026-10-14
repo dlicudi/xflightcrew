@@ -57,7 +57,13 @@ fn load() -> Prefs {
 /// deleted model file quietly falls back to the default rather than failing
 /// the TTS load at startup.
 pub fn pilot_voice() -> Option<String> {
-    load().pilot_voice.filter(|p| Path::new(p).exists())
+    load().pilot_voice.filter(|p| model_on_disk(p))
+}
+
+/// A saved voice spec's model file is on disk: the `#N` speaker suffix of a
+/// multi-speaker model stripped first (a `vctk#12` pick is its `.onnx`).
+fn model_on_disk(spec: &str) -> bool {
+    Path::new(spec.split('#').next().unwrap_or(spec)).exists()
 }
 
 /// Persist a new pilot-voice pick. Best-effort: a read-only working directory
@@ -70,7 +76,7 @@ pub fn save_pilot_voice(spec: &str) {
 
 /// The saved cabin-voice pick, if its model is still on disk.
 pub fn cabin_voice() -> Option<String> {
-    load().cabin_voice.filter(|p| Path::new(p).exists())
+    load().cabin_voice.filter(|p| model_on_disk(p))
 }
 
 /// Persist a new cabin-voice pick. Best-effort, like the pilot's.
@@ -129,6 +135,26 @@ pub fn save_setting(key: &str, rendered: &str) {
     let mut prefs = load();
     prefs.settings.insert(key.to_string(), rendered.to_string());
     store(prefs);
+}
+
+/// Forget one registry setting: its default is in force from the next read.
+pub fn remove_setting(key: &str) {
+    let mut prefs = load();
+    if prefs.settings.remove(key).is_some() {
+        store(prefs);
+    }
+}
+
+/// Persist several registry settings in ONE rewrite (the `.env` import):
+/// all of them land or, on a failed write, none do. `Err` names the file.
+pub fn save_settings(pairs: &[(String, String)]) -> Result<(), String> {
+    let mut prefs = load();
+    for (k, v) in pairs {
+        prefs.settings.insert(k.clone(), v.clone());
+    }
+    let json = serde_json::to_string_pretty(&prefs).map_err(|e| format!("prefs: {e}"))?;
+    let path = prefs_path();
+    std::fs::write(&path, json).map_err(|e| format!("saving {}: {e}", path.display()))
 }
 
 fn store(prefs: Prefs) {

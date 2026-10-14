@@ -96,6 +96,8 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("efb::mod::SERVING", 'S'),
     ("efb::ptt::AVAILABLE", 'P'),
     ("efb::ptt::HOLD", 'S'),
+    ("env_import::CACHE", 'C'),
+    ("env_import::CLEAR", 'C'),
     ("flight::PILOT_TAKEOVER", 'F'),
     ("flight::PUBLISHED", 'S'),
     ("flight_state::FLIGHTS_BEGUN", 'S'),
@@ -255,6 +257,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("tts_onnx::ORT_SESSION_INIT", 'P'),
     ("voice::LINES_QUEUED", 'S'),
     ("voice::PILOT_ENGINE", 'P'),
+    ("voice::RUNNING", 'P'),
     ("weather::WINDS_CACHE", 'C'),
 ];
 

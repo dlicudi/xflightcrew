@@ -43,6 +43,7 @@ mod test_card;
 mod detect;
 mod dialogue;
 mod efb;
+mod env_import;
 mod failures;
 mod flight;
 mod duty;
@@ -416,10 +417,10 @@ async fn main() -> Result<()> {
         eprintln!(
             "voice: {voice}  (length={} noise={} noise_w={})",
             pace.map(|p| p.to_string())
-                .or_else(|| std::env::var("XCOPILOT_TTS_LENGTH").ok())
+                .or_else(|| config::knob("XCOPILOT_TTS_LENGTH"))
                 .unwrap_or_else(|| "model".into()),
-            std::env::var("XCOPILOT_TTS_NOISE").unwrap_or_else(|_| "model".into()),
-            std::env::var("XCOPILOT_TTS_NOISE_W").unwrap_or_else(|_| "model".into())
+            config::knob("XCOPILOT_TTS_NOISE").unwrap_or_else(|| "model".into()),
+            config::knob("XCOPILOT_TTS_NOISE_W").unwrap_or_else(|| "model".into())
         );
         let mut v = tts_onnx::OnnxTts::load(&voice)?;
         if pace.is_some() {
@@ -632,6 +633,8 @@ async fn main() -> Result<()> {
     // The speech arbiter is shared by the command loop and the monitor, so it's
     // created here (above both) and handed to each.
     let voice = Voice::new(config.clone());
+    // The settings registry's voice picks swap it live, as the panel does.
+    voice::register_running(&voice);
 
     // The panel's copilot-voice picker: publish the roster, poll for picks,
     // swap live. Only where the pick can matter — the `say` backend ignores

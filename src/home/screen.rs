@@ -265,7 +265,9 @@ fn key(app: &mut App, code: KeyCode, ctrl: bool) -> Act {
         View::Settings => {
             if app.settings.edit.is_some() {
                 app.settings.edit_key(code, ctrl);
-            } else if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+            } else if !app.settings.confirming()
+                && matches!(code, KeyCode::Esc | KeyCode::Char('q'))
+            {
                 app.view = View::Home;
                 app.summary = super::summary();
             } else {
