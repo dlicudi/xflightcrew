@@ -1112,7 +1112,7 @@ impl TrafficAircraft {
             Some(d) if instrument && matches!(leg, Leg::Inbound | Leg::Final) => {
                 let below = leg == Leg::Final && self.kin.alt_ft < alt_target - 30.0;
                 let kts = if d > 4.0 * NM {
-                    self.instrument_kts(d, others)
+                    self.instrument_kts(d, others, o.follow)
                 } else {
                     kts
                 };
@@ -1194,7 +1194,7 @@ impl TrafficAircraft {
         // A straight-in that cannot fit is given its delay out here; an
         // instrument arrival only once slowing cannot make its place.
         if instrument {
-            self.instrument_delay(end, others);
+            self.instrument_delay(end, others, o.follow);
         } else {
             self.delay_if_no_slot(end, others);
         }
