@@ -210,6 +210,7 @@ pub(super) fn cessna_172sp() -> AircraftProfile {
             ],
             takeoff_ratio: Some(0.0), // 172 takes off clean
             by_command: None,
+            speedbrake_max_ratio: None,
         }),
         fuel: Some(FuelProfile {
             reserve_caution_min: 45.0,
@@ -619,6 +620,7 @@ pub(super) fn cirrus_sr22() -> AircraftProfile {
             ],
             takeoff_ratio: None,
             by_command: None,
+            speedbrake_max_ratio: None,
         }),
         // SR22 ~92 gal usable, ~17 gal/hr cruise (~46 kg/hr). Verify.
         fuel: Some(FuelProfile {

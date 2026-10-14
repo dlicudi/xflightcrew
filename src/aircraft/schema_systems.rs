@@ -751,6 +751,13 @@ pub struct FlapProfile {
     /// (probed parked, 2026-10-06). `None` writes the stock handle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by_command: Option<LeverCommands>,
+    /// The deepest flap handle ratio the speedbrake is flown with on a
+    /// FINAL, where the energy plan says the gate cannot be made at idle
+    /// (`approach_energy::final_drag`). A crew rule of the airframe's,
+    /// declared; `None`: never on a final (the descent's own rule,
+    /// `procedure::drag_barred`, is separate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speedbrake_max_ratio: Option<f64>,
 }
 
 /// A lever that answers only to its step commands: one notch per press, read

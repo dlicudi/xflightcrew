@@ -78,7 +78,7 @@
             ("pilot", "DEADBAND_FPM", "the energy throttle's hand: an energy-rate error it leaves alone (about 1.5 kt at a 172's approach speed), the learnt power still trims it; any airframe (2026-10-11)"),
             ("autoland", "LEVEL_RETURN_MAX_FPM", "the rate an engaged altitude hold may return to its altitude at and still be holding it, a watchdog band, not a commanded rate; any airframe (2026-10-11)"),
             ("autoland", "MAX_OFF_PATH_FPM", "how much steeper than the path's own rate a visual final's dial may go to rejoin it from above, a bound, not a commanded rate; any airframe (2026-10-12)"),
-            ("pilot", "SPEED_TERM_MAX_FPM", "the most energy rate a speed error may ask of the energy throttle, a bound on the request, not a commanded rate; any airframe (2026-10-11)"),
+            ("pilot", "SPEED_TERM_MAX_FPM", "the most energy rate a SLOW speed error may ask of the energy throttle (a fast one is bounded by idle, 2026-10-14), a bound on the request, not a commanded rate; any airframe (2026-10-11)"),
             ("pilot", "REJOIN_MAX_FPM", "how far off the path's own sink the hand-flown segment may ask to rejoin it, a bound on the request, not a commanded rate; any airframe (2026-10-12)"),
             ("autoland", "FLARE_BLEED_KTS_S", "the landing call's float for speed over the airframe's own approach speed, a prediction margin, not a commanded rate; only airframes declaring landing_roll_ft (LXGB 2026-10-06)"),
             ("autoland", "GA_CLIMB_ESTABLISHED_FPM", "a go-around's positive climb, the test for reducing thrust, not a commanded rate; any airframe (#199)"),

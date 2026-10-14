@@ -197,6 +197,17 @@ pub fn path_tolerance_ft(dist_to_aim_nm: f64) -> f64 {
     (dist_to_aim_nm.max(0.0) * 6076.1 * PATH_TOL_DEG.to_radians().tan()).max(PATH_TOL_MIN_FT)
 }
 
+/// How far over the landing target the speed may be at `height_aal_ft`:
+/// [`FAST_ABOVE_STABLE_KTS`] above [`STABLE_HEIGHT_AAL_FT`], else
+/// [`FAST_KTS`]. Pure.
+pub fn fast_allowance_kts(height_aal_ft: f64) -> f64 {
+    if height_aal_ft > STABLE_HEIGHT_AAL_FT {
+        FAST_ABOVE_STABLE_KTS
+    } else {
+        FAST_KTS
+    }
+}
+
 /// Every criterion the sample fails behind `gate`, in the order a crew calls
 /// them; empty is stable. Not judged outside [`judged`]. Pure.
 pub fn breaches(gate: GateKind, s: &Sample) -> Vec<Breach> {
@@ -210,12 +221,7 @@ pub fn breaches(gate: GateKind, s: &Sample) -> Vec<Breach> {
     if !s.landing_flap {
         out.push(Breach::Flap);
     }
-    let fast_by = if s.height_aal_ft > STABLE_HEIGHT_AAL_FT {
-        FAST_ABOVE_STABLE_KTS
-    } else {
-        FAST_KTS
-    };
-    if s.ias_kts > s.target_kts + fast_by {
+    if s.ias_kts > s.target_kts + fast_allowance_kts(s.height_aal_ft) {
         out.push(Breach::Fast);
     }
     if s.ias_kts < s.target_kts - SLOW_KTS {

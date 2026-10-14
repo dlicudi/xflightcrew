@@ -121,6 +121,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
             detents: list,
             takeoff_ratio: Some(0.0),
             by_command: None,
+            speedbrake_max_ratio: None,
         });
     }
 

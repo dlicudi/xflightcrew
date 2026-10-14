@@ -881,6 +881,9 @@ impl Tool for SetPitchTrim {
 /// Speedbrake/spoiler lever: 1 = fully extended, 0 = stowed, -0.5 = armed (auto
 /// deploy on touchdown). The MD-82 uses this standard, writable dataref.
 pub const SPEEDBRAKE: &str = "sim/cockpit2/controls/speedbrake_ratio";
+/// The speedbrake's flight detent, stock sense: half. Full is a ground
+/// spoiler setting on most jets.
+pub const SPEEDBRAKE_FLIGHT: f64 = 0.5;
 /// Gear handle (1 = down). Read by the speedbrake-on-final guard.
 const GEAR_HANDLE_DOWN: &str = crate::datarefs::GEAR_HANDLE_DOWN;
 
