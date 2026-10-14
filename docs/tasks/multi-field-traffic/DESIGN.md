@@ -129,9 +129,10 @@ party_line: the installed station adopts its field's FieldDesk strips on install
    the station's field plus every timetable field within `SIM_RANGE_NM` 100 of us, kept to
    `SIM_OUT_NM` 120; still nothing without `ours`, ATC on and an installed station. Built one
    at a time off the tick, the station's field first, then ICAO order; a build that fails is
-   not retried while the field stays in range. Only timetable fields are simulated beyond the
-   station's (a generated field stays the station's alone), and a desk field always flies its
-   timetable (the pilot's `XCOPILOT_TRAFFIC_FILE` is the station's field's only).
+   not retried while the field stays in range. Only timetable fields are simulated, the station's
+   included (2026-10-14: no generated hour any more where a field has no route table; every
+   en-route radar handoff had brought one up), and a desk field always flies its timetable
+   (the pilot's `XCOPILOT_TRAFFIC_FILE` is the station's field's only).
    - **The desk** is `traffic::FieldDesk` (`crates/traffic/src/desk.rs`, pure, in the traffic
      crate rather than the world crate: it needs no station and tests as plain data). Its
      claims are computed from the fleet each tick: a takeoff cleared and on the ground, a

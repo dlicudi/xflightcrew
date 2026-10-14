@@ -2331,3 +2331,23 @@ fn real_install_two_fields_at_once_inner() {
     );
     Station::uninstall();
 }
+
+/// TRAFFIC ONLY WHERE IT IS DEFINED (2026-10-14): a field with no route
+/// timetable and no pilot file gets no fleet, before apt.dat is even read
+/// (LEGR, LEMD and the rest came up one per radar handoff en route). A
+/// field with a table goes on to the build.
+#[test]
+fn a_field_without_routes_has_no_traffic() {
+    let ctx = BuildCtx {
+        seed: 1,
+        name: "",
+        zulu_s: None,
+        day: None,
+        runway: None,
+    };
+    assert!(traffic::routes::field_routes("LEGR").is_none());
+    assert!(build_link("LEGR", "/nonexistent/apt.dat", "", "", "normal", &ctx).is_none());
+    for icao in ["EGKK", "LEMG", "LXGB"] {
+        assert!(traffic::routes::field_routes(icao).is_some(), "{icao} has its routes");
+    }
+}
