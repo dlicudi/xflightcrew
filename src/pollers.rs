@@ -387,6 +387,7 @@ pub(crate) fn spawn_voice_picker(
                             tracing::info!(model = %spec, "panel cabin voice pick");
                             voice.set_cabin_voice(spec.clone());
                             prefs::save_cabin_voice(&spec);
+                            settings::update(|c| c.cabin_piper_voice = spec.clone());
                             voice.say_cabin(
                                 voice::Priority::Advisory,
                                 "Flight deck, cabin crew. New voice, checked in.",
@@ -419,6 +420,8 @@ pub(crate) fn spawn_voice_picker(
             tracing::info!(model = %spec, "panel voice pick");
             voice.set_pilot_voice(spec.clone());
             prefs::save_pilot_voice(&spec);
+            // The registry's view follows (the Cast view, the settings screens).
+            settings::update(|c| c.piper_voice = spec.clone());
             pilot_spec = spec.clone();
             // Confirmed in the new voice itself: the swap applies before the
             // next intercom utterance, which is exactly this line.
@@ -658,11 +661,17 @@ pub(crate) fn apply_text_edit(key: &str, raw: &str) -> Result<(), String> {
 /// it was only in the terminal and the EFB).
 pub(crate) const PANEL_CHOICES: &[&str] = &["traffic", "traffic_density"];
 
+/// The text knobs the panel's rows carry. A list, not "every text knob":
+/// the registry grew boot knobs and paths (2026-10-14) that belong to the
+/// terminal, and the panel's payload is one dataref string.
+pub(crate) const PANEL_TEXT: &[&str] =
+    &["traffic_file", "callsign", "airline_telephony", "efb_token"];
+
 /// A registry knob the panel's text rows carry: every text knob, and the
 /// [`PANEL_CHOICES`].
 fn on_panel_rows(s: &settings::Setting) -> bool {
     match s.kind {
-        settings::Kind::Text { .. } => true,
+        settings::Kind::Text { .. } => PANEL_TEXT.contains(&s.key),
         settings::Kind::Choice(_) => PANEL_CHOICES.contains(&s.key),
         _ => false,
     }

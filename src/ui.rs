@@ -258,6 +258,8 @@ pub struct SettingsPane {
     /// A text setting being edited (callsign, airline telephony): the
     /// buffer, saved on Enter, dropped on Esc.
     pub edit: Option<String>,
+    /// The `.env` move was asked for: the list is shown, `y` makes it.
+    pub confirm_import: bool,
 }
 
 const MAX_LOG: usize = 500;
@@ -356,6 +358,10 @@ pub fn run_dashboard(
                         // through the registry, Esc drops the edit.
                         app.settings.edit_key(k.code, ctrl);
                         dirty = true;
+                    } else if app.settings.confirming() {
+                        // The .env move asked: every key answers it.
+                        app.settings.key(k.code);
+                        dirty = true;
                     } else if app.editing {
                         // Text mode: keys type; Enter runs the command (staying in
                         // text mode for the next one); Esc leaves text mode.
@@ -451,8 +457,32 @@ fn tab_key(app: &mut App, key: KeyCode) -> bool {
 }
 
 impl SettingsPane {
+    /// The setting under the cursor, in the screen's order (grouped by
+    /// section, `settings::by_section`).
+    pub fn selected(&self) -> Option<&'static settings::Setting> {
+        settings::by_section().get(self.cursor).copied()
+    }
+
+    /// A question is open (the `.env` move): every key answers it, so `q`
+    /// cannot quit from under it.
+    pub fn confirming(&self) -> bool {
+        self.confirm_import
+    }
+
     /// A navigation or edit key on the list. Returns whether anything changed.
     pub fn key(&mut self, key: KeyCode) -> bool {
+        if self.confirm_import {
+            self.confirm_import = false;
+            self.notice = Some(if key == KeyCode::Char('y') {
+                match crate::env_import::apply(&crate::env_import::pending()) {
+                    Ok(m) => (m, true),
+                    Err(e) => (e, false),
+                }
+            } else {
+                (".env left as it is".into(), true)
+            });
+            return true;
+        }
         match key {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.cursor = (self.cursor + 1).min(settings::ALL.len().saturating_sub(1));
@@ -466,6 +496,16 @@ impl SettingsPane {
             }
             KeyCode::Right | KeyCode::Char(' ') | KeyCode::Char('l') => self.adjust(true),
             KeyCode::Left | KeyCode::Char('h') => self.adjust(false),
+            KeyCode::Char('m') => {
+                let moves = crate::env_import::pending();
+                if crate::env_import::movable(&moves).is_empty() {
+                    self.notice = Some(("nothing in .env to move".into(), true));
+                } else {
+                    self.confirm_import = true;
+                    self.notice = None;
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -493,13 +533,16 @@ impl SettingsPane {
     /// Step the selected setting and apply it. A refusal (an env-pinned knob, a
     /// value the setting won't take) is shown rather than swallowed: silently
     /// ignoring a keypress is how a settings screen teaches you to distrust it.
-    /// A text knob cannot be stepped: the key opens its field instead (a pinned
-    /// one says so).
+    /// A text, path or voice knob cannot be stepped: the key opens its field
+    /// instead (a pinned one says so).
     fn adjust(&mut self, up: bool) -> bool {
-        let Some(s) = settings::ALL.get(self.cursor) else {
+        let Some(s) = self.selected() else {
             return false;
         };
-        if matches!(s.kind, settings::Kind::Text { .. }) {
+        if matches!(
+            s.kind,
+            settings::Kind::Text { .. } | settings::Kind::Path { .. } | settings::Kind::Voice
+        ) {
             if s.env_pinned() {
                 self.notice = Some((format!("pinned by {}, edit your .env", s.env), false));
             } else {
@@ -511,7 +554,7 @@ impl SettingsPane {
         }
         let next = s.kind.step(&s.value(), up);
         self.notice = Some(match settings::set(s.key, &next) {
-            Ok(()) => (format!("{} → {}", s.label, s.kind.render(&next)), true),
+            Ok(()) => (changed_line(s, &s.kind.render(&next)), true),
             Err(e) => (e, false),
         });
         true
@@ -520,7 +563,7 @@ impl SettingsPane {
     /// Save the text setting being edited through the registry (validate, apply
     /// live, persist), saying what happened. A refusal keeps the field open.
     fn save_text(&mut self) {
-        let (Some(buf), Some(s)) = (self.edit.as_ref(), settings::ALL.get(self.cursor)) else {
+        let (Some(buf), Some(s)) = (self.edit.as_ref(), self.selected()) else {
             self.edit = None;
             return;
         };
@@ -531,7 +574,7 @@ impl SettingsPane {
             .and_then(|v| settings::set(s.key, &v));
         match result {
             Ok(()) => {
-                self.notice = Some((format!("{} = {}", s.label, s.rendered()), true));
+                self.notice = Some((changed_line(s, &s.rendered()), true));
                 self.edit = None;
             }
             Err(e) => self.notice = Some((e, false)),
@@ -541,7 +584,7 @@ impl SettingsPane {
     /// The open text field as the bottom line, or `None`.
     pub fn edit_line(&self) -> Option<Line<'static>> {
         let buf = self.edit.as_ref()?;
-        let label = settings::ALL.get(self.cursor).map_or("", |s| s.label);
+        let label = self.selected().map_or("", |s| s.label);
         Some(Line::from(vec![
             Span::styled(
                 format!(" {label}: "),
@@ -556,6 +599,15 @@ impl SettingsPane {
                 Style::default().fg(Color::DarkGray),
             ),
         ]))
+    }
+}
+
+/// What an accepted change says: the new value, and for a boot knob that
+/// it waits for the next start.
+fn changed_line(s: &settings::Setting, shown: &str) -> String {
+    match s.tier {
+        settings::Tier::Live => format!("{} → {shown}", s.label),
+        settings::Tier::Restart => format!("{} → {shown} (applies on restart)", s.label),
     }
 }
 
@@ -858,58 +910,123 @@ fn draw_health(f: &mut Frame, app: &App, area: Rect) {
 /// The settings list and the selected row's help: the dashboard's Settings
 /// tab and the home screen's.
 pub fn draw_settings(f: &mut Frame, app: &SettingsPane, area: Rect) {
-    let [list, detail] = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).areas(area);
+    let moves = crate::env_import::pending();
+    let movable = crate::env_import::movable(&moves).len();
+    let banner = u16::from(movable > 0 || app.confirm_import);
+    let [top, list, detail] = Layout::vertical([
+        Constraint::Length(banner),
+        Constraint::Min(3),
+        Constraint::Length(4),
+    ])
+    .areas(area);
+
+    // The `.env` pins, and the one action that moves them: the list first
+    // when asked, so nothing is rewritten unseen.
+    if app.confirm_import {
+        let names: Vec<String> = moves
+            .iter()
+            .map(|m| match &m.stored {
+                Ok(_) => m.env.to_string(),
+                Err(_) => format!("({} stays)", m.env),
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(format!(
+                " move {} into xfc settings (.env backed up, lines commented)? y moves, any other key keeps",
+                names.join(", ")
+            ))
+            .style(Style::default().fg(Color::Yellow)),
+            top,
+        );
+    } else if movable > 0 {
+        f.render_widget(
+            Paragraph::new(format!(
+                " {movable} setting(s) pinned by .env: m moves them into xfc settings"
+            ))
+            .style(Style::default().fg(Color::Yellow)),
+            top,
+        );
+    }
+
+    // The rows as drawn: a title line per section, then its settings.
+    enum Row {
+        Title(&'static str),
+        Knob(usize, &'static settings::Setting),
+    }
+    let ordered = settings::by_section();
+    let mut rows_all: Vec<Row> = Vec::new();
+    let mut last = None;
+    for (i, s) in ordered.iter().enumerate() {
+        if last != Some(s.section) {
+            rows_all.push(Row::Title(s.section.title()));
+            last = Some(s.section);
+        }
+        rows_all.push(Row::Knob(i, s));
+    }
+    let selected_row = rows_all
+        .iter()
+        .position(|r| matches!(r, Row::Knob(i, _) if *i == app.cursor))
+        .unwrap_or(0);
 
     // Keep the cursor on screen without a scrollbar: page the window so the
-    // selected row is always inside it.
+    // selected row is always inside it (its section title too when it fits).
     let rows = list.height.saturating_sub(2).max(1) as usize;
-    let start = app
-        .cursor
+    let start = selected_row
         .saturating_sub(rows.saturating_sub(1))
-        .min(settings::ALL.len().saturating_sub(rows));
+        .min(rows_all.len().saturating_sub(rows));
 
-    let items: Vec<ListItem> = settings::ALL
+    let items: Vec<ListItem> = rows_all
         .iter()
-        .enumerate()
         .skip(start)
         .take(rows)
-        .map(|(i, s)| {
-            let selected = i == app.cursor;
-            let pinned = s.env_pinned();
-            let label_style = if pinned {
-                Style::default().fg(Color::DarkGray)
-            } else if selected {
+        .map(|r| match r {
+            Row::Title(t) => ListItem::new(Line::from(Span::styled(
+                format!(" {t}"),
                 Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let mut spans = vec![
-                Span::styled(
-                    if selected { "› " } else { "  " },
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(format!("{:<20}", s.label), label_style),
-                Span::styled(
-                    format!("{:<12}", s.rendered()),
-                    if pinned {
-                        Style::default().fg(Color::DarkGray)
-                    } else {
-                        Style::default().fg(Color::Green)
-                    },
-                ),
-            ];
-            if pinned {
-                spans.push(Span::styled(
-                    format!("pinned by {}", s.env),
-                    Style::default().fg(Color::Yellow),
-                ));
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Row::Knob(i, s) => {
+                let selected = *i == app.cursor;
+                let pinned = s.env_pinned();
+                let label_style = if pinned {
+                    Style::default().fg(Color::DarkGray)
+                } else if selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let mut spans = vec![
+                    Span::styled(
+                        if selected { "› " } else { "  " },
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(format!("{:<22}", s.label), label_style),
+                    Span::styled(
+                        format!("{:<12}", s.rendered()),
+                        if pinned {
+                            Style::default().fg(Color::DarkGray)
+                        } else {
+                            Style::default().fg(Color::Green)
+                        },
+                    ),
+                ];
+                if pinned {
+                    spans.push(Span::styled(
+                        format!(" pinned by {}", s.env),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                if s.tier == settings::Tier::Restart {
+                    spans.push(Span::styled(" ⟳", Style::default().fg(Color::DarkGray)));
+                }
+                ListItem::new(Line::from(spans))
             }
-            ListItem::new(Line::from(spans))
         })
         .collect();
-    let title = if settings::ALL.len() > rows {
+    let title = if rows_all.len() > rows {
         format!(" settings · {}/{} ", app.cursor + 1, settings::ALL.len())
     } else {
         " settings ".to_string()
@@ -920,14 +1037,13 @@ pub fn draw_settings(f: &mut Frame, app: &SettingsPane, area: Rect) {
     );
 
     let mut lines = Vec::new();
-    if let Some(s) = settings::ALL.get(app.cursor) {
+    if let Some(s) = app.selected() {
         lines.push(Line::from(Span::styled(
             s.help,
             Style::default().fg(Color::White),
         )));
-        // When it takes effect, then where it lives. The first half stops
-        // being uniform as soon as the reload-tier knobs (voices, whisper, the
-        // station) arrive, which is why it is spelled out per row.
+        // When it takes effect, then where it lives: spelled out per row,
+        // since the boot knobs (⟳) wait for the next start.
         let mut provenance = vec![s.tier.describe().to_string()];
         if !s.env.is_empty() {
             provenance.push(s.env.to_string());
@@ -948,7 +1064,7 @@ pub fn draw_settings(f: &mut Frame, app: &SettingsPane, area: Rect) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" ←/→ change (text: edit) · ↑/↓ select "),
+                .title(" ←/→ change (text: edit) · ↑/↓ select · ⟳ applies on restart "),
         ),
         detail,
     );
@@ -1161,7 +1277,7 @@ mod tests {
         app.tab = Tab::Settings;
         let out = render(&app, 100, 24);
         assert!(out.contains("app mode"), "{out}");
-        assert!(out.contains(settings::ALL[0].help), "{out}");
+        assert!(out.contains(settings::by_section()[0].help), "{out}");
         assert!(out.contains("applies immediately"), "{out}");
         // Walking down past the end parks on the last row rather than running off.
         for _ in 0..settings::ALL.len() + 5 {
@@ -1170,7 +1286,7 @@ mod tests {
         assert_eq!(app.settings.cursor, settings::ALL.len() - 1);
         let out = render(&app, 100, 24);
         assert!(
-            out.contains(settings::ALL[settings::ALL.len() - 1].label),
+            out.contains(settings::by_section()[settings::ALL.len() - 1].label),
             "the last row must be visible once selected: {out}"
         );
     }
@@ -1179,7 +1295,7 @@ mod tests {
     /// screen teaches you to distrust it.
     #[test]
     fn a_pinned_setting_reports_its_refusal_on_screen() {
-        let s = settings::ALL
+        let s = settings::by_section()
             .iter()
             .position(|s| s.key == "atc_chatter")
             .expect("declared");
@@ -1205,7 +1321,7 @@ mod tests {
         let _guard = settings::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let i = settings::ALL
+        let i = settings::by_section()
             .iter()
             .position(|s| s.key == "callsign")
             .expect("declared");

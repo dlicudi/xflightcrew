@@ -339,7 +339,7 @@ fn setting_facts(s: &crate::settings::Setting) -> state::SettingFacts {
                 unit,
             },
             Kind::Choice(o) => state::SettingKind::Choice(o),
-            Kind::Text { .. } => state::SettingKind::Text,
+            Kind::Text { .. } | Kind::Path { .. } | Kind::Voice => state::SettingKind::Text,
         },
         value,
         shown: s.kind.render(&v),
@@ -503,7 +503,16 @@ fn gather(server: &Server) -> state::Facts {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone(),
-        settings: crate::settings::ALL.iter().map(setting_facts).collect(),
+        // The live knobs a page can edit as a field: a boot knob or a voice
+        // spec (no picker here) stays with the terminal.
+        settings: crate::settings::ALL
+            .iter()
+            .filter(|s| {
+                s.tier == crate::settings::Tier::Live
+                    && !matches!(s.kind, crate::settings::Kind::Voice)
+            })
+            .map(setting_facts)
+            .collect(),
         alerts: feed::alerts(),
         // A background line (a callout, the cabin) speaks without the loop's
         // own phase: the voice knows it is talking.

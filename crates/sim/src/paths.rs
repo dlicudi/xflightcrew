@@ -384,9 +384,13 @@ pub fn prefs_file() -> PathBuf {
     data().join("prefs.json")
 }
 
+/// A `.env` file's name: the data folder's ([`env_file`]) and the one
+/// dotenvy finds from the working directory up.
+pub const ENV_FILE_NAME: &str = ".env";
+
 /// The user's `.env` in the data folder.
 pub fn env_file() -> PathBuf {
-    data().join(".env")
+    data().join(ENV_FILE_NAME)
 }
 
 /// Where `xfc plugin install` backs up the plugin it replaces: one folder
