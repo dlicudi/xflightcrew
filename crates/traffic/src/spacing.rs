@@ -635,7 +635,7 @@ pub fn apply(
             .find(|&&p| dist_m(w[0], p) > 1.0)
             .map(|&p| bearing(w[0], p))
     });
-    let mut long: Vec<Option<Vec<LatLon>>> = fleet
+    let long: Vec<Option<Vec<LatLon>>> = fleet
         .iter()
         .map(|a| route_ahead(a, MEETING_LOOKAHEAD_M))
         .collect();
