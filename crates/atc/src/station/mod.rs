@@ -24,7 +24,8 @@ use sim::xplane::SimView;
 // `party_line`'s accessors, never these statics.
 pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
-    AircraftState, ArrivalHandoff, FlightId, FlightStrip, IfrFlight, StripRef, ARRIVAL_PIN,
+    AircraftState, ArrivalHandoff, FlightId, FlightStrip, IfrFlight, RunwayTimes, SpokenOrder,
+    StripRef, ARRIVAL_PIN,
     GO_AROUND_ORDERS,
     OWN_STRIP, PENDING_STATION, STRIPS, traffic_strip, traffic_strips,
     REGION_HANDOFF,
@@ -595,3 +596,6 @@ mod arrival_tests;
 
 #[cfg(test)]
 mod positions_tests;
+
+#[cfg(test)]
+mod sequence_tests;

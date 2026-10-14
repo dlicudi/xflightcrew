@@ -1054,6 +1054,23 @@ impl Link {
         // is released and calls.
         for ac in self.fleet.aircraft().iter().filter(|a| !a.dormant()) {
             crate::world::note_traffic_state(ac.id, aircraft_state(ac, now));
+            // Its place at the runway, for the station's landing sequence.
+            let dist_m = ac
+                .route
+                .thr_idx
+                .map(|i| ac.route.dist_to(ac.kin.pos(), i));
+            let times = ac.slot().filter(|_| !ac.kin.on_ground).and_then(|slot| {
+                runway_times(
+                    &self.fleet.field,
+                    &slot,
+                    ac.kin.pos(),
+                    dist_m,
+                    &ac.callsign,
+                    Some(&ac.icao_type),
+                    now,
+                )
+            });
+            crate::world::note_traffic_times(ac.id, times);
         }
         self.noted = self
             .fleet
@@ -1765,6 +1782,37 @@ pub(crate) fn own_arrival(
     })
 }
 
+/// A slot as the station's runway times: its landing end (the field's end
+/// whose threshold it is), its times and its distance to go. `None` over
+/// the threshold or for a threshold the field has no end at.
+pub(crate) fn runway_times(
+    field: &FieldModel,
+    slot: &traffic::slot::RunwaySlot,
+    pos: traffic::LatLon,
+    dist_m: Option<f64>,
+    callsign: &str,
+    icao_type: Option<&str>,
+    at: Instant,
+) -> Option<crate::party_line::RunwayTimes> {
+    if slot.to_thr_s <= 0.0 {
+        return None;
+    }
+    let end = field
+        .ends()
+        .into_iter()
+        .find(|e| traffic::kin::dist_m(e.thr, slot.thr) < 1.0)?;
+    let dist_m = dist_m.unwrap_or_else(|| traffic::kin::dist_m(pos, end.thr));
+    Some(crate::party_line::RunwayTimes {
+        runway: end.ident,
+        to_thr_s: slot.to_thr_s,
+        clear_s: slot.clear_s,
+        dist_nm: dist_m / 1852.0,
+        callsign: callsign.to_string(),
+        icao_type: icao_type.map(str::to_string),
+        at,
+    })
+}
+
 /// Our type for the traffic's runway time: the live profile's ICAO type
 /// where the traffic's tables know it, else by the profile's class (an
 /// approach at 100 kt or more flies as a medium jet, slower as a piston
@@ -2125,6 +2173,20 @@ impl TrafficWorld {
             own.slot = arrival
                 .as_ref()
                 .and_then(|a| traffic::slot::own_slot(&link.fleet().field, a));
+            // ...and the same place for the station's landing sequence.
+            let times = own.slot.filter(|_| !own.on_ground).and_then(|slot| {
+                let field = &link.fleet().field;
+                let pos = (own.lat, own.lon);
+                let end = arrival.as_ref().and_then(|a| field.end(&a.runway))?;
+                let dist_m = match arrival.as_ref().and_then(|a| a.join_m) {
+                    Some(j) if -end.frame(pos).0 > j => {
+                        traffic::kin::dist_m(pos, end.at(-j, 0.0)) + j
+                    }
+                    _ => traffic::kin::dist_m(pos, end.thr),
+                };
+                runway_times(field, &slot, pos, Some(dist_m), OWN_KEY, Some(&own_icao_type()), now)
+            });
+            crate::world::note_own_times(times);
         }
         // Our position for the tower's book, which asks for a traffic
         // flight's holds without it: how far out our landing clearance is.

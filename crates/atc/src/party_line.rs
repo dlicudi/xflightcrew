@@ -259,6 +259,11 @@ flight_strip! {
             /// the line-up took the nearest end and lined the Evolution up on LILB 21
             /// for a route planned to 03 (2026-09-25).
             self_taxi: Mutex<Option<String>> = Mutex::new(None),
+            /// The landing sequence as it was last SPOKEN to us (approach's
+            /// "number two, following ...", the tower's): an order once
+            /// said holds unless the gap reverses by more than
+            /// `station::SEQUENCE_REVERSE_S` (`station::own_ahead`).
+            arrival_order: Mutex<Option<SpokenOrder>> = Mutex::new(None),
         },
         /// The FLIGHT's, carried across a region handoff: reset by `uninstall`
         /// and `retire_for_new_flight`, never by `install` (the main loop installs
@@ -307,6 +312,12 @@ flight_strip! {
             /// the traffic link (`world::note_own_state`) for the queries that
             /// ask without our state; a query handed our state uses that.
             seen: Mutex<Option<AircraftState>> = Mutex::new(None),
+            /// This flight's place at its landing runway as its producer
+            /// works it out (the traffic's slot rule, ours included:
+            /// `world::note_traffic_times`, `world::note_own_times`): the
+            /// landing sequence is computed from these every time it is
+            /// asked (`station::landing_sequence`), never stored.
+            runway_times: Mutex<Option<RunwayTimes>> = Mutex::new(None),
         },
     }
 }
@@ -419,6 +430,36 @@ impl AircraftState {
             at: Instant::now(),
         }
     }
+}
+
+/// One flight's place at its landing runway, as its producer worked it out
+/// (2026-10-14, arrival sequencing): the traffic's own slot rule, our
+/// aircraft's through the same rule. Data only; the station orders the
+/// landing sequence from it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunwayTimes {
+    /// The landing END ("13").
+    pub runway: String,
+    /// Seconds to the threshold along the path it flies.
+    pub to_thr_s: f64,
+    /// Seconds until it is off the runway again.
+    pub clear_s: f64,
+    /// Its distance to the threshold along that path, nm.
+    pub dist_nm: f64,
+    /// Its raw callsign.
+    pub callsign: String,
+    /// Its ICAO type designator, when known.
+    pub icao_type: Option<String>,
+    /// When it was worked out.
+    pub at: Instant,
+}
+
+/// The landing sequence as it was spoken to one flight: its runway and the
+/// flights it was told were ahead of it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SpokenOrder {
+    pub runway: String,
+    pub ahead: std::collections::BTreeSet<FlightId>,
 }
 
 /// Which flight a strip is: OUR aircraft, or a traffic strip by its stable
@@ -1120,8 +1161,9 @@ pub use crate::station::{
 /// - Our own traffic, the ONE way the crew sees it: `traffic_picture`; the
 ///   installed field it flies at: `installed_icao`.
 /// - Our arrival as the station has armed it, for the traffic link to put
-///   our slot in the traffic's picture: `own_arrival_plan`.
-pub use crate::station::{own_arrival_plan, OwnArrivalPlan};
+///   our slot in the traffic's picture: `own_arrival_plan`; our place in
+///   the landing sequence it computes: `own_number`, `own_leader`.
+pub use crate::station::{own_arrival_plan, own_leader, own_number, OwnArrivalPlan};
 pub use crate::station::{
     active_field, active_icao, active_station_in_range, active_station_range_nm, climb_announced,
     coach_query, coach_yes_no, departure_station, dialect_for, field_position, field_under,
