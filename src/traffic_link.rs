@@ -494,6 +494,40 @@ pub(crate) struct Link {
     /// The whole flight of each arrival the simulation took from the model,
     /// by id: its origin's times for the EFB's card.
     entered: HashMap<u32, (String, traffic::track::Whole)>,
+    /// A route table's timetable: what it was planned with, so a jump of
+    /// the sim's clock plans it again ([`Link::reanchor`]); `None` for a
+    /// generated schedule or the pilot's file.
+    timetable: Option<Timetable>,
+}
+
+/// What a timetable link was planned with (`timetable_start`): its density,
+/// seed and the date its board's local seconds count from.
+#[derive(Debug, Clone, Copy)]
+struct Timetable {
+    density: traffic::Density,
+    seed: u64,
+    date: traffic::rotation::Date,
+}
+
+/// The sim's clock and the timetable's may part by this much, seconds,
+/// before the timetable is planned again: a sim time or date change, never
+/// the drift of a paused or fast-forwarded spell's few seconds.
+pub(crate) const CLOCK_JUMP_S: f64 = 600.0;
+
+/// How often the sim's clock is compared with the timetables'.
+const CLOCK_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Seconds the sim's local clock (`now_date`, `now_local_s`) runs ahead of
+/// a timetable's (`expected_local_s` after `ref_date`'s midnight); negative
+/// behind. Pure.
+pub(crate) fn clock_jump_s(
+    ref_date: traffic::rotation::Date,
+    expected_local_s: f64,
+    now_date: traffic::rotation::Date,
+    now_local_s: f64,
+) -> f64 {
+    let days = (now_date.epoch_days() - ref_date.epoch_days()) as f64;
+    now_local_s + days * 86_400.0 - expected_local_s
 }
 
 /// Traffic ids from ONE counter for every field's fleet (multi-field
@@ -610,6 +644,7 @@ impl Link {
             model_s: f64::NEG_INFINITY,
             summer: true,
             entered: HashMap::new(),
+            timetable: None,
         }
     }
 
@@ -927,6 +962,59 @@ impl Link {
                 self.actual.entry(a.callsign.clone()).or_insert(now);
             }
         }
+    }
+
+    /// The sim's clock jumped (LXGB 2026-10-14: a timetable planned at 21:31
+    /// local held only the next morning's flights when the sim was moved to
+    /// 11:05): the timetable is planned again from the new clock, its
+    /// waiting movements replaced by the new plan's still to come and its
+    /// board renewed. Never a reinstall: what flies stays flying (a
+    /// callsign already flying is not spawned twice) and an aircraft parked
+    /// for its departure keeps its release. `None` when nothing to re-plan.
+    fn reanchor(
+        &mut self,
+        table: &traffic::routes::FieldRoutes,
+        zulu_s: f64,
+        day: Option<u32>,
+        runway: Option<String>,
+    ) -> Option<usize> {
+        let tt = self.timetable?;
+        let (date, _, _) = timetable_clock(table, Some(zulu_s), day);
+        let (schedule, board, local_s) = timetable_start(
+            &self.fleet.field,
+            table,
+            tt.density,
+            tt.seed,
+            Some(zulu_s),
+            day,
+            runway,
+        );
+        let flying: std::collections::HashSet<&str> = self
+            .fleet
+            .aircraft()
+            .iter()
+            .map(|a| a.callsign.as_str())
+            .collect();
+        // Only the flights still to come: the plan's placed ones (in motion
+        // at its start, `Start`) and its parked fill belong to a fresh field.
+        let ahead: Vec<Movement> = schedule
+            .into_iter()
+            .filter(|m| {
+                m.kind != MovementKind::Parked
+                    && !m.parked_from_start
+                    && m.start.is_none()
+                    && !flying.contains(m.callsign.as_str())
+            })
+            .collect();
+        let n = ahead.len();
+        let now_s = self.fleet.clock.now_s();
+        self.due.retain(|d| d.held.is_some());
+        self.add_schedule(ahead, now_s);
+        self.set_board(board, local_s - now_s);
+        self.actual.clear();
+        self.set_summer(date.summer());
+        self.timetable = Some(Timetable { date, ..tt });
+        Some(n)
     }
 
     /// More movements, `offset_s` fleet seconds from the clock's start (the
@@ -1823,6 +1911,9 @@ pub(crate) struct TrafficWorld {
     /// The plugin has no field pick (an older one): not asked again before
     /// this.
     board_pick_quiet_until: Option<Instant>,
+    /// When the sim's clock was last compared with the timetables'
+    /// ([`TrafficWorld::follow_sim_clock`]).
+    clock_checked: Option<Instant>,
 }
 
 /// The draw cull's counts in the blackbox (`traffic` `draw`): simulated
@@ -2036,6 +2127,9 @@ impl TrafficWorld {
                 link.note_own_transmission(on);
             }
         }
+        if !fast {
+            self.follow_sim_clock(xp, &active, now).await;
+        }
         let mut station_out = None;
         let fields: Vec<String> = self.links.keys().cloned().collect();
         for icao in fields {
@@ -2105,6 +2199,54 @@ impl TrafficWorld {
         self.note_efb_boards(now);
         self.note_efb_traffic(now);
         station_out
+    }
+
+    /// A timetable follows the sim's clock (#280): once a minute the sim's
+    /// date and zulu time are read and each timetable link whose clock has
+    /// parted from them by [`CLOCK_JUMP_S`] is planned again
+    /// ([`Link::reanchor`]). Not while the fleets are frozen: the check
+    /// after a fast spell catches the field up to the sim.
+    async fn follow_sim_clock(
+        &mut self,
+        xp: &crate::xplane::XPlaneClient,
+        active: &str,
+        now: Instant,
+    ) {
+        if self.clock_checked.is_some_and(|t| now.duration_since(t) < CLOCK_CHECK_EVERY) {
+            return;
+        }
+        if !self.links.values().any(|l| l.timetable.is_some()) {
+            return;
+        }
+        self.clock_checked = Some(now);
+        let (zulu, day) = tokio::join!(sim_zulu_s(xp), sim_date_days(xp));
+        // A failed read is no measurement.
+        let Some(zulu) = zulu else { return };
+        for (icao, link) in self.links.iter_mut() {
+            let (Some(tt), Some(table)) = (link.timetable, traffic::routes::field_routes(icao))
+            else {
+                continue;
+            };
+            let (date, _, local_s) = timetable_clock(table, Some(zulu), day);
+            let jump = clock_jump_s(tt.date, link.local_now_s(), date, local_s);
+            if jump.abs() < CLOCK_JUMP_S {
+                continue;
+            }
+            let from = link.local_now_s();
+            let runway = if icao == active { station_runway() } else { None };
+            if let Some(n) = link.reanchor(table, zulu, day, runway) {
+                tracing::info!(%icao, jump_s = jump.round(), movements = n,
+                    "traffic: the sim's clock jumped; the timetable planned again");
+                crate::blackbox::record(
+                    "traffic",
+                    serde_json::json!({
+                        "event": "reanchored", "field": icao, "jump_s": jump.round(),
+                        "from_local_s": from.round(), "to_local_s": local_s.round(),
+                        "movements": n, "zulu_s": zulu,
+                    }),
+                );
+            }
+        }
     }
 
     /// The EFB's Map tab (2026-10-13): every simulated field's aircraft
@@ -2605,7 +2747,15 @@ fn build_link(
         link.set_board(flights, local_s);
     }
     if let Some(table) = table {
-        link.set_summer(timetable_clock(table, zulu_s, day).0.summer());
+        let date = timetable_clock(table, zulu_s, day).0;
+        link.set_summer(date.summer());
+        if source == "timetable" {
+            link.timetable = Some(Timetable {
+                density: traffic::Density::parse(density).unwrap_or(traffic::Density::Normal),
+                seed,
+                date,
+            });
+        }
     }
     Some(link)
 }

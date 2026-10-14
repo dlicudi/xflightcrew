@@ -1905,6 +1905,53 @@ fn ulmm_table() -> traffic::routes::FieldRoutes {
     }
 }
 
+/// A TIMETABLE FOLLOWS THE SIM'S CLOCK (#280, LXGB 2026-10-14): planned
+/// at 23:00 local it holds only tomorrow's flights; moved to 10:00 the same
+/// day, the re-plan's next flight comes within the hour's spacing, the
+/// board's clock reads the new time, and the next re-plan sees no jump.
+#[test]
+fn a_timetable_follows_a_jump_of_the_sims_clock() {
+    let table = ulmm_table();
+    let apt = format!("{}/ulmm.dat", fixtures());
+    let field = FieldModel::load(&apt, "ULMM").unwrap().unwrap();
+    let date = traffic::rotation::Date::ymd(2026, 7, 14);
+    // UTC+3 in summer is +4: 23:00 local is 19:00 zulu, 10:00 is 06:00.
+    let (late, board, local_s) = timetable_start(
+        &field,
+        &table,
+        Density::Normal,
+        7,
+        Some(19.0 * 3600.0),
+        Some(date.ordinal),
+        None,
+    );
+    let mut link = Link::new(field, late, "");
+    link.set_board(board, local_s);
+    link.timetable = Some(Timetable { density: Density::Normal, seed: 7, date });
+    let first = |l: &Link| l.due.iter().map(|d| d.at_s).fold(f64::INFINITY, f64::min);
+    assert!(first(&link) > 6.0 * 3600.0, "at 23:00 only tomorrow's: {}", first(&link));
+
+    let (now_date, _, now_local) = timetable_clock(&table, Some(6.0 * 3600.0), Some(date.ordinal));
+    let jump = clock_jump_s(date, link.local_now_s(), now_date, now_local);
+    assert!((jump + 13.0 * 3600.0).abs() < 1.0, "13 h back: {jump}");
+
+    let n = link.reanchor(&table, 6.0 * 3600.0, Some(date.ordinal), None).unwrap();
+    assert!(n > 0 && link.pending() >= n);
+    assert!(first(&link) < 3.0 * 3600.0, "the morning's flights: {}", first(&link));
+    assert!((link.local_now_s() - 10.0 * 3600.0).abs() < 1.0);
+    let again = clock_jump_s(link.timetable.unwrap().date, link.local_now_s(), now_date, now_local);
+    assert!(again.abs() < CLOCK_JUMP_S, "no jump after the re-plan: {again}");
+}
+
+/// The jump across midnight counts the days: 23:50 to 00:10 the next day
+/// is 20 minutes, never a day back.
+#[test]
+fn a_clock_jump_counts_the_days() {
+    let d = traffic::rotation::Date::ymd(2026, 10, 13);
+    let j = clock_jump_s(d, 23.0 * 3600.0 + 50.0 * 60.0, d.plus(1), 10.0 * 60.0);
+    assert!((j - 1200.0).abs() < 1e-6, "{j}");
+}
+
 /// ONE COUNTER, NO CLASHES (multi-field traffic stage 2, 2026-10-13): two
 /// fleets sharing the world's ids hand out every id once, whichever takes
 /// first; a counter of its own still starts at 1.
