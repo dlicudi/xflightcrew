@@ -294,14 +294,27 @@ seat_belt_signs:
 # leaves ALT for the base leg's descent (blackbox `circuit` `leg`: `ap_level`
 # true on the downwind, false with `vs_on` true on base).
 ap_altitude_capture: true
-# The thrust levers' A/THR instinctive disconnect (A333.autopilot.lua: it
-# fires autothrottle_hard_off, autothrottle_enabled -1). The stock
-# autothrottle_off leaves it ARMED (0, probed parked 2026-10-14), and the
-# script keeps an armed A/THR the FADEC's: twice airborne the governor's
-# take "would not stay off" (#295). VERIFY airborne: `autoflight`
-# `thrust_taken` `at_mode` then no `thrust_not_taken`.
+# The A/THR flies the speed, as an Airbus crew has it (#295). The lever
+# detents are the .acf's `_fadec_tla`: TOGA 1.0, FLX/MCT 0.76, CL 0.53. The
+# A333 script (A333.autopilot.lua `A333_autothrust`) re-arms the A/THR
+# (autothrottle_enabled 0) every frame with both levers at FLX/MCT or above,
+# and the sim makes an armed A/THR active back in CL: our continuous lever
+# at 1.0 re-armed it, so the governor's take "would not stay off" three
+# sorties running, one before a +7,383 fpm climb. So with `athr_cl_detent`
+# the speed governor's airborne hold sets the target on the FCU, puts the
+# levers IN the CL detent, reads the A/THR back active and stands aside
+# (src/tools/speedhold.rs `athr_tick`, ap_lands::AtSpeed); an A/THR that
+# drops out or does not hold the speed for 30 s is our lever again, said
+# once, kept below CL, so a disconnected A/THR is never re-armed by it.
+# `autothrottle_off_command` is the levers' instinctive disconnect (it fires
+# autothrottle_hard_off, -1): the stock autothrottle_off leaves it ARMED (0,
+# probed parked 2026-10-14), which the script keeps the FADEC's. VERIFY
+# airborne: `speedhold` `athr` `at_speed` with `at_mode` 1 and `fadec` [1, 1]
+# after the governor arms, `held` records with `lever` 0.53 throughout, no
+# `autoflight` `thrust_not_taken`.
 autoflight:
   autothrottle_off_command: laminar/A333/autopilot/a_thr_off_eng1
+  athr_cl_detent: 0.53
 takeoff_config:
   arm_spoilers: true
   autobrake_rto: true
@@ -313,10 +326,17 @@ takeoff_config:
   # "flight directors on" and "V2 153 set", or "Check ..." if they did not
   # take. NOT declared here: the autothrust arm (A333.autopilot.lua sets
   # autothrottle_enabled from the lever detents' FADEC mode every frame, so a
-  # write is its output) and the thrust reduction (the lever positions of
-  # its CL and FLX detents are the script's, unprobed).
+  # write is its output).
   flight_directors: true
   v2_kts: 153.0
+  # The Airbus thrust reduction: the levers to the CL detent at 1,500 ft
+  # (the default THR RED ALT), where the A/THR the FLX/TOGA levers armed goes
+  # active and holds the FCU speed; the takeoff's thrust watch stands aside
+  # (autotakeoff::takeoff_watch_reads). The climb lever IS `athr_cl_detent`
+  # (pinned by a test). VERIFY: `autotakeoff` `thrust_reduction` `to` 0.53,
+  # no `autoflight` `thrust_taken` `owner` autotakeoff after it.
+  thrust_reduction_agl_ft: 1500.0
+  climb_thrust_ratio: 0.53
 # Clean stall from the acf at a mid weight. 1.2 x this (210) is the floor any
 # handed-down target is raised to; the derived approach speed is max(1.3 Vso,
 # 1.2 Vs) so a clean floor never lands the aircraft fast on its own.

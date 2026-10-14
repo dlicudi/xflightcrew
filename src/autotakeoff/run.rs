@@ -606,7 +606,11 @@ pub(super) async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
         // the configuration's, never touched) is taken out and said once.
         {
             let panel_reads: Vec<Option<f64>> = extra.map(|r| r.ok()).collect();
-            let engaged = af_panel.tick_from(&panel_reads).at_engaged;
+            let engaged = takeoff_watch_reads(
+                af_panel.tick_from(&panel_reads).at_engaged,
+                reduced,
+                crate::aircraft::athr_cl_detent(),
+            );
             let step = thrust_watch.step(thrust_t0.elapsed().as_secs_f64(), engaged);
             if let Some(line) = autoflight::act_thrust(&xp, step, "autotakeoff").await {
                 alert(&voice, Priority::Caution, line);

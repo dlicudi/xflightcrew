@@ -966,7 +966,8 @@ mod tests {
             !a.autothrottle_armed,
             "the A330's script arms it from the levers"
         );
-        assert!(a.thrust_reduction_agl_ft.is_none());
+        // The Airbus reduction: the levers to CL at 1,500 ft (#295).
+        assert_eq!(a.thrust_reduction_agl_ft, Some(1500.0));
         assert!(!a.references().contains(&AT_MODE));
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         publish(Some(b));
@@ -978,7 +979,13 @@ mod tests {
             })
         );
         publish(Some(a));
-        assert_eq!(thrust_reduction(), None);
+        assert_eq!(
+            thrust_reduction(),
+            Some(ThrustReduction {
+                agl_ft: 1500.0,
+                lever: 0.53
+            })
+        );
         publish(None);
         assert_eq!(thrust_reduction(), None);
     }

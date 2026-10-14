@@ -4266,6 +4266,27 @@
         assert_eq!(law.target_deg(), ROTATE_PITCH_DEG);
     }
 
+    /// #295: the A330's thrust reduction puts its levers IN the CL detent
+    /// (its climb lever IS `athr_cl_detent`), and from then on the A/THR the
+    /// FLX/TOGA levers armed, active there, is the climb's: the takeoff's
+    /// thrust watch stands aside. Before the reduction, and on every airframe
+    /// without the detent, the watch reads as ever.
+    #[test]
+    fn the_a330_reduction_hands_the_climb_to_its_athr_in_cl() {
+        let p = crate::aircraft::load("airbus_a330_300").expect("a330");
+        let d = p.autoflight.as_ref().and_then(|a| a.athr_cl_detent).expect("detent");
+        let tc = p.takeoff_config.as_ref().expect("takeoff_config");
+        assert_eq!(tc.climb_thrust_ratio, Some(d), "the climb lever is the CL detent");
+        let agl_ft = tc.thrust_reduction_agl_ft.expect("reduction height");
+        let r = Some(crate::takeoff_config::ThrustReduction { agl_ft, lever: d });
+        assert_eq!(thrust_reduced(1.0, true, agl_ft, r), (d, true));
+        assert_eq!(thrust_reduced(1.0, true, agl_ft - 1.0, r), (1.0, false));
+        assert_eq!(takeoff_watch_reads(Some(true), true, Some(d)), None);
+        assert_eq!(takeoff_watch_reads(Some(true), false, Some(d)), Some(true));
+        assert_eq!(takeoff_watch_reads(Some(true), true, None), Some(true));
+        assert_eq!(takeoff_watch_reads(None, false, None), None);
+    }
+
     /// #91: thrust comes back to the declared climb lever at the reduction
     /// height, airborne only, at a crew's pace; every other release (the
     /// swinging-nose hold, the overspeed guard) stays instant, and a silent

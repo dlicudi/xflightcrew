@@ -81,6 +81,19 @@ pub fn thrust_reduced(
     }
 }
 
+/// What the takeoff's thrust watch reads: once the reduction has put a
+/// lever-driven A/THR's levers in CL (`autoflight.athr_cl_detent`, the
+/// A330's climb lever IS its CL detent), the active A/THR is the climb's,
+/// the Airbus handover, never taken out; elsewhere, and before it, the
+/// watch as ever. Pure.
+pub fn takeoff_watch_reads(engaged: Option<bool>, reduced: bool, athr_cl_detent: Option<f64>) -> Option<bool> {
+    if reduced && athr_cl_detent.is_some() {
+        None
+    } else {
+        engaged
+    }
+}
+
 /// A reduction comes back at this rate, lever per second: the way a crew
 /// pulls to climb thrust, not a step the pitch has to answer at once.
 pub const THRUST_REDUCE_PER_S: f64 = 0.1;

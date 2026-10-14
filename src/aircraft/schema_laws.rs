@@ -214,6 +214,14 @@ pub struct AutoflightProfile {
     /// `autothrottle`). `None` is the stock `autothrottle_on`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed_command: Option<String>,
+    /// The thrust levers' CL detent (ratio) on an airframe whose A/THR is
+    /// LEVER-driven, Airbus style: the `.acf`'s lowest `_fadec_tla`. Levers
+    /// in CL with the A/THR armed make it active; levers at FLX/MCT or TOGA
+    /// re-arm it (the A333 script). Declared, the speed governor flies an
+    /// airborne speed on the A/THR (`speedhold` `athr`) and its own lever,
+    /// the fallback, stays below this detent. `None`: the levers are ours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub athr_cl_detent: Option<f64>,
 }
 
 /// The mode lamps of a panel whose MCP is not the stock autopilot's
@@ -541,6 +549,15 @@ impl SpeedGovernorProfile {
 /// The live airframe's speed governor, when declared and sane.
 pub fn speed_governor() -> Option<SpeedGovernorProfile> {
     live_profile().and_then(|p| p.speed_governor).and_then(SpeedGovernorProfile::valid)
+}
+
+/// The live airframe's lever-driven A/THR CL detent
+/// (`autoflight.athr_cl_detent`), when declared and a lever ratio inside
+/// the travel.
+pub fn athr_cl_detent() -> Option<f64> {
+    live_profile()
+        .and_then(|p| p.autoflight.as_ref().and_then(|a| a.athr_cl_detent))
+        .filter(|d| d.is_finite() && *d > 0.1 && *d < 0.95)
 }
 
 /// The rotation's elevator on the wheels (`autotakeoff::RotatePitch`),

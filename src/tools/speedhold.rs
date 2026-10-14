@@ -441,6 +441,169 @@ const DEEP_PULL_MAX: f64 = 2.0;
 /// climb limiter's and altitude capture's leads.
 const THROTTLE_LEAD_S: f64 = 5.0;
 
+// ---------------------------------------------------------------------------
+// A lever-driven A/THR (`autoflight.athr_cl_detent`, the A330).
+// ---------------------------------------------------------------------------
+//
+// An Airbus crew flies the speed on the A/THR: the target on the FCU, the
+// levers IN the CL detent. Our continuous lever fought it on the A330
+// (#295): the governor's lever at 1.0 is the TOGA detent, where the A333
+// script re-arms the A/THR every frame (`A333_autothrust`: both FADEC modes
+// at 2 or more force `autothrottle_enabled` 0), and back in the CL range the
+// sim made the armed A/THR active, so every take came back ("won't stay
+// off", three sorties, one a +7,383 fpm climb). So on that airframe the
+// governor's airborne hold is the A/THR's (`ap_lands::AtSpeed`, the Zibo's
+// approach machine), watched; and our lever, the fallback, never reaches
+// the CL detent, so a disconnected A/THR can never be re-armed by it.
+
+/// The FADEC's lever mode per engine: on the tape beside the lever.
+const FADEC_MODE: &str = crate::datarefs::FADEC_MODE;
+/// Our own lever stays this far below the CL detent (ratio).
+const ATHR_MANUAL_MARGIN: f64 = 0.02;
+/// The levers read IN the detent within this (ratio).
+const ATHR_DETENT_TOL: f64 = 0.005;
+/// The A/T is astray with its projection (the governor's lead) further than
+/// this off the target, knots: past it our own law would act at its urgent
+/// rate.
+pub const ATHR_BAND_KTS: f64 = 10.0;
+/// ...unless the speed closes on the target at least this fast, knots per
+/// second: an accelerating A/THR is holding a new target, not losing it.
+pub const ATHR_CLOSING_KTS_S: f64 = 0.3;
+/// A held A/THR is on the tape this often, seconds.
+const ATHR_HELD_LOG_S: f64 = 15.0;
+
+/// The top of our own lever: below the CL detent on a lever-driven A/THR,
+/// `None` (the whole travel) elsewhere. Pure.
+pub fn manual_lever_cap(cl_detent: Option<f64>) -> Option<f64> {
+    cl_detent.map(|d| d - ATHR_MANUAL_MARGIN)
+}
+
+/// The lever our law writes this tick, from the lever read and the law's
+/// adjustment, within the cap: `None` writes nothing (in the groove, under
+/// the cap). A lever found above the cap is brought under it. Without a cap
+/// exactly the old rule. Pure.
+pub fn governor_lever(thr: f64, adj: f64, cap: Option<f64>) -> Option<f64> {
+    let top = cap.unwrap_or(1.0);
+    if adj == 0.0 && cap.is_none_or(|c| thr <= c) {
+        return None;
+    }
+    Some((thr + adj).clamp(0.0, top))
+}
+
+/// The A/THR is not holding the speed this tick: projected (the governor's
+/// own lead) further than [`ATHR_BAND_KTS`] off the target, and not closing
+/// on it at [`ATHR_CLOSING_KTS_S`]. Pure.
+pub fn athr_astray(err_kts: f64, trend_kts_s: f64, lead_s: f64) -> bool {
+    let proj = err_kts - trend_kts_s * lead_s;
+    proj.abs() > ATHR_BAND_KTS && err_kts.signum() * trend_kts_s < ATHR_CLOSING_KTS_S
+}
+
+/// One tick's A/THR reads.
+#[derive(Debug, Default)]
+struct AthrReads {
+    at_on: Option<f64>,
+    at_mode: Option<f64>,
+    window: Option<f64>,
+    fadec: Option<Vec<f64>>,
+}
+
+async fn read_athr(xp: &XPlaneClient) -> AthrReads {
+    use crate::autoflight::{names, Dial};
+    let (on, mode, window, fadec) = tokio::join!(
+        xp.get_float(names::AT_ON),
+        xp.get_float(names::AT_MODE),
+        crate::autoflight::read_dial(xp, Dial::AirspeedKts),
+        xp.get_float_array(FADEC_MODE),
+    );
+    let fin = |r: anyhow::Result<f64>| r.ok().filter(|v| v.is_finite());
+    AthrReads {
+        at_on: fin(on),
+        at_mode: fin(mode),
+        window: fin(window),
+        fadec: fadec.ok(),
+    }
+}
+
+/// The governor's A/THR hold across ticks.
+#[derive(Debug, Default)]
+struct AthrHold {
+    at: crate::ap_lands::AtSpeed,
+    window_last: Option<f64>,
+    logged_s: Option<f64>,
+}
+
+/// One tick's flight facts for [`athr_tick`].
+struct AthrTick {
+    target: f64,
+    ias: f64,
+    trend: f64,
+    thr: f64,
+    on_ground: Option<bool>,
+    now_s: f64,
+}
+
+/// The A/THR's tick: engaged (armed from hard off, the window on the target,
+/// the levers put IN the CL detent `d`, SPEED pressed if it does not go
+/// active), then watched; let go loudly to our lever law. Returns whether
+/// the A/THR has the speed this tick (our lever law and the thrust watch
+/// stand aside). Taped `speedhold` `athr`.
+async fn athr_tick(
+    xp: &XPlaneClient,
+    voice: &Option<crate::voice::Voice>,
+    h: &mut AthrHold,
+    d: f64,
+    r: &AthrReads,
+    t: AthrTick,
+) -> bool {
+    use crate::autoflight::{Button, Dial};
+    let lead = crate::aircraft::speed_governor().map_or(THROTTLE_LEAD_S, |g| g.lead_s);
+    let astray = athr_astray(t.target - t.ias, t.trend, lead);
+    let before = h.at;
+    let o = h.at.step(crate::ap_lands::AtIn {
+        wanted: t.on_ground != Some(true),
+        engaged: crate::autoflight::autothrottle_engaged(r.at_on, r.at_mode),
+        window_kts: r.window,
+        want_kts: t.target,
+        now_s: t.now_s,
+        astray,
+    });
+    let armed = if o.arm_switch {
+        crate::autoflight::arm_autothrottle(xp, "speed_governor").await
+    } else {
+        None
+    };
+    if let Some(w) = o.set_window {
+        let _ = crate::autoflight::set_dial_confirmed("speedhold", xp, Dial::AirspeedKts, w, &mut h.window_last, 1.0)
+            .await;
+    }
+    if o.press_speed {
+        crate::autoflight::press_logged(xp, Button::Speed, "speed_governor").await;
+    }
+    let engaging = matches!(h.at, crate::ap_lands::AtSpeed::Engaging { .. });
+    let lever_set = engaging && (t.thr - d).abs() > ATHR_DETENT_TOL;
+    if lever_set {
+        glide(xp, &throttle_dataref(), d, 200).await;
+    }
+    if let Some(line) = o.say {
+        if let Some(v) = voice {
+            v.alert(crate::voice::Priority::Caution, line);
+        }
+    }
+    let held_due = h.at.flies() && h.logged_s.is_none_or(|s| t.now_s - s >= ATHR_HELD_LOG_S);
+    if h.at != before || o.event.is_some() || held_due {
+        h.logged_s = Some(t.now_s);
+        crate::blackbox::record(
+            "speedhold",
+            json!({"event": "athr", "what": o.event.unwrap_or("held"), "from": before.word(),
+                   "to": h.at.word(), "want": t.target, "ias": t.ias, "trend": t.trend,
+                   "astray": astray, "window": r.window, "at_on": r.at_on, "at_mode": r.at_mode,
+                   "lever": t.thr, "lever_set": lever_set, "detent": d, "fadec": r.fadec,
+                   "armed": armed}),
+        );
+    }
+    h.at.quiets_thrust_watch()
+}
+
 /// The governor's ceiling for an airframe that declares no Vne. The same
 /// number as [`BELOW_10K_LIMIT_KTS`] by history, not by meaning: that one is
 /// airspace, this one is an unknown airframe (refactor audit 2026-10-04,
@@ -1217,6 +1380,8 @@ async fn governor(
     // ENGAGED autothrottle moves them, which the override check below would
     // read as the pilot's hand and stand down on.
     let mut thrust_watch = crate::autoflight::ThrustWatch::default();
+    // A lever-driven A/THR's hold (`athr_tick`), on that airframe alone.
+    let mut athr = AthrHold::default();
     loop {
         if !run.live() {
             break;
@@ -1268,11 +1433,21 @@ async fn governor(
         match mode {
             Mode::Flight => {
                 let thr_name = throttle_dataref();
-                let (ias_r, thr_r, engaged) = tokio::join!(
+                let detent = crate::aircraft::athr_cl_detent();
+                let (ias_r, thr_r, engaged, at_reads) = tokio::join!(
                     xp.get_float(IAS),
                     xp.get_float(&thr_name),
                     crate::autoflight::read_autothrottle_engaged(&xp),
+                    async {
+                        match detent {
+                            Some(_) => Some(read_athr(&xp).await),
+                            None => None,
+                        }
+                    },
                 );
+                // The A/THR this hold engages is not taken out by its own
+                // watch; let go, it is watched as ever.
+                let engaged = if athr.at.quiets_thrust_watch() { None } else { engaged };
                 let step = thrust_watch.step(clock.elapsed().as_secs_f64(), engaged);
                 let took = matches!(step, crate::autoflight::ThrustStep::Take { .. });
                 if let Some(line) = crate::autoflight::act_thrust(&xp, step, "speed_governor").await {
@@ -1353,6 +1528,23 @@ async fn governor(
                     };
                     prev_ias = Some((ias, now_t));
                     *ACTUAL.lock().unwrap_or_else(|e| e.into_inner()) = ias;
+                    if let (Some(d), Some(r)) = (detent, &at_reads) {
+                        let tick = AthrTick {
+                            target,
+                            ias,
+                            trend,
+                            thr,
+                            on_ground,
+                            now_s: clock.elapsed().as_secs_f64(),
+                        };
+                        if athr_tick(&xp, &voice, &mut athr, d, r, tick).await {
+                            // The levers sit in the detent: moved off it is
+                            // a hand (the override check above).
+                            last_cmd = Some(d);
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            continue;
+                        }
+                    }
                     if let Some(line) =
                         idle_fast.tick(clock.elapsed().as_secs_f64(), ias, target, thr, trend)
                     {
@@ -1365,16 +1557,14 @@ async fn governor(
                         }
                     }
                     let adj = throttle_adjust_live(target - ias, trend);
-                    if adj != 0.0 {
-                        let cmd = (thr + adj).clamp(0.0, 1.0);
+                    // Below a lever-driven A/THR's CL detent (`manual_lever_cap`).
+                    if let Some(cmd) = governor_lever(thr, adj, manual_lever_cap(detent)) {
                         glide(&xp, &throttle_dataref(), cmd, 200).await; // ~most of the tick
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        last_cmd = Some(cmd);
                     } else {
                         // In the groove: don't spin the API at 20 Hz doing nothing.
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    }
-                    if adj != 0.0 {
-                        last_cmd = Some((thr + adj).clamp(0.0, 1.0));
                     }
                 } else {
                     // Reads failed (sim hiccup): back off, don't spin.
@@ -1605,6 +1795,15 @@ async fn governor(
     // client refuses every write, and these are not the lever's law.
     let xp = xp.unscoped();
     life("governor_stopped");
+    // An A/THR holding the speed is left holding it (a disconnect with the
+    // levers in CL is a thrust step to climb); the next lever owner's thrust
+    // watch takes it out.
+    if athr.at.flies() {
+        crate::blackbox::record(
+            "speedhold",
+            json!({"event": "athr", "what": "left_active", "from": "ours", "to": "ours"}),
+        );
+    }
     // A lever left in beta goes back to idle: the next thing on this lever
     // may be a takeoff, and a roll must never start with the prop in beta.
     if crate::aircraft::taxi_beta_max().is_some() && last_cmd.is_some_and(|c| c < 0.0) {
@@ -1834,6 +2033,57 @@ mod tests {
         assert!(released < 0.4, "{released}");
         // Small trims pass through unslewed.
         assert_eq!(brake_slew(0.2, 0.22, 0.1), 0.22);
+    }
+
+    /// #295: on the A330 our own lever is the fallback under a lever-driven
+    /// A/THR and never reaches its CL detent (0.53, the `.acf`'s lowest
+    /// `_fadec_tla`): from anywhere on the travel, for any error and trend
+    /// its law answers, the lever written is under the detent, and one found
+    /// above it (FLX after a takeoff, TOGA after a go-around) is brought under
+    /// it even in the groove. Every other airframe: exactly the old rule.
+    #[test]
+    fn the_a330_lever_never_enters_the_cl_detent() {
+        let p = crate::aircraft::load("airbus_a330_300").expect("a330");
+        let d = p.autoflight.as_ref().and_then(|a| a.athr_cl_detent).expect("the A330 declares its CL detent");
+        assert!((d - 0.53).abs() < 1e-9);
+        let gov = p.speed_governor.and_then(crate::aircraft::SpeedGovernorProfile::valid);
+        let cap = super::manual_lever_cap(Some(d));
+        for i in 0..=100 {
+            let thr = i as f64 / 100.0;
+            for err in (-60..=60).step_by(3) {
+                for trend in [-4.0, -1.0, 0.0, 1.0, 4.0] {
+                    let adj = super::throttle_adjust_with(err as f64, trend, gov);
+                    match super::governor_lever(thr, adj, cap) {
+                        Some(cmd) => assert!(cmd < d && cmd >= 0.0, "thr {thr} err {err} -> {cmd}"),
+                        None => assert!(thr < d, "left at {thr} in the detent"),
+                    }
+                }
+            }
+        }
+        assert_eq!(super::governor_lever(0.76, 0.0, cap), cap, "FLX brought under CL in the groove");
+        // No detent: the old rule, byte for byte.
+        for (thr, adj) in [(0.4_f64, 0.0_f64), (0.4, 0.05), (0.98, 0.05), (0.02, -0.05), (1.0, 0.0)] {
+            let old = (adj != 0.0).then(|| (thr + adj).clamp(0.0, 1.0));
+            assert_eq!(super::governor_lever(thr, adj, None), old);
+        }
+        assert_eq!(super::manual_lever_cap(None), None);
+        let b738 = crate::aircraft::load("boeing_737_800").expect("737");
+        assert!(b738.autoflight.and_then(|a| a.athr_cl_detent).is_none());
+    }
+
+    /// The A/THR is astray only with its projection past the band AND the
+    /// speed not closing: accelerating through a new target is holding it.
+    #[test]
+    fn an_athr_is_astray_only_off_the_band_and_not_closing() {
+        use super::{athr_astray, ATHR_BAND_KTS};
+        let lead = 8.0;
+        assert!(!athr_astray(5.0, 0.0, lead), "inside the band");
+        assert!(!athr_astray(40.0, 1.0, lead), "accelerating toward a new target");
+        assert!(!athr_astray(-40.0, -1.0, lead), "slowing toward a new target");
+        assert!(athr_astray(ATHR_BAND_KTS + 1.0, 0.0, lead), "stuck slow");
+        assert!(athr_astray(20.0, -0.5, lead), "slowing away from it");
+        assert!(athr_astray(-15.0, 0.1, lead), "fast and not slowing");
+        assert!(athr_astray(4.0, -1.5, lead), "on speed but falling fast");
     }
 
     /// #169, LEMG 30 (sortie 1790633832-full_auto, 2026-09-28): the clean

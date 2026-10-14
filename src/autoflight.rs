@@ -1334,6 +1334,33 @@ pub async fn ensure_switch_on(xp: &dyn XPlane, p: &Panel, s: Switch, want: bool,
     Some(taken)
 }
 
+/// The autothrottle ARMED: the panel's declared arm switch
+/// ([`ensure_switch`]), else the stock mode read first and `autothrottle_arm`
+/// pressed only from HARD OFF (`autothrottle_enabled` -1: armed is 0,
+/// engaged above), read back after a settle. `None` unread, `Some(true)`
+/// armed or engaged (already, or now), `Some(false)` pressed and not taken.
+/// Taped `autoflight` `at_arm` when pressed.
+pub async fn arm_autothrottle(xp: &dyn XPlane, site: &str) -> Option<bool> {
+    let p = panel();
+    if p.switch(Switch::AutothrottleArm).is_some() {
+        return ensure_switch_on(xp, &p, Switch::AutothrottleArm, true, site).await;
+    }
+    let before = xp.get_float(names::AT_MODE).await.ok().filter(|v| v.is_finite())?;
+    if before > -0.5 {
+        return Some(true);
+    }
+    let sent = press_on(xp, &p, Button::AutothrottleArm).await.is_ok();
+    tokio::time::sleep(Duration::from_millis(SETTLE_MS)).await;
+    let after = xp.get_float(names::AT_MODE).await.ok();
+    let taken = after.is_some_and(|v| v > -0.5);
+    crate::blackbox::record(
+        "autoflight",
+        json!({"event": "at_arm", "site": site, "cmd": p.command(Button::AutothrottleArm),
+               "sent": sent, "before": before, "after": after, "taken": taken}),
+    );
+    Some(taken)
+}
+
 /// Press a button: the airframe's command for it. Routine presses (the
 /// knob's steps, a loop's re-engage every tick) are not taped here; the
 /// sites tape their own decisions, and the mode presses below are taped by

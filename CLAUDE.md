@@ -119,6 +119,13 @@ Rust tools; YAML is per-airframe config.
   `take_thrust`, `drop_thrust_now`, `arm_approach`. Its ledger (`ours_since`, `Ours`) answers "was
   this change ours?". **The thrust has one owner**: a loop flying the levers takes an ENGAGED A/T
   out to ARM (`ThrustWatch`).
+- **A lever-driven A/THR flies the speed, as an Airbus crew has it** (`autoflight:`
+  `athr_cl_detent`, the A330; `speedhold::athr_tick` on `ap_lands::AtSpeed`): the governor's
+  airborne hold sets the FCU window, puts the levers IN the CL detent, reads the A/THR back
+  active and stands aside, its thrust watch quiet; dropped out or astray 30 s (`athr_astray`), our
+  lever again, said once, kept BELOW CL (`manual_lever_cap`): our lever through FLX re-armed it
+  every frame (the A333 script) and three takes "would not stay off" (#295). The takeoff's
+  reduction puts the levers in CL and hands it the climb (`takeoff_watch_reads`).
 - Multi-engine tools take `engines`, read back the LAST element; singles stay byte-identical.
   `vyse_kts`, `vmca_kts` stay `None` on singles: say nothing rather than invent.
 - **An unknown type is never silently the 172** (an RV-10 stalled on its numbers):
