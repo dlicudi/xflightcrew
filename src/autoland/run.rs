@@ -2973,6 +2973,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         window_kts: r.speed_window,
                         want_kts: at_want,
                         now_s,
+                        astray: false,
                     });
                     if ao.arm_switch {
                         let armed = autoflight::ensure_switch(

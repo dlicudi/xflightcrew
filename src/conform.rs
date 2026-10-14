@@ -382,6 +382,8 @@ pub enum Step {
     Steer,
     Tiller,
     Throttle,
+    /// A lever-driven A/THR's CL detent (`autoflight.athr_cl_detent`).
+    Athr,
     Reverse,
     ParkBrake,
     /// A channel the profile does not declare: a SKIPPED row.
@@ -466,6 +468,9 @@ pub fn plan(p: &AircraftProfile, only: &[Area]) -> Vec<Step> {
         } else {
             skip("throttle", "no throttle declared")
         });
+        if p.throttle && p.autoflight.as_ref().is_some_and(|a| a.athr_cl_detent.is_some()) {
+            out.push(Step::Athr);
+        }
     }
     if want(Area::Reverse) {
         out.push(if p.reverse_thrust {
@@ -1195,6 +1200,84 @@ pub async fn probe_throttle(xp: &dyn XPlane, lever: &str, hardware: Option<&str>
     )
 }
 
+/// A lever-driven A/THR's CL detent: with the engines STOPPED only (climb
+/// thrust against the park brake is no parked check), the levers from idle
+/// into the declared detent, the FADEC's lever mode read with the A/THR's,
+/// and back. The detent is right when every engine reads CL (1) there.
+pub async fn probe_athr(xp: &dyn XPlane, lever: &str, detent: f64, engines: usize) -> Row {
+    let n = engines.max(1);
+    match engines_running(xp, n).await {
+        Some(false) => {}
+        Some(true) => {
+            return Row::skipped("athr", "engines running: the levers are not put in CL parked")
+        }
+        None => return Row::fail("athr", "no reading of the engines running"),
+    }
+    let Some(was) = read(xp, lever).await else {
+        return Row::fail("athr", format!("no reading of {lever}"));
+    };
+    if was > IDLE_MAX {
+        return Row::skipped("athr", format!("levers not at idle ({}): not moved", num(was)));
+    }
+    let _ = xp.set_float(lever, detent).await;
+    sleep_s(0.6).await;
+    let (at, fadec, at_mode) = tokio::join!(
+        read(xp, lever),
+        read_array(xp, crate::datarefs::FADEC_MODE),
+        read(xp, autoflight::names::AT_MODE),
+    );
+    let _ = xp.set_float(lever, was).await;
+    sleep_s(0.4).await;
+    let back = read(xp, lever).await;
+    Row::new(
+        "athr",
+        athr_detent_verdict(detent, at, fadec.as_deref(), n, was, back),
+        json!({"lever": lever, "detent": detent, "was": was, "at": at, "fadec": fadec,
+               "at_mode": at_mode, "back": back}),
+    )
+}
+
+/// The CL detent's verdict: the lever took the detent, the FADEC read CL
+/// (1) on each of the first `n` engines there, and the lever went back.
+/// Pure.
+pub fn athr_detent_verdict(
+    detent: f64,
+    at: Option<f64>,
+    fadec: Option<&[f64]>,
+    n: usize,
+    was: f64,
+    back: Option<f64>,
+) -> (Verdict, String) {
+    let restored = back.is_some_and(|b| (b - was).abs() <= LEVER_TOL);
+    let tail = if restored { "restored" } else { "NOT restored" };
+    if !at.is_some_and(|a| (a - detent).abs() <= LEVER_TOL) {
+        return (
+            Verdict::Fail,
+            format!("lever sent to {} read {}; {tail}", num(detent), read_str(at)),
+        );
+    }
+    let Some(modes) = fadec.filter(|f| f.len() >= n).map(|f| &f[..n]) else {
+        return (Verdict::Fail, format!("no FADEC lever mode read at {}; {tail}", num(detent)));
+    };
+    let cl = modes.iter().all(|m| (m - 1.0).abs() < 0.5);
+    let shown: Vec<String> = modes.iter().map(|m| num(*m)).collect();
+    match (cl, restored) {
+        (true, true) => (
+            Verdict::Pass,
+            format!("{} reads CL on every engine; {tail}", num(detent)),
+        ),
+        (true, false) => (Verdict::Fail, format!("{} reads CL; {tail}", num(detent))),
+        (false, _) => (
+            Verdict::Fail,
+            format!(
+                "the FADEC reads [{}] at {}, not CL (1): the detent, or a FADEC that judges no stopped engine; {tail}",
+                shown.join(", "),
+                num(detent)
+            ),
+        ),
+    }
+}
+
 /// The furthest-deployed of the first `n` elements (a reverser read per
 /// engine).
 fn max_of(v: Option<Vec<f64>>, n: usize) -> Option<f64> {
@@ -1882,6 +1965,13 @@ pub async fn run_steps(
             Step::Throttle => {
                 let lever = crate::aircraft::throttle_dataref();
                 probe_throttle(xp, &lever, p.throttle_hardware_axis.as_deref()).await
+            }
+            Step::Athr => {
+                let lever = crate::aircraft::throttle_dataref();
+                match p.autoflight.as_ref().and_then(|a| a.athr_cl_detent) {
+                    Some(d) => probe_athr(xp, &lever, d, p.engines).await,
+                    None => Row::skipped("athr", "no A/THR CL detent declared"),
+                }
             }
             Step::Reverse => {
                 let lever = crate::aircraft::throttle_dataref();
@@ -2590,6 +2680,25 @@ mod tests {
         let at = |w: &Step| steps.iter().position(|s| s == w).unwrap();
         assert!(at(&Step::Throttle) > at(&Step::Steer));
         assert!(at(&Step::Reverse) > at(&Step::Throttle));
+    }
+
+    /// The A330's CL detent is checked after the throttle, on that airframe
+    /// alone; it passes only with the lever in the detent, the FADEC
+    /// reading CL on every engine, and the lever back.
+    #[test]
+    fn a_lever_driven_athr_has_its_cl_detent_checked() {
+        let a330 = crate::aircraft::load("airbus_a330_300").unwrap();
+        let steps = plan(&a330, &[Area::Throttle]);
+        assert_eq!(steps, [Step::Throttle, Step::Athr]);
+        let b738 = crate::aircraft::load("boeing_737_800").unwrap();
+        assert!(!plan(&b738, &[]).contains(&Step::Athr));
+        let v = |at, f: Option<&[f64]>, back| athr_detent_verdict(0.53, at, f, 2, 0.0, back).0;
+        assert_eq!(v(Some(0.53), Some(&[1.0, 1.0]), Some(0.0)), Verdict::Pass);
+        assert_eq!(v(Some(0.53), Some(&[1.0, 1.0]), Some(0.3)), Verdict::Fail, "not restored");
+        assert_eq!(v(Some(0.53), Some(&[0.0, 1.0]), Some(0.0)), Verdict::Fail, "one engine not in CL");
+        assert_eq!(v(Some(0.53), Some(&[1.0]), Some(0.0)), Verdict::Fail, "one engine read");
+        assert_eq!(v(Some(0.2), Some(&[1.0, 1.0]), Some(0.0)), Verdict::Fail, "lever did not take");
+        assert_eq!(v(Some(0.53), None, Some(0.0)), Verdict::Fail);
     }
 
     #[test]

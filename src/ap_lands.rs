@@ -488,8 +488,14 @@ pub const WINDOW_TOL_KTS: f64 = 5.0;
 pub const WINDOW_WRONG_S: f64 = 6.0;
 /// The SPEED button is pressed at most this many times.
 pub const SPEED_PRESSES: u32 = 2;
+/// A speed the A/T does not hold ([`AtIn::astray`]) this long (seconds) is
+/// let go to our thrust law: long enough for an airliner to accelerate
+/// through a new target at climb thrust, short of a climb bleeding away.
+pub const NOT_HOLDING_S: f64 = 30.0;
 
-/// The autothrottle holding the approach speed.
+/// The autothrottle holding a speed: the Zibo's approach (`ap_lands`), and
+/// the speed governor's airborne hold on a lever-driven A/THR
+/// (`speedhold` `athr`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum AtSpeed {
     /// Not declared, or not begun.
@@ -505,8 +511,9 @@ pub enum AtSpeed {
     Ours {
         off_since: Option<f64>,
         wrong_since: Option<f64>,
+        astray_since: Option<f64>,
     },
-    /// Our thrust law's for the rest of this approach.
+    /// Our thrust law's for the rest of this approach (or this hold).
     Released,
 }
 
@@ -524,6 +531,9 @@ pub struct AtIn {
     /// The approach target, knots.
     pub want_kts: f64,
     pub now_s: f64,
+    /// The speed is not being held this tick (`speedhold::athr_astray`);
+    /// `false` where nobody judges it (the Zibo's approach).
+    pub astray: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -596,6 +606,7 @@ impl AtSpeed {
                     *self = AtSpeed::Ours {
                         off_since: None,
                         wrong_since: None,
+                        astray_since: None,
                     };
                     out.say = Some("Autothrottle in speed.");
                     out.event = Some("at_speed");
@@ -622,6 +633,7 @@ impl AtSpeed {
             AtSpeed::Ours {
                 off_since,
                 wrong_since,
+                astray_since,
             } => {
                 if !i.wanted {
                     *self = AtSpeed::Released;
@@ -637,6 +649,7 @@ impl AtSpeed {
                     (Some(_), false) => Some(wrong_since.unwrap_or(i.now_s)),
                     _ => None,
                 };
+                let astray_since = i.astray.then(|| astray_since.unwrap_or(i.now_s));
                 if off_since.is_some_and(|t| i.now_s - t >= crate::autoflight::PRESS_SETTLE_S) {
                     *self = AtSpeed::Released;
                     out.say = Some("Autothrottle's off. I have the thrust.");
@@ -645,10 +658,15 @@ impl AtSpeed {
                     *self = AtSpeed::Released;
                     out.say = Some("The speed window won't set. I have the thrust.");
                     out.event = Some("at_window_wrong");
+                } else if astray_since.is_some_and(|t| i.now_s - t >= NOT_HOLDING_S) {
+                    *self = AtSpeed::Released;
+                    out.say = Some("The autothrottle isn't holding the speed. I have the thrust.");
+                    out.event = Some("at_not_holding");
                 } else {
                     *self = AtSpeed::Ours {
                         off_since,
                         wrong_since,
+                        astray_since,
                     };
                 }
             }
@@ -988,6 +1006,7 @@ mod tests {
             window_kts: window,
             want_kts: 140.4,
             now_s,
+            astray: false,
         };
         let mut a = AtSpeed::default();
         let o = a.step(i(Some(false), Some(100.0), 0.0));
@@ -1026,10 +1045,37 @@ mod tests {
         let mut a = AtSpeed::Ours {
             off_since: None,
             wrong_since: None,
+            astray_since: None,
         };
         let mut n = i(Some(true), Some(140.0), 0.0);
         n.wanted = false;
         assert!(a.step(n).say.is_none() && a == AtSpeed::Released);
+    }
+
+    /// Engaged on the window but not holding the speed: let go to our
+    /// thrust only once astray for [`NOT_HOLDING_S`] together, said; a
+    /// tick back in hand starts the clock again.
+    #[test]
+    fn an_autothrottle_not_holding_the_speed_is_let_go_after_its_time() {
+        let i = |astray, now_s| AtIn {
+            wanted: true,
+            engaged: Some(true),
+            window_kts: Some(250.0),
+            want_kts: 250.0,
+            now_s,
+            astray,
+        };
+        let mut a = AtSpeed::default();
+        a.step(i(false, 0.0));
+        a.step(i(false, 0.5));
+        assert!(a.flies());
+        a.step(i(true, 1.0));
+        a.step(i(false, 20.0));
+        assert!(a.step(i(true, 25.0)).event.is_none());
+        assert!(a.step(i(true, 25.0 + NOT_HOLDING_S - 1.0)).event.is_none() && a.flies());
+        let o = a.step(i(true, 25.0 + NOT_HOLDING_S));
+        assert_eq!((a, o.event), (AtSpeed::Released, Some("at_not_holding")));
+        assert!(o.say.is_some());
     }
 
     /// The rollout is the autopilot's until taxi speed, a cross-track past

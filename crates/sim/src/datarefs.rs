@@ -206,6 +206,9 @@ pub const LOCAL_VX_MS: &str = "sim/flightmodel/position/local_vx";
 pub const LOCAL_VZ_MS: &str = "sim/flightmodel/position/local_vz";
 /// Per engine, 1 while running.
 pub const ENGINE_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
+/// Per engine, the FADEC's lever mode: 0 outside a detent, 1 CL, 2 FLX/MCT,
+/// 3 TOGA (a lever-driven A/THR, the A330).
+pub const FADEC_MODE: &str = "sim/flightmodel/engine/ENGN_fadec_pow_req";
 pub const N1_PERCENT: &str = "sim/cockpit2/engine/indicators/N1_percent";
 pub const N2_PERCENT: &str = "sim/cockpit2/engine/indicators/N2_percent";
 pub const PROP_SPEED_RPM: &str = "sim/cockpit2/engine/indicators/prop_speed_rpm";
