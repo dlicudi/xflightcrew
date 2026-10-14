@@ -70,6 +70,47 @@ pub fn leg_flyable(leg: &ProcLeg) -> bool {
         && leg.arc().is_none()
 }
 
+/// Why the heading bug, not LNAV, flies this leg: the follower's ONE
+/// answer to "is it using the GPS?", blackboxed `lnav` `on_bug` on each
+/// change (an EGKK departure flew the bug with the FMS loaded and nothing
+/// said why, 2026-10-14). `None` while LNAV owns the lateral. Pure.
+#[derive(Clone, Copy)]
+pub struct BugWhy<'a> {
+    pub owned: bool,
+    pub declared: bool,
+    pub enroute: bool,
+    pub retired: bool,
+    /// The follower's own steer is not a plain direct (a course, an arc,
+    /// a hold, a pattern): said as its word.
+    pub steering: Option<&'static str>,
+    pub leg: &'a ProcLeg,
+    pub fms_ident: Option<&'a str>,
+}
+
+pub fn bug_reason(w: &BugWhy) -> Option<&'static str> {
+    if w.owned {
+        return None;
+    }
+    Some(if !w.declared {
+        "lnav_not_declared"
+    } else if !w.enroute {
+        "not_enroute"
+    } else if w.retired {
+        "retired"
+    } else if let Some(s) = w.steering {
+        s
+    } else if !leg_flyable(w.leg) {
+        "leg_not_flyable"
+    } else {
+        match w.fms_ident {
+            None => "fms_unread",
+            Some(f) if f.trim().is_empty() => "fms_empty",
+            Some(f) if !same_ident(f, &w.leg.fix_ident) => "fms_not_on_leg",
+            Some(_) => "engaging",
+        }
+    })
+}
+
 /// The FMS's active ident is this leg's fix, as the route payload spelt it
 /// (`simbrief::fms_ident`). An empty FMS or an empty ident never is. Pure.
 pub fn same_ident(fms: &str, leg_ident: &str) -> bool {

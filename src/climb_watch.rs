@@ -121,7 +121,8 @@ impl ClimbWatch {
         self.vs
     }
 
-    /// `alt_ft` the altitude now; `floor_kts` the configuration's floor
+    /// `alt_ft` the TRUE altitude now (never the altimeter, which steps
+    /// when its setting changes); `floor_kts` the configuration's floor
     /// (`None` = unknown, no slow watch); `dial_fpm` the VS the loop commands
     /// through the autopilot, `None` when the dial is not what flies (the
     /// autopilot's own altitude hold owns the level).

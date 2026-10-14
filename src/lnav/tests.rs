@@ -796,3 +796,29 @@ fn the_followers_lateral_writes_are_gated_on_lnav() {
         "LNAV is dropped before the stall writes the bug"
     );
 }
+
+#[test]
+fn the_bug_says_why_it_flies_instead_of_lnav() {
+    let tf = leg("TF", "KKW07");
+    let base = BugWhy {
+        owned: false,
+        declared: true,
+        enroute: true,
+        retired: false,
+        steering: None,
+        leg: &tf,
+        fms_ident: Some("KKW07"),
+    };
+    let why = |w: BugWhy| bug_reason(&w);
+    assert_eq!(why(BugWhy { owned: true, ..base }), None);
+    assert_eq!(why(BugWhy { declared: false, ..base }), Some("lnav_not_declared"));
+    assert_eq!(why(BugWhy { enroute: false, ..base }), Some("not_enroute"));
+    assert_eq!(why(BugWhy { retired: true, ..base }), Some("retired"));
+    assert_eq!(why(BugWhy { steering: Some("holding"), ..base }), Some("holding"));
+    let rf = leg("RF", "KKW07");
+    assert_eq!(why(BugWhy { leg: &rf, ..base }), Some("leg_not_flyable"));
+    assert_eq!(why(BugWhy { fms_ident: None, ..base }), Some("fms_unread"));
+    assert_eq!(why(BugWhy { fms_ident: Some(""), ..base }), Some("fms_empty"));
+    assert_eq!(why(BugWhy { fms_ident: Some("MID"), ..base }), Some("fms_not_on_leg"));
+    assert_eq!(why(base), Some("engaging"));
+}
