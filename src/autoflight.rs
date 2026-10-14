@@ -1652,6 +1652,10 @@ pub async fn act_thrust(xp: &dyn XPlane, step: ThrustStep, owner: &str) -> Optio
         ThrustStep::Nothing => None,
         ThrustStep::Take { n, say } => {
             let p = panel();
+            // What made it "engaged", on the tape: the A330's script re-arms
+            // its A/THR from the levers every frame, and the record said
+            // only that a press went out (2026-10-14).
+            let (at_on, at_mode) = tokio::join!(xp.get_float(names::AT_ON), xp.get_float(names::AT_MODE));
             let sent = {
                 note(OurChange::Press(Button::AutothrottleOff));
                 xp.run_command(&p.autothrottle_off).await
@@ -1659,7 +1663,8 @@ pub async fn act_thrust(xp: &dyn XPlane, step: ThrustStep, owner: &str) -> Optio
             .is_ok();
             crate::blackbox::record(
                 "autoflight",
-                json!({"event": "thrust_taken", "owner": owner, "try": n, "cmd": p.autothrottle_off, "sent": sent}),
+                json!({"event": "thrust_taken", "owner": owner, "try": n, "cmd": p.autothrottle_off, "sent": sent,
+                       "at_on": at_on.ok(), "at_mode": at_mode.ok()}),
             );
             say.then_some(THRUST_TAKEN_LINE)
         }
