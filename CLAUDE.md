@@ -499,7 +499,11 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
 - **A final asks for descent OR deceleration, planned back from the gate**
   (`src/approach_energy.rs`, `idle_decel_kts_s`); a planned final never accelerates
   (`energy_cap`). **Established on the final path beyond the FAP the descent is the final's**
-  (`established_on_final_path`).
+  (`established_on_final_path`). **The follower crosses the FAF at the plan's join speed and
+  flap** (`procedure::faf_speed_cap`, `faf_flap`: slowed for in time, the descent owed first),
+  never clean at the clean approach speed. **A final that cannot make its gate takes the
+  speedbrake** (`approach_energy::final_drag`, declared `speedbrake_max_ratio` only, back as
+  found), and **TECS bounds a FAST error only by idle** (`pilot::energy::speed_term_fpm`).
 - **A descent flies its speed first, at idle** (`speed_protected_vs`); the speedbrake is for
   HEIGHT. A STAR window over the cruise is flown at the cruise (`windows_above_cruise`).
 - **One stabilised-approach rule for every final** (`src/stable_approach.rs`): a breach held 3 s
@@ -600,8 +604,8 @@ Issues labelled `owed` + `area:approach-landing` / `area:takeoff` / `area:full-a
 Also owed from 2026-10-05: the loops' mode presses go through `autoflight::bring` (reconcile,
 then apply; `loop_mode_presses_go_through_reconcile`) except four that need a flight: the pattern
 guard's hand-back VS, autoland's arrest return, window-park and VS-watchdog presses;
-`idle_decel_kts_s` fitted for the other airframes; the speedbrake in the energy plan;
-`e_gate` over the gate's limit acted on before the gate.
+`idle_decel_kts_s` fitted for the other airframes; the speedbrake's own deceleration fitted
+into the plan (`final_drag` is closed-loop on the idle prediction).
 
 ## Helicopters: the hover loop
 
