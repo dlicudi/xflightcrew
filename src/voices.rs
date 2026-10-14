@@ -92,6 +92,11 @@ impl Store {
         catalogue::join(kind, cat, &disk, &self.uses)
     }
 
+    /// The roles as the registry now has them, after a pick on the screen.
+    pub fn refresh_uses(&mut self) {
+        self.uses = catalogue::uses(&configured(&crate::settings::live()));
+    }
+
     /// Find a key on either tab.
     pub fn row(&self, key: &str) -> Option<Row> {
         [Kind::Piper, Kind::Whisper]
@@ -193,37 +198,97 @@ pub fn voice_spec(key: &str) -> String {
     crate::config::model_path(&format!("{key}.onnx"))
 }
 
-/// Set the copilot's or the cabin's voice through the SAME prefs the panel's
-/// voice picker writes. ATC roles stay env-configured.
-pub fn use_as(row: &Row, role: &str) -> Result<String> {
-    if row.entry.kind != Kind::Piper {
-        return Err(anyhow!(
-            "a speech model is set with WHISPER_MODEL={} in .env",
-            crate::config::model_path(&format!("{}.bin", row.entry.key))
-        ));
-    }
-    if !row.installed {
-        return Err(anyhow!("install {} first", row.entry.key));
-    }
-    let spec = voice_spec(&row.entry.key);
-    match role {
-        "copilot" => crate::prefs::save_pilot_voice(&spec),
-        "cabin" => crate::prefs::save_cabin_voice(&spec),
-        other => return Err(anyhow!("{other} is set in .env, not here")),
-    }
+/// The registry setting a role's voice is picked through.
+pub fn role_setting(role: &str) -> Option<&'static str> {
+    Some(match role {
+        "copilot" => "copilot_voice",
+        "cabin" => "cabin_voice",
+        "tower" => "atc_tower_voice",
+        "approach" => "atc_approach_voice",
+        "departure" => "atc_departure_voice",
+        "ATIS" => "atc_atis_voice",
+        "speech recognition" => "whisper_model",
+        _ => return None,
+    })
+}
+
+/// Pick a voice (or the speech model) for a role through the settings
+/// registry, the ONE door: pinning, checks, persistence and a live swap are
+/// its. Ok says what happened and when it applies.
+pub fn set_role(role: &str, spec: &str) -> std::result::Result<String, String> {
+    let key = role_setting(role).ok_or_else(|| format!("no voice setting for {role}"))?;
+    set_key(key, spec)
+}
+
+/// Set a voice setting by its registry key (the Cast view's rows carry it).
+pub fn set_key(key: &str, spec: &str) -> std::result::Result<String, String> {
+    let s = crate::settings::ALL
+        .iter()
+        .find(|s| s.key == key)
+        .ok_or_else(|| format!("no setting {key}"))?;
+    crate::settings::set(key, &crate::settings::Value::Text(spec.to_string()))?;
+    let when = match s.tier {
+        crate::settings::Tier::Live => "in force now",
+        crate::settings::Tier::Restart => RESTART_NOTE,
+    };
     Ok(format!(
-        "{role} voice set to {}; {RESTART_NOTE}",
-        row.entry.key
+        "{}: {}; {when}",
+        s.label,
+        crate::settings::voice_name(spec)
     ))
 }
 
-/// How an ATC role is pointed at a voice: the variable to set.
-pub fn atc_hint(key: &str) -> String {
-    format!(
-        "ATC voices are set in .env: XCOPILOT_ATC_PIPER_VOICE={} for the tower; \
-         _APPROACH_, _DEPARTURE_, _ATIS_PIPER_VOICE and XCOPILOT_ATC_VOICE_POOL alike",
-        voice_spec(key)
-    )
+/// Add a voice to the away-field pool, or take one out, through the
+/// registry. Ok says the pool's new size.
+pub fn edit_pool(spec: &str, add: bool) -> std::result::Result<String, String> {
+    let live = crate::settings::live();
+    let mut pool: Vec<String> = live
+        .atc_voice_pool
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let had = pool.iter().any(|p| p == spec);
+    match (add, had) {
+        (true, true) => return Err(format!("{} is in the pool", crate::settings::voice_name(spec))),
+        (false, false) => {
+            return Err(format!("{} is not in the pool", crate::settings::voice_name(spec)))
+        }
+        (true, false) => pool.push(spec.to_string()),
+        (false, true) => pool.retain(|p| p != spec),
+    }
+    crate::settings::set(
+        "atc_voice_pool",
+        &crate::settings::Value::Text(pool.join(",")),
+    )?;
+    Ok(format!(
+        "away-field pool: {} voices; {RESTART_NOTE}",
+        pool.len()
+    ))
+}
+
+/// `u` on a list row: use this voice or model for a role, through
+/// [`set_role`]. A voice must be installed first.
+pub fn use_as(row: &Row, role: &str) -> Result<String> {
+    if !row.installed {
+        return Err(anyhow!("install {} first", row.entry.key));
+    }
+    let spec = match row.entry.kind {
+        Kind::Piper => voice_spec(&row.entry.key),
+        Kind::Whisper => crate::config::model_path(&format!("{}.bin", row.entry.key)),
+    };
+    let role = match row.entry.kind {
+        Kind::Whisper => "speech recognition",
+        Kind::Piper if role == "speech recognition" => {
+            return Err(anyhow!("{} is a voice, not a speech model", row.entry.key))
+        }
+        Kind::Piper => role,
+    };
+    if role == "pool" {
+        return edit_pool(&spec, true).map_err(|e| anyhow!(e));
+    }
+    set_role(role, &spec).map_err(|e| anyhow!(e))
 }
 
 /// Speak the preview line in a voice (speaker 0 of a multi-speaker one),
@@ -265,6 +330,9 @@ const USAGE: &str = "usage:
   xfc voices remove <key>...";
 
 fn run(args: &[String], config: &Config) -> Result<bool> {
+    // The registry as boot has it, so a pick here is judged and shown
+    // against the same values (the screen runs before the crew's install).
+    crate::settings::install(config.clone());
     let store = Store::load(config);
     match args.first().map(String::as_str) {
         None => {
@@ -494,14 +562,28 @@ mod tests {
         }
     }
 
-    /// Only the refusals: a successful pick writes the panel's prefs.json.
+    /// Only the refusals (a pick that takes writes prefs.json): a voice not
+    /// installed, a voice offered as the speech model, a role no setting
+    /// picks, and a role its variable pins, refused by the registry itself.
     #[test]
-    fn use_as_takes_an_installed_voice_for_the_copilot_or_cabin_only() {
+    fn use_as_goes_through_the_registry_and_says_its_refusals() {
         let err = use_as(&row(Kind::Piper, false), "copilot").unwrap_err();
         assert!(err.to_string().contains("install"), "{err}");
-        let err = use_as(&row(Kind::Whisper, true), "copilot").unwrap_err();
-        assert!(err.to_string().contains("WHISPER_MODEL"), "{err}");
+        let err = use_as(&row(Kind::Piper, true), "speech recognition").unwrap_err();
+        assert!(err.to_string().contains("not a speech model"), "{err}");
+        let err = use_as(&row(Kind::Piper, true), "pilot").unwrap_err();
+        assert!(err.to_string().contains("no voice setting"), "{err}");
+        let _guard = crate::settings::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock above serialises every env-mutating test.
+        unsafe { std::env::set_var("XCOPILOT_ATC_PIPER_VOICE", "x.onnx") };
         let err = use_as(&row(Kind::Piper, true), "tower").unwrap_err();
-        assert!(err.to_string().contains(".env"), "{err}");
+        unsafe { std::env::remove_var("XCOPILOT_ATC_PIPER_VOICE") };
+        assert!(
+            err.to_string().contains("pinned by XCOPILOT_ATC_PIPER_VOICE"),
+            "{err}"
+        );
+        assert_eq!(role_setting("ATIS"), Some("atc_atis_voice"));
     }
 }

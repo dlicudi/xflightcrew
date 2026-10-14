@@ -520,7 +520,7 @@ pub fn remove_gate(row: &Row) -> Result<()> {
             if u.via_prefs {
                 format!("{} (pick another with u)", u.role)
             } else {
-                format!("{} (set by {})", u.role, u.env)
+                format!("{} (set by {}; pick another in Cast)", u.role, u.env)
             }
         })
         .collect();

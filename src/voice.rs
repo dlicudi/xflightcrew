@@ -33,6 +33,8 @@
 //!     until the readback has finished (else it captures its own TTS).
 //!   - [`Voice::alert`] — fire-and-forget. The monitor queues and moves on.
 
+pub mod cast;
+
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Condvar, Mutex};
