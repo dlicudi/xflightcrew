@@ -208,6 +208,7 @@ fn key(app: &mut App, code: KeyCode, tx: &Sender<Msg>) -> bool {
             app.editing_filter = true;
         }
         KeyCode::Enter => start_install(app, tx),
+        KeyCode::Char('s') => start_starter(app, tx),
         KeyCode::Char('d') => {
             if let Some(r) = app.selected() {
                 match catalogue::remove_gate(&r) {
@@ -293,6 +294,42 @@ fn answer(app: &mut App, prompt: Prompt, code: KeyCode) {
 
 fn start_install(app: &mut App, tx: &Sender<Msg>) {
     let Some(r) = app.selected() else { return };
+    spawn_install(app, r, tx);
+}
+
+/// `s`: every missing starter item, each on its own worker as `enter` does.
+fn start_starter(app: &mut App, tx: &Sender<Msg>) {
+    let status = app.store.starter_status();
+    if status.complete() {
+        app.notice = Some(("the starter set is complete".into(), true));
+        return;
+    }
+    let rows = app.store.starter_rows();
+    if rows.is_empty() {
+        app.notice = Some((
+            format!(
+                "{} not in the catalogue: nothing to download",
+                status.unknown.join(", ")
+            ),
+            false,
+        ));
+        return;
+    }
+    let n = rows.len();
+    for r in rows {
+        spawn_install(app, r, tx);
+    }
+    app.notice = Some((
+        format!(
+            "downloading the starter set: {n} item(s), {}",
+            catalogue::human_size(status.bytes)
+        ),
+        true,
+    ));
+}
+
+/// Install one row on a worker thread, its progress on the list.
+fn spawn_install(app: &mut App, r: Row, tx: &Sender<Msg>) {
     let key = r.entry.key.clone();
     if r.installed {
         app.notice = Some((format!("{key} is installed"), true));
@@ -395,6 +432,18 @@ fn draw(f: &mut Frame, app: &mut App) {
                 format!("      filter: {}{cursor}", app.filter),
                 filter_style,
             ),
+            {
+                let status = app.store.starter_status();
+                let style = if status.complete() {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                Span::styled(
+                    format!("      {}", catalogue::starter_line(&status, "press s")),
+                    style,
+                )
+            },
         ])),
         head,
     );
@@ -474,7 +523,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let hint_text = if app.editing_filter {
         " type to filter   enter keep   esc clear"
     } else {
-        " ↑↓ move  tab switch  / filter  enter install  d uninstall  p preview  u use as...  q quit"
+        " ↑↓ move  tab switch  / filter  enter install  s starter  d uninstall  p preview  u use as  q quit"
     };
     f.render_widget(
         Paragraph::new(hint_text).style(Style::default().fg(Color::DarkGray)),
@@ -488,6 +537,15 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn store(dir: std::path::PathBuf) -> Store {
+        let in_dir = |f: &str| dir.join(f).to_string_lossy().into_owned();
+        let starter = catalogue::starter_items(
+            &catalogue::Configured {
+                tower: in_dir("en_GB-alba-medium.onnx"),
+                copilot: in_dir("en_GB-alan-medium.onnx"),
+                ..Default::default()
+            },
+            true,
+        );
         Store {
             dir,
             piper: catalogue::parse_piper(include_str!("../../bench/voices_catalogue.json"))
@@ -498,6 +556,7 @@ mod tests {
                 whisper: "models/ggml-base.en.bin".into(),
                 ..Default::default()
             }),
+            starter,
             note: None,
         }
     }
@@ -529,6 +588,11 @@ mod tests {
         assert!(screen.contains("✓ en_GB-alba-medium"), "{screen}");
         assert!(screen.contains("tower"), "{screen}");
         assert!(screen.contains("109 spk"), "{screen}");
+        // alba is on disk, alan is not: one missing, priced, `s` named.
+        assert!(
+            screen.contains("starter set: 1 missing, 63 MB, press s"),
+            "{screen}"
+        );
 
         let (tx, _rx) = channel();
         for c in "/de_DE".chars() {

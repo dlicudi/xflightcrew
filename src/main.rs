@@ -36,6 +36,7 @@ mod course_leg;
 mod crew_radio;
 mod debrief;
 mod heading_bug;
+mod home;
 mod sortie_runner;
 mod conform;
 mod test_card;
@@ -227,6 +228,25 @@ async fn main() -> Result<()> {
         print!("{}", licenses::text(full));
         return Ok(());
     }
+    // `xfc home` (alias `xfc setup`): the setup screen (src/home.rs); `r`
+    // falls through to the boot below, in this process. Plain `xfc` shows it
+    // first only on a TTY with a REQUIRED check red (file checks only);
+    // `xfc run` never does. First, before the log: it owns the terminal.
+    let arg = std::env::args().nth(1);
+    let home_args: Option<Vec<String>> = match arg.as_deref() {
+        Some("home" | "setup") => Some(std::env::args().skip(2).collect()),
+        None if home::wanted_at_boot(&config) => Some(Vec::new()),
+        _ => None,
+    };
+    let config = match home_args {
+        Some(args) => match home::main_cmd(&args, &config)? {
+            home::Leave::Quit => return Ok(()),
+            // The screen may have changed prefs (a voice pick, a setting)
+            // and installed models: the boot reads them afresh.
+            home::Leave::Run => Config::from_env()?,
+        },
+        None => config,
+    };
     let tui = config.ui == "tui";
 
     // Always log to a daily-rolling file. In TUI mode the stderr layer would
@@ -294,25 +314,7 @@ async fn main() -> Result<()> {
     // joins it, by the crew's own rule (#152).
     party_line::provide_filed_route(simbrief::filed_route);
 
-    // Initial app mode: explicit env > the panel's saved pick > both. The
-    // panel's Settings tab can change it live from here on (mode.rs).
-    let initial_mode = mode::Mode::parse(&config.mode)
-        .or_else(|| prefs::mode().as_deref().and_then(mode::Mode::parse))
-        .unwrap_or(mode::Mode::Both);
-    mode::set(initial_mode);
-    tracing::info!(mode = initial_mode.as_str(), "app mode");
-
-    // Cabin crew staffing, same precedence: explicit env > the panel's saved
-    // pick > auto (the airframe profile decides). Panel-toggleable live.
-    let initial_staffing = cabin::Staffing::parse(&config.cabin_crew)
-        .or_else(|| {
-            prefs::cabin_crew()
-                .as_deref()
-                .and_then(cabin::Staffing::parse)
-        })
-        .unwrap_or(cabin::Staffing::Auto);
-    cabin::set_staffing(initial_staffing);
-    tracing::info!(cabin_crew = initial_staffing.as_str(), "cabin staffing");
+    boot_mode_and_staffing(&config);
 
     // Route whisper/ggml C logging through tracing so its model-load chatter
     // goes to the log file, not onto the terminal (which would corrupt the TUI).
@@ -1118,6 +1120,30 @@ fn load_wav_16k(input: &str) -> Result<Vec<f32>> {
 
 /// `xfc paths`: the mode, both roots, the models, the log and the prefs,
 /// each absolute (`sim::paths::shown`).
+/// The boot's mode and cabin staffing, set before anything reads them (the
+/// boot, and the home screen's Settings view before it).
+fn boot_mode_and_staffing(config: &Config) {
+    // Initial app mode: explicit env > the panel's saved pick > both. The
+    // panel's Settings tab can change it live from here on (mode.rs).
+    let initial_mode = mode::Mode::parse(&config.mode)
+        .or_else(|| prefs::mode().as_deref().and_then(mode::Mode::parse))
+        .unwrap_or(mode::Mode::Both);
+    mode::set(initial_mode);
+    tracing::info!(mode = initial_mode.as_str(), "app mode");
+
+    // Cabin crew staffing, same precedence: explicit env > the panel's saved
+    // pick > auto (the airframe profile decides). Panel-toggleable live.
+    let initial_staffing = cabin::Staffing::parse(&config.cabin_crew)
+        .or_else(|| {
+            prefs::cabin_crew()
+                .as_deref()
+                .and_then(cabin::Staffing::parse)
+        })
+        .unwrap_or(cabin::Staffing::Auto);
+    cabin::set_staffing(initial_staffing);
+    tracing::info!(cabin_crew = initial_staffing.as_str(), "cabin staffing");
+}
+
 fn paths_report() -> String {
     use sim::paths;
     let r = paths::roots();

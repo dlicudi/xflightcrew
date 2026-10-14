@@ -199,6 +199,60 @@ pub fn local_voices_on_disk(icao: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a voice spec is installed: its `.onnx` AND the `.onnx.json`
+/// beside it, a `#N` speaker suffix stripped first.
+pub fn voice_installed(spec: &str) -> bool {
+    let path = spec.split('#').next().unwrap_or(spec).trim();
+    !path.is_empty()
+        && std::path::Path::new(path).is_file()
+        && std::path::Path::new(&format!("{path}.json")).is_file()
+}
+
+/// The away-field pool as the caster draws from it: the INSTALLED entries
+/// only, in their order, so the seeds stay stable over what is there. Run
+/// once where the radio thread takes its config, never per call: a user with
+/// only the starter set must never be cast a missing model. An empty result
+/// falls back to the curated per-position voices, as an empty pool always did.
+fn installed_pool(pool: &str, installed: impl Fn(&str) -> bool) -> String {
+    pool.split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && installed(m))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The model a station voice actually LOADS: the cast pick when installed,
+/// else the tower's voice, else the copilot's, else the first voice on disk
+/// (`on_disk`, asked only then). A user may remove a curated voice too, so
+/// this is the one place every pick passes before its load. Each missing
+/// file is said ONCE (`said`), never per line. An empty pick stays empty
+/// (the `say` fallback, as before); with nothing installed the pick stands
+/// and its load fails over to `say` as it always did.
+fn loadable_station_model(
+    chosen: &str,
+    config: &Config,
+    installed: impl Fn(&str) -> bool,
+    on_disk: impl FnOnce() -> Vec<String>,
+    said: &mut std::collections::HashSet<String>,
+) -> String {
+    if chosen.is_empty() || installed(chosen) {
+        return chosen.to_string();
+    }
+    let instead = [config.atc_piper_voice.clone(), config.piper_voice.clone()]
+        .into_iter()
+        .find(|v| !v.is_empty() && installed(v))
+        .or_else(|| on_disk().into_iter().find(|v| installed(v)));
+    let missing = chosen.split('#').next().unwrap_or(chosen).to_string();
+    if said.insert(missing.clone()) {
+        tracing::warn!(
+            missing = %missing,
+            instead = instead.as_deref().unwrap_or("the `say` fallback"),
+            "station voice not installed (`xfc voices` installs it); casting another"
+        );
+    }
+    instead.unwrap_or_else(|| chosen.to_string())
+}
+
 /// Every piper voice on disk — what the panel's Settings picker offers for
 /// the copilot's own voice. A model qualifies by having its `.onnx.json`
 /// sidecar beside it — the piper shape, and piper is the only engine we run.
@@ -2659,7 +2713,26 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
 /// (retune, avionics off, crash, replay) never touch the copilot's audio.
 fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     crate::tts::set_thread_channel(crate::tts::Channel::Radio);
-    let station_cfg = config;
+    let mut station_cfg = config;
+    let named = station_cfg
+        .atc_voice_pool
+        .split(',')
+        .filter(|m| !m.trim().is_empty())
+        .count();
+    station_cfg.atc_voice_pool = installed_pool(&station_cfg.atc_voice_pool, voice_installed);
+    let drawn = station_cfg
+        .atc_voice_pool
+        .split(',')
+        .filter(|m| !m.trim().is_empty())
+        .count();
+    if drawn < named {
+        tracing::info!(
+            named,
+            installed = drawn,
+            "away-field voice pool: drawing from the installed voices only (`xfc voices` adds more)"
+        );
+    }
+    let mut missing_said = std::collections::HashSet::new();
     // One lazy warm voice per position (tower/approach/departure/ATIS, plus
     // one slot for whichever GHOST pilot spoke last), keyed by model name so
     // a cast change — or a different ghost — rebuilds only that slot. A
@@ -2733,7 +2806,13 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         let who = utt
             .station
             .expect("radio queue only holds station utterances");
-        let model = station_model(who, &station_cfg, seed, &locals);
+        let model = loadable_station_model(
+            &station_model(who, &station_cfg, seed, &locals),
+            &station_cfg,
+            voice_installed,
+            pilot_voice_choices,
+            &mut missing_said,
+        );
         // Signal quality from the CURRENT range to the station, read per
         // transmission — the same tower fades in as you close on the field.
         // Ghost pilots ride the same value: they're on this field's frequency
@@ -3041,6 +3120,134 @@ mod tests {
             local_accents_for("LXGB").is_empty(),
             "home field keeps its curated cast anyway"
         );
+    }
+
+    /// A scratch models folder holding `installed` (the `.onnx` and its
+    /// `.onnx.json`) and `bare` (an `.onnx` with no sidecar: not installed).
+    fn scratch_models(tag: &str, installed: &[&str], bare: &[&str]) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "xfc-voice-pool-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for f in installed {
+            std::fs::write(d.join(f), b"onnx").unwrap();
+            std::fs::write(d.join(format!("{f}.json")), b"{}").unwrap();
+        }
+        for f in bare {
+            std::fs::write(d.join(f), b"onnx").unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn the_pool_draws_only_installed_voices() {
+        let d = scratch_models("pool", &["a.onnx", "multi.onnx"], &["nojson.onnx"]);
+        let p = |f: &str| d.join(f).to_string_lossy().into_owned();
+        let pool = [
+            p("a.onnx"),
+            p("gone.onnx"),
+            p("multi.onnx#3"),
+            p("nojson.onnx"),
+            p("gone.onnx#1"),
+            p("multi.onnx#7"),
+        ]
+        .join(", ");
+        let filtered = installed_pool(&pool, voice_installed);
+        assert_eq!(
+            filtered,
+            [p("a.onnx"), p("multi.onnx#3"), p("multi.onnx#7")].join(",")
+        );
+        let cfg = Config {
+            atc_piper_voice: p("tower.onnx"),
+            atc_voice_pool: filtered,
+            ..Config::default()
+        };
+        for name in ["Ciudad Real", "Malaga", "Gibraltar", "Jerez", "Sevilla"] {
+            let seed = station_voice_seed(name);
+            for who in [
+                StationSpeaker::Tower,
+                StationSpeaker::Approach,
+                StationSpeaker::Departure,
+                StationSpeaker::Atis,
+                StationSpeaker::Ghost { seed },
+            ] {
+                let m = station_model(who, &cfg, seed, &[]);
+                assert!(voice_installed(&m), "{name} {who:?} drew {m}");
+            }
+        }
+        // Nothing installed: an empty pool, so the curated voices stand.
+        assert_eq!(installed_pool(&p("gone.onnx"), voice_installed), "");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_missing_station_voice_falls_back_once() {
+        let d = scratch_models("fallback", &["copilot.onnx", "other.onnx"], &[]);
+        let p = |f: &str| d.join(f).to_string_lossy().into_owned();
+        let mut said = std::collections::HashSet::new();
+        let none = || -> Vec<String> { panic!("the disk is asked only as the last resort") };
+        // Installed: kept as is.
+        let cfg = Config {
+            atc_piper_voice: p("tower.onnx"),
+            piper_voice: p("copilot.onnx"),
+            ..Config::default()
+        };
+        assert_eq!(
+            loadable_station_model(&p("copilot.onnx"), &cfg, voice_installed, none, &mut said),
+            p("copilot.onnx")
+        );
+        assert!(said.is_empty());
+        // A curated voice removed, the tower's too: the copilot's voice.
+        let pick =
+            loadable_station_model(&p("approach.onnx"), &cfg, voice_installed, none, &mut said);
+        assert_eq!(pick, p("copilot.onnx"));
+        // The tower's voice first when it is there.
+        let with_tower = Config {
+            atc_piper_voice: p("other.onnx"),
+            ..cfg.clone()
+        };
+        assert_eq!(
+            loadable_station_model(
+                &p("approach.onnx#2"),
+                &with_tower,
+                voice_installed,
+                none,
+                &mut said
+            ),
+            p("other.onnx")
+        );
+        // Said once per missing FILE, the speaker stripped.
+        assert_eq!(said.len(), 1, "{said:?}");
+        // Neither tower nor copilot installed: whatever is on disk.
+        let bare = Config {
+            atc_piper_voice: p("tower.onnx"),
+            piper_voice: p("gone.onnx"),
+            ..Config::default()
+        };
+        assert_eq!(
+            loadable_station_model(
+                &p("x.onnx"),
+                &bare,
+                voice_installed,
+                || vec![p("other.onnx")],
+                &mut said
+            ),
+            p("other.onnx")
+        );
+        // Nothing at all: the pick stands (its load fails over to `say`).
+        assert_eq!(
+            loadable_station_model(&p("x.onnx"), &bare, voice_installed, Vec::new, &mut said),
+            p("x.onnx")
+        );
+        // An empty pick is the `say` voice by design.
+        assert_eq!(
+            loadable_station_model("", &bare, voice_installed, none, &mut said),
+            ""
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

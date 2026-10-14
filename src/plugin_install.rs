@@ -482,8 +482,25 @@ fn install(
     dry_run: bool,
     while_running: bool,
 ) -> Result<bool> {
+    let mut out = String::new();
+    let result = install_to(xplane, carried, dry_run, while_running, &mut out);
+    print!("{out}");
+    result
+}
+
+/// The install, its report written to `out` (the CLI prints it, the home
+/// screen shows it): the same refusals, the same steps.
+pub fn install_to(
+    xplane: &Path,
+    carried: Option<&[u8]>,
+    dry_run: bool,
+    while_running: bool,
+    out: &mut String,
+) -> Result<bool> {
+    use std::fmt::Write as _;
     let Some(bytes) = carried else {
-        println!(
+        let _ = writeln!(
+            out,
             "this build carries no plugin (built without the embed-plugin feature).\n\
              From a source checkout: make -C plugin install\n\
              Or build a release that carries it: scripts/build-release.sh"
@@ -491,7 +508,8 @@ fn install(
         return Ok(false);
     };
     if !xplane.join(PLUGINS_REL).is_dir() {
-        println!(
+        let _ = writeln!(
+            out,
             "{} has no Resources/plugins: not an X-Plane folder (pass --xplane <dir> or set XCOPILOT_XPLANE_ROOT)",
             xplane.display()
         );
@@ -505,12 +523,16 @@ fn install(
             "cannot tell whether X-Plane is running"
         };
         if !dry_run {
-            println!(
+            let _ = writeln!(
+                out,
                 "{why}: refusing to install. Quit X-Plane first, or pass --while-running and then reload plugins or restart X-Plane yourself."
             );
             return Ok(false);
         }
-        println!("{why}: a real install would refuse without --while-running.");
+        let _ = writeln!(
+            out,
+            "{why}: a real install would refuse without --while-running."
+        );
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -520,26 +542,31 @@ fn install(
     let backup_dir = PathBuf::from(sim::paths::shown(&backup_dir));
     let steps = plan(xplane, &backup_dir, Present::look(xplane));
     if let Some(id) = marker(bytes) {
-        println!("installing the plugin this build carries: {}", id.shown());
+        let _ = writeln!(
+            out,
+            "installing the plugin this build carries: {}",
+            id.shown()
+        );
     }
     if dry_run {
-        println!("dry run, the steps an install would take:");
+        let _ = writeln!(out, "dry run, the steps an install would take:");
     }
     for (n, s) in steps.iter().enumerate() {
-        println!("{}. {}", n + 1, s.describe());
+        let _ = writeln!(out, "{}. {}", n + 1, s.describe());
     }
     if dry_run {
-        println!("dry run: nothing changed");
+        let _ = writeln!(out, "dry run: nothing changed");
         return Ok(true);
     }
     apply(&steps, bytes)?;
-    println!("installed to {}", xplane.join(XPL_REL).display());
+    let _ = writeln!(out, "installed to {}", xplane.join(XPL_REL).display());
     if running == Some(true) {
-        println!(
+        let _ = writeln!(
+            out,
             "X-Plane is running: the new plugin loads only once you reload plugins or restart X-Plane (xfc never reloads them)."
         );
     } else {
-        println!("it loads the next time X-Plane starts.");
+        let _ = writeln!(out, "it loads the next time X-Plane starts.");
     }
     Ok(true)
 }

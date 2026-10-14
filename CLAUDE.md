@@ -746,6 +746,14 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   feature, `scripts/build-release.sh`): `xcopilot/` removed first, backups to
   `data()/plugin-backups/`, never inside `plugins/`; refused while X-Plane runs unless
   `--while-running`; it NEVER reloads plugins. `xfc licenses` prints the notices verbatim.
+- **The home screen** (2026-10-14, `src/home.rs`, `xfc home`/`setup`, `--print` for support):
+  checks with a fix each (X-Plane folder, ONE Web API GET on open or `c`, plugin, mic NAME,
+  starter set), the voices screen, the dashboard's own Settings view (`ui::SettingsPane`),
+  files; `r` boots in-process. Plain `xfc` shows it only on a TTY with a REQUIRED check red
+  (folder, plugin missing, starter incomplete: file checks only); `xfc run` never. The starter
+  set is the config's named single voices plus its whisper model (`voices::starter`, never a
+  list of its own; `xfc voices install --starter`, `s`). The ATC pool draws INSTALLED voices
+  only, a missing pick falls back once (`voice::installed_pool`, `loadable_station_model`).
 
 ## EFB: a page on the LAN (`src/efb/`, `docs/efb.md`)
 
