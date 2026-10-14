@@ -42,6 +42,20 @@
 //! An airframe that declares no deceleration keeps the distance schedule
 //! ([`EnergyModel::from_profile`] is `None`): a plan is only as good as its
 //! fit.
+//!
+//! # The speedbrake ([`final_drag`])
+//!
+//! The plan is flown at idle; when even idle and the flap each speed allows
+//! will not make the gate ([`predicted_gate_kts`] over [`gate_limit_kts`]),
+//! the final takes the speedbrake, as a crew does, where the airframe
+//! declares the flap it may fly with (`flaps.speedbrake_max_ratio`), and
+//! stows it once the idle plan makes the gate again, past that flap, or by
+//! [`DRAG_FLOOR_AAL_FT`]. Its own deceleration is not in the plan (no
+//! airframe has one fitted: the descent's rule never flew it with flap or
+//! gear); the rule needs none, being closed on the idle prediction from the
+//! speed it has made. EGKK 26L, 2026-10-14 (sortie 1791979030-full_auto):
+//! 210 kt at 6 nm, `e_gate` 186 to 219 the whole final, nothing acted on it
+//! and the gate went around 38 kt fast without the landing flap.
 
 use crate::aircraft::{AircraftProfile, FlapDetent};
 
@@ -277,6 +291,65 @@ pub fn predicted_gate_kts(
     v
 }
 
+/// The fastest the gate accepts, kt: the stabilised rule's allowance over
+/// `vapp_kts` at a `gate_ft` gate, and no faster than the landing flap goes
+/// out at (its placard less autoland's extension margin): a gate without
+/// the landing flap is not stable either. Pure.
+pub fn gate_limit_kts(m: &EnergyModel, vapp_kts: f64, gate_ft: f64) -> f64 {
+    let landing = m
+        .detents
+        .last()
+        .and_then(|d| d.vfe_kts)
+        .map_or(f64::INFINITY, |v| {
+            v - crate::autoland::FLAP_EXTEND_MARGIN_KTS
+        });
+    (vapp_kts + crate::stable_approach::fast_allowance_kts(gate_ft)).min(landing)
+}
+
+/// The speedbrake is stowed on a final by this height above the runway, ft
+/// (the instrument gate; and the speedbrake tool's own gate).
+pub const DRAG_FLOOR_AAL_FT: f64 = 1000.0;
+/// Out, it stays out until the idle plan makes the gate by this much, kt (a
+/// comparator on a noisy prediction cycles).
+pub const DRAG_IN_MARGIN_KTS: f64 = 5.0;
+
+/// Whether a final wants the speedbrake out, and why (the blackbox's word).
+/// `out`: it is out now, ours. `gate_kts`: the idle plan's speed at the gate
+/// (`None`: no plan this tick: a go-around, a hold, the flare), against
+/// `limit_kts` ([`gate_limit_kts`]). `flap`: the handle commanded;
+/// `max_flap`: the airframe's declared `speedbrake_max_ratio`. Pure.
+pub fn final_drag(
+    out: bool,
+    gate_kts: Option<f64>,
+    limit_kts: f64,
+    height_aal_ft: f64,
+    flap: f64,
+    max_flap: Option<f64>,
+) -> (bool, &'static str) {
+    let Some(max_flap) = max_flap else {
+        return (false, "undeclared");
+    };
+    let Some(gate) = gate_kts.filter(|k| k.is_finite()) else {
+        return (false, "no_plan");
+    };
+    if height_aal_ft <= DRAG_FLOOR_AAL_FT {
+        return (false, "low");
+    }
+    if flap > max_flap + 0.01 {
+        return (false, "flaps");
+    }
+    let over = if out {
+        limit_kts - DRAG_IN_MARGIN_KTS
+    } else {
+        limit_kts
+    };
+    if gate > over {
+        (true, "gate")
+    } else {
+        (false, "made")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +486,66 @@ mod tests {
         let mut flaps = p.flaps.clone().unwrap();
         flaps.detents[3].idle_decel_kts_s = None;
         assert!(EnergyModel::from_detents(&flaps.detents, 3.0).is_none());
+    }
+
+    /// EGKK 26L (sortie 1791979030-full_auto): 212 kt at 5.9 nm, flaps 5 to
+    /// 10, `e_gate` 214 against a gate that takes the landing flap at 157:
+    /// the speedbrake. In again once the idle plan makes the gate with
+    /// margin, past flaps 10, under 1,000 ft, without a plan, and never on
+    /// an airframe that does not declare it.
+    #[test]
+    fn a_final_that_cannot_make_the_gate_takes_the_speedbrake() {
+        let m = b738();
+        let limit = gate_limit_kts(&m, 145.0, 1000.0);
+        assert_eq!(
+            limit, 157.0,
+            "the landing flap's 162 less 5, under 145 + 25"
+        );
+        assert_eq!(gate_limit_kts(&m, 145.0, 500.0), 157.0);
+        assert_eq!(
+            gate_limit_kts(&m, 120.0, 500.0),
+            135.0,
+            "a light 737: 120 + 15"
+        );
+        // The recorded tick: 212 kt, 5.93 nm to the aim, 4.1 to the gate.
+        let gate = predicted_gate_kts(&m, 145.0, 212.0, 4.1, 4.1);
+        assert!(gate > limit + 20.0, "{gate}");
+        let max = Some(0.5);
+        assert_eq!(
+            final_drag(false, Some(gate), limit, 1830.0, 0.375, max),
+            (true, "gate")
+        );
+        assert_eq!(
+            final_drag(false, Some(gate), limit, 1830.0, 0.5, max),
+            (true, "gate")
+        );
+        // Hysteresis: out at 158, stays out at 154, in at 151.
+        assert!(final_drag(false, Some(158.0), limit, 1500.0, 0.5, max).0);
+        assert!(!final_drag(false, Some(154.0), limit, 1500.0, 0.5, max).0);
+        assert!(final_drag(true, Some(154.0), limit, 1500.0, 0.5, max).0);
+        assert_eq!(
+            final_drag(true, Some(151.0), limit, 1500.0, 0.5, max),
+            (false, "made")
+        );
+        // The bars.
+        assert_eq!(
+            final_drag(true, Some(gate), limit, 1830.0, 0.625, max),
+            (false, "flaps")
+        );
+        assert_eq!(
+            final_drag(true, Some(gate), limit, 1000.0, 0.5, max),
+            (false, "low")
+        );
+        assert_eq!(
+            final_drag(true, None, limit, 1830.0, 0.5, max),
+            (false, "no_plan")
+        );
+        assert_eq!(
+            final_drag(false, Some(gate), limit, 1830.0, 0.5, None),
+            (false, "undeclared")
+        );
+        // The 737 declares flaps 10; nothing else does yet.
+        let p = crate::aircraft::load("boeing_737_800").unwrap();
+        assert_eq!(p.flaps.unwrap().speedbrake_max_ratio, Some(0.5));
     }
 }

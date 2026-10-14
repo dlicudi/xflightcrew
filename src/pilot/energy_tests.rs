@@ -156,3 +156,76 @@ fn full_flap_on_the_glideslope_never_bleeds_to_the_stall() {
     let late = &r.kts[r.kts.len() * 2 / 3..];
     assert!(late.iter().all(|k| (k - 65.0).abs() < 3.0), "settles: {:?}", late.last());
 }
+
+/// The 737 on a 3 degree path as sortie 1791979030-full_auto flew it
+/// (EGKK 26L, 2026-10-14): the lever's energy the book's (twice the
+/// 3,000 fpm climb: 5.9 kt/s a unit at 190 kt) through the jet's spool, and
+/// the idle deceleration that leaves the slow-down recorded, 0.5 kt/s on
+/// the path at 0.08 of lever over idle with flaps 10 and 15 and the gear:
+/// 2.0 kt/s level (the profile's lower quartile is 1.2). Flaps 40 under
+/// its placard less the margin, scaled alike (the profile's 2.2 to 3.5).
+/// The law's own 0.35 s tick. Returns the speed and the lever.
+fn fly_737_final(from_kts: f64, target_kts: f64, thr0: f64, secs: f64) -> Run {
+    const S1: f64 = 5.94;
+    let tecs = Tecs::from_book(Some(3_000.0), EngineClass::Jet);
+    let gp = 3f64.to_radians();
+    let (dt, tick) = (0.05, 0.35);
+    let mut law = EnergyThrottle::default();
+    let (mut v, mut thrust, mut thr, mut t, mut next, mut prev) = (from_kts, thr0, thr0, 0.0, 0.0, from_kts);
+    let mut run = Run { kts: vec![], vs: vec![], thr: vec![] };
+    while t < secs {
+        let path_vs = -v * FPS_PER_KT * 60.0 * gp.sin();
+        if t >= next {
+            thr = law
+                .step(
+                    In {
+                        ias_kts: v,
+                        accel_kts_s: (v - prev) / tick,
+                        vs_fpm: path_vs,
+                        target_kts,
+                        floor_kts: None,
+                        path_vs_fpm: path_vs,
+                        thr_now: thr,
+                        dt: tick,
+                        flare_to_wheels_s: None,
+                    },
+                    tecs,
+                )
+                .lever;
+            prev = v;
+            next += tick;
+            run.kts.push(v);
+            run.thr.push(thr);
+        }
+        let idle = if v <= 157.0 { 2.2 } else { 2.0 };
+        thrust += (thr - thrust) * dt / tecs.spool_s;
+        v += (-idle + S1 * thrust + 32.174 / FPS_PER_KT * gp.sin()) * dt;
+        t += dt;
+    }
+    run
+}
+
+/// EGKK 26L, 2026-10-14 (sortie 1791979030-full_auto): the 737 took the
+/// final at 210 kt against 145, and the speed term's bound held a 0.5 kt/s
+/// slow-down on 0.12 to 0.29 of lever for 55 s, 38 kt fast at the gate.
+/// Fast by more than the band closes, the lever is at idle within its
+/// hand's walk and stays there; the trim kept, the speed then arrives
+/// without falling out of the stable band under the target.
+#[test]
+fn a_737_far_fast_on_the_path_flies_it_at_idle() {
+    let r = fly_737_final(200.0, 145.0, 0.25, 360.0);
+    let tick = 0.35;
+    let mut idle_after = None;
+    for (i, (k, l)) in r.kts.iter().zip(&r.thr).enumerate() {
+        let at = i as f64 * tick;
+        if *k > 145.0 + 15.0 && at > 0.25 / SLEW_PER_S + 1.0 {
+            assert!(*l < 0.05, "{k:.0} kt at {at:.0} s: lever {l:.2}, not idle");
+            idle_after.get_or_insert(at);
+        }
+    }
+    assert!(idle_after.is_some(), "never far fast");
+    let min = r.kts.iter().cloned().fold(f64::MAX, f64::min);
+    assert!(min > 145.0 - 7.0, "bled to {min:.1}");
+    let late = &r.kts[r.kts.len() * 5 / 6..];
+    assert!(late.iter().all(|k| (k - 145.0).abs() < 4.0), "settles: {:?}", late.last());
+}

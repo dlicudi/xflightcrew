@@ -356,6 +356,11 @@ reference:
 # 162 for the last). VERIFY the middle in the sim.
 flaps:
   takeoff_ratio: 0.375
+  # The speedbrake on a final the energy plan says cannot make the gate at
+  # idle (`approach_energy::final_drag`), only to flaps 10: past it the real
+  # NG's SPEED BRAKE EXTENDED caution, and the flap is the drag from there.
+  # Stowed by 1,000 ft above the runway. VERIFY against the FCTM.
+  speedbrake_max_ratio: 0.5
   detents:
     # `retract_above_kts` is the detent's manoeuvring speed and gates the
     # climb-out retraction. Flaps 5 is the takeoff setting, so the schedule

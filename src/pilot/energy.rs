@@ -11,7 +11,15 @@
 //! - The energy rate is the vertical speed plus speed x acceleration / g,
 //!   which a phugoid holds still.
 //! - The rate wanted is the path's own descent plus the speed error closed
-//!   over [`TIME_CONST_S`] (TECS_TIME_CONST).
+//!   over [`TIME_CONST_S`] (TECS_TIME_CONST). A SLOW error's request is
+//!   bounded ([`SPEED_TERM_MAX_FPM`]); a FAST one's only by idle, as TECS
+//!   bounds the deceleration it asks by what idle gives: a 737 at 190 kt
+//!   against 145 held the bound's 0.5 kt/s with the lever at 0.12 to 0.29
+//!   down an EGKK 26L final and went around at the gate 38 kt fast
+//!   (sortie 1791979030-full_auto, 2026-10-14).
+//! - The trim never learns further into a lever already at its stop
+//!   (TECS's integrator limits): back inside the band, the power the path
+//!   needs is still there.
 //! - The lever is the trim (an integrator, learnt over [`BASE_TAU_S`] and
 //!   stepped at once by a new path's energy: the feed-forward
 //!   `STEdot_dem / K_thr2STE`) plus the rate error over `K_thr2STE`.
@@ -47,7 +55,8 @@ pub const SLEW_PROTECT_PER_S: f64 = 0.15;
 /// Energy errors inside this are left alone, fpm (about 1.5 kt of speed
 /// error at a 172's approach speed).
 const DEADBAND_FPM: f64 = 25.0;
-/// The speed term never asks more than this, fpm.
+/// A SLOW speed error never asks the thrust for more than this, fpm. A fast
+/// one is not bounded here: the lever's idle stop is its bound.
 const SPEED_TERM_MAX_FPM: f64 = 500.0;
 /// The energy rate is smoothed over this, seconds: both its terms together,
 /// so a phugoid's still cancel.
@@ -131,10 +140,10 @@ pub fn energy_rate_fpm(ias_kts: f64, accel_kts_s: f64, vs_fpm: f64) -> f64 {
 }
 
 /// The energy rate that closes `err_kts` of speed (positive: slow) over
-/// [`TIME_CONST_S`], fpm. Pure.
+/// [`TIME_CONST_S`], fpm: at most [`SPEED_TERM_MAX_FPM`] slow, unbounded
+/// fast. Pure.
 pub fn speed_term_fpm(ias_kts: f64, err_kts: f64) -> f64 {
-    (ias_kts * FPS_PER_KT * err_kts * FPS_PER_KT / G_FPS2 / TIME_CONST_S * 60.0)
-        .clamp(-SPEED_TERM_MAX_FPM, SPEED_TERM_MAX_FPM)
+    (ias_kts * FPS_PER_KT * err_kts * FPS_PER_KT / G_FPS2 / TIME_CONST_S * 60.0).min(SPEED_TERM_MAX_FPM)
 }
 
 impl EnergyThrottle {
@@ -170,8 +179,7 @@ impl EnergyThrottle {
         self.underspeed = under || (self.underspeed && !clear);
         let weight = if self.underspeed { 1.0 / UNDERSPEED_TIME_SHARE } else { 1.0 };
         let want = i.path_vs_fpm
-            + (speed_term_fpm(i.ias_kts, i.target_kts - i.ias_kts) * weight)
-                .clamp(-SPEED_TERM_MAX_FPM * weight, SPEED_TERM_MAX_FPM * weight);
+            + (speed_term_fpm(i.ias_kts, i.target_kts - i.ias_kts) * weight).min(SPEED_TERM_MAX_FPM * weight);
         let raw = want - have;
         self.bad_s = if raw > BAD_DESCENT_FPM { self.bad_s + dt } else { 0.0 };
         let bad_descent = self.bad_s >= BAD_DESCENT_S && !self.underspeed;
@@ -183,10 +191,17 @@ impl EnergyThrottle {
         // The trim learns every error, however small (the deadband is the
         // hand's), and a new path moves it at once by the energy the path
         // asks: a glideslope captured from level takes the power off as it
-        // starts down.
+        // starts down. It never learns further into a lever already at its
+        // stop: a final flown fast at idle would otherwise unlearn the
+        // power its path needs.
         let path_step = self.last_path_vs.map_or(0.0, |p| i.path_vs_fpm - p);
         self.last_path_vs = Some(i.path_vs_fpm);
-        *base = (*base + path_step / k + raw / k * dt / BASE_TAU_S).clamp(0.0, 1.0);
+        *base = (*base + path_step / k).clamp(0.0, 1.0);
+        let pushed = *base + err / k;
+        let at_stop = (pushed <= 0.0 && raw < 0.0) || (pushed >= 1.0 && raw > 0.0);
+        if !at_stop {
+            *base = (*base + raw / k * dt / BASE_TAU_S).clamp(0.0, 1.0);
+        }
         let cmd = (*base + err / k).clamp(0.0, 1.0);
         let step = if self.underspeed { SLEW_PROTECT_PER_S } else { SLEW_PER_S } * dt;
         let lever = cmd.clamp(i.thr_now - step, i.thr_now + step).clamp(0.0, 1.0);

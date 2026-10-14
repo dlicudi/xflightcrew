@@ -280,6 +280,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let mut pattern_gs_kts = 0.0_f64;
             let mut gear_down = false;
             let mut landing_config_done = false;
+            // The speedbrake this final put out, and the lever it found
+            // (stowed, or armed for landing): put back as it was
+            // (`approach_energy::final_drag`).
+            let mut drag_restore: Option<f64> = None;
             // The flap the wing is flying on at the arm: the schedule's first
             // write must know what it would take away (`flap_kept_flying`).
             // A failed read is no measurement: unknown, as before.
@@ -3449,6 +3453,49 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         announce(line, Priority::Advisory);
                     }
                 }
+                // THE SPEEDBRAKE ON A FINAL (`approach_energy::final_drag`):
+                // out where idle and the flap cannot make the gate, back as
+                // it was found once they can, past the declared flap, by
+                // 1,000 ft, in a go-around or the flare. A lever found out is
+                // not ours (the pilot's, or the descent's being stowed).
+                if let Some(m) = energy_model.as_ref() {
+                    let max_flap = crate::aircraft::live_profile()
+                        .and_then(|p| p.flaps.as_ref().and_then(|f| f.speedbrake_max_ratio));
+                    let limit = crate::approach_energy::gate_limit_kts(m, energy_vapp, gate.gate_ft());
+                    let e_gate = energy.map(|(.., k)| k).filter(|_| !ga && g.phase != ApproachPhase::Flare);
+                    let (want, why) = crate::approach_energy::final_drag(
+                        drag_restore.is_some(),
+                        e_gate,
+                        limit,
+                        alt - rwy.elev_ft,
+                        last_flap.unwrap_or(0.0),
+                        max_flap,
+                    );
+                    if want != drag_restore.is_some() {
+                        let at = crate::tools::controls::speedbrake_read(&xp).await.ok();
+                        let write = match (want, at, drag_restore) {
+                            (true, Some(v), _) if v <= 0.05 => Some((crate::tools::controls::SPEEDBRAKE_FLIGHT, Some(v.min(0.0)))),
+                            (false, _, Some(back)) => Some((back, None)),
+                            _ => None,
+                        };
+                        if let Some((v, restore)) = write {
+                            let ok = crate::tools::controls::speedbrake_set(&xp, v).await.is_ok();
+                            if ok {
+                                drag_restore = restore;
+                                announce(
+                                    if want { "Speedbrake." } else { "Speedbrake in." }.to_string(),
+                                    Priority::Advisory,
+                                );
+                            }
+                            crate::blackbox::record(
+                                "autoland",
+                                serde_json::json!({"event": "speedbrake", "out": want, "why": why, "ok": ok,
+                                    "lever": v, "found": at, "e_gate": e_gate, "limit": limit, "ias": ias,
+                                    "flap": last_flap, "height_aal": alt - rwy.elev_ft, "dist": g.dist_nm}),
+                            );
+                        }
+                    }
+                }
                 // Go-around flap: half, whatever the schedule says — full flap
                 // won't climb, and clean this low gives the sink away.
                 // A CLOSE downwind is flown at half flap too. `outbound` also
@@ -3671,6 +3718,18 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // latched by `rolling_out`, before the approach guidance.)
                 // The flare's tick from minimums: the segment is hand flown.
                 pacer.wait(std::time::Duration::from_millis(tick_ms(last_phase, g.arresting || arrest_hands))).await;
+            }
+            // A speedbrake this final put out goes back as it was found,
+            // however the run ended (a client of its own: the run's may be
+            // cancelled).
+            if let Some(back) = drag_restore.take() {
+                let ok = crate::tools::controls::speedbrake_set(&XPlaneClient::new(base_url.clone()), back)
+                    .await
+                    .is_ok();
+                crate::blackbox::record(
+                    "autoland",
+                    serde_json::json!({"event": "speedbrake", "out": false, "why": "run_ended", "ok": ok, "lever": back}),
+                );
             }
             // A newer loop (the clearance re-arm above, or any later arm) has
             // already set ACTIVE for itself; clearing it here would report
