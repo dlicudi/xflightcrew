@@ -34,6 +34,10 @@ pub struct Order {
     pub follow: Option<u32>,
     /// "Hold position": stop where you are, and no "ready" call yet.
     pub hold: bool,
+    /// "Behind the landing traffic, line up": the ready call was answered,
+    /// and it waits short of the runway for the named arrival to pass (the
+    /// state reads [`TowerState::TaxiCleared`] until it has).
+    pub line_up_behind: bool,
     /// "Go around": at once, from a final or a landing.
     pub go_around: bool,
     /// A readback the tower is owed, answered verbatim once.
@@ -412,6 +416,16 @@ pub enum Event {
     SpacingCleared {
         id: u32,
         removed: u32,
+        /// What made the guard act: `runway` (stopped on one), `junction`
+        /// (giving way to one standing still), `parked`, or `facing` (one
+        /// standing nose to it).
+        why: &'static str,
+        /// The mover's and the removed one's place and heading, the removed
+        /// one's phase as it went, and how long it had stood: the case is
+        /// recreated from the record alone (LEMG, 2026-10-14).
+        at: [(LatLon, f64); 2],
+        phase: Phase,
+        still_s: f64,
     },
     /// ...and with no other way and nothing to tow (our own aircraft, or one
     /// that may yet move), it waits where it is: said once per blocker.
@@ -465,6 +479,8 @@ pub struct RadioState {
     pub readback_at_s: f64,
     /// The phase's call has gone out (reset on every phase change).
     pub called: bool,
+    /// When it went out, the phase's own seconds.
+    pub called_at_s: f64,
 }
 
 #[cfg(test)]

@@ -1827,6 +1827,7 @@ pub(crate) fn map_order(o: &TrafficOrder) -> Order {
             _ => None,
         },
         hold: o.hold,
+        line_up_behind: o.line_up_condition == Some(false),
         go_around: o.go_around,
         readback_owed: o.readback_owed.clone(),
         cross_cleared: o.crossing.clone(),
@@ -3185,10 +3186,31 @@ fn record(out: &TickOut, link: &Link) {
                 field,
                 serde_json::json!({ "event": "spacing_rerouted", "id": id, "around": around }),
             ),
-            Event::SpacingCleared { id, removed } => rec(
-                field,
-                serde_json::json!({ "event": "spacing_cleared", "id": id, "removed": removed }),
-            ),
+            Event::SpacingCleared {
+                id,
+                removed,
+                why,
+                at,
+                phase,
+                still_s,
+            } => {
+                let place = |(p, hdg): ((f64, f64), f64)| {
+                    serde_json::json!({ "lat": p.0, "lon": p.1, "hdg": hdg.round() })
+                };
+                rec(
+                    field,
+                    serde_json::json!({
+                        "event": "spacing_cleared",
+                        "id": id,
+                        "removed": removed,
+                        "why": why,
+                        "mover": place(at[0]),
+                        "at": place(at[1]),
+                        "phase": format!("{phase:?}"),
+                        "still_s": still_s.round(),
+                    }),
+                )
+            }
             Event::SpacingHeld { id, behind } => rec(
                 field,
                 serde_json::json!({ "event": "spacing_held", "id": id, "behind": behind }),

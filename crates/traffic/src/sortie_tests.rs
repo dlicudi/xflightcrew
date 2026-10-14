@@ -1351,6 +1351,156 @@ fn guard_events(events: &[Event]) -> (usize, usize, usize) {
     )
 }
 
+/// A DEPARTURE WAITING FOR THE RUNWAY IS A QUEUE, NEVER A BLOCKAGE: LEMG
+/// 12 (2026-10-14), two departures held on Delta for their takeoff were
+/// towed off one after the other by a third joining from a branch behind
+/// them, and vanished in front of our own aircraft (the geometry there is
+/// not yet recreated: owed). [2] stands on the line under a "hold
+/// position"; [3] comes up a branch to join the line behind it the same
+/// way and queues. Ten minutes on, [2] is still there and was never towed.
+#[test]
+fn a_departure_held_for_the_runway_is_never_towed_by_one_joining_behind_it() {
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    let mut fleet = Fleet::new(field.clone());
+    fleet.spawn(taxiing(
+        &field,
+        2,
+        "A320",
+        vec![end.at(600.0, -150.0), end.at(900.0, -150.0)],
+    ));
+    fleet.spawn(taxiing(
+        &field,
+        3,
+        "B738",
+        vec![
+            end.at(400.0, -450.0),
+            end.at(400.0, -150.0),
+            end.at(900.0, -150.0),
+        ],
+    ));
+    let order = |id: u32| {
+        Some(Order {
+            state: TowerState::TaxiCleared,
+            hold: id == 2,
+            ..Default::default()
+        })
+    };
+    let (mut t, mut all) = (0.0, Vec::new());
+    while t < 600.0 {
+        all.extend(fleet.step(0.1, None, &order));
+        t += 0.1;
+    }
+    let (rerouted, towed, held) = guard_events(&all);
+    println!("held departure: rerouted {rerouted} towed {towed} held {held}");
+    assert_eq!(towed, 0, "the held departure was towed");
+    assert_eq!(
+        fleet.get(2).map(|a| a.phase),
+        Some(Phase::TaxiOut),
+        "still waiting for the runway"
+    );
+}
+
+/// A HELD DEPARTURE FACING A MOVER IS STILL NO BLOCKAGE: [2] waits under a
+/// "hold position" for its takeoff, its way ahead turning off north; [3]
+/// comes west down the line and stops nose to it. [2] is not waiting on
+/// [3] (its way does not run through it), and [3], on the tower's route,
+/// has no other way: it waits. [2] is never towed.
+#[test]
+fn a_held_departure_nose_to_a_mover_is_never_towed() {
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    let mut fleet = Fleet::new(field.clone());
+    let mut held = taxiing(
+        &field,
+        2,
+        "A320",
+        vec![end.at(300.0, -150.0), end.at(300.0, 100.0)],
+    );
+    held.kin.hdg_deg = crate::kin::bearing(end.at(300.0, -150.0), end.at(600.0, -150.0));
+    fleet.spawn(held);
+    // On the tower's route, which the guard may not plan another way.
+    let mut mover = taxiing(
+        &field,
+        3,
+        "C172",
+        vec![end.at(700.0, -150.0), end.at(0.0, -150.0)],
+    );
+    mover.tower_route = true;
+    fleet.spawn(mover);
+    let order = |id: u32| {
+        Some(Order {
+            state: TowerState::TaxiCleared,
+            hold: id == 2,
+            ..Default::default()
+        })
+    };
+    let (mut t, mut all) = (0.0, Vec::new());
+    while t < 600.0 {
+        all.extend(fleet.step(0.1, None, &order));
+        t += 0.1;
+    }
+    let (rerouted, towed, held) = guard_events(&all);
+    println!("nose to a held departure: rerouted {rerouted} towed {towed} held {held}");
+    assert_eq!(towed, 0, "the held departure was towed");
+    assert!(fleet.get(2).is_some_and(|a| a.phase == Phase::TaxiOut));
+}
+
+/// A "READY" NOBODY ANSWERED IS CALLED AGAIN: LEMG (2026-10-14), a
+/// departure at the hold called the tower before its strip held a taxi
+/// clearance, Ground answered it, and it stood forty minutes silent. At
+/// the hold, still only cleared to taxi and not held, it calls again every
+/// [`READY_RETRY_S`]; held by the tower, or told to line up behind the
+/// landing traffic, its one call stands.
+#[test]
+fn an_unanswered_ready_call_is_made_again() {
+    use crate::aircraft::READY_RETRY_S;
+    let field = fixtures::xtst();
+    let end = field.end("09").unwrap();
+    let readies = |order: Order| {
+        let mut fleet = Fleet::new(field.clone());
+        let mut ac = taxiing(
+            &field,
+            1,
+            "A320",
+            vec![end.at(300.0, -150.0), end.at(300.0, -100.0)],
+        );
+        ac.phase = Phase::HoldShort;
+        fleet.spawn(ac);
+        let (mut t, mut n) = (0.0, 0);
+        while t < 2.5 * READY_RETRY_S {
+            for e in fleet.step(0.1, None, &|_| Some(order.clone())) {
+                if matches!(
+                    e,
+                    Event::Call {
+                        call: Call::Ready,
+                        ..
+                    }
+                ) {
+                    n += 1;
+                }
+            }
+            t += 0.1;
+        }
+        n
+    };
+    let taxi = Order {
+        state: TowerState::TaxiCleared,
+        ..Default::default()
+    };
+    assert_eq!(readies(taxi.clone()), 3, "called, then again twice");
+    let held = Order {
+        hold: true,
+        ..taxi.clone()
+    };
+    assert_eq!(readies(held), 0, "held: no call");
+    let behind = Order {
+        line_up_behind: true,
+        ..taxi
+    };
+    assert_eq!(readies(behind), 1, "answered: one call");
+}
+
 /// HEAD ON AT A JUNCTION (the pass-through, 2026-10-09: the one with the
 /// right of way drove THROUGH the other). [2] taxis east along the line;
 /// [1] comes up a side branch and would turn west down the same line,
