@@ -867,6 +867,8 @@ confirms it closes it (`fixes #N` in the commit). Known gaps are `owed` issues.
   `cargo test --release -p atc -- --ignored atc_world_sweep`; ILS smoke
   `cargo test -- --ignored real_install_ils`; `docs/atc-chaos-card.md`.
 - `xfc debrief` (`src/debrief.rs`) after every flight, before diagnosing by hand.
+  A failed sortie: `xfc debrief --sortie <id|last>` (the moment it ended, the decisions before
+  it, contradiction flags; `src/debrief/sortie.rs` `RULES`); one airframe's: `--airframe <id> [--since]`.
 - **A new airframe or profile edit is checked parked first** (`xfc conform [--only <area>]`,
   `src/conform.rs`, `docs/conform.md`): every declared channel through its own seam, read back,
   put back; a row per channel and a blackbox `conform` record each. `--prepare` brings it up
