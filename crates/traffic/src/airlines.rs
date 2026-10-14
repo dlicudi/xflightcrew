@@ -453,6 +453,85 @@ pub(crate) const AEE: Carrier = c("AEE", "Aegean", &[("A20N", 60), ("A21N", 40)]
 pub(crate) const LOT: Carrier = c("LOT", "LOT", &[("B38M", 100)], (400, 499));
 pub(crate) const ETD: Carrier = c("ETD", "Etihad", &[("B789", 60), ("A321", 40)], (1, 199));
 
+/// Every carrier constant by its Rust name, written once so the name and
+/// the value can never part: the route tables' data files
+/// (`crates/traffic/routes/*.yaml`) name their carriers this way.
+macro_rules! named_carriers {
+    ($($name:ident),* $(,)?) => {
+        /// The carrier constant called `name` ("EZY_GATWICK"), `None` for a
+        /// name no constant carries.
+        pub fn carrier_by_name(name: &str) -> Option<Carrier> {
+            match name {
+                $(stringify!($name) => Some($name),)*
+                _ => None,
+            }
+        }
+
+        /// Every name [`carrier_by_name`] knows.
+        #[cfg(test)]
+        pub(crate) const CARRIER_NAMES: &[&str] = &[$(stringify!($name)),*];
+    };
+}
+
+named_carriers!(
+    EZY,
+    EZY_GATWICK,
+    BAW_EUROPE,
+    BAW_GATWICK,
+    BAW_HEATHROW,
+    BAW_LONG,
+    RYR,
+    WZZ,
+    VLG,
+    TOM,
+    EXS,
+    UAE,
+    VIR,
+    EIN,
+    DLH,
+    DLH_FRANKFURT,
+    AAL_LONG,
+    AAL,
+    UAL_LONG,
+    UAL,
+    DAL_LONG,
+    DAL,
+    JBU,
+    SWA,
+    ASA,
+    QTR,
+    TAP,
+    THY,
+    ACA,
+    SWR,
+    AFR,
+    AFR_PARIS,
+    AFR_LONG,
+    KLM,
+    KLM_AMSTERDAM,
+    IBE,
+    IBE_MADRID,
+    IBS,
+    AEA,
+    NAX,
+    TRA,
+    TVF,
+    EWG,
+    CFG,
+    ITY,
+    ANE,
+    LOG,
+    HOP,
+    BEL,
+    AUA,
+    SAS,
+    FIN,
+    ICE,
+    AEE,
+    LOT,
+    ETD,
+);
+
 /// The fields we fly, each its own mix.
 pub fn field_mix(icao: &str) -> Option<&'static [Share]> {
     Some(match icao {
@@ -931,5 +1010,33 @@ mod tests {
         let share = ezy as f64 / n as f64;
         assert!((share - 0.45).abs() < 0.02, "{share}");
         assert!(draw(&[], &mut r).is_none());
+    }
+
+    /// Every carrier constant in this file is reachable by its name, so a
+    /// route file can name any of them; the source is the list, so a new
+    /// constant missing from `named_carriers!` fails here.
+    #[test]
+    fn every_carrier_const_is_reachable_by_name() {
+        let src = include_str!("airlines.rs");
+        let mut declared = Vec::new();
+        for line in src.lines() {
+            let Some(rest) = line.strip_prefix("pub(crate) const ") else {
+                continue;
+            };
+            if let Some((name, ty)) = rest.split_once(':') {
+                if ty.trim_start().starts_with("Carrier ") {
+                    declared.push(name.trim().to_string());
+                }
+            }
+        }
+        assert!(declared.len() > 40, "{declared:?}");
+        for name in &declared {
+            assert!(carrier_by_name(name).is_some(), "{name} has no name");
+        }
+        assert_eq!(declared.len(), CARRIER_NAMES.len());
+        assert_eq!(carrier_by_name("EZY_GATWICK"), Some(EZY_GATWICK));
+        assert_eq!(carrier_by_name("BAW_EUROPE"), Some(BAW_EUROPE));
+        assert_eq!(carrier_by_name("ezy"), None);
+        assert_eq!(carrier_by_name("EZY GATWICK"), None);
     }
 }
