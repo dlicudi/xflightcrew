@@ -55,6 +55,12 @@ impl XorShift64 {
     }
 }
 
+/// The session's seed the app draws every field's day with ([`field_seed`]):
+/// a constant, so the same field is the same day every session, and a
+/// shared route's far end can draw the source field's day exactly
+/// ([`crate::rotation`], 2026-10-14).
+pub const SESSION_SEED: u64 = 1;
+
 /// A field's seed for its day: its ICAO (any case) hashed with the
 /// session's seed (multi-field traffic stage 2, 2026-10-13). Each field
 /// draws the same day whichever field was built first and however often

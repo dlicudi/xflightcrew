@@ -1,0 +1,193 @@
+# Gatwick's route table, read by crates/traffic/src/routes.rs (embedded at
+# build time, validated by its tests). A row names its carrier by the Rust
+# constant in crates/traffic/src/airlines.rs; `number` is the INBOUND flight
+# of the day's first rotation, its outbound the next number; `windows` are
+# the local hours the arrivals fall in (absent: the carrier's lines of
+# flying); `based: true` night-stops the first rotation; `types` are the
+# route's own types by weight (absent: the carrier's). Row order is kept:
+# the day's draws follow it.
+#
+# A route to another table field is written ONCE (2026-10-14): Malaga's six
+# Gatwick routes (easyJet, BA, Vueling, Wizz, Jet2, TUI) are in LEMG.yaml
+# and Gibraltar's easyJet in LXGB.yaml, and this table derives them, the
+# same flights seen from here a block time away. They are not written
+# below.
+#
+# Sources (read 2026-10-14): Wikipedia, "Gatwick Airport" (operating bases,
+# Airlines and destinations, the busiest routes of 2025 international and
+# 2024 domestic, annual traffic); UK CAA, UK airport data annual 2025
+# (Table 12.1 international and 12.2 domestic route analysis, Table 03.1
+# aircraft movements, Table 05 air transport movements: 263,113 movements
+# in 2025, 261,529 of them air transport, 721 a day, a summer day 850 to
+# 900); Emirates' media centre and AirInsight (three daily A380s and a
+# fourth daily A350-900 since 9 February 2026); Travelradar (Turkish from
+# 26 to 28 a week, summer 2025); Air Cargo Week (Qatar double daily on the
+# 787); FlightAware logs (China Eastern's B77W, B773 and A332 to Pudong);
+# Gatwick's media centre (Air China and China Eastern to Shanghai);
+# airplanes.live (Norse Atlantic UK, Sky Express).
+#
+# The method, as Malaga's: a route's weekly rotations are its 2025
+# passengers over a full narrowbody each way (150 seated, 85% full) and the
+# 52 weeks, split between the carriers the article names on it (the split
+# is judgement: no source publishes it); a year-round route flies 1.2 of
+# that in the summer and 0.7 in the winter, a winter-sun or ski route the
+# same all year, a summer-heavy one 1.5 in the summer, a summer-only one
+# 1.68 in the summer and none in the winter. The rows are the 40 busiest
+# international routes and the 9 busiest domestic ones, 60% of Gatwick's
+# passengers.
+#
+# SCALED by 0.7 and rounded: Gatwick carries 163.5 passengers a movement,
+# not the method's 127.5 (easyJet's A321neos, the widebodies), and Malaga's
+# table flies about 0.62 of the method as written; at 0.7 the two tables
+# agree. A route flown more than seven a day is two rows (Ryanair to
+# Dublin, easyJet to Rome). Long haul and the Gulf keep their PUBLISHED
+# frequencies (Emirates 28 a week, Turkish 28, Qatar 14) or an estimate
+# from passengers over a widebody's seats (Shanghai, Orlando, Cancun, New
+# York), in published-like windows. The rest of Gatwick's day (the long
+# tail of routes below the cut) is the hour generator's TOP-UP
+# (`top_up: true`, crates/traffic/src/midflow.rs `top_up`): it flies the
+# field's own rate less what this table flies in the hour.
+#
+# Flight numbers are illustrative inside each carrier's own range (BA's
+# Gatwick flights are its 2xxx ones), spaced so a day's rotations never
+# collide. Wizz flies as WZZ, not Wizz Air UK's WUK, so the Malaga route
+# keeps its one carrier.
+icao: EGKK
+city: "London Gatwick"
+# Standard time's offset from UTC, hours (the United Kingdom keeps
+# Greenwich Mean Time with British Summer Time on top, on the EU's dates:
+# the last Sundays of March and October).
+utc_offset_h: 0.0
+top_up: true
+routes:
+  # The United Kingdom, the Channel Islands and Ireland.
+  - {carrier: RYR, number: 8301, other: EIDW, city: "Dublin", summer: 32, winter: 19}
+  - {carrier: RYR, number: 8351, other: EIDW, city: "Dublin", summer: 32, winter: 18}
+  - {carrier: EZY_GATWICK, number: 8655, other: EGJJ, city: "Jersey", summer: 19, winter: 4, based: true}
+  - {carrier: BAW_GATWICK, number: 2345, other: EGJJ, city: "Jersey", summer: 19, winter: 4, based: true}
+  - {carrier: EZY_GATWICK, number: 8673, other: EGPH, city: "Edinburgh", summer: 29, winter: 17, based: true}
+  - {carrier: EZY_GATWICK, number: 8695, other: EGPF, city: "Glasgow", summer: 16, winter: 10, based: true}
+  - {carrier: BAW_GATWICK, number: 2357, other: EGPF, city: "Glasgow", summer: 11, winter: 6, based: true}
+  - {carrier: EZY_GATWICK, number: 8713, other: EGAA, city: "Belfast International", summer: 25, winter: 15, based: true}
+  - {carrier: EZY_GATWICK, number: 8733, other: EGAC, city: "Belfast City", summer: 18, winter: 11, based: true}
+  - {carrier: AUR, number: 601, other: EGJB, city: "Guernsey", summer: 14, winter: 14}
+  - {carrier: EZY_GATWICK, number: 8751, other: EGPE, city: "Inverness", summer: 15, winter: 8, based: true}
+  - {carrier: EZY_GATWICK, number: 8767, other: EGPD, city: "Aberdeen", summer: 13, winter: 8, based: true}
+  - {carrier: EZY_GATWICK, number: 8783, other: EGNS, city: "Isle of Man", summer: 12, winter: 7, based: true}
+  # Spain and Portugal (Malaga is Malaga's file: LEMG.yaml writes those
+  # routes and this table derives them).
+  - {carrier: EZY_GATWICK, number: 8101, other: LEBL, city: "Barcelona", summer: 43, winter: 25, based: true}
+  - {carrier: VLG, number: 8851, other: LEBL, city: "Barcelona", summer: 35, winter: 20, based: true}
+  - {carrier: EZY_GATWICK, number: 8129, other: LEAL, city: "Alicante", summer: 27, winter: 16, based: true}
+  - {carrier: EXS, number: 651, other: LEAL, city: "Alicante", summer: 8, winter: 5, based: true}
+  - {carrier: BAW_GATWICK, number: 2201, other: LEAL, city: "Alicante", summer: 6, winter: 4, based: true}
+  - {carrier: VLG, number: 8871, other: LEAL, city: "Alicante", summer: 6, winter: 4, based: true}
+  - {carrier: RYR, number: 8331, other: LEAL, city: "Alicante", summer: 6, winter: 4}
+  - {carrier: TOM, number: 651, other: LEAL, city: "Alicante", summer: 3, winter: 1, based: true}
+  - {carrier: EZY_GATWICK, number: 8183, other: LPFR, city: "Faro", summer: 26, winter: 15, based: true}
+  - {carrier: EXS, number: 659, other: LPFR, city: "Faro", summer: 11, winter: 6, based: true}
+  - {carrier: BAW_GATWICK, number: 2209, other: LPFR, city: "Faro", summer: 8, winter: 4, based: true}
+  - {carrier: WZZ, number: 4501, other: LPFR, city: "Faro", summer: 8, winter: 4, based: true}
+  - {carrier: EZY_GATWICK, number: 8257, other: LEPA, city: "Palma de Mallorca", summer: 30, winter: 5, based: true}
+  - {carrier: BAW_GATWICK, number: 2223, other: LEPA, city: "Palma de Mallorca", summer: 8, winter: 1, based: true}
+  - {carrier: EXS, number: 675, other: LEPA, city: "Palma de Mallorca", summer: 8, winter: 1, based: true}
+  - {carrier: TOM, number: 663, other: LEPA, city: "Palma de Mallorca", summer: 8, winter: 1, based: true}
+  - {carrier: EZY_GATWICK, number: 8309, other: LEMD, city: "Madrid", summer: 15, winter: 9, based: true}
+  - {carrier: AEA, number: 1001, other: LEMD, city: "Madrid", summer: 12, winter: 7}
+  - {carrier: IBS, number: 3801, other: LEMD, city: "Madrid", summer: 12, winter: 7}
+  - {carrier: EZY_GATWICK, number: 8421, other: LPPT, city: "Lisbon", summer: 18, winter: 10, based: true}
+  - {carrier: TAP, number: 1331, other: LPPT, city: "Lisbon", summer: 14, winter: 8}
+  - {carrier: EZY_GATWICK, number: 8457, other: LEZL, city: "Seville", summer: 15, winter: 9, based: true}
+  - {carrier: VLG, number: 8879, other: LEZL, city: "Seville", summer: 9, winter: 6, based: true}
+  - {carrier: BAW_GATWICK, number: 2269, other: LEZL, city: "Seville", summer: 6, winter: 4, based: true}
+  - {carrier: EZY_GATWICK, number: 8491, other: LPPR, city: "Porto", summer: 15, winter: 8, based: true}
+  - {carrier: TAP, number: 1341, other: LPPR, city: "Porto", summer: 8, winter: 5}
+  - {carrier: BAW_GATWICK, number: 2291, other: LPPR, city: "Porto", summer: 6, winter: 4, based: true}
+  - {carrier: VLG, number: 8887, other: LEBB, city: "Bilbao", summer: 22, winter: 13, based: true}
+  # France, Italy, Switzerland, the Benelux, the Nordics and Hungary.
+  - {carrier: EZY_GATWICK, number: 8151, other: LIRF, city: "Rome Fiumicino", summer: 26, winter: 15, based: true}
+  - {carrier: EZY_GATWICK, number: 8171, other: LIRF, city: "Rome Fiumicino", summer: 26, winter: 15, based: true}
+  - {carrier: EZY_GATWICK, number: 8205, other: LIMC, city: "Milan Malpensa", summer: 48, winter: 28, based: true}
+  - {carrier: EZY_GATWICK, number: 8235, other: LSGG, city: "Geneva", summer: 29, winter: 29, based: true}
+  - {carrier: BAW_GATWICK, number: 2217, other: LSGG, city: "Geneva", summer: 4, winter: 4, based: true}
+  - {carrier: SWR, number: 351, other: LSGG, city: "Geneva", summer: 2, winter: 2}
+  - {carrier: EXS, number: 669, other: LSGG, city: "Geneva", summer: 2, winter: 2, based: true}
+  - {carrier: TOM, number: 657, other: LSGG, city: "Geneva", summer: 2, winter: 2, based: true}
+  - {carrier: EZY_GATWICK, number: 8345, other: EHAM, city: "Amsterdam", summer: 34, winter: 20, based: true}
+  - {carrier: NAX, number: 1301, other: EKCH, city: "Copenhagen", summer: 20, winter: 11}
+  - {carrier: EZY_GATWICK, number: 8385, other: EKCH, city: "Copenhagen", summer: 13, winter: 8, based: true}
+  - {carrier: EZY_GATWICK, number: 8401, other: LFMN, city: "Nice", summer: 24, winter: 14, based: true}
+  - {carrier: BAW_GATWICK, number: 2261, other: LFMN, city: "Nice", summer: 8, winter: 5, based: true}
+  - {carrier: EZY_GATWICK, number: 8539, other: LFPG, city: "Paris Charles de Gaulle", summer: 16, winter: 9, based: true}
+  - {carrier: AFR, number: 1081, other: LFPG, city: "Paris Charles de Gaulle", summer: 11, winter: 6}
+  - {carrier: NAX, number: 1313, other: ENGM, city: "Oslo", summer: 24, winter: 14}
+  - {carrier: EZY_GATWICK, number: 8623, other: LIRN, city: "Naples", summer: 16, winter: 9, based: true}
+  - {carrier: EXS, number: 745, other: LIRN, city: "Naples", summer: 4, winter: 2, based: true}
+  - {carrier: TOM, number: 751, other: LIRN, city: "Naples", summer: 2, winter: 1, based: true}
+  - {carrier: WZZ, number: 4523, other: LHBP, city: "Budapest", summer: 15, winter: 8, based: true}
+  - {carrier: EZY_GATWICK, number: 8641, other: LHBP, city: "Budapest", summer: 6, winter: 4, based: true}
+  # The Canaries and Morocco.
+  - {carrier: EZY_GATWICK, number: 8281, other: GCTS, city: "Tenerife South", summer: 14, winter: 14, based: true}
+  - {carrier: TOM, number: 671, other: GCTS, city: "Tenerife South", summer: 9, winter: 9, based: true}
+  - {carrier: EXS, number: 683, other: GCTS, city: "Tenerife South", summer: 7, winter: 7, based: true}
+  - {carrier: BAW_GATWICK, number: 2231, other: GCTS, city: "Tenerife South", summer: 6, winter: 6, based: true}
+  - {carrier: EZY_GATWICK, number: 8327, other: GMMX, city: "Marrakesh", summer: 19, winter: 19, based: true}
+  - {carrier: BAW_GATWICK, number: 2245, other: GMMX, city: "Marrakesh", summer: 8, winter: 8, based: true}
+  - {carrier: TOM, number: 687, other: GMMX, city: "Marrakesh", summer: 5, winter: 5, based: true}
+  - {carrier: EZY_GATWICK, number: 8475, other: GCRR, city: "Lanzarote", summer: 11, winter: 11, based: true}
+  - {carrier: EXS, number: 707, other: GCRR, city: "Lanzarote", summer: 5, winter: 5, based: true}
+  - {carrier: TOM, number: 699, other: GCRR, city: "Lanzarote", summer: 5, winter: 5, based: true}
+  - {carrier: BAW_GATWICK, number: 2285, other: GCRR, city: "Lanzarote", summer: 4, winter: 4, based: true}
+  # Greece, Turkey's coast, Cyprus and Malta: summer heavy, Corfu,
+  # Heraklion, Rhodes and Dalaman summer only.
+  - {carrier: SXS, number: 1631, other: LTAI, city: "Antalya", summer: 18, winter: 3}
+  - {carrier: EXS, number: 691, other: LTAI, city: "Antalya", summer: 13, winter: 2, based: true}
+  - {carrier: TOM, number: 679, other: LTAI, city: "Antalya", summer: 8, winter: 1, based: true}
+  - {carrier: EZY_GATWICK, number: 8297, other: LTAI, city: "Antalya", summer: 5, winter: 1, based: true}
+  - {carrier: CAI, number: 1661, other: LTAI, city: "Antalya", summer: 5, winter: 1}
+  - {carrier: BAW_GATWICK, number: 2239, other: LTAI, city: "Antalya", summer: 3, winter: 1, based: true}
+  - {carrier: EZY_GATWICK, number: 8369, other: LMML, city: "Malta", summer: 15, winter: 9, based: true}
+  - {carrier: BAW_GATWICK, number: 2253, other: LMML, city: "Malta", summer: 8, winter: 5, based: true}
+  - {carrier: KMM, number: 391, other: LMML, city: "Malta", summer: 7, winter: 4}
+  - {carrier: EXS, number: 701, other: LMML, city: "Malta", summer: 4, winter: 2, based: true}
+  - {carrier: EZY_GATWICK, number: 8439, other: LGAV, city: "Athens", summer: 18, winter: 11, based: true}
+  - {carrier: SEH, number: 411, other: LGAV, city: "Athens", summer: 8, winter: 4}
+  - {carrier: AEE, number: 601, other: LGAV, city: "Athens", summer: 5, winter: 3}
+  - {carrier: EZY_GATWICK, number: 8507, other: LCLK, city: "Larnaca", summer: 13, winter: 8, based: true}
+  - {carrier: BAW_GATWICK, number: 2299, other: LCLK, city: "Larnaca", summer: 6, winter: 4, based: true}
+  - {carrier: WZZ, number: 4509, other: LCLK, city: "Larnaca", summer: 6, winter: 4, based: true}
+  - {carrier: TOM, number: 705, other: LCLK, city: "Larnaca", summer: 4, winter: 3, based: true}
+  - {carrier: EZY_GATWICK, number: 8523, other: LTBS, city: "Dalaman", summer: 14, winter: 0, based: true}
+  - {carrier: TOM, number: 711, other: LTBS, city: "Dalaman", summer: 10, winter: 0, based: true}
+  - {carrier: SXS, number: 1643, other: LTBS, city: "Dalaman", summer: 6, winter: 0}
+  - {carrier: BAW_GATWICK, number: 2307, other: LTBS, city: "Dalaman", summer: 6, winter: 0, based: true}
+  - {carrier: WZZ, number: 4517, other: LTBS, city: "Dalaman", summer: 4, winter: 0, based: true}
+  - {carrier: EZY_GATWICK, number: 8557, other: LCPH, city: "Paphos", summer: 15, winter: 3, based: true}
+  - {carrier: EXS, number: 713, other: LCPH, city: "Paphos", summer: 7, winter: 1, based: true}
+  - {carrier: BAW_GATWICK, number: 2315, other: LCPH, city: "Paphos", summer: 4, winter: 1, based: true}
+  - {carrier: TOM, number: 719, other: LCPH, city: "Paphos", summer: 3, winter: 1, based: true}
+  - {carrier: EZY_GATWICK, number: 8573, other: LGKR, city: "Corfu", summer: 16, winter: 0, based: true}
+  - {carrier: EXS, number: 721, other: LGKR, city: "Corfu", summer: 8, winter: 0, based: true}
+  - {carrier: BAW_GATWICK, number: 2327, other: LGKR, city: "Corfu", summer: 5, winter: 0, based: true}
+  - {carrier: TOM, number: 731, other: LGKR, city: "Corfu", summer: 4, winter: 0, based: true}
+  - {carrier: EZY_GATWICK, number: 8591, other: LGIR, city: "Heraklion", summer: 14, winter: 0, based: true}
+  - {carrier: EXS, number: 729, other: LGIR, city: "Heraklion", summer: 8, winter: 0, based: true}
+  - {carrier: TOM, number: 737, other: LGIR, city: "Heraklion", summer: 6, winter: 0, based: true}
+  - {carrier: BAW_GATWICK, number: 2333, other: LGIR, city: "Heraklion", summer: 3, winter: 0, based: true}
+  - {carrier: EZY_GATWICK, number: 8607, other: LGRP, city: "Rhodes", summer: 14, winter: 0, based: true}
+  - {carrier: EXS, number: 737, other: LGRP, city: "Rhodes", summer: 9, winter: 0, based: true}
+  - {carrier: TOM, number: 745, other: LGRP, city: "Rhodes", summer: 5, winter: 0, based: true}
+  - {carrier: BAW_GATWICK, number: 2339, other: LGRP, city: "Rhodes", summer: 3, winter: 0, based: true}
+  # Istanbul, the Gulf and long haul: published frequencies, not the
+  # passenger method, and published windows (the arrivals' local hours).
+  - {carrier: UAE, number: 5, other: OMDB, city: "Dubai", summer: 28, winter: 28, windows: [[7.0, 7.5], [12.5, 13.0], [14.5, 15.0], [19.5, 20.0]], types: [[A388, 75], [A359, 25]]}
+  - {carrier: THY, number: 1979, other: LTFM, city: "Istanbul", summer: 28, winter: 28, windows: [[9.0, 9.5], [12.0, 12.5], [17.0, 17.5], [21.0, 21.5]], types: [[A321, 50], [A333, 30], [B738, 20]]}
+  - {carrier: CES, number: 551, other: ZSPD, city: "Shanghai", summer: 7, winter: 7, windows: [[6.5, 7.0]], types: [[B77W, 60], [A359, 40]]}
+  - {carrier: CCA, number: 851, other: ZSPD, city: "Shanghai", summer: 7, winter: 7, windows: [[16.5, 17.0]], types: [[A333, 60], [B789, 40]]}
+  - {carrier: BAW_GATWICK, number: 2277, other: KMCO, city: "Orlando", summer: 10, winter: 10, windows: [[6.0, 7.0]], types: [[B77W, 60], [B772, 40]]}
+  - {carrier: UBT, number: 1, other: KMCO, city: "Orlando", summer: 4, winter: 4, windows: [[6.5, 7.0]], types: [[B789, 100]]}
+  - {carrier: TOM, number: 693, other: KMCO, city: "Orlando", summer: 3, winter: 3, windows: [[7.0, 7.5]], types: [[B789, 100]]}
+  - {carrier: BAW_GATWICK, number: 2321, other: MMUN, city: "Cancun", summer: 6, winter: 6, windows: [[9.5, 10.0]], types: [[B772, 100]]}
+  - {carrier: TOM, number: 725, other: MMUN, city: "Cancun", summer: 6, winter: 6, windows: [[10.0, 10.5]], types: [[B789, 60], [B788, 40]]}
+  - {carrier: QTR, number: 15, other: OTHH, city: "Doha", summer: 14, winter: 14, windows: [[7.0, 7.5], [14.0, 14.5]], types: [[B788, 50], [B789, 30], [A359, 20]]}
+  - {carrier: UBT, number: 7, other: KJFK, city: "New York JFK", summer: 7, winter: 4, windows: [[6.0, 6.5]], types: [[B789, 100]]}

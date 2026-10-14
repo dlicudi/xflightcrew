@@ -139,10 +139,23 @@ pub fn circuit_hours(h: f64) -> bool {
 /// schedule starting at `zulu_s` (`None`: no clock, the field's peak, a
 /// 50/50 split), times `scale` (the density), each capped by the runway.
 pub fn rates_at(field: &FieldModel, scale: f64, zulu_s: Option<f64>, t_s: f64) -> (f64, f64) {
-    let peak = peak_per_h(field) * scale;
+    rates_for(peak_per_h(field), field_lon(field), scale, zulu_s, t_s)
+}
+
+/// [`rates_at`] for a field whose peak ([`peak_per_h`]) and longitude are
+/// known: pure, for a field with no model loaded (the top-up's day,
+/// [`crate::midflow::top_up`]).
+pub fn rates_for(
+    peak_per_h: f64,
+    lon: f64,
+    scale: f64,
+    zulu_s: Option<f64>,
+    t_s: f64,
+) -> (f64, f64) {
+    let peak = peak_per_h * scale;
     let (factor, dep) = match zulu_s {
         Some(z) => {
-            let h = local_solar_h(z + t_s, field_lon(field));
+            let h = local_solar_h(z + t_s, lon);
             (day_factor(h), departure_share(h))
         }
         None => (1.0, 0.5),

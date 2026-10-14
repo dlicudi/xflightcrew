@@ -21,6 +21,7 @@ const BUSY: &[RouteRow] = &[RouteRow {
     windows: &[(9.6, 10.4)],
     based: false,
     types: &[("A320", 100)],
+    mirror_of: None,
 }];
 
 const BUSIER: &[RouteRow] = &[
@@ -45,6 +46,8 @@ fn table(rows: &'static [RouteRow]) -> FieldRoutes {
     FieldRoutes {
         icao: "ULMM",
         utc_offset_h: 3.0,
+        city: "Ulmm",
+        top_up: false,
         rows,
     }
 }
@@ -395,4 +398,120 @@ fn a_departure_is_off_the_ground_when_its_own_taxi_says() {
     let long = [(36.15, -5.35), (36.15, -5.25)];
     assert_eq!(out_times(Some(&long), "A320"), out_times(None, "A320"));
     assert_eq!(out_times(None, "A320").2, CLIMB_S);
+}
+
+/// The timetable's scheduled movements by local hour of `date`.
+fn timetable_by_hour(icao: &str, date: Date) -> ([f64; 24], [f64; 24]) {
+    let t = crate::routes::field_routes(icao).unwrap();
+    let seed = crate::rng::field_seed(icao, crate::rng::SESSION_SEED);
+    let (mut dep, mut arr) = ([0.0; 24], [0.0; 24]);
+    for r in rotation::window(t, date, seed, Density::Normal, 0.0, 86_400.0) {
+        for (s, h) in [(r.dep.sched_s, &mut dep), (r.arr.sched_s, &mut arr)] {
+            if (0.0..86_400.0).contains(&s) {
+                h[(s / 3600.0) as usize] += 1.0;
+            }
+        }
+    }
+    (dep, arr)
+}
+
+/// GATWICK FLIES ITS RATE (2026-10-14): a summer Wednesday's timetable
+/// and the generator's top-up, its hour rate less the timetable's, come to
+/// a real summer day (the CAA's 2025 average is 721 movements a day, a
+/// summer day 850 to 900). The generator's peak is the install's apt.dat
+/// (189 airline stands, `rate::PER_AIRLINE_STAND_PER_H`'s fit): the top-up
+/// is reckoned here from the rate itself, no field loaded. Run with
+/// --nocapture for the numbers.
+#[test]
+fn gatwick_with_its_top_up_flies_a_real_summer_day() {
+    use crate::rate::{rates_for, BASE_TOWERED_PER_H, PER_AIRLINE_STAND_PER_H};
+    let peak = BASE_TOWERED_PER_H + PER_AIRLINE_STAND_PER_H * 189.0;
+    let date = Date::ymd(2026, 7, 15);
+    let (dep, arr) = timetable_by_hour("EGKK", date);
+    let table: f64 = dep.iter().chain(arr.iter()).sum();
+    let (mut generator, mut top) = (0.0, 0.0);
+    // Five-minute steps through the local day; BST is zulu plus one.
+    for step in 0..288 {
+        let local = step as f64 * 300.0;
+        let zulu = (local - 3600.0).rem_euclid(86_400.0);
+        let (d, a) = rates_for(peak, -0.19, 1.0, Some(zulu), 0.0);
+        let h = step / 12;
+        generator += (d + a) / 12.0;
+        top += ((d - dep[h]).max(0.0) + (a - arr[h]).max(0.0)) / 12.0;
+    }
+    println!(
+        "EGKK {date:?}: peak {peak:.1}/h, generator alone {generator:.0}, timetable {table:.0}, \
+         top-up {top:.0}, together {:.0}",
+        table + top
+    );
+    assert!((380.0..=520.0).contains(&table), "{table}");
+    assert!((680.0..=950.0).contains(&(table + top)), "{}", table + top);
+    assert!(top < generator, "never the generator's whole rate on top");
+    // Malaga and Gibraltar do not opt in.
+    for icao in ["LEMG", "LXGB"] {
+        assert!(!crate::routes::field_routes(icao).unwrap().top_up, "{icao}");
+    }
+}
+
+/// The real Gatwick: a summer Wednesday's top-up, hour by hour, flies
+/// fewer than the generator alone, none under a timetable callsign.
+/// `cargo test -p traffic -- --ignored real_install_top_up --nocapture`
+#[test]
+#[ignore] // needs the real X-Plane install
+fn real_install_top_up_gatwick() {
+    let apt = nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    let Ok(Some(f)) = FieldModel::load(&apt, "EGKK") else {
+        return;
+    };
+    let f = f.with_cifp(&nav::test_xplane_path("Custom Data/CIFP"));
+    let t = crate::routes::field_routes("EGKK").unwrap();
+    let seed = crate::rng::field_seed("EGKK", crate::rng::SESSION_SEED);
+    let date = Date::ymd(2026, 7, 15);
+    let (mut gen_day, mut top_day) = (0usize, 0usize);
+    let moves = |ms: &[Movement]| {
+        ms.iter()
+            .filter(|m| matches!(m.kind, MovementKind::Arrival | MovementKind::Departure))
+            .count()
+    };
+    for h in 0..24u32 {
+        let local = f64::from(h) * 3600.0;
+        let ctx = SpawnCtx {
+            zulu_s: Some((local - 3600.0).rem_euclid(86_400.0)),
+            ..SpawnCtx::default()
+        };
+        let names: std::collections::HashSet<String> = rotation::window(
+            t,
+            date,
+            seed,
+            Density::Normal,
+            local - 86_400.0,
+            local + 86_400.0,
+        )
+        .into_iter()
+        .flat_map(|r| [r.arr.callsign, r.dep.callsign])
+        .collect();
+        let gen = crate::schedule::generate(&f, Density::Normal, u64::from(h) + 1, &ctx);
+        let top = top_up(
+            &f,
+            t,
+            Density::Normal,
+            seed,
+            u64::from(h) + 1,
+            date,
+            local,
+            &ctx,
+        );
+        assert!(top.iter().all(|m| !names.contains(&m.callsign)));
+        gen_day += moves(&gen);
+        top_day += moves(&top);
+    }
+    let (dep, arr) = timetable_by_hour("EGKK", date);
+    let table: f64 = dep.iter().chain(arr.iter()).sum();
+    println!(
+        "EGKK real install: peak {:.1}/h, generator alone {gen_day} a day, timetable {table:.0}, \
+         top-up {top_day}, together {:.0}",
+        crate::rate::peak_per_h(&f),
+        table + top_day as f64
+    );
+    assert!(top_day < gen_day);
 }

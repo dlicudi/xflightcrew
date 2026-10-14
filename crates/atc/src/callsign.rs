@@ -416,6 +416,16 @@ pub(crate) const TELEPHONY: &[(&str, &str)] = &[
     ("IBS", "Iberexpres"),
     ("SWA", "Southwest"),
     ("ASA", "Alaska"),
+    // Gatwick's route table's carriers (`traffic::airlines`, 2026-10-14), each
+    // the ICAO telephony.
+    ("SXS", "Sunexpress"),
+    ("CAI", "Corendon"),
+    ("KMM", "Skyknight"),
+    ("SEH", "Air Crete"),
+    ("UBT", "Longboat"),
+    ("CES", "China Eastern"),
+    ("CCA", "Air China"),
+    ("AUR", "Ayline"),
 ];
 
 /// IATA two-letter prefixes. LiveTraffic's flight ids arrive this way
@@ -470,6 +480,14 @@ pub(crate) const TELEPHONY_IATA: &[(&str, &str)] = &[
     ("PK", "Pakistan"),
     ("WS", "WestJet"),
     ("PC", "Sunturk"),
+    ("XQ", "Sunexpress"),
+    ("XC", "Corendon"),
+    ("KM", "Skyknight"),
+    ("GQ", "Air Crete"),
+    ("Z0", "Longboat"),
+    ("MU", "China Eastern"),
+    ("CA", "Air China"),
+    ("GR", "Ayline"),
 ];
 
 /// Is a SPOKEN callsign an airline's: a telephony from the tables (or the

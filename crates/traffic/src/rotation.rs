@@ -503,51 +503,203 @@ pub fn day_rotations(
     if density == Density::Off {
         return out;
     }
-    let day_salt = (date.epoch_days() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     for row in table.rows {
-        let n = daily_count(row, date);
-        let types = if row.types.is_empty() {
-            row.carrier.types
-        } else {
-            row.types
-        };
-        let lines = if row.windows.is_empty() {
-            line_visits(table, row, date, n)
-        } else {
-            None
-        };
-        let visits = lines.unwrap_or_else(|| window_visits(row, n));
-        for (k, v) in (0u32..).zip(visits) {
-            let seed_k = row_hash(
-                row,
-                day_salt ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ u64::from(k),
-            );
-            if density == Density::Light && seed_k % 2 == 1 {
-                continue;
-            }
-            let mut rng = XorShift64::new(seed_k);
-            let icao_type = pick_type(types, &mut rng);
-            let in_no = row.number + 2 * k;
-            let out_no = in_no + 1;
-            let sta = on_five(v.sta);
-            let std = on_five(
-                v.std
-                    .unwrap_or_else(|| sta + sched_turn_s(icao_type, &mut rng)),
-            );
-            let eta = sta + delay_s(&mut rng);
-            let etd = (std + delay_s(&mut rng).max(0.0)).max(eta + min_turn_s(icao_type));
-            out.push(Rotation {
-                carrier: row.carrier,
-                icao_type,
-                arr: leg(&row.carrier, in_no, row, sta, eta),
-                dep: leg(&row.carrier, out_no, row, std, etd),
-                night_stop: v.night_stop,
-                seed: rng.next_u64(),
-            });
+        match row.mirror_of {
+            Some(src) => out.extend(mirror_rotations(table, row, src, date, density).0),
+            None => row_rotations(table, row, date, seed, density, &mut out),
         }
     }
     out.sort_by(|a, b| a.arr.est_s.total_cmp(&b.arr.est_s));
     out
+}
+
+/// The rotations of one row written in `table`'s own file on `date`
+/// ([`day_rotations`]), pushed onto `out` in the row's own order.
+fn row_rotations(
+    table: &FieldRoutes,
+    row: &RouteRow,
+    date: Date,
+    seed: u64,
+    density: Density,
+    out: &mut Vec<Rotation>,
+) {
+    let day_salt = (date.epoch_days() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let n = daily_count(row, date);
+    let types = if row.types.is_empty() {
+        row.carrier.types
+    } else {
+        row.types
+    };
+    let lines = if row.windows.is_empty() {
+        line_visits(table, row, date, n)
+    } else {
+        None
+    };
+    let visits = lines.unwrap_or_else(|| window_visits(row, n));
+    for (k, v) in (0u32..).zip(visits) {
+        let seed_k = row_hash(
+            row,
+            day_salt ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ u64::from(k),
+        );
+        if density == Density::Light && seed_k % 2 == 1 {
+            continue;
+        }
+        let mut rng = XorShift64::new(seed_k);
+        let icao_type = pick_type(types, &mut rng);
+        let in_no = row.number + 2 * k;
+        let out_no = in_no + 1;
+        let sta = on_five(v.sta);
+        let std = on_five(
+            v.std
+                .unwrap_or_else(|| sta + sched_turn_s(icao_type, &mut rng)),
+        );
+        let eta = sta + delay_s(&mut rng);
+        let etd = (std + delay_s(&mut rng).max(0.0)).max(eta + min_turn_s(icao_type));
+        out.push(Rotation {
+            carrier: row.carrier,
+            icao_type,
+            arr: leg(&row.carrier, in_no, row, sta, eta),
+            dep: leg(&row.carrier, out_no, row, std, etd),
+            night_stop: v.night_stop,
+            seed: rng.next_u64(),
+        });
+    }
+}
+
+/// How many days back a shared route's far end looks for the aircraft it
+/// left standing ([`mirror_rotations`]): a week and a day, so a route flown
+/// a few days a week finds the aircraft that came in on its last day.
+const MIRROR_LOOKBACK_DAYS: i64 = 8;
+
+/// One flight of a shared route seen from its far end: the leg, its type,
+/// and the source day it belongs to.
+#[derive(Debug, Clone)]
+struct Half {
+    leg: FlightLeg,
+    icao_type: &'static str,
+    day: i64,
+}
+
+/// The rotations of a DERIVED row ([`crate::routes`], a shared route's far
+/// end) on `date`, and how many of its flights found no pair (2026-10-14).
+/// The source field's day of the route is drawn exactly as the source
+/// flies it (its own rows, its session seed [`crate::SESSION_SEED`]), and
+/// each of its flights is seen from here a block time away on our clock:
+/// its departure is our arrival a block time later, its arrival our
+/// departure a block time before. Malaga's EZY8062 off the blocks at 10:45
+/// local is Gatwick's EZY8062 on them at 12:25 local, whichever field is
+/// simulated.
+///
+/// Our arrivals and departures are paired into visits by time, the
+/// aircraft that has waited longest leaving first (each at least its type's
+/// minimum turnaround after it came in), one source day after another from
+/// [`MIRROR_LOOKBACK_DAYS`] back; today's departures make today's
+/// rotations. An aircraft that waits overnight is a night-stop here. A
+/// departure with no aircraft on the ground to take is not flown here (the
+/// second number), the far end's honest gap: the source's day was drawn
+/// without us.
+fn mirror_rotations(
+    here: &FieldRoutes,
+    row: &RouteRow,
+    src: &str,
+    date: Date,
+    density: Density,
+) -> (Vec<Rotation>, usize) {
+    let mut out = Vec::new();
+    let Some(src_table) = crate::routes::field_routes(src) else {
+        return (out, 0);
+    };
+    let Some(src_row) = src_table.rows.iter().find(|r| {
+        r.mirror_of.is_none()
+            && r.other.eq_ignore_ascii_case(here.icao)
+            && r.carrier.code == row.carrier.code
+            && r.number == row.number
+    }) else {
+        return (out, 0);
+    };
+    let src_seed = crate::rng::field_seed(src_table.icao, crate::rng::SESSION_SEED);
+    // Both clocks keep the EU's summer dates (a table field is in Europe):
+    // the standard offsets' difference is the clocks' all year.
+    let dh = (here.utc_offset_h - src_table.utc_offset_h) * 3600.0;
+    let as_here = |l: &FlightLeg, shift: f64, sched: f64, est: f64| FlightLeg {
+        callsign: l.callsign.clone(),
+        spoken: l.spoken.clone(),
+        other: row.other,
+        city: row.city,
+        sched_s: on_five(sched + shift),
+        est_s: est + shift,
+    };
+    let mut waiting: std::collections::VecDeque<Half> = Default::default();
+    let mut orphans = 0;
+    for d in -MIRROR_LOOKBACK_DAYS..=0 {
+        let mut src_day = Vec::new();
+        row_rotations(
+            src_table,
+            src_row,
+            date.plus(d),
+            src_seed,
+            density,
+            &mut src_day,
+        );
+        let shift = 86_400.0 * d as f64 + dh;
+        // (time here, arrival?, half), in time order, an arrival first at
+        // a tie.
+        let mut events: Vec<(f64, bool, Half)> = Vec::new();
+        for r in &src_day {
+            let Some(block) = block_s(src_table.icao, here.icao, r.icao_type) else {
+                return (Vec::new(), 0);
+            };
+            let arr = as_here(&r.dep, shift, r.dep.sched_s + block, r.dep.est_s + block);
+            let dep = as_here(&r.arr, shift, r.arr.sched_s - block, r.arr.est_s - block);
+            let half = |leg: FlightLeg| Half {
+                leg,
+                icao_type: r.icao_type,
+                day: d,
+            };
+            events.push((arr.sched_s, true, half(arr)));
+            events.push((dep.sched_s, false, half(dep)));
+        }
+        events.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
+        for (t, is_arr, h) in events {
+            if is_arr {
+                waiting.push_back(h);
+                continue;
+            }
+            let Some(i) = waiting
+                .iter()
+                .position(|a| a.leg.sched_s + min_turn_s(a.icao_type) <= t)
+            else {
+                if d == 0 {
+                    orphans += 1;
+                }
+                continue;
+            };
+            let Some(a) = waiting.remove(i) else {
+                continue;
+            };
+            if d < 0 {
+                continue;
+            }
+            let mut dep = h.leg;
+            dep.est_s = dep.est_s.max(a.leg.est_s + min_turn_s(a.icao_type));
+            let seed = dep
+                .callsign
+                .bytes()
+                .chain(a.leg.callsign.bytes())
+                .fold(row_hash(row, date.epoch_days() as u64), |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+                });
+            out.push(Rotation {
+                carrier: row.carrier,
+                icao_type: a.icao_type,
+                night_stop: a.day < d,
+                arr: a.leg,
+                dep,
+                seed,
+            });
+        }
+    }
+    (out, orphans)
 }
 
 fn pick_type(types: &'static [(&'static str, u32)], rng: &mut XorShift64) -> &'static str {
@@ -853,6 +1005,110 @@ mod tests {
         // Gibraltar keeps its published slots.
         let (arr, dep, _) = by_hour(&day("LXGB", Date::ymd(2026, 7, 14), 3));
         println!("LXGB\n  arr {arr:?}\n  dep {dep:?}");
+    }
+
+    /// Gatwick's timetable (2026-10-14) flies a summer weekday of about 440
+    /// movements, the winter well under it, quiet from one to five, and in
+    /// the summer both ways every hour from seven to eight at night (the
+    /// based lines are home by then: the evening's departures are mostly
+    /// the top-up's, `crate::midflow::top_up`). Run with --nocapture for
+    /// the hours.
+    #[test]
+    fn a_day_at_gatwick_has_its_count_and_its_waves() {
+        let t = field_routes("EGKK").unwrap();
+        let mut totals = Vec::new();
+        for d in [Date::ymd(2026, 7, 15), Date::ymd(2026, 1, 14)] {
+            let w = window(t, d, 3, Density::Normal, 0.0, 86_400.0);
+            let (arr, dep, _) = by_hour(&w);
+            let total: u32 = arr.iter().chain(dep.iter()).sum();
+            println!("EGKK {d:?} {total}\n  arr {arr:?}\n  dep {dep:?}");
+            assert!((1..5).all(|h| arr[h] + dep[h] <= 2), "{arr:?} {dep:?}");
+            if d.summer() {
+                assert!((7..20).all(|h| arr[h] > 0 && dep[h] > 0), "{arr:?} {dep:?}");
+            }
+            totals.push(total);
+        }
+        assert!((380..=520).contains(&totals[0]), "{totals:?}");
+        assert!(totals[1] * 10 < totals[0] * 8, "{totals:?}");
+    }
+
+    /// A SHARED ROUTE IS ONE SET OF FLIGHTS (2026-10-14): Gatwick's day of
+    /// a route Malaga or Gibraltar writes is their day seen from here. Every
+    /// Gatwick departure on it is the source's arrival of that number that
+    /// day a block time later; every Gatwick arrival the source's departure
+    /// of that number a block time earlier (on five minutes, so within two
+    /// and a half); each turns round here at least its minimum. Over a
+    /// summer and a winter week no more than one flight in fifty finds no
+    /// aircraft here (the source draws its days without us). Run with
+    /// --nocapture for the counts.
+    #[test]
+    fn a_shared_route_is_the_same_flights_at_both_ends() {
+        let here = field_routes("EGKK").unwrap();
+        let mut flights = 0usize;
+        let mut lost = 0usize;
+        // Each arrival here once over the week (callsign and absolute minute).
+        let mut seen = std::collections::HashSet::new();
+        for start in [Date::ymd(2026, 7, 13), Date::ymd(2026, 1, 19)] {
+            for k in 0..7 {
+                let date = start.plus(k);
+                for row in here.rows.iter().filter(|r| r.mirror_of.is_some()) {
+                    let src_icao = row.mirror_of.unwrap();
+                    let src = field_routes(src_icao).unwrap();
+                    let seed = crate::rng::field_seed(src_icao, crate::rng::SESSION_SEED);
+                    let dh = (here.utc_offset_h - src.utc_offset_h) * 3600.0;
+                    let src_days: Vec<Vec<Rotation>> = (-8..=0)
+                        .map(|d| day_rotations(src, date.plus(d), seed, Density::Normal))
+                        .collect();
+                    let (rots, orphans) =
+                        mirror_rotations(here, row, src_icao, date, Density::Normal);
+                    let src_row = src
+                        .rows
+                        .iter()
+                        .find(|r| r.carrier.code == row.carrier.code && r.number == row.number)
+                        .unwrap();
+                    let own = |r: &&Rotation| {
+                        r.arr.callsign[3..]
+                            .parse::<u32>()
+                            .is_ok_and(|n| (src_row.number..src_row.number + 20).contains(&n))
+                            && r.arr.other == "EGKK"
+                            && r.carrier.code == row.carrier.code
+                    };
+                    let sent = src_days[8].iter().filter(own).count();
+                    assert_eq!(rots.len() + orphans, sent, "{} {date:?}", row.number);
+                    flights += sent;
+                    lost += orphans;
+                    for r in &rots {
+                        assert_eq!(r.arr.other, src_icao);
+                        let abs = date.epoch_days() * 1440 + (r.arr.sched_s / 60.0).round() as i64;
+                        assert!(
+                            seen.insert((r.arr.callsign.clone(), abs)),
+                            "{} twice",
+                            r.arr.callsign
+                        );
+                        let block = block_s(src_icao, "EGKK", r.icao_type).unwrap();
+                        let s = src_days[8]
+                            .iter()
+                            .find(|s| s.arr.callsign == r.dep.callsign)
+                            .expect("our departure is the source's arrival today");
+                        let want = s.arr.sched_s - block + dh;
+                        assert!((r.dep.sched_s - want).abs() <= 150.0, "{}", r.dep.callsign);
+                        let met = (0..9).any(|i| {
+                            let shift = 86_400.0 * (i as f64 - 8.0);
+                            src_days[i].iter().any(|s| {
+                                s.dep.callsign == r.arr.callsign
+                                    && (r.arr.sched_s - (s.dep.sched_s + block + dh + shift)).abs()
+                                        <= 150.0
+                            })
+                        });
+                        assert!(met, "{} in at {}", r.arr.callsign, hhmm(r.arr.sched_s));
+                        assert!(r.dep.sched_s - r.arr.sched_s >= min_turn_s(r.icao_type) - 300.0);
+                        assert!(r.dep.est_s - r.arr.est_s >= min_turn_s(r.icao_type) - 1e-6);
+                    }
+                }
+            }
+        }
+        println!("shared routes at EGKK: {flights} rotations, {lost} departures without an aircraft here");
+        assert!(flights > 100 && lost * 50 <= flights, "{lost} of {flights}");
     }
 
     /// A line's times are the route's own: a block time from its place

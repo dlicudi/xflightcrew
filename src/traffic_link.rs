@@ -730,6 +730,52 @@ impl Link {
         self.t0_local_s + self.fleet.clock.now_s()
     }
 
+    /// A timetable that opts in to the TOP-UP (`top_up` in its route file,
+    /// Gatwick's, 2026-10-14): the generator fills its hours.
+    fn tops_up(&self) -> bool {
+        self.timetable.is_some()
+            && traffic::routes::field_routes(&self.fleet.field.icao).is_some_and(|t| t.top_up)
+    }
+
+    /// The next hour of a timetable's top-up from now
+    /// (`traffic::midflow::top_up`: the field's rate less the timetable's),
+    /// `hour` its draws, clear of every stand the fleet holds and every
+    /// stand a timetable movement still to come is planned on. Nothing for
+    /// a table that does not opt in.
+    pub(crate) fn top_up_hour(
+        &self,
+        hour: u64,
+        own: Option<(f64, f64)>,
+        zulu_s: Option<f64>,
+    ) -> Vec<Movement> {
+        let (Some(tt), Some(table)) = (
+            self.timetable,
+            traffic::routes::field_routes(&self.fleet.field.icao),
+        ) else {
+            return Vec::new();
+        };
+        let field = &self.fleet.field;
+        let mut occupied = self.fleet.stands_held();
+        occupied.extend(planned_stands(field, self.due.iter().map(|d| &d.m)));
+        let ctx = SpawnCtx {
+            runway: None,
+            own,
+            occupied,
+            zulu_s,
+            parked_airframes: 0,
+        };
+        traffic::midflow::top_up(
+            field,
+            table,
+            tt.density,
+            tt.seed,
+            hour,
+            tt.date,
+            self.local_now_s(),
+            &ctx,
+        )
+    }
+
     /// The board's payload (`traffic::board::payload`): each flight's status
     /// from where its aircraft is (by its callsign, or a departure's
     /// inbound's while it turns round), the live ETA of an arrival in the
@@ -2137,8 +2183,10 @@ impl TrafficWorld {
                 continue;
             };
             let out = link.tick(Some(&own), dt, now);
-            // The next hour of a generated schedule, once this one is spent.
-            if link.pending() == 0 {
+            // The next hour of a generated schedule, once this one is spent;
+            // a timetable's top-up every hour, its day never spent.
+            let tops_up = link.tops_up();
+            if link.pending() == 0 || tops_up {
                 let start = link.fleet().clock.now_s();
                 let next = link
                     .hours
@@ -2146,7 +2194,11 @@ impl TrafficWorld {
                 if let Some(h) = next {
                     link.hours = Some(h + 1);
                     let zulu = sim_zulu_s(xp).await;
-                    let ms = generate_for(link.fleet(), u64::from(h + 1), &own, zulu);
+                    let ms = if tops_up {
+                        link.top_up_hour(u64::from(h + 1), Some((own.lat, own.lon)), zulu)
+                    } else {
+                        generate_for(link.fleet(), u64::from(h + 1), &own, zulu)
+                    };
                     link.add_schedule(ms, start);
                 }
             }
@@ -2681,8 +2733,18 @@ fn build_link(
     let table = traffic::routes::field_routes(icao);
     let (schedule, source) = if let (true, Some(table)) = (file.is_empty(), table) {
         let d = traffic::Density::parse(density).unwrap_or(traffic::Density::Normal);
-        let (schedule, flights, local_s) =
+        let (mut schedule, flights, local_s) =
             timetable_start(&field, table, d, seed, zulu_s, day, runway.clone());
+        // A table that opts in is topped up by the generator from the
+        // start (`traffic::midflow::top_up`), clear of its stands.
+        let (date, zulu, _) = timetable_clock(table, zulu_s, day);
+        let top_ctx = SpawnCtx {
+            zulu_s: Some(zulu),
+            occupied: planned_stands(&field, schedule.iter()),
+            ..SpawnCtx::default()
+        };
+        let top = traffic::midflow::top_up(&field, table, d, seed, seed, date, local_s, &top_ctx);
+        schedule.extend(top);
         board = Some((flights, local_s));
         (schedule, "timetable")
     } else if file.is_empty() {
@@ -2742,7 +2804,9 @@ fn build_link(
     let mut link = Link::new(field, schedule, &name);
     // A field with a route table flies its timetable's day whole; the rest
     // generate an hour at a time.
-    link.hours = (source == "generated").then_some(1);
+    // So does a timetable's top-up.
+    let tops_up = source == "timetable" && table.is_some_and(|t| t.top_up);
+    link.hours = (source == "generated" || tops_up).then_some(1);
     if let Some((flights, local_s)) = board {
         link.set_board(flights, local_s);
     }
@@ -2758,6 +2822,19 @@ fn build_link(
         }
     }
     Some(link)
+}
+
+/// The stands `movements` stand on or are planned on, where `field` has
+/// them: the top-up never hands one out.
+fn planned_stands<'a>(
+    field: &FieldModel,
+    movements: impl Iterator<Item = &'a Movement>,
+) -> Vec<(f64, f64)> {
+    movements
+        .filter_map(|m| m.stand.as_deref())
+        .filter_map(|n| field.stand(n))
+        .map(|s| (s.lat, s.lon))
+        .collect()
 }
 
 /// What a link is built with besides the files: the field's seed
@@ -2887,7 +2964,7 @@ const REMOTE_BOARD_REBUILD_S: f64 = 6.0 * 3600.0;
 /// its board by the clock draw the same day, whichever was built first.
 /// A constant: the same field is the same day every session, as a sweep
 /// is.
-pub(crate) const SESSION_SEED: u64 = 1;
+pub(crate) const SESSION_SEED: u64 = traffic::SESSION_SEED;
 
 /// The board of a field with a timetable that the fleet does not fly
 /// (2026-10-13, the Board tab's selector): its flights round the time it

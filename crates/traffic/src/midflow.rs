@@ -246,10 +246,11 @@ fn movement(
     let instrument = crate::arrival::is_instrument(class_for_type(r.icao_type).0);
     let entry = arr
         .then(|| {
-            end.as_ref().and_then(|e| match other.filter(|_| instrument) {
-                Some(o) => crate::arrival::entry_toward(e, o, rng.next_f64(), ctx.own),
-                None => entry_clear_of_own(e, ctx.own, rng),
-            })
+            end.as_ref()
+                .and_then(|e| match other.filter(|_| instrument) {
+                    Some(o) => crate::arrival::entry_toward(e, o, rng.next_f64(), ctx.own),
+                    None => entry_clear_of_own(e, ctx.own, rng),
+                })
         })
         .flatten();
     let pick = |v: &[String], rng: &mut XorShift64| {
@@ -364,7 +365,10 @@ pub fn timetable_board(
     );
     let mut out = Vec::new();
     for r in &rots {
-        for (dir, leg, arr) in [(Dir::Arrival, &r.arr, true), (Dir::Departure, &r.dep, false)] {
+        for (dir, leg, arr) in [
+            (Dir::Arrival, &r.arr, true),
+            (Dir::Departure, &r.dep, false),
+        ] {
             let mut info = info(r, arr);
             info.stand = stands.get(&leg.callsign).cloned();
             out.push(BoardFlight {
@@ -771,10 +775,100 @@ pub fn plan(
     out
 }
 
+/// The timetable's scheduled departures and arrivals in each local clock
+/// hour (keyed by the hour's start, local seconds after `date`'s midnight)
+/// from `from_s` to `to_s`, of the flights `field` flies (a type its
+/// longest runway and some stand take), and every callsign the timetable
+/// uses round them.
+fn timetable_hours(
+    field: &FieldModel,
+    table: &FieldRoutes,
+    density: Density,
+    seed: u64,
+    date: Date,
+    from_s: f64,
+    to_s: f64,
+) -> (
+    std::collections::HashMap<i64, (f64, f64)>,
+    std::collections::HashSet<String>,
+) {
+    let runway_m = default_runway(field)
+        .and_then(|r| field.end(&r))
+        .map_or(0.0, |e| e.length_m);
+    let fits = |t: &str| {
+        runway_m >= runway_needed_m(t) && field.net.stands.iter().any(|s| field.takes(s, t))
+    };
+    let mut hours: std::collections::HashMap<i64, (f64, f64)> = Default::default();
+    let mut names = std::collections::HashSet::new();
+    let rots = rotation::window(
+        table,
+        date,
+        seed,
+        density,
+        from_s - 24.0 * 3600.0,
+        to_s + 24.0 * 3600.0,
+    );
+    for r in &rots {
+        names.insert(r.arr.callsign.clone());
+        names.insert(r.dep.callsign.clone());
+        if !fits(r.icao_type) {
+            continue;
+        }
+        let key = |t: f64| (t / 3600.0).floor() as i64;
+        hours.entry(key(r.dep.sched_s)).or_default().0 += 1.0;
+        hours.entry(key(r.arr.sched_s)).or_default().1 += 1.0;
+    }
+    (hours, names)
+}
+
+/// THE TOP-UP (2026-10-14): an hour of the generator ([`crate::generate`])
+/// at a field whose route table opts in (`top_up`, Gatwick's), flown at the
+/// field's own rate ([`crate::rate::rates_at`]) LESS what the timetable
+/// flies in that clock hour, departures and arrivals each, never below
+/// none: the table holds the busiest routes, the generator the long tail
+/// below them, and together they fly the field's rate, never the
+/// generator's whole rate on top of the table's. Its callsigns are never
+/// the timetable's (one that is is dropped), and its stands are not those
+/// `ctx.occupied` holds (the bin passes the timetable's). `local_s` is the
+/// hour's start, local seconds after `date`'s midnight; `seed` the
+/// timetable's, `hour_seed` this hour's draws. Nothing for a table that
+/// does not opt in: Gibraltar's and Malaga's days are their tables'.
+#[allow(clippy::too_many_arguments)]
+pub fn top_up(
+    field: &FieldModel,
+    table: &FieldRoutes,
+    density: Density,
+    seed: u64,
+    hour_seed: u64,
+    date: Date,
+    local_s: f64,
+    ctx: &SpawnCtx,
+) -> Vec<Movement> {
+    if !table.top_up || density == Density::Off {
+        return Vec::new();
+    }
+    let (hours, names) = timetable_hours(
+        field,
+        table,
+        density,
+        seed,
+        date,
+        local_s,
+        local_s + crate::schedule::HORIZON_S,
+    );
+    let less = |t: f64| {
+        let h = ((local_s + t) / 3600.0).floor() as i64;
+        hours.get(&h).copied().unwrap_or((0.0, 0.0))
+    };
+    let mut out = crate::schedule::generate_less(field, density, hour_seed, ctx, &less);
+    out.retain(|m| !names.contains(&m.callsign));
+    out
+}
+
 /// The start looks this far back for departures still in the air,
-/// seconds: the longest flight a table names (Malaga to Doha, about 7 h)
-/// and a margin.
-pub const AWAY_BACK_S: f64 = 9.0 * 3600.0;
+/// seconds: the longest flight a table names (Gatwick to Shanghai, about
+/// 12 h of block since 2026-10-14) and a margin.
+pub const AWAY_BACK_S: f64 = 13.0 * 3600.0;
 
 impl Movement {
     /// The aircraft placed where its [`Start`] says (the mid-flow start), as

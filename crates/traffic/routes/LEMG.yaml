@@ -16,6 +16,7 @@
 # carriers' LINES OF FLYING: each aircraft's day built from the route's
 # block time and turnarounds (crates/traffic/src/rotation.rs).
 icao: LEMG
+city: "Malaga"
 # Standard time's offset from UTC, hours (Spain keeps Central European
 # Time, with the EU's summer time on top).
 utc_offset_h: 1.0

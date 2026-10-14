@@ -30,8 +30,9 @@ use super::{Due, Link};
 pub(super) const MODEL_EVERY_S: f64 = 1.0;
 
 /// An arrival's model is built once its entry is this near, fleet seconds:
-/// the longest flight the tables name and its taxi.
-const MODEL_AHEAD_S: f64 = 9.0 * 3600.0;
+/// the longest flight the tables name and its taxi (Gatwick to Shanghai,
+/// about 12 h of block, 2026-10-14).
+const MODEL_AHEAD_S: f64 = 13.0 * 3600.0;
 
 /// A flight the model flies: the aircraft as drawn and shown (the
 /// simulation's id, callsign, type and plan; the model's position), its
@@ -466,6 +467,8 @@ mod tests {
         let table = FieldRoutes {
             icao: "ULMM",
             utc_offset_h: 3.0,
+            city: "Ulmm",
+            top_up: false,
             rows,
         };
         let apt = format!("{}/ulmm.dat", fixtures());

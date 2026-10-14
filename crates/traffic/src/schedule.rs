@@ -514,6 +514,21 @@ pub(crate) fn field_seed(icao: &str, seed: u64) -> u64 {
 /// - never on an occupied stand (ours, anyone's in `ctx`, or one already
 ///   handed out), never an entry within [`OWN_CLEAR_NM`] of us.
 pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx) -> Vec<Movement> {
+    generate_less(field, density, seed, ctx, &|_| (0.0, 0.0))
+}
+
+/// [`generate`] at the field's rate LESS `less(t)` (departures and
+/// arrivals an hour at `t` seconds into the hour, never below none): the
+/// hour generator topping up a timetable that flies part of the field's
+/// day ([`crate::midflow::top_up`], 2026-10-14). With nothing less it is
+/// [`generate`], draw for draw.
+pub fn generate_less(
+    field: &FieldModel,
+    density: Density,
+    seed: u64,
+    ctx: &SpawnCtx,
+    less: &dyn Fn(f64) -> (f64, f64),
+) -> Vec<Movement> {
     let mut out = Vec::new();
     if density == Density::Off {
         return out;
@@ -595,7 +610,11 @@ pub fn generate(field: &FieldModel, density: Density, seed: u64, ctx: &SpawnCtx)
     // capped by the one runway everyone uses.
     let scale = density.scale();
     let zulu = ctx.zulu_s;
-    let rates = |t: f64| rate::rates_at(field, scale, zulu, t);
+    let rates = |t: f64| {
+        let (d, a) = rate::rates_at(field, scale, zulu, t);
+        let (ld, la) = less(t);
+        ((d - ld).max(0.0), (a - la).max(0.0))
+    };
     let has_stands = field.net.stands.iter().any(|s| s.is_suitable());
 
     // A field that publishes no procedures still has its airline traffic,
