@@ -65,6 +65,9 @@ pub(crate) struct OwnState {
     /// ([`own_arrival`]): in every fleet's picture, where only the field
     /// whose strip it is sequences round it.
     pub(crate) slot: Option<traffic::slot::RunwaySlot>,
+    /// Our auto taxi's route still ahead ([`crate::autotaxi::route_ahead`]):
+    /// the traffic gives way to it.
+    pub(crate) route: Vec<(f64, f64)>,
 }
 
 impl OwnState {
@@ -89,6 +92,7 @@ impl OwnState {
             on_ground: self.on_ground,
             gs_kts: self.gs_kts,
             slot: self.slot,
+            route: self.route.clone(),
         }
     }
 }
@@ -2291,6 +2295,7 @@ impl TrafficWorld {
             vs_fpm: snap.vs_fpm.unwrap_or(0.0),
             gs_kts: snap.groundspeed_kts,
             slot: None,
+            route: crate::autotaxi::route_ahead(),
         };
         // Our place at the active field's runway while we arrive: the
         // traffic sequences round it and yields to it (2026-10-14).
@@ -3308,6 +3313,14 @@ async fn sim_zulu_s(xp: &crate::xplane::XPlaneClient) -> Option<f64> {
 /// one write.
 fn record(out: &TickOut, link: &Link) {
     let field = link.icao();
+    // The route ahead we gave the traffic, metres: what it gives way to.
+    let own_route_m = link.fleet().own().map_or(0.0, |o| {
+        o.route
+            .windows(2)
+            .map(|w| traffic::kin::dist_m(w[0], w[1]))
+            .sum::<f64>()
+            .round()
+    });
     for (id, callsign) in &out.spawned {
         let ac = link.fleet().get(*id);
         let from = out
@@ -3392,12 +3405,14 @@ fn record(out: &TickOut, link: &Link) {
                         "at": place(at[1]),
                         "phase": format!("{phase:?}"),
                         "still_s": still_s.round(),
+                        "own_route_m": own_route_m,
                     }),
                 )
             }
             Event::SpacingHeld { id, behind } => rec(
                 field,
-                serde_json::json!({ "event": "spacing_held", "id": id, "behind": behind }),
+                serde_json::json!({ "event": "spacing_held", "id": id, "behind": behind,
+                    "own_route_m": own_route_m }),
             ),
             Event::Call { .. } | Event::Spawn { .. } => {}
         }

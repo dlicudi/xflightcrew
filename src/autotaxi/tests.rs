@@ -221,6 +221,25 @@
         assert!(off_line_stop_line(-27.44).contains("27 metres off the line"));
     }
 
+    /// The route the traffic gives way to is the drive's route still AHEAD
+    /// of us, from where we are on it, and none once the drive has ended.
+    #[test]
+    fn the_route_ahead_starts_where_we_are_and_dies_with_the_drive() {
+        let r = Route::build(&watch()).expect("route");
+        let way = r.path_ahead(250.0);
+        assert_eq!(way.len(), 2, "{way:?}");
+        let (a, b) = (ll(200.0, 50.0), ll(200.0, 300.0));
+        assert!((way[0].0 - a.0).abs() < 1e-7 && (way[0].1 - a.1).abs() < 1e-7, "{way:?}");
+        assert_eq!(way[1], b);
+        assert_eq!(r.path_ahead(-5.0).len(), 3, "joining: the whole route");
+        assert!(r.path_ahead(1.0e6).is_empty(), "past the end: none");
+        let published = RouteAheadGuard;
+        published.publish(way);
+        assert_eq!(ROUTE_AHEAD.lock().unwrap().len(), 2);
+        drop(published);
+        assert!(ROUTE_AHEAD.lock().unwrap().is_empty(), "emptied as the drive ends");
+    }
+
     #[test]
     fn capped_aim_drives_the_final_corner_instead_of_chording_it() {
         // A short L: 60 m east, then a left corner, 18 m north to the stop —

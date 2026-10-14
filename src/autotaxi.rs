@@ -385,6 +385,42 @@ pub static LAST_ARRIVED: AtomicBool = AtomicBool::new(false);
 /// drive it was running belongs to a place the aircraft no longer is.
 pub static RELOCATED: AtomicBool = AtomicBool::new(false);
 
+/// The running drive's route still ahead of us, lat/lon from where we
+/// are: the traffic's ground spacing gives way to it as to one of its own
+/// movers (`traffic::OwnTarget::route`; EGKK 2026-10-14, a 737 drove onto
+/// our stretch unseen and stood nose to nose with us for good). Written by
+/// the drive each fix, emptied as it ends ([`RouteAheadGuard`]).
+static ROUTE_AHEAD: std::sync::Mutex<Vec<(f64, f64)>> = std::sync::Mutex::new(Vec::new());
+
+/// The route ahead the running drive published; empty with no drive.
+pub(crate) fn route_ahead() -> Vec<(f64, f64)> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    ROUTE_AHEAD.lock().map(|r| r.clone()).unwrap_or_default()
+}
+
+fn publish_route_ahead(way: Vec<(f64, f64)>) {
+    if let Ok(mut r) = ROUTE_AHEAD.lock() {
+        *r = way;
+    }
+}
+
+/// Empties [`ROUTE_AHEAD`] however the drive ends.
+pub(super) struct RouteAheadGuard;
+
+impl RouteAheadGuard {
+    pub(super) fn publish(&self, way: Vec<(f64, f64)>) {
+        publish_route_ahead(way);
+    }
+}
+
+impl Drop for RouteAheadGuard {
+    fn drop(&mut self) {
+        publish_route_ahead(Vec::new());
+    }
+}
+
 /// No aircraft on its wheels covers ground faster than this; the slack
 /// absorbs a stale read and the tick's own jitter.
 pub(crate) const RELOCATE_MAX_MPS: f64 = 60.0;

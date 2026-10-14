@@ -455,6 +455,24 @@ impl Route {
             })
     }
 
+    /// The route still ahead of `progress` metres along it, lat/lon.
+    pub(super) fn path_ahead(&self, progress: f64) -> Vec<(f64, f64)> {
+        let k = self.cum.partition_point(|&c| c <= progress);
+        let (Some(b), Some(&end)) = (k.checked_sub(1), self.path.get(k)) else {
+            return if k == 0 {
+                self.path.clone()
+            } else {
+                Vec::new()
+            };
+        };
+        let (a, len) = (self.path[b], self.cum[k] - self.cum[b]);
+        let f = ((progress - self.cum[b]) / len.max(1e-9)).clamp(0.0, 1.0);
+        let here = (a.0 + (end.0 - a.0) * f, a.1 + (end.1 - a.1) * f);
+        std::iter::once(here)
+            .chain(self.path[k..].iter().copied())
+            .collect()
+    }
+
     /// A fix in the route's own frame, metres (x east, y north).
     pub fn local_m(&self, lat: f64, lon: f64) -> (f64, f64) {
         taxi_guide::Geo::new(self.path[0].0).to_m(self.path[0], (lat, lon))

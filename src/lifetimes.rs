@@ -56,6 +56,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("autotaxi::LAST_ARRIVED", 'F'),
     ("autotaxi::PROGRESS", 'L'),
     ("autotaxi::RELOCATED", 'L'),
+    ("autotaxi::ROUTE_AHEAD", 'L'),
     ("autotaxi::RUN", 'L'),
     ("cabin::STAFFING", 'P'),
     ("circuit::ACTIVE", 'L'),
