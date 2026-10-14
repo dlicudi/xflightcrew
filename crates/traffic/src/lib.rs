@@ -40,7 +40,7 @@ pub use fleet::Fleet;
 pub use kin::{follow, follow_on_gear, Follow, FollowSpec, Gear, Kin, LatLon, Lights};
 pub use perf::{class_for_type, Perf, Wake, JET_HEAVY, JET_MED, PISTON_SINGLE, TURBOPROP};
 pub use phase::{Call, Despawn, Event, Leg, Order, OwnTarget, Phase, Plan, RadioState, TowerState};
-pub use rng::{field_seed, XorShift64};
+pub use rng::{field_seed, XorShift64, SESSION_SEED};
 pub use schedule::{
     generate, park_at_start, Density, FileEntry, FlightInfo, Movement, MovementKind, Refusal,
     SpawnCtx, Start,

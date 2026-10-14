@@ -15403,3 +15403,28 @@ comments; a row names its carrier by its constant (`airlines::carrier_by_name`).
 check is now tests (`every_route_row_is_well_formed`, `two_table_fields_agree_on_the_route_between_them`,
 vacuous until Gatwick lists Malaga). Proved equal before the Rust tables went: every row and every
 generated day, two seasons, weekday and weekend, byte for byte; `the_generated_days_are_pinned` keeps it.
+
+## 2026-10-14: Gatwick's timetable
+
+`crates/traffic/routes/EGKK.yaml`: the 40 busiest international and 9 busiest domestic routes of
+2025 (CAA Tables 12.1 and 12.2, Wikipedia's carrier lists), by the passenger method scaled by 0.7
+(Gatwick carries 163.5 passengers a movement, the method assumes 127.5, and Malaga's table flies
+0.62 of the method), long haul at published frequencies in windows; 122 rows, eight new carriers
+(SXS, CAI, KMM, SEH, UBT Longboat, CES, CCA, AUR), each telephony checked against the ICAO lists.
+
+- **A route between two table fields is written ONCE** (`routes::derive`): Malaga's six Gatwick
+  rows and Gibraltar's easyJet are in their files only; Gatwick's rows are derived (`mirror_of`),
+  and `rotation::mirror_rotations` draws the source's day with ITS session seed and sees each
+  flight a block time away: Malaga's departure EZY8062 is Gatwick's arrival EZY8062 one block
+  later. Gatwick pairs its arrivals and departures longest-waiting first, eight days back, so a
+  visitor's aircraft night-stops here. Pinned by `a_shared_route_is_the_same_flights_at_both_ends`
+  (a summer and a winter week: 127 rotations, none without an aircraft) and
+  `a_shared_route_is_written_once_and_derived_at_the_other_end` (the old two-ends-agree test
+  became: written in both files is an error). Gibraltar's and Malaga's pinned days unchanged.
+- **The top-up** (`midflow::top_up`, `top_up: true` in the file, Gatwick only): the hour generator
+  at the field's rate LESS the timetable's movements in that clock hour, its callsigns never the
+  timetable's, clear of the stands the timetable holds; the bin composes it hourly
+  (`Link::top_up_hour`). A summer Wednesday: timetable 440, top-up 281 by the rate (232 drawn on
+  the real install), together 721 (672): the CAA's 2025 AVERAGE day, short of a summer day's 850
+  to 900, because `rate::peak_per_h` gives Gatwick 46.6 an hour at the peak (the generator alone
+  681 a day). Left as it is; a summer factor is the rate's own question.

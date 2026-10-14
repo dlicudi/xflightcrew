@@ -1860,6 +1860,8 @@ fn a_board_for_a_field_nobody_flies() {
     let table = FieldRoutes {
         icao: "ULMM",
         utc_offset_h: 3.0,
+        city: "Ulmm",
+        top_up: false,
         rows,
     };
     let apt = format!("{}/ulmm.dat", fixtures());
@@ -1901,6 +1903,8 @@ fn ulmm_table() -> traffic::routes::FieldRoutes {
     FieldRoutes {
         icao: "ULMM",
         utc_offset_h: 3.0,
+        city: "Ulmm",
+        top_up: false,
         rows,
     }
 }

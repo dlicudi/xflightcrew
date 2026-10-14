@@ -5,7 +5,7 @@
 //! ([`crate::schedule::generate`]).
 //!
 //! The timetables are DATA (2026-10-14): one YAML file per field in
-//! `crates/traffic/routes/` (`LXGB.yaml`, `LEMG.yaml`), each with its
+//! `crates/traffic/routes/` (`LXGB.yaml`, `LEMG.yaml`, `EGKK.yaml`), each with its
 //! sources as comments, built into the crate by `include_str!` and parsed
 //! once ([`fields`]), so nothing is read from disk or the network and the
 //! binary needs nothing beside it. They were Rust tables until then; Gatwick
@@ -16,8 +16,15 @@
 //! compile-time check the tables had is now this module's tests: every
 //! file parses, every carrier resolves, every type is one the performance
 //! tables know (never a silent 172), the numbers, windows and frequencies
-//! are sane, and two fields that list each other agree. The pilot's own
-//! file (`XCOPILOT_TRAFFIC_FILE`) stays the other YAML way in.
+//! are sane, and a route between two table fields is written once. The
+//! pilot's own file (`XCOPILOT_TRAFFIC_FILE`) stays the other YAML way in.
+//!
+//! Gatwick (`EGKK.yaml`, 2026-10-14) is the third table and the first that
+//! shares routes: Malaga's and Gibraltar's Gatwick rows are written in
+//! their files only, and Gatwick's rows for them are DERIVED ([`derive`]),
+//! the same flights seen from the other end ([`crate::rotation`]). Its
+//! table holds the busiest routes; the hour generator flies the rest of its
+//! rate (`top_up`, [`crate::midflow::top_up`]).
 //!
 //! A weekly frequency is the route's passengers over a full narrowbody each
 //! way (about 150 seated, 85% full) and the 52 weeks, rounded, split
@@ -57,6 +64,13 @@ pub struct RouteRow {
     /// The types flown on the route, by weight; the carrier's own when
     /// empty.
     pub types: &'static [(&'static str, u32)],
+    /// A SHARED route's far end (2026-10-14): the route is written once,
+    /// in `other`'s file, and this row is derived from it ([`derive`]): the
+    /// same carrier, numbers and frequencies, its flights the source's seen
+    /// from here ([`crate::rotation`] mirrors the source's day: our arrival
+    /// is its departure a block time later). `None`: written in this
+    /// field's own file.
+    pub mirror_of: Option<&'static str>,
 }
 
 /// A field's table.
@@ -66,6 +80,14 @@ pub struct FieldRoutes {
     /// Standard time's offset from UTC, hours (Spain and Gibraltar keep
     /// Central European Time, with the EU's summer time on top).
     pub utc_offset_h: f64,
+    /// The field's name as a board shows it (another field's derived rows
+    /// name it as their city).
+    pub city: &'static str,
+    /// The hour generator fills what the timetable does not fly
+    /// ([`crate::midflow::top_up`]): a table that covers only the busiest
+    /// routes opts in, so the field still flies its own rate. Off, the
+    /// timetable is the whole day (Gibraltar's and Malaga's are).
+    pub top_up: bool,
     pub rows: &'static [RouteRow],
 }
 
@@ -85,6 +107,7 @@ pub const LINES: &[(f64, f64)] = &[];
 const FILES: &[(&str, &str)] = &[
     ("LXGB.yaml", include_str!("../routes/LXGB.yaml")),
     ("LEMG.yaml", include_str!("../routes/LEMG.yaml")),
+    ("EGKK.yaml", include_str!("../routes/EGKK.yaml")),
 ];
 
 /// A route file as written.
@@ -92,7 +115,10 @@ const FILES: &[(&str, &str)] = &[
 #[serde(deny_unknown_fields)]
 struct FileTable {
     icao: String,
+    city: String,
     utc_offset_h: f64,
+    #[serde(default)]
+    top_up: bool,
     routes: Vec<FileRow>,
 }
 
@@ -159,13 +185,66 @@ fn parse_table(file: &str, text: &str) -> Result<FieldRoutes, String> {
             windows,
             based: r.based,
             types,
+            mirror_of: None,
         });
     }
     Ok(FieldRoutes {
         icao: leak_str(t.icao),
         utc_offset_h: t.utc_offset_h,
+        city: leak_str(t.city),
+        top_up: t.top_up,
         rows: Box::leak(rows.into_boxed_slice()),
     })
+}
+
+/// Every table with the rows other tables share with it (2026-10-14): a
+/// route between two table fields is ONE thing, written once in one
+/// field's file; the other field's row is DERIVED here from it, after its
+/// own rows (so a table no other names keeps its rows and their order,
+/// and its day, exactly). A derived row keeps the source's carrier,
+/// numbers, frequencies and types; its `other` is the source field, its
+/// city the source's name, and its times are the source's flights a block
+/// time away ([`crate::rotation`]), so `based` and `windows` are the
+/// source's business and unused here. Malaga's EZY8061 row is Gatwick's
+/// too: Malaga's departure EZY8062 is Gatwick's arrival EZY8062.
+fn derive(tables: Vec<FieldRoutes>) -> Vec<FieldRoutes> {
+    let shared: Vec<Vec<RouteRow>> = tables
+        .iter()
+        .map(|here| {
+            tables
+                .iter()
+                .filter(|src| src.icao != here.icao)
+                .flat_map(|src| {
+                    src.rows
+                        .iter()
+                        .filter(|r| r.mirror_of.is_none() && r.other == here.icao)
+                        .map(|r| RouteRow {
+                            other: src.icao,
+                            city: src.city,
+                            windows: LINES,
+                            based: false,
+                            mirror_of: Some(src.icao),
+                            ..*r
+                        })
+                })
+                .collect()
+        })
+        .collect();
+    tables
+        .into_iter()
+        .zip(shared)
+        .map(|(t, more)| {
+            if more.is_empty() {
+                return t;
+            }
+            let mut rows = t.rows.to_vec();
+            rows.extend(more);
+            FieldRoutes {
+                rows: Box::leak(rows.into_boxed_slice()),
+                ..t
+            }
+        })
+        .collect()
 }
 
 /// Every field with a route table. The tables are parsed from the files
@@ -175,13 +254,16 @@ fn parse_table(file: &str, text: &str) -> Result<FieldRoutes, String> {
 pub fn fields() -> &'static [FieldRoutes] {
     static TABLES: OnceLock<Vec<FieldRoutes>> = OnceLock::new();
     TABLES.get_or_init(|| {
-        FILES
-            .iter()
-            .map(|(file, text)| {
-                parse_table(file, text)
-                    .unwrap_or_else(|e| panic!("a shipped route file: {e} (see routes.rs tests)"))
-            })
-            .collect()
+        derive(
+            FILES
+                .iter()
+                .map(|(file, text)| {
+                    parse_table(file, text).unwrap_or_else(|e| {
+                        panic!("a shipped route file: {e} (see routes.rs tests)")
+                    })
+                })
+                .collect(),
+        )
     })
 }
 
@@ -236,6 +318,15 @@ pub fn airline_name(code: &str) -> (&'static str, &'static str) {
         "AEE" => ("Aegean", "A3"),
         "WZZ" => ("Wizz Air", "W6"),
         "ITY" => ("ITA Airways", "AZ"),
+        "SXS" => ("SunExpress", "XQ"),
+        "CAI" => ("Corendon", "XC"),
+        "KMM" => ("KM Malta Airlines", "KM"),
+        "SEH" => ("Sky Express", "GQ"),
+        "UBT" => ("Norse Atlantic", "Z0"),
+        "CES" => ("China Eastern", "MU"),
+        "CCA" => ("Air China", "CA"),
+        "AUR" => ("Aurigny", "GR"),
+        "UAE" => ("Emirates", "EK"),
         _ => ("", ""),
     }
 }
@@ -263,13 +354,13 @@ mod tests {
     /// field, fails naming the file and the row.
     #[test]
     fn a_bad_route_file_names_its_file_and_row() {
-        let bad = "icao: XXXX\nutc_offset_h: 0.0\nroutes:\n  \
+        let bad = "icao: XXXX\ncity: X\nutc_offset_h: 0.0\nroutes:\n  \
                    - {carrier: EZY, number: 11, other: EGKK, city: A, summer: 7, winter: 7}\n  \
                    - {carrier: EZY_GATWIK, number: 8001, other: EGKK, city: A, summer: 7, winter: 7}\n";
         let e = parse_table("XXXX.yaml", bad).unwrap_err();
         assert!(e.contains("XXXX.yaml") && e.contains("routes[1]"), "{e}");
         assert!(e.contains("EZY_GATWIK"), "{e}");
-        let typo = "icao: XXXX\nutc_offset_h: 0.0\nroutes:\n  \
+        let typo = "icao: XXXX\ncity: X\nutc_offset_h: 0.0\nroutes:\n  \
                     - {carrier: EZY, number: 11, other: EGKK, city: A, sumer: 7, winter: 7}\n";
         let e = parse_table("XXXX.yaml", typo).unwrap_err();
         assert!(e.contains("XXXX.yaml") && e.contains("routes[0]"), "{e}");
@@ -352,36 +443,27 @@ mod tests {
         }
     }
 
-    /// Two fields with tables that list each other fly ONE route: the
-    /// rows at each end name the same carrier and the same frequencies,
-    /// and one end's first outbound is the other's first inbound (a row's
-    /// `number` is its inbound and `number + 1` its outbound, so the two
-    /// rows' numbers are one apart, either way round). Vacuous until two
-    /// table fields list each other (Gatwick and Malaga, the first).
-    fn ends_disagree(tables: &[FieldRoutes]) -> Vec<String> {
+    /// A route between two table fields is written ONCE (2026-10-14): a
+    /// file's own row to another table field whose own file also has a row
+    /// back with the same carrier is the route twice, and the two could
+    /// disagree. One file writes it; the other end derives it ([`derive`]).
+    fn written_twice(tables: &[FieldRoutes]) -> Vec<String> {
         let mut out = Vec::new();
         for a in tables {
-            for b in tables.iter().filter(|b| b.icao != a.icao) {
-                for ra in a.rows.iter().filter(|r| r.other == b.icao) {
-                    let agrees = b.rows.iter().any(|rb| {
-                        rb.other == a.icao
+            for b in tables.iter().filter(|b| b.icao < a.icao) {
+                for ra in a
+                    .rows
+                    .iter()
+                    .filter(|r| r.mirror_of.is_none() && r.other == b.icao)
+                {
+                    if b.rows.iter().any(|rb| {
+                        rb.mirror_of.is_none()
+                            && rb.other == a.icao
                             && rb.carrier.code == ra.carrier.code
-                            && (rb.number == ra.number + 1 || ra.number == rb.number + 1)
-                            && rb.summer == ra.summer
-                            && rb.winter == ra.winter
-                    });
-                    if !agrees {
+                    }) {
                         out.push(format!(
-                            "{} {}{} from {}: no matching row at {} ({}{} in, {} and {} a week)",
-                            a.icao,
-                            ra.carrier.code,
-                            ra.number,
-                            b.icao,
-                            b.icao,
-                            ra.carrier.code,
-                            ra.number + 1,
-                            ra.summer,
-                            ra.winter
+                            "{} {}{} to {}: written in both files; write it in one",
+                            a.icao, ra.carrier.code, ra.number, b.icao
                         ));
                     }
                 }
@@ -390,45 +472,102 @@ mod tests {
         out
     }
 
-    #[test]
-    fn two_table_fields_agree_on_the_route_between_them() {
-        let bad = ends_disagree(fields());
-        assert!(bad.is_empty(), "{bad:#?}");
+    /// Every derived row is its source's: the source's own row back to this
+    /// field, the same carrier, numbers, frequencies and types.
+    fn derived_disagree(tables: &[FieldRoutes]) -> Vec<String> {
+        let mut out = Vec::new();
+        for t in tables {
+            for r in t.rows {
+                let Some(src) = r.mirror_of else {
+                    continue;
+                };
+                let ok = tables.iter().filter(|s| s.icao == src).any(|s| {
+                    s.rows.iter().any(|sr| {
+                        sr.mirror_of.is_none()
+                            && sr.other == t.icao
+                            && sr.carrier == r.carrier
+                            && sr.number == r.number
+                            && sr.summer == r.summer
+                            && sr.winter == r.winter
+                            && sr.types == r.types
+                            && r.other == src
+                    })
+                });
+                if !ok {
+                    out.push(format!(
+                        "{} {}{} from {src}",
+                        t.icao, r.carrier.code, r.number
+                    ));
+                }
+            }
+        }
+        out
     }
 
-    /// The cross-field rule bites: a route listed at one end only, or with
-    /// another frequency or number at the other, is caught.
     #[test]
-    fn the_cross_field_rule_catches_a_one_sided_route() {
-        let lxgb = field_routes("LXGB").unwrap();
+    fn a_shared_route_is_written_once_and_derived_at_the_other_end() {
+        let bad = written_twice(fields());
+        assert!(bad.is_empty(), "{bad:#?}");
+        let bad = derived_disagree(fields());
+        assert!(bad.is_empty(), "{bad:#?}");
+        // Every own row to a table field has its derived row there.
+        for a in fields() {
+            for r in a.rows.iter().filter(|r| r.mirror_of.is_none()) {
+                if let Some(b) = field_routes(r.other) {
+                    assert!(
+                        b.rows.iter().any(|d| d.mirror_of == Some(a.icao)
+                            && d.carrier.code == r.carrier.code
+                            && d.number == r.number),
+                        "{} {}{} has no row at {}",
+                        a.icao,
+                        r.carrier.code,
+                        r.number,
+                        b.icao
+                    );
+                }
+            }
+        }
+    }
+
+    /// The rule bites: a route written at both ends is refused, and the
+    /// derived row is the source's, its far end the source field.
+    #[test]
+    fn the_cross_field_rule_catches_a_route_written_twice() {
+        let lxgb = *field_routes("LXGB").unwrap();
         let ezy = lxgb.rows.iter().find(|r| r.other == "EGKK").unwrap();
-        let gatwick_row = |number: u32, summer: u8| RouteRow {
-            carrier: airlines::carrier_by_name("EZY_GATWICK").unwrap(),
-            number,
-            other: "LXGB",
-            city: "Gibraltar",
-            summer,
-            winter: ezy.winter,
-            windows: LINES,
-            based: false,
-            types: &[],
-        };
         let table = |rows: Vec<RouteRow>| FieldRoutes {
             icao: "EGKK",
             utc_offset_h: 0.0,
+            city: "London Gatwick",
+            top_up: false,
             rows: Box::leak(rows.into_boxed_slice()),
         };
-        assert!(!ends_disagree(&[*lxgb, table(vec![])]).is_empty());
-        assert!(
-            !ends_disagree(&[*lxgb, table(vec![gatwick_row(ezy.number, ezy.summer)])]).is_empty()
+        let twice = RouteRow {
+            other: "LXGB",
+            city: "Gibraltar",
+            number: ezy.number + 1,
+            ..*ezy
+        };
+        assert!(!written_twice(&[lxgb, table(vec![twice])]).is_empty());
+        let derived = derive(vec![lxgb, table(vec![])]);
+        let d = derived[1].rows;
+        assert_eq!(
+            d.len(),
+            lxgb.rows.iter().filter(|r| r.other == "EGKK").count()
         );
-        assert!(!ends_disagree(&[
-            *lxgb,
-            table(vec![gatwick_row(ezy.number + 1, ezy.summer + 1)])
-        ])
-        .is_empty());
-        let both = ends_disagree(&[*lxgb, table(vec![gatwick_row(ezy.number + 1, ezy.summer)])]);
-        assert!(both.is_empty(), "{both:#?}");
+        assert_eq!(d[0].mirror_of, Some("LXGB"));
+        assert_eq!((d[0].other, d[0].city), ("LXGB", "Gibraltar"));
+        assert_eq!(
+            (d[0].number, d[0].summer, d[0].winter),
+            (ezy.number, ezy.summer, ezy.winter)
+        );
+        assert_eq!(derived[0].rows, lxgb.rows, "the source keeps its rows");
+        assert!(written_twice(&derived).is_empty());
+        assert!(derived_disagree(&derived).is_empty());
+        // A derived row that strays from its source is caught.
+        let mut strayed = d.to_vec();
+        strayed[0].summer += 1;
+        assert!(!derived_disagree(&[lxgb, table(strayed)]).is_empty());
     }
 
     /// The generated day of every field, pinned: an edit to a route file
@@ -436,7 +575,9 @@ mod tests {
     /// made on purpose and the pin updated with it. Pinned 2026-10-14 from
     /// the day the Rust tables generated, proved equal to the files' in
     /// the commit that moved them (`the_route_files_equal_the_rust_tables`,
-    /// `the_route_files_fly_the_same_day_as_the_rust_tables`).
+    /// `the_route_files_fly_the_same_day_as_the_rust_tables`). Gatwick's
+    /// pinned 2026-10-14 with its table, Gibraltar's and Malaga's unchanged
+    /// by it.
     #[test]
     fn the_generated_days_are_pinned() {
         use crate::rotation::{day_rotations, Date};
@@ -471,6 +612,10 @@ mod tests {
             "LEMG 2026-07-18 227 NAX3586 82b1c932f8bd0438",
             "LEMG 2026-01-14 154 NAX3586 6eeac15b260dfe52",
             "LEMG 2026-01-17 170 NAX3586 d2bf3149f7b602af",
+            "EGKK 2026-07-15 220 EZY8902 d615124dfa988254",
+            "EGKK 2026-07-18 227 EZY8904 40265b14ebaf1785",
+            "EGKK 2026-01-14 125 EXS618 d4774891337865b5",
+            "EGKK 2026-01-17 130 EZY8066 021370be12c51c71",
         ];
         assert_eq!(got, want, "{got:#?}");
     }
@@ -482,6 +627,6 @@ mod tests {
             .rows
             .iter()
             .all(|r| ["BAW", "EZY"].contains(&r.carrier.code)));
-        assert!(field_routes("EGKK").is_none());
+        assert!(field_routes("EGLL").is_none());
     }
 }

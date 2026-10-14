@@ -453,6 +453,52 @@ pub(crate) const AEE: Carrier = c("AEE", "Aegean", &[("A20N", 60), ("A21N", 40)]
 pub(crate) const LOT: Carrier = c("LOT", "LOT", &[("B38M", 100)], (400, 499));
 pub(crate) const ETD: Carrier = c("ETD", "Etihad", &[("B789", 60), ("A321", 40)], (1, 199));
 
+// Gatwick's route table's carriers (2026-10-14). Each telephony is the
+// ICAO one, read 2026-10-14: Wikipedia's "List of airline codes" (SXS
+// SUNEXPRESS, CAI CORENDON, CES CHINA EASTERN, SEH AIR CRETE, CCA AIR
+// CHINA, AUR AYLINE), airplanes.live and airhex.com for UBT LONGBOAT (Norse
+// Atlantic UK; NBT LONGSHIP is the Norwegian AOC), 123atc.com and
+// airhex.com for KMM SKYKNIGHT (KM Malta Airlines). Aurigny flies its
+// E195 to Gatwick (its ATRs serve the islands).
+pub(crate) const SXS: Carrier = c(
+    "SXS",
+    "Sunexpress",
+    &[("B738", 70), ("B38M", 30)],
+    (1600, 1699),
+);
+pub(crate) const CAI: Carrier = c(
+    "CAI",
+    "Corendon",
+    &[("B738", 70), ("B38M", 30)],
+    (1600, 1699),
+);
+pub(crate) const KMM: Carrier = c(
+    "KMM",
+    "Skyknight",
+    &[("A20N", 70), ("A21N", 30)],
+    (100, 499),
+);
+pub(crate) const SEH: Carrier = c(
+    "SEH",
+    "Air Crete",
+    &[("A20N", 60), ("A21N", 40)],
+    (100, 999),
+);
+pub(crate) const UBT: Carrier = c("UBT", "Longboat", &[("B789", 100)], (1, 999));
+pub(crate) const CES: Carrier = c(
+    "CES",
+    "China Eastern",
+    &[("B77W", 60), ("A359", 40)],
+    (500, 599),
+);
+pub(crate) const CCA: Carrier = c(
+    "CCA",
+    "Air China",
+    &[("A333", 60), ("B789", 40)],
+    (800, 899),
+);
+pub(crate) const AUR: Carrier = c("AUR", "Ayline", &[("E195", 100)], (600, 699));
+
 /// Every carrier constant by its Rust name, written once so the name and
 /// the value can never part: the route tables' data files
 /// (`crates/traffic/routes/*.yaml`) name their carriers this way.
@@ -530,6 +576,14 @@ named_carriers!(
     AEE,
     LOT,
     ETD,
+    SXS,
+    CAI,
+    KMM,
+    SEH,
+    UBT,
+    CES,
+    CCA,
+    AUR,
 );
 
 /// The fields we fly, each its own mix.
