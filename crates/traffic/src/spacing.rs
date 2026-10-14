@@ -920,9 +920,24 @@ pub fn apply(
         // nose, planned round one, then the other, every 90 s for ten
         // minutes, each plan clearing its "no way", and neither departure
         // could ever have it towed; three more and our own queued behind.
+        // NEVER A DEPARTURE WAITING FOR THE RUNWAY: a queue to the hold
+        // moves in its own time, as the tower releases it. LEMG 12
+        // (2026-10-14): two departures held on Delta for their takeoff were
+        // towed off by a third joining behind them, one after the other,
+        // and vanished in front of our own aircraft. Only one stopped for
+        // THIS mover, the two nose to nose, is a deadlock to break; and one
+        // in the way of a mover stopped ON the runway, which the departure
+        // is itself waiting for (ULMM's vacate: the arrivals behind it go
+        // round for good).
         let me = Blocker::Traffic(fleet[i].id);
         let towable = ob.idx.filter(|&j| {
             let b = &fleet[j];
+            let for_the_runway = !ob.on_stand
+                && !on_strip[i]
+                && matches!(b.phase, Phase::TaxiOut | Phase::HoldShort | Phase::LineUp);
+            if for_the_runway {
+                return b.spacing.blocker == Some(me) && b.spacing.still_s >= STUCK_S;
+            }
             b.phase == Phase::Parked
                 || b.spacing.still_s >= 2.0 * STUCK_S
                 || (b.spacing.still_s >= STUCK_S
@@ -933,6 +948,20 @@ pub fn apply(
         if let Some(j) = towable {
             let from = fleet[j].phase;
             let removed = fleet[j].id;
+            let why = if on_strip[i] {
+                "runway"
+            } else if s.junction {
+                "junction"
+            } else if ob.parked {
+                "parked"
+            } else {
+                "facing"
+            };
+            let at = [
+                (fleet[i].kin.pos(), fleet[i].kin.hdg_deg),
+                (fleet[j].kin.pos(), fleet[j].kin.hdg_deg),
+            ];
+            let still_s = fleet[j].spacing.still_s;
             fleet[j].phase = Phase::Gone;
             events.push(Event::Phase {
                 id: removed,
@@ -946,6 +975,10 @@ pub fn apply(
             events.push(Event::SpacingCleared {
                 id: fleet[i].id,
                 removed,
+                why,
+                at,
+                phase: from,
+                still_s,
             });
             fleet[i].spacing.no_way = None;
             continue;

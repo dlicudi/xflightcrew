@@ -96,6 +96,14 @@ const REPLAN_S: f64 = 10.0;
 /// Held short of a crossing, the request is made again this often.
 pub const CROSS_ASK_RETRY_S: f64 = 30.0;
 
+/// At the hold with its "ready" call unanswered (still only cleared to
+/// taxi, not held, no line-up), the call is made again this often: LEMG
+/// (2026-10-14), a departure spawned at the hold called the tower before
+/// its strip had a taxi clearance, Ground answered it, and it stood there
+/// silent for forty minutes with three departures and our own queued
+/// behind it.
+pub const READY_RETRY_S: f64 = 90.0;
+
 /// An owed readback still owed this long after it went out was not taken:
 /// it is given again (the link may hold a call a few seconds before it
 /// keys, `CALL_GAP_S` in the bin, so this is several of those).
@@ -247,7 +255,7 @@ pub struct TrafficAircraft {
     pub(crate) vacated_at_s: Option<f64>,
     /// The taxi route being driven is the tower's (its cleared route): the
     /// spacing's guard never plans another, the tower watches it.
-    tower_route: bool,
+    pub(crate) tower_route: bool,
     /// The altitude an arrival came in at (after a missed approach, the
     /// missed approach altitude it climbed to).
     pub(crate) entry_alt_ft: f64,
@@ -547,6 +555,7 @@ impl TrafficAircraft {
     fn call_once(&mut self, call: Call, events: &mut Vec<Event>) {
         if !self.radio.called {
             self.radio.called = true;
+            self.radio.called_at_s = self.phase_s;
             events.push(Event::Call { id: self.id, call });
         }
     }
@@ -635,6 +644,10 @@ impl TrafficAircraft {
             }
             Phase::HoldShort => {
                 self.hold_still(dt);
+                let unanswered = o.state == TowerState::TaxiCleared && !o.line_up_behind;
+                if unanswered && self.phase_s - self.radio.called_at_s >= READY_RETRY_S {
+                    self.radio.called = false;
+                }
                 if !o.hold {
                     self.call_once(Call::Ready, events);
                 }
