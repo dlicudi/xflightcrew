@@ -328,6 +328,8 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
     // bug is the watched fallback (#227, `crate::lnav`).
     let lnav_on = matches!(end, EndAction::Enroute) && autoflight::panel().lnav_declared();
     let mut lnav = crate::lnav::LnavLateral::default();
+    // The last `lnav` `on_bug` reason published, with its leg.
+    let mut bug_why_said: Option<(usize, &'static str)> = None;
     // The leg index last published with the route (`route_ahead`).
     let mut route_published: Option<usize> = None;
     // Terrain look-ahead: probed on its own slow cadence (the ground does not
@@ -463,10 +465,10 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
         // 8,000 ft before the descent gets there. Without a `vmo_high:` it
         // is the published ceiling.
         let vmo_vs = match vmo_prev_alt {
-            Some(prev) if (0.2..=5.0).contains(&dt) => (alt_ft - prev) / dt * 60.0,
+            Some(prev) if (0.2..=5.0).contains(&dt) => (true_alt_ft - prev) / dt * 60.0,
             _ => 0.0,
         };
-        vmo_prev_alt = Some(alt_ft);
+        vmo_prev_alt = Some(true_alt_ft);
         let speed_ceiling = vmo.ceiling(alt_ft, vmo_vs);
         let agl_ft = agl_m * M_TO_FT;
         // The magnetic variation HERE, not at the departure airport. It is a
@@ -1067,6 +1069,7 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
         // The EFB's "who has the lateral": a tap on the follower's own
         // decision, never a read.
         crate::efb::feed::note_lateral(lnav.owns_lateral());
+        let mut fms_seen: Option<String> = None;
         if lnav_on && !lnav.retired() && (lnav_eligible || lnav.in_play()) {
             let now_s = started.elapsed().as_secs_f64();
             let (fms_r, xtk_r, engaged) = tokio::join!(
@@ -1075,6 +1078,7 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
                 autoflight::read_lnav(&xp),
             );
             let fms = fms_r.ok();
+            fms_seen = fms.clone();
             let xtk = xtk_r.ok().filter(|v| v.is_finite());
             // The capture's best, before a drop resets it (for the tape).
             let best_xtk = lnav.best_xtk();
@@ -1163,6 +1167,37 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
                     );
                 }
             }
+        }
+        // Why the bug and not LNAV flies this leg, on each change.
+        let steering = if steer != Steer::Direct || steer_track.is_some() || steer_line.is_some() {
+            Some("course_leg")
+        } else if arc.is_some() {
+            Some("arc")
+        } else if holding {
+            Some("holding")
+        } else if final_join.flying_pattern() {
+            Some("pattern")
+        } else {
+            None
+        };
+        let why = crate::lnav::bug_reason(&crate::lnav::BugWhy {
+            owned: lnav.owns_lateral(),
+            declared: autoflight::panel().lnav_declared(),
+            enroute: matches!(end, EndAction::Enroute),
+            retired: lnav.retired(),
+            steering,
+            leg,
+            fms_ident: fms_seen.as_deref(),
+        });
+        if let Some(w) = why.filter(|w| bug_why_said != Some((idx, *w))) {
+            bug_why_said = Some((idx, w));
+            crate::blackbox::record(
+                "lnav",
+                serde_json::json!({"event": "on_bug", "why": w, "idx": idx,
+                    "fix": leg.fix_ident, "type": leg.leg_type, "fms": fms_seen}),
+            );
+        } else if why.is_none() {
+            bug_why_said = None;
         }
         // A course leg flown on its course is done abeam its fix, as a
         // fly-by is: the intercept may still be closing the line.
@@ -1794,9 +1829,13 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
             },
             other => other,
         };
+        // The rate is the aircraft's, so the TRUE altitude: the altimeter
+        // steps when its setting changes (30.32 to 29.92 at EGKK's
+        // transition read as -1,681 fpm in a 2,100 fpm climb and handed a
+        // climbing A330 to the recovery, 2026-10-14).
         let verdict = climb_watch.step(
             watch_t0.elapsed().as_secs_f64(),
-            alt_ft,
+            true_alt_ft,
             ias,
             watch_floor,
             (action == VsAction::Write).then_some(vs_cmd),
