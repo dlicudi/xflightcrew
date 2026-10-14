@@ -360,6 +360,9 @@ pub fn try_parse(
     // A helicopter's hover and set-down. Only where the airframe has the
     // tool: "set it down" means nothing to an aeroplane.
     if registry.get("hover").is_some() {
+        if let Some(c) = collective_call(&t) {
+            return Some(vec![c]);
+        }
         if let Some(c) = hover_call(&t) {
             return Some(vec![c]);
         }
@@ -427,6 +430,20 @@ pub fn try_parse(
         c.name = "hold_speed".to_string();
     }
     valid(&c, registry, profile).then_some(vec![c])
+}
+
+/// "Lower the collective", "collective down", "bottom the collective": the
+/// lever to the bottom on the ground (LXGB 2026-10-14, #284, where the words
+/// were heard and answered with nothing). Never "raise": lifting is the
+/// hover's. A "don't" leaves it alone.
+fn collective_call(t: &str) -> Option<ToolCall> {
+    if !has(t, "collective") || ["don", "dont", "not", "never"].iter().any(|w| has(t, w)) {
+        return None;
+    }
+    let down = ["lower", "down", "bottom", "drop", "dump", "floor"]
+        .iter()
+        .any(|w| has(t, w));
+    down.then(|| call("lower_collective", json!({})))
 }
 
 /// "Lift to a hover", "hover at fifteen feet", "lift off"; "set it down",

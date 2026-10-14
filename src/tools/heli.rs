@@ -5,8 +5,9 @@
 //! engine the throttle to idle (throttle 0 is OFF, anything above it lets fuel
 //! in, the mixture follows by itself) and the starter HELD until the engine
 //! settles at about 62 % N1; then both throttles to FLY, the generators on,
-//! and the rotor read back at its governed 313 rpm. Nothing here writes the
-//! collective: a lever the pilot's hand may be on is refused, not moved.
+//! and the rotor read back at its governed 313 rpm. The start and shutdown
+//! never write the collective: a lever the pilot's hand may be on is refused,
+//! not moved. Only the pilot's own "lower the collective" moves it.
 
 use crate::datarefs::ON_GROUND_ANY;
 use anyhow::Result;
@@ -264,6 +265,89 @@ impl Tool for StartHelicopter {
             ));
         }
         Ok(line)
+    }
+}
+
+/// The rate a spoken "lower the collective" brings the lever down: the
+/// hover's own set-down rate (about 3 s from a hover's 0.6).
+const LOWER_PER_S: f64 = 0.20;
+const LOWER_TICK_MS: u64 = 100;
+
+/// "Lower the collective": on the ground only, smoothly to the bottom, read
+/// back. LXGB 2026-10-14 (#284): a hover handed back at 400 ft left the lever
+/// at its trim, 0.47; the pilot landed by hand with no collective axis of
+/// their own, the shutdown refused four times and the words had no tool.
+/// Refused airborne and while the hover loop holds the lever (its writer).
+pub struct LowerCollective {
+    collective: String,
+}
+
+impl LowerCollective {
+    pub fn new(p: &HeliStartProfile) -> Self {
+        Self {
+            collective: p.collective.clone(),
+        }
+    }
+}
+
+/// The ramp's steps from `from` to the bottom at [`LOWER_PER_S`]. Pure.
+fn lower_steps(from: f64) -> Vec<f64> {
+    let step = LOWER_PER_S * LOWER_TICK_MS as f64 / 1000.0;
+    let mut out = Vec::new();
+    let mut v = from;
+    while v > 0.0 {
+        v = (v - step).max(0.0);
+        out.push(v);
+    }
+    out
+}
+
+#[async_trait]
+impl Tool for LowerCollective {
+    fn name(&self) -> &str {
+        "lower_collective"
+    }
+    fn description(&self) -> &str {
+        "Lower the helicopter's collective fully, on the ground only. Use for \
+         'lower the collective', 'collective down', 'bottom the collective'."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        if crate::hover::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok("I'm flying the collective in the hover. Say set it down.".to_string());
+        }
+        if !ctx
+            .xplane
+            .get_float(ON_GROUND_ANY)
+            .await
+            .is_ok_and(sim::ground::on_ground)
+        {
+            return Ok(
+                "Negative, we're not on the ground. The collective stays where it is."
+                    .to_string(),
+            );
+        }
+        let Some(from) = elem(ctx, &self.collective, 0).await else {
+            return Ok("I can't read the collective.".to_string());
+        };
+        if from <= COLLECTIVE_DOWN_MAX {
+            return Ok("The collective's already fully down.".to_string());
+        }
+        for v in lower_steps(from) {
+            ctx.xplane.set_float_array_elem(&self.collective, 0, v).await?;
+            tokio::time::sleep(Duration::from_millis(LOWER_TICK_MS)).await;
+        }
+        // READBACK: down when it reads down.
+        Ok(match elem(ctx, &self.collective, 0).await {
+            Some(c) if c <= COLLECTIVE_DOWN_MAX => "Collective fully down.".to_string(),
+            Some(c) => format!(
+                "The collective didn't come down, it reads {:.0} percent.",
+                c * 100.0
+            ),
+            None => "I lowered the collective but can't read it back.".to_string(),
+        })
     }
 }
 
@@ -965,7 +1049,24 @@ async fn running_all(ctx: &ToolCtx<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{start_line, EngineStart as E};
+    use super::{lower_steps, start_line, EngineStart as E, LOWER_PER_S};
+
+    /// The lever comes down at the set-down's rate and ends at the bottom,
+    /// never below it (#284).
+    #[test]
+    fn the_collective_comes_down_smoothly_to_the_bottom() {
+        let steps = lower_steps(0.47);
+        assert_eq!(steps.last().copied(), Some(0.0));
+        assert!(steps.iter().all(|v| *v >= 0.0));
+        let secs = steps.len() as f64 * 0.1;
+        assert!((secs - 0.47 / LOWER_PER_S).abs() < 0.11, "{secs} s");
+        let mut prev = 0.47;
+        for v in steps {
+            assert!(prev - v <= LOWER_PER_S * 0.1 + 1e-9);
+            prev = v;
+        }
+        assert!(lower_steps(0.0).is_empty());
+    }
 
     #[test]
     fn the_start_says_what_came_up() {

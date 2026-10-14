@@ -211,6 +211,12 @@ fn a_helicopter_hovers_and_sets_down_by_voice() {
     assert_eq!(c.arguments, json!({ "action": "down" }));
     let c = first("set it down").expect("down");
     assert_eq!(c.arguments, json!({ "action": "down" }));
+    // LXGB 2026-10-14 (#284): heard, answered with nothing.
+    for words in ["Lower the collective.", "collective down", "bottom the collective"] {
+        let name = first(words).map(|c| c.name);
+        assert_eq!(name.as_deref(), Some("lower_collective"), "{words}");
+    }
+    assert!(first("don't lower the collective").is_none_or(|c| c.name != "lower_collective"));
     assert!(first("landing light on").is_none_or(|c| c.name != "hover"));
     // A helicopter's pad is not a flight's destination.
     assert!(first("take us to the pad").is_some_and(|c| c.name == "hover"));
