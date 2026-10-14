@@ -133,6 +133,48 @@ pub(super) const STAND_ALIGN_M: f64 = 25.0;
 /// ...when the turn at that point is no more than this.
 pub(super) const STAND_ALIGN_MAX_TURN_DEG: f64 = 90.0;
 
+/// A ROUTE STARTS AHEAD OF THE NOSE WHEN ONE CAN. LEMG (2026-10-14 13:55,
+/// a Laminar 737-800 at 79 t, #288): stopped on Delta short of HW1 facing
+/// 297 when the runway in use turned 12 to 13, the tower's new route to HN1
+/// (Delta, Quebec, Alpha) ran straight back past the tail, the drive found
+/// no turn round on a taxiway (`join_refused`, err -179.6, radius 15 m) and
+/// full auto gave up `taxi_incomplete`. The planner routed from a POSITION;
+/// a ground controller routes an aircraft from where it points, round the
+/// block when there is one. So, given the heading
+/// ([`TaxiNet::plan_to_runway_facing`]), a start node more than
+/// [`FACING_REVERSAL_DEG`] off the nose, or a first edge out of the start
+/// doubling back that far on the way the aircraft went to it, costs
+/// [`FACING_REVERSAL_COST_M`] more.
+/// A cost, never a ban: with no way ahead the reversal is still the route
+/// and the drive's own join turn (or its refusal) stays the fallback.
+///
+/// More than this off the nose is a reversal: past the drive's planned
+/// join turn (90 degrees) with room for the ordinary acute junction.
+pub const FACING_REVERSAL_DEG: f64 = 120.0;
+/// ...and what a reversal is worth avoiding, in the planner's own cost
+/// (metres, a runway edge at 25 times its length): a route ahead up to this
+/// much dearer wins over turning on the spot. The cost of the alternative
+/// is an aircraft stopped dead and hand-taxied (or a tug), so it is set
+/// high: LEMG's way ahead from Delta is HW1, 295 m back along the idle
+/// 12/30 and E7 back onto Delta, 683 m longer than the reversal and about
+/// 7,500 dearer for the runway stretch. Only for an aircraft that cannot
+/// pivot: the caller passes no heading for a light one (the drive's
+/// `JOIN_TURN_LIGHT_KG`) or a helicopter.
+pub const FACING_REVERSAL_COST_M: f64 = 10_000.0;
+/// A start node nearer than this is where the aircraft already is: its
+/// bearing is noise, and the first edge out of it is judged on the nose.
+pub(super) const FACING_AT_NODE_M: f64 = 5.0;
+/// The ends of the taxiway edge nearest the aircraft are start nodes too
+/// when it is within this of the edge (the join's own reach,
+/// `JOIN_AHEAD_MAX_LAT_M`): the nearest node alone may be the one behind.
+pub(super) const FACING_EDGE_M: f64 = 60.0;
+/// Parked on a stand (within this of it, nose within
+/// [`FACING_STAND_ALIGN_DEG`] of its heading: the crew's `on_a_stand`) the
+/// nose points at the building and the tug turns it: the heading is no
+/// constraint.
+pub(super) const FACING_STAND_M: f64 = 35.0;
+pub(super) const FACING_STAND_ALIGN_DEG: f64 = 60.0;
+
 /// ...unless the straight lead-in already arrives within this of the stand's
 /// heading.
 pub(super) const STAND_ALIGN_OK_DEG: f64 = 30.0;
@@ -856,6 +898,7 @@ impl TaxiNet {
             hold_zone,
             false,
             None,
+            None,
         )
     }
 
@@ -884,6 +927,35 @@ impl TaxiNet {
         hold_zone: &[String],
         strip: Option<&Runway>,
     ) -> Option<TaxiRoutePlan> {
+        self.plan_to_runway_facing(
+            from_lat,
+            from_lon,
+            to_lat,
+            to_lon,
+            hold_short_m,
+            hold_zone,
+            strip,
+            None,
+        )
+    }
+
+    /// [`plan_to_runway`](Self::plan_to_runway) for an aircraft pointing
+    /// `psi_true` (true degrees): a route that starts AHEAD of the nose wins
+    /// when one exists within [`FACING_REVERSAL_COST_M`] (see
+    /// [`FACING_REVERSAL_DEG`]). `None`, or parked on a stand, plans exactly
+    /// as `plan_to_runway`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_to_runway_facing(
+        &self,
+        from_lat: f64,
+        from_lon: f64,
+        to_lat: f64,
+        to_lon: f64,
+        hold_short_m: f64,
+        hold_zone: &[String],
+        strip: Option<&Runway>,
+        psi_true: Option<f64>,
+    ) -> Option<TaxiRoutePlan> {
         self.plan_inner(
             from_lat,
             from_lon,
@@ -893,7 +965,100 @@ impl TaxiNet {
             hold_zone,
             true,
             strip,
+            psi_true,
         )
+    }
+
+    /// [`plan`](Self::plan) for an aircraft pointing `psi_true`, as
+    /// [`plan_to_runway_facing`](Self::plan_to_runway_facing).
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_facing(
+        &self,
+        from_lat: f64,
+        from_lon: f64,
+        to_lat: f64,
+        to_lon: f64,
+        hold_short_m: f64,
+        hold_zone: &[String],
+        psi_true: Option<f64>,
+    ) -> Option<TaxiRoutePlan> {
+        self.plan_inner(
+            from_lat,
+            from_lon,
+            to_lat,
+            to_lon,
+            hold_short_m,
+            hold_zone,
+            false,
+            None,
+            psi_true,
+        )
+    }
+
+    /// Where a route may start for an aircraft at `here` pointing `psi`, what
+    /// reaching each start costs, metres, and the way the aircraft is going
+    /// when it gets there (true degrees, for the first edge out of it): the
+    /// nearest node `snap` and the two ends of the taxiway edge it is beside
+    /// (within [`FACING_EDGE_M`]), each at its distance, plus
+    /// [`FACING_REVERSAL_COST_M`] when it lies behind the nose. Arriving, the
+    /// aircraft is going the way it went to the node (turned round for one
+    /// behind, so carrying on back is no second reversal), or the nose's way
+    /// at a node it already stands on. Pure.
+    fn facing_starts(
+        &self,
+        here: (f64, f64),
+        psi: f64,
+        snap: i64,
+        dist_m: &dyn Fn((f64, f64), (f64, f64)) -> f64,
+    ) -> Vec<(i64, f64, f64)> {
+        let m_per_deg_lon = 111_320.0 * here.0.to_radians().cos();
+        let to_m = |p: (f64, f64)| ((p.1 - here.1) * m_per_deg_lon, (p.0 - here.0) * 111_320.0);
+        let beside = self
+            .edges
+            .iter()
+            .filter(|e| !e.runway)
+            .filter_map(|e| {
+                let (a, b) = (to_m(*self.nodes.get(&e.a)?), to_m(*self.nodes.get(&e.b)?));
+                let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                let l2 = dx * dx + dy * dy;
+                let t = if l2 < 1e-6 {
+                    0.0
+                } else {
+                    (-(a.0 * dx + a.1 * dy) / l2).clamp(0.0, 1.0)
+                };
+                let (cx, cy) = (a.0 + t * dx, a.1 + t * dy);
+                Some((e, (cx * cx + cy * cy).sqrt()))
+            })
+            .filter(|(_, d)| *d <= FACING_EDGE_M)
+            .min_by(|x, y| x.1.total_cmp(&y.1))
+            .map(|(e, _)| [e.a, e.b]);
+        let mut ids = vec![snap];
+        for n in beside.into_iter().flatten() {
+            if !ids.contains(&n) {
+                ids.push(n);
+            }
+        }
+        ids.into_iter()
+            .filter_map(|id| {
+                let p = *self.nodes.get(&id)?;
+                let d = dist_m(here, p);
+                if d <= FACING_AT_NODE_M {
+                    return Some((id, d, psi));
+                }
+                let going = bearing_deg(here.0, here.1, p.0, p.1);
+                let behind = sim::angles::abs_diff_deg(going, psi) > FACING_REVERSAL_DEG;
+                Some((id, d + if behind { FACING_REVERSAL_COST_M } else { 0.0 }, going))
+            })
+            .collect()
+    }
+
+    /// Parked on a stand: near one and nosed in along it (see
+    /// [`FACING_STAND_M`]).
+    fn parked_on_stand(&self, lat: f64, lon: f64, psi: f64) -> bool {
+        self.nearest_stand(lat, lon).is_some_and(|s| {
+            haversine_nm(lat, lon, s.lat, s.lon) * 1852.0 <= FACING_STAND_M
+                && sim::angles::abs_diff_deg(s.heading, psi) <= FACING_STAND_ALIGN_DEG
+        })
     }
 
     /// Whether a departure from `ident` (an end of `strip`) can get onto
@@ -1339,6 +1504,7 @@ impl TaxiNet {
         hold_zone: &[String],
         to_runway: bool,
         strip: Option<&Runway>,
+        psi_true: Option<f64>,
     ) -> Option<TaxiRoutePlan> {
         let m_per_deg_lat = 111_320.0;
         let m_per_deg_lon = 111_320.0 * from_lat.to_radians().cos();
@@ -1448,14 +1614,32 @@ impl TaxiNet {
         let mut best: std::collections::HashMap<i64, (f64, Option<usize>)> =
             std::collections::HashMap::new();
         let mut heap: BinaryHeap<(Reverse<u64>, i64)> = BinaryHeap::new();
-        best.insert(start, (0.0, None));
-        heap.push((Reverse(0), start));
+        // Where the route may start. Without a heading (or parked on a
+        // stand, where the tug turns the nose) the snapped node alone, as
+        // always; with one, the starts ahead of the nose against those
+        // behind ([`FACING_REVERSAL_DEG`]).
+        let facing = psi_true
+            .filter(|p| p.is_finite())
+            .filter(|&p| !self.parked_on_stand(from_lat, from_lon, p));
+        let starts = match facing {
+            Some(psi) => self.facing_starts((from_lat, from_lon), psi, start, &dist_m),
+            None => vec![(start, 0.0, 0.0)],
+        };
+        let mut going_at: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+        for &(id, c, going) in &starts {
+            best.insert(id, (c, None));
+            going_at.insert(id, going);
+            heap.push((Reverse((c * 1000.0) as u64), id));
+        }
         while let Some((Reverse(cost_mm), node)) = heap.pop() {
             let cost = cost_mm as f64 / 1000.0;
             if node == goal {
                 break;
             }
-            if best.get(&node).is_none_or(|(c, _)| cost > *c + 0.5) {
+            let Some(&(node_cost, came_by)) = best.get(&node) else {
+                continue;
+            };
+            if cost > node_cost + 0.5 {
                 continue; // stale heap entry
             }
             for &ei in adj.get(&node).map(|v| v.as_slice()).unwrap_or(&[]) {
@@ -1468,6 +1652,17 @@ impl TaxiNet {
                 if e.runway {
                     w *= 25.0;
                 }
+                // The first edge of the route, out of a start: a reversal
+                // of the way the aircraft is going costs what turning round
+                // is worth.
+                if let (Some(_), None, Some(&going)) = (facing, came_by, going_at.get(&node)) {
+                    let (from, to) = if e.a == node { (pa, pb) } else { (pb, pa) };
+                    if sim::angles::abs_diff_deg(bearing_deg(from.0, from.1, to.0, to.1), going)
+                        > FACING_REVERSAL_DEG
+                    {
+                        w += FACING_REVERSAL_COST_M;
+                    }
+                }
                 let nc = cost + w;
                 if best.get(&next).is_none_or(|(c, _)| nc < *c) {
                     best.insert(next, (nc, Some(ei)));
@@ -1475,13 +1670,15 @@ impl TaxiNet {
                 }
             }
         }
-        // Walk back goal→start collecting edges, then flip.
+        // Walk back goal→start collecting edges, then flip. The start is
+        // whichever of `starts` the walk ends on (a node with no edge in).
         let mut edges_rev: Vec<usize> = Vec::new();
         let mut node = goal;
         let mut hops = 0;
-        while node != start {
-            let (_, Some(ei)) = *best.get(&node)? else {
-                return None;
+        loop {
+            let (_, came_by) = *best.get(&node)?;
+            let Some(ei) = came_by else {
+                break;
             };
             edges_rev.push(ei);
             let e = &self.edges[ei];
@@ -1492,6 +1689,7 @@ impl TaxiNet {
             }
         }
         edges_rev.reverse();
+        let start = node;
         let mut via: Vec<String> = Vec::new();
         let mut crossings: Vec<String> = Vec::new();
         let mut holding_point = String::new();

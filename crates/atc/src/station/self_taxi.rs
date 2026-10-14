@@ -117,6 +117,7 @@ pub fn plan_self_taxi(
     lon: f64,
     runway: Option<&str>,
     wind: Option<(f64, f64)>,
+    psi_true: Option<f64>,
 ) -> Result<SelfTaxi, String> {
     let found = match icao {
         Some(icao) => nav::find_airport(apt_path, icao)
@@ -167,8 +168,11 @@ pub fn plan_self_taxi(
     };
     let standoff = (r.width_m / 2.0 + 30.0).max(nav::HOLD_SHORT_STANDOFF_M);
     let zone = [r.ident_a.clone(), r.ident_b.clone()];
+    // From where the nose points, for an aircraft that cannot turn on the
+    // spot (`psi_true`, the crew's to judge): the route starts ahead of it
+    // when one does (LEMG 2026-10-14, #288).
     let mut plan = net
-        .plan_to_runway(lat, lon, tlat, tlon, standoff, &zone, Some(r))
+        .plan_to_runway_facing(lat, lon, tlat, tlon, standoff, &zone, Some(r), psi_true)
         .filter(|p| p.path.len() >= 2)
         .ok_or_else(|| {
             format!(

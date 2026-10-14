@@ -3792,3 +3792,192 @@ fn a_runway_end_finds_its_own_papi() {
     assert!(p27.facing_deg > 260.0, "{p27:?}");
     assert!(crate::papi_for(&papis, t09.0, t09.1, (c09 + 90.0) % 360.0).is_none(), "a crossing course has none");
 }
+
+/// LEMG 2026-10-14 13:55 (#288): a 737-800 stopped on Delta short of HW1
+/// facing 297 when the runway in use turned 12 to 13. Planned from the
+/// position alone the route to 13 ran straight back past the tail (the
+/// drive's `join_refused`, err -179.6); planned from where it points, the
+/// route starts ahead of the nose.
+/// `cargo test -p nav -- --ignored live_lemg_delta_route_starts_ahead --nocapture`
+#[test]
+#[ignore] // needs the real X-Plane install; run with --ignored
+fn live_lemg_delta_route_starts_ahead() {
+    let path =
+        &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    let Ok(Some(net)) = find_taxi_net(path, "LEMG") else {
+        return; // no install, no verdict
+    };
+    let runways = find_runways(path, "LEMG").unwrap();
+    let strip = runways
+        .iter()
+        .find(|r| r.ident_a == "13" || r.ident_b == "13")
+        .expect("LEMG 13/31");
+    let (tlat, tlon) = if strip.ident_a == "13" {
+        (strip.lat_a, strip.lon_a)
+    } else {
+        (strip.lat_b, strip.lon_b)
+    };
+    let zone: Vec<String> = vec![strip.ident_a.clone(), strip.ident_b.clone()];
+    let (lat, lon, psi) = (36.689508452, -4.508558165, 297.3);
+    let len = |p: &TaxiRoutePlan| -> f64 {
+        p.path
+            .windows(2)
+            .map(|w| haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1) * 1852.0)
+            .sum()
+    };
+    // The first bearing a route asks for, past its first 10 m.
+    let first_brg = |p: &TaxiRoutePlan| -> f64 {
+        let to = p
+            .path
+            .iter()
+            .find(|q| haversine_nm(lat, lon, q.0, q.1) * 1852.0 > 10.0)
+            .expect("a route away from here");
+        bearing_deg(lat, lon, to.0, to.1)
+    };
+    let old = net
+        .plan_to_runway(lat, lon, tlat, tlon, 100.0, &zone, Some(strip))
+        .expect("the position-only route");
+    let new = net
+        .plan_to_runway_facing(lat, lon, tlat, tlon, 100.0, &zone, Some(strip), Some(psi))
+        .expect("a route");
+    println!(
+        "old: {} via {:?} {:.0} m, first {:.0}; new: {} via {:?} {:.0} m, first {:.0}",
+        old.holding_point,
+        old.via,
+        len(&old),
+        first_brg(&old),
+        new.holding_point,
+        new.via,
+        len(&new),
+        first_brg(&new)
+    );
+    assert!(
+        sim::angles::abs_diff_deg(first_brg(&old), psi) > FACING_REVERSAL_DEG,
+        "the incident: the position-only route starts behind us"
+    );
+    assert!(
+        sim::angles::abs_diff_deg(first_brg(&new), psi) < 90.0,
+        "the route starts ahead of the nose: first {:.0}",
+        first_brg(&new)
+    );
+}
+
+/// A block for the facing rule (#288), metres east and north of a datum:
+/// taxiway D runs east-west, nodes 1 (-200, 0), 2 (0, 0), 3 (300, 0) and
+/// 4 (600, 0); with `loop_ahead`, a link L1 north from node 2 to 5
+/// (0, 100), a parallel P east to 6 (600, 100) and a link L2 down to node
+/// 4: round the block from 2 to 4, 400 m longer than D direct.
+fn facing_block(loop_ahead: bool) -> (TaxiNet, impl Fn(f64, f64) -> (f64, f64)) {
+    let (lat0, lon0) = (36.0, -4.0);
+    let at = move |x: f64, y: f64| {
+        (lat0 + y / 111_320.0, lon0 + x / (111_320.0 * lat0.to_radians().cos()))
+    };
+    let mut net = TaxiNet::default();
+    let mut pts = vec![(1, -200.0, 0.0), (2, 0.0, 0.0), (3, 300.0, 0.0), (4, 600.0, 0.0)];
+    let mut legs = vec![(1, 2, "D"), (2, 3, "D"), (3, 4, "D")];
+    if loop_ahead {
+        pts.extend([(5, 0.0, 100.0), (6, 600.0, 100.0)]);
+        legs.extend([(2, 5, "L1"), (5, 6, "P"), (6, 4, "L2")]);
+    }
+    for (id, x, y) in pts {
+        net.nodes.insert(id, at(x, y));
+    }
+    for (a, b, name) in legs {
+        net.edges.push(TaxiEdge {
+            a,
+            b,
+            name: name.into(),
+            runway: false,
+            oneway: false,
+            zone_of: Vec::new(),
+        });
+    }
+    (net, at)
+}
+
+/// The first bearing a route asks for, past its first 10 m from `here`.
+fn first_bearing(plan: &TaxiRoutePlan, here: (f64, f64)) -> f64 {
+    let to = plan
+        .path
+        .iter()
+        .find(|q| haversine_nm(here.0, here.1, q.0, q.1) * 1852.0 > 10.0)
+        .expect("a route away from here");
+    bearing_deg(here.0, here.1, to.0, to.1)
+}
+
+/// LEMG 2026-10-14 (#288) in miniature: on D between nodes 2 and 3 facing
+/// west, bound for node 4 east of us. From the position alone the route
+/// runs back past the tail; from where the nose points, round the block
+/// ahead.
+#[test]
+fn a_route_starts_ahead_of_the_nose_when_a_way_round_exists() {
+    let (net, at) = facing_block(true);
+    let here = at(100.0, 0.0);
+    let goal = at(600.0, 0.0);
+    let plain = net.plan(here.0, here.1, goal.0, goal.1, 0.0, &[]).expect("a route");
+    assert_eq!(plain.via, vec!["D".to_string()], "the position-only route: D, back past the tail");
+    assert!(sim::angles::abs_diff_deg(first_bearing(&plain, here), 270.0) > FACING_REVERSAL_DEG);
+    let ahead = net
+        .plan_facing(here.0, here.1, goal.0, goal.1, 0.0, &[], Some(270.0))
+        .expect("a route");
+    assert_eq!(ahead.via, vec!["L1", "P", "L2"], "round the block: {:?}", ahead.via);
+    assert!(
+        sim::angles::abs_diff_deg(first_bearing(&ahead, here), 270.0) < 45.0,
+        "starts ahead of the nose: {:.0}",
+        first_bearing(&ahead, here)
+    );
+    assert_eq!(ahead.path[0], here, "and starts at the aircraft");
+}
+
+/// Facing the destination, the direct route is already ahead: nothing changes.
+#[test]
+fn a_route_facing_its_destination_is_the_direct_one() {
+    let (net, at) = facing_block(true);
+    let here = at(100.0, 0.0);
+    let goal = at(600.0, 0.0);
+    let plan = net
+        .plan_facing(here.0, here.1, goal.0, goal.1, 0.0, &[], Some(90.0))
+        .expect("a route");
+    assert_eq!(plan.via, vec!["D".to_string()]);
+    assert!(sim::angles::abs_diff_deg(first_bearing(&plan, here), 90.0) < 45.0);
+}
+
+/// No way round: the reversal is still the route, back down the taxiway the
+/// position alone plans (the drive's join turn, or its refusal, is the
+/// fallback). No heading, or parked on a stand (the tug turns the nose),
+/// plans exactly as before.
+#[test]
+fn with_no_way_ahead_the_reversal_stands() {
+    let (net, at) = facing_block(false);
+    let here = at(100.0, 0.0);
+    let goal = at(600.0, 0.0);
+    let plain = net.plan(here.0, here.1, goal.0, goal.1, 0.0, &[]).expect("a route");
+    let facing = net
+        .plan_facing(here.0, here.1, goal.0, goal.1, 0.0, &[], Some(270.0))
+        .expect("the reversal, not a refusal");
+    assert_eq!(facing.via, plain.via);
+    assert_eq!(facing.path.last(), plain.path.last());
+    assert!(
+        sim::angles::abs_diff_deg(first_bearing(&facing, here), first_bearing(&plain, here)) < 1.0,
+        "the same way back down D"
+    );
+
+    let (mut net, at) = facing_block(true);
+    let plain = net.plan(here.0, here.1, goal.0, goal.1, 0.0, &[]).expect("a route");
+    let unread = net.plan_facing(here.0, here.1, goal.0, goal.1, 0.0, &[], None).expect("a route");
+    assert_eq!(unread.path, plain.path, "no heading: the position alone");
+    let (slat, slon) = at(100.0, 10.0);
+    net.stands.push(Stand {
+        lat: slat,
+        lon: slon,
+        heading: 270.0,
+        name: "Stand 1".into(),
+        kind: "gate".into(),
+        accepts: Vec::new(),
+        width: None,
+    });
+    let parked = net
+        .plan_facing(here.0, here.1, goal.0, goal.1, 0.0, &[], Some(275.0))
+        .expect("a route");
+    assert_eq!(parked.path, plain.path, "on a stand the push turns us");
+}

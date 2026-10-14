@@ -307,6 +307,10 @@ struct CallScratch {
     /// true, read off its stand's lane and its route on (`ctx_for_call`,
     /// [`push_facing_deg`]); `None` with no lane drawn.
     push_facing: Option<f64>,
+    /// Our own `acf_m_max`, kg, read by `build_ctx` for a ground call of
+    /// ours: whether its departure route must start ahead of the nose
+    /// ([`facing_for_route`]). `None` unread, or a traffic call.
+    own_mtow_kg: Option<f64>,
 }
 
 impl StripDesk {

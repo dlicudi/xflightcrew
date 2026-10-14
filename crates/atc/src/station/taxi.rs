@@ -355,8 +355,39 @@ pub(super) fn plan_taxi_route_to(
     ident: &str,
     lat: f64,
     lon: f64,
+    psi_true: Option<f64>,
 ) -> Option<nav::TaxiRoutePlan> {
     let net = TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let instrument = |r: &nav::Runway| {
+        ILS_FACTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|f| {
+                f.ils
+                    .iter()
+                    .any(|i| i.runway == r.ident_a || i.runway == r.ident_b)
+            })
+    };
+    taxi_route_on(&net, runways, ident, lat, lon, psi_true, instrument)
+}
+
+/// [`plan_taxi_route_to`] on a given network, so the real apt.dat can test
+/// it. `psi_true` is the nose of an aircraft that cannot turn on the spot
+/// (see [`facing_for_route`]): the route starts ahead of it when one does
+/// ([`nav::FACING_REVERSAL_DEG`], LEMG 2026-10-14, #288), unless the way
+/// ahead buys itself onto the departure runway the plain route stays off
+/// (a route ahead never taxis along the runway it is cleared to hold short
+/// of). `None` plans from the position alone, as before.
+pub(super) fn taxi_route_on(
+    net: &nav::TaxiNet,
+    runways: &[nav::Runway],
+    ident: &str,
+    lat: f64,
+    lon: f64,
+    psi_true: Option<f64>,
+    instrument: impl Fn(&nav::Runway) -> bool,
+) -> Option<nav::TaxiRoutePlan> {
     let r = strip(runways, ident)?;
     let (tlat, tlon) = if r.ident_a == ident {
         (r.lat_a, r.lon_a)
@@ -371,25 +402,71 @@ pub(super) fn plan_taxi_route_to(
     // = instrument holds; otherwise width-scaled, floored at the default.
     // ILS facts still loading falls back to the GA figure — early over
     // absent.
-    let instrument = ILS_FACTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|f| {
-            f.ils
-                .iter()
-                .any(|i| i.runway == r.ident_a || i.runway == r.ident_b)
-        });
-    let standoff = if instrument {
+    let standoff = if instrument(r) {
         100.0
     } else {
         (r.width_m / 2.0 + 30.0).max(nav::HOLD_SHORT_STANDOFF_M)
     };
     let zone = [r.ident_a.clone(), r.ident_b.clone()];
-    let mut plan = net.plan_to_runway(lat, lon, tlat, tlon, standoff, &zone, Some(r))?;
-    mark_runway_crossings(&mut plan, runways);
-    Some(plan)
+    let plain = || {
+        let mut plan = net.plan_to_runway(lat, lon, tlat, tlon, standoff, &zone, Some(r))?;
+        mark_runway_crossings(&mut plan, runways);
+        Some(plan)
+    };
+    let Some(psi) = psi_true.filter(|p| p.is_finite()) else {
+        return plain();
+    };
+    let ahead = net
+        .plan_to_runway_facing(lat, lon, tlat, tlon, standoff, &zone, Some(r), Some(psi))
+        .map(|mut p| {
+            mark_runway_crossings(&mut p, runways);
+            p
+        });
+    let Some(ahead) = ahead else {
+        return plain();
+    };
+    let plain = plain();
+    let own = format!("{}/{}", r.ident_a, r.ident_b);
+    let crosses_own = |p: &nav::TaxiRoutePlan| p.crossings.contains(&own);
+    if crosses_own(&ahead) && !plain.as_ref().is_some_and(crosses_own) {
+        return plain;
+    }
+    if let Some(p) = plain.as_ref().filter(|p| p.via != ahead.via) {
+        sim::blackbox::record(
+            "atc",
+            serde_json::json!({
+                "event": "taxi_route_ahead", "runway": ident, "psi": psi,
+                "via": ahead.via, "crossings": ahead.crossings,
+                "reversal_via": p.via,
+            }),
+        );
+    }
+    Some(ahead)
 }
+
+/// The heading a departure's taxi route is planned to, or `None` to plan
+/// from the position alone: OUR aircraft only (a traffic desk's routes are
+/// the traffic crate's), never a helicopter (it air-taxis), never a light
+/// one (`acf_m_max` at or under [`LIGHT_PIVOT_KG`]: it pivots on its brakes,
+/// the drive's own join turn). An unread mass is a heavy one, as the
+/// drive's `join_turn_applies` reads it. Pure.
+pub(super) fn facing_for_route(
+    traffic: bool,
+    state: &AircraftState,
+    mtow_kg: Option<f64>,
+) -> Option<f64> {
+    if traffic || state.helicopter {
+        return None;
+    }
+    if mtow_kg.is_some_and(|m| m.is_finite() && m > 0.0 && m <= LIGHT_PIVOT_KG) {
+        return None;
+    }
+    state.psi_deg.filter(|p| p.is_finite())
+}
+
+/// ICAO's light class (5,700 kg maximum takeoff mass): the crew's
+/// `JOIN_TURN_LIGHT_KG` and `pushback::LIGHT_MTOW_KG`.
+pub(super) const LIGHT_PIVOT_KG: f64 = 5_700.0;
 
 /// Name the crossings the planner couldn't — geometry is the authority,
 /// never the network flags, because apt.dat authors get crossings wrong two

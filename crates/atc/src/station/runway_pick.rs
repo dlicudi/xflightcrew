@@ -127,7 +127,13 @@ impl Station {
     /// ctx names THAT runway and, on the ground, the taxi route is re-planned
     /// to it from `pos` (as `RequestTaxi` plans one to the runway in use);
     /// refused, the ctx carries the reason. Pure but for the route planner.
-    pub(super) fn apply_runway_request(&mut self, ctx: &mut tower::Ctx, pos: Option<(f64, f64)>) {
+    /// `facing`: the nose the route starts ahead of (`facing_for_route`).
+    pub(super) fn apply_runway_request(
+        &mut self,
+        ctx: &mut tower::Ctx,
+        pos: Option<(f64, f64)>,
+        facing: Option<f64>,
+    ) {
         match resolve_runway_request(&self.apt.runways, self.desk.call.runway_request.as_deref()) {
             Err(refusal) => {
                 self.desk.call.requested_ident = None;
@@ -138,7 +144,7 @@ impl Station {
                 ctx.runway_refusal = None;
                 if ctx.on_ground {
                     self.desk.planned_route = pos.and_then(|(lat, lon)| {
-                        plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
+                        plan_taxi_route_to(&self.apt.runways, &ident, lat, lon, facing)
                     });
                     let route = self.desk.planned_route.as_ref();
                     ctx.holding_point = route
