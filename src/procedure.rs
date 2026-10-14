@@ -542,6 +542,8 @@ mod tests;
 #[cfg(test)]
 mod departure_minimum_tests;
 
-/// #199: the arrival hands autoland its clean approach speed.
+/// #199: the arrival hands autoland its clean approach speed; an
+/// approach crosses its FAF at the speed its final absorbs (EGKK 26L,
+/// 2026-10-14).
 #[cfg(test)]
 mod arrival_handoff_tests;

@@ -162,6 +162,50 @@ pub fn on_path_max_kts(m: &EnergyModel, vapp_kts: f64, s_nm: f64) -> f64 {
     v
 }
 
+/// The distance flown LEVEL at idle slowing from `from_kts` to `to_kts`, nm,
+/// the configuration each speed allows out on the way (as
+/// [`predicted_gate_kts`] flies its level part). Zero when already there.
+/// Pure.
+pub fn level_slow_nm(m: &EnergyModel, from_kts: f64, to_kts: f64) -> f64 {
+    let mut v = from_kts;
+    let mut s = 0.0;
+    while v > to_kts {
+        // The model's every detent slows level (`from_detents` keeps only
+        // positive figures), so this always ends.
+        let a = m.level_decel(m.flap_for(v)).max(NO_DECEL_KTS_S);
+        v -= a * 3600.0 * STEP_NM / v;
+        s += STEP_NM;
+    }
+    s
+}
+
+/// The steepest descent idle holds `kts` on, ft per nm: the path whose
+/// gravity gives back exactly the level idle deceleration of the
+/// configuration that speed allows (steeper, idle gains speed). Pure.
+pub fn idle_descent_ft_per_nm(m: &EnergyModel, kts: f64) -> f64 {
+    let sin = (m.level_decel(m.flap_for(kts)) / G_KTS_PER_S).clamp(0.0, 0.5);
+    6076.12 * sin.asin().tan()
+}
+
+/// The speed the final's stabilised gate judges against: the approach
+/// speed with the landing flap out, under its placard and over its floor.
+/// Autoland's plan and the arrival's slow-down to the FAF read this one
+/// figure.
+pub fn gate_kts(approach_ias: f64) -> f64 {
+    crate::autoland::approach_target_kts(
+        approach_ias,
+        1.0,
+        &crate::aircraft::flap_limits(),
+        crate::aircraft::config_floor_kts(1.0),
+    )
+}
+
+/// The plan's configuration goes out with the gear from this flap on: its
+/// deceleration was fitted with the gear down from half flap.
+pub fn gear_with_flap(flap: f64) -> bool {
+    flap >= 0.5 - 1e-6
+}
+
 /// The configuration for the join goes out this long before it (a crew
 /// configures before the path, never on it).
 pub const CONFIGURE_AHEAD_S: f64 = 30.0;

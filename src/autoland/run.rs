@@ -174,12 +174,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let energy_model = crate::aircraft::live_profile()
                 .and_then(|p| crate::approach_energy::EnergyModel::from_profile(&p, gp_deg));
             // What the gate judges the speed against (the stable sample's).
-            let energy_vapp = approach_target_kts(
-                approach_ias,
-                1.0,
-                &crate::aircraft::flap_limits(),
-                crate::aircraft::config_floor_kts(1.0),
-            );
+            let energy_vapp = crate::approach_energy::gate_kts(approach_ias);
             // A planned final never accelerates: the speed it asked for is a
             // ceiling for the rest of it (the curve is a MAXIMUM, and a
             // governor handed a maximum flies it as a target).
@@ -3433,7 +3428,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 let plan_flap = energy.and_then(|(a, ..)| a.flap);
                 if !gear_down
                     && !outbound
-                    && (g.dist_nm < 6.0 || plan_flap.is_some_and(|f| f >= 0.5 - 1e-6))
+                    && (g.dist_nm < 6.0 || plan_flap.is_some_and(crate::approach_energy::gear_with_flap))
                     && gear_may_extend(ias, crate::aircraft::gear_limit_kts())
                 {
                     let _ = crate::tools::gear::set_handle(&xp, false).await;
