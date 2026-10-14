@@ -644,6 +644,14 @@ impl TrafficAircraft {
             }
             Phase::HoldShort => {
                 self.hold_still(dt);
+                // Held IS an answer: the retry counts from the release, never
+                // across the hold. LEMG 2026-10-14 (#286): EZY2264, held 117 s
+                // for a lander, saw the hold lift a tick before its takeoff
+                // clearance, "90 s unanswered", and called ready again 16 s
+                // after reading back cleared for takeoff.
+                if o.hold {
+                    self.radio.called_at_s = self.phase_s;
+                }
                 let unanswered = o.state == TowerState::TaxiCleared && !o.line_up_behind;
                 if unanswered && self.phase_s - self.radio.called_at_s >= READY_RETRY_S {
                     self.radio.called = false;
