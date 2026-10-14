@@ -622,6 +622,10 @@ physical drive.
 - **In the air the AP is never simply turned off** (`hand_back`). The start reads every throttle
   back at FLY and locks the tail wheel first. Airborne requests take over below
   `TAKEOVER_MAX_MPS` and `DEPART_MAX_FT`.
+- **A hover lost up high is flown out, never handed back** (#282, `hover::at_height`, `let_go`):
+  above `SET_DOWN_MAX_FT` no stop, set-down or hover-mode hand-back; into the wind
+  (`fly_out_vector`) to the cruise modes' airspeed (`FlyOut`), handed to them WATCHED
+  (`CruiseWatch`: sink, height, AP) and taken back if not held.
 - **The final is capped by what the hover mode can hold**; **a transit field's challenge is
   answered with a transit request** (`heli_route` `zone_challenge`).
 - **Circuit** (`src/heli_circuit.rs`) and **Route** (`src/heli_route.rs`: the whole flight, as

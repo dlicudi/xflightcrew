@@ -1245,13 +1245,17 @@ pub fn request(base_url: String, voice: Option<Voice>, collective: String, g: Go
 /// hand-back that followed left an unstabilised S-76 at 15 ft with nobody
 /// able to hold it (EDDV, 2026-09-23). Low down the answer to a drift is the
 /// ground, with the autopilot still on the cyclic; the pilot gets it only
-/// when even the set-down is not flying.
+/// when even the set-down is not flying. High up there is no ground to
+/// answer with: [`Drift::FlyOut`] ([`at_height`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Drift {
     Fine,
     Stop,
     SetDown,
     HandBack,
+    /// Out of it into forward flight, through translational lift
+    /// ([`fly_out_vector`]), the height held.
+    FlyOut,
 }
 
 /// `err_mps`: how far the groundspeed is from the one commanded (the plain
@@ -1304,6 +1308,149 @@ pub fn settled(action: Drift, since_s: f64) -> Drift {
         Drift::Fine
     } else {
         action
+    }
+}
+
+/// A set-down, a stop into a hover and a hand-back are low-level answers:
+/// above this the ground is no answer and a hover out of the cushion in
+/// wind is what failed. The route handed its final over at 420 ft downwind,
+/// the hover mode let go, the loop stopped to a hover at 394 ft, then "set
+/// it down" drifting at 10 m/s, and handed an unstable hover to the hover
+/// mode with the lever 0.06 under the hover: 1,825 fpm down at 181 ft
+/// (LXGB, 2026-10-14, #282).
+pub const SET_DOWN_MAX_FT: f64 = MAX_HOVER_FT;
+
+/// `action` at `h_ft`: high up, every low-level answer is a fly-out. Pure.
+pub fn at_height(action: Drift, h_ft: f64) -> Drift {
+    match action {
+        Drift::Stop | Drift::SetDown | Drift::HandBack if h_ft > SET_DOWN_MAX_FT => Drift::FlyOut,
+        a => a,
+    }
+}
+
+/// What the loop does when the hover itself is lost (an attitude past the
+/// limits, the autopilot out of its mode). Low, the old hand-back. High, the
+/// hover is never given to the hover mode and the pilot: it is flown out,
+/// and once flying out, handed to the cruise modes WATCHED.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LetGo {
+    HandBack,
+    FlyOut,
+    CruiseWatched,
+}
+
+/// Pure.
+pub fn let_go(h_ft: f64, flying_out: bool) -> LetGo {
+    if h_ft <= SET_DOWN_MAX_FT {
+        LetGo::HandBack
+    } else if flying_out {
+        LetGo::CruiseWatched
+    } else {
+        LetGo::FlyOut
+    }
+}
+
+/// The airspeed a fly-out is after: inside the 47 kt the hover mode let go
+/// at (EDDV, 2026-09-23), past the cruise modes' side of the hand-over.
+const FLY_OUT_AIR_MPS: f64 = 23.0;
+/// Wind under this is no reason to turn: the drift is accepted.
+const FLY_OUT_WIND_MPS: f64 = 3.0;
+
+/// The fly-out's (groundspeed, true track). Into a wind worth turning for,
+/// where every metre a second of it is airspeed the hover mode never has to
+/// make good over the ground; in calm along the drift, with no turn. The
+/// groundspeed is the hover mode's range, so a strong headwind is a slow
+/// climb out, never a stop. `wind`: (from, true degrees; m/s); `None` is a
+/// failed read, flown as calm. Pure.
+pub fn fly_out_vector(drift_track_deg: f64, wind: Option<(f64, f64)>) -> (f64, f64) {
+    let (track, head) = match wind {
+        Some((from, mps)) if mps >= FLY_OUT_WIND_MPS => (from.rem_euclid(360.0), mps),
+        _ => (drift_track_deg.rem_euclid(360.0), 0.0),
+    };
+    (
+        (FLY_OUT_AIR_MPS - head).clamp(DEPART_CLIMB_MPS, DEPART_MAX_MPS),
+        track,
+    )
+}
+
+/// The fly-out hands the cruise modes an aircraft FLYING: this airspeed (the
+/// route's own hand-over between the two), held without a sink this long.
+const FLY_OUT_HANDOVER_KTS: f64 = crate::heli_route::HANDOVER_KTS;
+const FLY_OUT_STEADY_S: f64 = 3.0;
+const FLY_OUT_MAX_SINK_FPM: f64 = 300.0;
+
+/// The fly-out's own clock: true once it has flown steady at the hand-over
+/// airspeed for [`FLY_OUT_STEADY_S`]. A failed airspeed read is no
+/// measurement and resets nothing. Pure.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlyOut {
+    steady_s: f64,
+}
+
+impl FlyOut {
+    pub fn step(&mut self, ias_kts: Option<f64>, vs_fpm: f64, dt_s: f64) -> bool {
+        match ias_kts {
+            Some(ias) if ias >= FLY_OUT_HANDOVER_KTS && vs_fpm > -FLY_OUT_MAX_SINK_FPM => {
+                self.steady_s += dt_s.clamp(0.0, 1.0);
+            }
+            Some(_) => self.steady_s = 0.0,
+            None => {}
+        }
+        self.steady_s >= FLY_OUT_STEADY_S
+    }
+}
+
+/// A cruise hand-back from a fly-out is the autopilot's only once WATCHED
+/// holding: this long, never this far below the height it was given, never
+/// sinking this fast for [`WATCH_SINK_S`]. Nobody watched the last one.
+const WATCH_S: f64 = 15.0;
+const WATCH_LOSS_FT: f64 = 100.0;
+const WATCH_SINK_FPM: f64 = 500.0;
+const WATCH_SINK_S: f64 = 2.0;
+/// A cruise hand-back not held is taken back and flown out again this many
+/// times; after that the loop keeps flying it and asks the pilot to take it.
+pub const MAX_TAKEBACKS: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Watch {
+    Watching,
+    Held,
+    NotHeld,
+}
+
+/// The watch on a cruise hand-back. Pure.
+#[derive(Debug, Clone, Copy)]
+pub struct CruiseWatch {
+    h0_ft: f64,
+    elapsed_s: f64,
+    sink_s: f64,
+}
+
+impl CruiseWatch {
+    pub fn new(h0_ft: f64) -> Self {
+        Self {
+            h0_ft,
+            elapsed_s: 0.0,
+            sink_s: 0.0,
+        }
+    }
+
+    /// `ap_on`: the autopilot reads engaged (off is not holding).
+    pub fn step(&mut self, h_ft: f64, vs_fpm: f64, ap_on: bool, dt_s: f64) -> Watch {
+        let dt = dt_s.clamp(0.0, 1.0);
+        self.elapsed_s += dt;
+        if vs_fpm < -WATCH_SINK_FPM {
+            self.sink_s += dt;
+        } else {
+            self.sink_s = 0.0;
+        }
+        if !ap_on || self.h0_ft - h_ft > WATCH_LOSS_FT || self.sink_s >= WATCH_SINK_S {
+            Watch::NotHeld
+        } else if self.elapsed_s >= WATCH_S {
+            Watch::Held
+        } else {
+            Watch::Watching
+        }
     }
 }
 
@@ -1367,6 +1514,64 @@ async fn hand_back(
         format!("{why} Your controls.")
     };
     say(voice, Priority::Warning, line);
+}
+
+/// Out of a hover that cannot be held up high (#282): the goal becomes a
+/// departure along [`fly_out_vector`] at the height of the moment, the
+/// autopilot on (the recapture puts the hover mode back). Returns the goal.
+async fn fly_out_goal(
+    xp: &XPlaneClient,
+    voice: &Option<Voice>,
+    why: &str,
+    h_ft: f64,
+    v: Option<[f64; 2]>,
+    psi: Option<f64>,
+) -> Goal {
+    let (wdir, wspd) = tokio::join!(
+        xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE),
+        xp.get_float(crate::datarefs::WIND_SPEED_MSC),
+    );
+    let wind = match (wdir, wspd) {
+        (Ok(d), Ok(w)) => Some((d, w)),
+        _ => None,
+    };
+    let drift_track = match v {
+        Some([x, z]) if x.hypot(z) > 1.0 => x.atan2(-z).to_degrees().rem_euclid(360.0),
+        _ => psi.unwrap_or(0.0),
+    };
+    let (speed_mps, track_deg) = fly_out_vector(drift_track, wind);
+    let g = Goal::Depart {
+        height_ft: h_ft.round(),
+        speed_mps,
+        track_deg,
+    };
+    *lock_goal() = Some(g);
+    set_motion(Motion::default());
+    if xp.get_float(AP_ON).await.is_ok_and(|a| a < 0.5) {
+        let _ = autoflight::press(xp, Button::Engage).await;
+    }
+    crate::blackbox::record(
+        "hover",
+        serde_json::json!({ "event": "fly_out", "why": why, "h_ft": h_ft, "v": v, "wind": wind, "drift_track": drift_track, "speed": speed_mps, "track": track_deg }),
+    );
+    say(
+        voice,
+        Priority::Warning,
+        format!(
+            "{why} Flying out of it, {:.0} knots at {:.0} feet.",
+            speed_mps * 1.94384,
+            h_ft.round()
+        ),
+    );
+    g
+}
+
+/// The fly-out's hand-over: the lever at the law's trim for the speed
+/// flown (a cruise power), the autopilot in its cruise modes. True when both
+/// modes read engaged; the watch decides whether they HOLD.
+async fn cruise_hand_over(xp: &XPlaneClient, collective: &str, trim: f64) -> bool {
+    let _ = xp.set_float_index(collective, 0, trim).await;
+    cruise_modes(xp).await
 }
 
 /// The autopilot on and in its hover mode, asked for zero groundspeed. True
@@ -1555,6 +1760,14 @@ async fn fly(
     // takeover in the air is already holding its height, and the droop guard
     // judges what it really has.
     let lifted_here = !law.airborne();
+    // A hover lost up high is flown out (#282): the fly-out's clock, the
+    // watch on its cruise hand-back, and how often the hand-back was taken
+    // back.
+    let mut flying_out = false;
+    let mut fly_out = FlyOut::default();
+    let mut watch: Option<(CruiseWatch, Goal)> = None;
+    let mut takebacks: u32 = 0;
+    let mut kept_said = false;
     while run.live() {
         tokio::time::sleep(TICK).await;
         if crate::xplane::sim_frozen(&xp).await {
@@ -1635,7 +1848,7 @@ async fn fly(
                 );
             }
         }
-        let (agl, vs, gnd, gs, th, ph, ap, hs, hv) = tokio::join!(
+        let (agl, vs, gnd, gs, th, ph, ap, hs, hv, ias) = tokio::join!(
             xp.get_float(Y_AGL),
             xp.get_float(VS_FPM),
             xp.get_float(ON_GROUND_ANY),
@@ -1645,8 +1858,17 @@ async fn fly(
             xp.get_float(AP_ON),
             xp.get_float(HOVER_STATUS),
             autoflight::read_dial_array(&xp, Dial::HoverVector),
+            xp.get_float(crate::datarefs::AIRSPEED_KTS),
         );
-        let (gs, th, ph, ap, hs, hv) = (gs.ok(), th.ok(), ph.ok(), ap.ok(), hs.ok(), hv.ok());
+        let (gs, th, ph, ap, hs, hv, ias) = (
+            gs.ok(),
+            th.ok(),
+            ph.ok(),
+            ap.ok(),
+            hs.ok(),
+            hv.ok(),
+            ias.ok(),
+        );
         // A failed read is no measurement: skip the tick, never guess.
         let (Ok(agl), Ok(vs), Ok(gnd)) = (agl, vs, gnd) else {
             continue;
@@ -1663,22 +1885,157 @@ async fn fly(
             (Ok(x), Ok(z)) => Some(x.hypot(*z)),
             _ => None,
         };
-        if ap.is_some_and(|v| v < 0.5) {
-            hand_back(
-                &xp,
-                &voice,
-                "The autopilot dropped out of the hover.",
-                steady,
-                speed_h,
-            )
-            .await;
-            return;
+        let v_now = match (&vx, &vz) {
+            (Ok(x), Ok(z)) => Some([*x, *z]),
+            _ => None,
+        };
+        // A cruise hand-back from a fly-out is watched: the loop touches
+        // nothing while the autopilot flies, and takes it back if it does not
+        // hold (or the pilot asked the loop for something else).
+        if let Some((w, given)) = watch.as_mut() {
+            let verdict = if g == *given {
+                w.step(h_ft, vs, ap.is_some_and(|a| a > 0.5), dt)
+            } else {
+                Watch::NotHeld
+            };
+            match verdict {
+                Watch::Watching => continue,
+                Watch::Held => {
+                    crate::blackbox::record(
+                        "hover",
+                        serde_json::json!({ "event": "hand_back", "why": "fly_out", "watched": true, "h_ft": h_ft, "vs": vs, "ias": ias, "speed": speed_h, "cruise_modes": true, "hover_mode": false }),
+                    );
+                    say(
+                        &voice,
+                        Priority::Warning,
+                        format!(
+                            "Autopilot's holding heading and altitude, {:.0} feet. Your controls.",
+                            h_ft.round()
+                        ),
+                    );
+                    return;
+                }
+                Watch::NotHeld => {
+                    let pilot_goal = g != *given;
+                    watch = None;
+                    if !pilot_goal {
+                        takebacks += 1;
+                    }
+                    crate::blackbox::record(
+                        "hover",
+                        serde_json::json!({ "event": "fly_out_takeback", "h_ft": h_ft, "vs": vs, "ias": ias, "ap": ap, "takebacks": takebacks, "pilot_goal": pilot_goal }),
+                    );
+                    if !pilot_goal {
+                        say(
+                            &voice,
+                            Priority::Warning,
+                            format!(
+                                "The autopilot's not holding it, {:.0} feet a minute. I have it.",
+                                vs.abs().round()
+                            ),
+                        );
+                    }
+                    // Taken back as a takeover in the air: the autopilot on,
+                    // the hover mode recaptured on the velocity of the moment,
+                    // the lever's trim the power curve's for that speed.
+                    let _ = autoflight::press(&xp, Button::Engage).await;
+                    last_recapture = None;
+                    if let Some(v) = v_now {
+                        ramp.set(v);
+                        law.trim = level_collective_at(v[0].hypot(v[1]), feed.loading.now());
+                    }
+                    speed_now = None;
+                    track_now = None;
+                    fly_out = FlyOut::default();
+                    continue;
+                }
+            }
         }
-        if th.is_some_and(|t| t.abs() > MAX_ATTITUDE_DEG)
+        // The hover itself lost: low, handed back as it always was; high,
+        // flown out, and once flying out, handed to the cruise modes watched.
+        let lost = if ap.is_some_and(|v| v < 0.5) {
+            Some("The autopilot dropped out of the hover.")
+        } else if th.is_some_and(|t| t.abs() > MAX_ATTITUDE_DEG)
             || ph.is_some_and(|p| p.abs() > MAX_ATTITUDE_DEG)
         {
-            hand_back(&xp, &voice, "The hover's gone unstable.", steady, speed_h).await;
-            return;
+            Some("The hover's gone unstable.")
+        } else {
+            None
+        };
+        let hand_over_due = flying_out && fly_out.step(ias, vs, dt);
+        let let_go_now = match lost {
+            Some(_) => Some(let_go(h_ft, flying_out)),
+            None if hand_over_due => Some(LetGo::CruiseWatched),
+            None => None,
+        };
+        match let_go_now {
+            None => {}
+            Some(LetGo::HandBack) => {
+                hand_back(&xp, &voice, lost.unwrap_or_default(), steady, speed_h).await;
+                return;
+            }
+            Some(LetGo::FlyOut) => {
+                fly_out_goal(
+                    &xp,
+                    &voice,
+                    lost.unwrap_or_default(),
+                    h_ft,
+                    v_now,
+                    psi.as_ref().ok().copied(),
+                )
+                .await;
+                flying_out = true;
+                fly_out = FlyOut::default();
+                announced_depart = true;
+                last_recapture = None;
+                if let Some(v) = v_now {
+                    ramp.set(v);
+                }
+                speed_now = None;
+                track_now = None;
+                continue;
+            }
+            Some(LetGo::CruiseWatched) if takebacks > MAX_TAKEBACKS => {
+                // The autopilot has failed the watch already: the loop keeps
+                // flying the fly-out and the pilot is asked, once.
+                if ap.is_some_and(|v| v < 0.5) {
+                    let _ = autoflight::press(&xp, Button::Engage).await;
+                }
+                if !kept_said {
+                    kept_said = true;
+                    crate::blackbox::record(
+                        "hover",
+                        serde_json::json!({ "event": "fly_out_kept", "h_ft": h_ft, "ias": ias, "takebacks": takebacks }),
+                    );
+                    say(
+                        &voice,
+                        Priority::Warning,
+                        format!("The autopilot won't hold it in cruise. I'm flying it, {:.0} feet. Say my controls when you have it.", h_ft.round()),
+                    );
+                }
+            }
+            Some(LetGo::CruiseWatched) => {
+                let trim = law.steady();
+                let ok = cruise_hand_over(&xp, &collective, trim).await;
+                crate::blackbox::record(
+                    "hover",
+                    serde_json::json!({ "event": "fly_out_handover", "ok": ok, "why": lost, "h_ft": h_ft, "vs": vs, "ias": ias, "speed": speed_h, "collective": trim }),
+                );
+                if ok {
+                    watch = Some((CruiseWatch::new(h_ft), g));
+                    say(
+                        &voice,
+                        Priority::Readback,
+                        "Flying. Autopilot on heading and altitude, watching it.",
+                    );
+                } else {
+                    takebacks += 1;
+                    let _ = autoflight::press(&xp, Button::Engage).await;
+                    last_recapture = None;
+                    fly_out = FlyOut::default();
+                }
+                continue;
+            }
         }
         // The hover mode let go (something replaced it): engage it again, at
         // most every few seconds. Only when it reads NOT captured - the
@@ -1807,9 +2164,31 @@ async fn fly(
             goal_since = Instant::now();
         }
         let action = err.or(gs).map_or(Drift::Fine, |e| drift_action(g, e));
-        match settled(action, goal_since.elapsed().as_secs_f64()) {
+        match at_height(settled(action, goal_since.elapsed().as_secs_f64()), h_ft) {
             Drift::Fine => {}
+            // Already flying out: the fly-out is the answer, and it is not
+            // stopped into the hover it left.
+            Drift::FlyOut if flying_out => {}
+            Drift::FlyOut => {
+                let why = match action {
+                    Drift::SetDown => "We're drifting.",
+                    Drift::HandBack => "The hover mode let go of the speed.",
+                    _ => "Not holding the speed.",
+                };
+                fly_out_goal(&xp, &voice, why, h_ft, v_now, psi.as_ref().ok().copied()).await;
+                flying_out = true;
+                fly_out = FlyOut::default();
+                announced_depart = true;
+                last_recapture = None;
+                if let Some(v) = v_now {
+                    ramp.set(v);
+                }
+                speed_now = None;
+                track_now = None;
+                continue;
+            }
             Drift::Stop => {
+                flying_out = false;
                 let hold = h_ft.round().max(10.0);
                 *lock_goal() = Some(Goal::Hover { height_ft: hold });
                 set_motion(Motion::default());
@@ -1825,6 +2204,7 @@ async fn fly(
                 continue;
             }
             Drift::SetDown => {
+                flying_out = false;
                 *lock_goal() = Some(Goal::Land);
                 set_motion(Motion::default());
                 crate::blackbox::record(
@@ -3024,5 +3404,171 @@ mod tests {
             "the ridge set-down at 19 kt"
         );
         assert!(!super::touchdown_brake_due(f64::NAN));
+    }
+
+    /// LXGB 2026-10-14 (#282): handed the final at 420 ft downwind, the
+    /// loop stopped to a hover at 394 ft, "set it down" drifting at 10 m/s,
+    /// and handed the unstable hover to the hover mode at 425 ft. Up there
+    /// every one of those is a fly-out, and a hover lost during the fly-out
+    /// goes to the cruise modes WATCHED, never the hover mode and the pilot.
+    #[test]
+    fn a_hover_lost_high_is_flown_out_never_handed_back() {
+        let fly = Goal::Fly {
+            height_ft: 419.7,
+            speed_mps: 19.5,
+            track_deg: 268.0,
+        };
+        // The Fly goal 10.2 m/s off its command, settled: was Stop at 394 ft.
+        let stop = settled(drift_action(fly, 10.2), 9.0);
+        assert_eq!(stop, Drift::Stop);
+        assert_eq!(at_height(stop, 394.1), Drift::FlyOut);
+        // The hover at 394 ft drifting at 10 m/s: was SetDown.
+        let hover = Goal::Hover { height_ft: 394.0 };
+        assert_eq!(at_height(drift_action(hover, 10.06), 395.1), Drift::FlyOut);
+        // The "landing" at 398 ft with groundspeed rising 10 to 22 m/s.
+        for gs in [9.0, 10.9, 16.6, 22.3] {
+            let a = at_height(settled(drift_action(Goal::Land, gs), 1.0), 398.0);
+            assert_ne!(a, Drift::HandBack, "gs {gs}");
+            assert_ne!(a, Drift::SetDown, "gs {gs}");
+        }
+        assert_eq!(
+            at_height(drift_action(Goal::Land, 22.3), 398.0),
+            Drift::FlyOut
+        );
+        // "The hover's gone unstable" at 425 ft: flown out, then cruise watched.
+        assert_eq!(let_go(425.0, false), LetGo::FlyOut);
+        assert_eq!(let_go(425.0, true), LetGo::CruiseWatched);
+        for h in [51.0, 100.0, 394.0, 1000.0] {
+            for out in [false, true] {
+                assert_ne!(let_go(h, out), LetGo::HandBack, "{h} ft");
+            }
+        }
+        // Low down the ground is still the answer, as it was.
+        assert_eq!(at_height(drift_action(hover, 9.0), 20.0), Drift::SetDown);
+        assert_eq!(
+            at_height(drift_action(Goal::Land, 17.0), 15.0),
+            Drift::HandBack
+        );
+        assert_eq!(at_height(Drift::Stop, 30.0), Drift::Stop);
+        assert_eq!(let_go(15.0, false), LetGo::HandBack);
+        assert_eq!(at_height(Drift::Fine, 400.0), Drift::Fine);
+    }
+
+    /// The fly-out turns into a wind worth turning for (LXGB: 070 at 14 kt
+    /// behind a final flown west), accepts the drift in calm, and stays in
+    /// the hover mode's groundspeed range.
+    #[test]
+    fn a_fly_out_goes_into_the_wind_for_airspeed() {
+        let (speed, track) = fly_out_vector(267.0, Some((70.0, 7.2)));
+        assert_eq!(track, 70.0);
+        assert!((speed - (FLY_OUT_AIR_MPS - 7.2)).abs() < 1e-9);
+        // Airspeed through translational lift, under the 47 kt let-go.
+        let air_kts = (speed + 7.2) * 1.94384;
+        assert!(
+            air_kts > FLY_OUT_HANDOVER_KTS && air_kts < 47.0,
+            "{air_kts}"
+        );
+        // Calm, or a failed read: along the drift, as fast as the mode goes.
+        assert_eq!(
+            fly_out_vector(267.0, Some((70.0, 1.0))),
+            (DEPART_MAX_MPS, 267.0)
+        );
+        assert_eq!(fly_out_vector(-93.0, None), (DEPART_MAX_MPS, 267.0));
+        // A gale: slow over the ground, never a stop.
+        assert_eq!(fly_out_vector(0.0, Some((180.0, 25.0))).0, DEPART_CLIMB_MPS);
+    }
+
+    /// The fly-out hands over only FLYING: the recorded IAS of 5 kt, or a
+    /// sink, never; the hand-over airspeed held level for 3 s.
+    #[test]
+    fn a_fly_out_hands_over_only_at_flying_speed() {
+        let mut f = FlyOut::default();
+        for _ in 0..600 {
+            assert!(!f.step(Some(5.4), -50.0, 0.1), "IAS 5 kt at the hand-over");
+        }
+        let mut f = FlyOut::default();
+        for _ in 0..600 {
+            assert!(!f.step(Some(42.0), -1825.0, 0.1), "sinking");
+        }
+        let mut f = FlyOut::default();
+        let mut t = 0.0;
+        while !f.step(Some(41.0), -100.0, 0.1) {
+            t += 0.1;
+            assert!(t < 3.5);
+        }
+        assert!(t >= FLY_OUT_STEADY_S - 0.2);
+        // A failed read is no measurement: it neither counts nor resets.
+        let mut f = FlyOut::default();
+        for _ in 0..20 {
+            f.step(Some(41.0), 0.0, 0.1);
+        }
+        f.step(None, 0.0, 0.1);
+        assert!((0..10).any(|_| f.step(Some(41.0), 0.0, 0.1)));
+        // A dip under the airspeed starts the clock again.
+        let mut f = FlyOut::default();
+        for _ in 0..25 {
+            f.step(Some(41.0), 0.0, 0.1);
+        }
+        assert!(!f.step(Some(30.0), 0.0, 0.1));
+        assert!(!f.step(Some(41.0), 0.0, 0.1));
+    }
+
+    /// The hand-back that went unwatched (LXGB #282): from 425 ft the
+    /// autopilot let it sink 126, 496, 865, 1,149 fpm, 1.3 s apart. The
+    /// watch takes it back inside four seconds; a held cruise is handed over
+    /// after its 15; an autopilot off is not holding.
+    #[test]
+    fn a_cruise_hand_back_is_watched_and_taken_back() {
+        let mut w = CruiseWatch::new(425.1);
+        let rec = [
+            (425.1, -126.0),
+            (412.1, -495.6),
+            (390.3, -864.7),
+            (363.5, -1148.6),
+            (332.7, -1382.5),
+        ];
+        let mut t = 0.0;
+        let mut verdict = Watch::Watching;
+        'out: for pair in rec.windows(2) {
+            let ((h0, v0), (h1, v1)) = (pair[0], pair[1]);
+            for i in 0..13 {
+                let k = f64::from(i) / 13.0;
+                t += 0.1;
+                verdict = w.step(h0 + (h1 - h0) * k, v0 + (v1 - v0) * k, true, 0.1);
+                if verdict != Watch::Watching {
+                    break 'out;
+                }
+            }
+        }
+        assert_eq!(verdict, Watch::NotHeld);
+        assert!(t < 4.0, "taken back after {t:.1} s");
+        // Level and engaged: held.
+        let mut w = CruiseWatch::new(400.0);
+        let mut n = 0;
+        let held = loop {
+            n += 1;
+            match w.step(400.0 + (f64::from(n) * 0.3).sin() * 20.0, 150.0, true, 0.1) {
+                Watch::Watching => assert!(n < 200),
+                v => break v,
+            }
+        };
+        assert_eq!(held, Watch::Held);
+        assert!(f64::from(n) * 0.1 >= WATCH_S - 0.2);
+        // A slow sink that loses the height is not held either.
+        let mut w = CruiseWatch::new(400.0);
+        let mut h = 400.0;
+        let slow = loop {
+            h -= 450.0 / 600.0;
+            match w.step(h, -450.0, true, 0.1) {
+                Watch::Watching => {}
+                v => break v,
+            }
+        };
+        assert_eq!(slow, Watch::NotHeld);
+        // The autopilot off is nobody holding it.
+        assert_eq!(
+            CruiseWatch::new(400.0).step(400.0, 0.0, false, 0.1),
+            Watch::NotHeld
+        );
     }
 }
