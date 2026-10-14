@@ -2571,8 +2571,9 @@ impl TrafficWorld {
 
     /// Build the link for `icao` off the tick: the field (apt.dat, its
     /// taxi network and CIFP) and its schedule. The `station`'s field flies
-    /// the pilot's file or a generated hour where it has no timetable, on
-    /// the station's runway; any other field its timetable, on its own.
+    /// the pilot's file, else its timetable, on the station's runway; any
+    /// other field its timetable, on its own. A field with neither has no
+    /// traffic ([`build_link`]).
     fn build(
         &mut self,
         icao: &str,
@@ -2715,6 +2716,21 @@ fn build_link(
         day,
         ref runway,
     } = *ctx;
+    let table = traffic::routes::field_routes(icao);
+    // Traffic only where a route timetable (`crates/traffic/routes/`) or the
+    // pilot's own file defines it. The station's field used to fly a
+    // generated hour where it had neither, so every radar handoff en route
+    // brought up a field nobody flies to: LEMG to EGKK (2026-10-14) put up
+    // LEGR, LERL, LEMD (46 movements, 80 parked), LERJ, LEVT and LEBB, one
+    // per Departure or Control unit, for traffic the pilot never sees.
+    if file.is_empty() && table.is_none() {
+        tracing::info!(%icao, "traffic: no route timetable for the field; no traffic");
+        crate::blackbox::record(
+            "traffic",
+            serde_json::json!({ "event": "no_routes", "field": icao }),
+        );
+        return None;
+    }
     let field = match FieldModel::load(apt, icao) {
         Ok(Some(f)) => f.with_cifp(cifp),
         Ok(None) => {
@@ -2731,7 +2747,6 @@ fn build_link(
         ..SpawnCtx::default()
     };
     let mut board = None;
-    let table = traffic::routes::field_routes(icao);
     let (schedule, source) = if let (true, Some(table)) = (file.is_empty(), table) {
         let d = traffic::Density::parse(density).unwrap_or(traffic::Density::Normal);
         let (mut schedule, flights, local_s) =
@@ -2748,12 +2763,6 @@ fn build_link(
         schedule.extend(top);
         board = Some((flights, local_s));
         (schedule, "timetable")
-    } else if file.is_empty() {
-        let d = traffic::Density::parse(density).unwrap_or(traffic::Density::Normal);
-        let mut schedule = traffic::generate(&field, d, seed, &ctx);
-        let parked = traffic::park_at_start(&field, d, seed, &ctx, &mut schedule);
-        schedule.extend(parked);
-        (schedule, "generated")
     } else {
         let text = match std::fs::read_to_string(file) {
             Ok(t) => t,
@@ -2803,11 +2812,10 @@ fn build_link(
         n => n,
     };
     let mut link = Link::new(field, schedule, &name);
-    // A field with a route table flies its timetable's day whole; the rest
-    // generate an hour at a time.
-    // So does a timetable's top-up.
+    // A field with a route table flies its timetable's day whole; a
+    // timetable's top-up generates an hour at a time beside it.
     let tops_up = source == "timetable" && table.is_some_and(|t| t.top_up);
-    link.hours = (source == "generated" || tops_up).then_some(1);
+    link.hours = tops_up.then_some(1);
     if let Some((flights, local_s)) = board {
         link.set_board(flights, local_s);
     }
