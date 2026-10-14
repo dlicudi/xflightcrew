@@ -27,12 +27,32 @@ only when a required check is red, and `r` leaves it to boot
   flying; read `flight_state` / `sim::ground` and refuse airborne, said). Work
   out what an in-process re-boot must stand down and re-arm; if it is not
   sound, fall back to "quit and start xfc again" and say why in the report.
-- **ATC tab**: home field, region, ATIS frequency, plus a "cast at" box: type
+- **ATC tab**: home field, region, plus a "cast at" box: type
   any ICAO, see who speaks with what voice there (part 1's casting rows).
 - Search (`/`) across every setting by label and help; a filter for pinned.
 - `xfc setup` and `xfc home` stay as hidden aliases that open the Checks tab.
   `xfc run` stays headless, never a TUI; `--print` stays.
 - Rendering tests under `TestBackend` as `ui.rs` does today.
+
+## Found in part 1 (merged ac27b6f)
+
+- `atc_airport`'s check and `voice::cast::cast_now(Some(icao))` each scan the
+  ~400 MB apt.dat on the calling thread: the "cast at" box and the ATC tab need
+  a worker thread or a cache; the UI never blocks on it.
+- `voice::RUNNING` is a `OnceLock` set once at boot (`register_running`): an
+  in-process crew restart must be able to replace it.
+- Restart knobs read a prefs SNAPSHOT taken by `Config::from_env`
+  (`config::knob`, `reload_boot_knobs`); `knob_next` is what the next start
+  reads. A crew restart must take a fresh snapshot.
+- `.env` pins moved by `env_import` still pin until the process restarts
+  (dotenvy loaded them): a crew restart does not clear the process env, so say
+  "quit and start xfc" for those, or remove the moved vars from the process
+  env as part of the move. Decide and report.
+- `XCOPILOT_ATIS_FREQ` is env-only (only the standalone `atc` binary reads it):
+  the ATC tab does NOT offer an ATIS frequency.
+- Cheap live candidates (optional here, only if the restart path is not
+  sound): the radio loop's ATC voices and pool read `settings::live()` per
+  transmission; chime and tones; `say_*`.
 
 ## Out of scope
 
