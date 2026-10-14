@@ -387,6 +387,7 @@ pub(crate) fn spawn_voice_picker(
                             tracing::info!(model = %spec, "panel cabin voice pick");
                             voice.set_cabin_voice(spec.clone());
                             prefs::save_cabin_voice(&spec);
+                            settings::update(|c| c.cabin_piper_voice = spec.clone());
                             voice.say_cabin(
                                 voice::Priority::Advisory,
                                 "Flight deck, cabin crew. New voice, checked in.",
@@ -419,6 +420,8 @@ pub(crate) fn spawn_voice_picker(
             tracing::info!(model = %spec, "panel voice pick");
             voice.set_pilot_voice(spec.clone());
             prefs::save_pilot_voice(&spec);
+            // The registry's view follows (the Cast view, the settings screens).
+            settings::update(|c| c.piper_voice = spec.clone());
             pilot_spec = spec.clone();
             // Confirmed in the new voice itself: the swap applies before the
             // next intercom utterance, which is exactly this line.
