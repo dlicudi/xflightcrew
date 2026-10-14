@@ -12,11 +12,24 @@
 
 A release is one file, `xfc`, with the profiles, checklists, radio sounds
 and the X-Plane plugin built in. Copy it anywhere (for example
-`~/bin/xfc`), then:
+`~/bin/xfc`), then run it and follow the screen:
+
+```sh
+xfc
+```
+
+On the first run it opens the home screen: each setup check with a fix on
+enter (the X-Plane folder, the Web API, the plugin, the microphone and the
+starter voices), the voices, the settings and where the files live. Enter
+on a red line fixes it (installs the plugin, downloads the starter voices),
+and `r` starts the crew. Once every required check is green, plain `xfc`
+starts the crew straight away; `xfc home` (or `xfc setup`) opens the screen
+any time, `xfc run` never does, and `xfc home --print` prints the checks as
+text for a support request. The same steps by hand:
 
 ```sh
 xfc plugin install
-xfc voices install ggml-base.en en_US-amy-medium en_US-hfc_female-medium
+xfc voices install --starter
 xfc
 ```
 
@@ -73,13 +86,15 @@ instead. `xfc paths` prints which of the three it is and every location.
 checksum:
 
 ```sh
-xfc voices install ggml-base.en en_US-amy-medium en_US-hfc_female-medium
-xfc voices install en_GB-alba-medium en_US-ryan-high en_GB-northern_english_male-medium
+xfc voices install --starter
 xfc voices list --installed
 ```
 
-Those are the speech model and the default copilot, cabin, tower, approach
-and departure voices. Run `xfc voices` alone for the screen: browse and
+The starter set is the speech model and every voice the configuration
+names (copilot, cabin, tower, approach, departure and, when set, the ATIS);
+it prints its size first. The away fields' controllers draw from a larger
+pool of voices that are optional: only the installed ones are cast, so add
+more with `xfc voices` for more variety. Run `xfc voices` alone for the screen: browse and
 filter the catalogue, preview a voice, install or remove one, and pick the
 copilot's or the cabin crew's voice. `xfc voices list --filter en_GB`
 prints the catalogue; `xfc voices remove <key>` refuses a model that is in

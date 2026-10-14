@@ -309,6 +309,13 @@ fn run(args: &[String], config: &Config) -> Result<bool> {
     }
 }
 
+/// The voices screen on the calling thread (the home screen's Voices row):
+/// returns when it is quit. Blocking HTTP: never call it inside the runtime.
+pub fn open_screen(config: &Config) -> Result<()> {
+    screen::run(Store::load(config))?;
+    Ok(())
+}
+
 /// One list line, shared by the CLI and the screen.
 pub fn row_columns(r: &Row) -> [String; 5] {
     let e = &r.entry;
