@@ -608,7 +608,9 @@ pub fn plan_self_taxi_to_stand(
 /// The crew's own taxi at an uncontrolled field, planned from the field's
 /// taxi network and published like a controller's route
 /// ([`crate::station::plan_self_taxi`]). A full apt.dat pass: off the
-/// realtime loop.
+/// realtime loop. `psi_true`: the nose of an aircraft that cannot turn on
+/// the spot, which the route then starts ahead of when it can; `None`
+/// plans from the position alone.
 pub fn plan_self_taxi(
     apt_path: &str,
     icao: Option<&str>,
@@ -616,8 +618,9 @@ pub fn plan_self_taxi(
     lon: f64,
     runway: Option<&str>,
     wind: Option<(f64, f64)>,
+    psi_true: Option<f64>,
 ) -> Result<crate::station::SelfTaxi, String> {
-    crate::station::plan_self_taxi(apt_path, icao, lat, lon, runway, wind)
+    crate::station::plan_self_taxi(apt_path, icao, lat, lon, runway, wind, psi_true)
 }
 
 pub fn clearance_state() -> Option<tower::State> {

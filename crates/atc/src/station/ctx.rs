@@ -103,6 +103,13 @@ impl Station {
         if !qnh.is_empty() {
             self.last_qnh = Some(qnh.clone());
         }
+        // Our mass, for a departure route that must start ahead of the
+        // nose (#288): read only for a ground call of ours.
+        self.desk.call.own_mtow_kg = if state.on_ground && !self.desk.strip.is_traffic() {
+            xp.get_float(datarefs::ACF_M_MAX_KG).await.ok()
+        } else {
+            None
+        };
         self.ctx_for_call(&state, wx, qnh, callsign, intent, &targets, &[], now)
     }
 
@@ -237,6 +244,10 @@ impl Station {
         self.desk.planned_route = None;
         let mut own_on_runway = false;
         let mut pos = None;
+        // The nose a departure's route starts ahead of, when the aircraft
+        // cannot turn on the spot (LEMG 2026-10-14, #288).
+        let mtow_kg = self.desk.call.own_mtow_kg.take();
+        let facing = facing_for_route(self.desk.strip.is_traffic(), state, mtow_kg);
         if on_ground {
             if let Some((lat, lon)) = state.position() {
                 pos = Some((lat, lon));
@@ -264,7 +275,7 @@ impl Station {
                     occupied.extend(stands_assigned(&self.desk.strip));
                     plan_taxi_route_to_stand(&self.apt.runways, lat, lon, state.psi_deg, &occupied)
                 } else {
-                    plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
+                    plan_taxi_route_to(&self.apt.runways, &ident, lat, lon, facing)
                 };
                 // A push is approved with the way it will leave the nose:
                 // off the stand's drawn lane, toward the route on.
@@ -296,7 +307,7 @@ impl Station {
         ctx.final_traffic_id = final_traffic_id;
         ctx.sequence_ahead = sequence_ahead;
         if intent == tower::Intent::RequestRunway {
-            self.apply_runway_request(&mut ctx, pos);
+            self.apply_runway_request(&mut ctx, pos, facing);
         }
         if intent == tower::Intent::RequestCrossing && on_ground {
             ctx.crossing = self.judge_crossing(targets, pos, now);

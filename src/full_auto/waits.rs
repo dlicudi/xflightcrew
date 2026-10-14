@@ -497,16 +497,26 @@ pub(super) async fn self_taxi(
     voice: &Option<Voice>,
     tools: &SubTools,
 ) -> Result<(), String> {
-    let (lat_r, lon_r, dir_r, spd_r) = tokio::join!(
+    let (lat_r, lon_r, dir_r, spd_r, psi_r, mtow_r) = tokio::join!(
         xp.get_float(LAT),
         xp.get_float(LON),
         xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE),
         xp.get_float(crate::datarefs::WIND_SPEED_MSC),
+        xp.get_float(crate::autotaxi::PSI_TRUE),
+        xp.get_float(crate::datarefs::ACF_M_MAX_KG),
     );
     let (Ok(lat), Ok(lon)) = (lat_r, lon_r) else {
         return Err("I can't read our position to plan the taxi.".to_string());
     };
     let wind = dir_r.ok().zip(spd_r.ok().map(|ms| ms * 1.943_844));
+    // The route starts ahead of the nose of an aircraft that cannot turn on
+    // the spot (LEMG 2026-10-14, #288): the drive's own rule for who pivots
+    // (light, by `acf_m_max`; an unread mass is a heavy one).
+    let heavy = mtow_r
+        .as_ref()
+        .ok()
+        .is_none_or(|&m| m > crate::autotaxi::JOIN_TURN_LIGHT_KG);
+    let facing = psi_r.ok().filter(|_| heavy);
     let (icao, rwy) = match &tools.mission {
         Mission::Flight(r) | Mission::Resume(r) => (
             Some(r.origin_icao.clone()).filter(|i| !i.is_empty()),
@@ -518,7 +528,15 @@ pub(super) async fn self_taxi(
     waiting("the taxi plan");
     let apt_path = config.apt_data_path.clone();
     let planned = tokio::task::spawn_blocking(move || {
-        crate::party_line::plan_self_taxi(&apt_path, icao.as_deref(), lat, lon, rwy.as_deref(), wind)
+        crate::party_line::plan_self_taxi(
+            &apt_path,
+            icao.as_deref(),
+            lat,
+            lon,
+            rwy.as_deref(),
+            wind,
+            facing,
+        )
     })
     .await
     .map_err(|_| "The taxi plan failed.".to_string())??;

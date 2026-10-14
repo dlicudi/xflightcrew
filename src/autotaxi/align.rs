@@ -394,6 +394,55 @@ pub(crate) fn join_turn_radius_m(mtow_kg: Option<f64>) -> f64 {
     }
 }
 
+/// ...and the tightest the planned join is drawn when that does not fit,
+/// m. A TURN ROUND IS FLOWN AS TIGHT AS THE AIRFRAME TURNS, NOT AS TIGHT AS
+/// IS COMFORTABLE. LEMG (2026-10-14 13:55, #288, the Laminar 737-800 at
+/// 79 t): stopped on Delta short of HW1 with the route straight behind,
+/// the 15 m join needed 30 m of pavement to one side for its 180 and Delta
+/// is drawn about 23 m to the left of the line and 29 m to the right, so
+/// no turn fitted (`join_refused`, err -179.6, radius_m 15) and full auto
+/// gave up. The pilot then turned it round there by hand to the right:
+/// 182 degrees in 17 s at 1.4 to 6 kt, 6 to 9 m radius (groundspeed over
+/// yaw rate, `state` t 1791978995 to 1791979006), the centre of gravity at
+/// most 22 m right of the line and 5 m ahead of where it stood. So the join
+/// is tried at the comfortable radius first, then tighter by
+/// [`JOIN_TURN_RADIUS_STEP_M`] down to this: 8 m, the measured turn, for
+/// the medium jet; a widebody, unmeasured, keeps its one 25 m. Still none
+/// on the pavement is a refusal, as before.
+pub(crate) fn join_turn_min_radius_m(mtow_kg: Option<f64>) -> f64 {
+    match mtow_kg {
+        Some(m) if m > 100_000.0 => 25.0,
+        _ => 8.0,
+    }
+}
+
+/// Each tighter try at the planned join's radius, m.
+pub(crate) const JOIN_TURN_RADIUS_STEP_M: f64 = 3.0;
+
+/// The planned join at the largest radius that fits, from
+/// [`join_turn_radius_m`] down to [`join_turn_min_radius_m`] (see there),
+/// with the radius it was drawn at. `None`: no radius fits. Pure.
+pub(crate) fn join_turn_fitting(
+    route: &[(f64, f64)],
+    lat: f64,
+    lon: f64,
+    psi: f64,
+    mtow_kg: Option<f64>,
+    on_pavement: impl Fn(f64, f64) -> Option<bool>,
+) -> Option<(JoinTurn, f64)> {
+    let (first, floor) = (join_turn_radius_m(mtow_kg), join_turn_min_radius_m(mtow_kg));
+    let mut radii = Vec::new();
+    let mut r = first;
+    while r > floor {
+        radii.push(r);
+        r -= JOIN_TURN_RADIUS_STEP_M;
+    }
+    radii.push(floor);
+    radii
+        .into_iter()
+        .find_map(|r| join_turn(route, lat, lon, psi, r, &on_pavement).map(|t| (t, r)))
+}
+
 /// Does a join this far off the nose get a planned turn ([`JoinTurn`])?
 /// Heavy (or unread), not pivoting, off a runway, a drive that is not a
 /// line-up or turn-round (those plan their own geometry). Pure.

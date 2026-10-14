@@ -3601,3 +3601,115 @@
         }
         assert!(s.stuck(150.0));
     }
+
+    /// #288's spot on LEMG's Delta, in metres: the 737 stopped short of HW1
+    /// at 36.689508452 -4.508558165 facing 297.3 (`join_refused` t
+    /// 1791978916.7), the route straight back down Delta on 117.3, and the
+    /// pavement as the install draws it there: 23 m to the left of the line,
+    /// 29 m to the right (sampled every metre square to the nose).
+    fn lemg_288() -> ((f64, f64), f64, Vec<(f64, f64)>, impl Fn(f64, f64, f64, f64) -> Option<bool>) {
+        let (lat, lon, psi): (f64, f64, f64) = (36.689508452, -4.508558165, 297.3);
+        let m_lon = 111_320.0 * lat.to_radians().cos();
+        let back = (psi - 180.0).to_radians();
+        let path: Vec<(f64, f64)> = (0..=60)
+            .map(|k| {
+                let d = 5.0 * k as f64;
+                (lat + d * back.cos() / 111_320.0, lon + d * back.sin() / m_lon)
+            })
+            .collect();
+        // Metres right of the line (positive) for a point, and the pavement
+        // between `left` and `right` of it.
+        let across = move |plat: f64, plon: f64| {
+            let (e, n) = ((plon - lon) * m_lon, (plat - lat) * 111_320.0);
+            let r = (psi + 90.0).to_radians();
+            e * r.sin() + n * r.cos()
+        };
+        let paved = move |plat: f64, plon: f64, left: f64, right: f64| {
+            let x = across(plat, plon);
+            Some(x >= -left && x <= right)
+        };
+        ((lat, lon), psi, path, paved)
+    }
+
+    /// LEMG 2026-10-14 (#288): the 15 m join's 180 needed 30 m of Delta to
+    /// one side and refused; the pilot turned it round by hand to the right
+    /// on 6 to 9 m. The fitting join tries tighter and finds the right turn,
+    /// every sample on the pavement.
+    #[test]
+    fn a_turn_round_on_a_taxiway_wide_enough_is_planned_tight() {
+        let ((lat, lon), psi, path, paved) = lemg_288();
+        let delta = |a: f64, b: f64| paved(a, b, 23.0, 29.0);
+        let w = TaxiWatch {
+            path: path.clone(),
+            via: String::new(),
+            seg: vec![(String::new(), false); path.len() - 1],
+            holding_point: "HN1".into(),
+            lead_on: Vec::new(),
+        };
+        let route = Route::build(&w).expect("a route");
+        let (progress, _) = route.fix_signed_facing(lat, lon, psi).expect("a fix");
+        let err = route.heading_err_deg(lat, lon, psi, progress, 20.0);
+        assert!(err.abs() > 175.0, "the route is straight behind: {err}");
+        assert!(join_turn_applies(err, false, Some(79_015.8), Some(false), false));
+        assert!(
+            join_turn(&route.path, lat, lon, psi, join_turn_radius_m(Some(79_015.8)), delta).is_none(),
+            "the refusal, replayed: 15 m does not fit"
+        );
+        let (t, r) = join_turn_fitting(&route.path, lat, lon, psi, Some(79_015.8), delta)
+            .expect("a turn round fits on Delta");
+        assert_eq!(t.dir, 1.0, "right, the side with room, as the pilot turned: {t:?}");
+        assert!((8.0..15.0).contains(&r), "tighter, never under the measured turn: {r}");
+        assert!(t.lead.iter().all(|&(a, b)| delta(a, b) == Some(true)), "on the pavement");
+        assert!(route.with_lead(&t.lead, t.join_m).is_some(), "drivable");
+    }
+
+    /// ...and where the pavement really does not fit (a taxiway 12 m either
+    /// side of its line: under the 8 m turn's 16 m), it still refuses.
+    #[test]
+    fn a_turn_round_with_no_room_still_refuses() {
+        let ((lat, lon), psi, path, paved) = lemg_288();
+        let narrow = |a: f64, b: f64| paved(a, b, 12.0, 12.0);
+        assert!(join_turn_fitting(&path, lat, lon, psi, Some(79_015.8), narrow).is_none());
+        // A widebody keeps its one 25 m: Delta has no room for that.
+        let delta = |a: f64, b: f64| paved(a, b, 23.0, 29.0);
+        assert!(join_turn_fitting(&path, lat, lon, psi, Some(230_000.0), delta).is_none());
+    }
+
+    /// The same spot over LEMG's drawn pavement and the route the station
+    /// plans there (the reversal, #288), read from the install.
+    /// `cargo test -- --ignored live_lemg_288_turn_round --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install
+    fn live_lemg_288_turn_round_fits_on_delta() {
+        let apt = &crate::config::xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+        let Ok(Some(net)) = atc::nav::find_taxi_net(apt, "LEMG") else {
+            return;
+        };
+        let runways = atc::nav::find_runways(apt, "LEMG").unwrap();
+        let strip = runways.iter().find(|r| r.ident_a == "13" || r.ident_b == "13").expect("13/31");
+        let (tlat, tlon) = if strip.ident_a == "13" {
+            (strip.lat_a, strip.lon_a)
+        } else {
+            (strip.lat_b, strip.lon_b)
+        };
+        let zone = vec![strip.ident_a.clone(), strip.ident_b.clone()];
+        let (lat, lon, psi) = (36.689508452, -4.508558165, 297.3);
+        let plan = net
+            .plan_to_runway_facing(lat, lon, tlat, tlon, 100.0, &zone, Some(strip), Some(psi))
+            .expect("a route");
+        let w = TaxiWatch {
+            path: plan.path.clone(),
+            via: String::new(),
+            seg: plan.seg.clone(),
+            holding_point: plan.holding_point.clone(),
+            lead_on: Vec::new(),
+        };
+        let route = Route::build(&w).expect("a route");
+        let pave = |a: f64, b: f64| net.on_pavement(a, b);
+        assert!(join_turn(&route.path, lat, lon, psi, 15.0, pave).is_none(), "the refusal, replayed");
+        let (t, r) = join_turn_fitting(&route.path, lat, lon, psi, Some(79_015.8), pave)
+            .expect("a turn round fits on Delta");
+        println!("radius {r} {t:?}");
+        assert_eq!(t.dir, 1.0, "right, as the pilot turned");
+        assert!(t.lead.iter().all(|&(a, b)| pave(a, b) == Some(true)));
+    }

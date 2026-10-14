@@ -1990,7 +1990,7 @@ fn a_runway_request_is_granted_or_refused_by_the_field() {
         st.note_stated_runway(words, intent);
         let mut ctx = scripted_ctx(st, wx);
         ctx.on_ground = true;
-        st.apply_runway_request(&mut ctx, None);
+        st.apply_runway_request(&mut ctx, None, None);
         st.route_keyed(words, Service::Tower, &ctx, wx)
     };
 
@@ -4877,7 +4877,7 @@ fn real_install_short_cleared_runway_is_granted_the_longer_one() {
     st.note_stated_runway(words, intent);
     let mut ctx = scripted_ctx(&mut st, wx);
     ctx.on_ground = true;
-    st.apply_runway_request(&mut ctx, Some((48.95620, 2.43880)));
+    st.apply_runway_request(&mut ctx, Some((48.95620, 2.43880)), None);
     let r = st.route_keyed(words, Service::Tower, &ctx, wx);
     println!("{r}");
     assert!(r.contains("runway two five approved, taxi to holding point"), "{r}");
@@ -4916,7 +4916,7 @@ fn real_install_self_taxi_lilb() {
     });
     // Where the 172 sat on 2026-09-25.
     let (lat, lon) = (45.771_275, 9.164_289);
-    let t = plan_self_taxi(&apt, Some("LILB"), lat, lon, Some("03"), Some((20.0, 4.0)));
+    let t = plan_self_taxi(&apt, Some("LILB"), lat, lon, Some("03"), Some((20.0, 4.0)), None);
     println!("{t:?}");
     let t = t.expect("planned");
     assert_eq!(t.runway, "03");
@@ -4933,7 +4933,7 @@ fn real_install_self_taxi_lilb() {
         assert!(t <= 90.0, "a {t:.0} degree turn at {:?}", w[1]);
     }
     // No ICAO: the field found by the scan is the same one.
-    let found = plan_self_taxi(&apt, None, lat, lon, None, None).expect("found");
+    let found = plan_self_taxi(&apt, None, lat, lon, None, None, None).expect("found");
     println!("{found:?}");
     *OWN_STRIP.taxi_route.lock().unwrap() = None;
     *OWN_STRIP.self_taxi.lock().unwrap() = None;
@@ -11024,4 +11024,63 @@ fn a_landing_release_waits_for_the_final() {
     own_on_lemg30_final(0.95, at(60.0));
     assert!(landing_hold_tick(&[], false, at(60.0)).is_some(), "back on the final");
     reset_runway_watch();
+}
+
+/// Who gets a departure route that starts ahead of the nose (#288): our own
+/// aeroplane, heavy or of unread mass; never a traffic desk, a helicopter
+/// or a light aircraft that pivots on its brakes.
+#[test]
+fn only_an_aircraft_that_cannot_pivot_is_routed_from_its_nose() {
+    let mut state = AircraftState::at_position(36.0, -4.0, true, 0.0);
+    state.psi_deg = Some(297.3);
+    assert_eq!(facing_for_route(false, &state, Some(79_015.8)), Some(297.3), "the LEMG 737");
+    assert_eq!(facing_for_route(false, &state, None), Some(297.3), "unread is heavy");
+    assert_eq!(facing_for_route(false, &state, Some(1_633.0)), None, "a 172 pivots");
+    assert_eq!(facing_for_route(true, &state, Some(79_015.8)), None, "traffic plans as before");
+    state.helicopter = true;
+    assert_eq!(facing_for_route(false, &state, Some(5_000.0)), None, "a helicopter air-taxis");
+    state.helicopter = false;
+    state.psi_deg = None;
+    assert_eq!(facing_for_route(false, &state, Some(79_015.8)), None, "no heading, no constraint");
+}
+
+/// LEMG 2026-10-14 13:55 (#288), through the station's own planner: the
+/// 737 on Delta short of HW1 facing 297 (state record t 1791978119.8, the
+/// taxi request at 1791978119.8) is NOT sent along 12/30 to get ahead of
+/// its nose: the clearance is the reversal, for the drive to turn round.
+/// `cargo test -p atc -- --ignored live_lemg_taxi_clearance_never --nocapture`
+#[test]
+#[ignore] // needs the real X-Plane install; run with --ignored
+fn live_lemg_taxi_clearance_never_backtracks_a_runway() {
+    let apt = crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
+    let Ok(Some(net)) = nav::find_taxi_net(&apt, "LEMG") else {
+        return; // no install, no verdict
+    };
+    let runways = nav::find_runways(&apt, "LEMG").unwrap();
+    let (lat, lon, psi) = (36.689508452, -4.508558165, 297.3);
+    let first_brg = |p: &nav::TaxiRoutePlan| {
+        let to = p
+            .path
+            .iter()
+            .find(|q| nav::haversine_nm(lat, lon, q.0, q.1) * 1852.0 > 10.0)
+            .expect("a route away from here");
+        nav::bearing_deg(lat, lon, to.0, to.1)
+    };
+    let old = taxi_route_on(&net, &runways, "13", lat, lon, None, |_| true).expect("a route");
+    let new = taxi_route_on(&net, &runways, "13", lat, lon, Some(psi), |_| true).expect("a route");
+    println!(
+        "old: {} via {:?} crossings {:?} first {:.0}; new: {} via {:?} crossings {:?} first {:.0}",
+        old.holding_point,
+        old.via,
+        old.crossings,
+        first_brg(&old),
+        new.holding_point,
+        new.via,
+        new.crossings,
+        first_brg(&new)
+    );
+    assert!(sim::angles::abs_diff_deg(first_brg(&old), psi) > nav::FACING_REVERSAL_DEG);
+    assert_eq!(new.path, old.path, "the reversal: {:?}", new.via);
+    assert_eq!(new.via, vec!["D", "Q", "A", "HN1"]);
+    assert!(new.crossings.is_empty(), "no runway: {:?}", new.crossings);
 }
