@@ -3796,12 +3796,13 @@ fn a_runway_end_finds_its_own_papi() {
 /// LEMG 2026-10-14 13:55 (#288): a 737-800 stopped on Delta short of HW1
 /// facing 297 when the runway in use turned 12 to 13. Planned from the
 /// position alone the route to 13 ran straight back past the tail (the
-/// drive's `join_refused`, err -179.6); planned from where it points, the
-/// route starts ahead of the nose.
-/// `cargo test -p nav -- --ignored live_lemg_delta_route_starts_ahead --nocapture`
+/// drive's `join_refused`, err -179.6). The only way ahead of the nose is
+/// HW1, 295 m along 12/30 and E7 back onto Delta: runway pavement, so no
+/// way ahead, and the reversal stands for the drive's turn round.
+/// `cargo test -p nav -- --ignored live_lemg_delta_way_ahead --nocapture`
 #[test]
 #[ignore] // needs the real X-Plane install; run with --ignored
-fn live_lemg_delta_route_starts_ahead() {
+fn live_lemg_delta_way_ahead_along_a_runway_is_no_way_ahead() {
     let path =
         &crate::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = find_taxi_net(path, "LEMG") else {
@@ -3855,11 +3856,8 @@ fn live_lemg_delta_route_starts_ahead() {
         sim::angles::abs_diff_deg(first_brg(&old), psi) > FACING_REVERSAL_DEG,
         "the incident: the position-only route starts behind us"
     );
-    assert!(
-        sim::angles::abs_diff_deg(first_brg(&new), psi) < 90.0,
-        "the route starts ahead of the nose: first {:.0}",
-        first_brg(&new)
-    );
+    assert_eq!(new.path, old.path, "the reversal stands: {:?}", new.via);
+    assert!(new.crossings.is_empty(), "no runway: {:?}", new.crossings);
 }
 
 /// A block for the facing rule (#288), metres east and north of a datum:
@@ -3980,4 +3978,25 @@ fn with_no_way_ahead_the_reversal_stands() {
         .plan_facing(here.0, here.1, goal.0, goal.1, 0.0, &[], Some(275.0))
         .expect("a route");
     assert_eq!(parked.path, plain.path, "on a stand the push turns us");
+}
+
+/// The only way ahead runs ALONG a runway: no way ahead, the reversal
+/// stands (LEMG's Delta, #288, where it was 295 m of 12/30). The strip is
+/// L1's 100 m, cheap enough at 25 times that only the rule, never the
+/// cost, keeps the route off it.
+#[test]
+fn a_way_ahead_along_a_runway_is_no_way_ahead() {
+    let (mut net, at) = facing_block(true);
+    for e in net.edges.iter_mut().filter(|e| e.name == "L1") {
+        e.name = "09/27".into();
+        e.runway = true;
+    }
+    let here = at(100.0, 0.0);
+    let goal = at(600.0, 0.0);
+    let plain = net.plan(here.0, here.1, goal.0, goal.1, 0.0, &[]).expect("a route");
+    let facing = net
+        .plan_facing(here.0, here.1, goal.0, goal.1, 0.0, &[], Some(270.0))
+        .expect("a route");
+    assert_eq!(facing.via, plain.via, "the reversal, back down D");
+    assert!(facing.crossings.is_empty(), "{:?}", facing.crossings);
 }

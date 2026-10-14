@@ -375,10 +375,9 @@ pub(super) fn plan_taxi_route_to(
 /// [`plan_taxi_route_to`] on a given network, so the real apt.dat can test
 /// it. `psi_true` is the nose of an aircraft that cannot turn on the spot
 /// (see [`facing_for_route`]): the route starts ahead of it when one does
-/// ([`nav::FACING_REVERSAL_DEG`], LEMG 2026-10-14, #288), unless the way
-/// ahead buys itself onto the departure runway the plain route stays off
-/// (a route ahead never taxis along the runway it is cleared to hold short
-/// of). `None` plans from the position alone, as before.
+/// ([`nav::FACING_REVERSAL_DEG`], LEMG 2026-10-14, #288), on taxiways
+/// only: a way ahead over a strip the plain route never crosses is no way
+/// ahead. `None` plans from the position alone, as before.
 pub(super) fn taxi_route_on(
     net: &nav::TaxiNet,
     runways: &[nav::Runway],
@@ -426,9 +425,13 @@ pub(super) fn taxi_route_on(
         return plain();
     };
     let plain = plain();
-    let own = format!("{}/{}", r.ident_a, r.ident_b);
-    let crosses_own = |p: &nav::TaxiRoutePlan| p.crossings.contains(&own);
-    if crosses_own(&ahead) && !plain.as_ref().is_some_and(crosses_own) {
+    // The planner already keeps a way ahead off runway edges the plain
+    // route does not use; this is the same rule for a strip the GEOMETRY
+    // names (a taxiway edge drawn across one, `mark_runway_crossings`).
+    let extra_strip = plain.as_ref().is_some_and(|p| {
+        ahead.crossings.iter().any(|c| !p.crossings.contains(c))
+    });
+    if extra_strip {
         return plain;
     }
     if let Some(p) = plain.as_ref().filter(|p| p.via != ahead.via) {

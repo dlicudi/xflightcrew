@@ -11046,12 +11046,12 @@ fn only_an_aircraft_that_cannot_pivot_is_routed_from_its_nose() {
 
 /// LEMG 2026-10-14 13:55 (#288), through the station's own planner: the
 /// 737 on Delta short of HW1 facing 297 (state record t 1791978119.8, the
-/// taxi request at 1791978119.8) is cleared ahead of its nose, and the way
-/// ahead never runs along 13/31, the runway it holds short of.
-/// `cargo test -p atc -- --ignored live_lemg_taxi_clearance_starts_ahead --nocapture`
+/// taxi request at 1791978119.8) is NOT sent along 12/30 to get ahead of
+/// its nose: the clearance is the reversal, for the drive to turn round.
+/// `cargo test -p atc -- --ignored live_lemg_taxi_clearance_never --nocapture`
 #[test]
 #[ignore] // needs the real X-Plane install; run with --ignored
-fn live_lemg_taxi_clearance_starts_ahead() {
+fn live_lemg_taxi_clearance_never_backtracks_a_runway() {
     let apt = crate::nav::test_xplane_path("Global Scenery/Global Airports/Earth nav data/apt.dat");
     let Ok(Some(net)) = nav::find_taxi_net(&apt, "LEMG") else {
         return; // no install, no verdict
@@ -11080,11 +11080,7 @@ fn live_lemg_taxi_clearance_starts_ahead() {
         first_brg(&new)
     );
     assert!(sim::angles::abs_diff_deg(first_brg(&old), psi) > nav::FACING_REVERSAL_DEG);
-    assert!(
-        sim::angles::abs_diff_deg(first_brg(&new), psi) < 90.0,
-        "the clearance starts ahead of the nose: {:.0}",
-        first_brg(&new)
-    );
-    assert_eq!(new.holding_point, old.holding_point, "to the same holding point");
-    assert!(!new.crossings.iter().any(|c| c == "13/31"), "{:?}", new.crossings);
+    assert_eq!(new.path, old.path, "the reversal: {:?}", new.via);
+    assert_eq!(new.via, vec!["D", "Q", "A", "HN1"]);
+    assert!(new.crossings.is_empty(), "no runway: {:?}", new.crossings);
 }

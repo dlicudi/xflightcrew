@@ -145,21 +145,19 @@ pub(super) const STAND_ALIGN_MAX_TURN_DEG: f64 = 90.0;
 /// [`FACING_REVERSAL_DEG`] off the nose, or a first edge out of the start
 /// doubling back that far on the way the aircraft went to it, costs
 /// [`FACING_REVERSAL_COST_M`] more.
-/// A cost, never a ban: with no way ahead the reversal is still the route
-/// and the drive's own join turn (or its refusal) stays the fallback.
+/// A cost, never a ban: with no way ahead on taxiways the reversal is
+/// still the route and the drive's own join turn stays the fallback.
 ///
 /// More than this off the nose is a reversal: past the drive's planned
 /// join turn (90 degrees) with room for the ordinary acute junction.
 pub const FACING_REVERSAL_DEG: f64 = 120.0;
 /// ...and what a reversal is worth avoiding, in the planner's own cost
-/// (metres, a runway edge at 25 times its length): a route ahead up to this
-/// much dearer wins over turning on the spot. The cost of the alternative
-/// is an aircraft stopped dead and hand-taxied (or a tug), so it is set
-/// high: LEMG's way ahead from Delta is HW1, 295 m back along the idle
-/// 12/30 and E7 back onto Delta, 683 m longer than the reversal and about
-/// 7,500 dearer for the runway stretch. Only for an aircraft that cannot
-/// pivot: the caller passes no heading for a light one (the drive's
-/// `JOIN_TURN_LIGHT_KG`) or a helicopter.
+/// (metres): a way ahead up to this much longer wins over turning on the
+/// spot, set high because the alternative is an aircraft stopped dead and
+/// hand-taxied (or a tug). A way ahead on runway pavement the plain route
+/// does not use never counts at any price (`plan_inner`). Only for an
+/// aircraft that cannot pivot: the caller passes no heading for a light one
+/// (the drive's `JOIN_TURN_LIGHT_KG`) or a helicopter.
 pub const FACING_REVERSAL_COST_M: f64 = 10_000.0;
 /// A start node nearer than this is where the aircraft already is: its
 /// bearing is noise, and the first edge out of it is judged on the nose.
@@ -1493,6 +1491,14 @@ impl TaxiNet {
         })
     }
 
+    /// The route, from the nose when `psi_true` is given. A way ahead is
+    /// only a way ahead on TAXIWAYS: one that uses runway pavement the
+    /// plain route does not (taxiing along a strip, or crossing one the
+    /// plain route never crosses) is no alternative to turning round, and
+    /// the plain route stands. LEMG 2026-10-14 (#288): the only way ahead
+    /// from Delta short of HW1 ran 295 m along 12/30 to E7, and a route
+    /// that buys its way past a reversal with a runway backtrack is the
+    /// controller's call to make, never the planner's.
     #[allow(clippy::too_many_arguments)]
     fn plan_inner(
         &self,
@@ -1506,6 +1512,47 @@ impl TaxiNet {
         strip: Option<&Runway>,
         psi_true: Option<f64>,
     ) -> Option<TaxiRoutePlan> {
+        let plan = |psi: Option<f64>| {
+            self.plan_route(
+                from_lat,
+                from_lon,
+                to_lat,
+                to_lon,
+                hold_short_m,
+                hold_zone,
+                to_runway,
+                strip,
+                psi,
+            )
+        };
+        let Some(psi) = psi_true.filter(|p| p.is_finite()) else {
+            return plan(None).map(|(p, _)| p);
+        };
+        let plain = plan(None);
+        match plan(Some(psi)) {
+            Some((ahead, used)) if plain.as_ref().is_none_or(|(_, p)| used.is_subset(p)) => {
+                Some(ahead)
+            }
+            _ => plain.map(|(p, _)| p),
+        }
+    }
+
+    /// [`plan_inner`](Self::plan_inner) for one heading (or none), with the
+    /// runway pavement the route uses: each runway edge's name, an unnamed
+    /// one by its index.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_route(
+        &self,
+        from_lat: f64,
+        from_lon: f64,
+        to_lat: f64,
+        to_lon: f64,
+        hold_short_m: f64,
+        hold_zone: &[String],
+        to_runway: bool,
+        strip: Option<&Runway>,
+        psi_true: Option<f64>,
+    ) -> Option<(TaxiRoutePlan, std::collections::BTreeSet<String>)> {
         let m_per_deg_lat = 111_320.0;
         let m_per_deg_lon = 111_320.0 * from_lat.to_radians().cos();
         let dist_m = |a: (f64, f64), b: (f64, f64)| -> f64 {
@@ -1591,14 +1638,17 @@ impl TaxiNet {
                 vec![here, dest]
             };
             let seg = vec![(String::new(), false); path.len() - 1];
-            return Some(TaxiRoutePlan {
-                via: Vec::new(),
-                crossings: Vec::new(),
-                holding_point: String::new(),
-                seg,
-                path,
-                lead_on: Vec::new(),
-            });
+            return Some((
+                TaxiRoutePlan {
+                    via: Vec::new(),
+                    crossings: Vec::new(),
+                    holding_point: String::new(),
+                    seg,
+                    path,
+                    lead_on: Vec::new(),
+                },
+                std::collections::BTreeSet::new(),
+            ));
         }
         // Dijkstra; runway edges cost ×25 so a route only touches one to
         // CROSS it, never to taxi along it.
@@ -1697,9 +1747,17 @@ impl TaxiNet {
         let mut seg: Vec<(String, bool)> = Vec::new();
         let mut walk = start;
         path.extend(self.nodes.get(&walk).copied());
+        let mut runway_used = std::collections::BTreeSet::new();
         for &ei in &edges_rev {
             let e = &self.edges[ei];
             walk = if e.a == walk { e.b } else { e.a };
+            if e.runway {
+                runway_used.insert(if e.name.is_empty() {
+                    format!("#{ei}")
+                } else {
+                    e.name.clone()
+                });
+            }
             // Keep `seg` aligned with `path` segments: a seg entry only when
             // this edge actually appends a point after an existing one.
             if let Some(&p) = self.nodes.get(&walk) {
@@ -1842,14 +1900,17 @@ impl TaxiNet {
                 seg.insert(0, (String::new(), false));
             }
         }
-        Some(TaxiRoutePlan {
-            via,
-            crossings,
-            holding_point,
-            path,
-            seg,
-            lead_on,
-        })
+        Some((
+            TaxiRoutePlan {
+                via,
+                crossings,
+                holding_point,
+                path,
+                seg,
+                lead_on,
+            },
+            runway_used,
+        ))
     }
 
     /// The taxiway node nearest `(lat, lon)` that can actually get onto a

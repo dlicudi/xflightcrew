@@ -764,11 +764,15 @@ pub(super) async fn drive(
             };
             let on_rwy = crate::party_line::on_runway(lat, lon);
             if joining && join_turn_applies(err, pivots, mtow_kg, on_rwy, own_geometry) {
-                let radius_m = join_turn_radius_m(mtow_kg);
-                let turn = join_turn(&route.path, lat, lon, psi, radius_m, |a, b| {
+                // The comfortable radius first, then tighter down to the
+                // airframe's own turn (`join_turn_min_radius_m`, #288).
+                let turn = join_turn_fitting(&route.path, lat, lon, psi, mtow_kg, |a, b| {
                     crate::party_line::on_pavement(a, b)
                 });
-                match turn.and_then(|t| route.with_lead(&t.lead, t.join_m).map(|r| (t, r))) {
+                let radius_m = turn
+                    .as_ref()
+                    .map_or(join_turn_min_radius_m(mtow_kg), |(_, r)| *r);
+                match turn.and_then(|(t, _)| route.with_lead(&t.lead, t.join_m).map(|r| (t, r))) {
                     Some((t, rebuilt)) => {
                         tracing::info!(err, turn = t.turn_deg, "auto taxi: planned turn onto the route");
                         crate::blackbox::record(
