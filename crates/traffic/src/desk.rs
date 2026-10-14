@@ -10,26 +10,38 @@
 //! runway book is), never stored: a departure cleared for takeoff while it
 //! is on the ground, a landing cleared from its final until it is off the
 //! pavement, anybody standing on the runway, a crossing just cleared. It
-//! clears, in the order asked, the first landing, then the first takeoff
-//! (only with no arrival inside [`ARRIVAL_CLEAR_S`] of the threshold and
-//! [`DEPART_GAP_S`] after the last), then crossings; a crossing of another
-//! strip is cleared at once. No readbacks, no radio: nothing is said.
-//! Stage 4 replaces it with the tower FSM per strip.
+//! clears, in the order asked, the first takeoff when it goes ahead of
+//! every arrival ([`DEPART_GAP_S`] after the last, and off before each
+//! arrival needs the runway: the fleet's one timed rule,
+//! [`crate::slot::off_before`]), else the first landing, then crossings; a
+//! crossing of another strip is cleared at once. A departure a landing has
+//! gone ahead of is given the next gap, ONE IN, ONE OUT: every arrival not
+//! yet cleared is spaced behind it (`Order::follow`) until it is released.
+//! No readbacks, no radio: nothing is said. Stage 4 replaces it with the
+//! tower FSM per strip.
+//!
+//! LEMG 13 (2026-10-14, issue #286): the field handed to the desk with
+//! arrivals 150 to 200 s apart, each landing was cleared the very second
+//! the one before was off (88 at 166.6 with 84 off at 171.8, 89 at 365.2
+//! with 88 off at 371.1, 90 at 534.6, 91 at 680.8), always before the
+//! takeoff was looked at; TRA5092 sat at the hold 730 s until the field
+//! stood down, five departures queued behind it.
 
 use std::collections::BTreeMap;
 
 use crate::field::FieldModel;
 use crate::fleet::Fleet;
 use crate::phase::{Call, Event, Order, Phase, Plan, TowerState};
+use crate::slot::off_before;
 use crate::TrafficAircraft;
 
 /// Seconds between two takeoff clearances: the station's one departure on
 /// the runway at a time (`WAKE_SECS`, 120).
 pub const DEPART_GAP_S: f64 = 120.0;
 
-/// No takeoff or crossing is cleared with an arrival this close to its
-/// threshold, seconds: about the station's 3 nm release gap
-/// (`DEPART_GAP_NM`) at an airliner's approach speed.
+/// No crossing is cleared with an arrival this close to its threshold,
+/// seconds: about the station's 3 nm release gap (`DEPART_GAP_NM`) at an
+/// airliner's approach speed.
 pub const ARRIVAL_CLEAR_S: f64 = 90.0;
 
 /// A crossing holds the runway this long after it is cleared, seconds,
@@ -52,6 +64,9 @@ pub struct FieldDesk {
     crossed_at: BTreeMap<u32, f64>,
     /// Fleet second of the last takeoff clearance.
     last_takeoff_s: Option<f64>,
+    /// The departure at the hold a landing has gone ahead of: the next gap
+    /// is its (module docs, one in, one out).
+    gap_for: Option<u32>,
 }
 
 impl FieldDesk {
@@ -121,6 +136,9 @@ impl FieldDesk {
     }
 
     fn forget(&mut self, id: u32) {
+        if self.gap_for == Some(id) {
+            self.end_gap();
+        }
         self.orders.remove(&id);
         self.crossed_at.remove(&id);
         self.want_takeoff.retain(|i| *i != id);
@@ -190,19 +208,42 @@ impl FieldDesk {
             }
         }
         let claim = |desk: &FieldDesk, except: u32| desk.claimed(fleet, strip, now, except);
+        // The departure waiting at the hold, ready.
+        let waiting = self
+            .want_takeoff
+            .first()
+            .copied()
+            .filter(|id| fleet.get(*id).is_some_and(|a| a.phase == Phase::HoldShort));
+        if let Some(id) = waiting {
+            let gap = self.last_takeoff_s.is_none_or(|t| now - t >= DEPART_GAP_S);
+            if gap && !claim(self, id) && goes_ahead(fleet, id) {
+                self.want_takeoff.remove(0);
+                self.last_takeoff_s = Some(now);
+                self.entry(id).state = TowerState::TakeoffCleared;
+                if self.gap_for == Some(id) {
+                    self.end_gap();
+                }
+            }
+        }
         if let Some(&id) = self.want_landing.first() {
             if !claim(self, id) {
                 self.want_landing.remove(0);
                 self.entry(id).state = TowerState::ClearedToLand;
+                // A landing gone ahead of a departure ready at the hold:
+                // the next gap is the departure's.
+                if let Some(dep) = waiting.filter(|d| self.want_takeoff.first() == Some(d)) {
+                    self.gap_for.get_or_insert(dep);
+                }
             }
         }
-        if let Some(&id) = self.want_takeoff.first() {
-            let at_hold = fleet.get(id).is_some_and(|a| a.phase == Phase::HoldShort);
-            let gap = self.last_takeoff_s.is_none_or(|t| now - t >= DEPART_GAP_S);
-            if at_hold && gap && !claim(self, id) && !arrival_near(fleet, id) {
-                self.want_takeoff.remove(0);
-                self.last_takeoff_s = Some(now);
-                self.entry(id).state = TowerState::TakeoffCleared;
+        // Every arrival not yet cleared to land is spaced behind it.
+        if let Some(dep) = self.gap_for {
+            for a in fleet.aircraft().iter().filter(|a| arriving(a)) {
+                if let Some(o) = self.orders.get_mut(&a.id) {
+                    if o.state != TowerState::ClearedToLand {
+                        o.follow = Some(dep);
+                    }
+                }
             }
         }
         let mut k = 0;
@@ -220,6 +261,15 @@ impl FieldDesk {
                 continue;
             }
             k += 1;
+        }
+    }
+
+    /// The gap is given: nobody is spaced behind the departure any more.
+    fn end_gap(&mut self) {
+        if let Some(dep) = self.gap_for.take() {
+            for o in self.orders.values_mut().filter(|o| o.follow == Some(dep)) {
+                o.follow = None;
+            }
         }
     }
 
@@ -263,18 +313,38 @@ fn strip_index(field: &FieldModel, ident: &str) -> Option<usize> {
         .position(|r| std::ptr::eq(r, s))
 }
 
+/// An arrival in the air, on its way to a runway.
+fn arriving(a: &TrafficAircraft) -> bool {
+    !a.kin.on_ground
+        && matches!(
+            a.phase,
+            Phase::Arrive | Phase::Pattern { .. } | Phase::Final | Phase::Landing
+        )
+}
+
 /// An arrival other than `except` is airborne within [`ARRIVAL_CLEAR_S`]
 /// of its threshold.
 fn arrival_near(fleet: &Fleet, except: u32) -> bool {
     fleet.aircraft().iter().any(|a| {
-        a.id != except
-            && !a.kin.on_ground
-            && matches!(
-                a.phase,
-                Phase::Arrive | Phase::Pattern { .. } | Phase::Final | Phase::Landing
-            )
-            && a.slot().is_some_and(|s| s.to_thr_s < ARRIVAL_CLEAR_S)
+        a.id != except && arriving(a) && a.slot().is_some_and(|s| s.to_thr_s < ARRIVAL_CLEAR_S)
     })
+}
+
+/// Departure `id`, released now, is off the runway before every arrival on
+/// its strip needs it: its own slot at the hold (the line-up driven, the
+/// roll) through [`off_before`], the rule each arrival spaces itself on.
+/// With no slot of its own yet, no arrival inside [`ARRIVAL_CLEAR_S`].
+fn goes_ahead(fleet: &Fleet, id: u32) -> bool {
+    let Some(own) = fleet.get(id).and_then(|a| a.slot()) else {
+        return !arrival_near(fleet, id);
+    };
+    fleet
+        .aircraft()
+        .iter()
+        .filter(|a| a.id != id && arriving(a))
+        .filter_map(|a| a.slot())
+        .filter(|x| own.same_strip(x))
+        .all(|x| off_before(&own, &x))
 }
 
 #[cfg(test)]
@@ -362,5 +432,134 @@ mod tests {
         fleet.remove(2);
         d.tick(&fleet);
         assert_eq!(d.order(3).unwrap().state, TowerState::ClearedToLand);
+    }
+
+    /// THE LEMG HOLD (2026-10-14, issue #286): the field handed to the
+    /// desk, TRA5092 sat at the hold 730 s while the desk cleared four
+    /// arrivals to land, each the moment the one before was off, and five
+    /// departures queued behind it. A steady stream of airliners 5 nm apart
+    /// onto XNOC 12 and a departure taxiing out under the desk: once one
+    /// landing has been cleared ahead of it, the next arrival is spaced
+    /// behind it and it goes before a second is cleared, never onto the
+    /// runway with a landing on it, nobody sent round. Before, all eight
+    /// landed first (1,239 s at the hold).
+    #[test]
+    fn a_departure_at_the_hold_is_given_a_gap_in_a_steady_arrival_stream() {
+        let field = fixtures::xnoc();
+        let end = field.end("12").unwrap();
+        let mut fleet = Fleet::new(field.clone());
+        for k in 0..8u32 {
+            let nm = 30.0 + 5.0 * k as f64;
+            let entry = crate::kin::project_m(end.thr, end.course_deg + 180.0, nm * 1852.0);
+            let ac = TrafficAircraft::at_entry(
+                100 + k,
+                &format!("A{k}"),
+                "Arrival",
+                "A320",
+                Plan::Arrival {
+                    entry,
+                    star: None,
+                    runway: "12".into(),
+                    straight_in: true,
+                },
+                &field,
+                100 + k as u64,
+            )
+            .unwrap();
+            assert!(fleet.spawn(ac));
+        }
+        let mut d = FieldDesk::new(Some("12".into()));
+        let dep = 1;
+        let (mut t, mut spawned, mut ready_at, mut cleared_at) = (0.0, false, None, None);
+        let (mut landings_ahead, mut overlap, mut go_arounds) = (0, 0, 0);
+        let mut to_land: Vec<u32> = Vec::new();
+        let airborne = |f: &Fleet| {
+            f.get(dep)
+                .is_some_and(|a| matches!(a.phase, Phase::Climb | Phase::Leave))
+        };
+        while t < 3600.0 && !airborne(&fleet) {
+            // The departure starts up once the stream's head is on final.
+            if !spawned && fleet.get(100).is_some_and(|a| a.phase == Phase::Final) {
+                let ac = TrafficAircraft::at_stand(
+                    dep,
+                    "D1",
+                    "Departure",
+                    "A320",
+                    Plan::Departure {
+                        runway: "12".into(),
+                        sid: None,
+                        exit_bearing: 120.0,
+                    },
+                    &field,
+                    &field.net.stands[0].name,
+                    dep as u64,
+                )
+                .unwrap();
+                assert!(fleet.spawn(ac));
+                spawned = true;
+            }
+            d.tick(&fleet);
+            let events = fleet.step(0.1, None, &|id| d.order(id));
+            t += 0.1;
+            for e in &events {
+                match e {
+                    Event::Call {
+                        id,
+                        call: Call::Ready,
+                    } if *id == dep => ready_at = Some(t),
+                    Event::Call {
+                        call: Call::GoingAround,
+                        ..
+                    } => go_arounds += 1,
+                    _ => {}
+                }
+            }
+            d.hear(&events);
+            let takeoff = d
+                .order(dep)
+                .is_some_and(|o| o.state == TowerState::TakeoffCleared);
+            for a in fleet.aircraft() {
+                let landing = d
+                    .order(a.id)
+                    .is_some_and(|o| o.state == TowerState::ClearedToLand);
+                if landing && !to_land.contains(&a.id) {
+                    to_land.push(a.id);
+                    if ready_at.is_some() && cleared_at.is_none() && !takeoff {
+                        landings_ahead += 1;
+                    }
+                }
+            }
+            if takeoff && cleared_at.is_none() {
+                cleared_at = Some(t);
+            }
+            let rolling = fleet
+                .get(dep)
+                .is_some_and(|a| matches!(a.phase, Phase::LineUp | Phase::Roll));
+            if rolling && fleet.aircraft().iter().any(|a| a.phase == Phase::Landing) {
+                overlap += 1;
+            }
+            // Arrivals off the runway leave: the stream is the test, not
+            // the apron's two jet stands.
+            let done: Vec<u32> = fleet
+                .aircraft()
+                .iter()
+                .filter(|a| a.id >= 100 && a.phase == Phase::TaxiIn)
+                .map(|a| a.id)
+                .collect();
+            for id in done {
+                fleet.remove(id);
+                d.forget(id);
+            }
+        }
+        let ready = ready_at.expect("the departure called ready");
+        let cleared = cleared_at.expect("the departure was cleared for takeoff");
+        assert!(
+            landings_ahead <= 1,
+            "{landings_ahead} landings cleared ahead of it after its call, {:.0} s waited",
+            cleared - ready
+        );
+        assert!(airborne(&fleet), "the departure flew");
+        assert_eq!(overlap, 0, "a departure on the runway with a landing on it");
+        assert_eq!(go_arounds, 0);
     }
 }

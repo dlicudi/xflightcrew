@@ -262,12 +262,13 @@ impl TrafficAircraft {
     }
 
     /// The speed flown `d_m` along the route from the threshold: the
-    /// schedule's, slowed for the spacing behind the one ahead.
-    pub(crate) fn instrument_kts(&self, d_m: f64, others: &[Seen]) -> f64 {
+    /// schedule's, slowed for the spacing behind the one ahead (and behind
+    /// the departure the tower named, `gap_for`).
+    pub(crate) fn instrument_kts(&self, d_m: f64, others: &[Seen], gap_for: Option<u32>) -> f64 {
         spacing_kts(
             self.perf,
             scheduled_kts(self.perf, d_m),
-            self.spacing_short_s(others) + SPACING_MARGIN_S,
+            self.spacing_short_s(others, gap_for) + SPACING_MARGIN_S,
         )
     }
 
@@ -277,12 +278,18 @@ impl TrafficAircraft {
     /// our landing clearance is due, and seen leaving outside the tower's
     /// go-around window, [`crate::slot::off_before`]), and, behind an
     /// arrival still on its approach, the wake spacing at the threshold
-    /// ([`wake_gap_nm`]) at our own final speeds.
-    pub(crate) fn spacing_short_s(&self, others: &[Seen]) -> f64 {
+    /// ([`wake_gap_nm`]) at our own final speeds. With a gap asked for a
+    /// departure at the hold (`gap_for`, the tower's "number two to"), the
+    /// departure's line-up and roll go in once the runway is clear of
+    /// everyone ahead of us, and our place is behind that
+    /// ([`crate::slot::off_before`], the rule the tower releases it on).
+    pub(crate) fn spacing_short_s(&self, others: &[Seen], gap_for: Option<u32>) -> f64 {
         let Some(own) = self.slot else {
             return 0.0;
         };
         let mut need = f64::NEG_INFINITY;
+        // When the runway is clear of everyone ahead of us, seconds.
+        let mut runway_free_s: f64 = 0.0;
         for s in others.iter().filter(|s| s.id != self.id) {
             let Some(x) = s.slot else { continue };
             if !x.committed || !own.same_strip(&x) {
@@ -300,6 +307,7 @@ impl TrafficAircraft {
             if !ahead {
                 continue;
             }
+            runway_free_s = runway_free_s.max(x.clear_s);
             let mut req = x.clear_s + FOLLOW_GAP_S + own.needs_clear_s;
             if x.unjudged_s > 0.0 {
                 req = req.max(x.unjudged_s + TOWER_DECIDE_S);
@@ -313,6 +321,17 @@ impl TrafficAircraft {
                 let gap_m = (wake_gap_nm(x.wake, self.wake) + WAKE_BUFFER_NM) * NM;
                 req = req.max(x.to_thr_s + scheduled_time_s(self.perf, gap_m));
             }
+            need = need.max(req);
+        }
+        // The departure waits at the hold, its slot never counting down:
+        // it is released the moment the runway is free and fits ahead of us.
+        let departure = gap_for
+            .and_then(|id| others.iter().find(|s| s.id == id && s.id != self.id))
+            .and_then(|s| s.slot)
+            .filter(|x| x.waiting && own.same_strip(x));
+        if let Some(x) = departure {
+            let req = (runway_free_s + x.clear_s + FOLLOW_GAP_S + own.needs_clear_s)
+                .max(runway_free_s + x.unjudged_s + TOWER_DECIDE_S);
             need = need.max(req);
         }
         if need.is_finite() {
@@ -336,7 +355,12 @@ impl TrafficAircraft {
     /// The delay a radar unit gives when speed cannot make the gap: an
     /// orbit, only while still [`ORBIT_MIN_M`] out, and only once slowing
     /// to the floor could not make up what it is short.
-    pub(crate) fn instrument_delay(&mut self, end: &RunwayEnd, others: &[Seen]) {
+    pub(crate) fn instrument_delay(
+        &mut self,
+        end: &RunwayEnd,
+        others: &[Seen],
+        gap_for: Option<u32>,
+    ) {
         if !matches!(self.phase, Phase::Arrive | Phase::Final)
             || !matches!(self.route.leg(), Leg::Inbound | Leg::Final)
             || self.orbit.is_some()
@@ -351,7 +375,7 @@ impl TrafficAircraft {
         if d < ORBIT_MIN_M {
             return;
         }
-        let short = self.spacing_short_s(others);
+        let short = self.spacing_short_s(others, gap_for);
         if short > self.slowing_can_add_s(d) + ORBIT_MARGIN_S {
             self.start_orbit(end);
         }
