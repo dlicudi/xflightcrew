@@ -15394,3 +15394,12 @@ min, Landed within 60, nothing beyond 12 h), `a_departure_is_off_the_ground_when
   come; a departure off its blocks 6 or more minutes before the restart not `spawn`ed but drawn by
   the model (the EFB map, `draw` `modeled`). At LEMG in the morning the board still fills both
   halves and the mid-flow start still places taxiing and holding departures (its taxis are long).
+
+## 2026-10-14: Traffic timetables become data
+
+The route tables left Rust for one YAML file per field (`crates/traffic/routes/LXGB.yaml`,
+`LEMG.yaml`), built in by `include_str!` and parsed once (`routes::fields`), their sources as
+comments; a row names its carrier by its constant (`airlines::carrier_by_name`). The compile-time
+check is now tests (`every_route_row_is_well_formed`, `two_table_fields_agree_on_the_route_between_them`,
+vacuous until Gatwick lists Malaga). Proved equal before the Rust tables went: every row and every
+generated day, two seasons, weekday and weekend, byte for byte; `the_generated_days_are_pinned` keeps it.
