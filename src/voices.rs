@@ -5,6 +5,7 @@
 //! xfc voices                    the screen
 //! xfc voices list [--installed] [--filter en_GB]
 //! xfc voices install <key>...   e.g. en_GB-alan-medium, or ggml-base.en
+//! xfc voices install --starter  what the config names and is missing
 //! xfc voices remove <key>...
 //! ```
 //!
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 
 use crate::config::Config;
-use catalogue::{Configured, Entry, Kind, Row, Use};
+use catalogue::{Configured, Entry, Kind, Row, StarterItem, StarterStatus, Use};
 
 /// What the preview says.
 pub const PREVIEW_LINE: &str = "Tower, Cessna one two three, ready for departure.";
@@ -37,6 +38,8 @@ pub struct Store {
     pub piper: Vec<Entry>,
     pub whisper: Vec<Entry>,
     pub uses: Vec<(String, Use)>,
+    /// The starter set the live config names ([`starter`]).
+    pub starter: Vec<StarterItem>,
     /// "offline: ..." when the catalogue came from the cache or not at all.
     pub note: Option<String>,
 }
@@ -51,8 +54,32 @@ impl Store {
             piper,
             whisper: catalogue::whisper_catalogue(),
             uses: catalogue::uses(&configured(config)),
+            starter: starter(config),
             note,
         }
+    }
+
+    /// The starter set as it stands: what is missing (file checks where the
+    /// config names each), priced against the catalogue.
+    pub fn starter_status(&self) -> StarterStatus {
+        let missing = self
+            .starter
+            .iter()
+            .filter(|i| !item_installed(i))
+            .cloned()
+            .collect();
+        let all: Vec<Entry> = self.piper.iter().chain(&self.whisper).cloned().collect();
+        catalogue::starter_status(missing, &all)
+    }
+
+    /// The rows the missing starter items install from (the catalogued ones).
+    pub fn starter_rows(&self) -> Vec<Row> {
+        self.starter_status()
+            .missing
+            .iter()
+            .filter_map(|i| self.row(&i.key))
+            .filter(|r| !r.installed && !r.entry.is_local())
+            .collect()
     }
 
     /// The rows of one tab, joined against the folder as it is now.
@@ -86,6 +113,30 @@ fn configured(c: &Config) -> Configured {
         pool: c.atc_voice_pool.clone(),
         whisper: c.whisper_model_path.clone(),
     }
+}
+
+/// The starter set the live config names: its speech model and every single
+/// voice (`catalogue::starter_items`); no voices when speech is off.
+pub fn starter(config: &Config) -> Vec<StarterItem> {
+    catalogue::starter_items(&configured(config), config.tts_backend != "off")
+}
+
+/// Whether a starter item is on disk where the config names it: a voice's
+/// `.onnx` and `.onnx.json`, the speech model's file.
+pub fn item_installed(i: &StarterItem) -> bool {
+    match i.kind {
+        Kind::Piper => crate::voice::voice_installed(&i.spec),
+        Kind::Whisper => Path::new(&i.spec).is_file(),
+    }
+}
+
+/// What of the starter set is missing: file checks only, offline and cheap
+/// (the boot's decision to show the home screen asks this).
+pub fn starter_missing(config: &Config) -> Vec<StarterItem> {
+    starter(config)
+        .into_iter()
+        .filter(|i| !item_installed(i))
+        .collect()
 }
 
 /// The Piper catalogue: the day-old cache, else a fetch (cached atomically),
@@ -210,6 +261,7 @@ const USAGE: &str = "usage:
   xfc voices                    the screen
   xfc voices list [--installed] [--filter en_GB]
   xfc voices install <key>...   e.g. en_GB-alan-medium, or ggml-base.en
+  xfc voices install --starter  what the config names and is missing
   xfc voices remove <key>...";
 
 fn run(args: &[String], config: &Config) -> Result<bool> {
@@ -237,6 +289,9 @@ fn run(args: &[String], config: &Config) -> Result<bool> {
             }
             print_list(&store, &query, installed);
             Ok(true)
+        }
+        Some("install") if args.get(1).map(String::as_str) == Some("--starter") => {
+            Ok(install_starter_cli(&store))
         }
         Some("install") if args.len() > 1 => Ok(args[1..]
             .iter()
@@ -351,6 +406,43 @@ fn install_cli(store: &Store, key: &str) -> bool {
             false
         }
     }
+}
+
+/// `xfc voices install --starter`: the total first, then each missing item
+/// through the same atomic, verified path as a single install.
+fn install_starter_cli(store: &Store) -> bool {
+    let s = store.starter_status();
+    if s.complete() {
+        println!(
+            "starter set: complete ({} items) in {}",
+            store.starter.len(),
+            store.dir.display()
+        );
+        return true;
+    }
+    let rows = store.starter_rows();
+    println!(
+        "starter set: {} missing, {} to download into {}",
+        s.missing.len(),
+        catalogue::human_size(s.bytes),
+        store.dir.display()
+    );
+    for r in &rows {
+        println!(
+            "  {:<42} {:>8}",
+            r.entry.key,
+            catalogue::human_size(r.entry.download_size())
+        );
+    }
+    let mut ok = true;
+    for key in &s.unknown {
+        eprintln!("{key}: not in the catalogue, nothing to download (is the catalogue offline?)");
+        ok = false;
+    }
+    for r in &rows {
+        ok &= install_cli(store, &r.entry.key);
+    }
+    ok
 }
 
 fn remove_cli(store: &Store, key: &str) -> bool {

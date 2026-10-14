@@ -281,6 +281,113 @@ pub fn uses(c: &Configured) -> Vec<(String, Use)> {
     out
 }
 
+/// One member of the starter set: the spec the config names and the entry
+/// key that installs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StarterItem {
+    pub kind: Kind,
+    pub key: String,
+    /// The path the config names, what the crew will load.
+    pub spec: String,
+}
+
+/// The starter set: the speech model the config names plus every SINGLE
+/// voice it names (copilot, cabin, tower, approach, departure, ATIS when
+/// set), each once. Derived from the config, never a list of its own, so a
+/// changed default changes the starter. The away-field pool is not in it:
+/// those voices are optional and the caster draws only the installed ones.
+/// `voices` false (the copilot's speech off) leaves the voices out.
+pub fn starter_items(c: &Configured, voices: bool) -> Vec<StarterItem> {
+    let mut out: Vec<StarterItem> = Vec::new();
+    let mut push = |kind: Kind, spec: &str| {
+        if let Some(key) = key_of_spec(spec) {
+            if !out.iter().any(|i| i.kind == kind && i.key == key) {
+                out.push(StarterItem {
+                    kind,
+                    key,
+                    spec: spec.trim().to_string(),
+                });
+            }
+        }
+    };
+    push(Kind::Whisper, &c.whisper);
+    if voices {
+        for spec in [
+            &c.copilot,
+            &c.cabin,
+            &c.tower,
+            &c.approach,
+            &c.departure,
+            &c.atis,
+        ] {
+            push(Kind::Piper, spec);
+        }
+    }
+    out
+}
+
+/// The starter's state against the catalogue: what is missing, its download
+/// size, and what no catalogue offers (a local model that went missing, or
+/// no catalogue to hand).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StarterStatus {
+    pub missing: Vec<StarterItem>,
+    pub bytes: u64,
+    pub unknown: Vec<String>,
+}
+
+impl StarterStatus {
+    pub fn complete(&self) -> bool {
+        self.missing.is_empty()
+    }
+}
+
+/// Price the missing items against the catalogue entries.
+pub fn starter_status(missing: Vec<StarterItem>, catalogue: &[Entry]) -> StarterStatus {
+    let mut bytes = 0;
+    let mut unknown = Vec::new();
+    for item in &missing {
+        match catalogue
+            .iter()
+            .find(|e| e.kind == item.kind && e.key == item.key && !e.is_local())
+        {
+            Some(e) => bytes += e.download_size(),
+            None => unknown.push(item.key.clone()),
+        }
+    }
+    StarterStatus {
+        missing,
+        bytes,
+        unknown,
+    }
+}
+
+/// The starter's one line: "starter set: complete", or how many are missing,
+/// their size and the key that gets them.
+pub fn starter_line(s: &StarterStatus, key_hint: &str) -> String {
+    if s.complete() {
+        return "starter set: complete".into();
+    }
+    let n = s.missing.len();
+    let size = if s.unknown.len() == n {
+        String::new()
+    } else if s.unknown.is_empty() {
+        format!(", {}", human_size(s.bytes))
+    } else {
+        format!(
+            ", {} plus {} not in the catalogue",
+            human_size(s.bytes),
+            s.unknown.len()
+        )
+    };
+    let hint = if key_hint.is_empty() {
+        String::new()
+    } else {
+        format!(", {key_hint}")
+    };
+    format!("starter set: {n} missing{size}{hint}")
+}
+
 /// One line of the list: an entry, whether it is installed, who uses it.
 #[derive(Clone, Debug)]
 pub struct Row {
@@ -501,6 +608,70 @@ mod tests {
         assert!(cat
             .iter()
             .all(|e| e.files.iter().all(|f| !f.url.ends_with("MODEL_CARD"))));
+    }
+
+    #[test]
+    fn the_starter_is_the_configs_single_voices_and_speech_model() {
+        let items = starter_items(&defaults(), true);
+        let keys: Vec<(Kind, &str)> = items.iter().map(|i| (i.kind, i.key.as_str())).collect();
+        assert_eq!(
+            keys,
+            [
+                (Kind::Whisper, "ggml-base.en"),
+                (Kind::Piper, "en_US-amy-medium"),
+                (Kind::Piper, "en_US-hfc_female-medium"),
+                (Kind::Piper, "en_GB-alba-medium"),
+                (Kind::Piper, "en_US-ryan-high"),
+                (Kind::Piper, "en_GB-northern_english_male-medium"),
+            ]
+        );
+        // The pool is never in it; a shared voice counts once; the ATIS
+        // when set; speech off leaves only the speech model.
+        let c = Configured {
+            atis: "models/en_GB-alan-medium.onnx".into(),
+            cabin: "models/en_US-amy-medium.onnx".into(),
+            ..defaults()
+        };
+        let keys: Vec<String> = starter_items(&c, true).into_iter().map(|i| i.key).collect();
+        assert!(!keys.iter().any(|k| k.contains("vctk")), "{keys:?}");
+        assert_eq!(keys.iter().filter(|k| *k == "en_US-amy-medium").count(), 1);
+        assert!(keys.contains(&"en_GB-alan-medium".to_string()));
+        assert_eq!(starter_items(&c, false).len(), 1);
+    }
+
+    #[test]
+    fn the_starter_line_prices_what_is_missing() {
+        let cat = parse_piper(FIXTURE).unwrap();
+        let alan = cat.iter().find(|e| e.key == "en_GB-alan-medium").unwrap();
+        let item = |kind, key: &str| StarterItem {
+            kind,
+            key: key.into(),
+            spec: String::new(),
+        };
+        let mut cat = cat.clone();
+        cat.extend(whisper_catalogue());
+        let s = starter_status(Vec::new(), &cat);
+        assert_eq!(starter_line(&s, "press s"), "starter set: complete");
+        let s = starter_status(
+            vec![
+                item(Kind::Piper, "en_GB-alan-medium"),
+                item(Kind::Whisper, "ggml-base.en"),
+            ],
+            &cat,
+        );
+        let base = whisper_catalogue()
+            .into_iter()
+            .find(|e| e.key == "ggml-base.en")
+            .unwrap()
+            .download_size();
+        assert_eq!(s.bytes, alan.download_size() + base);
+        assert_eq!(
+            starter_line(&s, "press s"),
+            format!("starter set: 2 missing, {}, press s", human_size(s.bytes))
+        );
+        // Nothing to price it against: still said, without a size.
+        let s = starter_status(vec![item(Kind::Piper, "en_GB-alan-medium")], &[]);
+        assert_eq!(starter_line(&s, ""), "starter set: 1 missing");
     }
 
     #[test]
