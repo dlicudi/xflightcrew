@@ -1633,16 +1633,14 @@ fn head_on_at_a_junction_the_one_giving_way_holds_short_of_it() {
     assert_eq!(guard_events(&all), (0, 0, 0), "no guard needed");
 }
 
-/// OUR AUTO TAXI'S ROUTE IS GIVEN WAY TO (EGKK, 2026-10-14: a 737 cleared
-/// to Mike drove onto the stretch our A330 was about to taxi, unseen, and
-/// the two stood nose to nose 44 m apart for good). We taxi east along the
-/// line, standing for anything just ahead of us as our own guard does; [1]
-/// comes up a side branch to turn west down the same line, straight at us.
-/// With our route published it holds short on the branch until we are
-/// through, then goes; without it (the old picture) it drives onto our
-/// stretch and both stand nose to nose.
+/// OUR ROUTE BUYS US NO RIGHT OF WAY (the pilot, 2026-10-14: "giving us
+/// priority is not realistic"). We taxi east along the line, standing for
+/// anything just ahead of us as our own guard does; [1] comes up a side
+/// branch to turn west down the same line, straight at us. Published or
+/// not, our route changes nothing in the meeting: who goes first is
+/// Ground's to say (#297), never a silent yield to the player.
 #[test]
-fn traffic_holds_short_of_the_stretch_our_auto_taxi_is_driving() {
+fn our_published_route_buys_us_no_right_of_way() {
     use crate::phase::OwnTarget;
     let field = fixtures::xtst();
     let end = field.end("09").unwrap();
@@ -1697,15 +1695,10 @@ fn traffic_holds_short_of_the_stretch_our_auto_taxi_is_driving() {
         );
         (x, stood, on_our_stretch)
     };
-    let (x, stood, entered) = run(true);
-    assert!(!entered, "held short of our stretch");
-    assert!(
-        x >= 700.0 && stood == 0.0,
-        "we taxied through: {x:.0} m, stood {stood:.0} s"
-    );
-    // Unseen, it met us nose to nose and we stood until the guard moved it.
-    let (_, stood, entered) = run(false);
-    assert!(entered && stood > 60.0, "stood {stood:.0} s");
+    let published = run(true);
+    let unseen = run(false);
+    assert!(published.2 && unseen.2, "it drove onto our stretch both times");
+    assert_eq!(published, unseen, "the route changed the meeting");
 }
 
 /// HEAD ON ON A DEAD END: a 172 taxiing up a line with a 737 PARKED on it,

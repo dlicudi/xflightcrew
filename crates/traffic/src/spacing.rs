@@ -621,11 +621,11 @@ pub fn apply(
     // a mover has the right of way; both outside, a line-up or a vacate
     // first, then the nearer to it, then the lower id. Both inside: met too
     // late, both stop by the spacing above, and the guard below sorts it.
-    // OUR OWN AIRCRAFT ON ITS AUTO TAXI is a mover too, the last party
-    // (index `n`), and always has the right of way: EGKK (2026-10-14), a
-    // 737 cleared to Mike drove onto the stretch our A330 was about to
-    // taxi (we carried no route, so it never gave way) and the two stood
-    // nose to nose 44 m apart for good.
+    // OUR OWN AIRCRAFT is never a party to the meetings: it would always
+    // win them, a right of way no airport gives the player (the pilot,
+    // 2026-10-14). Who goes first between us and the traffic is Ground's to
+    // say, to us as to them (#297); until then our route is read only for
+    // the deadlock tow below (`in_own_way`).
     let origin = fleet.first().map(|a| a.kin.pos()).unwrap_or((0.0, 0.0));
     let own_way = own
         .filter(|o| o.on_ground)
@@ -639,7 +639,6 @@ pub fn apply(
         .iter()
         .map(|a| route_ahead(a, MEETING_LOOKAHEAD_M))
         .collect();
-    long.push(own_way.clone());
     let perf_of = |p: usize| fleet.get(p).map_or(OWN_PERF, |a| a.perf);
     let who_of = |p: usize| {
         fleet

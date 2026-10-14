@@ -378,11 +378,12 @@ everything blackboxes to `logs/blackbox.jsonl`. A record's kind is the first arg
   (`traffic_guard::traffic_stop_in_m`, `GOVERNOR_LAG_S`): the gap less the ground covered in 3.5 s
   at our speed; our nose from the `.acf` (`GroundGeometry::nose_m`, ahead of the CG), the target's
   tail from its type (`traffic::perf::length_of`).
-- **Our auto taxi's route is given way to** (`autotaxi::route_ahead`, `traffic::OwnTarget::route`):
-  in the traffic's meetings we are a mover that always has the right of way, so a mover holds
-  short of our stretch at its junction (EGKK 2026-10-14: unseen, a 737 drove onto it and the two
-  stood nose to nose for good); one standing in our way while we stand 2 x `STUCK_S` is towed,
-  ours never (`spacing_cleared` `why: own`, `own_route_m` on the spacing records).
+- **The world never favours our aircraft**: no silent right of way, ever (the pilot,
+  2026-10-14); who goes first between us and traffic is Ground's to say, to us too (#297). Our
+  auto taxi's route (`autotaxi::route_ahead`, `traffic::OwnTarget::route`) serves only the
+  deadlock breaker: traffic standing on it waiting for us while we stand 2 x `STUCK_S` is towed,
+  as two traffic deadlocked are, ours never (EGKK 2026-10-14, a 737 nose to nose for good;
+  `spacing_cleared` `why: own`, `own_route_m`).
 - **The sim brakes against hard rudder**, so the plugin holds `override_toe_brakes` while steering;
   a pilot brake latches `xcopilot/brake_yield`. Never "fix" a corner that stops the aircraft by
   tuning the governor.
