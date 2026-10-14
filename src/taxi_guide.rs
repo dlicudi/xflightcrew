@@ -707,6 +707,13 @@ impl Geo {
             (p.0 - origin.0) * self.m_per_deg_lat,
         )
     }
+    /// The inverse of [`Geo::to_m`]: meters from `origin` to (lat, lon).
+    pub(crate) fn to_ll(&self, origin: (f64, f64), m: (f64, f64)) -> (f64, f64) {
+        (
+            origin.0 + m.1 / self.m_per_deg_lat,
+            origin.1 + m.0 / self.m_per_deg_lon,
+        )
+    }
 }
 
 pub(crate) fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
