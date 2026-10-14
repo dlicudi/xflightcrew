@@ -259,12 +259,36 @@ pub fn final_cap_mps(from_mps: f64, wind: Option<(f64, f64)>) -> f64 {
 /// never under [`SLOW_MIN_KTS`]. A headwind leaves it at [`HANDOVER_KTS`]:
 /// slower over the ground is already inside the range. With 38 kt indicated
 /// a 12 kt tailwind is 50 kt over the ground, and the takeover, which waits
-/// for 39, never came: the route flew on over the pad. Pure.
+/// for 39, never came: the route flew on over the pad. A tailwind past
+/// [`FINAL_TAILWIND_MAX_KTS`] keeps [`HANDOVER_KTS`]: slowing further cannot
+/// bring the groundspeed into the range, it only spends the translational
+/// lift (LXGB 2026-10-14: 30 kt asked, 5 kt indicated at the hand-over, 16 kt
+/// downwind, #281). Pure.
 pub fn slow_target_kts(ias_kts: f64, gs_kts: f64) -> f64 {
     if !(ias_kts.is_finite() && gs_kts.is_finite()) {
         return HANDOVER_KTS;
     }
-    (HANDOVER_KTS - (gs_kts - ias_kts).max(0.0)).max(SLOW_MIN_KTS)
+    let tail = (gs_kts - ias_kts).max(0.0);
+    if tail > FINAL_TAILWIND_MAX_KTS {
+        return HANDOVER_KTS;
+    }
+    (HANDOVER_KTS - tail).max(SLOW_MIN_KTS)
+}
+
+/// The most tailwind a final into the pad is slowed into, kt: what the
+/// slow-down's target absorbs ([`slow_target_kts`]). More, the hover is never
+/// handed a downwind final ([`hover_takes_final`]): the slow-down keeps its
+/// airspeed, the pad overflown goes around, bounded, and says so (#281).
+pub const FINAL_TAILWIND_MAX_KTS: f64 = HANDOVER_KTS - SLOW_MIN_KTS;
+
+/// Whether the hover loop may take the final: slowed to the hand-over speed,
+/// inside the mode's groundspeed range, and not downwind past
+/// [`FINAL_TAILWIND_MAX_KTS`] (`tail_kts`, the wind along the track to the
+/// pad). Pure.
+pub fn hover_takes_final(ias_kts: f64, gs_mps: f64, tail_kts: f64) -> bool {
+    ias_kts < HANDOVER_KTS + 2.0
+        && gs_mps < hover::TAKEOVER_MAX_MPS
+        && !(tail_kts > FINAL_TAILWIND_MAX_KTS)
 }
 /// The slowest the slow-down flies under the cruise modes: altitude hold at
 /// 35 kt drifted backwards and sank once (ETHC, 2026-09-23), so the tailwind
@@ -586,7 +610,9 @@ pub enum SlowCheck {
 /// S-76 is planned to make is too fast. Either goes around; a slow enough
 /// aircraft is the hover loop's wherever it is. Pure.
 pub fn slow_check(gs_kts: f64, ias_kts: f64, remaining_m: f64, final_m: f64, pad_behind: bool) -> SlowCheck {
-    if ias_kts < HANDOVER_KTS + 2.0 {
+    // Slowed, but downwind past what the hand-over absorbs (the target kept
+    // its airspeed, #281): never the hover's, so the pad behind is overflown.
+    if ias_kts < HANDOVER_KTS + 2.0 && (gs_kts - ias_kts <= FINAL_TAILWIND_MAX_KTS || !pad_behind) {
         return SlowCheck::OnTrack;
     }
     if pad_behind {
@@ -805,6 +831,65 @@ pub fn spot_for_runway(
         .iter()
         .find(|(id, ..)| id.eq_ignore_ascii_case(named))
         .cloned()
+}
+
+/// The landing track (true) of the runway end `id` among [`runway_spots`]:
+/// from its spot toward the other end's (the list holds each runway's two
+/// ends together). Pure.
+pub fn runway_track(spots: &[(String, f64, f64)], id: &str) -> Option<f64> {
+    let i = spots.iter().position(|(s, ..)| s.eq_ignore_ascii_case(id.trim()))?;
+    let (_, la, lo) = &spots[i];
+    let (_, la2, lo2) = spots.get(i ^ 1)?;
+    Some(crate::nav::bearing_deg(*la, *lo, *la2, *lo2))
+}
+
+/// A final flown this far off the landing track is still that final.
+pub const FINAL_ALIGN_DEG: f64 = 30.0;
+
+/// The points (x east, y north, m) to fly before the spot at `pad` so the
+/// final lands along `land_deg` (true), INTO the wind the tower's runway
+/// was picked for (#281), from `from` (the route's last point before the
+/// spot, or the aircraft): the join `final_m` out on the extended
+/// centreline, on the approach side, and, from abeam or the far side, a
+/// point abeam it `2 r_m` out on `side` (+1 right of the final, -1 left), so
+/// the turns there are a half circle onto the final. Nothing when `from` is
+/// already on the final. Pure.
+///
+/// LXGB (2026-10-14, 1791970325-heli_route): 15 km east on 27's final the
+/// tower gave 09, wind 070/14; the spot moved to 09's end and the S-76 flew
+/// on west to it, the final 16 kt downwind, and slowed to 5 kt indicated.
+pub fn final_join(
+    pad: (f64, f64),
+    land_deg: f64,
+    from: (f64, f64),
+    final_m: f64,
+    r_m: f64,
+    side: f64,
+) -> Vec<(f64, f64)> {
+    let (ux, uy) = (land_deg.to_radians().sin(), land_deg.to_radians().cos());
+    let along = (from.0 - pad.0) * ux + (from.1 - pad.1) * uy;
+    if along <= -final_m && crate::angles::abs_diff_deg(bearing(from, pad), land_deg) <= FINAL_ALIGN_DEG {
+        return Vec::new();
+    }
+    let join = (pad.0 - ux * final_m, pad.1 - uy * final_m);
+    if along <= -final_m - r_m {
+        return vec![join];
+    }
+    // Right of the final is the track turned 90 degrees clockwise.
+    let off = 2.0 * r_m * side.signum();
+    vec![(join.0 + uy * off, join.1 - ux * off), join]
+}
+
+/// The side of the final (+1 right, -1 left, looking along `land_deg`) that
+/// `from` lies on; on the line, the left (a standard circuit's). Pure.
+pub fn join_side(pad: (f64, f64), land_deg: f64, from: (f64, f64)) -> f64 {
+    let (ux, uy) = (land_deg.to_radians().sin(), land_deg.to_radians().cos());
+    let right = (from.0 - pad.0) * uy - (from.1 - pad.1) * ux;
+    if right > 1.0 {
+        1.0
+    } else {
+        -1.0
+    }
 }
 
 /// The runway end a spot's name lands on ("LXGB runway 27" is "27").
@@ -1908,6 +1993,7 @@ async fn fly(
     let mut bug_set: Option<f64> = None;
     let mut unheld_since: Option<std::time::Instant> = None;
     let mut slow_tail_said = false;
+    let mut final_tail_said = false;
     if route.resume {
         let c = xp.get_float_array(&collective).await.ok()
             .and_then(|v| v.first().copied()).unwrap_or(0.45);
@@ -1939,6 +2025,11 @@ async fn fly(
     let mut clearance = ClearanceWatch::default();
     let mut readback_sent: Option<String> = None;
     let mut hold_said = false;
+    // The join onto the tower's final, points just before the pad (#281),
+    // and the level the approach's path is capped at (never climbing back
+    // for a longer way round).
+    let mut joined_n = 0usize;
+    let mut ceiling_ft = cruise_alt_ft;
     let t0 = std::time::Instant::now();
     let mut last = std::time::Instant::now();
     let mut tick_n = 0u64;
@@ -2006,21 +2097,120 @@ async fn fly(
                     *last = (name.clone(), la, lo);
                 }
                 pad = to_m;
+                // The final is the runway's, INTO the wind it was picked for
+                // (#281): the arrival is re-planned to join it from the side
+                // it is on, never the old approach flown on to the moved spot.
+                // A join made for an earlier runway goes with it.
+                let n = pts.len();
+                let first = (n - 1 - joined_n).max(leg.min(n - 1));
+                pts.drain(first..n - 1);
+                route.points.drain(first..n - 1);
+                joined_n = 0;
+                let replannable = matches!(phase, Phase::Cruise | Phase::Approach | Phase::Slow);
+                let land = runway_track(&route.runway_spots, &id).filter(|_| replannable);
+                let mut plan: Vec<(f64, f64)> = Vec::new();
+                let mut side = 0.0;
+                if let Some(land) = land {
+                    let n = pts.len();
+                    let from_m = if leg + 1 >= n { here } else { pts[n - 2].1 };
+                    let gs_kts = s.gs * 1.943_84;
+                    let r = turn_radius_m(s.gs.max(APPROACH_KTS * 0.514_444));
+                    let final_m = approach_slow_m(gate.map_or(GATE_FT, |g| g.1), gs_kts)
+                        .max(path.map_or(0.0, |p| p.slow_m))
+                        + r;
+                    side = join_side(pad, land, from_m);
+                    plan = final_join(pad, land, from_m, final_m, r, side);
+                    // Round the far side of the field: the side over the
+                    // lower ground, the aircraft's own on a tie or no probe.
+                    if plan.len() == 2 {
+                        let other = final_join(pad, land, from_m, final_m, r, -side);
+                        let line = |p: &[(f64, f64)]| {
+                            let mut l = vec![(s.lat, s.lon)];
+                            l.extend(p.iter().map(|m| geo.to_ll(origin, *m)));
+                            l.push((la, lo));
+                            sample_corridor(&l, 500.0, CORRIDOR_HALF_M)
+                        };
+                        let (mine, theirs) = (line(&plan), line(&other));
+                        let (a, b) = tokio::join!(
+                            crate::terrain::max_elevation_ft(&xp, &mine),
+                            crate::terrain::max_elevation_ft(&xp, &theirs),
+                        );
+                        if let (Some(a), Some(b)) = (a, b) {
+                            if b + 100.0 < a {
+                                plan = other;
+                                side = -side;
+                            }
+                        }
+                    }
+                    let at = pts.len() - 1;
+                    for (k, m) in plan.iter().enumerate() {
+                        let fix = if k + 1 == plan.len() { format!("FINAL{id}") } else { format!("BASE{id}") };
+                        let ll = geo.to_ll(origin, *m);
+                        pts.insert(at + k, (fix.clone(), *m));
+                        route.points.insert(at + k, (fix, ll.0, ll.1));
+                    }
+                    joined_n = plan.len();
+                }
+                let replanned = !plan.is_empty();
+                if replanned {
+                    // Not yet on the new final: no slow-down before it. The
+                    // speed law takes the lever back where the slow law has it.
+                    if phase == Phase::Slow {
+                        phase = Phase::Approach;
+                        let c = slow_law.take().map_or(0.45, |l| l.cmd);
+                        law = Some(SpeedLaw::from(c, s.ias));
+                        slow_want = f64::INFINITY;
+                    }
+                    // The descent never climbs back for the longer way round.
+                    if let Ok(alt) = xp.get_float(crate::datarefs::ALTITUDE_FT).await {
+                        ceiling_ft = ceiling_ft.min(alt);
+                    }
+                    // The gate clears the ground on the new legs too.
+                    if let Some((pad_e, g)) = gate {
+                        let mut rest = vec![(s.lat, s.lon)];
+                        rest.extend(route.points[leg.min(route.points.len())..].iter().map(|p| (p.1, p.2)));
+                        if let Some(ahead) = crate::terrain::max_elevation_ft(
+                            &xp,
+                            &sample_corridor(&rest, 500.0, CORRIDOR_HALF_M),
+                        )
+                        .await
+                        {
+                            let ng = gate_agl_ft(pad_e, Some(ahead + ind_offset_ft.unwrap_or(0.0)));
+                            if ng > g {
+                                gate = Some((pad_e, ng));
+                                path = Some(ApproachPath::new(ng, approach_kts));
+                                level_ft = pad_e + ng;
+                            }
+                        }
+                    }
+                }
                 crate::blackbox::record(
                     "heli_route",
                     serde_json::json!({
                         "event": "pad_to_tower_runway", "from": from, "to": name, "rwy": id,
                         "was_rwy": pad_rwy, "phase": format!("{phase:?}"),
                         "to_pad_m": dist(here, pad), "book": format!("{book:?}"),
+                        "land_deg": land, "replanned": replanned, "join_side": side,
+                        "join": plan.iter().map(|m| geo.to_ll(origin, *m)).collect::<Vec<_>>(),
+                        "final_in_deg": pts.len().checked_sub(2).map(|i| bearing(pts[i].1, pad)),
+                        "remaining_m": remaining_m(here, &pts.iter().map(|p| p.1).collect::<Vec<_>>(), leg),
+                        "gate_agl": gate.map(|g| g.1),
                     }),
                 );
                 say(
                     &voice,
                     Priority::Readback,
-                    format!(
-                        "Tower wants runway {}. Landing on it.",
-                        crate::crew_radio::spell_runway(&id)
-                    ),
+                    if replanned {
+                        format!(
+                            "Tower wants runway {}. Joining its final, into the wind.",
+                            crate::crew_radio::spell_runway(&id)
+                        )
+                    } else {
+                        format!(
+                            "Tower wants runway {}. Landing on it.",
+                            crate::crew_radio::spell_runway(&id)
+                        )
+                    },
                 );
                 pad_rwy = Some(id);
             }
@@ -2398,7 +2588,11 @@ async fn fly(
                         say(
                             &voice,
                             Priority::Caution,
-                            "Too fast for the pad. Going around: straight ahead, slowing, then back to it on the hover.",
+                            if final_tail_said {
+                                "Downwind over the pad. Going around: straight ahead, keeping the airspeed."
+                            } else {
+                                "Too fast for the pad. Going around: straight ahead, slowing, then back to it on the hover."
+                            },
                         );
                     }
                 }
@@ -2439,8 +2633,8 @@ async fn fly(
                 let vplan = match (phase, gate, path) {
                     (Phase::Around, _, _) => Some((level_ft, level_ft, level_ft)),
                     (Phase::Approach | Phase::Slow, Some((pad, g)), Some(p)) => Some((
-                        p.target_ft(remaining, pad, cruise_alt_ft),
-                        p.target_ft((remaining - s.gs * 10.0).max(0.0), pad, cruise_alt_ft),
+                        p.target_ft(remaining, pad, ceiling_ft),
+                        p.target_ft((remaining - s.gs * 10.0).max(0.0), pad, ceiling_ft),
                         pad + g,
                     )),
                     _ => None,
@@ -2523,6 +2717,34 @@ async fn fly(
                         serde_json::json!({ "event": "slow_tailwind", "ias": s.ias, "gs_kts": gs_kts, "target_kts": handover_want }),
                     );
                 }
+                // The wind along the track to the pad, while slowing: a
+                // final flown downwind is never the hover's (#281). The
+                // wind read, else the groundspeed over the airspeed.
+                let slowing = matches!(phase, Phase::Slow | Phase::Around);
+                let tail_kts = if slowing {
+                    let (wdir, wspd) = tokio::join!(
+                        xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE),
+                        xp.get_float(crate::datarefs::WIND_SPEED_MSC),
+                    );
+                    match (wdir, wspd) {
+                        (Ok(d), Ok(v)) => -wind_components(bearing(here, pad), d, v).0 * 1.943_84,
+                        _ => gs_kts - s.ias,
+                    }
+                } else {
+                    0.0
+                };
+                if slowing && tail_kts > FINAL_TAILWIND_MAX_KTS && !final_tail_said {
+                    final_tail_said = true;
+                    crate::blackbox::record(
+                        "heli_route",
+                        serde_json::json!({ "event": "final_tailwind", "tail_kts": tail_kts, "ias": s.ias, "gs_kts": gs_kts, "target_kts": handover_want, "to_pad_m": to_pad, "phase": format!("{phase:?}"), "agl": s.agl_ft }),
+                    );
+                    say(
+                        &voice,
+                        Priority::Caution,
+                        format!("{tail_kts:.0} knots of tailwind on the final. Keeping the airspeed, no hover downwind."),
+                    );
+                }
                 // Level in the cruise with the collective pinned at its cap:
                 // the speed the power makes becomes the cruise, said once.
                 if phase == Phase::Cruise && !climbing {
@@ -2548,7 +2770,6 @@ async fn fly(
                 // The slow-down's lever is the slow law's (down to the
                 // cruise floor, the autopilot's nose-up doing the slowing);
                 // the approach keeps the speed law on its 0.35 floor.
-                let slowing = matches!(phase, Phase::Slow | Phase::Around);
                 if let Some(l) = law.as_mut() {
                     l.set_floor(if phase == Phase::Approach {
                         APPROACH_COLLECTIVE_MIN
@@ -2584,11 +2805,7 @@ async fn fly(
                 // a helicopter at these speeds, and waiting for the gate's
                 // height kept the cycle above going over the ridge.
                 let slowed = s.ias < HANDOVER_KTS + 2.0;
-                if slowing
-                    && (at_gate || slowed)
-                    && s.ias < HANDOVER_KTS + 2.0
-                    && s.gs < hover::TAKEOVER_MAX_MPS
-                {
+                if slowing && (at_gate || slowed) && hover_takes_final(s.ias, s.gs, tail_kts) {
                     hover::request(
                         base_url.clone(),
                         voice.clone(),
@@ -3412,7 +3629,8 @@ mod tests {
         );
         assert_eq!(slow_target_kts(38.0, 38.0), HANDOVER_KTS);
         assert_eq!(slow_target_kts(38.0, 44.0), 32.0);
-        assert_eq!(slow_target_kts(38.0, 60.0), SLOW_MIN_KTS);
+        assert_eq!(slow_target_kts(38.0, 44.0 + 2.0), SLOW_MIN_KTS);
+        assert_eq!(slow_target_kts(38.0, 60.0), HANDOVER_KTS, "past what it absorbs: the lift kept (#281)");
         assert_eq!(slow_target_kts(f64::NAN, 40.0), HANDOVER_KTS);
         // Through the speed law and a lagged plant, a 6 kt tailwind: the old
         // target settles 44 kt over the ground, outside the takeover; the new
@@ -3772,6 +3990,108 @@ mod tests {
         assert!(spot_for_runway(&spots, current.as_deref(), Some("15")).is_none(), "no such end");
         // Once moved, the same runway named again is no move.
         assert!(spot_for_runway(&spots, Some("09"), Some("09")).is_none());
+    }
+
+    /// #281, LXGB 2026-10-14 (1791970325-heli_route): 15 km east on 27's
+    /// final the tower gave 09 (wind 070/14). The arrival is re-planned onto
+    /// 09's final: round the field to a join on the WEST of it, then the
+    /// final inbound on 09's track (about 088 true), long enough for the
+    /// approach's slow-down and final. From the approach side on the line
+    /// nothing changes; from well out to one side only the join is added.
+    #[test]
+    fn a_runway_change_joins_the_new_final_into_the_wind() {
+        let spots = runway_spots(&lxgb());
+        let land = runway_track(&spots, "09").expect("09's track");
+        assert!((land - 88.0).abs() < 2.0, "{land}");
+        let back = runway_track(&spots, "27").expect("27's track");
+        assert!((crate::angles::abs_diff_deg(back, land) - 180.0).abs() < 0.1, "{back}");
+        assert!(runway_track(&spots, "15").is_none());
+        let (_, la, lo) = spots.iter().find(|s| s.0 == "09").cloned().unwrap();
+        let geo = Geo::new(la);
+        let pad = (0.0, 0.0);
+        // East of the field on the 27 line, 15 km out.
+        let east = crate::nav::project_latlon(la, lo, land, 15_000.0 / 1852.0);
+        let from = geo.to_m((la, lo), east);
+        let r = turn_radius_m(150.0 * 0.514_444);
+        let final_m = approach_slow_m(GATE_FT, 150.0) + r;
+        let side = join_side(pad, land, from);
+        assert_eq!(side, -1.0, "on the line: the left");
+        let plan = final_join(pad, land, from, final_m, r, side);
+        assert_eq!(plan.len(), 2, "{plan:?}");
+        let (base, join) = (plan[0], plan[1]);
+        let inbound = bearing(join, pad);
+        assert!(crate::angles::abs_diff_deg(inbound, land) < 0.5, "final in on {inbound:.1}");
+        assert!((dist(join, pad) - final_m).abs() < 1.0);
+        assert!(join.0 < -final_m * 0.9, "the join is west of the field: {join:?}");
+        assert!(base.1 > join.1 + r, "the base is north of the line (left of 09): {base:?}");
+        assert!((dist(base, join) - 2.0 * r).abs() < 1.0);
+        // Into the tower's wind: 070/14 is a headwind on that final; the
+        // old final (west on to the moved spot) was 13 kt downwind.
+        let (head, _) = wind_components(inbound, 70.0, 14.0);
+        assert!(head > 12.0, "{head}");
+        let (old_head, _) = wind_components(bearing(from, pad), 70.0, 14.0);
+        assert!(-old_head > FINAL_TAILWIND_MAX_KTS, "{old_head}");
+        // South of the line, the join is flown on the south.
+        let south = (from.0, from.1 - 3000.0);
+        assert_eq!(join_side(pad, land, south), 1.0);
+        let plan = final_join(pad, land, south, final_m, r, 1.0);
+        assert!(plan[0].1 < plan[1].1 - r, "{plan:?}");
+        // West of the field on 09's final already: nothing to add.
+        let west = (-(final_m + 5000.0), -150.0);
+        assert!(final_join(pad, land, west, final_m, r, join_side(pad, land, west)).is_empty());
+        // Well out west and off to the north: the join only.
+        let nw = (-(final_m + 3.0 * r), 8000.0);
+        let plan = final_join(pad, land, nw, final_m, r, join_side(pad, land, nw));
+        assert_eq!(plan.len(), 1);
+        assert!(crate::angles::abs_diff_deg(bearing(plan[0], pad), land) < 0.5);
+        // The local frame goes back to the same place.
+        let ll = geo.to_ll((la, lo), from);
+        assert!((ll.0 - east.0).abs() < 1e-9 && (ll.1 - east.1).abs() < 1e-9);
+    }
+
+    /// #281: no plan flies its final downwind. From anywhere round the field,
+    /// for any runway, the final's last leg runs within [`FINAL_ALIGN_DEG`]
+    /// of the landing track and at least the approach's length, so any wind
+    /// the tower could pick that runway for (within 60 degrees of it) is no
+    /// tailwind on it; and a final that still has one past
+    /// [`FINAL_TAILWIND_MAX_KTS`] is never slowed out of its translational
+    /// lift nor handed to the hover, and goes around once overflown.
+    #[test]
+    fn no_final_is_flown_downwind() {
+        let (pad, r, final_m) = ((0.0, 0.0), 1200.0, 6000.0);
+        for land in (0..12).map(|i| i as f64 * 30.0 + 7.0) {
+            for brg in (0..16).map(|i| i as f64 * 22.5) {
+                for d in [800.0, 4000.0, 9000.0, 25_000.0] {
+                    let from = (d * brg.to_radians().sin(), d * brg.to_radians().cos());
+                    let plan = final_join(pad, land, from, final_m, r, join_side(pad, land, from));
+                    let start = plan.last().copied().unwrap_or(from);
+                    let inbound = bearing(start, pad);
+                    let off = crate::angles::abs_diff_deg(inbound, land);
+                    assert!(off <= FINAL_ALIGN_DEG + 1e-9, "land {land} from {brg}/{d}: {inbound:.1}");
+                    assert!(dist(start, pad) >= final_m - 1.0, "land {land} from {brg}/{d}");
+                    for wind_off in [-60.0, -30.0, 0.0, 30.0, 60.0] {
+                        let (head, _) = wind_components(inbound, land + wind_off, 10.0);
+                        assert!(head > -0.01, "land {land} from {brg}/{d}, wind {wind_off}: head {head:.2} m/s");
+                    }
+                }
+            }
+        }
+        // The guard, where no re-plan could be made.
+        let tail = FINAL_TAILWIND_MAX_KTS + 1.0;
+        assert_eq!(slow_target_kts(38.0, 38.0 + tail), HANDOVER_KTS);
+        assert_eq!(slow_target_kts(5.0, 37.0), HANDOVER_KTS, "LXGB: 5 kt indicated, 37 over the ground");
+        assert!(!hover_takes_final(30.0, 15.0, tail), "downwind: not the hover's");
+        assert!(hover_takes_final(30.0, 15.0, FINAL_TAILWIND_MAX_KTS - 1.0));
+        assert!(!hover_takes_final(30.0, hover::TAKEOVER_MAX_MPS + 1.0, 0.0));
+        assert!(!hover_takes_final(45.0, 15.0, 0.0));
+        assert!(hover_takes_final(30.0, 15.0, f64::NAN), "no wind read is no tailwind");
+        // Kept at the hand-over speed, too fast over the ground for the
+        // hover: the pad behind is overflown (a bounded go-around), ahead
+        // the slow-down carries on.
+        let gs = 38.0 + tail + 10.0;
+        assert_eq!(slow_check(gs, 38.0, 500.0, 1300.0, true), SlowCheck::Overflown);
+        assert_eq!(slow_check(gs, 38.0, 2000.0, 1300.0, false), SlowCheck::OnTrack);
+        assert_eq!(slow_check(30.0, 38.0, 500.0, 1300.0, true), SlowCheck::OnTrack, "slow enough: the hover's");
     }
 
     /// A towered landing: the final reported once the inbound call is out
