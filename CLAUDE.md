@@ -796,14 +796,24 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   feature, `scripts/build-release.sh`): `xcopilot/` removed first, backups to
   `data()/plugin-backups/`, never inside `plugins/`; refused while X-Plane runs unless
   `--while-running`; it NEVER reloads plugins. `xfc licenses` prints the notices verbatim.
-- **The home screen** (2026-10-14, `src/home.rs`, `xfc home`/`setup`, `--print` for support):
-  checks with a fix each (X-Plane folder, ONE Web API GET on open or `c`, plugin, mic NAME,
-  starter set), the voices screen, the dashboard's own Settings view (`ui::SettingsPane`),
-  files; `r` boots in-process. Plain `xfc` shows it only on a TTY with a REQUIRED check red
-  (folder, plugin missing, starter incomplete: file checks only); `xfc run` never. The starter
-  set is the config's named single voices plus its whisper model (`voices::starter`, never a
-  list of its own; `xfc voices install --starter`, `s`). The ATC pool draws INSTALLED voices
-  only, a missing pick falls back once (`voice::installed_pool`, `loadable_station_model`).
+- **One app, no setup step** (2026-10-15, `src/app.rs`): plain `xfc` on a TTY is ONE TUI, tabs
+  Flight (`ui::Dashboard`), Checks (`home::screen::Checks`: X-Plane folder, ONE Web API GET on
+  open or `c`, plugin, mic NAME, starter set), Voices (`voices::screen::Pane`, Cast included),
+  one per `settings::Section` (`ui::SettingsPane` + `Scope`; the ATC tab's "cast at" box), Plugin,
+  Files; `/` searches every setting, `P` the pinned. **The crew boots itself**: required checks
+  green, at once; red, the Flight tab says "waiting on" and it boots the moment they pass
+  (`spawn_tui_crew`, its own thread). A slow check (the home field's apt.dat) saves on a worker
+  (`SLOW_SAVES`). `xfc home`/`setup` open on Checks (`--print` for support); `xfc run` is
+  headless, never the app. **A crew restart is the process starting again in place, ON THE
+  GROUND ONLY** (`src/restart.rs`: no loop of ours holding anything, stopped on the ground or
+  no X-Plane running; a failed read refuses): an in-process re-boot is unsound (a dozen threads
+  with no stop, the safe hold never stood down, `voice::RUNNING`, the EFB's port). It re-execs
+  with the SHELL's environment (`capture_original_env`), so a pin moved out of `.env` stops
+  pinning; what waits for it is `restart::waiting` (`config::restart_pending`, `stale_pins`).
+  The starter set is the config's named single voices plus its whisper model
+  (`voices::starter`, never a list of its own; `xfc voices install --starter`, `s`). The ATC
+  pool draws INSTALLED voices only, a missing pick falls back once (`voice::installed_pool`,
+  `loadable_station_model`).
 
 ## EFB: a page on the LAN (`src/efb/`, `docs/efb.md`)
 
