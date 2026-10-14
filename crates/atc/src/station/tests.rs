@@ -3632,9 +3632,23 @@ fn incursion_traffic_check_ignores_the_other_runways_stream() {
     *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
 }
 
+/// Every cell the coach reads, back to a flight nobody has worked yet: a
+/// test before it under the same lock leaves its own (a landing handoff, the
+/// FAA dialect), and the coach read them as ours (#271, #278). Call with
+/// [`SIDE_STATE_LOCK`] held.
+fn coach_fresh() {
+    *OWN_STRIP.clearance.lock().unwrap() = None;
+    *OWN_STRIP.taxi_route.lock().unwrap() = None;
+    *OWN_STRIP.vectors.lock().unwrap() = None;
+    *OWN_STRIP.landing_handoff.lock().unwrap() = None;
+    *ATIS.lock().unwrap() = None;
+    *ACTIVE_DIALECT.lock().unwrap() = Dialect::Icao;
+}
+
 #[test]
 fn the_coach_suggests_the_parsers_happy_path() {
     let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    coach_fresh();
     *ACTIVE_PANEL.lock().unwrap() = Some((
         "Gibraltar".into(),
         11.0,
@@ -3754,6 +3768,7 @@ fn the_coach_suggests_the_parsers_happy_path() {
 #[test]
 fn the_coach_leads_with_the_prerequisite() {
     let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    coach_fresh();
     *ACTIVE_PANEL.lock().unwrap() = Some((
         "Gibraltar".into(),
         11.0,
@@ -10639,6 +10654,7 @@ fn real_install_lfpg_off_strip_stand_route_needs_no_crossing() {
 #[test]
 fn the_coach_speaks_the_fields_dialect() {
     let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    coach_fresh();
     *ACTIVE_PANEL.lock().unwrap() = Some((
         "Boston".into(),
         20.0,

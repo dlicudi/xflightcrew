@@ -444,6 +444,10 @@ pub struct FullAuto {
     pub piston_mixture: bool,
 }
 
+/// The cancel's acknowledgement: never a hand-back. "Your aircraft" is the
+/// mission's own last line, said once the aircraft is held (#287).
+pub(crate) const CANCELLING: &str = "Cancelling.";
+
 #[derive(Deserialize, Default)]
 struct Args {
     #[serde(default)]
@@ -509,8 +513,14 @@ impl Tool for FullAuto {
         // A waiver is only ever this arm's preflight's to hand on.
         crate::full_auto::RUNWAY_WAIVER_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
         if a.off {
+            // The hand-back is the mission's to say, once whatever holds the
+            // aircraft holds it (`give_up`: "Cancelled. Your aircraft.
+            // Parking brake set."). LEMG 2026-10-14 (#287): this line said
+            // "You have the aircraft" the instant the taxi governor let go,
+            // before the give-up parked, so nothing held the 737 when xfc
+            // went away inside that gap.
             return Ok(if crate::full_auto::abort() {
-                "I've stopped flying. You have the aircraft.".to_string()
+                CANCELLING.to_string()
             } else {
                 "I'm not flying the aircraft.".to_string()
             });
@@ -2104,6 +2114,17 @@ pub fn spoken_arm_line(
 mod tests {
     use super::*;
     use crate::recovery_plan::Join;
+
+    /// The cancel never claims the hand-back: every abort path ends in a
+    /// line of the mission's own that does, said once the aircraft is held
+    /// (LEMG 2026-10-14, #287).
+    #[test]
+    fn the_cancel_leaves_the_hand_back_to_the_mission() {
+        assert!(!CANCELLING.to_ascii_lowercase().contains("aircraft"));
+        let mission = crate::test_support::module_source("full_auto");
+        assert!(mission.contains("\"Cancelled. Your aircraft.\""));
+        assert!(mission.contains("fn hand_back_line("));
+    }
 
     /// The planner's runway need is the arm's: an airframe that recites only
     /// a takeoff distance is still checked (the live landing figure alone

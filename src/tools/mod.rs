@@ -726,6 +726,7 @@ impl Registry {
                 h.clone(),
                 profile.engines,
             )));
+            tools.push(Box::new(heli::LowerCollective::new(h)));
             tools.push(Box::new(heli::Hover::new(
                 h,
                 start,
