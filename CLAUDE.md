@@ -30,6 +30,14 @@ and safety fixes only. "Every miss becomes a rule" is for the grammar, never a f
 Order: stage A (untangle copilot from autonomy, station behind `party_line`), B (command loop),
 C (ATC per-flight strips, `crates/nav`), D (`crates/traffic`).
 
+## Keep it simple (2026-10-15, the pilot)
+
+Prefer the simplest implementation that meets the requirements. Reuse existing code and
+patterns. Avoid speculative features, unnecessary abstractions and new frameworks. Do not
+introduce additional functionality unless explicitly requested. When refactoring, aim to reduce
+complexity and code size without sacrificing necessary functionality or reliability. A brief
+for an agent is held to the same rule: strike every item the pilot did not ask for.
+
 ## Wire contracts (never rename)
 
 Named 2026-07-30. These names survived the renames because they are wire contracts:
