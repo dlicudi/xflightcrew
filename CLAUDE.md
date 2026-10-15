@@ -498,18 +498,19 @@ phase needs or a spoken decline; the upset RECOVERY only for an actual upset or 
 
 ## Checklist flows: the list at its phase, three flavours
 
-`src/flow.rs` runs the airframe's XChecklist sections (`src/checklist.rs`); replies via
-`flow::take_reply` (CLOSED vocabulary). Every `Item::Act` carries its pass test, so a runner reads
-FIRST: in state is confirmed, never re-written; an item a loop owns (`held_by_automation`) is
-named as held, never written.
+`src/flow.rs` runs the airframe's native list (`checklists/<profile id>.yaml`, `src/checklist.rs`);
+replies via `flow::take_reply` (CLOSED vocabulary). Every checked item is read FIRST: in state is
+confirmed, never re-written; an item a loop owns (`held_by_automation`) is named as held, never
+written.
 
 - **Crew** (pilot flying, copilot acting): the spoken "descent checklist". **Monitor** (an
   automation flying): read-only and silent, ONE line at the end (`flow::summary_line`).
   **Instruct** ("talk me through"): never writes; says, watches, moves on.
-- **A compound test is read whole** (`checklist::Expr`): a term that does not read is no
-  verdict; an ACT only through its ONE settable term. A file the aircraft ships is
-  `checklist: acf:<file>` (`checklist::resolve_acf_path`); a phase split into parts is ONE list
-  (`checklist_flow:`).
+- **An item names a STATE, never a dataref** (`checklist::STATES`, closed): an actable one acts
+  through its curated tool (`act: false` only confirms), a read-only one is only read; nothing
+  writes raw. Each read has ONE home: the tool's readback, `datarefs::*`, or the profile's
+  `checklist_states:` for an add-on's own switch. An unknown state or value fails the LOAD; a
+  term that does not read is no verdict. Sections are keyed by phase (`before_landing`).
 - **Who starts one**: `flow::Tracker`, one-shot per flight, every boundary SUSTAINED. Under an
   automation Monitor starts at once (BEFORE LANDING only once configured); with a pilot flying the
   copilot PROPOSES and never acts by itself; the after-landing list runs once OFF the runway. A

@@ -26,8 +26,8 @@ field comes from the METAR. See
 
 ## Checklists
 
-Checklists come from the aircraft's XChecklist file, where its profile names
-one. "Run the before takeoff checklist" reads each item in turn: it sets the
+Checklists come from the aircraft's own list, `checklists/<profile id>.yaml`,
+where one ships. "Run the before takeoff checklist" reads each item in turn: it sets the
 items it can, checks the ones it can read and calls out the ones that are
 yours. "Talk me through the before landing checklist" reads them without
 touching anything.
