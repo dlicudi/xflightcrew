@@ -1050,6 +1050,27 @@
         assert!(c.eval(&s).is_none());
     }
 
+    /// 2026-10-15: the yoke under the autoland 10 s and 1 s before the
+    /// wheels made the landing the pilot's.
+    #[test]
+    fn a_recent_hand_on_the_yoke_is_the_pilots_flying() {
+        use super::inputs::pilot_hands_recent;
+        assert!(pilot_hands_recent(Some(1.0)));
+        assert!(pilot_hands_recent(Some(10.0)));
+        assert!(!pilot_hands_recent(Some(120.0)), "long ago");
+        assert!(!pilot_hands_recent(None), "never");
+    }
+
+    /// 2026-10-15: "About 14300 feet a minute makes the profile", close in.
+    /// Too close to the field or too steep to fly is "too high", never a rate.
+    #[test]
+    fn tod_passed_close_in_is_too_high_not_a_rate() {
+        let too_high = "We're past the descent point. We're too high for a straight-in.";
+        assert_eq!(TodPassed.eval(&cruise_with_dest(6.0)).as_deref(), Some(too_high));
+        // 15 nm out, 10,000 ft to lose over 2 minutes: 5,000 fpm.
+        assert_eq!(TodPassed.eval(&cruise_with_dest(15.0)).as_deref(), Some(too_high));
+    }
+
     /// LEJR-LXGB, 2026-09-14: level at 7,000 with the SimBrief ring long
     /// passed, but the follower pacing its own descent to 27D10 at 3,143 ft.
     /// The advisor speaks the follower's point and altitude, and "past the

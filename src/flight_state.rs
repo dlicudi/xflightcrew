@@ -1247,7 +1247,10 @@ mod tests {
             crate::test_support::module_source("full_auto"),
             "fn stop_active()",
         );
-        assert!(mission_end.contains("publish_flight_transition(None)"));
+        assert!(
+            !mission_end.contains("publish_flight_transition"),
+            "the transition is the flight's: a mission end keeps it"
+        );
     }
 
     /// The doors do every step, in order: the loops stop before the

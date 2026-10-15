@@ -192,9 +192,10 @@ pub(crate) fn forget_mission() {
 fn stop_active() {
     forget_mission();
     set_arrival_runway(None, "mission_ended");
-    // The plan's transition was armed for this mission; the monitor's
-    // altimeter check must not judge the next flight against it.
-    crate::tools::instruments::publish_flight_transition(None);
+    // The plan's transition is the FLIGHT's, not the mission's: kept past a
+    // mission end (the next flight's door, `flight_state::forget_flight`,
+    // clears it). Cleared here, an airborne give-up over the UK fell back to
+    // the profile's 18,000 ft and nagged "QNH" at FL090 (2026-10-15).
     ACTIVE.store(false, SeqCst);
 }
 
@@ -631,8 +632,55 @@ async fn give_up(
     // Held before it is said: the line claims the pilot has the aircraft, so
     // whatever is going to hold it should already be holding it.
     let held = hand_back_brakes(xp, valve_set).await;
+    let line = match hand_back_speed(xp, voice, reason).await {
+        Some(kts) => format!(
+            "{} I'm holding {kts:.0} knots for you.",
+            hand_back_line(line, held)
+        ),
+        None => hand_back_line(line, held),
+    };
     clear_stage();
-    announce(voice, Priority::Caution, &hand_back_line(line, held));
+    announce(voice, Priority::Caution, &line);
+}
+
+/// Whether an airborne give-up owes the speed to the governor: in the air,
+/// no autothrottle holding it, no governor already on it, and not the
+/// pilot's own cancel (their "my controls" takes the lever too). Pure.
+fn speed_hand_back_owed(
+    on_ground: Option<bool>,
+    autothrottle: Option<bool>,
+    governor_holding: bool,
+    reason: &str,
+) -> bool {
+    on_ground == Some(false) && autothrottle != Some(true) && !governor_holding && reason != "abort"
+}
+
+/// "Your aircraft" in the air with a speed held, as autoland's give-up does
+/// (`autoland::hand_back_speed_kts`): an enroute give-up left the A/T off
+/// and the lever at 0.33, and the 737 crept to 268 kt below FL100
+/// (2026-10-15). The speed held, `None` when none was owed.
+async fn hand_back_speed(xp: &XPlaneClient, voice: &Option<Voice>, reason: &str) -> Option<f64> {
+    let free = xp.unscoped();
+    let (ground, flap) = tokio::join!(
+        free.get_float(crate::datarefs::ON_GROUND_ANY),
+        free.get_float(crate::datarefs::FLAP_RATIO),
+    );
+    let on_ground = ground.ok().map(sim::ground::on_ground);
+    let flap = flap.ok();
+    let at = crate::autoflight::read_autothrottle_engaged(&free).await;
+    let governor = crate::tools::speedhold::flight_target().is_some();
+    if !speed_hand_back_owed(on_ground, at, governor, reason) {
+        return None;
+    }
+    let profile = crate::aircraft::live_profile()?;
+    let kts = crate::autoland::hand_back_speed_kts(
+        crate::tools::approach_ias(&profile),
+        flap.unwrap_or(0.0),
+        &crate::aircraft::flap_limits(),
+    );
+    event("hand_back_speed", json!({ "speed_kts": kts, "flap": flap }));
+    crate::tools::speedhold::arm_flight(free.base_url().to_string(), voice.clone(), kts);
+    Some(kts)
 }
 
 /// The circuit mission ended because its takeoff never completed, or the

@@ -651,6 +651,11 @@ impl XPlaneClient {
         }
     }
 
+    /// The Web API base this client talks to, for a loop armed from it.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     pub fn cancellation(&self) -> Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.cancel.clone()
     }

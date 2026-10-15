@@ -153,6 +153,8 @@ pub async fn run(
     let mut seen_sim = false;
     let mut disconnected = false;
     let mut had_flying_control = false;
+    // The last tick the pilot's hand was on the yoke under the automation.
+    let mut hands_at: Option<Instant> = None;
     let mut control_idle_since: Option<Instant> = None;
     let mut airspeed_recovery = crate::interaction::Recovery::default();
     let mut cabin_recovery = crate::interaction::Recovery::default();
@@ -1199,7 +1201,9 @@ pub async fn run(
                 crate::climb_watch::publish_telemetry(p.telemetry());
             }
             crate::climb_watch::publish_sim_speed(inputs.sim_speed);
-            note_interventions(&inputs, flight.control());
+            if note_interventions(&inputs, flight.control()) {
+                hands_at = Some(Instant::now());
+            }
             crate::blackbox::record(
                 "state",
                 serde_json::json!({
@@ -1336,6 +1340,7 @@ pub async fn run(
                     flap_ratio: snap.flap_ratio,
                     gear_down: snap.gear_down,
                     automation_flying: snap.automation_flying,
+                    pilot_hands: pilot_hands_recent(hands_at.map(|t| t.elapsed().as_secs_f64())),
                     dest_dist_nm: snap.dest_dist_nm,
                     crashed: voice.crashed(),
                     instructing: crate::mode::instructing(),
