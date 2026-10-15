@@ -39,6 +39,10 @@ pub struct Route {
     /// TOWARD the centreline ([`turn_round_hint`]). `None` leaves the
     /// first sign of the error to decide ([`committed_err`]).
     pub turn_hint: Option<f64>,
+    /// How far short of the route's end the drive stops its reference point:
+    /// [`STOP_SHORT_M`], or the nose's length back from a hold line
+    /// ([`Route::hold_nose_behind_end`]).
+    pub(super) stop_short_m: f64,
 }
 
 /// How far before a runway span the landing light comes on.
@@ -250,6 +254,7 @@ impl Route {
             align_course_deg: self.align_course_deg,
             align_runway: self.align_runway.clone(),
             turn_hint: self.turn_hint,
+            stop_short_m: self.stop_short_m,
         })
     }
 
@@ -289,6 +294,7 @@ impl Route {
             align_course_deg: None,
             align_runway: None,
             turn_hint: None,
+            stop_short_m: STOP_SHORT_M,
         })
     }
 
@@ -411,7 +417,15 @@ impl Route {
 
     /// Meters left before the stop point short of the holding point.
     pub fn remaining(&self, progress: f64) -> f64 {
-        self.total - STOP_SHORT_M - progress
+        self.total - self.stop_short_m - progress
+    }
+
+    /// This route ends at a hold line: stop with the NOSE behind it, `nose_m`
+    /// ahead of the reference point the route is flown by, never less than
+    /// [`STOP_SHORT_M`]. The reference point on the line put an A330's nose
+    /// 29.6 m past it, a 737's 18.1 m (EGKK, 2026-10-15).
+    pub fn hold_nose_behind_end(&mut self, nose_m: f64) {
+        self.stop_short_m = STOP_SHORT_M.max(nose_m + NOSE_BEHIND_LINE_M);
     }
 
     /// The bend-imposed speed cap near `progress`, if a corner is close

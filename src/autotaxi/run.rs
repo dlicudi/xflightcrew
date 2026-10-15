@@ -380,7 +380,8 @@ pub(super) async fn drive(
     tracing::info!("auto taxi started");
     crate::blackbox::record(
         "autotaxi",
-        serde_json::json!({"event": "engaged", "total_m": route.total, "base_kts": base_kts}),
+        serde_json::json!({"event": "engaged", "total_m": route.total, "base_kts": base_kts,
+                           "stop_short_m": route.stop_short_m}),
     );
     // The pilot's pace: adopted from a spoken "taxi at N" mid-drive.
     let mut base = base_kts;
@@ -441,13 +442,7 @@ pub(super) async fn drive(
     // turn reads too, our nose from the `.acf`, the picture read once a
     // second (the sim's TCAS table is five Web API reads), the hold's
     // state. No picture, no guard.
-    let own_size = OwnSize::from_mtow(
-        xp.get_float(crate::datarefs::ACF_M_MAX_KG)
-            .await
-            .ok()
-            .map(f64::from),
-    )
-    .with_nose(crate::aircraft::learned::acf_model().and_then(|m| m.geometry.nose_m));
+    let own_size = OwnSize::read(&xp).await;
     let mut traffic_track = TrafficTrack::default();
     let mut traffic_seen: Vec<Seen> = Vec::new();
     let mut traffic_read_at: Option<std::time::Instant> = None;
