@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::aircraft::AircraftProfile;
-use crate::checklist::{self, Checklist, Item};
+use crate::checklist::{self, cap_first, Checklist, Item};
 use crate::config::Config;
 use crate::tools::ToolCtx;
 use crate::voice::{Priority, Voice};
@@ -109,7 +109,6 @@ pub enum Reply {
     Abort,
 }
 
-static WAITING: Mutex<Option<Waiting>> = Mutex::new(None);
 static REPLY: Mutex<Option<Reply>> = Mutex::new(None);
 
 /// The installed lists (the airframe's), and the profile's section title
@@ -121,10 +120,27 @@ static OVERRIDES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// A proposed section (index into the lists) and when it was offered.
 static PROPOSAL: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
 
-/// The running flow's flavour (`None` when no flow runs).
-static RUNNING: Mutex<Option<Flavour>> = Mutex::new(None);
-/// Why a running Crew flow was stood down, for its closing line.
-static STOOD_DOWN: Mutex<Option<StandDown>> = Mutex::new(None);
+/// The running flow (`None` when no flow runs): its flavour, what it waits
+/// on from the pilot, and why it was stood down, for its closing line.
+#[derive(Clone, Copy)]
+struct Running {
+    flavour: Flavour,
+    waiting: Option<Waiting>,
+    stood_down: Option<StandDown>,
+}
+static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
+
+/// What the running flow waits on (nothing when no flow runs).
+fn waiting() -> Option<Waiting> {
+    lock(&RUNNING).and_then(|r| r.waiting)
+}
+
+fn set_waiting(w: Option<Waiting>) {
+    if let Some(r) = lock(&RUNNING).as_mut() {
+        r.waiting = w;
+    }
+}
+
 /// How long "Climb checklist when you're ready?" stays answerable.
 pub const PROPOSAL_TTL: Duration = Duration::from_secs(120);
 
@@ -162,7 +178,7 @@ pub(crate) fn overrides_for(
         .checklist_flow
         .iter()
         .map(|(k, v)| {
-            let key = section_key(k);
+            let key = checklist::section_key(k);
             let titles = v.titles();
             let title = match titles.as_slice() {
                 [one] => one.to_string(),
@@ -177,19 +193,10 @@ pub(crate) fn overrides_for(
         .collect()
 }
 
-fn lists() -> Arc<Vec<Checklist>> {
-    lock(&LISTS).clone().unwrap_or_else(|| Arc::new(Vec::new()))
-}
-
 /// The installed lists, for readers (the panel's Checklist tab): the same
 /// `Arc` until the next [`install`], so a reader can tell a swap by it.
 pub(crate) fn installed() -> Arc<Vec<Checklist>> {
-    lists()
-}
-
-/// "before_landing" / "Before Landing" -> "before landing".
-fn section_key(k: &str) -> String {
-    checklist::section_key(k)
+    lock(&LISTS).clone().unwrap_or_else(|| Arc::new(Vec::new()))
 }
 
 /// The phase sections a flow can be triggered for, in flight order.
@@ -207,7 +214,7 @@ pub const SECTIONS: [&str; 5] = [
 /// spoken "climb checklist" uses, so the two can never disagree). `None`
 /// when this file has no such section: nothing is proposed, nothing said.
 pub fn find_section(key: &str) -> Option<usize> {
-    let lists = lists();
+    let lists = installed();
     find_section_in(&lists, key, &lock(&OVERRIDES))
 }
 
@@ -216,7 +223,7 @@ pub(crate) fn find_section_in(
     key: &str,
     overrides: &[(String, String)],
 ) -> Option<usize> {
-    let key = section_key(key);
+    let key = checklist::section_key(key);
     if let Some((_, title)) = overrides.iter().find(|(k, _)| *k == key) {
         return lists
             .iter()
@@ -591,15 +598,19 @@ impl InitWatch {
 /// The first cause is the one said. `true` when a flow was stood down.
 pub fn stand_down(why: StandDown) -> bool {
     *lock(&PROPOSAL) = None;
-    let running = *lock(&RUNNING);
+    let mut running = lock(&RUNNING);
+    let Some(r) = running.as_mut() else {
+        return false;
+    };
     let applies = match why {
-        StandDown::Mission(_) => running == Some(Flavour::Crew),
-        StandDown::NewFlight(_) => running.is_some(),
+        StandDown::Mission(_) => r.flavour == Flavour::Crew,
+        StandDown::NewFlight(_) => true,
     };
     if !ACTIVE.load(SeqCst) || !applies {
         return false;
     }
-    lock(&STOOD_DOWN).get_or_insert(why);
+    r.stood_down.get_or_insert(why);
+    drop(running);
     RUN.cancel();
     true
 }
@@ -626,7 +637,7 @@ pub fn phase_boundary(section: &str, config: &Config, voice: &Voice) {
     if ACTIVE.load(SeqCst) {
         return;
     }
-    let title = lists()
+    let title = installed()
         .get(idx)
         .map(|c| c.title.clone())
         .unwrap_or_default();
@@ -972,7 +983,7 @@ pub fn take_reply(text: &str) -> Option<Reply> {
         return None;
     }
     let reply = classify(text)?;
-    let waiting = *lock(&WAITING);
+    let waiting = waiting();
     let taken = matches!(
         (reply, waiting),
         (Reply::Abort, _)
@@ -1094,7 +1105,7 @@ pub fn sheet() -> Option<Sheet> {
 /// The standing proposal's list title ("Climb"), if one is answerable.
 pub fn proposal_title() -> Option<String> {
     let idx = proposal()?;
-    lists().get(idx).map(|c| c.title.clone())
+    installed().get(idx).map(|c| c.title.clone())
 }
 
 /// What the running list waits on from the pilot: "confirm" (yes/no at a
@@ -1103,7 +1114,7 @@ pub fn waiting_for() -> Option<&'static str> {
     if !ACTIVE.load(SeqCst) {
         return None;
     }
-    match *lock(&WAITING) {
+    match waiting() {
         Some(Waiting::Confirm) => Some("confirm"),
         Some(Waiting::Advance) => Some("advance"),
         None => None,
@@ -1124,7 +1135,7 @@ pub fn start(idx: usize, flavour: Flavour, config: Config, voice: Voice) -> bool
     } else {
         flavour
     };
-    let lists = lists();
+    let lists = installed();
     if idx >= lists.len() {
         return false;
     }
@@ -1137,10 +1148,12 @@ pub fn start(idx: usize, flavour: Flavour, config: Config, voice: Voice) -> bool
         return false;
     };
     *lock(&REPLY) = None;
-    *lock(&WAITING) = None;
     *lock(&PROPOSAL) = None;
-    *lock(&STOOD_DOWN) = None;
-    *lock(&RUNNING) = Some(flavour);
+    *lock(&RUNNING) = Some(Running {
+        flavour,
+        waiting: None,
+        stood_down: None,
+    });
     std::thread::Builder::new()
         .name("checklist-flow".into())
         .spawn(move || {
@@ -1154,7 +1167,6 @@ pub fn start(idx: usize, flavour: Flavour, config: Config, voice: Voice) -> bool
             lease.record(sim::run::Outcome::Completed);
             drop(lease);
             DETAIL.clear();
-            *lock(&WAITING) = None;
             *lock(&RUNNING) = None;
             ACTIVE.store(false, SeqCst);
         })
@@ -1290,14 +1302,6 @@ fn stateful(
     }
 }
 
-fn cap_first(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-        None => String::new(),
-    }
-}
-
 // ---- the runner --------------------------------------------------------------
 
 /// How long the instructor waits for an item before moving on.
@@ -1324,7 +1328,7 @@ fn take_pending_reply() -> Option<Reply> {
 /// Watch for the pilot to satisfy the item's pass test (when it has one),
 /// or to say next/skip; the clock restarts on "wait".
 async fn wait_for(xp: &XPlaneClient, item: &Item, secs: f64) -> Waited {
-    *lock(&WAITING) = Some(Waiting::Advance);
+    set_waiting(Some(Waiting::Advance));
     let mut deadline = Instant::now() + Duration::from_secs_f64(secs);
     let out = loop {
         if stopped() {
@@ -1345,14 +1349,14 @@ async fn wait_for(xp: &XPlaneClient, item: &Item, secs: f64) -> Waited {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
-    *lock(&WAITING) = None;
+    set_waiting(None);
     out
 }
 
 /// Ask a hazard confirm through the command loop: yes, no (skip), or abort.
 async fn confirm(voice: &Voice, hazard: &str) -> Waited {
     voice.say_crew(Priority::Readback, format!("Confirm, {hazard}?"));
-    *lock(&WAITING) = Some(Waiting::Confirm);
+    set_waiting(Some(Waiting::Confirm));
     let deadline = Instant::now() + Duration::from_secs_f64(CONFIRM_WAIT_SECS);
     let out = loop {
         if stopped() {
@@ -1368,7 +1372,7 @@ async fn confirm(voice: &Voice, hazard: &str) -> Waited {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
-    *lock(&WAITING) = None;
+    set_waiting(None);
     out
 }
 
@@ -1434,8 +1438,6 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
     );
     let mut failed = 0usize;
     let mut discrepancies = 0usize;
-    // The monitor's discrepancies, named in its one summary line.
-    let mut not_set: Vec<String> = Vec::new();
     let mut aborted = false;
     // A Crew list writes the cockpit: an automation taking the aircraft
     // after it began stands it down (the list belongs to the flight that
@@ -1520,9 +1522,7 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
                     "checklist",
                     json!({ "event": "discrepancy", "title": cl.title, "item": item_line(item), "value": value }),
                 );
-                if flavour == Flavour::Monitor {
-                    not_set.push(item_line(item).to_string());
-                } else {
+                if flavour != Flavour::Monitor {
                     say(&line);
                 }
             }
@@ -1589,33 +1589,35 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
                 let line = item_line(item);
                 match act(cl, item, &ctx, xp, voice).await {
                     None => mark(ItemState::Said),
-                    Some(msg) => match msg {
-                        Acted::Ok => {
-                            mark(ItemState::Done);
-                            say(line)
-                        }
-                        Acted::Skipped => {
-                            mark(ItemState::Skipped);
-                            say(&format!("{line} Skipped, your call."))
-                        }
-                        Acted::Failed(what) => {
-                            mark(ItemState::Failed);
-                            failed += 1;
-                            say(&format!("{line} {what}"));
-                        }
-                        Acted::Aborted => {
-                            aborted = true;
-                            break;
-                        }
+                    Some(Acted::Ok) => {
+                        mark(ItemState::Done);
+                        say(line)
+                    }
+                    Some(Acted::Skipped) => {
+                        mark(ItemState::Skipped);
+                        say(&format!("{line} Skipped, your call."))
+                    }
+                    Some(Acted::Failed(what)) => {
+                        mark(ItemState::Failed);
+                        failed += 1;
+                        say(&format!("{line} {what}"));
+                    }
+                    Some(Acted::Aborted) => {
+                        aborted = true;
+                        break;
                     }
                 }
             }
         }
     }
-    let stood_down = if aborted { *lock(&STOOD_DOWN) } else { None };
+    let stood_down = if aborted {
+        lock(&RUNNING).and_then(|r| r.stood_down)
+    } else {
+        None
+    };
     let summary = match stood_down {
         Some(why) => stood_down_line(&cl.title, why),
-        None => summary_line(&cl.title, flavour, aborted, failed, discrepancies, &not_set),
+        None => summary_line(&cl.title, flavour, aborted, failed, discrepancies),
     };
     sheet_update(sheet_gen, |s| {
         s.running = false;
@@ -1639,16 +1641,15 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
 }
 
 /// The list's closing line. The monitor's is the ONLY line it speaks for a
-/// list, so it carries the discrepancies by name ("Climb checklist complete,
-/// 2 items not as listed: flaps, up on schedule; altimeters, standard at
-/// transition."); the other flavours said each item as they went.
+/// list, so it carries the count of discrepancies ("Climb checklist
+/// complete, 2 items not as listed, on the checklist card."); the other
+/// flavours said each item as they went.
 pub fn summary_line(
     title: &str,
     flavour: Flavour,
     aborted: bool,
     failed: usize,
     discrepancies: usize,
-    not_set: &[String],
 ) -> String {
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     if aborted {
@@ -1666,7 +1667,6 @@ pub fn summary_line(
     // The count only: the items themselves are on the checklist card
     // (`sheet`, the EFB's), item by item. Spoken whole they ran to eleven
     // items a list into the transcript and the speaker (pilot, 2026-10-07).
-    let _ = not_set;
     format!(
         "{title} checklist complete, {discrepancies} item{} not as listed, on the checklist card.",
         plural(discrepancies)
@@ -1712,21 +1712,9 @@ async fn act(
                     _ => return Some(Acted::Skipped),
                 }
             }
-            let ok = checklist::run_step(
-                tool,
-                args,
-                &cl.lights,
-                &cl.flaps,
-                &cl.electrical,
-                &cl.fuel_selector,
-                cl.engines,
-                cl.magnetos_per_engine,
-                cl.park_brake_valve_set,
-                cl.pitot_heat_dataref.clone(),
-                ctx,
-            )
-            .await
-            .is_ok();
+            let ok = checklist::run_step(tool, args, &cl.profile, ctx)
+                .await
+                .is_ok();
             if !ok {
                 return Some(Acted::Failed("Didn't take, check it."));
             }
@@ -2381,36 +2369,32 @@ mod tests {
     }
 
     #[test]
-    fn monitor_summary_names_its_discrepancies() {
-        // The monitor's one line per list: clean, or the items by name.
+    fn monitor_summary_counts_its_discrepancies() {
+        // The monitor's one line per list: clean, or the count.
         assert_eq!(
-            summary_line("Climb", Flavour::Monitor, false, 0, 0, &[]),
+            summary_line("Climb", Flavour::Monitor, false, 0, 0),
             "Climb checklist complete."
         );
-        let names = vec![
-            "Flaps, up on schedule.".to_string(),
-            "Altimeters, standard at transition.".to_string(),
-        ];
         assert_eq!(
-            summary_line("Climb", Flavour::Monitor, false, 0, 2, &names),
+            summary_line("Climb", Flavour::Monitor, false, 0, 2),
             "Climb checklist complete, 2 items not as listed, on the checklist card."
         );
         assert_eq!(
-            summary_line("Descent", Flavour::Monitor, false, 0, 1, &names[..1]),
+            summary_line("Descent", Flavour::Monitor, false, 0, 1),
             "Descent checklist complete, 1 item not as listed, on the checklist card."
         );
         // The crew flavour counts failed writes; the instructor counts what
         // the pilot never did (no names: each was said as it happened).
         assert_eq!(
-            summary_line("Descent", Flavour::Crew, false, 1, 0, &[]),
+            summary_line("Descent", Flavour::Crew, false, 1, 0),
             "Descent checklist complete, 1 item didn't take, check the panel."
         );
         assert_eq!(
-            summary_line("Descent", Flavour::Instruct, false, 0, 3, &[]),
+            summary_line("Descent", Flavour::Instruct, false, 0, 3),
             "Descent checklist complete, 3 items not as listed, on the checklist card."
         );
         assert_eq!(
-            summary_line("Descent", Flavour::Monitor, true, 0, 1, &names),
+            summary_line("Descent", Flavour::Monitor, true, 0, 1),
             "Descent checklist stopped where we were."
         );
     }
@@ -2425,7 +2409,11 @@ mod tests {
         assert_eq!(take_reply("yes"), None);
         ACTIVE.store(true, SeqCst);
         let lease = RUN.begin().unwrap();
-        *lock(&WAITING) = None;
+        *lock(&RUNNING) = Some(Running {
+            flavour: Flavour::Crew,
+            waiting: None,
+            stood_down: None,
+        });
         *lock(&REPLY) = None;
         // Running, waiting on nothing: a stray "yes" is not consumed, "stop" is.
         assert_eq!(take_reply("yes"), None);
@@ -2433,12 +2421,12 @@ mod tests {
         assert!(stopped());
         drop(lease);
         // At a confirm: yes/no taken, "next" is not an answer.
-        *lock(&WAITING) = Some(Waiting::Confirm);
+        set_waiting(Some(Waiting::Confirm));
         assert_eq!(take_reply("next"), None);
         assert_eq!(take_reply("affirm"), Some(Reply::Yes));
         assert_eq!(lock(&REPLY).take(), Some(Reply::Yes));
         // At an instructor item: set/next/skip/yes all taken.
-        *lock(&WAITING) = Some(Waiting::Advance);
+        set_waiting(Some(Waiting::Advance));
         assert_eq!(take_reply("set"), Some(Reply::Next));
         assert_eq!(take_reply("skip"), Some(Reply::Skip));
         assert_eq!(
@@ -2446,12 +2434,12 @@ mod tests {
             Some(Reply::DoIt)
         );
         // ...but not at a hazard confirm, where "help me" is not a yes.
-        *lock(&WAITING) = Some(Waiting::Confirm);
+        set_waiting(Some(Waiting::Confirm));
         assert_eq!(take_reply("help me with that"), None);
-        *lock(&WAITING) = Some(Waiting::Advance);
+        set_waiting(Some(Waiting::Advance));
         assert_eq!(take_reply("flaps ten"), None);
         ACTIVE.store(false, SeqCst);
-        *lock(&WAITING) = None;
+        *lock(&RUNNING) = None;
         *lock(&REPLY) = None;
     }
 
@@ -2567,26 +2555,33 @@ mod tests {
         // A Monitor list is the mission's own audit: it goes on...
         ACTIVE.store(true, SeqCst);
         let lease = RUN.begin().unwrap();
-        *lock(&RUNNING) = Some(Flavour::Monitor);
-        *lock(&STOOD_DOWN) = None;
+        let running = |flavour| {
+            Some(Running {
+                flavour,
+                waiting: None,
+                stood_down: None,
+            })
+        };
+        *lock(&RUNNING) = running(Flavour::Monitor);
         assert!(!stand_down(StandDown::Mission("full auto")));
         assert!(!stopped());
         // ...but not into a new flight.
         assert!(stand_down(StandDown::NewFlight("setup")));
         assert!(stopped());
         drop(lease);
-        *lock(&STOOD_DOWN) = None;
         // A Crew list stops for the mission, and the first cause is kept.
-        *lock(&RUNNING) = Some(Flavour::Crew);
+        *lock(&RUNNING) = running(Flavour::Crew);
         assert!(stand_down(StandDown::Mission("full auto")));
         assert!(stand_down(StandDown::NewFlight("reposition")));
-        assert_eq!(*lock(&STOOD_DOWN), Some(StandDown::Mission("full auto")));
+        assert_eq!(
+            lock(&RUNNING).and_then(|r| r.stood_down),
+            Some(StandDown::Mission("full auto"))
+        );
         assert_eq!(
             stood_down_line("After landing", StandDown::Mission("full auto")),
             "After landing checklist stopped, full auto has the aircraft."
         );
         ACTIVE.store(false, SeqCst);
         *lock(&RUNNING) = None;
-        *lock(&STOOD_DOWN) = None;
     }
 }
