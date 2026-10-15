@@ -263,6 +263,10 @@ pub struct SettingsPane {
     /// A text setting being edited (callsign, airline telephony): the
     /// buffer, saved on Enter, dropped on Esc.
     pub edit: Option<String>,
+    /// A switch, choice or number opened with Enter: the value Enter saves
+    /// (Left/Right/Space change it, Esc drops it). Nothing changes from
+    /// the row itself.
+    pub step: Option<settings::Value>,
     /// The `.env` move was asked for: the list is shown, `y` makes it.
     pub confirm_import: bool,
     /// A save whose check is slow (the home field's apt.dat scan) runs on a
@@ -420,13 +424,6 @@ impl Dashboard {
     /// changed on screen.
     pub fn key(&mut self, key: KeyCode) -> bool {
         match key {
-            KeyCode::Left | KeyCode::Right => {
-                self.view = match self.view {
-                    View::Health => View::Transcript,
-                    View::Transcript => View::Health,
-                };
-                true
-            }
             _ if self.view == View::Transcript => match key {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.scrollback = self.scrollback.saturating_sub(1);
@@ -601,8 +598,7 @@ impl SettingsPane {
                 self.notice = None;
                 true
             }
-            KeyCode::Right | KeyCode::Char(' ') | KeyCode::Char('l') => self.adjust(true),
-            KeyCode::Left | KeyCode::Char('h') => self.adjust(false),
+            KeyCode::Enter => self.open(),
             KeyCode::Char('m') => {
                 let moves = crate::env_import::pending();
                 if crate::env_import::movable(&moves).is_empty() {
@@ -641,34 +637,54 @@ impl SettingsPane {
         }
     }
 
-    /// Step the selected setting and apply it. A refusal (an env-pinned knob, a
-    /// value the setting won't take) is shown rather than swallowed: silently
-    /// ignoring a keypress is how a settings screen teaches you to distrust it.
-    /// A text, path or voice knob cannot be stepped: the key opens its field
-    /// instead (a pinned one says so).
-    fn adjust(&mut self, up: bool) -> bool {
+    /// Enter on a row: a text, path or voice knob opens its field, any
+    /// other its stepper. A pinned one says so rather than swallowing the
+    /// key: silently ignoring a keypress is how a settings screen teaches
+    /// you to distrust it.
+    fn open(&mut self) -> bool {
         let Some(s) = self.selected() else {
             return false;
         };
+        if s.env_pinned() {
+            self.notice = Some((format!("pinned by {}, edit your .env", s.env), false));
+            return true;
+        }
+        self.notice = None;
         if matches!(
             s.kind,
             settings::Kind::Text { .. } | settings::Kind::Path { .. } | settings::Kind::Voice
         ) {
-            if s.env_pinned() {
-                self.notice = Some((format!("pinned by {}, edit your .env", s.env), false));
-            } else {
-                let current = s.value().as_text().unwrap_or_default().to_string();
-                self.edit = Some(current);
+            self.edit = Some(s.value().as_text().unwrap_or_default().to_string());
+        } else {
+            self.step = Some(s.value());
+        }
+        true
+    }
+
+    /// A key while the stepper is open: Left/Right/Space change the value,
+    /// Enter saves it through the registry (a refusal shown, the stepper
+    /// kept), Esc drops it.
+    pub fn step_key(&mut self, key: KeyCode) {
+        let (Some(s), Some(v)) = (self.selected(), self.step.as_mut()) else {
+            self.step = None;
+            return;
+        };
+        match key {
+            KeyCode::Left | KeyCode::Char('h') => *v = s.kind.step(v, false),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => *v = s.kind.step(v, true),
+            KeyCode::Esc => {
+                self.step = None;
                 self.notice = None;
             }
-            return true;
+            KeyCode::Enter => match settings::set(s.key, v) {
+                Ok(()) => {
+                    self.notice = Some((changed_line(s, &s.kind.render(v)), true));
+                    self.step = None;
+                }
+                Err(e) => self.notice = Some((e, false)),
+            },
+            _ => {}
         }
-        let next = s.kind.step(&s.value(), up);
-        self.notice = Some(match settings::set(s.key, &next) {
-            Ok(()) => (changed_line(s, &s.kind.render(&next)), true),
-            Err(e) => (e, false),
-        });
-        true
     }
 
     /// Save the text setting being edited through the registry (validate, apply
@@ -714,6 +730,21 @@ impl SettingsPane {
 
     /// The open text field as the bottom line, or `None`.
     pub fn edit_line(&self) -> Option<Line<'static>> {
+        if let (Some(v), Some(s)) = (&self.step, self.selected()) {
+            return Some(Line::from(vec![
+                Span::styled(
+                    format!(" {}: ", s.label),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("‹ {} ›", s.kind.render(v))),
+                Span::styled(
+                    "   ←/→ change · Enter save · Esc cancel",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
         let buf = self.edit.as_ref()?;
         let label = self.selected().map_or("", |s| s.label);
         let hint = if self.saving() {
@@ -1113,7 +1144,7 @@ pub fn draw_settings(f: &mut Frame, app: &SettingsPane, area: Rect) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" ←/→ change (text: edit) · ↑/↓ select · ⟳ applies on restart "),
+                .title(" Enter change · ⟳ applies on restart "),
         ),
         detail,
     );
@@ -1475,10 +1506,42 @@ mod tests {
         };
         // SAFETY: the lock above serialises every env-mutating test.
         unsafe { std::env::set_var("XCOPILOT_ATC_CHATTER", "true") };
-        assert!(pane.key(KeyCode::Right));
+        assert!(pane.key(KeyCode::Enter));
+        assert!(pane.step.is_none(), "no stepper on a pinned knob");
         let out = render_settings(&pane, 100, 22);
         assert!(out.contains("pinned by XCOPILOT_ATC_CHATTER"), "{out}");
         unsafe { std::env::remove_var("XCOPILOT_ATC_CHATTER") };
+    }
+
+    /// Nothing changes from the row: Left/Right there do nothing, Enter
+    /// opens the stepper, its Right changes only the value Enter would
+    /// save, and Esc drops it with the live value untouched.
+    #[test]
+    fn a_value_changes_only_after_enter() {
+        let _guard = settings::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock above serialises every env-mutating test.
+        unsafe { std::env::remove_var("XCOPILOT_ATC_CHATTER") };
+        let i = settings::by_section()
+            .iter()
+            .position(|s| s.key == "atc_chatter")
+            .expect("declared");
+        let mut pane = SettingsPane {
+            cursor: i,
+            ..Default::default()
+        };
+        let live = pane.selected().unwrap().value();
+        assert!(!pane.key(KeyCode::Right));
+        assert!(!pane.key(KeyCode::Left));
+        assert_eq!(pane.selected().unwrap().value(), live);
+        assert!(pane.key(KeyCode::Enter));
+        pane.step_key(KeyCode::Right);
+        assert_ne!(pane.step.as_ref(), Some(&live));
+        assert!(pane.edit_line().unwrap().to_string().contains("Enter save"));
+        pane.step_key(KeyCode::Esc);
+        assert!(pane.step.is_none());
+        assert_eq!(pane.selected().unwrap().value(), live);
     }
 
     /// A text knob is edited in place: the key opens its field with the
@@ -1500,7 +1563,7 @@ mod tests {
         // SAFETY: the lock above serialises every env-mutating test.
         unsafe { std::env::remove_var("XCOPILOT_CALLSIGN") };
         settings::update(|c| c.callsign = "WAT2516".into());
-        assert!(pane.key(KeyCode::Right));
+        assert!(pane.key(KeyCode::Enter));
         assert_eq!(pane.edit.as_deref(), Some("WAT2516"));
         let line = pane.edit_line().expect("the field").to_string();
         assert!(line.contains("callsign: WAT2516"), "{line}");
@@ -1508,7 +1571,7 @@ mod tests {
         pane.edit = None;
 
         unsafe { std::env::set_var("XCOPILOT_CALLSIGN", "BAW306") };
-        assert!(pane.key(KeyCode::Right));
+        assert!(pane.key(KeyCode::Enter));
         assert!(pane.edit.is_none());
         let out = render_settings(&pane, 100, 22);
         assert!(out.contains("pinned by XCOPILOT_CALLSIGN"), "{out}");

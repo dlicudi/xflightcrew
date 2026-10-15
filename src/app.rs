@@ -1,8 +1,14 @@
-//! The one app: plain `xfc` on a terminal. One TUI, its tabs Flight (the
-//! running crew's dashboard, `ui::Dashboard`), Checks (`home::screen`),
-//! Voices (`voices::screen`, its Cast view included), one tab per
-//! settings section (`settings::Section`, through `ui::SettingsPane`),
-//! Plugin and Files.
+//! The one app: plain `xfc` on a terminal. One TUI, a sidebar and a page:
+//! Flight (the running crew's dashboard, `ui::Dashboard`, its Transcript
+//! under it), Checks (`home::screen`), Voices (`voices::screen`, Speech
+//! recognition and Cast under it), Settings (every setting, each section
+//! under it, through `ui::SettingsPane`), Plugin and Files.
+//!
+//! **Navigation.** On the sidebar Up/Down move and show the page at once,
+//! Right or Enter go into it, `q` quits (from here only). On a page Left or
+//! Esc go back ONE level (out of a field first), never quit; a value
+//! changes only after Enter. The mouse selects a sidebar entry and the
+//! wheel scrolls.
 //!
 //! **The crew boots itself.** With every REQUIRED check green it boots at
 //! once; red, the app opens on Checks and boots the moment they pass, the
@@ -19,11 +25,13 @@
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::config::Config;
@@ -50,21 +58,32 @@ pub enum Open {
     Checks,
 }
 
-/// The tabs, in the bar's order.
+/// The sidebar's entries, in order; a child is indented under its page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Flight,
+    Transcript,
     Checks,
-    Voices,
-    Settings(Section),
+    /// 0 the voices, 1 speech recognition, 2 the cast.
+    Voices(usize),
+    /// `None`: every setting; a section is a child.
+    Settings(Option<Section>),
     Plugin,
     Files,
 }
 
 impl Tab {
     pub fn all() -> Vec<Tab> {
-        let mut t = vec![Tab::Flight, Tab::Checks, Tab::Voices];
-        t.extend(Section::ALL.iter().map(|s| Tab::Settings(*s)));
+        let mut t = vec![
+            Tab::Flight,
+            Tab::Transcript,
+            Tab::Checks,
+            Tab::Voices(0),
+            Tab::Voices(1),
+            Tab::Voices(2),
+            Tab::Settings(None),
+        ];
+        t.extend(Section::ALL.iter().map(|s| Tab::Settings(Some(*s))));
         t.extend([Tab::Plugin, Tab::Files]);
         t
     }
@@ -72,18 +91,38 @@ impl Tab {
     pub fn label(self) -> &'static str {
         match self {
             Tab::Flight => "Flight",
+            Tab::Transcript => "Transcript",
             Tab::Checks => "Checks",
-            Tab::Voices => "Voices",
-            // The Voices tab is the voices themselves; their numbers here.
-            Tab::Settings(Section::Voices) => "Voice settings",
-            Tab::Settings(Section::AudioPtt) => "Audio and PTT",
-            Tab::Settings(Section::Identity) => "Identity",
-            Tab::Settings(s) => s.title(),
+            Tab::Voices(0) => "Voices",
+            Tab::Voices(1) => "Speech",
+            Tab::Voices(_) => "Cast",
+            Tab::Settings(None) => "Settings",
+            // The Voices page is the voices themselves; their numbers here.
+            Tab::Settings(Some(Section::Voices)) => "Voice settings",
+            Tab::Settings(Some(Section::AudioPtt)) => "Audio and PTT",
+            Tab::Settings(Some(s)) => s.title(),
             Tab::Plugin => "Plugin",
             Tab::Files => "Files",
         }
     }
+
+    /// Indented under the page above it.
+    fn child(self) -> bool {
+        matches!(
+            self,
+            Tab::Transcript | Tab::Voices(1 | 2) | Tab::Settings(Some(_))
+        )
+    }
 }
+
+/// The pane of a settings entry: every setting first, then each section.
+fn pane_index(s: Option<Section>) -> usize {
+    s.and_then(|sec| Section::ALL.iter().position(|x| *x == sec))
+        .map_or(0, |i| i + 1)
+}
+
+/// The sidebar's width.
+const SIDE_W: u16 = 22;
 
 /// Where the crew is.
 pub enum Crew {
@@ -181,6 +220,11 @@ pub struct App {
     config: Config,
     tabs: Vec<Tab>,
     pub tab: usize,
+    /// The keys go to the page (else the sidebar).
+    pub on_page: bool,
+    /// The sidebar's area and first shown entry as last drawn, for the
+    /// mouse.
+    side: (Rect, usize),
     pub checks: Checks,
     voices: Option<crate::voices::screen::Pane>,
     store_rx: Option<Receiver<Store>>,
@@ -218,10 +262,12 @@ impl App {
     /// `load_store` is false (tests).
     pub fn new(config: Config, checks: Checks, spawn: Spawn, open: Open, real: bool) -> Self {
         let tabs = Tab::all();
-        let panes = Section::ALL
-            .iter()
-            .map(|s| SettingsPane::scoped(Scope::Section(*s)))
-            .collect();
+        let mut panes = vec![SettingsPane::scoped(Scope::All)];
+        panes.extend(
+            Section::ALL
+                .iter()
+                .map(|s| SettingsPane::scoped(Scope::Section(*s))),
+        );
         let store_rx = real.then(|| {
             let (tx, rx) = channel();
             let c = config.clone();
@@ -234,6 +280,8 @@ impl App {
         let mut app = App {
             config,
             tab: 0,
+            on_page: false,
+            side: (Rect::default(), 0),
             checks,
             voices: None,
             store_rx,
@@ -273,8 +321,21 @@ impl App {
         if let Some(i) = self.tabs.iter().position(|x| *x == t) {
             self.tab = i;
         }
-        if t == Tab::Plugin {
-            self.refresh_plugin();
+        self.shown();
+    }
+
+    /// The sidebar moved: what the page needs to show itself.
+    fn shown(&mut self) {
+        match self.current() {
+            Tab::Plugin => self.refresh_plugin(),
+            Tab::Voices(i) => {
+                if let Some(v) = self.voices.as_mut() {
+                    v.show(i);
+                }
+            }
+            Tab::Flight => self.dashboard.view = ui::View::Health,
+            Tab::Transcript => self.dashboard.view = ui::View::Transcript,
+            _ => {}
         }
     }
 
@@ -341,7 +402,11 @@ impl App {
         if let Some(rx) = self.store_rx.as_ref() {
             if let Ok(store) = rx.try_recv() {
                 self.checks.set_store(store.clone());
-                self.voices = Some(crate::voices::screen::Pane::new(store));
+                let mut pane = crate::voices::screen::Pane::new(store);
+                if let Tab::Voices(i) = self.current() {
+                    pane.show(i);
+                }
+                self.voices = Some(pane);
                 self.store_rx = None;
                 dirty = true;
             }
@@ -442,14 +507,14 @@ impl App {
             return true;
         }
         if let Some(p) = self.pane() {
-            if p.edit.is_some() || p.confirming() {
+            if p.edit.is_some() || p.step.is_some() || p.confirming() {
                 return true;
             }
         }
         match self.current() {
-            Tab::Flight => self.dashboard.editing(),
-            Tab::Voices => self.voices.as_ref().is_some_and(|v| v.capturing()),
-            Tab::Settings(Section::Atc) => self.cast_at.field.is_some(),
+            Tab::Flight | Tab::Transcript => self.dashboard.editing(),
+            Tab::Voices(_) => self.voices.as_ref().is_some_and(|v| v.capturing()),
+            Tab::Settings(Some(Section::Atc)) => self.cast_at.field.is_some(),
             _ => false,
         }
     }
@@ -460,17 +525,14 @@ impl App {
             return Some(&s.pane);
         }
         match self.current() {
-            Tab::Settings(sec) => Section::ALL
-                .iter()
-                .position(|s| *s == sec)
-                .map(|i| &self.panes[i]),
+            Tab::Settings(sec) => Some(&self.panes[pane_index(sec)]),
             _ => None,
         }
     }
 
     fn pane_mut(&mut self) -> Option<&mut SettingsPane> {
         let section = match self.current() {
-            Tab::Settings(sec) => Section::ALL.iter().position(|s| *s == sec),
+            Tab::Settings(sec) => Some(pane_index(sec)),
             _ => None,
         };
         if let Some(s) = self.search.as_mut() {
@@ -515,37 +577,46 @@ impl App {
             self.captured_key(code, ctrl);
             return None;
         }
+        let voices_page = self.on_page && matches!(self.current(), Tab::Voices(_));
         match code {
-            KeyCode::Tab => {
-                self.search = None;
-                let t = self.tabs[(self.tab + 1) % self.tabs.len()];
-                self.go(t);
-                return None;
-            }
-            KeyCode::BackTab => {
-                self.search = None;
-                let t = self.tabs[(self.tab + self.tabs.len() - 1) % self.tabs.len()];
-                self.go(t);
-                return None;
-            }
-            KeyCode::Char('q') => return Some(Exit::Quit),
             KeyCode::Char('R') => {
                 self.ask_restart();
                 return None;
             }
-            KeyCode::Char('/') if self.current() != Tab::Voices => {
+            // On a Voices page `/` filters its list.
+            KeyCode::Char('/') if !voices_page => {
                 self.search = Some(Search::new(false));
+                self.on_page = true;
                 return None;
             }
             KeyCode::Char('P') => {
                 self.search = Some(Search::new(true));
+                self.on_page = true;
                 return None;
             }
             _ => {}
         }
+        if !self.on_page {
+            let last = self.tabs.len() - 1;
+            let to = match code {
+                KeyCode::Up | KeyCode::Char('k') => self.tab.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => (self.tab + 1).min(last),
+                KeyCode::Home => 0,
+                KeyCode::End => last,
+                KeyCode::Right | KeyCode::Enter => {
+                    self.on_page = true;
+                    return None;
+                }
+                KeyCode::Char('q') => return Some(Exit::Quit),
+                _ => return None,
+            };
+            self.tab = to;
+            self.shown();
+            return None;
+        }
         if let Some(s) = self.search.as_mut() {
             match code {
-                KeyCode::Esc => self.search = None,
+                KeyCode::Esc | KeyCode::Left => self.search = None,
                 KeyCode::Char('/') => s.typing = true,
                 KeyCode::Char('p') => {
                     s.pinned = !s.pinned;
@@ -557,8 +628,29 @@ impl App {
             }
             return None;
         }
+        // A page's q is nobody's: only the sidebar quits.
+        if code == KeyCode::Char('q') {
+            return None;
+        }
+        if matches!(self.current(), Tab::Voices(_)) {
+            // Left is Esc there; Esc at its top level is back.
+            let code = if code == KeyCode::Left {
+                KeyCode::Esc
+            } else {
+                code
+            };
+            let top = self.voices.as_mut().is_none_or(|v| v.key(code));
+            if top && code == KeyCode::Esc {
+                self.on_page = false;
+            }
+            return None;
+        }
+        if matches!(code, KeyCode::Left | KeyCode::Esc) {
+            self.on_page = false;
+            return None;
+        }
         match self.current() {
-            Tab::Flight => {
+            Tab::Flight | Tab::Transcript => {
                 if code == KeyCode::Enter && matches!(self.crew, Crew::Up) {
                     self.dashboard.start_editing();
                 } else {
@@ -568,14 +660,9 @@ impl App {
             Tab::Checks => {
                 self.checks.key(code);
             }
-            Tab::Voices => {
-                if let Some(v) = self.voices.as_mut() {
-                    // Its own quit (Esc at the top) is not the app's.
-                    let _ = v.key(code);
-                }
-            }
+            Tab::Voices(_) => {}
             Tab::Settings(sec) => {
-                if sec == Section::Atc && code == KeyCode::Char('a') {
+                if sec == Some(Section::Atc) && code == KeyCode::Char('a') {
                     self.cast_at.field = Some(String::new());
                 } else if let Some(p) = self.pane_mut() {
                     p.key(code);
@@ -618,19 +705,25 @@ impl App {
                 p.edit_key(code, ctrl);
                 return;
             }
+            if p.step.is_some() {
+                p.step_key(code);
+                return;
+            }
             if p.confirming() {
                 p.key(code);
                 return;
             }
         }
         match self.current() {
-            Tab::Flight => self.dashboard.edit_key(code, ctrl, self.cmd_tx.as_ref()),
-            Tab::Voices => {
+            Tab::Flight | Tab::Transcript => {
+                self.dashboard.edit_key(code, ctrl, self.cmd_tx.as_ref())
+            }
+            Tab::Voices(_) => {
                 if let Some(v) = self.voices.as_mut() {
                     let _ = v.key(code);
                 }
             }
-            Tab::Settings(Section::Atc) => {
+            Tab::Settings(Some(Section::Atc)) => {
                 let Some(buf) = self.cast_at.field.as_mut() else {
                     return;
                 };
@@ -661,8 +754,7 @@ impl App {
 
     /// The whole screen.
     pub fn draw(&mut self, f: &mut Frame) {
-        let [status, bar, body, notice, hint] = Layout::vertical([
-            Constraint::Length(1),
+        let [status, middle, notice, hint] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(2),
@@ -670,14 +762,16 @@ impl App {
         ])
         .areas(f.area());
         self.draw_status(f, status);
-        self.draw_tabs(f, bar);
+        let [side, body] =
+            Layout::horizontal([Constraint::Length(SIDE_W), Constraint::Min(0)]).areas(middle);
+        self.draw_side(f, side);
         if let Some(s) = &self.search {
             ui::draw_settings(f, &s.pane, body);
         } else {
             match self.current() {
-                Tab::Flight => self.draw_flight(f, body),
+                Tab::Flight | Tab::Transcript => self.draw_flight(f, body),
                 Tab::Checks => self.checks.draw(f, body),
-                Tab::Voices => match self.voices.as_mut() {
+                Tab::Voices(_) => match self.voices.as_mut() {
                     Some(v) => v.draw(f, body),
                     None => f.render_widget(
                         Paragraph::new("  loading the voice catalogue...")
@@ -685,7 +779,7 @@ impl App {
                         body,
                     ),
                 },
-                Tab::Settings(Section::Atc) => self.draw_atc(f, body),
+                Tab::Settings(Some(Section::Atc)) => self.draw_atc(f, body),
                 Tab::Settings(_) => {
                     if let Some(p) = self.pane() {
                         ui::draw_settings(f, p, body);
@@ -699,7 +793,7 @@ impl App {
                         .collect();
                     lines.push(Line::raw(""));
                     lines.push(Line::styled(
-                        "  i installs the plugin this build carries (refused while X-Plane runs)",
+                        "  Enter installs the plugin this build carries (refused while X-Plane runs)",
                         Style::default().fg(Color::DarkGray),
                     ));
                     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
@@ -771,38 +865,82 @@ impl App {
         );
     }
 
-    /// The tab bar: as many as fit, the current one always among them.
-    fn draw_tabs(&self, f: &mut Frame, area: Rect) {
-        let widths: Vec<usize> = self
+    /// The sidebar: every page, its children indented, the current one
+    /// marked; its edge lit while it has the keys.
+    fn draw_side(&mut self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(if self.on_page {
+                Color::DarkGray
+            } else {
+                Color::Cyan
+            }));
+        let inner = block.inner(area);
+        let red = !self.checks.waiting_on().is_empty();
+        let items: Vec<ListItem> = self
             .tabs
             .iter()
-            .map(|t| t.label().chars().count() + 3)
+            .enumerate()
+            .map(|(i, t)| {
+                let on = i == self.tab;
+                let style = match (on, self.on_page) {
+                    (true, false) => Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    (true, true) => Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    _ if t.child() => Style::default().fg(Color::Gray),
+                    _ => Style::default(),
+                };
+                let indent = if t.child() { "    " } else { "  " };
+                let mut spans = vec![Span::styled(format!("{indent}{}", t.label()), style)];
+                if *t == Tab::Checks && red {
+                    spans.push(Span::styled(" ●", Style::default().fg(Color::Red)));
+                }
+                ListItem::new(Line::from(spans))
+            })
             .collect();
-        let room = area.width as usize;
-        let mut start = 0;
-        while start < self.tab && widths[start..=self.tab].iter().sum::<usize>() + 2 > room {
-            start += 1;
-        }
-        let mut spans = vec![Span::raw(if start > 0 { "‹" } else { " " })];
-        let mut used = 1;
-        for (i, t) in self.tabs.iter().enumerate().skip(start) {
-            if used + widths[i] > room {
-                spans.push(Span::raw("›"));
-                break;
+        let mut state = ListState::default().with_selected(Some(self.tab));
+        f.render_stateful_widget(List::new(items).block(block), area, &mut state);
+        self.side = (inner, state.offset());
+    }
+
+    /// A click or the wheel: a sidebar entry clicked is shown with the
+    /// sidebar's keys; a click on the page gives the page the keys; the
+    /// wheel moves the sidebar or the page's list under the pointer.
+    pub fn mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) -> Option<Exit> {
+        let (r, offset) = self.side;
+        let on_side = x < r.right() && y >= r.y && y < r.bottom();
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) if on_side => {
+                let i = (y - r.y) as usize + offset;
+                if i < self.tabs.len() && !self.capturing() {
+                    self.search = None;
+                    self.on_page = false;
+                    self.tab = i;
+                    self.shown();
+                }
+                None
             }
-            let style = if i == self.tab && self.search.is_none() {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            spans.push(Span::styled(format!(" {} ", t.label()), style));
-            spans.push(Span::raw(" "));
-            used += widths[i];
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.on_page = true;
+                None
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if self.capturing() {
+                    return None;
+                }
+                self.on_page = !on_side;
+                let up = kind == MouseEventKind::ScrollUp;
+                self.key(
+                    if up { KeyCode::Up } else { KeyCode::Down },
+                    KeyModifiers::NONE,
+                )
+            }
+            _ => None,
         }
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_flight(&self, f: &mut Frame, area: Rect) {
@@ -922,35 +1060,45 @@ impl App {
         if let Some(l) = self
             .dashboard
             .input_line()
-            .filter(|_| self.current() == Tab::Flight)
+            .filter(|_| matches!(self.current(), Tab::Flight | Tab::Transcript))
         {
             return l;
         }
         if let Some(l) = self.pane().and_then(|p| p.edit_line()) {
             return l;
         }
+        if !self.on_page {
+            return Line::styled(
+                " ↑↓ pages · → or Enter open · / search · P pinned · R restart crew · q quit",
+                Style::default().fg(Color::DarkGray),
+            );
+        }
         let own = if let Some(s) = &self.search {
             if s.typing {
                 "type to search · Enter results · Esc close"
             } else {
-                "←/→ change · ↑↓ select · / search again · p pinned only · Esc close"
+                "↑↓ select · Enter change · / search again · p pinned only · Esc close"
             }
         } else {
             match self.current() {
                 Tab::Flight if matches!(self.crew, Crew::Up) => {
-                    "Enter type a command · ←/→ health, transcript · or just speak"
+                    "Enter type a command · or just speak"
                 }
-                Tab::Flight => "the crew starts when the checks pass",
-                Tab::Checks => "↑↓ move · enter fix · c check again",
-                Tab::Voices => "←/→ voices, speech, cast",
-                Tab::Settings(Section::Atc) => "←/→ change · ↑↓ select · a cast at a field",
-                Tab::Settings(_) => "←/→ change · ↑↓ select · m move .env pins",
-                Tab::Plugin => "i install",
+                Tab::Transcript if matches!(self.crew, Crew::Up) => {
+                    "↑↓ scroll · End follow · Enter type a command"
+                }
+                Tab::Flight | Tab::Transcript => "the crew starts when the checks pass",
+                Tab::Checks => "↑↓ move · Enter fix · c check again",
+                // The voices pages say their own keys.
+                Tab::Voices(_) => "the page's own keys are listed above",
+                Tab::Settings(Some(Section::Atc)) => "↑↓ select · Enter change · a cast at a field",
+                Tab::Settings(_) => "↑↓ select · Enter change · m move .env pins",
+                Tab::Plugin => "Enter or i install",
                 Tab::Files => "where every file lives",
             }
         };
         Line::styled(
-            format!(" {own} · Tab next · / search · P pinned · R restart crew · q quit"),
+            format!(" {own} · ← back · / search · R restart crew"),
             Style::default().fg(Color::DarkGray),
         )
     }
@@ -961,15 +1109,38 @@ impl App {
 pub fn run(config: Config, open: Open, spawn: Spawn) -> std::io::Result<Exit> {
     let checks = Checks::new(&config);
     let mut app = App::new(config, checks, spawn, open, true);
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal();
     let res = event_loop(&mut terminal, &mut app);
-    ratatui::restore();
+    // The mouse given back before any re-exec.
+    restore_terminal();
     if app.checks.downloading.is_some() {
         eprintln!(
             "left with a download unfinished: nothing half-installed, the parts are cleaned on the next run"
         );
     }
     res
+}
+
+/// The app's terminal: ratatui's, plus the mouse. The mouse mode is given
+/// back on every exit, a panic included (ratatui's own hook gives back the
+/// rest).
+fn init_terminal() -> ratatui::DefaultTerminal {
+    use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    let terminal = ratatui::init();
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    let next = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        next(info);
+    }));
+    terminal
+}
+
+/// The terminal as it was, the mouse mode first.
+fn restore_terminal() {
+    use ratatui::crossterm::event::DisableMouseCapture;
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Result<Exit> {
@@ -990,6 +1161,17 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 dirty = true;
                 if let Some(exit) = app.key(k.code, k.modifiers) {
+                    return Ok(exit);
+                }
+            }
+            Event::Mouse(m)
+                if matches!(
+                    m.kind,
+                    MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+            {
+                dirty = true;
+                if let Some(exit) = app.mouse(m.kind, m.column, m.row) {
                     return Ok(exit);
                 }
             }
