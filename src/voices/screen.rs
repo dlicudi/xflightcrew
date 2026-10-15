@@ -77,6 +77,8 @@ struct App {
     prompt: Option<Prompt>,
     /// The last thing that happened, and whether it went well.
     notice: Option<(String, bool)>,
+    /// A page of the one app: its sidebar switches the tabs, Esc goes back.
+    in_app: bool,
 }
 
 impl App {
@@ -99,6 +101,7 @@ impl App {
             downloads: BTreeMap::new(),
             previewing: None,
             prompt: None,
+            in_app: false,
         }
     }
 
@@ -199,6 +202,16 @@ impl Pane {
     /// One key. Returns true for the screen's own quit (q, Esc at the top).
     pub fn key(&mut self, code: KeyCode) -> bool {
         key(&mut self.app, code, &self.tx)
+    }
+
+    /// Show tab `i` (0 Voices, 1 Speech recognition, 2 Cast): the app's
+    /// sidebar moved.
+    pub fn show(&mut self, i: usize) {
+        self.app.in_app = true;
+        let tab = [Tab::List(Kind::Piper), Tab::List(Kind::Whisper), Tab::Cast][i.min(2)];
+        if self.app.tab != tab {
+            self.app.switch(tab);
+        }
     }
 
     /// A field, a picker or a question is open: every key is the pane's.
@@ -338,8 +351,9 @@ fn key(app: &mut App, code: KeyCode, tx: &Sender<Msg>) -> bool {
         KeyCode::PageUp => app.step(-15),
         KeyCode::Home => app.list.select(Some(0)),
         KeyCode::End => app.step(isize::MAX / 2),
-        KeyCode::Tab | KeyCode::Right => app.switch(next_tab(app.tab)),
-        KeyCode::Left => app.switch(next_tab(next_tab(app.tab))),
+        // `xfc voices` alone: Tab cycles its three tabs. In the app the
+        // sidebar shows them (`Pane::show`).
+        KeyCode::Tab => app.switch(next_tab(app.tab)),
         _ if app.tab == Tab::Cast => cast_key(app, code, tx),
         KeyCode::Char('/') => {
             app.editing_filter = true;
@@ -742,9 +756,19 @@ fn draw_in(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     } else if app.tab == Tab::Cast && app.pool_open {
         " ↑↓ move  a add a voice  d take it out  esc back"
     } else if app.tab == Tab::Cast {
-        " ↑↓ move  enter pick a voice (the pool: edit it)  i install a missing one  ←/→ switch  q quit"
+        " ↑↓ move  enter pick a voice (the pool: edit it)  i install a missing one"
     } else {
-        " ↑↓ move  ←/→ switch  / filter  enter install  s starter  d uninstall  p preview  u use as  q quit"
+        " ↑↓ move  / filter  enter install  s starter  d uninstall  p preview  u use as"
+    };
+    let way_out = if app.in_app {
+        "  ← back"
+    } else {
+        "  tab switch  q quit"
+    };
+    let hint_text = if app.pick.is_some() || app.editing_filter || app.pool_open {
+        hint_text.to_string()
+    } else {
+        format!("{hint_text}{way_out}")
     };
     f.render_widget(
         Paragraph::new(hint_text).style(Style::default().fg(Color::DarkGray)),

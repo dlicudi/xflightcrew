@@ -6,6 +6,7 @@ use super::*;
 use crate::home::Facts;
 use crate::plugin_install::Verdict;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 use std::path::PathBuf;
 
 fn green() -> Facts {
@@ -74,13 +75,18 @@ fn press(app: &mut App, code: KeyCode) -> Option<Exit> {
     app.key(code, KeyModifiers::NONE)
 }
 
+/// The sidebar: each page, its children under it (every settings section
+/// under Settings, the voices' views under Voices).
 #[test]
-fn every_section_is_a_tab_between_voices_and_plugin() {
+fn every_section_is_a_child_of_settings() {
     let tabs = Tab::all();
-    assert_eq!(&tabs[..3], &[Tab::Flight, Tab::Checks, Tab::Voices]);
-    for s in Section::ALL {
-        assert!(tabs.contains(&Tab::Settings(s)), "{s:?}");
+    assert_eq!(&tabs[..3], &[Tab::Flight, Tab::Transcript, Tab::Checks]);
+    let settings = tabs.iter().position(|t| *t == Tab::Settings(None)).unwrap();
+    for (i, s) in Section::ALL.iter().enumerate() {
+        assert_eq!(tabs[settings + 1 + i], Tab::Settings(Some(*s)));
+        assert!(Tab::Settings(Some(*s)).child());
     }
+    assert!(Tab::Voices(2).child() && !Tab::Voices(0).child());
     assert_eq!(&tabs[tabs.len() - 2..], &[Tab::Plugin, Tab::Files]);
 }
 
@@ -94,7 +100,7 @@ fn green_checks_boot_the_crew_at_once() {
     a.poll();
     assert!(matches!(a.crew, Crew::Up));
     let screen = render(&mut a, 120, 30);
-    assert!(screen.contains("Health"), "{screen}");
+    assert!(screen.contains("systems"), "{screen}");
     assert!(screen.contains("abc1234"), "{screen}");
     assert!(!screen.contains("waiting on"), "{screen}");
 }
@@ -131,7 +137,10 @@ fn a_red_required_check_holds_the_crew_until_it_passes() {
     let screen = render(&mut a, 120, 30);
     assert!(screen.contains("The crew is waiting on:"), "{screen}");
     assert!(screen.contains("✗ Plugin not installed"), "{screen}");
-    // Typing is refused until the crew is up: Enter does nothing.
+    // Typing is refused until the crew is up: Enter (into the page, then
+    // on it) does nothing.
+    press(&mut a, KeyCode::Enter);
+    assert!(a.on_page);
     press(&mut a, KeyCode::Enter);
     assert!(!a.dashboard.editing());
 
@@ -192,27 +201,86 @@ fn the_restart_asks_first_and_never_before_the_crew_is_up() {
     assert!(a.notice.as_ref().unwrap().0.contains("keeps running"));
 }
 
-/// Tab walks every tab and each renders, cramped or wide, with no panic.
+/// Down on the sidebar reaches every page, showing each at once, and each
+/// renders, cramped or wide, sidebar or page focused, with no panic.
 #[test]
-fn every_tab_renders_at_any_size() {
+fn the_sidebar_reaches_every_page_and_each_renders() {
     let _guard = crate::settings::TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut a = app(green(), boots, Open::Default);
     a.poll();
     let n = a.tabs.len();
-    for _ in 0..n {
-        for (w, h) in [(120u16, 32u16), (40, 10), (20, 6)] {
-            render(&mut a, w, h);
+    for i in 0..n {
+        assert_eq!(a.tab, i);
+        for on_page in [false, true] {
+            a.on_page = on_page;
+            for (w, h) in [(120u16, 32u16), (80, 24), (40, 10)] {
+                render(&mut a, w, h);
+            }
         }
-        let screen = render(&mut a, 160, 32);
+        a.on_page = false;
+        let screen = render(&mut a, 120, 32);
         let label = a.current().label();
         assert!(screen.contains(label), "{label}: {screen}");
-        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Down);
     }
-    assert_eq!(a.current(), Tab::Flight, "Tab comes round");
-    press(&mut a, KeyCode::BackTab);
-    assert_eq!(a.current(), Tab::Files);
+    assert_eq!(a.current(), Tab::Files, "Down stops at the last page");
+    press(&mut a, KeyCode::Home);
+    assert_eq!(a.current(), Tab::Flight);
+}
+
+/// From any page and any depth Esc goes back one level at a time to the
+/// sidebar and never quits; `q` on a page is nobody's, on the sidebar it
+/// quits.
+#[test]
+fn esc_never_quits_and_q_quits_from_the_sidebar_only() {
+    let _guard = crate::settings::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut a = app(green(), boots, Open::Default);
+    a.poll();
+    for t in Tab::all() {
+        a.go(t);
+        assert_eq!(press(&mut a, KeyCode::Right), None);
+        assert!(a.on_page, "{t:?}");
+        assert_eq!(press(&mut a, KeyCode::Char('q')), None, "{t:?}");
+        // One level in where the page has one: a settings editor.
+        if matches!(t, Tab::Settings(_)) {
+            press(&mut a, KeyCode::Enter);
+        }
+        for _ in 0..2 {
+            assert_eq!(press(&mut a, KeyCode::Esc), None, "{t:?}");
+        }
+        assert!(!a.on_page, "{t:?}: two Esc reach the sidebar");
+        assert_eq!(press(&mut a, KeyCode::Esc), None, "{t:?}");
+    }
+    assert_eq!(press(&mut a, KeyCode::Char('q')), Some(Exit::Quit));
+}
+
+/// A click on a sidebar entry shows its page; the wheel over the sidebar
+/// moves it.
+#[test]
+fn the_mouse_picks_a_page() {
+    let mut a = app(green(), boots, Open::Default);
+    a.poll();
+    render(&mut a, 120, 32);
+    let (side, _) = a.side;
+    let checks = a.tabs.iter().position(|t| *t == Tab::Checks).unwrap() as u16;
+    a.mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        side.x + 2,
+        side.y + checks,
+    );
+    assert_eq!(a.current(), Tab::Checks);
+    a.mouse(MouseEventKind::ScrollDown, side.x + 2, side.y);
+    assert_eq!(a.current(), Tab::Voices(0));
+    a.mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        side.right() + 5,
+        side.y + 3,
+    );
+    assert!(a.on_page);
 }
 
 /// `/` searches every setting by label and help; Esc closes it; `P` lists
@@ -261,6 +329,7 @@ fn the_typed_line_reaches_the_crew() {
     let (tx, rx) = channel();
     a.cmd_tx = Some(tx);
     press(&mut a, KeyCode::Enter);
+    press(&mut a, KeyCode::Enter);
     assert!(a.dashboard.editing());
     for c in "qnh 2992".chars() {
         assert_eq!(press(&mut a, KeyCode::Char(c)), None);
@@ -272,6 +341,8 @@ fn the_typed_line_reaches_the_crew() {
         "stamped like the panel's"
     );
     press(&mut a, KeyCode::Esc);
+    assert_eq!(press(&mut a, KeyCode::Char('q')), None, "q on a page");
+    press(&mut a, KeyCode::Left);
     assert_eq!(press(&mut a, KeyCode::Char('q')), Some(Exit::Quit));
 }
 
@@ -280,7 +351,8 @@ fn the_typed_line_reaches_the_crew() {
 #[test]
 fn the_cast_at_box_takes_an_icao() {
     let mut a = app(green(), boots, Open::Default);
-    a.go(Tab::Settings(Section::Atc));
+    a.go(Tab::Settings(Some(Section::Atc)));
+    press(&mut a, KeyCode::Enter);
     press(&mut a, KeyCode::Char('a'));
     for c in "le-mgx".chars() {
         press(&mut a, KeyCode::Char(c));
