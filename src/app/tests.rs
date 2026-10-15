@@ -231,10 +231,9 @@ fn the_sidebar_reaches_every_page_and_each_renders() {
 }
 
 /// From any page and any depth Esc goes back one level at a time to the
-/// sidebar and never quits; `q` on a page is nobody's, on the sidebar it
-/// quits.
+/// sidebar and never quits; `q` quits from any page.
 #[test]
-fn esc_never_quits_and_q_quits_from_the_sidebar_only() {
+fn esc_never_quits_and_q_quits_from_any_page() {
     let _guard = crate::settings::TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -244,7 +243,6 @@ fn esc_never_quits_and_q_quits_from_the_sidebar_only() {
         a.go(t);
         assert_eq!(press(&mut a, KeyCode::Right), None);
         assert!(a.on_page, "{t:?}");
-        assert_eq!(press(&mut a, KeyCode::Char('q')), None, "{t:?}");
         // One level in where the page has one: a settings editor.
         if matches!(t, Tab::Settings(_)) {
             press(&mut a, KeyCode::Enter);
@@ -254,8 +252,9 @@ fn esc_never_quits_and_q_quits_from_the_sidebar_only() {
         }
         assert!(!a.on_page, "{t:?}: two Esc reach the sidebar");
         assert_eq!(press(&mut a, KeyCode::Esc), None, "{t:?}");
+        assert_eq!(press(&mut a, KeyCode::Right), None);
+        assert_eq!(press(&mut a, KeyCode::Char('q')), Some(Exit::Quit), "{t:?}");
     }
-    assert_eq!(press(&mut a, KeyCode::Char('q')), Some(Exit::Quit));
 }
 
 /// A click on a sidebar entry shows its page; the wheel over the sidebar
@@ -341,9 +340,11 @@ fn the_typed_line_reaches_the_crew() {
         "stamped like the panel's"
     );
     press(&mut a, KeyCode::Esc);
-    assert_eq!(press(&mut a, KeyCode::Char('q')), None, "q on a page");
-    press(&mut a, KeyCode::Left);
-    assert_eq!(press(&mut a, KeyCode::Char('q')), Some(Exit::Quit));
+    assert_eq!(
+        press(&mut a, KeyCode::Char('q')),
+        Some(Exit::Quit),
+        "q on a page"
+    );
 }
 
 /// The ATC tab's "cast at" box takes an ICAO only, upper-cased, four at

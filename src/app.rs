@@ -5,8 +5,9 @@
 //! under it, through `ui::SettingsPane`), Plugin and Files.
 //!
 //! **Navigation.** On the sidebar Up/Down move and show the page at once,
-//! Right or Enter go into it, `q` quits (from here only). On a page Left or
-//! Esc go back ONE level (out of a field first), never quit; a value
+//! Right or Enter go into it. On a page Left or Esc go back ONE level (out
+//! of a field first), never quit. `q` quits from anywhere a field is not
+//! taking the keys; a value
 //! changes only after Enter. The mouse selects a sidebar entry and the
 //! wheel scrolls.
 //!
@@ -22,9 +23,10 @@
 //!
 //! `/` searches every setting by label and help, `P` lists the pinned.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
@@ -32,7 +34,6 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::config::Config;
 use crate::home::screen::Checks;
@@ -579,6 +580,8 @@ impl App {
         }
         let voices_page = self.on_page && matches!(self.current(), Tab::Voices(_));
         match code {
+            // Quits from anywhere a field is not taking the keys.
+            KeyCode::Char('q') => return Some(Exit::Quit),
             KeyCode::Char('R') => {
                 self.ask_restart();
                 return None;
@@ -607,7 +610,6 @@ impl App {
                     self.on_page = true;
                     return None;
                 }
-                KeyCode::Char('q') => return Some(Exit::Quit),
                 _ => return None,
             };
             self.tab = to;
@@ -626,10 +628,6 @@ impl App {
                     s.pane.key(other);
                 }
             }
-            return None;
-        }
-        // A page's q is nobody's: only the sidebar quits.
-        if code == KeyCode::Char('q') {
             return None;
         }
         if matches!(self.current(), Tab::Voices(_)) {
@@ -1098,7 +1096,7 @@ impl App {
             }
         };
         Line::styled(
-            format!(" {own} · ← back · / search · R restart crew"),
+            format!(" {own} · ← back · / search · R restart crew · q quit"),
             Style::default().fg(Color::DarkGray),
         )
     }
