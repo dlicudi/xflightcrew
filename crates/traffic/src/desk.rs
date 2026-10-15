@@ -14,10 +14,9 @@
 //! every arrival ([`DEPART_GAP_S`] after the last, and off before each
 //! arrival needs the runway: the fleet's one timed rule,
 //! [`crate::slot::off_before`]), else the first landing, then crossings; a
-//! crossing of another strip is cleared at once. A departure a landing has
-//! gone ahead of is given the next gap, ONE IN, ONE OUT: every arrival not
-//! yet cleared is spaced behind it (`Order::follow`) until it is released.
-//! No readbacks, no radio: nothing is said. Stage 4 replaces it with the
+//! crossing of another strip is cleared at once. A departure waiting at the
+//! hold is given its gap by the arrivals themselves
+//! ([`crate::slot::departure_gap_s`]). No readbacks, no radio: nothing is said. Stage 4 replaces it with the
 //! tower FSM per strip.
 //!
 //! LEMG 13 (2026-10-14, issue #286): the field handed to the desk with
@@ -64,9 +63,6 @@ pub struct FieldDesk {
     crossed_at: BTreeMap<u32, f64>,
     /// Fleet second of the last takeoff clearance.
     last_takeoff_s: Option<f64>,
-    /// The departure at the hold a landing has gone ahead of: the next gap
-    /// is its (module docs, one in, one out).
-    gap_for: Option<u32>,
 }
 
 impl FieldDesk {
@@ -136,9 +132,6 @@ impl FieldDesk {
     }
 
     fn forget(&mut self, id: u32) {
-        if self.gap_for == Some(id) {
-            self.end_gap();
-        }
         self.orders.remove(&id);
         self.crossed_at.remove(&id);
         self.want_takeoff.retain(|i| *i != id);
@@ -220,30 +213,12 @@ impl FieldDesk {
                 self.want_takeoff.remove(0);
                 self.last_takeoff_s = Some(now);
                 self.entry(id).state = TowerState::TakeoffCleared;
-                if self.gap_for == Some(id) {
-                    self.end_gap();
-                }
             }
         }
         if let Some(&id) = self.want_landing.first() {
             if !claim(self, id) {
                 self.want_landing.remove(0);
                 self.entry(id).state = TowerState::ClearedToLand;
-                // A landing gone ahead of a departure ready at the hold:
-                // the next gap is the departure's.
-                if let Some(dep) = waiting.filter(|d| self.want_takeoff.first() == Some(d)) {
-                    self.gap_for.get_or_insert(dep);
-                }
-            }
-        }
-        // Every arrival not yet cleared to land is spaced behind it.
-        if let Some(dep) = self.gap_for {
-            for a in fleet.aircraft().iter().filter(|a| arriving(a)) {
-                if let Some(o) = self.orders.get_mut(&a.id) {
-                    if o.state != TowerState::ClearedToLand {
-                        o.follow = Some(dep);
-                    }
-                }
             }
         }
         let mut k = 0;
@@ -261,15 +236,6 @@ impl FieldDesk {
                 continue;
             }
             k += 1;
-        }
-    }
-
-    /// The gap is given: nobody is spaced behind the departure any more.
-    fn end_gap(&mut self) {
-        if let Some(dep) = self.gap_for.take() {
-            for o in self.orders.values_mut().filter(|o| o.follow == Some(dep)) {
-                o.follow = None;
-            }
         }
     }
 
@@ -560,6 +526,139 @@ mod tests {
         );
         assert!(airborne(&fleet), "the departure flew");
         assert_eq!(overlap, 0, "a departure on the runway with a landing on it");
+        assert_eq!(go_arounds, 0);
+    }
+
+    /// EGKK 26L (2026-10-15, issue #300): arrivals at their landing spacing
+    /// and ~90 s on the runway each never left the station the gap it
+    /// releases a departure into (the strip clear 15 s, then the next lander
+    /// at least 107.5 s out: `departure_clears_lander` with `LINE_UP_S`), so
+    /// a departure sat at the hold 20 minutes. Released here by THAT rule,
+    /// not the desk's, it goes within two landings: the arrivals open its
+    /// gap ([`crate::slot::departure_gap_s`]), nobody goes around.
+    #[test]
+    fn a_departure_held_by_the_stations_release_rule_gets_its_gap() {
+        let field = fixtures::xnoc();
+        let end = field.end("12").unwrap();
+        let mut fleet = Fleet::new(field.clone());
+        for k in 0..10u32 {
+            let nm = 25.0 + 3.0 * k as f64;
+            let entry = crate::kin::project_m(end.thr, end.course_deg + 180.0, nm * 1852.0);
+            let ac = TrafficAircraft::at_entry(
+                100 + k,
+                &format!("A{k}"),
+                "Arrival",
+                "A320",
+                Plan::Arrival {
+                    entry,
+                    star: None,
+                    runway: "12".into(),
+                    straight_in: true,
+                },
+                &field,
+                100 + k as u64,
+            )
+            .unwrap();
+            assert!(fleet.spawn(ac));
+        }
+        let mut d = FieldDesk::new(Some("12".into()));
+        let dep = 1;
+        let (mut t, mut spawned, mut ready_at, mut released_at) = (0.0, false, None, None);
+        let (mut landed_while_held, mut go_arounds) = (0, 0);
+        let mut clear_since: Option<f64> = None;
+        let mut landed: Vec<u32> = Vec::new();
+        let airborne = |f: &Fleet| {
+            f.get(dep)
+                .is_some_and(|a| matches!(a.phase, Phase::Climb | Phase::Leave))
+        };
+        while t < 3600.0 && !airborne(&fleet) {
+            if !spawned && fleet.get(100).is_some_and(|a| a.phase == Phase::Final) {
+                let ac = TrafficAircraft::at_stand(
+                    dep,
+                    "D1",
+                    "Departure",
+                    "A320",
+                    Plan::Departure {
+                        runway: "12".into(),
+                        sid: None,
+                        exit_bearing: 120.0,
+                    },
+                    &field,
+                    &field.net.stands[0].name,
+                    dep as u64,
+                )
+                .unwrap();
+                assert!(fleet.spawn(ac));
+                spawned = true;
+            }
+            // The station's release: the strip clear HOLD_CLEAR_SECS, every
+            // lander far enough out for the line-up and roll.
+            if ready_at.is_some() && released_at.is_none() {
+                let others = || fleet.aircraft().iter().filter(|a| a.id != dep);
+                let occupied = others().any(|a| a.slot().is_some_and(|s| s.to_thr_s <= 0.0));
+                clear_since = if occupied {
+                    None
+                } else {
+                    clear_since.or(Some(t))
+                };
+                let gap = others().all(|a| a.slot().is_none_or(|s| s.to_thr_s >= 107.5));
+                if gap && clear_since.is_some_and(|c| t - c >= 15.0) {
+                    released_at = Some(t);
+                    d.entry(dep).state = TowerState::TakeoffCleared;
+                }
+            }
+            d.tick(&fleet);
+            let mut events = fleet.step(0.1, None, &|id| d.order(id));
+            t += 0.1;
+            for e in &events {
+                match e {
+                    Event::Call {
+                        id,
+                        call: Call::Ready,
+                    } if *id == dep => {
+                        ready_at.get_or_insert(t);
+                    }
+                    Event::Call {
+                        call: Call::GoingAround,
+                        ..
+                    } => go_arounds += 1,
+                    _ => {}
+                }
+            }
+            // The departure's release is the station's, never the desk's.
+            events.retain(|e| !matches!(e, Event::Call { id, call: Call::Ready } if *id == dep));
+            d.hear(&events);
+            for a in fleet
+                .aircraft()
+                .iter()
+                .filter(|a| a.phase == Phase::Landing)
+            {
+                if !landed.contains(&a.id) {
+                    landed.push(a.id);
+                    if ready_at.is_some() && released_at.is_none() {
+                        landed_while_held += 1;
+                    }
+                }
+            }
+            let done: Vec<u32> = fleet
+                .aircraft()
+                .iter()
+                .filter(|a| a.id >= 100 && a.phase == Phase::TaxiIn)
+                .map(|a| a.id)
+                .collect();
+            for id in done {
+                fleet.remove(id);
+                d.forget(id);
+            }
+        }
+        let ready = ready_at.expect("the departure called ready");
+        let released = released_at.expect("the station's rule released it");
+        assert!(
+            landed_while_held <= 2,
+            "{landed_while_held} landings while it was held, {:.0} s",
+            released - ready
+        );
+        assert!(airborne(&fleet), "the departure flew");
         assert_eq!(go_arounds, 0);
     }
 }

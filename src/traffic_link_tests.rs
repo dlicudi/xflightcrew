@@ -2428,6 +2428,10 @@ fn approach_sequences_by_the_traffics_own_numbers() {
     );
     assert_eq!(crate::party_line::SEQUENCE_GAP_S, traffic::slot::FOLLOW_GAP_S);
     assert_eq!(
+        traffic::slot::DEPARTURE_GAP_S,
+        crate::party_line::DEPARTURE_RELEASE_S
+    );
+    assert_eq!(
         crate::party_line::RADAR_SPACING_NM,
         traffic::arrival::wake_gap_nm(traffic::Wake::Medium, traffic::Wake::Medium)
             + traffic::arrival::WAKE_BUFFER_NM

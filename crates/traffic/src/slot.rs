@@ -179,6 +179,97 @@ pub fn slot_free(me: u32, own: &RunwaySlot, others: &[Seen], yields: bool) -> bo
         })
 }
 
+/// The least a departure waiting at the hold needs from the runway being
+/// free to the next lander's threshold, seconds: the station's release
+/// (`atc::party_line::DEPARTURE_RELEASE_S`: the strip clear 15 s, then a
+/// lander far enough out that the line-up and roll never send it round),
+/// counted from the "vacated" REPORT, which comes after the pavement is
+/// clear. Pinned equal by the crew.
+pub const DEPARTURE_GAP_S: f64 = 122.5;
+
+/// OUR line-up from the hold, seconds: the station's (`LINE_UP_S`, a pilot
+/// is slower than the traffic).
+const OWN_LINE_UP_S: f64 = 60.0;
+
+/// How long after the runway is free the departure `dep` needs before
+/// `next` reaches its threshold: its line-up and roll off [`FOLLOW_GAP_S`]
+/// before `next` needs the runway, seen rolling outside the tower's
+/// go-around window, never less than [`DEPARTURE_GAP_S`].
+fn departure_need_s(dep: &RunwaySlot, next: &RunwaySlot) -> f64 {
+    (dep.clear_s + FOLLOW_GAP_S + next.needs_clear_s)
+        .max(dep.unjudged_s + TOWER_DECIDE_S)
+        .max(DEPARTURE_GAP_S)
+}
+
+/// THE DEPARTURE GAP (EGKK 26L, 2026-10-15, issue #300: arrivals spaced
+/// only for landing, ~90 s on the runway each, left no gap the tower could
+/// release into; a departure sat at the hold 20 minutes). Approach opens
+/// one gap per departure waiting at the hold on `own`'s strip: when the
+/// slots `ahead` of it (committed, nearest first or not) do not already
+/// leave one for each, `own` reaches its threshold no sooner than the
+/// returned seconds from now, the runway free of everyone ahead and the
+/// departure's need ([`departure_need_s`]) after that. `None`: nobody
+/// waits, or the gaps ahead hold them all. One rule for every arrival, ours
+/// too ([`own_departure_gap_s`]), and every waiting departure, ours too
+/// ([`own_departure_slot`]).
+pub fn departure_gap_s(
+    me: u32,
+    own: &RunwaySlot,
+    ahead: &[RunwaySlot],
+    others: &[Seen],
+) -> Option<f64> {
+    let waiting: Vec<RunwaySlot> = others
+        .iter()
+        .filter(|s| s.id != me)
+        .filter_map(|s| s.slot)
+        .filter(|x| x.waiting && own.same_strip(x))
+        .collect();
+    let dep = waiting.first()?;
+    let mut ahead = ahead.to_vec();
+    ahead.sort_by(|a, b| a.to_thr_s.total_cmp(&b.to_thr_s));
+    let (mut free, mut gaps) = (0.0_f64, 0);
+    for p in &ahead {
+        if p.to_thr_s >= free + departure_need_s(dep, p) {
+            gaps += 1;
+        }
+        free = free.max(p.clear_s);
+    }
+    (gaps < waiting.len()).then(|| free + departure_need_s(dep, own))
+}
+
+/// [`departure_gap_s`] for OUR arrival: every committed slot on our strip
+/// that reaches the threshold before us is ahead.
+pub fn own_departure_gap_s(own: &RunwaySlot, others: &[Seen]) -> Option<f64> {
+    let ahead: Vec<RunwaySlot> = others
+        .iter()
+        .filter_map(|s| s.slot)
+        .filter(|x| x.committed && own.same_strip(x) && x.to_thr_s < own.to_thr_s)
+        .collect();
+    departure_gap_s(crate::fleet::OWN_ID, own, &ahead, others)
+}
+
+/// OUR departure held at the hold for `runway` (the tower's takeoff hold):
+/// waiting there like the traffic's ([`TrafficAircraft::slot_now`]), so the
+/// arrivals open its gap and the circuit yields to it the same way. The
+/// line-up at [`OWN_LINE_UP_S`], the roll our type's.
+pub fn own_departure_slot(field: &FieldModel, runway: &str, icao_type: &str) -> Option<RunwaySlot> {
+    let end = field.end(runway)?;
+    let (p, wake) = crate::perf::class_for_type(icao_type);
+    let roll = p.vr_kts / p.roll_accel_kts_s;
+    Some(RunwaySlot {
+        thr: end.thr,
+        far: end.far,
+        to_thr_s: 0.0,
+        clear_s: OWN_LINE_UP_S + roll,
+        unjudged_s: OWN_LINE_UP_S,
+        needs_clear_s: 0.0,
+        committed: false,
+        waiting: true,
+        wake,
+        rejoining: false,
+    })
+}
+
 /// Our own aircraft arriving at the field, as the bin's link sees it
 /// (2026-10-14, arrival sequencing): where we are, our type, the runway end
 /// we land on and, while the vectors still have us short of the final,
@@ -1019,5 +1110,37 @@ mod tests {
         let later = s.arriving_in(160.0);
         assert_eq!((later.clear_s, later.unjudged_s), (210.0, 190.0));
         assert_eq!(slot(100.0, 150.0).arriving_in(40.0).unjudged_s, 0.0);
+    }
+
+    /// ONE GAP PER WAITING DEPARTURE (#300): the first arrival with no gap
+    /// ahead of it opens one, [`DEPARTURE_GAP_S`] after the runway is free
+    /// of those ahead; behind a gap already open nobody stretches, unless a
+    /// second departure waits too.
+    #[test]
+    fn each_waiting_departure_is_given_one_gap() {
+        let dep = |id| {
+            seen(
+                id,
+                RunwaySlot {
+                    unjudged_s: 40.0,
+                    committed: false,
+                    waiting: true,
+                    ..slot(0.0, 75.0)
+                },
+            )
+        };
+        let a1 = slot(60.0, 140.0);
+        let a2 = slot(300.0, 380.0);
+        let own = slot(400.0, 480.0);
+        assert_eq!(departure_gap_s(1, &own, &[a1], &[]), None, "nobody waits");
+        assert_eq!(
+            departure_gap_s(1, &a2, &[a1], &[dep(9)]),
+            Some(140.0 + DEPARTURE_GAP_S)
+        );
+        assert_eq!(departure_gap_s(1, &own, &[a1, a2], &[dep(9)]), None);
+        assert_eq!(
+            departure_gap_s(1, &own, &[a2, a1], &[dep(9), dep(8)]),
+            Some(380.0 + DEPARTURE_GAP_S)
+        );
     }
 }

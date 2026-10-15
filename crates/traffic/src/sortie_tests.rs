@@ -894,6 +894,41 @@ fn a_readback_not_taken_twice_says_again_once_then_leaves() {
     );
 }
 
+/// A READBACK WAITING FOR THE FREQUENCY IS NOT RETRIED AGAINST (#300,
+/// EGKK 26L): the retry clock runs from the moment the readback is SAID
+/// ([`Fleet::note_keyed`]), so a readback that waited 22 s to air is
+/// never chased by a "say again" while the tower is still taking it.
+#[test]
+fn a_readback_is_retried_from_when_it_aired() {
+    use crate::aircraft::READBACK_RETRY_S;
+    let field = fixtures::xtst();
+    let mut fleet = Fleet::new(field.clone());
+    assert!(fleet.spawn(cessna(&field, 1, "GA1", "09", 1)));
+    let rb = "Holding position, Cessna three four five.".to_string();
+    let owed = Order {
+        readback_owed: Some(rb.clone()),
+        ..Default::default()
+    };
+    let mut calls = Vec::new();
+    let mut run = |fleet: &mut Fleet, secs: f64| {
+        for _ in 0..(secs * 10.0).round() as usize {
+            for e in fleet.step(0.1, None, &|_| Some(owed.clone())) {
+                if let Event::Call { call, .. } = e {
+                    calls.push(call);
+                }
+            }
+        }
+    };
+    // Queued behind a busy frequency, it airs 22 s later.
+    run(&mut fleet, 22.0);
+    fleet.note_keyed(1, &Call::Readback(rb.clone()));
+    run(&mut fleet, READBACK_RETRY_S - 1.0);
+    assert!(
+        !calls.contains(&Call::SayAgain),
+        "no say again within a retry of the readback airing: {calls:?}"
+    );
+}
+
 /// #242 (BIEG 03): a landing short rolled 1.2 km to the far exit at taxi
 /// pace, and the wait for a stand, timed from the START of the vacate, ran
 /// out the moment the drive ended: gone `NoStand` with "runway vacated"

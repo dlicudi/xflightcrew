@@ -1223,6 +1223,7 @@ impl Link {
             clear_s,
         } in keyed
         {
+            self.fleet.note_keyed(id, &call);
             let Some(ac) = self.fleet.get(id) else {
                 continue;
             };
@@ -1913,6 +1914,7 @@ pub(crate) fn runway_times(
         dist_nm: dist_m / 1852.0,
         callsign: callsign.to_string(),
         icao_type: icao_type.map(str::to_string),
+        depart_gap_s: None,
         at,
     })
 }
@@ -2298,7 +2300,15 @@ impl TrafficWorld {
             own.slot = arrival
                 .as_ref()
                 .and_then(|a| traffic::slot::own_slot(&link.fleet().field, a));
-            // ...and the same place for the station's landing sequence.
+            // Held at the hold, we wait there like a traffic departure: the
+            // arrivals open our gap as they open theirs (#300).
+            if own.slot.is_none() && own.on_ground {
+                own.slot = crate::party_line::takeoff_hold_runway().and_then(|r| {
+                    traffic::slot::own_departure_slot(&link.fleet().field, &r, &own_icao_type())
+                });
+            }
+            // ...and the same place for the station's landing sequence,
+            // with the gap a waiting departure is owed ahead of us.
             let times = own.slot.filter(|_| !own.on_ground).and_then(|slot| {
                 let field = &link.fleet().field;
                 let pos = (own.lat, own.lon);
@@ -2309,7 +2319,20 @@ impl TrafficWorld {
                     }
                     _ => traffic::kin::dist_m(pos, end.thr),
                 };
-                runway_times(field, &slot, pos, Some(dist_m), OWN_KEY, Some(&own_icao_type()), now)
+                let times = runway_times(
+                    field,
+                    &slot,
+                    pos,
+                    Some(dist_m),
+                    OWN_KEY,
+                    Some(&own_icao_type()),
+                    now,
+                )?;
+                let picture = link.fleet().picture();
+                Some(crate::party_line::RunwayTimes {
+                    depart_gap_s: traffic::slot::own_departure_gap_s(&slot, &picture),
+                    ..times
+                })
             });
             crate::world::note_own_times(times);
         }

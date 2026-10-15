@@ -5,7 +5,7 @@ use crate::aircraft::{Seen, TrafficAircraft};
 use crate::clock::{SimClock, SUBSTEP_S};
 use crate::field::FieldModel;
 use crate::kin::LatLon;
-use crate::phase::{Despawn, Event, Order, OwnTarget, Phase, Plan};
+use crate::phase::{Call, Despawn, Event, Order, OwnTarget, Phase, Plan};
 use crate::rng::XorShift64;
 use std::collections::HashMap;
 
@@ -337,6 +337,21 @@ impl Fleet {
         self.aircraft.iter().find(|a| a.id == id)
     }
 
+    /// Flight `id`'s `call` has gone out on the frequency: an owed readback
+    /// (or its "say again") is retried [`crate::aircraft::READBACK_RETRY_S`]
+    /// after it was SAID, never after it was queued. EGKK 26L (#300,
+    /// 2026-10-15): a hold readback waited 23 s for the frequency, and the
+    /// "say again" queued behind it reached a tower that had taken the
+    /// readback a second before.
+    pub fn note_keyed(&mut self, id: u32, call: &Call) {
+        if !matches!(call, Call::Readback(_) | Call::SayAgain) {
+            return;
+        }
+        if let Some(a) = self.aircraft.iter_mut().find(|a| a.id == id) {
+            a.radio.readback_at_s = a.age_s;
+        }
+    }
+
     /// Our own aircraft as last given to [`Fleet::step`].
     pub fn own(&self) -> Option<OwnTarget> {
         self.own.clone()
@@ -438,14 +453,17 @@ impl Fleet {
             // Our own aircraft arriving holds its slot at the runway like
             // any traffic arrival, and the traffic yields to it: we are the
             // player, never told to wait by the fleet, so the slot is in the
-            // picture as committed (2026-10-14, arrival sequencing). On the
-            // ground otherwise it takes a stand like a parked one: an
-            // arrival never picks the stand we stand on.
+            // picture as committed (2026-10-14, arrival sequencing). Held at
+            // the hold it waits there like a traffic departure, owed its gap
+            // the same way (#300). On the ground otherwise it takes a stand
+            // like a parked one: an arrival never picks the stand we stand on.
             if let Some(o) = &own {
                 if let Some(slot) = o.slot {
                     picture.push(Seen {
                         id: OWN_ID,
-                        phase: if o.on_ground {
+                        phase: if slot.waiting {
+                            Phase::HoldShort
+                        } else if o.on_ground {
                             Phase::Landing
                         } else {
                             Phase::Final
@@ -453,7 +471,7 @@ impl Fleet {
                         pos: o.pos,
                         gs_kts: o.gs_kts,
                         slot: Some(crate::slot::RunwaySlot {
-                            committed: true,
+                            committed: !slot.waiting,
                             ..slot
                         }),
                     });

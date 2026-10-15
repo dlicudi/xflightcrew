@@ -674,6 +674,7 @@ fn a_release_ahead_of_a_lander_is_judged_as_the_go_around_watch_judges() {
     let need = LINE_UP_S + roll + RUNWAY_CLEAR_MARGIN_S;
     assert!(!departure_clears_lander(Some(need - 1.0), LINE_UP_S));
     assert!(departure_clears_lander(Some(need + 1.0), LINE_UP_S));
+    assert_eq!(DEPARTURE_RELEASE_S, HOLD_CLEAR_SECS + need);
     assert!(
         !departure_clears_lander(None, LINE_UP_S),
         "an unknown time holds"
