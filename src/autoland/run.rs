@@ -25,6 +25,12 @@ const PITCH_PLANT: [&str; 9] = [
     sim::datarefs::SIDESLIP_DEG,
 ];
 
+/// The pilot's yoke, pitch then roll, read after [`PITCH_PLANT`].
+const YOKE_READS: [&str; 2] = [
+    sim::datarefs::YOKE_PITCH_RATIO,
+    sim::datarefs::YOKE_ROLL_RATIO,
+];
+
 pub(super) fn spawn_autoland(launch: AutolandLaunch) {
     let AutolandLaunch {
         base,
@@ -243,6 +249,8 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             }
 
             TRACKING_ERROR.clear();
+            // The window a missed approach parked (`missed_window_ft`).
+            let mut missed_window: Option<f64> = None;
             let mut last_phase: Option<ApproachPhase> = None;
             // The heading knob, set as a pilot sets it (`bug_knob`, issue #93).
             let mut bug_hold = crate::heading_bug::BugHold::default();
@@ -314,6 +322,8 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             // The roundout gate's go/no-go for this approach (`landing_call`).
             let mut landing_called: Option<LandingCall> = None;
             let mut pitch_yielded = false;
+            // A hand on the yoke under the autopilot (`YokeTakeover`).
+            let mut yoke_takeover = YokeTakeover::default();
             // The hand-flown segment has the servos, from minimums to the
             // wheels (`arrest_hands_step`); the roundout has begun under it
             // (`hold_roundout` keeps it); the ailerons on the bank
@@ -500,6 +510,8 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // flown on (`energy_throttle`).
                 let panel_n = extra_names.len() - 1;
                 extra_names.extend(PITCH_PLANT.iter().map(|n| n.to_string()));
+                // ...and the pilot's yoke (`YokeTakeover`), after the plant.
+                extra_names.extend(YOKE_READS.iter().map(|n| n.to_string()));
                 let extra_refs: Vec<&str> = extra_names.iter().map(String::as_str).collect();
                 // ...and on a landing the autopilot flies (`ap_lands`), its
                 // FMA, second channel and speed window, in the same round.
@@ -1930,6 +1942,22 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                                            "dist": raw.dist_nm}),
                     );
                 }
+                // The window flies with the missed approach (an AtField MCP,
+                // `missed_window_ft`): parked at the level it climbs to, and
+                // back at the field once the approach is the ordinary one
+                // again. Written on a change only; a failed write retries.
+                let want_window = missed_window_ft(window_rule, missed.is_some(), rwy.elev_ft, pattern.map(|p| p.2));
+                if want_window != missed_window {
+                    let to = want_window.unwrap_or_else(|| autoflight::field_window_ft(rwy.elev_ft));
+                    let ok = autoflight::set_dial(&xp, Dial::Altitude, to).await.is_ok();
+                    if ok {
+                        missed_window = want_window;
+                    }
+                    crate::blackbox::record("autoland", serde_json::json!({
+                        "event": "alt_dial_parked", "now": to, "missed": want_window.is_some(),
+                        "ok": ok, "alt_ft": alt, "rule": window_rule,
+                    }));
+                }
                 // Cleared to try again: the next balked landing is a new call.
                 if missed.is_none() {
                     runtime.said_going_around = false;
@@ -3105,11 +3133,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 // 270 times in 8 minutes, +524 fpm climbing to our own path
                 // under the beam). A dead glideslope or a beam below us keeps
                 // the path's VS.
-                let level_for_gs = matches!(
-                    coupling,
-                    crate::ils::Coupling::Armed | crate::ils::Coupling::LocCaptured
-                ) && !ap_modes.is_some_and(|m| m.gs())
-                    && needles.is_some_and(|n| n.gs_valid && n.vdef.is_some_and(|v| v <= 0.0));
+                let level_for_gs = level_for_glideslope(coupling, ap_modes, needles);
                 if cpl.own_vertical && !level_for_gs && !arrest_hands {
                     autoflight::stage_dial(&mut writes, Dial::Vs, vs_dial);
                 }
@@ -3178,6 +3202,27 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         "You have the roll. I'm on the elevator and the power.".into(),
                         Priority::Caution,
                     );
+                }
+                // THE PILOT'S HAND ON THE YOKE under the autopilot, or the
+                // autopilot gone to CWS under it, held (`YokeTakeover`): the
+                // pilot has taken it. Nothing more is pressed or written:
+                // the autopilot comes out and the run ends, the lever where
+                // the hand has it.
+                let hands = !arrest_hands
+                    && !crate::monitor::crew_yoke_fresh()
+                    && yoke_hands(plant_at(PITCH_PLANT.len()), plant_at(PITCH_PLANT.len() + 1));
+                let cws = !arrest_hands && engage.confirmed() && ap_modes.is_some_and(|m| m.cws());
+                let airborne_now = on_ground < 0.5 && !rolling_out;
+                if yoke_takeover.step(ap_t0.elapsed().as_secs_f64(), airborne_now && hands, airborne_now && cws) {
+                    crate::flight::note_pilot_takeover("autoland: yoke");
+                    let off = disconnect_autopilot(&xp).await;
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "pilot_yoke_takeover", "hands": hands, "cws": cws,
+                            "modes": ap_modes.map(|m| m.0), "ap_off": off, "radio": radio_ft}),
+                    );
+                    announce("Your controls.".into(), Priority::Caution);
+                    break;
                 }
                 // Mode housekeeping is the autopilot's while it flies. With
                 // the arrest on the channels a mode press is at best nothing
@@ -3472,7 +3517,11 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     let max_flap = crate::aircraft::live_profile()
                         .and_then(|p| p.flaps.as_ref().and_then(|f| f.speedbrake_max_ratio));
                     let limit = crate::approach_energy::gate_limit_kts(m, energy_vapp, gate.gate_ft());
-                    let e_gate = energy.map(|(.., k)| k).filter(|_| !ga && g.phase != ApproachPhase::Flare);
+                    let e_gate = energy
+                        .filter(|_| !ga && g.phase != ApproachPhase::Flare)
+                        .map(|(_, s_nm, path_nm, _)| {
+                            crate::approach_energy::drag_gate_kts(m, energy_vapp, ias, s_nm, path_nm, drag_restore.is_some())
+                        });
                     let (want, why) = crate::approach_energy::final_drag(
                         drag_restore.is_some(),
                         e_gate,

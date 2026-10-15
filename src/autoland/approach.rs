@@ -823,3 +823,51 @@ pub(super) fn live_floor_leg(
         None => C::Base,
     })
 }
+
+/// An ILS is intercepted LEVEL: with the localiser CAPTURED, the glideslope
+/// not yet and a live beam above us, ALT holds and the glideslope captures
+/// from below. Only once the localiser is captured: merely armed, a "valid"
+/// glideslope is only the display's (EGBB 15, 2026-10-15: levelled at 5,150
+/// ft 15 nm out, 10 km off the localiser, `vdef` a frozen -5.6e-45). Pure.
+pub fn level_for_glideslope(
+    coupling: crate::ils::Coupling,
+    modes: Option<autoflight::Modes>,
+    needles: Option<crate::ils::Needles>,
+) -> bool {
+    coupling == crate::ils::Coupling::LocCaptured
+        && !modes.is_some_and(|m| m.gs())
+        && needles.is_some_and(|n| n.gs_valid && n.vdef.is_some_and(|v| v <= 0.0))
+}
+
+/// The pilot taking the aircraft from autoland by hand: the yoke past the
+/// monitor's hands figure ([`crate::safe_hold::YOKE_HANDS`], not our own
+/// channel), or the autopilot in control wheel steering
+/// ([`autoflight::Modes::cws`]) once its engage is confirmed, either HELD
+/// for [`crate::stable_approach::PERSIST_S`]. EGBB 15 (2026-10-15): the
+/// pilot pushed at 17:26:37, the 737 went to CWS, and autoland pressed V/S
+/// and HDG and drove the lever to TOGA for 15 s against the hand.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct YokeTakeover {
+    since_s: Option<f64>,
+}
+
+impl YokeTakeover {
+    /// One tick at `now_s`; true once the hand has held.
+    pub fn step(&mut self, now_s: f64, hands: bool, cws: bool) -> bool {
+        if !(hands || cws) {
+            self.since_s = None;
+            return false;
+        }
+        let since = *self.since_s.get_or_insert(now_s);
+        now_s - since >= crate::stable_approach::PERSIST_S
+    }
+}
+
+/// Whether the yoke reads a hand: either axis past
+/// [`crate::safe_hold::YOKE_HANDS`]; a failed read is no hand. Pure.
+pub fn yoke_hands(pitch: Option<f64>, roll: Option<f64>) -> bool {
+    [pitch, roll]
+        .into_iter()
+        .flatten()
+        .any(|v| v.is_finite() && v.abs() > crate::safe_hold::YOKE_HANDS)
+}

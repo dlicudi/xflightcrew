@@ -91,6 +91,26 @@ pub fn parked_window_ft(
     autoflight::window_for(rule, dial_ft, alt_ft, field_ft)
 }
 
+/// The window a missed approach flies with on an
+/// [`autoflight::WindowRule::AtField`] MCP: the level it climbs to (the
+/// pattern's platform when one flies, else the reposition's
+/// [`REPOSITION_MIN_AGL_FT`] over the field), rounded up to the hundred.
+/// Left at the field, the 737's reversion to ALT HOLD mid go-around drove
+/// for the runway (EGBB 15, 2026-10-15). `None`: no missed approach, or a
+/// window rule that already parks above. Pure.
+pub fn missed_window_ft(
+    rule: autoflight::WindowRule,
+    missed: bool,
+    field_ft: f64,
+    pattern_platform_ft: Option<f64>,
+) -> Option<f64> {
+    if !missed || rule != autoflight::WindowRule::AtField {
+        return None;
+    }
+    let level = pattern_platform_ft.unwrap_or(field_ft + REPOSITION_MIN_AGL_FT);
+    Some((level / 100.0).ceil() * 100.0)
+}
+
 /// A probed threshold elevation within this of the header is the header (the
 /// mesh and the file agree; no reason to move the aim by a few feet).
 pub const THRESHOLD_ELEV_TRUST_FT: f64 = 20.0;

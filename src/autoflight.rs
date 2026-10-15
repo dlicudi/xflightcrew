@@ -639,6 +639,21 @@ impl Modes {
     pub fn lnav(self) -> bool {
         self.has(Self::LNAV)
     }
+    /// Control wheel steering: the pitch synced to a hand on the yoke and no
+    /// vertical mode of ours (the stock 737 reverts to it under a pilot's
+    /// push, 164 and 162 at EGBB 15, 2026-10-15). An engage brings it in
+    /// too, for the tick before its mode press.
+    pub fn cws(self) -> bool {
+        self.has(Self::PITCH_SYNC)
+            && !self.has(
+                Self::VS
+                    | Self::ALT_HOLD
+                    | Self::GS
+                    | Self::LEVEL_CHANGE
+                    | Self::VNAV
+                    | Self::TOGA_VERTICAL,
+            )
+    }
     /// The approach mode is in: either half armed or captured.
     pub fn approach_any(self) -> bool {
         self.has(Self::LOC_ARMED | Self::LOC | Self::GS_ARMED | Self::GS)
@@ -701,10 +716,17 @@ pub fn window_for(rule: WindowRule, dial_ft: f64, alt_ft: f64, field_ft: f64) ->
         WindowRule::ParkAbove => (dial_ft < alt_ft + WINDOW_CLEAR_FT)
             .then(|| ((alt_ft + WINDOW_PARK_ABOVE_FT) / 100.0).ceil() * 100.0),
         WindowRule::AtField => {
-            let field = (field_ft.max(0.0) / 100.0).floor() * 100.0;
+            let field = field_window_ft(field_ft);
             (dial_ft > field + 1.0).then_some(field)
         }
     }
+}
+
+/// An [`WindowRule::AtField`] window: the field rounded UP to the hundred,
+/// never under the runway (EGBB 15, 2026-10-15: 327 ft floored to 300, and
+/// the 737's ALT HOLD reversion in the go-around drove for it). Pure.
+pub fn field_window_ft(field_ft: f64) -> f64 {
+    (field_ft.max(0.0) / 100.0).ceil() * 100.0
 }
 
 /// The airframe's panel: which command each button is, and how its MCP
@@ -2502,27 +2524,33 @@ mod tests {
 
     /// LEMG 13, 2026-10-05: the 737 held level at 3,400 ft against a -570
     /// dial with the window parked at 5,600. On a V/S-toward-window MCP the
-    /// window goes to the field (rounded down), whatever lies between; the
+    /// window goes to the field (rounded up), whatever lies between; the
     /// LEAX rule parks it above everywhere else.
     #[test]
     fn the_window_is_parked_where_no_capture_takes_the_wheel() {
         let r = WindowRule::AtField;
-        assert_eq!(window_for(r, 5600.0, 3400.0, 52.0), Some(0.0));
+        assert_eq!(window_for(r, 5600.0, 3400.0, 52.0), Some(100.0));
         assert_eq!(
-            window_for(r, 0.0, 3400.0, 52.0),
+            window_for(r, 100.0, 3400.0, 52.0),
             None,
             "already at the field"
         );
         assert_eq!(
             window_for(r, 2000.0, 3400.0, 52.0),
-            Some(0.0),
+            Some(100.0),
             "below us is a capture"
         );
         assert_eq!(
             window_for(r, 9000.0, 7000.0, 5432.0),
-            Some(5400.0),
+            Some(5500.0),
             "a mountain field"
         );
+        assert_eq!(
+            window_for(r, 5600.0, 3000.0, 327.0),
+            Some(400.0),
+            "EGBB: never under the runway"
+        );
+        assert_eq!(window_for(r, 5600.0, 3000.0, 300.0), Some(300.0));
         let a = WindowRule::ParkAbove;
         assert_eq!(window_for(a, 3000.0, 4579.0, 52.0), Some(5600.0));
         assert_eq!(window_for(a, 9500.0, 4579.0, 52.0), None);
