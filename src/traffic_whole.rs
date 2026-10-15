@@ -54,12 +54,12 @@ impl Modeled {
     /// The model at `t`: the aircraft put where it says.
     fn fly(&mut self, t: f64) {
         self.stage = self.whole.at(t).map(|f| {
-            put(&mut self.ac, &f, t < self.whole.track.t_a);
+            put(&mut self.ac, &f);
             f.stage
         });
     }
 
-    /// Shown now (between its off-block and its on-block or its handover).
+    /// Shown now (between its wheels up and its wheels on or its handover).
     pub(crate) fn shown(&self) -> bool {
         self.stage.is_some()
     }
@@ -67,8 +67,6 @@ impl Modeled {
     /// What it is doing, in a pilot's words.
     pub(crate) fn words(&self) -> &'static str {
         match self.stage {
-            Some(Stage::Taxi) if self.ac.phase == Phase::TaxiOut => "taxiing out",
-            Some(Stage::Taxi) => "taxiing in",
             Some(Stage::Holding) => "holding",
             _ if self.ac.kin.vs_fpm > 300.0 => "climbing",
             _ if self.ac.kin.vs_fpm < -300.0 => "descending",
@@ -174,7 +172,7 @@ fn journey(
 /// The aircraft where the model puts it: position, height, speed and
 /// heading, gear and lights as a crew sets them, the phase that draws
 /// its engines running.
-fn put(ac: &mut TrafficAircraft, f: &Fix, leaving: bool) {
+fn put(ac: &mut TrafficAircraft, f: &Fix) {
     let k = &mut ac.kin;
     k.lat = f.pos.0;
     k.lon = f.pos.1;
@@ -183,31 +181,22 @@ fn put(ac: &mut TrafficAircraft, f: &Fix, leaving: bool) {
     k.hdg_deg = f.hdg_deg;
     k.track_deg = f.hdg_deg;
     k.vs_fpm = f.vs_fpm;
-    k.on_ground = f.on_ground;
+    k.on_ground = false;
     k.roll = 0.0;
     k.flaps = 0.0;
-    k.pitch = if f.on_ground {
-        0.0
-    } else {
-        2.0 + (f.vs_fpm / (f.gs_kts.max(60.0) * 101.3))
+    k.pitch = 2.0
+        + (f.vs_fpm / (f.gs_kts.max(60.0) * 101.3))
             .atan()
-            .to_degrees()
-    };
-    k.gear = if f.on_ground || !ac.perf.retractable_gear {
-        1.0
-    } else {
-        0.0
-    };
+            .to_degrees();
+    k.gear = if ac.perf.retractable_gear { 0.0 } else { 1.0 };
     k.lights.nav = true;
     k.lights.beacon = true;
-    k.lights.strobe = !f.on_ground;
-    k.lights.taxi = f.on_ground;
-    k.lights.landing = !f.on_ground && f.alt_ft < 10_000.0;
-    ac.phase = match (f.on_ground, &ac.plan) {
-        (true, _) if leaving => Phase::TaxiOut,
-        (true, _) => Phase::TaxiIn,
-        (false, Plan::Departure { .. }) => Phase::Leave,
-        (false, _) => Phase::Arrive,
+    k.lights.strobe = true;
+    k.lights.taxi = false;
+    k.lights.landing = f.alt_ft < 10_000.0;
+    ac.phase = match &ac.plan {
+        Plan::Departure { .. } => Phase::Leave,
+        _ => Phase::Arrive,
     };
 }
 
@@ -423,10 +412,9 @@ impl Link {
             .filter(|m| m.shown())
     }
 
-    /// The model's aircraft in the air, for the plugin's draw ring (on the
-    /// ground they are at the far end, out of it anyway).
+    /// The model's aircraft, all in the air, for the plugin's draw ring.
     pub(crate) fn modeled_drawn(&self) -> impl Iterator<Item = &TrafficAircraft> {
-        self.modeled().map(|m| &m.ac).filter(|a| !a.kin.on_ground)
+        self.modeled().map(|m| &m.ac)
     }
 
     /// "HH:MM" on the clock at `icao` at fleet time `t` (each country's

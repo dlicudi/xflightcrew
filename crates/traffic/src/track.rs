@@ -165,8 +165,6 @@ impl End {
 /// What the model says at one time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// On the ground at a field, taxiing out or in.
-    Taxi,
     /// In the air on the track.
     Flying,
     /// Past its handover point and not yet taken by the simulation (a
@@ -183,7 +181,6 @@ pub struct Fix {
     pub gs_kts: f64,
     pub hdg_deg: f64,
     pub vs_fpm: f64,
-    pub on_ground: bool,
     pub stage: Stage,
 }
 
@@ -247,7 +244,6 @@ pub struct Track {
     toc_m: f64,
     tod_m: f64,
     segs: [Seg; 3],
-    taxi_kts: f64,
     /// The course arriving at `b`, degrees true.
     final_deg: f64,
 }
@@ -305,7 +301,6 @@ impl Track {
             toc_m: toc,
             tod_m: tod,
             segs,
-            taxi_kts: p.taxi_kts,
             final_deg: (gc_bearing(b.pos, a.pos) + 180.0).rem_euclid(360.0),
         }
     }
@@ -357,37 +352,24 @@ impl Track {
         (self.len_m, self.segs[2].v1)
     }
 
-    /// Where the flight is at `t`, or `None` before its off-block (or, from
-    /// the simulation's handover, before the handover) and after its
-    /// on-block.
+    /// Where the flight is at `t`, or `None` before its wheels up (or, from
+    /// the simulation's handover, before the handover) and after its wheels
+    /// on at a field. Never on the ground: the model knows a field only by
+    /// its reference point, and every taxi there stacked on it (2026-10-15,
+    /// seven aircraft on one spot at EGLL on the EFB map).
     pub fn at(&self, t: f64) -> Option<Fix> {
-        let ground = |e: &End, hdg: f64, kts: f64| Fix {
-            pos: e.pos,
-            alt_ft: e.alt_ft,
-            gs_kts: kts,
-            hdg_deg: hdg,
-            vs_fpm: 0.0,
-            on_ground: true,
-            stage: Stage::Taxi,
-        };
         if t < self.t_a {
-            return (self.a.on_field && t >= self.t_a - TAXI_OUT_S)
-                .then(|| ground(&self.a, gc_bearing(self.a.pos, self.b.pos), self.taxi_kts));
+            return None;
         }
         if t > self.t_b {
-            if !self.b.on_field {
-                return Some(Fix {
-                    pos: self.b.pos,
-                    alt_ft: self.b.alt_ft,
-                    gs_kts: self.b.gs_kts,
-                    hdg_deg: self.final_deg,
-                    vs_fpm: 0.0,
-                    on_ground: false,
-                    stage: Stage::Holding,
-                });
-            }
-            return (t <= self.t_b + TAXI_IN_S)
-                .then(|| ground(&self.b, self.final_deg, self.taxi_kts));
+            return (!self.b.on_field).then(|| Fix {
+                pos: self.b.pos,
+                alt_ft: self.b.alt_ft,
+                gs_kts: self.b.gs_kts,
+                hdg_deg: self.final_deg,
+                vs_fpm: 0.0,
+                stage: Stage::Holding,
+            });
         }
         let (s, v) = self.along(t - self.t_a);
         let f = if self.len_m > 0.0 {
@@ -410,7 +392,6 @@ impl Track {
             gs_kts: v / KT_TO_MS,
             hdg_deg: hdg,
             vs_fpm: grad * v * 60.0,
-            on_ground: false,
             stage: Stage::Flying,
         })
     }
@@ -515,7 +496,7 @@ mod tests {
     const LEMG: LatLon = (36.67, -4.50);
     const EGKK: LatLon = (51.15, -0.19);
 
-    /// Malaga to Gatwick in an A320: taxi, climb, cruise at the class's
+    /// Malaga to Gatwick in an A320: climb, cruise at the class's
     /// level, descent on 3 degrees, on the great circle (its middle is the
     /// slerp's, west of the rhumb line's), about 2 h of airborne time.
     #[test]
@@ -528,10 +509,9 @@ mod tests {
         let t = Track::starting_at(a, b, 1000.0, cruise, p);
         let hrs = t.duration_s() / 3600.0;
         assert!((1.8..2.4).contains(&hrs), "{hrs} h airborne");
-        // Taxiing before the wheels up, nothing before the off-block.
-        let taxi = t.at(1000.0 - 60.0).unwrap();
-        assert!(taxi.on_ground && taxi.stage == Stage::Taxi && taxi.pos == LEMG);
-        assert!(t.at(1000.0 - TAXI_OUT_S - 1.0).is_none());
+        // Nothing on the ground: shown from the wheels up.
+        assert!(t.at(1000.0 - 60.0).is_none());
+        assert_eq!(t.at(1000.0).unwrap().pos, LEMG);
         // Ten minutes up: climbing, below the level.
         let c = t.at(1000.0 + 600.0).unwrap();
         assert!(
@@ -552,11 +532,10 @@ mod tests {
             .atan()
             .to_degrees();
         assert!((-3.3..-2.7).contains(&path_deg), "{path_deg} degrees");
-        // Down: taxiing in, then gone.
+        // Down, then gone.
         let land = t.at(t.t_b).unwrap();
         assert!((land.alt_ft - 202.0).abs() < 1.0 && gc_dist_m(land.pos, EGKK) < 1.0);
-        assert!(t.at(t.t_b + 60.0).unwrap().on_ground);
-        assert!(t.at(t.t_b + TAXI_IN_S + 1.0).is_none());
+        assert!(t.at(t.t_b + 1.0).is_none());
     }
 
     /// The level by distance, on the semicircular rule.

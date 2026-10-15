@@ -555,6 +555,12 @@
     '.apt-status[hidden]{display:none}',
     '.apt-pop{position:absolute;left:12px;top:12px;width:min(340px,calc(100% - 24px));max-height:calc(100% - 24px);overflow:auto;display:flex;flex-direction:column;gap:6px;padding:12px 14px;border-radius:12px;background:rgba(13,17,23,0.96);border:1px solid var(--line2);box-shadow:0 6px 24px rgba(0,0,0,0.5);color:var(--text);z-index:2}',
     '.apt-pop[hidden]{display:none}',
+    '.apt-board{position:absolute;right:12px;top:12px;bottom:12px;width:min(680px,calc(100% - 24px));overflow:auto;display:flex;flex-direction:column;gap:6px;padding:12px 14px;border-radius:12px;background:rgba(13,17,23,0.96);border:1px solid var(--line2);box-shadow:0 6px 24px rgba(0,0,0,0.5);color:var(--text);z-index:3;touch-action:pan-x pan-y}',
+    '.apt-board[hidden]{display:none}',
+    '.apt-board .hd{display:flex;align-items:flex-start;gap:8px}',
+    '.apt-board .ttl{flex:1 1 auto;min-width:0;font-size:19px;font-weight:700;overflow-wrap:anywhere}',
+    '.apt-board .x{flex:0 0 auto;width:36px;height:36px;margin:-6px -8px 0 0;border:0;background:none;color:var(--muted);font-size:22px;cursor:pointer;touch-action:manipulation}',
+    '.apt-board .sub{font-size:14px;color:var(--muted)}',
     '.apt-pop .hd{display:flex;align-items:flex-start;gap:8px}',
     '.apt-pop .ttl{flex:1 1 auto;min-width:0;font-size:19px;font-weight:700;overflow-wrap:anywhere}',
     '.apt-pop .x{flex:0 0 auto;width:36px;height:36px;margin:-6px -8px 0 0;border:0;background:none;color:var(--muted);font-size:22px;cursor:pointer;touch-action:manipulation}',
@@ -611,6 +617,7 @@
   }
 
   var popBox = null, popTitle = null, popSub = null, popRows = null, popAct = null;
+  var bdBox = null, bdTitle = null, bdSub = null, bdBody = null;
   function mount() {
     var hostEl = document.getElementById('apt-root');
     if (!hostEl || root) return;
@@ -670,6 +677,24 @@
     popBox.appendChild(popRows);
     popBox.appendChild(popAct);
     root.appendChild(popBox);
+
+    bdBox = el('div', 'apt-board');
+    bdBox.hidden = true;
+    bdBox.setAttribute('role', 'dialog');
+    var bhd = el('div', 'hd');
+    bdTitle = el('div', 'ttl', '');
+    var bshut = el('button', 'x', '\u00d7');
+    bshut.type = 'button';
+    bshut.setAttribute('aria-label', 'Close');
+    bshut.addEventListener('click', function () { select(null); });
+    bhd.appendChild(bdTitle);
+    bhd.appendChild(bshut);
+    bdSub = el('div', 'sub', '');
+    bdBody = el('div');
+    bdBox.appendChild(bhd);
+    bdBox.appendChild(bdSub);
+    bdBox.appendChild(bdBody);
+    root.appendChild(bdBox);
 
     var ctlBox = el('div', 'apt-ctl');
     var zin = ctl('plus', 'Zoom in', function () { zoomTo(view.z + 1, W / 2, H / 2); });
@@ -891,7 +916,8 @@
 
   // What a tap at screen (sx, sy) lands on: our traffic first (the nearest
   // within 22 px), then a stand of a field drawn close enough for its
-  // stands (16 px), else nothing (the card closes).
+  // stands (16 px), then a field (anywhere on its diagram, else within
+  // 22 px of its dot), else nothing (the card closes).
   function hitAt(px, py) {
     var t = performance.now(), best = null, bd = 22;
     Object.keys(tr).forEach(function (k) {
@@ -908,9 +934,17 @@
         if (d < bd) { bd = d; best = { kind: 'stand', icao: f.geo.icao, name: s.s.name }; }
       });
     });
+    if (best) return best;
+    bd = Infinity;
+    function field(icao, x, y, reach) {
+      var d = Math.hypot(x - px, y - py);
+      if (d < reach && d < bd) { bd = d; best = { kind: 'field', icao: icao }; }
+    }
+    visibleFields().forEach(function (f) { if (f.alpha > 0.3) field(f.geo.icao, sx(f.fr.X0), sy(f.fr.Y0), f.R * f.ppm); });
+    if (base) base.fields.forEach(function (f) { if (f.towered || view.z >= 8.5) field(f.icao, sx(f.X), sy(f.Y), 22); });
     return best;
   }
-  var sel = null;          // { kind: 'ac', id } or { kind: 'stand', icao, name }
+  var sel = null;          // { kind: 'ac', id }, { kind: 'stand', icao, name } or { kind: 'field', icao }
   var confirming = false;  // the stand card asks before it moves us
   var popNote = '', popSig = '';
   function select(s) {
@@ -918,6 +952,7 @@
     if (!same) { confirming = false; popNote = ''; }
     sel = s;
     renderPop();
+    renderFieldBoard();
     dirty = true;
   }
 
@@ -986,7 +1021,7 @@
   }
   function overlayRects() {
     var out = [], b = root.getBoundingClientRect();
-    root.querySelectorAll('.apt-card, .apt-info, .apt-ctl, .apt-pop').forEach(function (e) {
+    root.querySelectorAll('.apt-card, .apt-info, .apt-ctl, .apt-pop, .apt-board').forEach(function (e) {
       if (e.hidden || e.offsetParent === null) return;
       var r = e.getBoundingClientRect();
       if (r.width) out.push([r.left - b.left, r.top - b.top, r.right - b.left, r.bottom - b.top]);
@@ -1624,7 +1659,7 @@
     var a = sel && sel.kind === 'ac' && tr[sel.id] ? tr[sel.id].d : null;
     var f = sel && sel.kind === 'stand' ? fields[sel.icao] : null;
     var s = f ? f.geo.stands.filter(function (x) { return x.name === sel.name; })[0] || null : null;
-    if (!a && !s) { popBox.hidden = true; popSig = ''; if (sel) sel = null; return; }
+    if (!a && !s) { popBox.hidden = true; popSig = ''; if (sel && sel.kind !== 'field') sel = null; return; }
     var mv = st && st.reposition;
     // Rebuilt only when what it says changed: a button rebuilt under a
     // finger would lose its tap.
@@ -1673,6 +1708,28 @@
       button('Cancel', 'plain', function () { confirming = false; renderPop(); });
     } else {
       button('Move here', '', function () { confirming = true; popNote = ''; renderPop(); }, taken);
+    }
+  }
+  // A tapped field's flight information board, the Board tab's own table
+  // (`window.XvlBoard`): only a field our traffic simulates has one.
+  var boards = null, bdSig = '';
+  function renderFieldBoard() {
+    if (!bdBox) return;
+    if (!sel || sel.kind !== 'field') { bdBox.hidden = true; bdSig = ''; return; }
+    var b = (boards || []).filter(function (x) { return x.icao === sel.icao; })[0] || null;
+    var sig = JSON.stringify([sel.icao, !!boards, b]);
+    if (sig === bdSig && !bdBox.hidden) return;
+    bdSig = sig;
+    bdBox.hidden = false;
+    var f = fields[sel.icao];
+    bdTitle.textContent = sel.icao + (f && f.geo.name ? ' ' + f.geo.name : '');
+    bdSub.textContent = b && b.clock ? 'Local time ' + b.clock : '';
+    clearEl(bdBody);
+    if (b && window.XvlBoard) {
+      bdBody.appendChild(window.XvlBoard('Departures', 'To', b.departures));
+      bdBody.appendChild(window.XvlBoard('Arrivals', 'From', b.arrivals));
+    } else {
+      bdBody.appendChild(el('div', 'sub', boards ? 'No flight board: our traffic does not simulate this field.' : 'No flight board: no traffic world running.'));
     }
   }
   // "Move here" is sim management: its own endpoint, never a spoken line.
@@ -1731,6 +1788,7 @@
       own = null;
     }
     ownD = o || null;
+    boards = (s && s.board && s.board.fields) || null;
     updateTraffic(mp && mp.traffic, t);
     convertPlan();
     if (stChanged) convertOverlay();
@@ -1738,6 +1796,7 @@
     renderInfo();
     renderCard();
     renderPop();
+    renderFieldBoard();
     wantFields();
     dirty = true;
   }

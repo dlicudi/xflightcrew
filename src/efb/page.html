@@ -1149,6 +1149,7 @@ form.say .send { min-height: 52px; }
     t.appendChild(tb); wrap.appendChild(t); box.appendChild(wrap);
     return box;
   }
+  window.XvlBoard = boardTable;
   function renderBoard(b) {
     var fields = b && b.fields;
     var segs = $('bd-fields'), body = $('bd-body');
