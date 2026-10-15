@@ -1,0 +1,10 @@
+# Air China: its routes from the hand tables (sources in ../fields.yaml).
+# Telephony read 2026-10-14: Wikipedia's "List of airline codes".
+code: CCA
+name: "Air China"
+iata: CA
+telephony: "Air China"
+types: [[A333, 60], [B789, 40]]
+numbers: [800, 899]
+routes:
+  - {at: EGKK, other: ZSPD, number: 851, summer: 7, winter: 7, windows: [[16.5, 17.0]], types: [[A333, 60], [B789, 40]]}

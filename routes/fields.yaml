@@ -1,0 +1,221 @@
+# Every field a route names (crates/traffic/src/routes.rs, places.rs):
+# its name as a board shows it, its airport reference point (X-Plane 12's
+# Global Airports apt.dat, `1302 datum_lat/lon`, else the first runway's
+# middle, rounded to a hundredth of a degree), its standard time's offset
+# from UTC, hours, and whether it keeps summer time (on the EU's dates; the
+# United States' differ by a few weeks, near enough for a timetable).
+# `top_up: true`: the field's routes cover only its busiest, and the hour
+# generator flies the rest of its rate (crates/traffic/src/midflow.rs).
+#
+# The routes themselves are in carriers/<ICAO code>.yaml, one file per
+# operator. A row's `at` is the field it was written for: `number` is the
+# INBOUND flight at `at` of the day's first rotation, its outbound the next
+# number; `windows` are the local hours at `at` the arrivals fall in
+# (absent: the carrier's lines of flying); `based: true` night-stops the
+# first rotation at `at`; `types` are the route's own types by weight
+# (absent: the carrier's). A field that is some row's `at` has a timetable;
+# a row whose `other` has one too is derived there, the same flights seen
+# from the other end. A carrier writes a pair from one end only.
+#
+# The hand tables, converted 2026-10-15 from one file per field:
+#
+# Gibraltar (LXGB). Source (read 2026-10-13): Wikipedia, "Gibraltar
+# International Airport", Airlines and destinations (British Airways to
+# Heathrow; easyJet to Birmingham, Bristol, Gatwick and Manchester) and its
+# 2024 route table (Heathrow 193,714 passengers, Gatwick 130,689,
+# Manchester 68,615, Bristol 31,038; 3,628 movements in the year, about ten
+# a day). BA492 Heathrow to Gibraltar and BA493 back, off the blocks 15:10
+# local (flightradar24.com/data/flights/ba493, planemapper.com/flights/BA492).
+# The 2024 pattern: BA twice a day to Heathrow in summer, once in winter at
+# its 14:20 slot; easyJet to Gatwick most days and Manchester, Bristol and
+# Birmingham a few days a week, midday into the afternoon (the runway shares
+# the frontier road, so nothing night-stops). Its rows keep the published
+# slots.
+#
+# Malaga (LEMG). Source (read 2026-10-13): Wikipedia, "Malaga Airport",
+# Airlines and destinations and the 2025 route tables (Gatwick 1.24 M,
+# Amsterdam 1.05 M, Barcelona 1.04 M, Dublin 853 k, ... down to San
+# Sebastian 19 k); 186,990 movements in 2025, about 512 a day, the summer
+# near 600. Its times are the carriers' LINES OF FLYING: each aircraft's
+# day built from the route's block time and turnarounds
+# (crates/traffic/src/rotation.rs).
+#
+# Gatwick (EGKK). Sources (read 2026-10-14): Wikipedia, "Gatwick
+# Airport" (operating bases, Airlines and destinations, the busiest routes
+# of 2025 international and 2024 domestic, annual traffic); UK CAA, UK
+# airport data annual 2025 (Table 12.1 international and 12.2 domestic
+# route analysis, Table 03.1 aircraft movements, Table 05 air transport
+# movements: 263,113 movements in 2025, 261,529 of them air transport, 721
+# a day, a summer day 850 to 900); Emirates' media centre and AirInsight
+# (three daily A380s and a fourth daily A350-900 since 9 February 2026);
+# Travelradar (Turkish from 26 to 28 a week, summer 2025); Air Cargo Week
+# (Qatar double daily on the 787); FlightAware logs (China Eastern's B77W,
+# B773 and A332 to Pudong); Gatwick's media centre (Air China and China
+# Eastern to Shanghai); airplanes.live (Norse Atlantic UK, Sky Express).
+#
+# The method: a route's weekly rotations are its passengers over a full
+# narrowbody each way (150 seated, 85% full) and the 52 weeks, split
+# between the carriers the article names on it (the split is judgement: no
+# source publishes it); a year-round route flies 1.2 of that in the summer
+# and 0.7 in the winter, a winter-sun or ski route the same all year, a
+# summer-heavy one 1.5 in the summer, a summer-only one 1.68 in the summer
+# and none in the winter. Gatwick's rows are its 40 busiest international
+# routes and 9 busiest domestic ones, 60% of its passengers, SCALED by 0.7
+# (it carries 163.5 passengers a movement, not the method's 127.5); a route
+# flown more than seven a day is two rows. Long haul and the Gulf keep
+# their PUBLISHED frequencies (Emirates 28 a week, Turkish 28, Qatar 14) or
+# an estimate from passengers over a widebody's seats, in published-like
+# windows. Flight numbers are illustrative inside each carrier's own range
+# (only BA's are the real ones), spaced so a day's rotations never collide.
+  - {icao: BIKF, city: "Reykjavik", lat: 63.98, lon: -22.61, utc_offset_h: 0.0, dst: false}
+  - {icao: EBBR, city: "Brussels", lat: 50.90, lon: 4.48, utc_offset_h: 1.0, dst: true}
+  - {icao: EBCI, city: "Brussels Charleroi", lat: 50.46, lon: 4.45, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDB, city: "Berlin", lat: 52.36, lon: 13.50, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDF, city: "Frankfurt", lat: 50.03, lon: 8.57, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDG, city: "Munster", lat: 52.13, lon: 7.68, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDH, city: "Hamburg", lat: 53.63, lon: 9.99, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDK, city: "Cologne", lat: 50.87, lon: 7.14, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDL, city: "Dusseldorf", lat: 51.28, lon: 6.76, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDM, city: "Munich", lat: 48.35, lon: 11.79, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDN, city: "Nuremberg", lat: 49.50, lon: 11.08, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDS, city: "Stuttgart", lat: 48.69, lon: 9.22, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDV, city: "Hannover", lat: 52.46, lon: 9.68, utc_offset_h: 1.0, dst: true}
+  - {icao: EDDW, city: "Bremen", lat: 53.05, lon: 8.79, utc_offset_h: 1.0, dst: true}
+  - {icao: EDFH, city: "Frankfurt Hahn", lat: 49.95, lon: 7.26, utc_offset_h: 1.0, dst: true}
+  - {icao: EDHL, city: "Lubeck", lat: 53.81, lon: 10.72, utc_offset_h: 1.0, dst: true}
+  - {icao: EDJA, city: "Memmingen", lat: 47.99, lon: 10.24, utc_offset_h: 1.0, dst: true}
+  - {icao: EDLV, city: "Weeze", lat: 51.60, lon: 6.14, utc_offset_h: 1.0, dst: true}
+  - {icao: EDSB, city: "Karlsruhe", lat: 48.78, lon: 8.08, utc_offset_h: 1.0, dst: true}
+  - {icao: EFHK, city: "Helsinki", lat: 60.32, lon: 24.96, utc_offset_h: 2.0, dst: true}
+  - {icao: EGAA, city: "Belfast International", lat: 54.66, lon: -6.22, utc_offset_h: 0.0, dst: true}
+  - {icao: EGAC, city: "Belfast City", lat: 54.62, lon: -5.87, utc_offset_h: 0.0, dst: true}
+  - {icao: EGBB, city: "Birmingham", lat: 52.45, lon: -1.75, utc_offset_h: 0.0, dst: true}
+  - {icao: EGCC, city: "Manchester", lat: 53.35, lon: -2.27, utc_offset_h: 0.0, dst: true}
+  - {icao: EGFF, city: "Cardiff", lat: 51.40, lon: -3.34, utc_offset_h: 0.0, dst: true}
+  - {icao: EGGD, city: "Bristol", lat: 51.38, lon: -2.72, utc_offset_h: 0.0, dst: true}
+  - {icao: EGGP, city: "Liverpool", lat: 53.33, lon: -2.85, utc_offset_h: 0.0, dst: true}
+  - {icao: EGGW, city: "London Luton", lat: 51.87, lon: -0.37, utc_offset_h: 0.0, dst: true}
+  - {icao: EGHH, city: "Bournemouth", lat: 50.78, lon: -1.84, utc_offset_h: 0.0, dst: true}
+  - {icao: EGHQ, city: "Newquay", lat: 50.44, lon: -5.00, utc_offset_h: 0.0, dst: true}
+  - {icao: EGJB, city: "Guernsey", lat: 49.43, lon: -2.60, utc_offset_h: 0.0, dst: true}
+  - {icao: EGJJ, city: "Jersey", lat: 49.21, lon: -2.20, utc_offset_h: 0.0, dst: true}
+  - {icao: EGKK, city: "London Gatwick", lat: 51.15, lon: -0.19, utc_offset_h: 0.0, dst: true, top_up: true}
+  - {icao: EGLL, city: "London Heathrow", lat: 51.48, lon: -0.46, utc_offset_h: 0.0, dst: true}
+  - {icao: EGMC, city: "London Southend", lat: 51.57, lon: 0.69, utc_offset_h: 0.0, dst: true}
+  - {icao: EGNM, city: "Leeds Bradford", lat: 53.87, lon: -1.66, utc_offset_h: 0.0, dst: true}
+  - {icao: EGNS, city: "Isle of Man", lat: 54.08, lon: -4.62, utc_offset_h: 0.0, dst: true}
+  - {icao: EGNT, city: "Newcastle", lat: 55.04, lon: -1.69, utc_offset_h: 0.0, dst: true}
+  - {icao: EGNV, city: "Teesside", lat: 54.51, lon: -1.43, utc_offset_h: 0.0, dst: true}
+  - {icao: EGNX, city: "East Midlands", lat: 52.83, lon: -1.33, utc_offset_h: 0.0, dst: true}
+  - {icao: EGPD, city: "Aberdeen", lat: 57.20, lon: -2.20, utc_offset_h: 0.0, dst: true}
+  - {icao: EGPE, city: "Inverness", lat: 57.54, lon: -4.05, utc_offset_h: 0.0, dst: true}
+  - {icao: EGPF, city: "Glasgow", lat: 55.87, lon: -4.43, utc_offset_h: 0.0, dst: true}
+  - {icao: EGPH, city: "Edinburgh", lat: 55.95, lon: -3.37, utc_offset_h: 0.0, dst: true}
+  - {icao: EGPK, city: "Glasgow Prestwick", lat: 55.51, lon: -4.59, utc_offset_h: 0.0, dst: true}
+  - {icao: EGSS, city: "London Stansted", lat: 51.88, lon: 0.23, utc_offset_h: 0.0, dst: true}
+  - {icao: EGTE, city: "Exeter", lat: 50.73, lon: -3.41, utc_offset_h: 0.0, dst: true}
+  - {icao: EHAM, city: "Amsterdam", lat: 52.31, lon: 4.76, utc_offset_h: 1.0, dst: true}
+  - {icao: EHEH, city: "Eindhoven", lat: 51.45, lon: 5.37, utc_offset_h: 1.0, dst: true}
+  - {icao: EHRD, city: "Rotterdam", lat: 51.96, lon: 4.44, utc_offset_h: 1.0, dst: true}
+  - {icao: EICK, city: "Cork", lat: 51.84, lon: -8.49, utc_offset_h: 0.0, dst: true}
+  - {icao: EIDW, city: "Dublin", lat: 53.42, lon: -6.27, utc_offset_h: 0.0, dst: true}
+  - {icao: EIKN, city: "Knock", lat: 53.91, lon: -8.82, utc_offset_h: 0.0, dst: true}
+  - {icao: EINN, city: "Shannon", lat: 52.70, lon: -8.92, utc_offset_h: 0.0, dst: true}
+  - {icao: EKAH, city: "Aarhus", lat: 56.30, lon: 10.62, utc_offset_h: 1.0, dst: true}
+  - {icao: EKBI, city: "Billund", lat: 55.74, lon: 9.15, utc_offset_h: 1.0, dst: true}
+  - {icao: EKCH, city: "Copenhagen", lat: 55.62, lon: 12.66, utc_offset_h: 1.0, dst: true}
+  - {icao: EKYT, city: "Aalborg", lat: 57.09, lon: 9.85, utc_offset_h: 1.0, dst: true}
+  - {icao: ENBR, city: "Bergen", lat: 60.29, lon: 5.22, utc_offset_h: 1.0, dst: true}
+  - {icao: ENGM, city: "Oslo", lat: 60.20, lon: 11.08, utc_offset_h: 1.0, dst: true}
+  - {icao: ENHD, city: "Haugesund", lat: 59.34, lon: 5.21, utc_offset_h: 1.0, dst: true}
+  - {icao: ENTO, city: "Sandefjord", lat: 59.19, lon: 10.26, utc_offset_h: 1.0, dst: true}
+  - {icao: ENVA, city: "Trondheim", lat: 63.46, lon: 10.92, utc_offset_h: 1.0, dst: true}
+  - {icao: ENZV, city: "Stavanger", lat: 58.88, lon: 5.64, utc_offset_h: 1.0, dst: true}
+  - {icao: EPGD, city: "Gdansk", lat: 54.38, lon: 18.47, utc_offset_h: 1.0, dst: true}
+  - {icao: EPKK, city: "Krakow", lat: 50.08, lon: 19.78, utc_offset_h: 1.0, dst: true}
+  - {icao: EPKT, city: "Katowice", lat: 50.47, lon: 19.08, utc_offset_h: 1.0, dst: true}
+  - {icao: EPLL, city: "Lodz", lat: 51.72, lon: 19.40, utc_offset_h: 1.0, dst: true}
+  - {icao: EPPO, city: "Poznan", lat: 52.42, lon: 16.83, utc_offset_h: 1.0, dst: true}
+  - {icao: EPWA, city: "Warsaw", lat: 52.17, lon: 20.97, utc_offset_h: 1.0, dst: true}
+  - {icao: EPWR, city: "Wroclaw", lat: 51.10, lon: 16.89, utc_offset_h: 1.0, dst: true}
+  - {icao: ESGG, city: "Gothenburg", lat: 57.66, lon: 12.29, utc_offset_h: 1.0, dst: true}
+  - {icao: ESKN, city: "Stockholm Skavsta", lat: 58.79, lon: 16.90, utc_offset_h: 1.0, dst: true}
+  - {icao: ESSA, city: "Stockholm", lat: 59.65, lon: 17.92, utc_offset_h: 1.0, dst: true}
+  - {icao: EVRA, city: "Riga", lat: 56.92, lon: 23.97, utc_offset_h: 2.0, dst: true}
+  - {icao: EYKA, city: "Kaunas", lat: 54.96, lon: 24.08, utc_offset_h: 2.0, dst: true}
+  - {icao: EYVI, city: "Vilnius", lat: 54.64, lon: 25.29, utc_offset_h: 2.0, dst: true}
+  - {icao: GCFV, city: "Fuerteventura", lat: 28.45, lon: -13.86, utc_offset_h: 0.0, dst: true}
+  - {icao: GCLP, city: "Gran Canaria", lat: 27.93, lon: -15.39, utc_offset_h: 0.0, dst: true}
+  - {icao: GCRR, city: "Lanzarote", lat: 28.95, lon: -13.61, utc_offset_h: 0.0, dst: true}
+  - {icao: GCTS, city: "Tenerife South", lat: 28.04, lon: -16.57, utc_offset_h: 0.0, dst: true}
+  - {icao: GCXO, city: "Tenerife North", lat: 28.48, lon: -16.34, utc_offset_h: 0.0, dst: true}
+  - {icao: GEML, city: "Melilla", lat: 35.28, lon: -2.96, utc_offset_h: 1.0, dst: true}
+  - {icao: GMFF, city: "Fez", lat: 33.93, lon: -4.98, utc_offset_h: 1.0, dst: false}
+  - {icao: GMME, city: "Rabat", lat: 34.05, lon: -6.75, utc_offset_h: 1.0, dst: false}
+  - {icao: GMMX, city: "Marrakesh", lat: 31.61, lon: -8.04, utc_offset_h: 1.0, dst: false}
+  - {icao: GMTN, city: "Tetouan", lat: 35.59, lon: -5.32, utc_offset_h: 1.0, dst: false}
+  - {icao: GMTT, city: "Tangier", lat: 35.73, lon: -5.92, utc_offset_h: 1.0, dst: false}
+  - {icao: KEWR, city: "Newark", lat: 40.69, lon: -74.17, utc_offset_h: -5.0, dst: true}
+  - {icao: KJFK, city: "New York JFK", lat: 40.64, lon: -73.78, utc_offset_h: -5.0, dst: true}
+  - {icao: KMCO, city: "Orlando", lat: 28.43, lon: -81.31, utc_offset_h: -5.0, dst: true}
+  - {icao: LATI, city: "Tirana", lat: 41.41, lon: 19.72, utc_offset_h: 1.0, dst: true}
+  - {icao: LBSF, city: "Sofia", lat: 42.70, lon: 23.41, utc_offset_h: 2.0, dst: true}
+  - {icao: LCLK, city: "Larnaca", lat: 34.88, lon: 33.63, utc_offset_h: 2.0, dst: true}
+  - {icao: LCPH, city: "Paphos", lat: 34.72, lon: 32.48, utc_offset_h: 2.0, dst: true}
+  - {icao: LDZA, city: "Zagreb", lat: 45.74, lon: 16.07, utc_offset_h: 1.0, dst: true}
+  - {icao: LEAL, city: "Alicante", lat: 38.28, lon: -0.56, utc_offset_h: 1.0, dst: true}
+  - {icao: LEBB, city: "Bilbao", lat: 43.30, lon: -2.91, utc_offset_h: 1.0, dst: true}
+  - {icao: LEBL, city: "Barcelona", lat: 41.30, lon: 2.08, utc_offset_h: 1.0, dst: true}
+  - {icao: LEIB, city: "Ibiza", lat: 38.87, lon: 1.37, utc_offset_h: 1.0, dst: true}
+  - {icao: LEMD, city: "Madrid", lat: 40.47, lon: -3.56, utc_offset_h: 1.0, dst: true}
+  - {icao: LEMG, city: "Malaga", lat: 36.67, lon: -4.50, utc_offset_h: 1.0, dst: true}
+  - {icao: LEPA, city: "Palma de Mallorca", lat: 39.55, lon: 2.74, utc_offset_h: 1.0, dst: true}
+  - {icao: LEST, city: "Santiago", lat: 42.90, lon: -8.42, utc_offset_h: 1.0, dst: true}
+  - {icao: LEVC, city: "Valencia", lat: 39.49, lon: -0.48, utc_offset_h: 1.0, dst: true}
+  - {icao: LEZL, city: "Seville", lat: 37.42, lon: -5.90, utc_offset_h: 1.0, dst: true}
+  - {icao: LFBD, city: "Bordeaux", lat: 44.83, lon: -0.72, utc_offset_h: 1.0, dst: true}
+  - {icao: LFLL, city: "Lyon", lat: 45.73, lon: 5.08, utc_offset_h: 1.0, dst: true}
+  - {icao: LFML, city: "Marseille", lat: 43.44, lon: 5.21, utc_offset_h: 1.0, dst: true}
+  - {icao: LFMN, city: "Nice", lat: 43.67, lon: 7.21, utc_offset_h: 1.0, dst: true}
+  - {icao: LFMT, city: "Montpellier", lat: 43.58, lon: 3.96, utc_offset_h: 1.0, dst: true}
+  - {icao: LFPG, city: "Paris Charles de Gaulle", lat: 49.01, lon: 2.55, utc_offset_h: 1.0, dst: true}
+  - {icao: LFPO, city: "Paris Orly", lat: 48.72, lon: 2.38, utc_offset_h: 1.0, dst: true}
+  - {icao: LFRS, city: "Nantes", lat: 47.16, lon: -1.61, utc_offset_h: 1.0, dst: true}
+  - {icao: LFSB, city: "Basel", lat: 47.59, lon: 7.53, utc_offset_h: 1.0, dst: true}
+  - {icao: LGAV, city: "Athens", lat: 37.94, lon: 23.94, utc_offset_h: 2.0, dst: true}
+  - {icao: LGIR, city: "Heraklion", lat: 35.34, lon: 25.18, utc_offset_h: 2.0, dst: true}
+  - {icao: LGKR, city: "Corfu", lat: 39.60, lon: 19.91, utc_offset_h: 2.0, dst: true}
+  - {icao: LGRP, city: "Rhodes", lat: 36.41, lon: 28.09, utc_offset_h: 2.0, dst: true}
+  - {icao: LHBP, city: "Budapest", lat: 47.44, lon: 19.26, utc_offset_h: 1.0, dst: true}
+  - {icao: LIMC, city: "Milan Malpensa", lat: 45.63, lon: 8.72, utc_offset_h: 1.0, dst: true}
+  - {icao: LIME, city: "Bergamo", lat: 45.67, lon: 9.70, utc_offset_h: 1.0, dst: true}
+  - {icao: LIMF, city: "Turin", lat: 45.20, lon: 7.65, utc_offset_h: 1.0, dst: true}
+  - {icao: LIPE, city: "Bologna", lat: 44.53, lon: 11.30, utc_offset_h: 1.0, dst: true}
+  - {icao: LIPH, city: "Treviso", lat: 45.65, lon: 12.20, utc_offset_h: 1.0, dst: true}
+  - {icao: LIPZ, city: "Venice", lat: 45.51, lon: 12.35, utc_offset_h: 1.0, dst: true}
+  - {icao: LIRF, city: "Rome Fiumicino", lat: 41.80, lon: 12.24, utc_offset_h: 1.0, dst: true}
+  - {icao: LIRN, city: "Naples", lat: 40.88, lon: 14.29, utc_offset_h: 1.0, dst: true}
+  - {icao: LIRP, city: "Pisa", lat: 43.68, lon: 10.40, utc_offset_h: 1.0, dst: true}
+  - {icao: LKMT, city: "Ostrava", lat: 49.70, lon: 18.11, utc_offset_h: 1.0, dst: true}
+  - {icao: LKPR, city: "Prague", lat: 50.10, lon: 14.26, utc_offset_h: 1.0, dst: true}
+  - {icao: LKTB, city: "Brno", lat: 49.15, lon: 16.69, utc_offset_h: 1.0, dst: true}
+  - {icao: LMML, city: "Malta", lat: 35.86, lon: 14.48, utc_offset_h: 1.0, dst: true}
+  - {icao: LOWW, city: "Vienna", lat: 48.11, lon: 16.57, utc_offset_h: 1.0, dst: true}
+  - {icao: LPFR, city: "Faro", lat: 37.01, lon: -7.97, utc_offset_h: 0.0, dst: true}
+  - {icao: LPPR, city: "Porto", lat: 41.24, lon: -8.68, utc_offset_h: 0.0, dst: true}
+  - {icao: LPPT, city: "Lisbon", lat: 38.77, lon: -9.13, utc_offset_h: 0.0, dst: true}
+  - {icao: LRCL, city: "Cluj", lat: 46.79, lon: 23.69, utc_offset_h: 2.0, dst: true}
+  - {icao: LROP, city: "Bucharest", lat: 44.57, lon: 26.09, utc_offset_h: 2.0, dst: true}
+  - {icao: LSGG, city: "Geneva", lat: 46.24, lon: 6.11, utc_offset_h: 1.0, dst: true}
+  - {icao: LSZH, city: "Zurich", lat: 47.46, lon: 8.55, utc_offset_h: 1.0, dst: true}
+  - {icao: LTAI, city: "Antalya", lat: 36.90, lon: 30.79, utc_offset_h: 3.0, dst: false}
+  - {icao: LTBS, city: "Dalaman", lat: 36.71, lon: 28.79, utc_offset_h: 3.0, dst: false}
+  - {icao: LTFM, city: "Istanbul", lat: 41.28, lon: 28.75, utc_offset_h: 3.0, dst: false}
+  - {icao: LXGB, city: "Gibraltar", lat: 36.15, lon: -5.35, utc_offset_h: 1.0, dst: true}
+  - {icao: LZIB, city: "Bratislava", lat: 48.17, lon: 17.21, utc_offset_h: 1.0, dst: true}
+  - {icao: LZKZ, city: "Kosice", lat: 48.66, lon: 21.24, utc_offset_h: 1.0, dst: true}
+  - {icao: MMUN, city: "Cancun", lat: 21.04, lon: -86.87, utc_offset_h: -5.0, dst: false}
+  - {icao: OMAA, city: "Abu Dhabi", lat: 24.43, lon: 54.65, utc_offset_h: 4.0, dst: false}
+  - {icao: OMDB, city: "Dubai", lat: 25.25, lon: 55.36, utc_offset_h: 4.0, dst: false}
+  - {icao: OTHH, city: "Doha", lat: 25.27, lon: 51.61, utc_offset_h: 3.0, dst: false}
+  - {icao: ZSPD, city: "Shanghai", lat: 31.14, lon: 121.79, utc_offset_h: 8.0, dst: false}

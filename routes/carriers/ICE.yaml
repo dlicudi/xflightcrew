@@ -1,0 +1,9 @@
+# Icelandair: its routes from the hand tables (sources in ../fields.yaml).
+code: ICE
+name: "Icelandair"
+iata: FI
+telephony: "Iceair"
+types: [[B38M, 100]]
+numbers: [500, 599]
+routes:
+  - {at: LEMG, other: BIKF, number: 532, summer: 2, winter: 2, windows: [[14.5, 15.5]]}

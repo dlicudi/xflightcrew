@@ -1,0 +1,9 @@
+# Iberia: its routes from the hand tables (sources in ../fields.yaml).
+code: IBE
+name: "Iberia"
+iata: IB
+telephony: "Iberia"
+types: [[A320, 40], [A321, 30], [A20N, 20], [A21N, 10]]
+numbers: [3000, 3999]
+routes:
+  - {at: LEMG, other: LEMD, number: 3700, summer: 21, winter: 21}

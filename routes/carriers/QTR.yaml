@@ -1,0 +1,10 @@
+# Qatar Airways: its routes from the hand tables (sources in ../fields.yaml).
+code: QTR
+name: "Qatar Airways"
+iata: QR
+telephony: "Qatari"
+types: [[A359, 40], [B77W, 30], [A388, 20], [A35K, 10]]
+numbers: [1, 99]
+routes:
+  - {at: EGKK, other: OTHH, number: 15, summer: 14, winter: 14, windows: [[7.0, 7.5], [14.0, 14.5]], types: [[B788, 50], [B789, 30], [A359, 20]]}
+  - {at: LEMG, other: OTHH, number: 52, summer: 7, winter: 7, windows: [[13.0, 13.5]], types: [[B788, 60], [A359, 40]]}

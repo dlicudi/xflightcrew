@@ -1,0 +1,10 @@
+# Air France: its routes from the hand tables (sources in ../fields.yaml).
+code: AFR
+name: "Air France"
+iata: AF
+telephony: "Air France"
+types: [[A320, 45], [A321, 20], [A319, 15], [A20N, 20]]
+numbers: [1000, 1999]
+routes:
+  - {at: EGKK, other: LFPG, number: 1081, summer: 11, winter: 6}
+  - {at: LEMG, other: LFPG, number: 1312, summer: 14, winter: 14}

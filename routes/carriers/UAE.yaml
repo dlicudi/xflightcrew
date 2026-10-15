@@ -1,0 +1,9 @@
+# Emirates: its routes from the hand tables (sources in ../fields.yaml).
+code: UAE
+name: "Emirates"
+iata: EK
+telephony: "Emirates"
+types: [[A388, 60], [B77W, 40]]
+numbers: [1, 99]
+routes:
+  - {at: EGKK, other: OMDB, number: 5, summer: 28, winter: 28, windows: [[7.0, 7.5], [12.5, 13.0], [14.5, 15.0], [19.5, 20.0]], types: [[A388, 75], [A359, 25]]}

@@ -1,0 +1,9 @@
+# Austrian: its routes from the hand tables (sources in ../fields.yaml).
+code: AUA
+name: "Austrian"
+iata: OS
+telephony: "Austrian"
+types: [[A320, 60], [A321, 25], [A20N, 15]]
+numbers: [100, 999]
+routes:
+  - {at: LEMG, other: LOWW, number: 157, summer: 10, winter: 7}

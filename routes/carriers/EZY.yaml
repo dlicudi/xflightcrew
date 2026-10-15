@@ -1,0 +1,74 @@
+# easyJet: its routes from the hand tables (sources in ../fields.yaml).
+code: EZY
+name: "easyJet"
+iata: U2
+telephony: "Easy"
+types: [[A320, 45], [A319, 15], [A20N, 25], [A21N, 15]]
+numbers: [11, 8999]
+routes:
+  - {at: EGKK, other: EGJJ, number: 8655, summer: 19, winter: 4, based: true}
+  - {at: EGKK, other: EGPH, number: 8673, summer: 29, winter: 17, based: true}
+  - {at: EGKK, other: EGPF, number: 8695, summer: 16, winter: 10, based: true}
+  - {at: EGKK, other: EGAA, number: 8713, summer: 25, winter: 15, based: true}
+  - {at: EGKK, other: EGAC, number: 8733, summer: 18, winter: 11, based: true}
+  - {at: EGKK, other: EGPE, number: 8751, summer: 15, winter: 8, based: true}
+  - {at: EGKK, other: EGPD, number: 8767, summer: 13, winter: 8, based: true}
+  - {at: EGKK, other: EGNS, number: 8783, summer: 12, winter: 7, based: true}
+  - {at: EGKK, other: LEBL, number: 8101, summer: 43, winter: 25, based: true}
+  - {at: EGKK, other: LEAL, number: 8129, summer: 27, winter: 16, based: true}
+  - {at: EGKK, other: LPFR, number: 8183, summer: 26, winter: 15, based: true}
+  - {at: EGKK, other: LEPA, number: 8257, summer: 30, winter: 5, based: true}
+  - {at: EGKK, other: LEMD, number: 8309, summer: 15, winter: 9, based: true}
+  - {at: EGKK, other: LPPT, number: 8421, summer: 18, winter: 10, based: true}
+  - {at: EGKK, other: LEZL, number: 8457, summer: 15, winter: 9, based: true}
+  - {at: EGKK, other: LPPR, number: 8491, summer: 15, winter: 8, based: true}
+  - {at: EGKK, other: LIRF, number: 8151, summer: 26, winter: 15, based: true}
+  - {at: EGKK, other: LIRF, number: 8171, summer: 26, winter: 15, based: true}
+  - {at: EGKK, other: LIMC, number: 8205, summer: 48, winter: 28, based: true}
+  - {at: EGKK, other: LSGG, number: 8235, summer: 29, winter: 29, based: true}
+  - {at: EGKK, other: EHAM, number: 8345, summer: 34, winter: 20, based: true}
+  - {at: EGKK, other: EKCH, number: 8385, summer: 13, winter: 8, based: true}
+  - {at: EGKK, other: LFMN, number: 8401, summer: 24, winter: 14, based: true}
+  - {at: EGKK, other: LFPG, number: 8539, summer: 16, winter: 9, based: true}
+  - {at: EGKK, other: LIRN, number: 8623, summer: 16, winter: 9, based: true}
+  - {at: EGKK, other: LHBP, number: 8641, summer: 6, winter: 4, based: true}
+  - {at: EGKK, other: GCTS, number: 8281, summer: 14, winter: 14, based: true}
+  - {at: EGKK, other: GMMX, number: 8327, summer: 19, winter: 19, based: true}
+  - {at: EGKK, other: GCRR, number: 8475, summer: 11, winter: 11, based: true}
+  - {at: EGKK, other: LTAI, number: 8297, summer: 5, winter: 1, based: true}
+  - {at: EGKK, other: LMML, number: 8369, summer: 15, winter: 9, based: true}
+  - {at: EGKK, other: LGAV, number: 8439, summer: 18, winter: 11, based: true}
+  - {at: EGKK, other: LCLK, number: 8507, summer: 13, winter: 8, based: true}
+  - {at: EGKK, other: LTBS, number: 8523, summer: 14, winter: 0, based: true}
+  - {at: EGKK, other: LCPH, number: 8557, summer: 15, winter: 3, based: true}
+  - {at: EGKK, other: LGKR, number: 8573, summer: 16, winter: 0, based: true}
+  - {at: EGKK, other: LGIR, number: 8591, summer: 14, winter: 0, based: true}
+  - {at: EGKK, other: LGRP, number: 8607, summer: 14, winter: 0, based: true}
+  - {at: LEMG, other: EGKK, number: 8061, summer: 28, winter: 21, based: true}
+  - {at: LEMG, other: EGCC, number: 1925, summer: 14, winter: 10, based: true}
+  - {at: LEMG, other: EGGD, number: 6127, summer: 21, winter: 14, based: true}
+  - {at: LEMG, other: EGBB, number: 3367, summer: 5, winter: 3}
+  - {at: LEMG, other: EGGW, number: 2041, summer: 14, winter: 10}
+  - {at: LEMG, other: EGGP, number: 2263, summer: 14, winter: 10}
+  - {at: LEMG, other: EGPH, number: 6811, summer: 7, winter: 5}
+  - {at: LEMG, other: EGPF, number: 6957, summer: 7, winter: 4}
+  - {at: LEMG, other: EGNT, number: 6497, summer: 5, winter: 3}
+  - {at: LEMG, other: EGAA, number: 6587, summer: 5, winter: 3}
+  - {at: LEMG, other: EHAM, number: 7951, summer: 14, winter: 7}
+  - {at: LEMG, other: LFLL, number: 4417, summer: 4, winter: 3}
+  - {at: LEMG, other: LFMN, number: 4581, summer: 3, winter: 2}
+  - {at: LEMG, other: LFSB, number: 5145, summer: 4, winter: 3}
+  - {at: LEMG, other: EDDB, number: 5531, summer: 7, winter: 4}
+  - {at: LEMG, other: LSZH, number: 1503, summer: 7, winter: 4}
+  - {at: LEMG, other: LSGG, number: 1427, summer: 4, winter: 3}
+  - {at: LEMG, other: LIMC, number: 2861, summer: 14, winter: 10}
+  - {at: LEMG, other: LFRS, number: 7101, summer: 4, winter: 3}
+  - {at: LEMG, other: LFBD, number: 7105, summer: 3, winter: 3}
+  - {at: LEMG, other: EGMC, number: 7109, summer: 4, winter: 2}
+  - {at: LEMG, other: LGAV, number: 7113, summer: 3, winter: 0}
+  - {at: LEMG, other: GMMX, number: 7117, summer: 4, winter: 3}
+  - {at: LEMG, other: EGNM, number: 7121, summer: 4, winter: 0}
+  - {at: LXGB, other: EGKK, number: 8901, summer: 9, winter: 6, windows: [[11.5, 12.5], [17.5, 18.5]]}
+  - {at: LXGB, other: EGCC, number: 1911, summer: 5, winter: 3, windows: [[13.0, 13.5]]}
+  - {at: LXGB, other: EGGD, number: 6191, summer: 3, winter: 2, windows: [[15.5, 16.0]]}
+  - {at: LXGB, other: EGBB, number: 2101, summer: 2, winter: 0, windows: [[16.5, 17.0]]}

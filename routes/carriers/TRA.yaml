@@ -1,0 +1,15 @@
+# Transavia: its routes from the hand tables (sources in ../fields.yaml).
+code: TRA
+name: "Transavia"
+iata: HV
+telephony: "Transavia"
+types: [[B738, 75], [A21N, 25]]
+numbers: [5000, 6999]
+routes:
+  - {at: LEMG, other: EHAM, number: 5091, summer: 21, winter: 14}
+  - {at: LEMG, other: EHEH, number: 5341, summer: 14, winter: 10}
+  - {at: LEMG, other: EBBR, number: 5221, summer: 7, winter: 4}
+  - {at: LEMG, other: LFPO, number: 6112, summer: 21, winter: 14}
+  - {at: LEMG, other: EHRD, number: 6501, summer: 6, winter: 4}
+  - {at: LEMG, other: LFLL, number: 6505, summer: 3, winter: 0}
+  - {at: LEMG, other: LFMT, number: 6509, summer: 3, winter: 0}

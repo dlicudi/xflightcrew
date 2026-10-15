@@ -1,0 +1,10 @@
+# China Eastern: its routes from the hand tables (sources in ../fields.yaml).
+# Telephony read 2026-10-14: Wikipedia's "List of airline codes".
+code: CES
+name: "China Eastern"
+iata: MU
+telephony: "China Eastern"
+types: [[B77W, 60], [A359, 40]]
+numbers: [500, 599]
+routes:
+  - {at: EGKK, other: ZSPD, number: 551, summer: 7, winter: 7, windows: [[6.5, 7.0]], types: [[B77W, 60], [A359, 40]]}

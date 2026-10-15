@@ -1,0 +1,9 @@
+# KLM: its routes from the hand tables (sources in ../fields.yaml).
+code: KLM
+name: "KLM"
+iata: KL
+telephony: "KLM"
+types: [[B738, 50], [B739, 20], [E190, 30]]
+numbers: [1000, 1999]
+routes:
+  - {at: LEMG, other: EHAM, number: 1043, summer: 21, winter: 14}

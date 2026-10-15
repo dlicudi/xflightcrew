@@ -1,0 +1,34 @@
+# Jet2: its routes from the hand tables (sources in ../fields.yaml).
+code: EXS
+name: "Jet2"
+iata: LS
+telephony: "Channex"
+types: [[B738, 60], [A321, 25], [A21N, 15]]
+numbers: [100, 999]
+routes:
+  - {at: EGKK, other: LEAL, number: 651, summer: 8, winter: 5, based: true}
+  - {at: EGKK, other: LPFR, number: 659, summer: 11, winter: 6, based: true}
+  - {at: EGKK, other: LEPA, number: 675, summer: 8, winter: 1, based: true}
+  - {at: EGKK, other: LSGG, number: 669, summer: 2, winter: 2, based: true}
+  - {at: EGKK, other: LIRN, number: 745, summer: 4, winter: 2, based: true}
+  - {at: EGKK, other: GCTS, number: 683, summer: 7, winter: 7, based: true}
+  - {at: EGKK, other: GCRR, number: 707, summer: 5, winter: 5, based: true}
+  - {at: EGKK, other: LTAI, number: 691, summer: 13, winter: 2, based: true}
+  - {at: EGKK, other: LMML, number: 701, summer: 4, winter: 2, based: true}
+  - {at: EGKK, other: LCPH, number: 713, summer: 7, winter: 1, based: true}
+  - {at: EGKK, other: LGKR, number: 721, summer: 8, winter: 0, based: true}
+  - {at: EGKK, other: LGIR, number: 729, summer: 8, winter: 0, based: true}
+  - {at: EGKK, other: LGRP, number: 737, summer: 9, winter: 0, based: true}
+  - {at: LEMG, other: EGKK, number: 617, summer: 7, winter: 3}
+  - {at: LEMG, other: EGCC, number: 563, summer: 7, winter: 5}
+  - {at: LEMG, other: EGSS, number: 675, summer: 7, winter: 4}
+  - {at: LEMG, other: EGBB, number: 695, summer: 10, winter: 5}
+  - {at: LEMG, other: EGPH, number: 751, summer: 7, winter: 4}
+  - {at: LEMG, other: EGPF, number: 787, summer: 7, winter: 4}
+  - {at: LEMG, other: EGNT, number: 527, summer: 7, winter: 4}
+  - {at: LEMG, other: EGNX, number: 643, summer: 7, winter: 4}
+  - {at: LEMG, other: EGNM, number: 729, summer: 7, winter: 4}
+  - {at: LEMG, other: EGGD, number: 801, summer: 4, winter: 0}
+  - {at: LEMG, other: EGGP, number: 805, summer: 4, winter: 0}
+  - {at: LEMG, other: EGAA, number: 809, summer: 5, winter: 2}
+  - {at: LEMG, other: EGGW, number: 813, summer: 3, winter: 0}

@@ -267,6 +267,7 @@ pub(crate) const SESSION: &[(&str, &str)] = &[
         "CALLSIGN_TELEPHONY",
         "crew provider, registered once at boot",
     ),
+    ("CARRIER_TELEPHONY", "crew provider, registered once at boot"),
     ("FILED_ROUTE", "crew provider, registered once at boot"),
     ("APPROACH_SPEEDS", "crew provider, registered once at boot"),
     (

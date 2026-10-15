@@ -1,0 +1,11 @@
+# Air Nostrum: its routes from the hand tables (sources in ../fields.yaml).
+code: ANE
+name: "Air Nostrum"
+iata: YW
+telephony: "Air Nostrum"
+types: [[AT76, 70], [CRJ9, 30], [SF34, 0]]
+numbers: [8000, 8999]
+routes:
+  - {at: LEMG, other: LEMD, number: 8810, summer: 7, winter: 7, types: [[CRJ9, 100]]}
+  - {at: LEMG, other: GEML, number: 8650, summer: 28, winter: 28, types: [[AT76, 100]]}
+  - {at: LEMG, other: LEVC, number: 8870, summer: 10, winter: 10, types: [[CRJ9, 100]]}

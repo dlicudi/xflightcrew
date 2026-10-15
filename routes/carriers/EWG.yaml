@@ -1,0 +1,15 @@
+# Eurowings: its routes from the hand tables (sources in ../fields.yaml).
+code: EWG
+name: "Eurowings"
+iata: EW
+telephony: "Eurowings"
+types: [[A320, 50], [A319, 30], [A20N, 20]]
+numbers: [1000, 9999]
+routes:
+  - {at: LEMG, other: EDDL, number: 1580, summer: 10, winter: 7}
+  - {at: LEMG, other: EDDH, number: 7520, summer: 7, winter: 4}
+  - {at: LEMG, other: EDDK, number: 5820, summer: 7, winter: 5}
+  - {at: LEMG, other: EDDS, number: 2654, summer: 5, winter: 3}
+  - {at: LEMG, other: EDDB, number: 8710, summer: 5, winter: 3}
+  - {at: LEMG, other: LKPR, number: 9101, summer: 3, winter: 0}
+  - {at: LEMG, other: EDDV, number: 9105, summer: 4, winter: 3}

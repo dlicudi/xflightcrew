@@ -1,0 +1,34 @@
+# British Airways: its routes from the hand tables (sources in ../fields.yaml).
+code: BAW
+name: "British Airways"
+iata: BA
+telephony: "Speedbird"
+types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]]
+numbers: [300, 2799]
+routes:
+  - {at: EGKK, other: EGJJ, number: 2345, summer: 19, winter: 4, based: true}
+  - {at: EGKK, other: EGPF, number: 2357, summer: 11, winter: 6, based: true}
+  - {at: EGKK, other: LEAL, number: 2201, summer: 6, winter: 4, based: true}
+  - {at: EGKK, other: LPFR, number: 2209, summer: 8, winter: 4, based: true}
+  - {at: EGKK, other: LEPA, number: 2223, summer: 8, winter: 1, based: true}
+  - {at: EGKK, other: LEZL, number: 2269, summer: 6, winter: 4, based: true}
+  - {at: EGKK, other: LPPR, number: 2291, summer: 6, winter: 4, based: true}
+  - {at: EGKK, other: LSGG, number: 2217, summer: 4, winter: 4, based: true}
+  - {at: EGKK, other: LFMN, number: 2261, summer: 8, winter: 5, based: true}
+  - {at: EGKK, other: GCTS, number: 2231, summer: 6, winter: 6, based: true}
+  - {at: EGKK, other: GMMX, number: 2245, summer: 8, winter: 8, based: true}
+  - {at: EGKK, other: GCRR, number: 2285, summer: 4, winter: 4, based: true}
+  - {at: EGKK, other: LTAI, number: 2239, summer: 3, winter: 1, based: true}
+  - {at: EGKK, other: LMML, number: 2253, summer: 8, winter: 5, based: true}
+  - {at: EGKK, other: LCLK, number: 2299, summer: 6, winter: 4, based: true}
+  - {at: EGKK, other: LTBS, number: 2307, summer: 6, winter: 0, based: true}
+  - {at: EGKK, other: LCPH, number: 2315, summer: 4, winter: 1, based: true}
+  - {at: EGKK, other: LGKR, number: 2327, summer: 5, winter: 0, based: true}
+  - {at: EGKK, other: LGIR, number: 2333, summer: 3, winter: 0, based: true}
+  - {at: EGKK, other: LGRP, number: 2339, summer: 3, winter: 0, based: true}
+  - {at: EGKK, other: KMCO, number: 2277, summer: 10, winter: 10, windows: [[6.0, 7.0]], types: [[B77W, 60], [B772, 40]]}
+  - {at: EGKK, other: MMUN, number: 2321, summer: 6, winter: 6, windows: [[9.5, 10.0]], types: [[B772, 100]]}
+  - {at: LEMG, other: EGKK, number: 2614, summer: 14, winter: 7, types: [[A320, 70], [A20N, 30]]}
+  - {at: LEMG, other: EGLL, number: 470, summer: 7, winter: 7, types: [[A320, 55], [A319, 20], [A321, 15], [A20N, 10]]}
+  - {at: LXGB, other: EGLL, number: 492, summer: 7, winter: 7, windows: [[14.0, 14.5]], types: [[A320, 55], [A319, 20], [A321, 15], [A20N, 10]]}
+  - {at: LXGB, other: EGLL, number: 490, summer: 7, winter: 4, windows: [[10.25, 10.75]], types: [[A320, 55], [A319, 20], [A321, 15], [A20N, 10]]}

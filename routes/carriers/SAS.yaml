@@ -1,0 +1,11 @@
+# SAS: its routes from the hand tables (sources in ../fields.yaml).
+code: SAS
+name: "SAS"
+iata: SK
+telephony: "Scandinavian"
+types: [[A20N, 70], [A320, 20], [A21N, 10]]
+numbers: [1000, 4999]
+routes:
+  - {at: LEMG, other: EKCH, number: 2581, summer: 14, winter: 10}
+  - {at: LEMG, other: ESSA, number: 1527, summer: 7, winter: 7}
+  - {at: LEMG, other: ENGM, number: 4651, summer: 7, winter: 5}

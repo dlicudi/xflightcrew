@@ -1,0 +1,25 @@
+# Norwegian: its routes from the hand tables (sources in ../fields.yaml).
+code: NAX
+name: "Norwegian"
+iata: DY
+telephony: "Nor Shuttle"
+types: [[B738, 70], [B38M, 30]]
+numbers: [1000, 7999]
+routes:
+  - {at: EGKK, other: EKCH, number: 1301, summer: 20, winter: 11}
+  - {at: EGKK, other: ENGM, number: 1313, summer: 24, winter: 14}
+  - {at: LEMG, other: EKCH, number: 3586, summer: 21, winter: 14, based: true}
+  - {at: LEMG, other: ESSA, number: 4171, summer: 21, winter: 14, based: true}
+  - {at: LEMG, other: ENGM, number: 1585, summer: 14, winter: 10}
+  - {at: LEMG, other: EFHK, number: 5641, summer: 10, winter: 7}
+  - {at: LEMG, other: ESGG, number: 3731, summer: 4, winter: 3}
+  - {at: LEMG, other: ENBR, number: 2643, summer: 3, winter: 2}
+  - {at: LEMG, other: EKYT, number: 6101, summer: 4, winter: 3}
+  - {at: LEMG, other: EKBI, number: 6105, summer: 4, winter: 3}
+  - {at: LEMG, other: ENZV, number: 6109, summer: 4, winter: 3}
+  - {at: LEMG, other: ENTO, number: 6113, summer: 3, winter: 2}
+  - {at: LEMG, other: ESKN, number: 6117, summer: 3, winter: 2}
+  - {at: LEMG, other: ENVA, number: 6121, summer: 3, winter: 0}
+  - {at: LEMG, other: EKAH, number: 6125, summer: 3, winter: 0}
+  - {at: LEMG, other: ENHD, number: 6129, summer: 2, winter: 0}
+  - {at: LEMG, other: EDDM, number: 6133, summer: 3, winter: 0}

@@ -1,0 +1,9 @@
+# Etihad: its routes from the hand tables (sources in ../fields.yaml).
+code: ETD
+name: "Etihad"
+iata: EY
+telephony: "Etihad"
+types: [[B789, 60], [A321, 40]]
+numbers: [1, 199]
+routes:
+  - {at: LEMG, other: OMAA, number: 131, summer: 3, winter: 0, windows: [[7.5, 8.0]], types: [[A321, 100]]}

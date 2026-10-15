@@ -1,0 +1,10 @@
+# Sky Express: its routes from the hand tables (sources in ../fields.yaml).
+# Telephony read 2026-10-14: Wikipedia's "List of airline codes".
+code: SEH
+name: "Sky Express"
+iata: GQ
+telephony: "Air Crete"
+types: [[A20N, 60], [A21N, 40]]
+numbers: [100, 999]
+routes:
+  - {at: EGKK, other: LGAV, number: 411, summer: 8, winter: 4}

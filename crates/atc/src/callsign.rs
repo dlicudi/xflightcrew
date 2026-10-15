@@ -244,7 +244,7 @@ pub fn addressed_to_own(transcript: &str) -> bool {
 // The crew registers its providers on the party line, beside their statics
 // (`party_line::provide_inputs`, `party_line::provide_telephony`); the old
 // path stays for the callers that name it.
-pub use crate::party_line::{provide_inputs, provide_telephony};
+pub use crate::party_line::{provide_carrier_telephony, provide_inputs, provide_telephony};
 
 /// The pilot's telephony entries right now; none without a provider.
 pub fn user_telephony() -> Vec<(String, String)> {
@@ -252,6 +252,16 @@ pub fn user_telephony() -> Vec<(String, String)> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     f.map(|f| parse_telephony(&f())).unwrap_or_default()
+}
+
+/// Our traffic's carriers' telephony, from the route data the crew
+/// registers ([`provide_carrier_telephony`]); none without a provider.
+/// Asked after [`TELEPHONY`].
+fn carrier_telephony() -> &'static [(&'static str, &'static str)] {
+    let f = *crate::party_line::CARRIER_TELEPHONY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    f.map_or(&[], |f| f())
 }
 
 /// The longest telephony a pilot may give ("Air Nostrum" is 11).
@@ -351,7 +361,9 @@ pub async fn live(xp: SimView<'_>) -> Option<Resolved> {
 }
 
 /// Airline telephony for the party line: the common carriers over Iberia;
-/// anything else is spoken NATO-style like a tail number.
+/// our traffic's timetabled carriers come from the route data
+/// ([`carrier_telephony`]); anything else is spoken NATO-style like a tail
+/// number.
 pub(crate) const TELEPHONY: &[(&str, &str)] = &[
     ("IBE", "Iberia"),
     // Our own traffic's French and Italian airlines (`traffic::schedule`):
@@ -384,17 +396,11 @@ pub(crate) const TELEPHONY: &[(&str, &str)] = &[
     ("EXS", "Channex"),
     ("EWG", "Eurowings"),
     ("MEA", "Cedar Jet"),
-    ("BEL", "Bee-line"),
-    ("AUA", "Austrian"),
-    ("SAS", "Scandinavian"),
     ("THY", "Turkish"),
-    ("FIN", "Finnair"),
-    ("ICE", "Iceair"),
     ("ACA", "Air Canada"),
     ("CPA", "Cathay"),
     ("SIA", "Singapore"),
     ("ANA", "All Nippon"),
-    ("ETD", "Etihad"),
     ("ELY", "El Al"),
     ("QFA", "Qantas"),
     ("ANZ", "New Zealand"),
@@ -404,8 +410,6 @@ pub(crate) const TELEPHONY: &[(&str, &str)] = &[
     ("NAX", "Nor Shuttle"),
     ("TOM", "Tomjet"),
     ("LOG", "Logan"),
-    ("AEE", "Aegean"),
-    ("LOT", "LOT"),
     ("AIC", "Air India"),
     ("PIA", "Pakistan"),
     ("WJA", "WestJet"),
@@ -416,16 +420,6 @@ pub(crate) const TELEPHONY: &[(&str, &str)] = &[
     ("IBS", "Iberexpres"),
     ("SWA", "Southwest"),
     ("ASA", "Alaska"),
-    // Gatwick's route table's carriers (`traffic::airlines`, 2026-10-14), each
-    // the ICAO telephony.
-    ("SXS", "Sunexpress"),
-    ("CAI", "Corendon"),
-    ("KMM", "Skyknight"),
-    ("SEH", "Air Crete"),
-    ("UBT", "Longboat"),
-    ("CES", "China Eastern"),
-    ("CCA", "Air China"),
-    ("AUR", "Ayline"),
 ];
 
 /// IATA two-letter prefixes. LiveTraffic's flight ids arrive this way
@@ -517,6 +511,7 @@ pub fn is_airline_telephony_with(spoken: &str, user: &[(String, String)]) -> boo
         || TELEPHONY
             .iter()
             .chain(TELEPHONY_IATA)
+            .chain(carrier_telephony())
             .any(|(_, t)| follows_digit(t))
 }
 
@@ -568,6 +563,7 @@ pub fn spoken_ghost_with(id: &str, user: &[(String, String)]) -> String {
             let built_in = || {
                 TELEPHONY
                     .iter()
+                    .chain(carrier_telephony())
                     .find(|(p, _)| *p == prefix)
                     .map(|(_, t)| *t)
             };

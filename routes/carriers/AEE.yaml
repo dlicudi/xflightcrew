@@ -1,0 +1,10 @@
+# Aegean: its routes from the hand tables (sources in ../fields.yaml).
+code: AEE
+name: "Aegean"
+iata: A3
+telephony: "Aegean"
+types: [[A20N, 60], [A21N, 40]]
+numbers: [600, 699]
+routes:
+  - {at: EGKK, other: LGAV, number: 601, summer: 5, winter: 3}
+  - {at: LEMG, other: LGAV, number: 652, summer: 4, winter: 0}
