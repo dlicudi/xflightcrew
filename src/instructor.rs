@@ -30,6 +30,7 @@ use std::sync::Mutex;
 use serde_json::{json, Value};
 
 use crate::aircraft::AircraftProfile;
+use crate::checklist::cap_first;
 
 /// An excursion must persist this long before the instructor speaks it. A
 /// gust is not a deviation; a pilot who has not noticed after three seconds
@@ -710,14 +711,6 @@ fn hdg(v: f64) -> String {
 
 fn knots(v: f64) -> String {
     format!("{:.0} knots", v)
-}
-
-fn cap_first(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-        None => String::new(),
-    }
 }
 
 /// Which axis a narration or a grade line is about.

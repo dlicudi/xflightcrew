@@ -115,8 +115,6 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("flow::RUN", 'L'),
     ("flow::RUNNING", 'L'),
     ("flow::SHEET", 'F'),
-    ("flow::STOOD_DOWN", 'F'),
-    ("flow::WAITING", 'L'),
     ("free_nose_replay::NET", 'C'),
     ("full_auto::ABORT", 'M'),
     ("full_auto::ACTIVE", 'M'),

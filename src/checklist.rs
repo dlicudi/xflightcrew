@@ -43,11 +43,9 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
-use crate::aircraft::{
-    AircraftProfile, ChecklistAction, ChecklistMapEntry, ElectricalSystem, FlapProfile,
-    FuelPosition, FuelSelectorProfile, LightProfile,
-};
+use crate::aircraft::{AircraftProfile, ChecklistAction, ChecklistMapEntry, FuelPosition};
 use crate::tools::autopilot::AutopilotOff;
 use crate::tools::controls::{SetParkingBrake, SetPitchTrim};
 use crate::tools::electrical::SetElectrical;
@@ -349,6 +347,7 @@ fn is_failure_dataref(d: &str) -> bool {
 }
 
 /// One interpreted line of a checklist.
+#[derive(Clone)]
 pub enum Item {
     /// Spoken context only — `sw_remark` and reference (`sw_itemvoid`) lines.
     Narrate(String),
@@ -494,24 +493,14 @@ pub fn judge_read(item: &Item, values: &[Option<f64>]) -> Option<bool> {
     })
 }
 
-/// One interpreted checklist. Carries the profile bits its actions need (lights,
-/// flaps), so the runner can dispatch without re-plumbing the profile.
+/// One interpreted checklist. Carries the profile it was parsed for, so the
+/// runner can dispatch its actions without re-plumbing the profile.
 pub struct Checklist {
     pub id: String,
     pub title: String,
     pub items: Vec<Item>,
-    pub lights: Vec<LightProfile>,
-    pub flaps: Option<FlapProfile>,
-    pub electrical: Vec<ElectricalSystem>,
-    pub fuel_selector: Option<FuelSelectorProfile>,
-    pub engines: usize,
-    pub magnetos_per_engine: bool,
-    /// Per-airframe park-brake valve sense for `set_parking_brake` (see
-    /// [`crate::aircraft::AircraftProfile::park_brake_valve_set`]).
-    pub park_brake_valve_set: Option<f64>,
-    /// Per-airframe pitot-heat switch override (see
-    /// [`crate::aircraft::AircraftProfile::pitot_heat_dataref`]).
-    pub pitot_heat_dataref: Option<String>,
+    /// The airframe the actions are built for ([`run_step`]).
+    pub profile: Arc<AircraftProfile>,
     /// The `checklist_flow:` key this list was JOINED for (its parts read in
     /// order as one list); `None` for a section as the file has it.
     pub section: Option<String>,
@@ -722,14 +711,12 @@ fn word_match(q: &str, t: &str) -> bool {
 /// which datarefs become actions). Tolerant: unknown directives and malformed
 /// lines are skipped rather than failing the whole file.
 pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
-    let lights = profile.lights.clone();
-    let flaps = profile.flaps.clone();
-    let electrical = &profile.electrical;
-    let fuel_selector = &profile.fuel_selector;
+    let shared = Arc::new(profile.clone());
     // The selector's positions (with their dataref values) let `action_for`
     // decode a file condition like `fuel_tank_selector:1` into the right position
     // for *this* airframe (172: 4=both; SR22: 0=off/1=left/2=right).
-    let fuel_positions: &[FuelPosition] = fuel_selector
+    let fuel_positions: &[FuelPosition] = profile
+        .fuel_selector
         .as_ref()
         .map_or(&[], |f| f.positions.as_slice());
     let map = &profile.checklist_map;
@@ -770,14 +757,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
                     id: slug(title),
                     title: humanize(title),
                     items: Vec::new(),
-                    lights: lights.clone(),
-                    flaps: flaps.clone(),
-                    electrical: electrical.clone(),
-                    fuel_selector: fuel_selector.clone(),
-                    engines: profile.engines,
-                    magnetos_per_engine: profile.magnetos_per_engine,
-                    park_brake_valve_set: profile.park_brake_valve_set,
-                    pitot_heat_dataref: profile.pitot_heat_dataref.clone(),
+                    profile: shared.clone(),
                     section: None,
                 });
             }
@@ -820,7 +800,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
         }
     }
     finish(&mut out, &mut cur);
-    join_flows(&mut out, profile);
+    join_flows(&mut out, &shared);
     out
 }
 
@@ -830,7 +810,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
 /// still finds its part). The joined list is titled by the parts' shared
 /// name ("CLIMB PROCEDURE (1/2)" -> "Climb procedure"). A title the file
 /// lacks is skipped and logged; none found, no list.
-fn join_flows(out: &mut Vec<Checklist>, profile: &AircraftProfile) {
+fn join_flows(out: &mut Vec<Checklist>, profile: &Arc<AircraftProfile>) {
     for (key, titles) in &profile.checklist_flow {
         let titles = titles.titles();
         if titles.len() < 2 {
@@ -848,9 +828,9 @@ fn join_flows(out: &mut Vec<Checklist>, profile: &AircraftProfile) {
                 i
             })
             .collect();
-        let Some(&first) = parts.first() else {
+        if parts.is_empty() {
             continue;
-        };
+        }
         let base = joined_title(titles[0]);
         let title = if out.iter().any(|c| c.title.eq_ignore_ascii_case(&base)) {
             format!("{base} (all parts)")
@@ -859,21 +839,13 @@ fn join_flows(out: &mut Vec<Checklist>, profile: &AircraftProfile) {
         };
         let items = parts
             .iter()
-            .flat_map(|&i| out[i].items.iter().map(clone_item))
+            .flat_map(|&i| out[i].items.iter().cloned())
             .collect();
-        let f = &out[first];
         let joined = Checklist {
             id: slug(&title),
             title,
             items,
-            lights: f.lights.clone(),
-            flaps: f.flaps.clone(),
-            electrical: f.electrical.clone(),
-            fuel_selector: f.fuel_selector.clone(),
-            engines: f.engines,
-            magnetos_per_engine: f.magnetos_per_engine,
-            park_brake_valve_set: f.park_brake_valve_set,
-            pitot_heat_dataref: f.pitot_heat_dataref.clone(),
+            profile: profile.clone(),
             section: Some(section_key(key)),
         };
         out.push(joined);
@@ -895,47 +867,6 @@ fn joined_title(t: &str) -> String {
         _ => t,
     };
     humanize(base)
-}
-
-fn clone_item(i: &Item) -> Item {
-    match i {
-        Item::Narrate(t) => Item::Narrate(t.clone()),
-        Item::CallOut(t) => Item::CallOut(t.clone()),
-        Item::Act {
-            say,
-            tool,
-            args,
-            confirm,
-            dataref,
-            index,
-            cond,
-            expr,
-        } => Item::Act {
-            say: say.clone(),
-            tool,
-            args: args.clone(),
-            confirm: *confirm,
-            dataref: dataref.clone(),
-            index: *index,
-            cond: cond.clone(),
-            expr: expr.clone(),
-        },
-        Item::Verify {
-            say,
-            dataref,
-            index,
-            cond,
-            settable,
-            expr,
-        } => Item::Verify {
-            say: say.clone(),
-            dataref: dataref.clone(),
-            index: *index,
-            cond: cond.clone(),
-            settable: *settable,
-            expr: expr.clone(),
-        },
-    }
 }
 
 /// Parse one item body: `CHALLENGE|RESPONSE[:condition]`. The text carries no
@@ -1232,53 +1163,46 @@ pub async fn read_dataref(xp: &XPlaneClient, dataref: &str, index: Option<usize>
 }
 
 /// Perform one checklist action by dispatching to the matching single-action
-/// tool (which reads the dataref back, so the action is verified). Lights/flaps
-/// tools are built from the profile.
-#[allow(clippy::too_many_arguments)]
+/// tool (which reads the dataref back, so the action is verified). Each tool
+/// is built from the profile.
 pub async fn run_step(
     tool: &str,
     args: &Value,
-    lights: &[LightProfile],
-    flaps: &Option<FlapProfile>,
-    electrical: &[ElectricalSystem],
-    fuel_selector: &Option<FuelSelectorProfile>,
-    engines: usize,
-    magnetos_per_engine: bool,
-    park_brake_valve_set: Option<f64>,
-    pitot_heat_dataref: Option<String>,
+    p: &AircraftProfile,
     ctx: &ToolCtx<'_>,
 ) -> Result<String> {
+    let engines = p.engines;
     match tool {
         "set_parking_brake" => {
             SetParkingBrake {
-                valve_set: park_brake_valve_set,
+                valve_set: p.park_brake_valve_set,
             }
             .execute(args, ctx)
             .await
         }
         "set_pitch_trim" => SetPitchTrim.execute(args, ctx).await,
         "set_electrical" => {
-            SetElectrical::new(electrical.to_vec())
+            SetElectrical::new(p.electrical.clone())
                 .execute(args, ctx)
                 .await
         }
         "set_mixture" => SetMixture.execute(args, ctx).await,
         "set_throttle" => SetThrottle.execute(args, ctx).await,
-        "set_fuel_selector" => match fuel_selector {
+        "set_fuel_selector" => match &p.fuel_selector {
             Some(f) => SetFuelSelector::new(f.clone()).execute(args, ctx).await,
             None => bail!("no fuel selector on this airframe"),
         },
         "set_magnetos" => {
             SetMagnetos {
                 engines,
-                per_engine: magnetos_per_engine,
+                per_engine: p.magnetos_per_engine,
             }
             .execute(args, ctx)
             .await
         }
         "set_pitot_heat" => {
             SetPitotHeat {
-                override_dataref: pitot_heat_dataref,
+                override_dataref: p.pitot_heat_dataref.clone(),
             }
             .execute(args, ctx)
             .await
@@ -1300,9 +1224,9 @@ pub async fn run_step(
             StartEngine {
                 engines,
                 cycle_selectors: Vec::new(),
-                fuel_selector: fuel_selector.clone(),
-                alternator_on_cmds: crate::tools::alternator_on_cmds(electrical),
-                bus_power_on_cmds: crate::tools::bus_power_on_cmds(electrical),
+                fuel_selector: p.fuel_selector.clone(),
+                alternator_on_cmds: crate::tools::alternator_on_cmds(&p.electrical),
+                bus_power_on_cmds: crate::tools::bus_power_on_cmds(&p.electrical),
             }
             .execute(args, ctx)
             .await
@@ -1310,13 +1234,13 @@ pub async fn run_step(
         "stop_engine" => {
             StopEngine {
                 engines,
-                park_brake_valve_set,
+                park_brake_valve_set: p.park_brake_valve_set,
             }
             .execute(args, ctx)
             .await
         }
-        "set_lights" => SetLights::new(lights.to_vec()).execute(args, ctx).await,
-        "set_flaps" => match flaps {
+        "set_lights" => SetLights::new(p.lights.clone()).execute(args, ctx).await,
+        "set_flaps" => match &p.flaps {
             Some(f) => SetFlaps::new(f.clone()).execute(args, ctx).await,
             None => bail!("no flaps on this airframe"),
         },
@@ -1424,7 +1348,7 @@ fn strip_colors(s: &str) -> String {
     out
 }
 
-fn cap_first(s: &str) -> String {
+pub(crate) fn cap_first(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
