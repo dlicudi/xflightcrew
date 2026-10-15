@@ -313,6 +313,29 @@ pub const DRAG_FLOOR_AAL_FT: f64 = 1000.0;
 /// comparator on a noisy prediction cycles).
 pub const DRAG_IN_MARGIN_KTS: f64 = 5.0;
 
+/// The gate prediction the speedbrake is judged on, with hysteresis on the
+/// INPUT: in, it comes out only if the gate is missed even from
+/// [`DRAG_IN_MARGIN_KTS`] slower than `ias_kts`; out, it is judged from the
+/// actual speed. At a flap's placard the configuration [`predicted_gate_kts`]
+/// assumes flips with a knot of speed, and so did the prediction (145 and
+/// 250 kt at 204.9 and 205.0, the speedbrake out and in every few seconds,
+/// EGBB 15 2026-10-15). Pure.
+pub fn drag_gate_kts(
+    m: &EnergyModel,
+    vapp_kts: f64,
+    ias_kts: f64,
+    s_nm: f64,
+    path_nm: f64,
+    out: bool,
+) -> f64 {
+    let from = if out {
+        ias_kts
+    } else {
+        ias_kts - DRAG_IN_MARGIN_KTS
+    };
+    predicted_gate_kts(m, vapp_kts, from, s_nm, path_nm)
+}
+
 /// Whether a final wants the speedbrake out, and why (the blackbox's word).
 /// `out`: it is out now, ours. `gate_kts`: the idle plan's speed at the gate
 /// (`None`: no plan this tick: a go-around, a hold, the flare), against
@@ -374,6 +397,42 @@ mod tests {
         assert_eq!(m.flap_for(157.0), 1.0);
         assert_eq!(m.flap_for(206.0), 0.375);
         assert_eq!(m.landing_flap(), 1.0);
+    }
+
+    /// EGBB 15 (2026-10-15): IAS sat at 204.6 to 205.5 on flap 5, 16.6 nm of
+    /// path to the gate, and the prediction flipped between 145 and 250 kt
+    /// across 205 (flap 10's 210 less 5): the speedbrake went out and in
+    /// every few seconds. Judged on the input's hysteresis, it never moves.
+    #[test]
+    fn a_speed_on_a_flap_placard_never_cycles_the_speedbrake() {
+        let m = b738();
+        let limit = gate_limit_kts(&m, 145.0, 1000.0);
+        let raw: Vec<f64> = [204.6, 205.5]
+            .iter()
+            .map(|&v| predicted_gate_kts(&m, 145.0, v, 16.6, 16.6))
+            .collect();
+        assert!(
+            raw[0] <= limit && raw[1] > limit,
+            "the recorded flip: {raw:?}"
+        );
+        let mut out = false;
+        for (i, ias) in [204.6, 205.5, 204.8, 205.2, 204.9, 205.1, 204.6, 205.5]
+            .iter()
+            .enumerate()
+        {
+            let s_nm = 16.6 - 0.05 * i as f64;
+            let gate = drag_gate_kts(&m, 145.0, *ias, s_nm, s_nm, out);
+            let (want, _) = final_drag(out, Some(gate), limit, 6000.0, 0.375, Some(0.5));
+            assert!(!want, "{ias} kt: out on {gate}");
+            out = want;
+        }
+        // Out (found missing the gate from well above), it goes in on the
+        // actual speed's prediction once that makes it.
+        let gate = drag_gate_kts(&m, 145.0, 204.6, 16.6, 16.6, true);
+        assert!(!final_drag(true, Some(gate), limit, 6000.0, 0.375, Some(0.5)).0);
+        // ...and a final that truly misses still takes it.
+        let gate = drag_gate_kts(&m, 145.0, 212.0, 4.1, 4.1, false);
+        assert!(final_drag(false, Some(gate), limit, 1830.0, 0.375, Some(0.5)).0);
     }
 
     /// The plan's configuration is the one autoland extends: over every
