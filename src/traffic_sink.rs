@@ -150,8 +150,9 @@ impl TrafficSink {
         }
     }
 
-    /// The aircraft drawn now (after [`DrawCull`]), taken at the sim's
-    /// running time `sim_time_s`: a new roster when who is drawn changed,
+    /// The aircraft drawn now (after [`DrawCull`]), taken at `sim_time_s`
+    /// (the world's clock, UTC seconds: the plugin draws on its offset from
+    /// the sim's running time): a new roster when who is drawn changed,
     /// the frames every time.
     pub(crate) fn publish(&mut self, fleet: &[&traffic::TrafficAircraft], sim_time_s: f64) {
         let roster: Vec<RosterEntry> = fleet.iter().map(|a| wire::roster_entry(a)).collect();

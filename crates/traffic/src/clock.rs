@@ -1,5 +1,6 @@
-//! Sim time for the fleet: advances only while the sim runs, in fixed
-//! substeps, so the same inputs give the same flight whatever the tick rate.
+//! The fleet's clock: the deltas it is fed (the world's UTC, 2026-10-15)
+//! spent in fixed substeps, so the same inputs give the same flight
+//! whatever the tick rate.
 
 /// One substep of the fleet, seconds. Every law integrates at this step and
 /// only this step: a recorded flight replays bit for bit.

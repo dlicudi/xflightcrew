@@ -207,8 +207,7 @@ fn timetable_schedule(
         table,
         Density::Normal,
         sweep_seed(),
-        Some(zulu),
-        Some(date.ordinal),
+        utc_at(date, zulu),
         None,
     )
 }
@@ -1918,51 +1917,106 @@ fn ulmm_table() -> traffic::routes::FieldRoutes {
     }
 }
 
-/// A TIMETABLE FOLLOWS THE SIM'S CLOCK (#280, LXGB 2026-10-14): planned
-/// at 23:00 local it holds only tomorrow's flights; moved to 10:00 the same
-/// day, the re-plan's next flight comes within the hour's spacing, the
-/// board's clock reads the new time, and the next re-plan sees no jump.
+/// THE WORLD'S CLOCK (2026-10-15): a timetable built at a UTC instant is
+/// the day of that instant's date and zulu time: 06:00 zulu on a summer
+/// Tuesday is 10:00 at UTC+3, its board the mid-flow plan's at 10:00 and
+/// every flight the plan placed is in the schedule.
 #[test]
-fn a_timetable_follows_a_jump_of_the_sims_clock() {
+fn a_timetable_is_built_at_the_worlds_utc_instant() {
     let table = ulmm_table();
     let apt = format!("{}/ulmm.dat", fixtures());
     let field = FieldModel::load(&apt, "ULMM").unwrap().unwrap();
     let date = traffic::rotation::Date::ymd(2026, 7, 14);
-    // UTC+3 in summer is +4: 23:00 local is 19:00 zulu, 10:00 is 06:00.
-    let (late, board, local_s) = timetable_start(
+    let utc = utc_at(date, 6.0 * 3600.0);
+    assert_eq!(utc_day(utc), (date, 6.0 * 3600.0));
+    let (schedule, board, local_s) = timetable_start(&field, &table, Density::Normal, 7, utc, None);
+    assert!((local_s - 10.0 * 3600.0).abs() < 1e-6, "{local_s}");
+    let ctx = SpawnCtx {
+        zulu_s: Some(6.0 * 3600.0),
+        ..SpawnCtx::default()
+    };
+    let plan = traffic::midflow::plan(
         &field,
         &table,
         Density::Normal,
         7,
-        Some(19.0 * 3600.0),
-        Some(date.ordinal),
-        None,
+        date,
+        local_s,
+        TIMETABLE_HORIZON_S,
+        &ctx,
     );
-    let mut link = Link::new(field, late, "");
-    link.set_board(board, local_s);
-    link.timetable = Some(Timetable { density: Density::Normal, seed: 7, date });
-    let first = |l: &Link| l.due.iter().map(|d| d.at_s).fold(f64::INFINITY, f64::min);
-    assert!(first(&link) > 6.0 * 3600.0, "at 23:00 only tomorrow's: {}", first(&link));
-
-    let (now_date, _, now_local) = timetable_clock(&table, Some(6.0 * 3600.0), Some(date.ordinal));
-    let jump = clock_jump_s(date, link.local_now_s(), now_date, now_local);
-    assert!((jump + 13.0 * 3600.0).abs() < 1.0, "13 h back: {jump}");
-
-    let n = link.reanchor(&table, 6.0 * 3600.0, Some(date.ordinal), None).unwrap();
-    assert!(n > 0 && link.pending() >= n);
-    assert!(first(&link) < 3.0 * 3600.0, "the morning's flights: {}", first(&link));
-    assert!((link.local_now_s() - 10.0 * 3600.0).abs() < 1.0);
-    let again = clock_jump_s(link.timetable.unwrap().date, link.local_now_s(), now_date, now_local);
-    assert!(again.abs() < CLOCK_JUMP_S, "no jump after the re-plan: {again}");
+    assert!(!board.is_empty());
+    assert_eq!(
+        board, plan.board,
+        "the same day from the same date and zulu"
+    );
+    let key = |m: &Movement| (m.callsign.clone(), m.t_s.to_bits());
+    let built: HashSet<_> = schedule.iter().map(key).collect();
+    assert!(plan.movements.iter().all(|m| built.contains(&key(m))));
 }
 
-/// The jump across midnight counts the days: 23:50 to 00:10 the next day
-/// is 20 minutes, never a day back.
+/// A SIM CLOCK THAT DISAGREES IS MEASURED, never followed: an hour behind
+/// is an hour; a local date a day either side of the world's is the time
+/// zone; across New Year the nearest year is taken.
 #[test]
-fn a_clock_jump_counts_the_days() {
-    let d = traffic::rotation::Date::ymd(2026, 10, 13);
-    let j = clock_jump_s(d, 23.0 * 3600.0 + 50.0 * 60.0, d.plus(1), 10.0 * 60.0);
-    assert!((j - 1200.0).abs() < 1e-6, "{j}");
+fn the_sims_clock_is_measured_against_the_worlds() {
+    let d = traffic::rotation::Date::ymd(2026, 10, 15);
+    let utc = utc_at(d, 10.0 * 3600.0);
+    assert!(sim_clock_off_s(utc, d.ordinal, 10.0 * 3600.0).abs() < 1e-6);
+    let behind = sim_clock_off_s(utc, d.ordinal, 9.0 * 3600.0);
+    assert!((behind + 3600.0).abs() < 1e-6, "{behind}");
+    let east = sim_clock_off_s(utc, d.plus(1).ordinal, 10.0 * 3600.0 + 60.0);
+    assert!((east - 60.0).abs() < 1e-6, "{east}");
+    let new_year = utc_at(traffic::rotation::Date::ymd(2027, 1, 1), 600.0);
+    let dec31 = traffic::rotation::Date::ymd(2026, 12, 31).ordinal;
+    let off = sim_clock_off_s(new_year, dec31, 23.0 * 3600.0 + 50.0 * 60.0);
+    assert!((off + 1200.0).abs() < 1e-6, "{off}");
+}
+
+/// THE WORLD RUNS WITHOUT US (2026-10-15): ULMM's timetable built at a
+/// fixed UTC instant and flown on its desk with no aircraft of ours, three
+/// hours twice, is the same flight both times; in it a departure taxis out
+/// and leaves, and an arrival lands and parks.
+#[test]
+fn the_world_flies_the_same_without_our_aircraft() {
+    let fly = || {
+        let apt = format!("{}/ulmm.dat", fixtures());
+        let field = FieldModel::load(&apt, "ULMM")
+            .unwrap()
+            .unwrap()
+            .with_cifp(&format!("{}/cifp", fixtures()));
+        let utc = utc_at(traffic::rotation::Date::ymd(2026, 7, 14), 6.0 * 3600.0);
+        let (schedule, board, local_s) =
+            timetable_start(&field, &ulmm_table(), Density::Normal, 7, utc, None);
+        let mut link = Link::new(field, schedule, "");
+        link.set_board(board, local_s);
+        link.make_desk();
+        let epoch = Instant::now();
+        let dt = 0.25;
+        let mut trace = Vec::new();
+        let mut t = 0.0;
+        while t < 3.0 * 3600.0 {
+            t += dt;
+            let out = link.tick(None, dt, epoch + Duration::from_secs_f64(t));
+            for ev in out.events {
+                trace.push(format!("{t:.2} {ev:?}"));
+            }
+        }
+        trace
+    };
+    let (a, b) = (fly(), fly());
+    assert_eq!(a, b, "the same world from the same instant");
+    let any = |what: &str| a.iter().any(|l| l.contains(what));
+    assert!(
+        any("to: Taxi") || any("to: Pushback"),
+        "a departure taxis out"
+    );
+    assert!(any("LeftTheArea"), "a departure leaves");
+    assert!(any("Touchdown"), "an arrival lands");
+    assert!(
+        any("reason: Parked") || any("TurnedRound"),
+        "an arrival parks"
+    );
 }
 
 /// ONE COUNTER, NO CLASHES (multi-field traffic stage 2, 2026-10-13): two
@@ -1995,18 +2049,8 @@ fn a_fields_day_is_the_same_whoever_builds_it() {
     let date = traffic::rotation::Date::ymd(2026, 7, 14);
     let seed = traffic::field_seed("ULMM", SESSION_SEED);
     // 10:00 local in summer at UTC+3: 06:00 zulu.
-    let zulu = Some(6.0 * 3600.0);
-    let start = |s: u64| {
-        timetable_start(
-            &field,
-            &table,
-            Density::Normal,
-            s,
-            zulu,
-            Some(date.ordinal),
-            None,
-        )
-    };
+    let utc = utc_at(date, 6.0 * 3600.0);
+    let start = |s: u64| timetable_start(&field, &table, Density::Normal, s, utc, None);
     let (a, board_a, local_a) = start(seed);
     let (b, board_b, _) = start(seed);
     let key = |v: &[Movement]| {
@@ -2350,8 +2394,7 @@ fn a_field_without_routes_has_no_traffic() {
     let ctx = BuildCtx {
         seed: 1,
         name: "",
-        zulu_s: None,
-        day: None,
+        utc_s: utc_now_s(),
         runway: None,
     };
     assert!(traffic::routes::field_routes("LEGR").is_none());

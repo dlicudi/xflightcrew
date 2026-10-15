@@ -4,7 +4,8 @@
 //!
 //! Per monitor tick ([`Link::tick`]): the schedule spawns what is due, the
 //! tower's orders are read level-triggered (`world::traffic_order`) and
-//! mapped onto `traffic::Order`, the fleet steps on its sim-time clock,
+//! mapped onto `traffic::Order`, the fleet steps on the world's UTC clock
+//! ([`utc_now_s`], with or without the sim),
 //! every call it keys goes to the station as TEXT (`world::post_traffic_call`,
 //! with the picture it saw), every aircraft's state is noted on its strip
 //! (`world::note_traffic_state`) and its runway watch ticked
@@ -506,9 +507,8 @@ pub(crate) struct Link {
     /// The whole flight of each arrival the simulation took from the model,
     /// by id: its origin's times for the EFB's card.
     entered: HashMap<u32, (String, traffic::track::Whole)>,
-    /// A route table's timetable: what it was planned with, so a jump of
-    /// the sim's clock plans it again ([`Link::reanchor`]); `None` for a
-    /// generated schedule or the pilot's file.
+    /// A route table's timetable: what it was planned with (its top-up
+    /// draws from it); `None` for a generated schedule or the pilot's file.
     timetable: Option<Timetable>,
 }
 
@@ -521,25 +521,57 @@ struct Timetable {
     date: traffic::rotation::Date,
 }
 
-/// The sim's clock and the timetable's may part by this much, seconds,
-/// before the timetable is planned again: a sim time or date change, never
-/// the drift of a paused or fast-forwarded spell's few seconds.
+/// The sim's clock may part from the world's by this much, seconds, before
+/// it is said ([`TrafficWorld::check_sim_clock`]): a sim set to another
+/// time, never a few seconds of drift.
 pub(crate) const CLOCK_JUMP_S: f64 = 600.0;
 
-/// How often the sim's clock is compared with the timetables'.
-const CLOCK_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// A gap in the world's ticks longer than this, seconds (the Mac asleep, a
+/// stalled loop), rebuilds the world at UTC: a fleet steps at most
+/// `traffic::clock::MAX_TICK_S` a tick and would stay behind for good.
+const CLOCK_GAP_S: f64 = 60.0;
 
-/// Seconds the sim's local clock (`now_date`, `now_local_s`) runs ahead of
-/// a timetable's (`expected_local_s` after `ref_date`'s midnight); negative
-/// behind. Pure.
-pub(crate) fn clock_jump_s(
-    ref_date: traffic::rotation::Date,
-    expected_local_s: f64,
-    now_date: traffic::rotation::Date,
-    now_local_s: f64,
-) -> f64 {
-    let days = (now_date.epoch_days() - ref_date.epoch_days()) as f64;
-    now_local_s + days * 86_400.0 - expected_local_s
+/// The world's clock (2026-10-15): UTC, seconds since the Unix epoch. The
+/// fleets step on it and their days are built from it, with or without the
+/// sim; the sim's clock is never followed.
+pub(crate) fn utc_now_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// The UTC date and the zulu seconds into it at `utc_s`. Pure.
+pub(crate) fn utc_day(utc_s: f64) -> (traffic::rotation::Date, f64) {
+    let days = (utc_s / 86_400.0).floor();
+    (
+        traffic::rotation::Date::from_epoch_days(days as i64),
+        utc_s - days * 86_400.0,
+    )
+}
+
+/// The world's clock at `zulu_s` on `date` ([`utc_day`]'s inverse).
+#[cfg(test)]
+pub(crate) fn utc_at(date: traffic::rotation::Date, zulu_s: f64) -> f64 {
+    date.epoch_days() as f64 * 86_400.0 + zulu_s
+}
+
+/// Seconds the sim's clock (`day` of the year, X-Plane's local date with no
+/// year, and `zulu_s`) runs ahead of the world's at `utc_s`; negative
+/// behind. The year is the nearest, and a day either side of the world's
+/// is the local date's time zone, never an error. Pure.
+pub(crate) fn sim_clock_off_s(utc_s: f64, day: u32, zulu_s: f64) -> f64 {
+    let year = utc_day(utc_s).0.year;
+    let mut best = f64::INFINITY;
+    for y in [year - 1, year, year + 1] {
+        let at = traffic::rotation::Date::of_year(y, day).epoch_days() as f64 * 86_400.0 + zulu_s;
+        for k in [-1.0, 0.0, 1.0] {
+            let off = at + k * 86_400.0 - utc_s;
+            if off.abs() < best.abs() {
+                best = off;
+            }
+        }
+    }
+    best
 }
 
 /// Traffic ids from ONE counter for every field's fleet (multi-field
@@ -594,6 +626,27 @@ pub(crate) fn note_station_runway(r: Option<&str>) {
 
 pub(crate) fn station_runway() -> Option<String> {
     STATION_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The sim answered at the world's last tick ([`TrafficWorld::tick`]): our
+/// traffic's frequency is aired only then ([`overhear`]).
+static SIM_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A line on our traffic's frequency: aired while the sim is attached,
+/// else only written to the EFB's transcript (no voices without the sim).
+fn overhear(
+    voice: &crate::voice::Voice,
+    on: crate::voice::StationSpeaker,
+    speaker: crate::voice::StationSpeaker,
+    line: &str,
+    made: Instant,
+    check: Option<crate::voice::StillValid>,
+) {
+    if SIM_ATTACHED.load(std::sync::atomic::Ordering::Relaxed) {
+        voice.overhear_checked(on, speaker, line, made, check);
+    } else {
+        crate::efb::feed::note_station(line, speaker, true);
+    }
 }
 
 impl Link {
@@ -986,59 +1039,6 @@ impl Link {
         }
     }
 
-    /// The sim's clock jumped (LXGB 2026-10-14: a timetable planned at 21:31
-    /// local held only the next morning's flights when the sim was moved to
-    /// 11:05): the timetable is planned again from the new clock, its
-    /// waiting movements replaced by the new plan's still to come and its
-    /// board renewed. Never a reinstall: what flies stays flying (a
-    /// callsign already flying is not spawned twice) and an aircraft parked
-    /// for its departure keeps its release. `None` when nothing to re-plan.
-    fn reanchor(
-        &mut self,
-        table: &traffic::routes::FieldRoutes,
-        zulu_s: f64,
-        day: Option<u32>,
-        runway: Option<String>,
-    ) -> Option<usize> {
-        let tt = self.timetable?;
-        let (date, _, _) = timetable_clock(table, Some(zulu_s), day);
-        let (schedule, board, local_s) = timetable_start(
-            &self.fleet.field,
-            table,
-            tt.density,
-            tt.seed,
-            Some(zulu_s),
-            day,
-            runway,
-        );
-        let flying: std::collections::HashSet<&str> = self
-            .fleet
-            .aircraft()
-            .iter()
-            .map(|a| a.callsign.as_str())
-            .collect();
-        // Only the flights still to come: the plan's placed ones (in motion
-        // at its start, `Start`) and its parked fill belong to a fresh field.
-        let ahead: Vec<Movement> = schedule
-            .into_iter()
-            .filter(|m| {
-                m.kind != MovementKind::Parked
-                    && !m.parked_from_start
-                    && m.start.is_none()
-                    && !flying.contains(m.callsign.as_str())
-            })
-            .collect();
-        let n = ahead.len();
-        let now_s = self.fleet.clock.now_s();
-        self.due.retain(|d| d.held.is_some());
-        self.add_schedule(ahead, now_s);
-        self.set_board(board, local_s - now_s);
-        self.actual.clear();
-        self.set_summer(date.summer());
-        self.timetable = Some(Timetable { date, ..tt });
-        Some(n)
-    }
-
     /// More movements, `offset_s` fleet seconds from the clock's start (the
     /// next hour of a generated schedule).
     pub(crate) fn add_schedule(&mut self, schedule: Vec<Movement>, offset_s: f64) {
@@ -1080,12 +1080,6 @@ impl Link {
         &self.fleet.field.icao
     }
 
-    /// Freeze or release the fleet's clock (replay, pause, time
-    /// acceleration above 1x).
-    pub(crate) fn set_frozen(&mut self, frozen: bool) {
-        self.fleet.clock.frozen = frozen;
-    }
-
     /// The picture the crew and the station see of the traffic: every
     /// aircraft going somewhere as a TCAS target (ours not in it). A
     /// dormant one, parked on its stand, is no TCAS traffic: the plugin
@@ -1110,8 +1104,8 @@ impl Link {
             .collect()
     }
 
-    /// One tick: spawn what is due, step the fleet `dt` seconds of sim time
-    /// (clamped and substepped by its clock; nothing while frozen), and
+    /// One tick: spawn what is due, step the fleet `dt` seconds of the
+    /// world's clock (clamped and substepped by its clock), and
     /// trade with the station. `now` is the station's clock for this tick.
     pub(crate) fn tick(&mut self, own: Option<&OwnState>, dt: f64, now: Instant) -> TickOut {
         if self.desk.is_some() {
@@ -1564,12 +1558,9 @@ impl Link {
         // A heartbeat every 30 s of fleet time: the clock, what is due, the tower's runway.
         if now_s - self.heartbeat_s >= 30.0 {
             self.heartbeat_s = now_s;
-            tracing::info!(now_s, frozen = self.fleet.clock.frozen, due = self.due.len(),
+            tracing::info!(now_s, due = self.due.len(),
                 next_s = self.due.first().map(|d| d.at_s), runway = ?self.tower_runway,
                 flying = self.fleet.aircraft().len(), "traffic: heartbeat");
-        }
-        if self.fleet.clock.frozen {
-            return;
         }
         if !self.parked {
             self.parked = true;
@@ -1724,10 +1715,10 @@ pub(crate) fn overhear_replies(
         let seed = crate::voice::station_voice_seed(&spoken);
         let on = reply.speaker;
         let ghost = crate::voice::StationSpeaker::Ghost { seed };
-        voice.overhear_checked(on, ghost, &reply.call, keyed, still_valid(reply.id));
+        overhear(voice, on, ghost, &reply.call, keyed, still_valid(reply.id));
         if !reply.line.is_empty() {
             let made = keyed + std::time::Duration::from_millis(1);
-            voice.overhear_checked(on, reply.speaker, reply.line, made, still_valid(reply.id));
+            overhear(voice, on, reply.speaker, &reply.line, made, still_valid(reply.id));
         }
     }
 }
@@ -2004,18 +1995,19 @@ impl TrafficMode {
     }
 }
 
-/// Above this time acceleration the fleet freezes: the station's timers are
-/// wall `Instant`s, so at 4x a hold would be judged on a quarter of the
-/// flight it waited for.
-const FAST_OVER: f64 = 1.2;
-
 /// The callsign our aircraft is keyed by in the traffic's picture (the
 /// tower names us by `FlightId::Own`, never by this).
 const OWN_KEY: &str = "OWNSHIP";
 
 /// The monitor's side of the traffic: a link per field simulated (built
-/// off the tick, one at a time: two apt.dat scans each), the clock, the
-/// fast-forward latch, the sink. Owned by `WorldTick`, never a static.
+/// off the tick, one at a time: two apt.dat scans each), the clock, our
+/// aircraft as last seen, the sink. Owned by `WorldTick`, never a static.
+///
+/// THE WORLD RUNS WITHOUT THE SIM (2026-10-15,
+/// `docs/tasks/standalone-world`): the monitor ticks it whether or not
+/// X-Plane answers, on UTC ([`utc_now_s`]); our aircraft is an input that
+/// may be absent, and only the plugin's outputs and the voices wait for
+/// the sim.
 ///
 /// SEVERAL FLEETS AT ONCE (multi-field traffic stage 3, 2026-10-13): the
 /// installed station's field, worked by the station as it always was, and
@@ -2036,10 +2028,17 @@ pub(crate) struct TrafficWorld {
     loading: Option<(String, std::sync::mpsc::Receiver<Option<Link>>)>,
     /// Fields whose build came back empty: not tried again while in range.
     failed: BTreeSet<String>,
-    /// The sim's running time at the last tick.
-    last_sim_s: Option<f64>,
-    /// Frozen for time acceleration (said once per spell).
-    fast: bool,
+    /// The world's clock at the last tick ([`utc_now_s`]).
+    last_utc_s: Option<f64>,
+    /// The sim answered at the last tick: an attach is the edge
+    /// ([`TrafficWorld::check_sim_clock`]).
+    attached: bool,
+    /// The sim's clock mismatch has been said (again only once it was
+    /// right in between).
+    clock_said: bool,
+    /// Our aircraft as last seen: held while the sim is attached without a
+    /// snapshot (paused, a replay, a failed read), none without the sim.
+    own: Option<OwnState>,
     /// Every fleet's ids, one counter for the session ([`Ids`]): a link
     /// built later never reuses an id an earlier one handed out.
     ids: Ids,
@@ -2064,9 +2063,6 @@ pub(crate) struct TrafficWorld {
     /// The plugin has no field pick (an older one): not asked again before
     /// this.
     board_pick_quiet_until: Option<Instant>,
-    /// When the sim's clock was last compared with the timetables'
-    /// ([`TrafficWorld::follow_sim_clock`]).
-    clock_checked: Option<Instant>,
     /// The runway end our arrival was last seen on, so the rollout keeps
     /// its slot once the plan that armed it is gone ([`own_arrival`]).
     own_arrival_end: Option<String>,
@@ -2160,17 +2156,20 @@ impl TrafficWorld {
     /// One monitor tick. Nothing at all unless `XCOPILOT_TRAFFIC=ours`, ATC
     /// is on and a station is installed: every fleet is dropped (every
     /// strip it opened retired, the picture withdrawn) the moment any of
-    /// those stops being true. `sim_speed` is the monitor's latest read.
-    /// The tick's output is the station's field's.
+    /// those stops being true. `snap` is our aircraft this tick, `attached`
+    /// whether the sim answers at all (paused, a replay or a failed read
+    /// hold our aircraft where it was last seen). The tick's output is the
+    /// station's field's.
     pub(crate) async fn tick(
         &mut self,
         xp: &crate::xplane::XPlaneClient,
         voice: &crate::voice::Voice,
-        snap: &crate::monitor::Snapshot,
-        sim_speed: Option<f64>,
+        snap: Option<&crate::monitor::Snapshot>,
+        attached: bool,
         now: Instant,
         status: Option<&crate::plugin_status::StatusSink>,
     ) -> Option<TickOut> {
+        SIM_ATTACHED.store(attached, std::sync::atomic::Ordering::Relaxed);
         let active = wanted_field(
             TrafficMode::now(),
             crate::mode::atc_enabled(),
@@ -2192,9 +2191,35 @@ impl TrafficWorld {
             self.stand_down();
         }
         self.density = Some(density);
-        let here = (snap.lat, snap.lon);
+        // The world's clock: UTC, never the sim's.
+        let utc = utc_now_s();
+        let mut dt = self.last_utc_s.map_or(0.0, |prev| (utc - prev).max(0.0));
+        if dt > CLOCK_GAP_S && !self.links.is_empty() {
+            crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "clock_gap_rebuild", "gap_s": dt }),
+            );
+            self.stand_down();
+            dt = 0.0;
+        }
+        self.last_utc_s = Some(utc);
+        if attached && !self.attached {
+            self.check_sim_clock(xp, voice, utc).await;
+        }
+        self.attached = attached;
+        if !attached {
+            self.own = None;
+        }
+        // The world's centre: us, else the station's field.
+        let here = snap
+            .map(|s| (s.lat, s.lon))
+            .or(self.own.as_ref().map(|o| (o.lat, o.lon)))
+            .or_else(|| crate::party_line::active_field().map(|(_, lat, lon, _)| (lat, lon)));
         let running: BTreeSet<String> = self.links.keys().cloned().collect();
-        let wanted = wanted_fields(&active, here, &running);
+        let wanted = match here {
+            Some(h) => wanted_fields(&active, h, &running),
+            None => BTreeSet::from([active.clone()]),
+        };
         if self.active.as_deref() != Some(active.as_str()) {
             self.change_station(&active, &wanted);
         }
@@ -2219,56 +2244,116 @@ impl TrafficWorld {
                 .cloned()
                 .collect();
             if let Some(icao) = next_build(&active, &wanted, &built) {
-                // The schedule follows the field's day (`traffic::rate`):
-                // the sim's zulu time, read only when a schedule is made.
-                let zulu = sim_zulu_s(xp).await;
-                let day = sim_date_days(xp).await;
-                self.world.note_clock(zulu, day, now);
                 let station = icao == active;
-                self.loading = Some((icao.clone(), self.build(&icao, station, zulu, day)));
+                self.loading = Some((icao.clone(), self.build(&icao, station, utc)));
             }
         }
         if self.links.is_empty() {
-            self.note_efb_traffic(now);
+            self.note_efb_traffic(now, utc);
             return None;
         }
-        // Time acceleration freezes the fleets (v1), said once per spell.
-        let fast = sim_speed.is_some_and(|v| v > FAST_OVER);
-        if fast != self.fast {
-            self.fast = fast;
-            crate::blackbox::record(
-                "traffic",
-                serde_json::json!({ "event": "frozen", "fast": fast, "sim_speed": sim_speed }),
-            );
-            if fast {
-                voice.alert(
-                    crate::voice::Priority::Advisory,
-                    "The traffic holds while the sim runs fast.",
-                );
+        if let Some(snap) = snap {
+            self.note_own(xp, voice, snap, &active, now).await;
+        }
+        let own = self.own.clone();
+        let mut station_out = None;
+        let fields: Vec<String> = self.links.keys().cloned().collect();
+        for icao in fields {
+            let Some(link) = self.links.get_mut(&icao) else {
+                continue;
+            };
+            let out = link.tick(own.as_ref(), dt, now);
+            // The next hour of a generated schedule, once this one is spent;
+            // a timetable's top-up every hour, its day never spent.
+            let tops_up = link.tops_up();
+            if link.pending() == 0 || tops_up {
+                let start = link.fleet().clock.now_s();
+                let next = link
+                    .hours
+                    .filter(|h| start >= f64::from(*h) * traffic::schedule::HORIZON_S);
+                if let Some(h) = next {
+                    link.hours = Some(h + 1);
+                    let zulu = Some(utc_day(utc).1);
+                    let pos = own.as_ref().map(|o| (o.lat, o.lon));
+                    let ms = if tops_up {
+                        link.top_up_hour(u64::from(h + 1), pos, zulu)
+                    } else {
+                        generate_for(link.fleet(), u64::from(h + 1), pos, zulu)
+                    };
+                    link.add_schedule(ms, start);
+                }
+            }
+            record(&out, link);
+            if icao == active {
+                station_out = Some(out);
             }
         }
-        for link in self.links.values_mut() {
-            link.set_frozen(fast);
+        if let Some(link) = self.links.get(&active) {
+            crate::party_line::publish_traffic_picture(Some(link.targets()));
+            crate::party_line::publish_stands_taken(link.stands_taken());
         }
-        // The fleets' clock is the sim's (a failed read is no time), and our
-        // height in the tower's picture is true feet MSL (the snapshot's is
-        // the altimeter's): one batched read, only while a fleet flies.
-        let (sim_s, ele_m) = tokio::join!(
-            xp.get_float(crate::datarefs::TOTAL_RUNNING_TIME_SEC),
-            xp.get_float(crate::datarefs::ELEVATION_M),
-        );
-        let sim_s = sim_s.ok().filter(|t| t.is_finite());
-        let alt_ft = ele_m
+        // The plugin's outputs only while the sim is there.
+        if attached && self.sink.is_none() {
+            self.sink = crate::traffic_sink::TrafficSink::start(
+                crate::settings::live().xplane_base_url.clone(),
+            );
+        }
+        if let Some(sink) = self.sink.as_mut().filter(|_| attached) {
+            // The simulated aircraft and, inside the same ring, the whole
+            // flights the model flies (a departure past 12 nm, an arrival
+            // still to enter): no aircraft pops in or out of TCAS range.
+            let simulated = self.links.values().map(|l| l.fleet().aircraft().len()).sum();
+            let all: Vec<&TrafficAircraft> = self
+                .links
+                .values()
+                .flat_map(|l| l.fleet().aircraft().iter().chain(l.modeled_drawn()))
+                .collect();
+            let drawn = self.cull.select(here, &all);
+            sink.publish(&drawn, utc);
+            self.draw_log
+                .note(simulated, all.len() - simulated, &drawn, now);
+        }
+        // The frequencies: the tower's runway-watch lines in the tower's
+        // voice, the positions' handoffs in theirs, each on its own
+        // frequency. The calls themselves are said with their answers, on
+        // the position that heard them (`overhear_replies`). Only the
+        // station's field speaks (the desks have no radio, stage 3).
+        if let Some(out) = &station_out {
+            let tower = crate::voice::StationSpeaker::Tower;
+            for (id, line) in &out.tower {
+                overhear(voice, tower, tower, line, now, still_valid(*id));
+            }
+            for (id, line, who) in &out.positions {
+                overhear(voice, *who, *who, line, now, still_valid(*id));
+            }
+        }
+        if let (Some(s), Some(here), true) = (status, here, attached) {
+            self.publish_board(xp, s, here, now, utc).await;
+        }
+        self.note_efb_boards(now);
+        self.note_efb_traffic(now, utc);
+        station_out
+    }
+
+    /// Our aircraft from this tick's snapshot (kept as [`Self::own`]): its
+    /// height true feet MSL (the snapshot's is the altimeter's), its slot
+    /// while it arrives or holds for departure, its place in the station's
+    /// landing sequence and the tower's book, and our pilot on the
+    /// frequency. Only with the sim attached and a snapshot read.
+    async fn note_own(
+        &mut self,
+        xp: &crate::xplane::XPlaneClient,
+        voice: &crate::voice::Voice,
+        snap: &crate::monitor::Snapshot,
+        active: &str,
+        now: Instant,
+    ) {
+        let alt_ft = xp
+            .get_float(crate::datarefs::ELEVATION_M)
+            .await
             .ok()
             .filter(|m| m.is_finite())
             .map_or(snap.alt_ft, |m| m * 3.28084);
-        let dt = match (self.last_sim_s, sim_s) {
-            (Some(prev), Some(t)) if t >= prev => t - prev,
-            _ => 0.0,
-        };
-        if sim_s.is_some() {
-            self.last_sim_s = sim_s;
-        }
         let mut own = OwnState {
             callsign: OWN_KEY.to_string(),
             lat: snap.lat,
@@ -2282,7 +2367,7 @@ impl TrafficWorld {
         };
         // Our place at the active field's runway while we arrive: the
         // traffic sequences round it and yields to it (2026-10-14).
-        if let Some(link) = self.links.get(&active) {
+        if let Some(link) = self.links.get(active) {
             let arrival = own_arrival(
                 &link.fleet().field,
                 crate::party_line::own_arrival_plan().as_ref(),
@@ -2352,139 +2437,53 @@ impl TrafficWorld {
         // tower answering us): the station's traffic waits it out, never
         // keys over it.
         if voice.frequency_ours() || crate::pollers::command_waiting() {
-            if let Some(link) = self.links.get_mut(&active) {
+            if let Some(link) = self.links.get_mut(active) {
                 let on = voice
                     .tuned_station()
                     .unwrap_or(crate::voice::StationSpeaker::Tower);
                 link.note_own_transmission(on);
             }
         }
-        if !fast {
-            self.follow_sim_clock(xp, &active, now).await;
-        }
-        let mut station_out = None;
-        let fields: Vec<String> = self.links.keys().cloned().collect();
-        for icao in fields {
-            let Some(link) = self.links.get_mut(&icao) else {
-                continue;
-            };
-            let out = link.tick(Some(&own), dt, now);
-            // The next hour of a generated schedule, once this one is spent;
-            // a timetable's top-up every hour, its day never spent.
-            let tops_up = link.tops_up();
-            if link.pending() == 0 || tops_up {
-                let start = link.fleet().clock.now_s();
-                let next = link
-                    .hours
-                    .filter(|h| start >= f64::from(*h) * traffic::schedule::HORIZON_S);
-                if let Some(h) = next {
-                    link.hours = Some(h + 1);
-                    let zulu = sim_zulu_s(xp).await;
-                    let ms = if tops_up {
-                        link.top_up_hour(u64::from(h + 1), Some((own.lat, own.lon)), zulu)
-                    } else {
-                        generate_for(link.fleet(), u64::from(h + 1), &own, zulu)
-                    };
-                    link.add_schedule(ms, start);
-                }
-            }
-            record(&out, link);
-            if icao == active {
-                station_out = Some(out);
-            }
-        }
-        if let Some(link) = self.links.get(&active) {
-            crate::party_line::publish_traffic_picture(Some(link.targets()));
-            crate::party_line::publish_stands_taken(link.stands_taken());
-        }
-        if self.sink.is_none() {
-            self.sink = crate::traffic_sink::TrafficSink::start(
-                crate::settings::live().xplane_base_url.clone(),
-            );
-        }
-        if let Some(sink) = self.sink.as_mut() {
-            // The simulated aircraft and, inside the same ring, the whole
-            // flights the model flies (a departure past 12 nm, an arrival
-            // still to enter): no aircraft pops in or out of TCAS range.
-            let simulated = self.links.values().map(|l| l.fleet().aircraft().len()).sum();
-            let all: Vec<&TrafficAircraft> = self
-                .links
-                .values()
-                .flat_map(|l| l.fleet().aircraft().iter().chain(l.modeled_drawn()))
-                .collect();
-            let drawn = self.cull.select(Some(here), &all);
-            sink.publish(&drawn, self.last_sim_s.unwrap_or(0.0));
-            self.draw_log
-                .note(simulated, all.len() - simulated, &drawn, now);
-        }
-        // The frequencies: the tower's runway-watch lines in the tower's
-        // voice, the positions' handoffs in theirs, each on its own
-        // frequency. The calls themselves are said with their answers, on
-        // the position that heard them (`overhear_replies`). Only the
-        // station's field speaks (the desks have no radio, stage 3).
-        if let Some(out) = &station_out {
-            let tower = crate::voice::StationSpeaker::Tower;
-            for (id, line) in &out.tower {
-                voice.overhear_checked(tower, tower, line, now, still_valid(*id));
-            }
-            for (id, line, who) in &out.positions {
-                voice.overhear_checked(*who, *who, line, now, still_valid(*id));
-            }
-        }
-        if let Some(s) = status {
-            self.publish_board(xp, s, here, now).await;
-        }
-        self.note_efb_boards(now);
-        self.note_efb_traffic(now);
-        station_out
+        self.own = Some(own);
     }
 
-    /// A timetable follows the sim's clock (#280): once a minute the sim's
-    /// date and zulu time are read and each timetable link whose clock has
-    /// parted from them by [`CLOCK_JUMP_S`] is planned again
-    /// ([`Link::reanchor`]). Not while the fleets are frozen: the check
-    /// after a fast spell catches the field up to the sim.
-    async fn follow_sim_clock(
+    /// The sim just attached: its zulu time and date read once and compared
+    /// with the world's (`utc`). Parted by more than [`CLOCK_JUMP_S`] it is
+    /// said once, never followed: the world keeps UTC (blackbox `traffic`
+    /// `clock_mismatch`). A failed read is no measurement.
+    async fn check_sim_clock(
         &mut self,
         xp: &crate::xplane::XPlaneClient,
-        active: &str,
-        now: Instant,
+        voice: &crate::voice::Voice,
+        utc: f64,
     ) {
-        if self.clock_checked.is_some_and(|t| now.duration_since(t) < CLOCK_CHECK_EVERY) {
-            return;
-        }
-        if !self.links.values().any(|l| l.timetable.is_some()) {
-            return;
-        }
-        self.clock_checked = Some(now);
         let (zulu, day) = tokio::join!(sim_zulu_s(xp), sim_date_days(xp));
-        self.world.note_clock(zulu, day, now);
-        // A failed read is no measurement.
-        let Some(zulu) = zulu else { return };
-        for (icao, link) in self.links.iter_mut() {
-            let (Some(tt), Some(table)) = (link.timetable, traffic::routes::field_routes(icao))
-            else {
-                continue;
-            };
-            let (date, _, local_s) = timetable_clock(table, Some(zulu), day);
-            let jump = clock_jump_s(tt.date, link.local_now_s(), date, local_s);
-            if jump.abs() < CLOCK_JUMP_S {
-                continue;
-            }
-            let from = link.local_now_s();
-            let runway = if icao == active { station_runway() } else { None };
-            if let Some(n) = link.reanchor(table, zulu, day, runway) {
-                tracing::info!(%icao, jump_s = jump.round(), movements = n,
-                    "traffic: the sim's clock jumped; the timetable planned again");
-                crate::blackbox::record(
-                    "traffic",
-                    serde_json::json!({
-                        "event": "reanchored", "field": icao, "jump_s": jump.round(),
-                        "from_local_s": from.round(), "to_local_s": local_s.round(),
-                        "movements": n, "zulu_s": zulu,
-                    }),
-                );
-            }
+        let (Some(zulu), Some(day)) = (zulu, day) else {
+            return;
+        };
+        let off = sim_clock_off_s(utc, day, zulu);
+        if off.abs() <= CLOCK_JUMP_S {
+            self.clock_said = false;
+            return;
+        }
+        let (date, utc_zulu) = utc_day(utc);
+        crate::blackbox::record(
+            "traffic",
+            serde_json::json!({
+                "event": "clock_mismatch", "off_s": off.round(),
+                "sim_zulu_s": zulu.round(), "sim_day": day,
+                "utc_zulu_s": utc_zulu.round(), "utc_day": date.ordinal,
+            }),
+        );
+        if !self.clock_said {
+            self.clock_said = true;
+            let minutes = (off.abs() / 60.0).round();
+            voice.alert(
+                crate::voice::Priority::Advisory,
+                format!(
+                    "The sim's clock is {minutes} minutes off the world's. Set X-Plane to the real time."
+                ),
+            );
         }
     }
 
@@ -2492,7 +2491,7 @@ impl TrafficWorld {
     /// and held stands ([`Link::efb_traffic`]), then every other
     /// timetabled flight of the day ([`whole::WorldBoard`]), tapped into
     /// `efb::feed` about once a second while the EFB serves (no reads).
-    fn note_efb_traffic(&mut self, now: Instant) {
+    fn note_efb_traffic(&mut self, now: Instant, utc: f64) {
         if self
             .efb_traffic_at
             .is_some_and(|t| now.saturating_duration_since(t) < EFB_TRAFFIC_EVERY)
@@ -2504,7 +2503,7 @@ impl TrafficWorld {
         let density = traffic::Density::parse(&crate::settings::live().traffic_density)
             .unwrap_or(traffic::Density::Normal);
         let mut fields: Vec<_> = self.links.values().map(Link::efb_traffic).collect();
-        fields.push(self.world.efb_field(self.links.values(), density, now));
+        fields.push(self.world.efb_field(self.links.values(), density, utc));
         crate::efb::feed::note_traffic(fields);
     }
 
@@ -2617,6 +2616,7 @@ impl TrafficWorld {
         s: &crate::plugin_status::StatusSink,
         own: (f64, f64),
         now: Instant,
+        utc: f64,
     ) {
         let since = self.board_sent.map(|t| now.saturating_duration_since(t));
         if since.is_some_and(|d| d < BOARD_MIN_GAP) {
@@ -2631,7 +2631,6 @@ impl TrafficWorld {
         } else {
             None
         };
-        let sim_s = self.last_sim_s.unwrap_or(0.0);
         let shown = board_field(pick.as_deref(), &choices).map(str::to_string);
         if let Some((_, rx)) = &self.remote_loading {
             match rx.try_recv() {
@@ -2649,17 +2648,13 @@ impl TrafficWorld {
             let fresh = self
                 .remote
                 .as_ref()
-                .is_some_and(|r| r.icao.eq_ignore_ascii_case(icao) && !r.stale(sim_s));
+                .is_some_and(|r| r.icao.eq_ignore_ascii_case(icao) && !r.stale(utc));
             let loading = self
                 .remote_loading
                 .as_ref()
                 .is_some_and(|(i, _)| i.eq_ignore_ascii_case(icao));
             if !fresh && !loading {
-                let zulu = sim_zulu_s(xp).await;
-                let day = sim_date_days(xp).await;
-                self.world.note_clock(zulu, day, now);
-                self.remote_loading =
-                    Some((icao.clone(), self.build_remote(icao, zulu, day, sim_s)));
+                self.remote_loading = Some((icao.clone(), self.build_remote(icao, utc)));
             }
         }
         let list: &[String] = if choices.len() > 1 { &choices } else { &[] };
@@ -2671,7 +2666,7 @@ impl TrafficWorld {
             (Some(icao), Some(r))
                 if !self.links.contains_key(icao) && r.icao.eq_ignore_ascii_case(icao) =>
             {
-                r.payload(sim_s, list)
+                r.payload(utc, list)
             }
             _ => match live {
                 Some(link) => link.board_payload(own_board_flight(link.icao()), list),
@@ -2713,9 +2708,7 @@ impl TrafficWorld {
     fn build_remote(
         &self,
         icao: &str,
-        zulu: Option<f64>,
-        day: Option<u32>,
-        sim0_s: f64,
+        utc_s: f64,
     ) -> std::sync::mpsc::Receiver<Option<RemoteBoard>> {
         let cfg = crate::settings::live();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2725,7 +2718,7 @@ impl TrafficWorld {
         let spawned = std::thread::Builder::new()
             .name("traffic-board".into())
             .spawn(move || {
-                let b = RemoteBoard::build(&icao, &apt, density, zulu, day, sim0_s);
+                let b = RemoteBoard::build(&icao, &apt, density, utc_s);
                 tracing::info!(%icao, flights = b.as_ref().map(|b| b.flights.len()),
                     "traffic: a board for another field");
                 let _ = tx.send(b);
@@ -2758,7 +2751,8 @@ impl TrafficWorld {
         self.loading = None;
         self.failed.clear();
         self.active = None;
-        self.last_sim_s = None;
+        self.last_utc_s = None;
+        self.attached = false;
     }
 
     /// Build the link for `icao` off the tick: the field (apt.dat, its
@@ -2770,8 +2764,7 @@ impl TrafficWorld {
         &mut self,
         icao: &str,
         station: bool,
-        zulu: Option<f64>,
-        day: Option<u32>,
+        utc_s: f64,
     ) -> std::sync::mpsc::Receiver<Option<Link>> {
         let cfg = crate::settings::live();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2801,8 +2794,7 @@ impl TrafficWorld {
                 let ctx = BuildCtx {
                     seed,
                     name: &name,
-                    zulu_s: zulu,
-                    day,
+                    utc_s,
                     runway,
                 };
                 let link = build_link(&icao, &apt, &cifp, &file, &density, &ctx);
@@ -2891,8 +2883,8 @@ pub(crate) fn wanted_field(
 }
 
 /// The link for one field, built off the tick; `None` (said in the log and
-/// the blackbox) when the field or the file cannot be read. `zulu_s` is
-/// the sim's zulu time now, for the field's day (`traffic::rate`).
+/// the blackbox) when the field or the file cannot be read. The world's
+/// clock now gives the field's day (`traffic::rate`).
 fn build_link(
     icao: &str,
     apt: &str,
@@ -2904,10 +2896,10 @@ fn build_link(
     let BuildCtx {
         seed,
         name,
-        zulu_s,
-        day,
+        utc_s,
         ref runway,
     } = *ctx;
+    let zulu_s = utc_day(utc_s).1;
     let table = traffic::routes::field_routes(icao);
     // Traffic only where a route timetable (`routes/`) or the
     // pilot's own file defines it. The station's field used to fly a
@@ -2935,19 +2927,19 @@ fn build_link(
         }
     };
     let ctx = SpawnCtx {
-        zulu_s,
+        zulu_s: Some(zulu_s),
         ..SpawnCtx::default()
     };
     let mut board = None;
     let (schedule, source) = if let (true, Some(table)) = (file.is_empty(), table) {
         let d = traffic::Density::parse(density).unwrap_or(traffic::Density::Normal);
         let (mut schedule, flights, local_s) =
-            timetable_start(&field, table, d, seed, zulu_s, day, runway.clone());
+            timetable_start(&field, table, d, seed, utc_s, runway.clone());
         // A table that opts in is topped up by the generator from the
         // start (`traffic::midflow::top_up`), clear of its stands.
-        let (date, zulu, _) = timetable_clock(table, zulu_s, day);
+        let (date, _, _) = timetable_clock(table, utc_s);
         let top_ctx = SpawnCtx {
-            zulu_s: Some(zulu),
+            zulu_s: Some(zulu_s),
             occupied: planned_stands(&field, schedule.iter()),
             ..SpawnCtx::default()
         };
@@ -3011,8 +3003,8 @@ fn build_link(
     if let Some((flights, local_s)) = board {
         link.set_board(flights, local_s);
     }
-    if let Some(table) = table {
-        let date = timetable_clock(table, zulu_s, day).0;
+    if table.is_some() {
+        let date = utc_day(utc_s).0;
         link.set_summer(date.summer());
         if source == "timetable" {
             link.timetable = Some(Timetable {
@@ -3040,22 +3032,19 @@ fn planned_stands<'a>(
 
 /// What a link is built with besides the files: the field's seed
 /// (`traffic::field_seed`), the station's spoken name (empty: the field's
-/// own), the sim's zulu time and date, the station's runway (`None` for a
-/// field worked by its desk: its timetable flies its default runway).
+/// own), the world's clock ([`utc_now_s`]), the station's runway (`None`
+/// for a field worked by its desk: its timetable flies its default runway).
 struct BuildCtx<'a> {
     seed: u64,
     name: &'a str,
-    zulu_s: Option<f64>,
-    day: Option<u32>,
+    utc_s: f64,
     runway: Option<String>,
 }
 
 /// The timetable's day at a field with a route table, already in motion
 /// (`traffic::midflow::plan`, 2026-10-13): the movements (the placed ones
-/// at 0 s), the board's flights, and the local time of day at the start.
-/// The sim's date and zulu time when they read, else the system clock's;
-/// the year is the system clock's (X-Plane's date carries none). The
-/// stands the rotations leave are filled at light density
+/// at 0 s), the board's flights, and the local time of day at the start,
+/// on the world's clock at `utc_s` ([`utc_now_s`]). The stands the rotations leave are filled at light density
 /// (`traffic::park_at_start`): the charters and the based aircraft no
 /// table holds.
 pub(crate) fn timetable_start(
@@ -3063,11 +3052,10 @@ pub(crate) fn timetable_start(
     table: &traffic::routes::FieldRoutes,
     density: traffic::Density,
     seed: u64,
-    zulu_s: Option<f64>,
-    day: Option<u32>,
+    utc_s: f64,
     runway: Option<String>,
 ) -> (Vec<Movement>, Vec<traffic::board::BoardFlight>, f64) {
-    let (date, zulu, local_s) = timetable_clock(table, zulu_s, day);
+    let (date, zulu, local_s) = timetable_clock(table, utc_s);
     let ctx = SpawnCtx {
         runway,
         zulu_s: Some(zulu),
@@ -3096,33 +3084,19 @@ pub(crate) fn timetable_start(
 /// A timetable field flies this much of its day from the start.
 pub(crate) const TIMETABLE_HORIZON_S: f64 = 24.0 * 3600.0;
 
-/// A timetable's day and clock: the sim's date and zulu time when they
-/// read, else the system clock's (the year is the system clock's, X-Plane's
-/// date carries none): (date, zulu seconds, local seconds after the
-/// date's midnight at the table's field).
+/// A timetable's day and clock at `utc_s` ([`utc_now_s`]): (the UTC date,
+/// zulu seconds, local seconds after the date's midnight at the table's
+/// field).
 fn timetable_clock(
     table: &traffic::routes::FieldRoutes,
-    zulu_s: Option<f64>,
-    day: Option<u32>,
+    utc_s: f64,
 ) -> (traffic::rotation::Date, f64, f64) {
-    let (date, zulu) = sim_day(zulu_s, day);
+    let (date, zulu) = utc_day(utc_s);
     (
         date,
         zulu,
         traffic::rotation::local_s(zulu, table.utc_offset_h, date),
     )
-}
-
-/// The sim's date and zulu time when they read, else the system clock's
-/// (the year is the system clock's).
-fn sim_day(zulu_s: Option<f64>, day: Option<u32>) -> (traffic::rotation::Date, f64) {
-    use traffic::rotation::Date;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64());
-    let today = Date::from_epoch_days((now / 86_400.0).floor() as i64);
-    let date = day.map_or(today, |o| Date::of_year(today.year, o));
-    (date, zulu_s.unwrap_or(now % 86_400.0))
 }
 
 /// The Board tab offers every field with a timetable this near us, nm
@@ -3163,7 +3137,8 @@ pub(crate) fn board_field<'a>(pick: Option<&str>, choices: &'a [String]) -> Opti
         .map(String::as_str)
 }
 
-/// A remote board is built again after this much sim time, seconds.
+/// A remote board is built again after this much of the world's time,
+/// seconds.
 const REMOTE_BOARD_REBUILD_S: f64 = 6.0 * 3600.0;
 
 /// The session's seed, hashed with each field's ICAO into that field's
@@ -3182,10 +3157,10 @@ pub(crate) struct RemoteBoard {
     icao: String,
     flights: Vec<traffic::board::BoardFlight>,
     names: Vec<String>,
-    /// Local seconds at the field when built, and the sim's running time
-    /// then: the board's clock runs with the sim's.
+    /// Local seconds at the field when built, and the world's clock then
+    /// ([`utc_now_s`]): the board's clock runs with it.
     t0_local_s: f64,
-    sim0_s: f64,
+    utc0_s: f64,
 }
 
 impl RemoteBoard {
@@ -3195,15 +3170,13 @@ impl RemoteBoard {
         icao: &str,
         apt: &str,
         density: traffic::Density,
-        zulu_s: Option<f64>,
-        day: Option<u32>,
-        sim0_s: f64,
+        utc_s: f64,
     ) -> Option<RemoteBoard> {
         let table = traffic::routes::field_routes(icao)?;
         let field = FieldModel::load(apt, icao).ok()??;
-        let (date, _, local_s) = timetable_clock(table, zulu_s, day);
+        let (date, _, local_s) = timetable_clock(table, utc_s);
         Some(RemoteBoard::from_field(
-            &field, table, density, date, local_s, sim0_s,
+            &field, table, density, date, local_s, utc_s,
         ))
     }
 
@@ -3214,7 +3187,7 @@ impl RemoteBoard {
         density: traffic::Density,
         date: traffic::rotation::Date,
         local_s: f64,
-        sim0_s: f64,
+        utc0_s: f64,
     ) -> RemoteBoard {
         RemoteBoard {
             icao: field.icao.clone(),
@@ -3229,19 +3202,19 @@ impl RemoteBoard {
             ),
             names: field.net.stands.iter().map(|s| s.name.clone()).collect(),
             t0_local_s: local_s,
-            sim0_s,
+            utc0_s,
         }
     }
 
-    fn stale(&self, sim_s: f64) -> bool {
-        sim_s - self.sim0_s > REMOTE_BOARD_REBUILD_S || sim_s < self.sim0_s
+    fn stale(&self, utc_s: f64) -> bool {
+        utc_s - self.utc0_s > REMOTE_BOARD_REBUILD_S || utc_s < self.utc0_s
     }
 
-    /// The payload at sim running time `sim_s`: each flight's status by
+    /// The payload at the world's clock `utc_s`: each flight's status by
     /// the clock, a departure's planned stand, an arrival's once landed.
-    pub(crate) fn payload(&self, sim_s: f64, choices: &[String]) -> String {
+    pub(crate) fn payload(&self, utc_s: f64, choices: &[String]) -> String {
         use traffic::board::{Dir, Row, Status};
-        let now = self.t0_local_s + (sim_s - self.sim0_s).max(0.0);
+        let now = self.t0_local_s + (utc_s - self.utc0_s).max(0.0);
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
         let rows: Vec<Row> = self
             .flights
@@ -3267,7 +3240,7 @@ impl RemoteBoard {
 }
 
 /// The sim's date, days since the first of January; `None` on a failed
-/// read.
+/// read. Only to say a sim clock that parts from the world's.
 async fn sim_date_days(xp: &crate::xplane::XPlaneClient) -> Option<u32> {
     xp.get_float(crate::datarefs::LOCAL_DATE_DAYS)
         .await
@@ -3276,11 +3249,16 @@ async fn sim_date_days(xp: &crate::xplane::XPlaneClient) -> Option<u32> {
         .map(|d| d as u32)
 }
 
-/// The next generated hour at the fleet's field, round us.
-fn generate_for(fleet: &Fleet, hour: u64, own: &OwnState, zulu_s: Option<f64>) -> Vec<Movement> {
+/// The next generated hour at the fleet's field, round us when we are there.
+fn generate_for(
+    fleet: &Fleet,
+    hour: u64,
+    own: Option<(f64, f64)>,
+    zulu_s: Option<f64>,
+) -> Vec<Movement> {
     let density = traffic::Density::parse(&crate::settings::live().traffic_density)
         .unwrap_or(traffic::Density::Normal);
-    next_hour(fleet, density, hour, Some((own.lat, own.lon)), zulu_s)
+    next_hour(fleet, density, hour, own, zulu_s)
 }
 
 /// The next generated hour at the fleet's field: every stand anybody holds
@@ -3317,8 +3295,8 @@ fn airframe_fits(a: &TrafficAircraft, light: bool, runway_m: f64) -> bool {
     is_light == light && (light || runway_m >= traffic::schedule::runway_needed_m(&a.icao_type))
 }
 
-/// The sim's zulu time, seconds after midnight; `None` on a failed read
-/// (the schedule then flies the field's peak, never a guessed hour).
+/// The sim's zulu time, seconds after midnight; `None` on a failed read.
+/// Only to say a sim clock that parts from the world's.
 async fn sim_zulu_s(xp: &crate::xplane::XPlaneClient) -> Option<f64> {
     xp.get_float(crate::datarefs::ZULU_TIME_SEC)
         .await

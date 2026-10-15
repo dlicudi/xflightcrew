@@ -244,6 +244,8 @@ pub async fn run(
         voice.set_replay(in_replay);
         voice.set_paused(paused);
         if in_replay || paused {
+            // The world does not wait (our aircraft held where last seen).
+            world.traffic_alone(&xp, &voice, &status, true).await;
             tokio::time::sleep(period).await;
             continue;
         }
@@ -1575,6 +1577,8 @@ pub async fn run(
                 }
             }
         } else if xp.get_float(crate::datarefs::ON_GROUND_ANY).await.is_err() {
+            // No sim: the world runs on alone.
+            world.traffic_alone(&xp, &voice, &status, false).await;
             let since = *lost_since.get_or_insert_with(Instant::now);
             if seen_sim && !disconnected && since.elapsed() >= Duration::from_secs(3) {
                 disconnected = true;
@@ -1589,6 +1593,7 @@ pub async fn run(
                 }
             }
         } else {
+            world.traffic_alone(&xp, &voice, &status, true).await;
             lost_since = None;
         }
         tokio::time::sleep(period).await;

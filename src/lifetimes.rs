@@ -246,6 +246,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("tools::speedhold::MODE", 'L'),
     ("tools::speedhold::TARGET_KTS", 'L'),
     ("tools::taxi::SAID", 'S'),
+    ("traffic_link::SIM_ATTACHED", 'S'),
     ("traffic_link::STATION_RUNWAY", 'S'),
     ("tts::AUDIO_BUS", 'P'),
     ("tts::AUDIO_BUS_PINNED", 'P'),

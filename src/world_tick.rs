@@ -874,13 +874,13 @@ impl WorldTick {
     }
 
     /// Our own traffic: the fleet at the installed field stepped on the
-    /// sim's clock and traded with the station (`traffic_link`), right after
-    /// the runway watch. Nothing at all unless `XCOPILOT_TRAFFIC=ours`.
+    /// world's clock (UTC) and traded with the station (`traffic_link`),
+    /// right after the runway watch. Nothing at all unless
+    /// `XCOPILOT_TRAFFIC=ours`.
     pub(crate) async fn traffic_link(&mut self, t: &Tick<'_>, _heard: &Heard) {
-        let sim_speed = crate::climb_watch::sim_speed_now();
         let _ = self
             .traffic
-            .tick(t.xp, t.voice, t.snap, sim_speed, t.now, t.status.as_ref())
+            .tick(t.xp, t.voice, Some(t.snap), true, t.now, t.status.as_ref())
             .await;
         // The frequency the fleet and the tower made, aired as it may be:
         // the tower tuned, never over our PTT or a pilot's line waiting,
@@ -888,6 +888,23 @@ impl WorldTick {
         let _ = t
             .voice
             .pump_overheard(t.now, crate::pollers::command_waiting());
+    }
+
+    /// Our own traffic on a tick with no snapshot of ours: the sim absent
+    /// (`attached` false, the world runs on alone), or paused, in a replay
+    /// or unread (our aircraft held where last seen). The world never waits
+    /// for the sim.
+    pub(crate) async fn traffic_alone(
+        &mut self,
+        xp: &XPlaneClient,
+        voice: &Voice,
+        status: &Option<StatusSink>,
+        attached: bool,
+    ) {
+        let _ = self
+            .traffic
+            .tick(xp, voice, None, attached, Instant::now(), status.as_ref())
+            .await;
     }
 
     /// Under `quiet` on the ground the vectors still advance, unheard.
