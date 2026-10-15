@@ -1,7 +1,7 @@
 //! Our own AI traffic (stage D, `docs/tasks/pillars-audit/stage-d-traffic.md`).
 //!
 //! Pure and deterministic: performance tables ([`perf`]), kinematics
-//! ([`kin`]), a sim-time clock ([`clock`]), a seeded generator ([`rng`]),
+//! ([`kin`]), a fixed-step clock ([`clock`]), a seeded generator ([`rng`]),
 //! the field ([`field`]), the phase machine ([`phase`], [`aircraft`]) and
 //! the fleet that steps it ([`fleet`]), keeping its distance on the
 //! ground ([`spacing`]). No statics: everything here is a

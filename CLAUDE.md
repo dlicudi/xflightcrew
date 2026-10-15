@@ -233,6 +233,9 @@ utterance iff COM1 is on the station AND it parses as a radio call (FSM in
   change, and controls our speed on the traffic's own bands** (`station::approach_sequence_lines`,
   `APPROACH_SPEED_BANDS` pinned to `traffic::arrival::SPEED_BANDS`), a band only where our type
   can fly it (`provide_approach_speeds`); the speed is void at the tower handoff and a go-around.
+- **The traffic world runs on UTC, with or without the sim** (`traffic_link::utc_now_s`): our
+  aircraft is an optional input, the plugin and the voices wait for the sim, and a sim clock off
+  UTC is said once, never followed (`TrafficWorld::check_sim_clock`).
 - **Taxi routes**: Dijkstra over apt.dat 1201/1202; crossings from strip GEOMETRY, never network
   flags; a runway destination snaps to a node ON THE DESTINATION STRIP; a refusing gate names
   strip and distance (`NoFit::NoneNear`).

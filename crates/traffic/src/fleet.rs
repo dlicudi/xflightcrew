@@ -1,5 +1,6 @@
 //! The fleet: every traffic aircraft at one field, stepped together on
-//! the sim-time clock. A value the bin owns; never a static.
+//! its clock (the bin feeds it the world's UTC). A value the bin owns;
+//! never a static.
 
 use crate::aircraft::{Seen, TrafficAircraft};
 use crate::clock::{SimClock, SUBSTEP_S};
@@ -435,7 +436,7 @@ impl Fleet {
             .collect()
     }
 
-    /// Advance by `dt` seconds of sim time (clamped and cut into fixed
+    /// Advance by `dt` seconds of the world's time (clamped and cut into fixed
     /// substeps by the clock; nothing while it is frozen). `orders` is the
     /// tower's level-triggered answer per aircraft, asked every substep.
     pub fn step(

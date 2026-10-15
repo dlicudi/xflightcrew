@@ -21,7 +21,6 @@
 //! (`traffic_sink::DrawCull`), never TCAS targets for the station.
 
 use std::collections::HashSet;
-use std::time::Instant;
 
 use traffic::board::Dir;
 use traffic::rotation::{hhmm, Date};
@@ -555,51 +554,29 @@ impl Link {
 /// fly) flown whole by the same closed-form model: a departure from its
 /// wheels up ([`from_wheels_up`]), an arrival to its blocks. A route
 /// between two table fields is in both tables, the departure's model
-/// shown. Times are zulu seconds after the day's midnight, the sim's when
-/// they were last read (`note_clock`, no read of its own), else the system
-/// clock's.
+/// shown. Times are zulu seconds after the day's midnight on the world's
+/// clock (`utc_now_s`).
 ///
 /// EFB only: never drawn by the plugin, never a TCAS target, never seen by
 /// the station. A flight a link has is the link's, never shown twice.
 #[derive(Default)]
 pub(crate) struct WorldBoard {
-    /// The sim's zulu time and date at their last read, and when.
-    clock: Option<(f64, Option<u32>, Instant)>,
     /// What the flights were built for.
     built: Option<(Date, traffic::Density)>,
     flights: Vec<Modeled>,
 }
 
 impl WorldBoard {
-    /// The sim's zulu time and date as just read (a failed read changes
-    /// nothing).
-    pub(crate) fn note_clock(&mut self, zulu: Option<f64>, day: Option<u32>, now: Instant) {
-        if let Some(z) = zulu {
-            self.clock = Some((z, day, now));
-        }
-    }
-
-    /// The day and zulu seconds into it at `now`: the last read run on by
-    /// the wall clock.
-    fn now(&self, now: Instant) -> (Date, f64) {
-        let (zulu, day) = match self.clock {
-            Some((z, d, at)) => (Some(z + now.saturating_duration_since(at).as_secs_f64()), d),
-            None => (None, None),
-        };
-        let (date, z) = super::sim_day(zulu, day);
-        let days = (z / 86_400.0).floor();
-        (date.plus(days as i64), z - days * 86_400.0)
-    }
-
-    /// The EFB's map field of every flight shown at `now` that none of
-    /// `links` has; the day built once per date and density.
+    /// The EFB's map field of every flight shown at the world's clock
+    /// `utc_s` that none of `links` has; the day built once per date and
+    /// density.
     pub(crate) fn efb_field<'a>(
         &mut self,
         links: impl Iterator<Item = &'a Link>,
         density: traffic::Density,
-        now: Instant,
+        utc_s: f64,
     ) -> crate::efb::feed::TrafficField {
-        let (date, t) = self.now(now);
+        let (date, t) = super::utc_day(utc_s);
         if self.built != Some((date, density)) {
             self.flights = world_flights(date, density);
             self.built = Some((date, density));
@@ -763,8 +740,7 @@ mod tests {
             &table,
             Density::Normal,
             7,
-            Some(6.0 * 3600.0),
-            Some(date.ordinal),
+            super::super::utc_at(date, 6.0 * 3600.0),
             None,
         );
         let mut link = Link::new(field, schedule, "");
@@ -774,15 +750,12 @@ mod tests {
         link
     }
 
-    /// The world board's day (a summer Tuesday's ordinal, the system
-    /// clock's year, as the board itself dates it) and a board whose sim
-    /// clock read `zulu_s` on it at `at`.
-    fn world_at(zulu_s: f64, at: Instant) -> (traffic::rotation::Date, super::WorldBoard) {
-        let ordinal = traffic::rotation::Date::ymd(2026, 7, 14).ordinal;
-        let date = super::super::sim_day(Some(0.0), Some(ordinal)).0;
-        let mut board = super::WorldBoard::default();
-        board.note_clock(Some(zulu_s), Some(ordinal), at);
-        (date, board)
+    /// The world board's day (a summer Tuesday), a board, and the world's
+    /// clock at `zulu_s` on it.
+    fn world_at(zulu_s: f64) -> (traffic::rotation::Date, super::WorldBoard, f64) {
+        let date = traffic::rotation::Date::ymd(2026, 7, 14);
+        let utc = super::super::utc_at(date, zulu_s);
+        (date, super::WorldBoard::default(), utc)
     }
 
     /// THE WORLD BOARD (2026-10-15): with no field simulated, a Gatwick to
@@ -790,8 +763,7 @@ mod tests {
     /// air, and no callsign is shown twice (the route is in both tables).
     #[test]
     fn the_world_board_shows_a_flight_no_field_simulates() {
-        let epoch = Instant::now();
-        let (date, _) = world_at(0.0, epoch);
+        let (date, _, _) = world_at(0.0);
         let flights = super::world_flights(date, Density::Normal);
         let (cs, mid) = flights
             .iter()
@@ -804,8 +776,8 @@ mod tests {
             })
             .find(|(_, t)| (0.0..86_400.0).contains(t))
             .expect("a Gatwick to Malaga flight today");
-        let (_, mut board) = world_at(mid, epoch);
-        let field = board.efb_field(std::iter::empty(), Density::Normal, epoch);
+        let (_, mut board, utc) = world_at(mid);
+        let field = board.efb_field(std::iter::empty(), Density::Normal, utc);
         let a = field
             .aircraft
             .iter()
@@ -834,8 +806,8 @@ mod tests {
         // their bytes on the wire.
         let (mut most, mut bytes) = (0, 0);
         for h in 0..24 {
-            let (_, mut board) = world_at(f64::from(h) * 3600.0, epoch);
-            let f = board.efb_field(std::iter::empty(), Density::Normal, epoch);
+            let (_, mut board, utc) = world_at(f64::from(h) * 3600.0);
+            let f = board.efb_field(std::iter::empty(), Density::Normal, utc);
             most = most.max(f.aircraft.len());
             let wire = serde_json::to_string(&crate::efb::airport::traffic_out(&[f])).unwrap();
             bytes = bytes.max(wire.len());
@@ -852,19 +824,18 @@ mod tests {
     #[test]
     fn the_world_board_never_shows_a_links_flight() {
         let link = heathrow_link();
-        let epoch = Instant::now();
         let owned: std::collections::HashSet<String> =
             link.callsigns().map(str::to_string).collect();
         let mut overlap = 0;
         for h in 0..24 {
-            let (_, mut board) = world_at(f64::from(h) * 3600.0, epoch);
-            let alone = board.efb_field(std::iter::empty(), Density::Normal, epoch);
+            let (_, mut board, utc) = world_at(f64::from(h) * 3600.0);
+            let alone = board.efb_field(std::iter::empty(), Density::Normal, utc);
             overlap += alone
                 .aircraft
                 .iter()
                 .filter(|a| owned.contains(&a.callsign))
                 .count();
-            let with = board.efb_field(std::iter::once(&link), Density::Normal, epoch);
+            let with = board.efb_field(std::iter::once(&link), Density::Normal, utc);
             for a in &with.aircraft {
                 assert!(!owned.contains(&a.callsign), "{} shown twice", a.callsign);
             }
@@ -968,8 +939,7 @@ mod tests {
             table,
             Density::Normal,
             traffic::field_seed("LEMG", super::super::SESSION_SEED),
-            Some(8.0 * 3600.0),
-            Some(date.ordinal),
+            super::super::utc_at(date, 8.0 * 3600.0),
             None,
         );
         let away = schedule
