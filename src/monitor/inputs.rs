@@ -620,8 +620,9 @@ impl CrewBrakeLatch {
 /// deflected while the autopilot flies for an automation and no loop of ours
 /// is writing it. Each is blackboxed `intervention` once per episode; "my
 /// controls" and the loops' own yield stand-downs record through
-/// `flight::note_pilot_takeover`.
-pub(super) fn note_interventions(i: &Inputs, control: crate::flight::Control) {
+/// `flight::note_pilot_takeover`. Returns whether the pilot's hand is on the
+/// yoke under the automation this tick (`yoke_under_ap`).
+pub(super) fn note_interventions(i: &Inputs, control: crate::flight::Control) -> bool {
     static PREV: std::sync::Mutex<[bool; 4]> = std::sync::Mutex::new([false; 4]);
     static BRAKE_LATCH: std::sync::Mutex<CrewBrakeLatch> =
         std::sync::Mutex::new(CrewBrakeLatch { prev: false, crews: false });
@@ -642,6 +643,18 @@ pub(super) fn note_interventions(i: &Inputs, control: crate::flight::Control) {
         }
     }
     *prev = now;
+    now[3]
+}
+
+/// A hand on the yoke under the automation within this long makes the
+/// flying the pilot's, for who landed it.
+pub(super) const PILOT_HANDS_RECENT_S: f64 = 30.0;
+
+/// Whether the pilot's hand was on the yoke lately (`yoke_under_ap`, seconds
+/// ago). 2026-10-15: the pilot held the 737's yoke through the autoland's
+/// flare and the landing was booked as the automation's. Pure.
+pub(super) fn pilot_hands_recent(hands_s_ago: Option<f64>) -> bool {
+    hands_s_ago.is_some_and(|s| s <= PILOT_HANDS_RECENT_S)
 }
 
 pub(crate) fn r1(v: f64) -> f64 {

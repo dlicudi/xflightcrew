@@ -909,6 +909,23 @@
         assert_eq!(hand_back_line(taxi, None), taxi);
     }
 
+    /// 2026-10-15: an enroute give-up left the A/T off and the lever at 0.33,
+    /// and the speed crept to 268 kt below FL100. An airborne give-up hands
+    /// the speed to the governor, unless something already holds it or the
+    /// pilot cancelled.
+    #[test]
+    fn an_airborne_give_up_hands_the_speed_to_the_governor() {
+        use super::speed_hand_back_owed as owed;
+        let stalled = "enroute_stalled";
+        assert!(owed(Some(false), Some(false), false, stalled));
+        assert!(owed(Some(false), None, false, stalled), "an unread A/T holds nothing");
+        assert!(!owed(Some(true), Some(false), false, "taxi_stalled"), "the brakes hold it");
+        assert!(!owed(None, Some(false), false, stalled), "an unread squat is no measurement");
+        assert!(!owed(Some(false), Some(true), false, stalled), "the A/T holds it");
+        assert!(!owed(Some(false), Some(false), true, stalled), "the governor holds it");
+        assert!(!owed(Some(false), Some(false), false, "abort"), "the pilot's cancel");
+    }
+
     #[test]
     fn full_auto_requires_both_instruments_to_confirm_ground_contact() {
         use sim::ground::on_ground_confirmed as confirmed_ground;

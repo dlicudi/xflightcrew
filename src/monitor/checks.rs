@@ -612,6 +612,12 @@ impl Check for TodAhead {
 /// failure of the LEAL–LEMD flight (TOD slipped past unannounced; the descent
 /// started late, steep, and fast). Says what rate recovers the profile, so the
 /// fix is in the same breath as the problem.
+/// Inside this distance to the field the profile is no rate to fly.
+const STRAIGHT_IN_MIN_NM: f64 = 7.0;
+/// The steepest descent worth naming as the way back onto the profile: a
+/// brisk descent for anything we fly, short of an emergency one.
+const BELIEVABLE_DESCENT_FPM: f64 = 3_000.0;
+
 pub(super) struct TodPassed;
 
 impl Check for TodPassed {
@@ -661,6 +667,11 @@ impl Check for TodPassed {
         let height = s.alt_ft - (elev + 2000.0);
         let mins = (dist - 5.0).max(2.0) / s.groundspeed_kts * 60.0;
         let fpm = ((height / mins) / 100.0).round() * 100.0;
+        // Close in the rate is nonsense ("about 14,300 feet a minute",
+        // 2026-10-15): too close or too steep is no profile to rejoin.
+        if dist < STRAIGHT_IN_MIN_NM || fpm > BELIEVABLE_DESCENT_FPM {
+            return Some("We're past the descent point. We're too high for a straight-in.".into());
+        }
         Some(format!(
             "We're past the descent point. About {fpm:.0} feet a minute makes the profile."
         ))

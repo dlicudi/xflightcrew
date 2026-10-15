@@ -602,10 +602,7 @@ impl Tool for SetParkingBrake {
         }
 
         if !drive_park_brake(ctx.xplane, args.on, self.valve_set).await? {
-            return Ok(format!(
-                "Tried, but the parking brake still reads {}. Check the handle.",
-                if args.on { "released" } else { "set" }
-            ));
+            return Ok(park_brake_failed_line(args.on).to_string());
         }
         // The handle holds us now: a crew brake hold still renewing under it
         // would just be a boot nobody needs, and one more thing to forget.
@@ -624,6 +621,17 @@ impl Tool for SetParkingBrake {
                 ""
             }
         ))
+    }
+}
+
+/// The parking brake did not read what was asked. A release that will not
+/// stay released is something holding it: the pilot's hardware switch bound
+/// to the brake (2026-10-15). Pure.
+fn park_brake_failed_line(on: bool) -> &'static str {
+    if on {
+        "Tried, but the parking brake still reads released. Check the handle."
+    } else {
+        "Tried, but the parking brake keeps coming back on. Something is holding it, likely a switch on your hardware bound to the brake."
     }
 }
 
@@ -1112,6 +1120,15 @@ mod tests {
     use super::*;
     use crate::tools::ToolCtx;
     use crate::xplane::FakeXPlane;
+
+    /// 2026-10-15: a release that would not stay released was the pilot's
+    /// hardware switch, never the handle.
+    #[test]
+    fn a_release_that_will_not_stay_names_the_hardware() {
+        assert!(park_brake_failed_line(false).contains("keeps coming back on"));
+        assert!(park_brake_failed_line(false).contains("switch on your hardware"));
+        assert!(park_brake_failed_line(true).ends_with("Check the handle."));
+    }
 
     fn ctx<'a>(fake: &'a FakeXPlane, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
         ToolCtx {

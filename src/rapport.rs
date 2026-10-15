@@ -69,6 +69,9 @@ pub struct View {
     pub flap_ratio: f64,
     pub gear_down: bool,
     pub automation_flying: bool,
+    /// The pilot's hand on the yoke under the automation lately
+    /// (`monitor::inputs::pilot_hands_recent`): a landing then is theirs.
+    pub pilot_hands: bool,
     pub dest_dist_nm: Option<f64>,
     pub crashed: bool,
     /// Instructor mode: the instructor grades the landing, and a copilot
@@ -325,7 +328,7 @@ impl Rapport {
         let l = Landing {
             t_s: td.t,
             sink_fpm: sink,
-            by_automation: v.automation_flying,
+            by_automation: v.automation_flying && !v.pilot_hands,
             airborne_s: td.t - m.aloft_t.unwrap_or(td.t),
             same_field,
             landings_here: self.landings_here,
@@ -859,6 +862,17 @@ mod tests {
     /// an arrival, a touchdown at `sink`, a roll to a stop. Returns every
     /// line said, in order, with the time it was said.
     fn fly(r: &mut Rig, p: &Persona, sink: f64, automation: bool) -> Vec<(f64, Line)> {
+        fly_hands(r, p, sink, automation, false)
+    }
+
+    /// [`fly`] with the pilot's hand on the yoke under the automation.
+    fn fly_hands(
+        r: &mut Rig,
+        p: &Persona,
+        sink: f64,
+        automation: bool,
+        pilot_hands: bool,
+    ) -> Vec<(f64, Line)> {
         let a = c172();
         let mut said = Vec::new();
         let mut t = 0.0;
@@ -869,6 +883,7 @@ mod tests {
         };
         let base = View {
             automation_flying: automation,
+            pilot_hands,
             lat: 36.15,
             lon: -5.35,
             ..View::default()
@@ -978,6 +993,20 @@ mod tests {
         assert!(
             said.iter()
                 .any(|(_, l)| l.text().contains("hard one, about 700")),
+            "{said:?}"
+        );
+    }
+
+    /// 2026-10-15: the pilot held the yoke through the autoland's flare and
+    /// the landing was booked `by_automation`. A hand on the yoke makes it
+    /// the pilot's landing.
+    #[test]
+    fn a_landing_with_the_pilots_hand_on_the_yoke_is_the_pilots() {
+        let mut r = Rig::new();
+        let said = fly_hands(&mut r, &persona(Chatter::Normal), 180.0, true, true);
+        assert!(
+            said.iter()
+                .any(|(_, l)| l.text().starts_with("Nice one, about 180")),
             "{said:?}"
         );
     }

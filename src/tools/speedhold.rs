@@ -114,6 +114,34 @@ fn pilot_took_the_brakes(left: f64, right: f64, parkbrake: f64, governor_braking
     !governor_braking && (left.min(right) > PILOT_BRAKE_YIELD || parkbrake > PILOT_BRAKE_YIELD)
 }
 
+/// Said when the taxi hold will not add power with the engines in beta or
+/// reverse.
+const REVERSED_LINE: &str =
+    "The engines are in reverse or beta, so I won't add power. Check the thrust levers, then ask again.";
+
+/// Whether taxi power would push the wrong way: any engine's `prop_mode`
+/// (0 feather, 1 normal, 2 beta, 3 reverse) in beta or reverse, on an
+/// airframe that does not taxi in beta itself (`taxi_beta`). A 737 taxied
+/// with the pilot's axes in the reverse range, the governor's lever became
+/// backward thrust and it rolled backwards and spun (2026-10-15). Feather is
+/// no backward thrust and is not judged. Only the airframe's own engines
+/// are read. Pure.
+fn taxi_thrust_reversed(prop_mode: &[f64], engines: usize, taxi_beta: bool) -> bool {
+    !taxi_beta && prop_mode.iter().take(engines.max(1)).any(|m| *m >= 1.5)
+}
+
+/// [`taxi_thrust_reversed`] against the live airframe; `None` on a failed
+/// read, which is no measurement.
+async fn taxi_thrust_reversed_now(xp: &dyn crate::xplane::XPlane) -> Option<bool> {
+    let modes = xp.get_float_array(crate::datarefs::PROP_MODE).await.ok()?;
+    let engines = crate::aircraft::live_profile().map_or(1, |p| p.engines);
+    Some(taxi_thrust_reversed(
+        &modes,
+        engines,
+        crate::aircraft::taxi_beta_max().is_some(),
+    ))
+}
+
 /// The parking-brake ratio the pause may read as the pilot's toggle: none
 /// until the ratio has READ released once since the governor armed. Before
 /// that it is the brake the arm released still bleeding off, or a crew hold
@@ -1130,6 +1158,14 @@ impl Tool for HoldSpeed {
         if on_ground && !taxi {
             return Ok("We're on the ground — say a taxi speed like 'taxi at 10 knots', or ask again airborne.".to_string());
         }
+        // Engines in beta or reverse: taxi power would push us backwards.
+        if taxi
+            && a.knots.is_none_or(|k| k >= 1.0)
+            && taxi_thrust_reversed_now(ctx.xplane).await == Some(true)
+        {
+            crate::blackbox::record("speedhold", json!({"event": "taxi_reversed_refused"}));
+            return Ok(REVERSED_LINE.to_string());
+        }
         // A crew-held "brakes on" yields to a commanded taxi the same way the
         // parking brake does: rolling was just asked for. A stop target hands
         // over silently, the governor parks on its own boot before the held
@@ -1336,6 +1372,8 @@ async fn governor(
         );
     };
     life("governor_started");
+    // Stood down for beta or reverse mid-taxi: stopped and parked on exit.
+    let mut reversed = false;
     let mut braking = false;
     // Our own brake pollution, by channel: the proportional channel drives
     // the PEDAL ratios (gated by `braking`), and the held stop command rides
@@ -1609,6 +1647,19 @@ async fn governor(
                     run.lower_flag();
                     break;
                 }
+                // Levers gone into beta or reverse mid-taxi: our power would
+                // push backwards. Idle, stand down, stop and park on exit.
+                if taxi_thrust_reversed_now(&xp).await == Some(true) {
+                    tracing::warn!("speed governor: engines in beta or reverse, standing down");
+                    crate::blackbox::record("speedhold", json!({"event": "taxi_reversed"}));
+                    glide(&xp, &taxi_lever(), 0.0, 300).await;
+                    if let Some(v) = &voice {
+                        v.alert(crate::voice::Priority::Caution, REVERSED_LINE);
+                    }
+                    reversed = true;
+                    run.lower_flag();
+                    break;
+                }
                 // The parking-brake ratio, read every tick: the park HANDLE
                 // (past 0.5) set mid-roll is the pilot STOPPING — close the
                 // throttle and hand the aircraft back, never chase the target
@@ -1821,6 +1872,11 @@ async fn governor(
     // client refuses every write, and these are not the lever's law.
     let xp = xp.unscoped();
     life("governor_stopped");
+    if reversed {
+        let valve = crate::aircraft::live_profile().and_then(|p| p.park_brake_valve_set);
+        super::controls::hand_back_hold(&xp, valve, super::controls::HoldFor::by("speedhold"))
+            .await;
+    }
     // An A/THR holding the speed is left holding it (a disconnect with the
     // levers in CL is a thrust step to climb); the next lever owner's thrust
     // watch takes it out.
@@ -1868,6 +1924,21 @@ async fn governor(
 
 #[cfg(test)]
 mod tests {
+    /// 2026-10-15: a 737 taxied with its engines in beta (`prop_mode` 2), the
+    /// governor's power pushed it backwards and it spun. Beta or reverse on
+    /// the airframe's own engines refuses taxi power, unless it taxis in
+    /// beta itself; the unused array tail and feather are never judged.
+    #[test]
+    fn taxi_power_is_refused_in_beta_or_reverse() {
+        use super::taxi_thrust_reversed as reversed;
+        assert!(!reversed(&[1.0, 1.0, 0.0, 0.0], 2, false), "normal");
+        assert!(reversed(&[2.0, 1.0], 2, false), "one engine in beta");
+        assert!(reversed(&[1.0, 3.0], 2, false), "one engine in reverse");
+        assert!(!reversed(&[1.0, 3.0], 1, false), "one engine aboard");
+        assert!(!reversed(&[0.0], 1, false), "feather is no backward thrust");
+        assert!(!reversed(&[2.0, 2.0], 2, true), "it taxis in beta");
+    }
+
     /// `release()` is the door the takeoff, autoland's handoff, reverse and
     /// the brake hold go through before writing the levers themselves, but
     /// the governor's client was unscoped: a tick already past its `live()`
