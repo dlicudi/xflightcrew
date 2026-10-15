@@ -59,8 +59,8 @@ routes:
   - {carrier: TOM, number: 286, other: EGNX, city: "East Midlands", summer: 3, winter: 0}
   - {carrier: EXS, number: 729, other: EGNM, city: "Leeds Bradford", summer: 7, winter: 4}
   - {carrier: RYR, number: 4417, other: EGNM, city: "Leeds Bradford", summer: 4, winter: 2}
-  - {carrier: EZY, number: 6587, other: EGAA, city: "Belfast", summer: 5, winter: 3}
-  - {carrier: RYR, number: 8935, other: EGAA, city: "Belfast", summer: 4, winter: 2}
+  - {carrier: EZY, number: 6587, other: EGAA, city: "Belfast International", summer: 5, winter: 3}
+  - {carrier: RYR, number: 8935, other: EGAA, city: "Belfast International", summer: 4, winter: 2}
   - {carrier: TOM, number: 318, other: EGFF, city: "Cardiff", summer: 3, winter: 0}
   - {carrier: RYR, number: 7181, other: EICK, city: "Cork", summer: 7, winter: 4}
   - {carrier: EIN, number: 774, other: EICK, city: "Cork", summer: 4, winter: 2}
@@ -108,9 +108,9 @@ routes:
   - {carrier: EZY, number: 1427, other: LSGG, city: "Geneva", summer: 4, winter: 3}
   - {carrier: AUA, number: 157, other: LOWW, city: "Vienna", summer: 10, winter: 7}
   - {carrier: RYR, number: 6081, other: LOWW, city: "Vienna", summer: 7, winter: 5}
-  - {carrier: RYR, number: 4893, other: LIRF, city: "Rome", summer: 14, winter: 10, based: true}
-  - {carrier: ITY, number: 1286, other: LIRF, city: "Rome", summer: 7, winter: 4}
-  - {carrier: WZZ, number: 6201, other: LIRF, city: "Rome", summer: 7, winter: 4}
+  - {carrier: RYR, number: 4893, other: LIRF, city: "Rome Fiumicino", summer: 14, winter: 10, based: true}
+  - {carrier: ITY, number: 1286, other: LIRF, city: "Rome Fiumicino", summer: 7, winter: 4}
+  - {carrier: WZZ, number: 6201, other: LIRF, city: "Rome Fiumicino", summer: 7, winter: 4}
   - {carrier: EZY, number: 2861, other: LIMC, city: "Milan Malpensa", summer: 14, winter: 10}
   - {carrier: RYR, number: 2843, other: LIMC, city: "Milan Malpensa", summer: 7, winter: 5, based: true}
   - {carrier: WZZ, number: 1347, other: LIMC, city: "Milan Malpensa", summer: 5, winter: 3}
@@ -203,7 +203,7 @@ routes:
   - {carrier: EZY, number: 7121, other: EGNM, city: "Leeds Bradford", summer: 4, winter: 0}
   - {carrier: EXS, number: 801, other: EGGD, city: "Bristol", summer: 4, winter: 0}
   - {carrier: EXS, number: 805, other: EGGP, city: "Liverpool", summer: 4, winter: 0}
-  - {carrier: EXS, number: 809, other: EGAA, city: "Belfast", summer: 5, winter: 2}
+  - {carrier: EXS, number: 809, other: EGAA, city: "Belfast International", summer: 5, winter: 2}
   - {carrier: EXS, number: 813, other: EGGW, city: "London Luton", summer: 3, winter: 0}
   - {carrier: TOM, number: 900, other: EGNT, city: "Newcastle", summer: 3, winter: 0}
   - {carrier: TOM, number: 904, other: EGBB, city: "Birmingham", summer: 4, winter: 0}

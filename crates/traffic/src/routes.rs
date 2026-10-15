@@ -593,56 +593,6 @@ mod tests {
         assert!(!derived_disagree(&[lxgb, table(strayed)]).is_empty());
     }
 
-    /// The generated day of every field, pinned: an edit to a route file
-    /// (or to the rotations) that moves a flight changes these, so it is
-    /// made on purpose and the pin updated with it. Pinned 2026-10-14 from
-    /// the day the Rust tables generated, proved equal to the files' in
-    /// the commit that moved them (`the_route_files_equal_the_rust_tables`,
-    /// `the_route_files_fly_the_same_day_as_the_rust_tables`). Gatwick's
-    /// pinned 2026-10-14 with its table, Gibraltar's and Malaga's unchanged
-    /// by it.
-    #[test]
-    fn the_generated_days_are_pinned() {
-        use crate::rotation::{day_rotations, Date};
-        use crate::schedule::Density;
-        let fnv = |s: &str| {
-            s.bytes().fold(0xCBF2_9CE4_8422_2325u64, |h, b| {
-                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
-            })
-        };
-        let mut got = Vec::new();
-        for f in fields() {
-            for (y, m, d) in [(2026, 7, 15), (2026, 7, 18), (2026, 1, 14), (2026, 1, 17)] {
-                let day = day_rotations(f, Date::ymd(y, m, d), 3, Density::Normal);
-                let first = day
-                    .first()
-                    .map(|r| r.arr.callsign.clone())
-                    .unwrap_or_default();
-                got.push(format!(
-                    "{} {y}-{m:02}-{d:02} {} {first} {:016x}",
-                    f.icao,
-                    day.len(),
-                    fnv(&format!("{day:?}"))
-                ));
-            }
-        }
-        let want = [
-            "EGKK 2026-07-15 220 EZY8902 d615124dfa988254",
-            "EGKK 2026-07-18 227 EZY8904 40265b14ebaf1785",
-            "EGKK 2026-01-14 125 EXS618 d4774891337865b5",
-            "EGKK 2026-01-17 130 EZY8066 021370be12c51c71",
-            "LEMG 2026-07-15 224 NAX3586 ba3692f54e0ab81f",
-            "LEMG 2026-07-18 227 NAX3586 82b1c932f8bd0438",
-            "LEMG 2026-01-14 154 NAX3586 6eeac15b260dfe52",
-            "LEMG 2026-01-17 170 NAX3586 d2bf3149f7b602af",
-            "LXGB 2026-07-15 7 BAW490 0d97bda92a9614ee",
-            "LXGB 2026-07-18 4 BAW490 6fae55dc3f7a571e",
-            "LXGB 2026-01-14 4 BAW490 e6bd1df68761b9a1",
-            "LXGB 2026-01-17 3 EZY8901 3bb8c9c69d5e1275",
-        ];
-        assert_eq!(got, want, "{got:#?}");
-    }
-
     /// The generated days of Gibraltar, Malaga and Gatwick, every movement
     /// written out (2026-10-15): pinned before the timetables became
     /// per-carrier data, so the move is proved to fly the same day. A
@@ -654,7 +604,7 @@ mod tests {
         use crate::schedule::Density;
         let mut got = String::new();
         for icao in ["LXGB", "LEMG", "EGKK"] {
-            for (y, m, d) in [(2026, 7, 15), (2026, 1, 14)] {
+            for (y, m, d) in [(2026, 7, 15), (2026, 7, 18), (2026, 1, 14), (2026, 1, 17)] {
                 let f = field_routes(icao).unwrap();
                 for r in day_rotations(f, Date::ymd(y, m, d), 3, Density::Normal) {
                     for (kind, l) in [("arr", &r.arr), ("dep", &r.dep)] {
