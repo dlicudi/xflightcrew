@@ -22,10 +22,10 @@ On the first run it opens the home screen: each setup check with a fix on
 enter (the X-Plane folder, the Web API, the plugin, the microphone and the
 starter voices), the voices, the settings and where the files live. Enter
 on a red line fixes it (installs the plugin, downloads the starter voices),
-and `r` starts the crew. Once every required check is green, plain `xfc`
-starts the crew straight away; `xfc home` (or `xfc setup`) opens the screen
-any time, `xfc run` never does, and `xfc home --print` prints the checks as
-text for a support request. The same steps by hand:
+and the crew starts by itself the moment every required check is green.
+`xfc home` (or `xfc setup`) opens the app on its checks, `xfc home --print`
+prints them as text for a support request, and `XCOPILOT_UI=plain xfc` runs
+the crew without the screen. The same steps by hand:
 
 ```sh
 xfc plugin install

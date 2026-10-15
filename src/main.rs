@@ -238,8 +238,13 @@ async fn main() -> Result<()> {
     // dashboard, the checks, the voices and every setting, the crew
     // booting itself once the required checks pass. `xfc home` / `xfc
     // setup` open it on Checks (`--print`, or no terminal: the checks as
-    // text). `xfc run` is the crew headless, never the app.
+    // text). Headless is plain `xfc` with no terminal, or `XCOPILOT_UI=plain`.
     let arg = std::env::args().nth(1);
+    if arg.as_deref() == Some("run") {
+        return Err(anyhow!(
+            "`xfc run` is gone: plain `xfc` is the app; `XCOPILOT_UI=plain xfc` runs the crew headless"
+        ));
+    }
     if matches!(arg.as_deref(), Some("home" | "setup")) {
         use std::io::IsTerminal;
         let rest: Vec<String> = std::env::args().skip(2).collect();
@@ -259,7 +264,7 @@ async fn main() -> Result<()> {
         None if config.ui == "tui" => Some(app::Open::Default),
         _ => None,
     };
-    let tui = open.is_some() || (config.ui == "tui" && arg.as_deref() != Some("run"));
+    let tui = open.is_some();
 
     // Always log to a daily-rolling file. In TUI mode the stderr layer would
     // scribble over the dashboard, so it's omitted there (file only).
@@ -550,7 +555,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Headless (`xfc run`, no terminal, `XCOPILOT_UI=plain`).
+    // Headless (no terminal, or `XCOPILOT_UI=plain`).
     let crew = boot_crew(config).await?;
     let Crew {
         config,

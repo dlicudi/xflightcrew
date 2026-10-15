@@ -8,7 +8,7 @@
 //!                          opens on Checks and boots the moment they pass
 //! xfc home | xfc setup     the app, opened on Checks (hidden aliases)
 //! xfc home --print         the checks as text (for support, and no TTY)
-//! xfc run                  the crew, headless, never the app
+//! XCOPILOT_UI=plain xfc    the crew, headless (also plain `xfc` with no TTY)
 //! ```
 //!
 //! The boot's decision is offline and cheap ([`offline`]: file checks only).

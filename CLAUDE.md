@@ -803,8 +803,9 @@ no-crew gate is the arbiter's enqueue door (`Voice::alert`); the atc crate never
   Files; `/` searches every setting, `P` the pinned. **The crew boots itself**: required checks
   green, at once; red, the Flight tab says "waiting on" and it boots the moment they pass
   (`spawn_tui_crew`, its own thread). A slow check (the home field's apt.dat) saves on a worker
-  (`SLOW_SAVES`). `xfc home`/`setup` open on Checks (`--print` for support); `xfc run` is
-  headless, never the app. **A crew restart is the process starting again in place, ON THE
+  (`SLOW_SAVES`). `xfc home`/`setup` open on Checks (`--print` for support); headless is
+  plain `xfc` with no terminal or `XCOPILOT_UI=plain` (`xfc run` is gone). **A crew restart is
+  the process starting again in place, ON THE
   GROUND ONLY** (`src/restart.rs`: no loop of ours holding anything, stopped on the ground or
   no X-Plane running; a failed read refuses): an in-process re-boot is unsound (a dozen threads
   with no stop, the safe hold never stood down, `voice::RUNNING`, the EFB's port). It re-execs
