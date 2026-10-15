@@ -2104,6 +2104,9 @@ pub(crate) struct TrafficWorld {
     /// The runway end our arrival was last seen on, so the rollout keeps
     /// its slot once the plan that armed it is gone ([`own_arrival`]).
     own_arrival_end: Option<String>,
+    /// The density the fleets were built at: a change rebuilds them all
+    /// (2026-10-15: a field set up at "off" stayed empty for its hour).
+    density: Option<String>,
 }
 
 /// The draw cull's counts in the blackbox (`traffic` `draw`): simulated
@@ -2211,6 +2214,15 @@ impl TrafficWorld {
             }
             return None;
         };
+        let density = crate::settings::live().traffic_density.clone();
+        if self.density.as_ref().is_some_and(|d| *d != density) {
+            crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "density_rebuild", "density": density }),
+            );
+            self.stand_down();
+        }
+        self.density = Some(density);
         let here = (snap.lat, snap.lon);
         let running: BTreeSet<String> = self.links.keys().cloned().collect();
         let wanted = wanted_fields(&active, here, &running);
