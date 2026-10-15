@@ -455,10 +455,15 @@ pub(crate) fn approach_sequence_lines(
             );
         }
     }
-    // The speed.
+    // The speed: behind the leader, and leaving a departure waiting at the
+    // hold its gap ahead of us as the traffic does (#300).
     let short = leader
         .as_ref()
-        .map_or(f64::NEG_INFINITY, |l| spacing_short_s(&own, l));
+        .map_or(f64::NEG_INFINITY, |l| spacing_short_s(&own, l))
+        .max(
+            own.depart_gap_s
+                .map_or(f64::NEG_INFINITY, |g| g - own.to_thr_s),
+        );
     if let Some(speeds) = crate::party_line::approach_speeds() {
         let was_spacing = said.speed.is_some_and(|(_, w)| w == "spacing");
         let want = wanted_speed(own.dist_nm, state.alt_ft, speeds, short, was_spacing);

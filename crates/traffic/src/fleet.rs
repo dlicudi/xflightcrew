@@ -453,14 +453,17 @@ impl Fleet {
             // Our own aircraft arriving holds its slot at the runway like
             // any traffic arrival, and the traffic yields to it: we are the
             // player, never told to wait by the fleet, so the slot is in the
-            // picture as committed (2026-10-14, arrival sequencing). On the
-            // ground otherwise it takes a stand like a parked one: an
-            // arrival never picks the stand we stand on.
+            // picture as committed (2026-10-14, arrival sequencing). Held at
+            // the hold it waits there like a traffic departure, owed its gap
+            // the same way (#300). On the ground otherwise it takes a stand
+            // like a parked one: an arrival never picks the stand we stand on.
             if let Some(o) = &own {
                 if let Some(slot) = o.slot {
                     picture.push(Seen {
                         id: OWN_ID,
-                        phase: if o.on_ground {
+                        phase: if slot.waiting {
+                            Phase::HoldShort
+                        } else if o.on_ground {
                             Phase::Landing
                         } else {
                             Phase::Final
@@ -468,7 +471,7 @@ impl Fleet {
                         pos: o.pos,
                         gs_kts: o.gs_kts,
                         slot: Some(crate::slot::RunwaySlot {
-                            committed: true,
+                            committed: !slot.waiting,
                             ..slot
                         }),
                     });

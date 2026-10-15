@@ -32,6 +32,7 @@ pub(super) fn times(runway: &str, to_thr_s: f64, callsign: &str, at: Instant) ->
         dist_nm: to_thr_s * 140.0 / 3600.0,
         callsign: callsign.into(),
         icao_type: Some("B738".into()),
+        depart_gap_s: None,
         at,
     }
 }

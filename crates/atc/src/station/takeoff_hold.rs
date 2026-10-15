@@ -9,7 +9,7 @@ pub struct TakeoffHold {
     /// Spoken, for the release line ("zero niner right").
     pub(super) runway: String,
     /// The end ident ("09R"), for the strip-restricted traffic check.
-    pub(super) runway_ident: String,
+    pub(crate) runway_ident: String,
     pub(super) clear_since: Option<Instant>,
     /// When the hold went on — the wake block is measured against this, so a
     /// busy field's departure stream can't extend it forever (see
@@ -122,6 +122,14 @@ pub(super) fn runway_stands_within(
 /// an arrival crossing the fence vanishes from the airborne band while still
 /// rolling out, and "cleared for takeoff" over a lander is a contradiction.
 pub(super) const HOLD_CLEAR_SECS: f64 = 15.0;
+
+/// What a held departure needs from the strip clearing to the next lander's
+/// threshold, seconds: [`HOLD_CLEAR_SECS`], then a lander far enough out
+/// that the line-up ([`LINE_UP_S`]) and roll never send it round
+/// ([`departure_clears_lander`]). The gap the traffic's arrivals open for a
+/// waiting departure (`traffic::slot::DEPARTURE_GAP_S`, pinned by the crew).
+pub const DEPARTURE_RELEASE_S: f64 =
+    HOLD_CLEAR_SECS + LINE_UP_S + LIFTOFF_KTS / ROLL_ACCEL_KTS_S + RUNWAY_CLEAR_MARGIN_S;
 
 /// How far out the nearest arrival may be and still have a departure released
 /// ahead of it.

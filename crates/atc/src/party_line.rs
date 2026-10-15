@@ -463,6 +463,10 @@ pub struct RunwayTimes {
     pub callsign: String,
     /// Its ICAO type designator, when known.
     pub icao_type: Option<String>,
+    /// The threshold no sooner than this, seconds from now: a departure
+    /// waiting at the hold is owed its gap ahead of it
+    /// (`traffic::slot::departure_gap_s`). `None` when none is owed.
+    pub depart_gap_s: Option<f64>,
     /// When it was worked out.
     pub at: Instant,
 }
@@ -883,6 +887,13 @@ pub fn takeoff_hold_armed() -> bool {
     lock(&OWN_STRIP.takeoff_hold).is_some()
 }
 
+/// The runway END our takeoff clearance is withheld for, while it is.
+pub fn takeoff_hold_runway() -> Option<String> {
+    lock(&OWN_STRIP.takeoff_hold)
+        .as_ref()
+        .map(|h| h.runway_ident.clone())
+}
+
 /// A landing clearance is currently being withheld for traffic on the
 /// runway: the monitor's traffic watch must keep reading the picture to
 /// release it (or order the go-around).
@@ -1218,8 +1229,11 @@ pub use crate::station::{
 pub use crate::station::{own_arrival_plan, own_leader, own_number, OwnArrivalPlan};
 /// - The numbers approach sequences by, the traffic's own (the crew pins
 ///   them equal to `traffic`'s: the crates never name each other):
-///   `APPROACH_SPEED_BANDS`, `SEQUENCE_GAP_S`, `RADAR_SPACING_NM`.
-pub use crate::station::{APPROACH_SPEED_BANDS, RADAR_SPACING_NM, SEQUENCE_GAP_S};
+///   `APPROACH_SPEED_BANDS`, `SEQUENCE_GAP_S`, `RADAR_SPACING_NM`; the gap
+///   a held departure is released into, `DEPARTURE_RELEASE_S`.
+pub use crate::station::{
+    APPROACH_SPEED_BANDS, DEPARTURE_RELEASE_S, RADAR_SPACING_NM, SEQUENCE_GAP_S,
+};
 pub use crate::station::{
     active_field, active_icao, active_station_in_range, active_station_range_nm, climb_announced,
     coach_query, coach_yes_no, departure_station, dialect_for, field_position, field_under,
