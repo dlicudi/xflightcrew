@@ -364,6 +364,10 @@ mod ap_engage_tests;
 #[cfg(test)]
 mod final_report_tests;
 
+/// The wheels' first contact, EGBB 15 2026-10-15.
+#[cfg(test)]
+mod first_contact_tests;
+
 /// LEMG 13 and 31 as apt.dat has them, a 737's heading response and the
 /// autoland loop's lateral composition, for the replays of the 2026-09-28
 /// circuits (issue #147): the circuit's final, the handoff and autoland's

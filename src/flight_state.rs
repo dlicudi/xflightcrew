@@ -291,6 +291,8 @@ fn forget_flight() {
     crate::monitor::forget_destination();
     // "The pilot has it" was about the flight that ended.
     crate::flight::forget_pilot_takeover();
+    // The wheels' last first contact was that flight's landing.
+    crate::flight::forget_first_contact();
     // Calls and readbacks queued for the old flight go to nobody.
     crate::crew_radio::forget_flight_calls();
     // "Say again" never repeats the last flight's readback.
