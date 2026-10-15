@@ -391,6 +391,11 @@ flaps:
     - { label: "30", spoken: thirty,      ratio: 0.875, vfe_kts: 175.0, idle_decel_kts_s: 1.4 } # VERIFY
     - { label: "40", spoken: forty,       ratio: 1.0,   vfe_kts: 162.0, idle_decel_kts_s: 2.2 } # acf Vfe
 
+# The checklist's read (checklists/boeing_737_800.yaml) of the 737's own
+# engine start switches: GRD is the knob turned left.
+checklist_states:
+  start_switch: { datarefs: [laminar/B738/spring_knob/starter_1, laminar/B738/spring_knob/starter_2], ground: [-9, -0.5] }
+
 # Phase-expectation advisor: the SOP table, the MD-82's on stock switches.
 advisor:
   - dataref: sim/cockpit2/switches/yaw_damper_on

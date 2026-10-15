@@ -26,15 +26,17 @@ specifications_limitations:
   - { note: "Min landing distance, 1721 ft." }
 
 engine_start:
-  - { say: "Cabin door, check closed.", check: doors, is: closed }
-  - { say: "Battery 1 & 2, on.", check: electrical.batteries, is: on }
-  - { say: "Nav lights, on.", check: lights.nav, is: on }
-  - { say: "Fuel control, auto.", check: fuel_selector, is: both }
-  - { say: "Thrust lever, idle.", check: throttle, is: idle }
-  - { say: "Engine start / stop, run." }
-  - { say: "Engine indication system, check green." }
-  - { say: "Generator 1 & 2, on.", check: electrical.generators, is: on }
-  - { say: "Probe heat and ice protection, as required.", check: pitot_heat, is: on }
+  title: "Cold and dark to engine start"
+  items:
+    - { say: "Cabin door, check closed.", check: doors, is: closed }
+    - { say: "Battery 1 & 2, on.", check: electrical.batteries, is: on }
+    - { say: "Nav lights, on.", check: lights.nav, is: on }
+    - { say: "Fuel control, auto.", check: fuel_selector, is: both }
+    - { say: "Thrust lever, idle.", check: throttle, is: idle }
+    - { say: "Engine start / stop, run." }
+    - { say: "Engine indication system, check green." }
+    - { say: "Generator 1 & 2, on.", check: electrical.generators, is: on }
+    - { say: "Probe heat and ice protection, as required.", check: pitot_heat, is: on }
 
 before_taxi:
   - { say: "Elevator trim, takeoff." }
@@ -70,10 +72,12 @@ after_landing:
   - { say: "Transponder, on.", check: transponder, is: standby }
 
 shutdown:
-  - { say: "Parking brake, on.", check: park_brake, is: on }
-  - { say: "Transponder, standby.", check: transponder, is: standby }
-  - { say: "Engine start / stop, stop." }
-  - { say: "Nav lights, off.", check: lights.nav, is: off }
-  - { say: "Probe heat and ice protection, off.", check: pitot_heat, is: off }
-  - { say: "Generator 1 & 2, off.", check: electrical.generators, is: off }
-  - { say: "Battery 1 & 2, off.", check: electrical.batteries, is: off }
+  title: "Parking"
+  items:
+    - { say: "Parking brake, on.", check: park_brake, is: on }
+    - { say: "Transponder, standby.", check: transponder, is: standby }
+    - { say: "Engine start / stop, stop." }
+    - { say: "Nav lights, off.", check: lights.nav, is: off }
+    - { say: "Probe heat and ice protection, off.", check: pitot_heat, is: off }
+    - { say: "Generator 1 & 2, off.", check: electrical.generators, is: off }
+    - { say: "Battery 1 & 2, off.", check: electrical.batteries, is: off }

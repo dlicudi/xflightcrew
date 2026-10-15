@@ -56,7 +56,7 @@ pub const STATES: &[(&str, &[&str])] = &[
     ("electrical", &["on", "off"]),
     ("transponder", &["off", "standby", "altitude"]),
     ("mixture", &["rich", "lean", "cutoff"]),
-    ("throttle", &["idle", "start", "runup", "full"]),
+    ("throttle", &["idle", "start", "runup", "cruise", "full"]),
     ("magnetos", &["off", "right", "left", "both"]),
     ("engine", &["running", "stopped"]),
     ("fuel_pump", &["on", "off"]),
@@ -90,6 +90,21 @@ pub const STATES: &[(&str, &[&str])] = &[
     ("master_warning", &["clear"]),
     ("weather_radar", &["on", "off"]),
     ("speed_bug", &["v2"]),
+    ("n2", &["turning", "stable", "stopped"]),
+    ("start_switch", &["ground", "normal", "continuous"]),
+    (
+        "controls",
+        &[
+            "roll_left",
+            "roll_right",
+            "pitch_forward",
+            "pitch_aft",
+            "yaw_left",
+            "yaw_right",
+        ],
+    ),
+    ("lamp_test", &["pressed"]),
+    ("cargo_doors", &["open", "closed"]),
 ];
 
 /// A flap handle at or past this is a landing flap: the fleet's shallowest
@@ -269,9 +284,24 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Result<Vec<Checklist>> {
     let doc: serde_yaml::Mapping = serde_yaml::from_str(text)?;
     let shared = Arc::new(profile.clone());
     let mut out = Vec::new();
-    for (key, items) in doc {
+    for (key, section) in doc {
         let Some(id) = key.as_str().map(str::to_string) else {
             bail!("a section key is not a name: {key:?}");
+        };
+        // A list of items, or `{ title, items }` where the airframe's own
+        // name for the section differs from its key.
+        let (title, items) = match section {
+            serde_yaml::Value::Mapping(mut m) => {
+                let title = m
+                    .remove("title")
+                    .and_then(|t| t.as_str().map(str::to_string));
+                let items = m.remove("items").unwrap_or_default();
+                if title.is_none() || !m.is_empty() {
+                    bail!("section {id}: a titled section is `{{ title, items }}`");
+                }
+                (title, items)
+            }
+            items => (None, items),
         };
         let raw: Vec<RawItem> =
             serde_yaml::from_value(items).with_context(|| format!("section {id}"))?;
@@ -281,7 +311,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Result<Vec<Checklist>> {
             .map(|(i, r)| item(r, profile).with_context(|| format!("{id} item {}", i + 1)))
             .collect::<Result<Vec<_>>>()?;
         out.push(Checklist {
-            title: title_of(&id),
+            title: title.unwrap_or_else(|| title_of(&id)),
             id,
             items,
             profile: shared.clone(),
@@ -329,7 +359,8 @@ fn title_of(key: &str) -> String {
 }
 
 /// A state and value, resolved against the airframe: validated, its read,
-/// and its action (`act` and actable).
+/// and its action (`act` and actable). A read-only state may name one
+/// engine, tank or door of its read (`n2.2`): without one it reads them all.
 fn resolve(state: &str, value: &str, act: bool, p: &AircraftProfile) -> Result<Check> {
     let (base, sub) = match state.split_once('.') {
         Some((b, s)) => (b, Some(s)),
@@ -338,7 +369,11 @@ fn resolve(state: &str, value: &str, act: bool, p: &AircraftProfile) -> Result<C
     let Some((_, values)) = STATES.iter().find(|(s, _)| *s == base) else {
         bail!("unknown state `{state}`");
     };
-    if matches!(base, "lights" | "electrical") != sub.is_some() {
+    let one: Option<usize> = sub.and_then(|s| s.parse().ok());
+    let keyed = matches!(base, "lights" | "electrical");
+    if keyed != (sub.is_some() && one.is_none())
+        || one.is_some_and(|n| n == 0 || action(base, None, value, p).is_some())
+    {
         bail!("unknown state `{state}`");
     }
     let known = values.contains(&value)
@@ -356,7 +391,8 @@ fn resolve(state: &str, value: &str, act: bool, p: &AircraftProfile) -> Result<C
     if !known {
         bail!("`{state}` has no value `{value}`");
     }
-    let terms = match p.checklist_states.get(state) {
+    let read = if one.is_some() { base } else { state };
+    let terms = match p.checklist_states.get(read) {
         Some(read) => {
             let Some(v) = read.values.get(value) else {
                 bail!("the airframe's `{state}` read has no value `{value}`");
@@ -371,6 +407,10 @@ fn resolve(state: &str, value: &str, act: bool, p: &AircraftProfile) -> Result<C
         }
         None => stock_read(base, sub, value, p)?,
     };
+    let terms = match one {
+        Some(n) => vec![nth(terms, n).with_context(|| format!("`{state}`: no {n} to read"))?],
+        None => terms,
+    };
     let action = if act {
         action(base, sub, value, p)
     } else {
@@ -382,6 +422,21 @@ fn resolve(state: &str, value: &str, act: bool, p: &AircraftProfile) -> Result<C
         terms,
         action,
     })
+}
+
+/// The `n`th (1-based) of a state's reads, or the `n`th element of its one
+/// array read.
+fn nth(mut terms: Vec<Term>, n: usize) -> Option<Term> {
+    if terms.len() >= n {
+        return Some(terms.swap_remove(n - 1));
+    }
+    match terms.as_mut_slice() {
+        [t] if t.index.is_some() => {
+            t.index = Some(n - 1);
+            terms.pop()
+        }
+        _ => None,
+    }
 }
 
 /// The read a state has without the airframe's own: its tool's readback, or
@@ -396,6 +451,12 @@ fn stock_read(
     use crate::autoflight::names::{AP_ON, AT_MODE, FD_MODE};
     use crate::datarefs as d;
     let one = |t: Term| Ok(vec![t]);
+    // One read per engine of a per-engine array.
+    let each = |name: &str, t: &dyn Fn(&str) -> Term| -> Vec<Term> {
+        (0..p.engines.max(1))
+            .map(|i| t(&format!("{name}[{i}]")))
+            .collect()
+    };
     match base {
         "park_brake" => one(match value {
             "on" => Term::above(crate::tools::PARK_BRAKE, 0.5),
@@ -472,6 +533,7 @@ fn stock_read(
             one(match value {
                 "idle" => Term::below(t, 0.05),
                 "start" => Term::new(t, 0.08, 0.2),
+                "cruise" => Term::new(t, 0.75, 0.99),
                 "runup" => Term::new(t, 0.5, 0.9),
                 _ => Term::above(t, 0.9),
             })
@@ -525,7 +587,7 @@ fn stock_read(
         "apu_bleed" => one(switch(d::APU_BLEED, value)),
         "apu_generator" => one(switch(d::APU_GENERATOR_ON, value)),
         "packs" => one(switch(d::PACK_LEFT, value)),
-        "engine_bleeds" => one(switch(&format!("{}[0]", d::ENGINE_BLEED_SOV), value)),
+        "engine_bleeds" => Ok(each(d::ENGINE_BLEED_SOV, &|r| switch(r, value))),
         "fuel_pumps" => one(switch(&format!("{}[0]", d::FUEL_TANK_PUMP_ON), value)),
         "gear" => one(switch(d::GEAR_HANDLE_DOWN, value)),
         "speedbrake" => one(match value {
@@ -546,13 +608,36 @@ fn stock_read(
         "ground_power" => one(switch(crate::tools::ground::GPU_ON, value)),
         "doors" => one(switch(&format!("{}[0]", d::DOOR_OPEN), value)),
         "hydraulic_pumps" => one(switch(d::ELECTRIC_HYDRAULIC_PUMP_ON, value)),
-        "start_levers" => {
-            let m = format!("{}[0]", crate::tools::jet_start::MIXTURE);
-            one(match value {
-                "idle" => Term::above(&m, 0.3),
-                _ => Term::below(&m, 0.1),
+        "start_levers" => Ok(each(crate::tools::jet_start::MIXTURE, &|m| match value {
+            "idle" => Term::above(m, 0.3),
+            _ => Term::below(m, 0.1),
+        })),
+        "n2" => Ok(each(d::N2_PERCENT, &|n| match value {
+            "turning" => Term::above(n, 20.0),
+            "stable" => Term::above(n, 50.0),
+            _ => Term::below(n, 10.0),
+        })),
+        "start_switch" => one(match value {
+            "ground" => Term::above(d::ENG_MODE_SELECTOR, 0.5),
+            "normal" => Term::new(d::ENG_MODE_SELECTOR, -0.49, 0.49),
+            _ => bail!("no stock `start_switch` position `{value}`"),
+        }),
+        "controls" => {
+            let (axis, sign) = match value {
+                "roll_left" => (d::CONTROL_ROLL, -1.0),
+                "roll_right" => (d::CONTROL_ROLL, 1.0),
+                "pitch_forward" => (d::CONTROL_PITCH, -1.0),
+                "pitch_aft" => (d::CONTROL_PITCH, 1.0),
+                "yaw_left" => (d::CONTROL_YAW, -1.0),
+                _ => (d::CONTROL_YAW, 1.0),
+            };
+            one(if sign < 0.0 {
+                Term::below(axis, -0.5)
+            } else {
+                Term::above(axis, 0.5)
             })
         }
+        "lamp_test" => one(Term::above(d::LAMP_TEST, 0.5)),
         "altimeter" => one(Term::new(crate::tools::instruments::BARO, 29.91, 29.93)),
         "autobrake" => one(match value {
             "rto" => Term::below(Tc::AUTOBRAKE, 0.49),
@@ -621,8 +706,9 @@ fn action(base: &str, sub: Option<&str>, value: &str, p: &AircraftProfile) -> Op
         "throttle" => {
             let pct = match value {
                 "idle" => 0,
-                "start" => 12,
+                "start" => 15,
                 "runup" => 60,
+                "cruise" => 94,
                 _ => 100,
             };
             let confirm = (value == "runup").then_some(CONFIRM_RUNUP);
@@ -768,15 +854,22 @@ pub fn match_request<'a>(transcript: &str, checklists: &'a [Checklist]) -> Optio
     let mut scored: Vec<(usize, &Checklist)> = checklists
         .iter()
         .filter_map(|c| {
-            let title: Vec<&str> = c.id.split('_').collect();
-            let matched = |q: &String| title.iter().any(|t| word_match(q, t));
-            query.iter().all(matched).then(|| {
-                let hit = title
-                    .iter()
-                    .filter(|t| query.iter().any(|q| word_match(q, t)))
-                    .count();
-                (title.len() - hit, c)
-            })
+            // The key's words, or the section's own title's.
+            let title = c.title.to_lowercase();
+            [c.id.split('_').collect::<Vec<_>>(), words(&title)]
+                .into_iter()
+                .filter_map(|title| {
+                    let matched = |q: &String| title.iter().any(|t| word_match(q, t));
+                    query.iter().all(matched).then(|| {
+                        let hit = title
+                            .iter()
+                            .filter(|t| query.iter().any(|q| word_match(q, t)))
+                            .count();
+                        title.len() - hit
+                    })
+                })
+                .min()
+                .map(|s| (s, c))
         })
         .collect();
     scored.sort_by_key(|(s, _)| *s);
@@ -876,6 +969,15 @@ fn request_words(transcript: &str) -> Vec<String> {
     ];
     words.retain(|w| !FILLER.contains(&w.as_str()));
     words
+}
+
+/// A title's words, lowercase, without the words that only say it is a list
+/// ("procedure", "checklist").
+fn words(title: &str) -> Vec<&str> {
+    title
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty() && !matches!(*w, "procedure" | "procedures" | "checklist"))
+        .collect()
 }
 
 /// A query word matches a title word exactly, or by prefix when the shorter of
@@ -984,6 +1086,66 @@ mod tests {
         assert_eq!(judge_read(&it[4], &[]), None);
     }
 
+    /// A read-only state reads every engine, or the one it names; an
+    /// actable state names none.
+    #[test]
+    fn a_state_reads_every_engine_or_the_one_it_names() {
+        let p = crate::aircraft::load("boeing_737_800").unwrap();
+        let l = parse(
+            r#"a:
+  - { say: x, check: start_levers, is: cutoff }
+  - { say: x, check: n2.2, is: stable }
+  - { say: x, check: fuel_pumps.3, is: on }
+  - { say: x, check: start_switch.2, is: ground }
+"#,
+            &p,
+        )
+        .unwrap();
+        let it = &l[0].items;
+        let idx =
+            |i: usize| -> Vec<Option<usize>> { it[i].terms().iter().map(|t| t.index).collect() };
+        assert_eq!(idx(0), vec![Some(0), Some(1)]);
+        assert_eq!(idx(1), vec![Some(1)]);
+        assert_eq!(idx(2), vec![Some(2)]);
+        assert_eq!(
+            it[3].terms()[0].dataref,
+            "laminar/B738/spring_knob/starter_2"
+        );
+        for bad in ["flaps.2", "n2.0", "n2.x"] {
+            let text = format!("a:\n  - {{ say: y, check: {bad}, is: up }}\n");
+            assert!(parse(&text, &p).is_err(), "{bad}");
+        }
+        // The 172's power: cruise and the start, read and set.
+        let l = parse(
+            "a:\n  - { say: y, check: throttle, is: cruise }\n  - { say: y, check: throttle, is: start }\n",
+            &p172(),
+        )
+        .unwrap();
+        assert_eq!(
+            l[0].items[0].action().unwrap().args,
+            json!({ "percent": 94 })
+        );
+        assert_eq!(
+            l[0].items[1].action().unwrap().args,
+            json!({ "percent": 15 })
+        );
+        assert!(l[0].items[1].terms()[0].holds(0.18));
+    }
+
+    #[test]
+    fn a_section_may_carry_its_own_title() {
+        let l = parse(
+            "shutdown:\n  title: Engine shutdown\n  items:\n    - { say: y }\n",
+            &p172(),
+        )
+        .unwrap();
+        assert_eq!(
+            (l[0].id.as_str(), l[0].title.as_str()),
+            ("shutdown", "Engine shutdown")
+        );
+        assert!(parse("a:\n  title: T\n  items: []\n  other: 1\n", &p172()).is_err());
+    }
+
     #[test]
     fn hazard_steps_are_confirmed() {
         let lists = load(&p172()).unwrap();
@@ -1071,6 +1233,15 @@ mod tests {
         assert_eq!(hit("landing checklist"), Some("before_landing"));
         assert_eq!(hit("engine start checklist"), Some("engine_start"));
         assert_eq!(hit("before start checklist"), Some("before_start"));
+        // The airframe's own section names still reach them.
+        assert_eq!(hit("engine shutdown checklist"), Some("shutdown"));
+        assert_eq!(
+            hit("before starting engine checklist"),
+            Some("before_start")
+        );
+        assert_eq!(hit("starting engine checklist"), Some("engine_start"));
+        let shut = cls.iter().find(|c| c.id == "shutdown").unwrap();
+        assert_eq!(shut.title, "Engine shutdown");
 
         // Never a guess: ambiguous or unknown asks return None (the caller
         // declines and names the options), and without the trigger word

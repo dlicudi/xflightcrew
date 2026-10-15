@@ -188,6 +188,8 @@ checklist_states:
   bus_tie: { datarefs: [laminar/md82/electrical/cross_tie_AC], on: 1, "off": 0 }
   doors:   { datarefs: ["sim/cockpit2/switches/custom_slider_on[0]"], open: 1, closed: 0 }
   packs:   { datarefs: [laminar/md82/bleedair/bleedair_HVAC_L, laminar/md82/bleedair/bleedair_HVAC_R], on: 1, "off": 0 }
+  start_switch: { datarefs: [laminar/md82/ignition_sys], ground: [1, 2], normal: 0, continuous: 4 }
+  cargo_doors:  { datarefs: ["sim/cockpit2/switches/custom_slider_on[7]", "sim/cockpit2/switches/custom_slider_on[8]", "sim/cockpit2/switches/custom_slider_on[9]"], open: 1, closed: 0 }
 
 # Phase-expectation advisor: the SOP table. In the listed phases the switch
 # should read as `expect_on`; otherwise the copilot advises once ("aren't you

@@ -105,12 +105,12 @@ engine_start:
   - { say: "Gnd rec/anti-coll lights, on." }
   - { say: "Cabin and cockpit packs, off.", check: packs, is: off }
   - { say: "Engine start rh button, press." }
-  - { say: "Rh n2%, wait >10." }
+  - { say: "Rh n2%, wait >10.", check: n2.2, is: turning }
   - { say: "Right power lever, idle." }
-  - { say: "Rh n2%, wait >60." }
+  - { say: "Rh n2%, wait >60.", check: n2.2, is: stable }
   - { say: "Engine start lh button, press." }
-  - { say: "Lh n2%, wait >10." }
-  - { say: "Left power lever, idle.", check: start_levers, is: idle }
+  - { say: "Lh n2%, wait >10.", check: n2.1, is: turning }
+  - { say: "Left power lever, idle.", check: start_levers.1, is: idle }
   - { say: "Eicas fuel page, check flow >500 pph." }
   - { say: "Eicas hyd page, check psi>3000." }
   - { say: "Engine bleed air, both lp.", check: engine_bleeds, is: on }
@@ -226,7 +226,7 @@ shutdown:
   - { say: "Taxi light, off.", check: lights.taxi, is: off, act: false }
   - { say: "Parking brake, set.", check: park_brake, is: on, act: false }
   - { say: "Throttles, cut off.", check: start_levers, is: cutoff }
-  - { say: "Engines n2%, below 10%." }
+  - { say: "Engines n2%, below 10%.", check: n2, is: stopped }
   - { say: "Gnd rec/anti-coll lights, off." }
   - { say: "Aircraft doors, open.", check: doors, is: open }
   - { say: "Seat belts, off.", check: seat_belts, is: off }

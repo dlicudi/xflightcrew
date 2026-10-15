@@ -510,7 +510,8 @@ written.
   through its curated tool (`act: false` only confirms), a read-only one is only read; nothing
   writes raw. Each read has ONE home: the tool's readback, `datarefs::*`, or the profile's
   `checklist_states:` for an add-on's own switch. An unknown state or value fails the LOAD; a
-  term that does not read is no verdict. Sections are keyed by phase (`before_landing`).
+  term that does not read is no verdict; a read-only state reads every engine unless it names one
+  (`n2.2`). Sections are keyed by phase (`before_landing`), an airframe's own name a `title:`.
 - **Who starts one**: `flow::Tracker`, one-shot per flight, every boundary SUSTAINED. Under an
   automation Monitor starts at once (BEFORE LANDING only once configured); with a pilot flying the
   copilot PROPOSES and never acts by itself; the after-landing list runs once OFF the runway. A

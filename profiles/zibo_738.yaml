@@ -1325,6 +1325,9 @@ checklist_states:
   hydraulic_pumps: { datarefs: [laminar/B738/toggle_switch/electric_hydro_pumps1_pos, laminar/B738/toggle_switch/electric_hydro_pumps2_pos], on: 1, "off": 0 }
   packs:           { datarefs: [laminar/B738/air/l_pack_pos, laminar/B738/air/r_pack_pos], on: [1, 2], "off": 0 }
   pitot_heat:      { datarefs: [laminar/B738/toggle_switch/capt_probes_pos, laminar/B738/toggle_switch/fo_probes_pos], on: 1, "off": 0 }
+  start_levers:    { datarefs: [laminar/B738/engine/mixture_ratio1, laminar/B738/engine/mixture_ratio2], idle: 1, cutoff: 0 }
+  start_switch:    { datarefs: [laminar/B738/engine/starter1_pos, laminar/B738/engine/starter2_pos], ground: 0, normal: 1, continuous: 2 }
+  cargo_doors:     { datarefs: [laminar/B738/annunciator/fwd_cargo, laminar/B738/annunciator/aft_cargo], open: 1, closed: 0 }
 
 # Phase-expectation advisor on the Zibo's own switch positions.
 advisor:

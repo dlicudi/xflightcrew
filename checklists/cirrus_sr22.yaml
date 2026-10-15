@@ -38,15 +38,17 @@ preflight:
   - { say: "Batteries, both off, check.", check: electrical.batteries, is: off, act: false }
 
 before_start:
-  - { say: "All switches, off, check." }
-  - { say: "Parking brakes, engaged, check.", check: park_brake, is: on }
-  - { say: "Alternate air, pushed, check." }
-  - { say: "Oxygen switch, off, check.", check: oxygen, is: off }
-  - { say: "Flaps, full up, check.", check: flaps, is: up }
-  - { say: "Throttle lever, iddle, check.", check: throttle, is: idle }
-  - { say: "Mixture lever, lean, check.", check: mixture, is: cutoff }
-  - { say: "Fuel tank selector, off, check.", check: fuel_selector, is: off }
-  - { say: "Close all doors, close, check.", check: doors, is: closed }
+  title: "Before engine start"
+  items:
+    - { say: "All switches, off, check." }
+    - { say: "Parking brakes, engaged, check.", check: park_brake, is: on }
+    - { say: "Alternate air, pushed, check." }
+    - { say: "Oxygen switch, off, check.", check: oxygen, is: off }
+    - { say: "Flaps, full up, check.", check: flaps, is: up }
+    - { say: "Throttle lever, iddle, check.", check: throttle, is: idle }
+    - { say: "Mixture lever, lean, check.", check: mixture, is: cutoff }
+    - { say: "Fuel tank selector, off, check.", check: fuel_selector, is: off }
+    - { say: "Close all doors, close, check.", check: doors, is: closed }
 
 engine_start:
   - { say: "Parking brakes, engaged, check.", check: park_brake, is: on }
@@ -68,18 +70,20 @@ engine_start:
   - { say: "All parameters, monitor, check." }
 
 before_taxi:
-  - { say: "Nav light, on, check.", check: lights.nav, is: on }
-  - { say: "Transponder, stby and dial, check.", check: transponder, is: standby }
-  - { say: "Hdg bug, set to runway, check." }
-  - { say: "Altimeter, set qnh, check." }
-  - { say: "Mfd g1000, enter flight plan, check." }
-  - { say: "Flight director, on, check.", check: flight_director, is: on }
-  - { say: "Autopilot, off and preconfigured, check." }
-  - { say: "Aileron trims, neutral, check." }
-  - { say: "Elevator trim, set t/o, check.", check: pitch_trim, is: takeoff }
-  - { say: "Flaps, full up, check.", check: flaps, is: up }
-  - { say: "Cabin heat, as required, check." }
-  - { say: "Fuel tank selector, switch to fullest, check." }
+  title: "Before taxiing"
+  items:
+    - { say: "Nav light, on, check.", check: lights.nav, is: on }
+    - { say: "Transponder, stby and dial, check.", check: transponder, is: standby }
+    - { say: "Hdg bug, set to runway, check." }
+    - { say: "Altimeter, set qnh, check." }
+    - { say: "Mfd g1000, enter flight plan, check." }
+    - { say: "Flight director, on, check.", check: flight_director, is: on }
+    - { say: "Autopilot, off and preconfigured, check." }
+    - { say: "Aileron trims, neutral, check." }
+    - { say: "Elevator trim, set t/o, check.", check: pitch_trim, is: takeoff }
+    - { say: "Flaps, full up, check.", check: flaps, is: up }
+    - { say: "Cabin heat, as required, check." }
+    - { say: "Fuel tank selector, switch to fullest, check." }
 
 taxiing:
   - { say: "Atc, request taxi, request." }
@@ -114,14 +118,16 @@ holding_point_tests:
   - { say: "All parameters, monitor, check." }
 
 holding_point_2:
-  - { note: "Pitot heat test." }
-  - { say: "Pitot heat, on, check.", check: pitot_heat, is: on }
-  - { note: "Mfd (system) current alt2, incruise, check." }
-  - { say: "Pitot heat, off, check.", check: pitot_heat, is: off }
-  - { note: "Flaps test." }
-  - { say: "Flaps, full down, check.", check: flaps, is: full }
-  - { note: "Check lowered." }
-  - { say: "Flaps, full up, check.", check: flaps, is: up }
+  title: "Holding point 2/2"
+  items:
+    - { note: "Pitot heat test." }
+    - { say: "Pitot heat, on, check.", check: pitot_heat, is: on }
+    - { note: "Mfd (system) current alt2, incruise, check." }
+    - { say: "Pitot heat, off, check.", check: pitot_heat, is: off }
+    - { note: "Flaps test." }
+    - { say: "Flaps, full down, check.", check: flaps, is: full }
+    - { note: "Check lowered." }
+    - { say: "Flaps, full up, check.", check: flaps, is: up }
 
 before_takeoff:
   - { say: "Doors, closed, check.", check: doors, is: closed }

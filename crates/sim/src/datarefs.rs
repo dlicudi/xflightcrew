@@ -236,6 +236,14 @@ pub const O2_VALVE_ON: &str = "sim/cockpit2/oxygen/actuators/o2_valve_on";
 pub const MASTER_CAUTION: &str = "sim/cockpit2/annunciators/master_caution";
 pub const MASTER_WARNING: &str = "sim/cockpit2/annunciators/master_warning";
 pub const WEATHER_RADAR: &str = "sim/cockpit2/EFIS/EFIS_weather_on";
+/// 0 normal, 1 ignition/start, -1 crank.
+pub const ENG_MODE_SELECTOR: &str = "sim/cockpit2/engine/actuators/eng_mode_selector";
+/// The cockpit's control deflections, -1..1.
+pub const CONTROL_ROLL: &str = "sim/cockpit2/controls/yoke_roll_ratio";
+pub const CONTROL_PITCH: &str = "sim/cockpit2/controls/yoke_pitch_ratio";
+pub const CONTROL_YAW: &str = "sim/cockpit2/controls/yoke_heading_ratio";
+/// 1 while the annunciator test is held.
+pub const LAMP_TEST: &str = "sim/cockpit/warnings/annunciator_test_pressed";
 pub const STALL_WARNING_RATIO: &str = "sim/cockpit2/annunciators/stall_warning_ratio";
 /// 1 while a tug is on the bar.
 pub const PUSHBACK_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";

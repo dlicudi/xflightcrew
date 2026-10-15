@@ -8,9 +8,9 @@ preflight:
   - { say: "Apu, start.", check: apu, is: on }
   - { say: "Apu generator, on.", check: apu_generator, is: on }
   - { say: "Bus transfer, auto.", check: bus_tie, is: on }
-  - { say: "Fuel pumps left, on.", check: fuel_pumps, is: on }
-  - { say: "Fuel pumps center, on." }
-  - { say: "Fuel pumps right, on." }
+  - { say: "Fuel pumps left, on.", check: fuel_pumps.1, is: on }
+  - { say: "Fuel pumps center, on.", check: fuel_pumps.2, is: on }
+  - { say: "Fuel pumps right, on.", check: fuel_pumps.3, is: on }
   - { say: "Apu bleed, on.", check: apu_bleed, is: on }
   - { say: "Packs, auto.", check: packs, is: on }
   - { say: "Electric hydraulic pumps, on.", check: hydraulic_pumps, is: on }
@@ -38,14 +38,14 @@ before_start:
 engine_start:
   - { note: "Engine start, the aircraft's own sequence: say start the engines." }
   - { say: "Packs, off for start.", check: packs, is: off }
-  - { say: "Engine 2 start switch, grd." }
-  - { say: "Engine 2 n2 rising, 25 percent." }
-  - { say: "Engine 2 start lever, idle." }
-  - { say: "Engine 2 stabilised, checked." }
-  - { say: "Engine 1 start switch, grd." }
-  - { say: "Engine 1 n2 rising, 25 percent." }
-  - { say: "Engine 1 start lever, idle.", check: start_levers, is: idle }
-  - { say: "Engine 1 stabilised, checked." }
+  - { say: "Engine 2 start switch, grd.", check: start_switch.2, is: ground }
+  - { say: "Engine 2 n2 rising, 25 percent.", check: n2.2, is: turning }
+  - { say: "Engine 2 start lever, idle.", check: start_levers.2, is: idle }
+  - { say: "Engine 2 stabilised, checked.", check: n2.2, is: stable }
+  - { say: "Engine 1 start switch, grd.", check: start_switch.1, is: ground }
+  - { say: "Engine 1 n2 rising, 25 percent.", check: n2.1, is: turning }
+  - { say: "Engine 1 start lever, idle.", check: start_levers.1, is: idle }
+  - { say: "Engine 1 stabilised, checked.", check: n2.1, is: stable }
   - { say: "Generator 1, on.", check: electrical.generators, is: on }
   - { say: "Generator 2, on.", check: electrical.generators, is: on }
   - { say: "Probe heat, on.", check: pitot_heat, is: on }

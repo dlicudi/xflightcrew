@@ -14,16 +14,16 @@ preliminary_preflight_procedure_1:
   - { say: "Galley, on." }
   - { say: "Passenger door (key is shift+f1), open.", check: doors, is: open }
   - { say: "Passenger stairs (key is shift+f3), extend." }
-  - { say: "Forward cargo door, open." }
-  - { say: "Mid cargo door, open." }
-  - { say: "Aft cargo door, open." }
+  - { say: "Forward cargo door, open.", check: cargo_doors.1, is: open }
+  - { say: "Mid cargo door, open.", check: cargo_doors.2, is: open }
+  - { say: "Aft cargo door, open.", check: cargo_doors.3, is: open }
   - { say: "Clear master caution, check.", check: master_caution, is: clear }
   - { say: "Battery, on and locked.", check: electrical.battery, is: on }
   - { say: "Fmc, program flight plan." }
 
 preliminary_preflight_procedure_2:
   - { say: "Apu air source, air condition cooler.", check: apu_bleed, is: on }
-  - { say: "Engine start pump, on." }
+  - { say: "Engine start pump, on.", check: fuel_pump, is: on, act: false }
   - { say: "Apu master, run.", check: apu, is: on }
   - { say: "Apu master, start." }
   - { say: "Check apu power avail, check." }
@@ -41,7 +41,7 @@ preliminary_preflight_procedure_2:
 light_test:
   - { say: "Stall test, check." }
   - { say: "Max spd warning test, check." }
-  - { say: "Annunciator/digital lights test, check." }
+  - { say: "Annunciator/digital lights test, check.", check: lamp_test, is: pressed }
   - { say: "Loops a test, check." }
   - { say: "Loops b test, check." }
   - { say: "Clear master caution, check.", check: master_caution, is: clear }
@@ -51,27 +51,27 @@ light_test:
 
 engine_start:
   - { say: "Stairs stowed & passenger door closed, check.", check: doors, is: closed }
-  - { say: "Forward cargo door, closed." }
-  - { say: "Mid cargo door, closed." }
-  - { say: "Aft cargo door, closed." }
+  - { say: "Forward cargo door, closed.", check: cargo_doors.1, is: closed }
+  - { say: "Mid cargo door, closed.", check: cargo_doors.2, is: closed }
+  - { say: "Aft cargo door, closed.", check: cargo_doors.3, is: closed }
   - { say: "Anti collision lights, on.", check: lights.beacon, is: on, act: false }
   - { say: "Push and start clearance, received and activated." }
   - { say: "Pushback procedure as required, check." }
   - { say: "Left engine bleed air cross feed, on." }
   - { say: "Right engine bleed air cross feed, on." }
   - { say: "Auxilliary transfer pump, on." }
-  - { say: "Left fuel pumps, on." }
-  - { say: "Center fuel pumps, on.", check: fuel_pumps, is: on }
-  - { say: "Right fuel pumps, on." }
-  - { say: "Engine start system a or b, select." }
-  - { say: "Right engine starter, hold until 20% n2." }
-  - { say: "Right fuel handles, on." }
+  - { say: "Left fuel pumps, on.", check: fuel_pumps.2, is: on }
+  - { say: "Center fuel pumps, on.", check: fuel_pumps.1, is: on }
+  - { say: "Right fuel pumps, on.", check: fuel_pumps.3, is: on }
+  - { say: "Engine start system a or b, select.", check: start_switch, is: ground }
+  - { say: "Right engine starter, hold until 20% n2.", check: n2.2, is: turning }
+  - { say: "Right fuel handles, on.", check: start_levers.2, is: idle }
   - { say: "Check right volts and frequency, check." }
-  - { say: "Left engine starter, hold until 20% n2." }
-  - { say: "Left fuel handles, on.", check: start_levers, is: idle }
+  - { say: "Left engine starter, hold until 20% n2.", check: n2.1, is: turning }
+  - { say: "Left fuel handles, on.", check: start_levers.1, is: idle }
   - { say: "Check left volts and frequency, check." }
-  - { say: "Engine starter system, off." }
-  - { say: "Engine start pump, off." }
+  - { say: "Engine starter system, off.", check: start_switch, is: normal }
+  - { say: "Engine start pump, off.", check: fuel_pump, is: off, act: false }
   - { say: "Ac bus x-tie, auto.", check: bus_tie, is: on }
   - { say: "Apu bus left, off." }
   - { say: "Apu bus right, off." }
@@ -79,12 +79,12 @@ engine_start:
   - { say: "Apu master, off.", check: apu, is: off }
 
 flight_controls_check:
-  - { say: "Flight control elevators full forward." }
-  - { say: "Flight control elevators full aft." }
-  - { say: "Flight control ailerons full left." }
-  - { say: "Flight control ailerons full right." }
-  - { say: "Flight control rudder full left." }
-  - { say: "Flight control rudder full right." }
+  - { say: "Flight control elevators full forward.", check: controls, is: pitch_forward }
+  - { say: "Flight control elevators full aft.", check: controls, is: pitch_aft }
+  - { say: "Flight control ailerons full left.", check: controls, is: roll_left }
+  - { say: "Flight control ailerons full right.", check: controls, is: roll_right }
+  - { say: "Flight control rudder full left.", check: controls, is: yaw_left }
+  - { say: "Flight control rudder full right.", check: controls, is: yaw_right }
 
 before_taxi:
   - { say: "Seat belt sign, on.", check: seat_belts, is: on }
@@ -115,7 +115,7 @@ before_taxi:
   - { say: "Parking brake, off.", check: park_brake, is: off }
 
 hold_short:
-  - { say: "Engine start system, ovrd." }
+  - { say: "Engine start system, ovrd.", check: start_switch, is: continuous }
   - { say: "Annunciator panel, check." }
   - { say: "Left external flood light, extend on." }
   - { say: "Right external flood light, extend on." }
@@ -160,7 +160,7 @@ climb:
   - { say: "Nose lights, off.", check: lights.taxi, is: off }
   - { say: "Logo light, off." }
   - { say: "Auto brakes, off.", check: autobrake, is: off }
-  - { say: "Engine start system, off above weather." }
+  - { say: "Engine start system, off above weather.", check: start_switch, is: normal }
   - { say: "Yaw damper, on.", check: yaw_damper, is: on }
   - { note: "Seatbelts as required." }
   - { say: "Maintain 250kts below 10,000 feet, check." }
@@ -197,7 +197,7 @@ approach:
   - { say: "180 knots approach, check." }
   - { say: "Flaps to 28 degrees, check.", check: flaps, is: "28", act: false }
   - { say: "Gear down at 28 deg flaps, down 3 green.", check: gear, is: down }
-  - { say: "Engine start system, ovrd." }
+  - { say: "Engine start system, ovrd.", check: start_switch, is: continuous }
   - { say: "Slow to 160 knots for final, check." }
   - { note: "Caution auto land indication does not mean an autoland!." }
   - { say: "Autothrottle, off 200 feet before touchdown." }
@@ -236,7 +236,7 @@ shut_down_1:
   - { say: "Anti skid, off." }
   - { say: "Nose light, off.", check: lights.taxi, is: off }
   - { say: "Apu air source, air condition cooler.", check: apu_bleed, is: on }
-  - { say: "Engine start pump, on." }
+  - { say: "Engine start pump, on.", check: fuel_pump, is: on, act: false }
   - { say: "Apu master, run.", check: apu, is: on }
   - { say: "Apu master, start." }
   - { say: "Check apu power avail, check." }
@@ -247,18 +247,18 @@ shut_down_1:
   - { say: "Left generator, off.", check: electrical.generators, is: off }
   - { say: "Seat belt sign, off.", check: seat_belts, is: off }
   - { say: "Flaps, retract.", check: flaps, is: up, act: false }
-  - { say: "Left fuel, off.", check: start_levers, is: cutoff }
-  - { say: "Right fuel, off." }
-  - { say: "Left fuel pumps, off." }
-  - { say: "Center fuel pumps, off.", check: fuel_pumps, is: off }
-  - { say: "Right fuel pumps, off." }
+  - { say: "Left fuel, off.", check: start_levers.1, is: cutoff }
+  - { say: "Right fuel, off.", check: start_levers.2, is: cutoff }
+  - { say: "Left fuel pumps, off.", check: fuel_pumps.2, is: off }
+  - { say: "Center fuel pumps, off.", check: fuel_pumps.1, is: off }
+  - { say: "Right fuel pumps, off.", check: fuel_pumps.3, is: off }
   - { say: "Auxilliary transfer pump, off." }
   - { say: "Ac bus x-tie, open.", check: bus_tie, is: off }
   - { say: "Left engine bleed air cross feed, off." }
   - { say: "Right engine bleed air cross feed, off." }
   - { say: "Pitot and stall heat, off.", check: pitot_heat, is: off, act: false }
-  - { say: "Engine start system, off." }
-  - { say: "Engine start pump, off." }
+  - { say: "Engine start system, off.", check: start_switch, is: normal }
+  - { say: "Engine start pump, off.", check: fuel_pump, is: off, act: false }
   - { say: "Battery, unlocked and off.", check: electrical.battery, is: off }
   - { say: "External power, on.", check: ground_power, is: on }
   - { say: "External power left and right bus, on." }

@@ -33,19 +33,19 @@ before_start:
   - { say: "Flaps, 0.", check: flaps, is: up }
   - { say: "Speed brake, retracted.", check: speedbrake, is: down }
   - { say: "Fuel quantity, checked." }
-  - { say: "Fuel pumps, all on." }
+  - { say: "Fuel pumps, all on.", check: fuel_pumps.2, is: on }
   - { say: "Apu bleed, on.", check: apu_bleed, is: on }
   - { say: "Doors, closed." }
   - { note: "Before start complete." }
 
 engine_start:
   - { note: "Engine start, number two first: say start the engines." }
-  - { say: "Engine mode selector, ign start." }
-  - { say: "Engine 2 master, on." }
-  - { say: "Engine 2 stabilised, checked." }
-  - { say: "Engine 1 master, on.", check: start_levers, is: idle }
-  - { say: "Engine 1 stabilised, checked." }
-  - { say: "Engine mode selector, norm." }
+  - { say: "Engine mode selector, ign start.", check: start_switch, is: ground }
+  - { say: "Engine 2 master, on.", check: start_levers.2, is: idle }
+  - { say: "Engine 2 stabilised, checked.", check: n2.2, is: stable }
+  - { say: "Engine 1 master, on.", check: start_levers.1, is: idle }
+  - { say: "Engine 1 stabilised, checked.", check: n2.1, is: stable }
+  - { say: "Engine mode selector, norm.", check: start_switch, is: normal }
   - { say: "Generator 1, on.", check: electrical.generators, is: on }
   - { say: "Generator 2, on." }
   - { say: "Apu generator, off.", check: apu_generator, is: off }
@@ -140,8 +140,8 @@ shutdown:
   - { say: "Parking brake, on.", check: park_brake, is: on }
   - { say: "Seat belt signs, off.", check: seat_belts, is: off }
   - { say: "Transponder, standby.", check: transponder, is: standby, act: false }
-  - { say: "Engine 1 master, off.", check: start_levers, is: cutoff }
-  - { say: "Engine 2 master, off." }
+  - { say: "Engine 1 master, off.", check: start_levers.1, is: cutoff }
+  - { say: "Engine 2 master, off.", check: start_levers.2, is: cutoff }
   - { say: "Fuel pumps, all off.", check: fuel_pumps, is: off }
   - { say: "Adirs selectors, off." }
   - { say: "Beacon, off.", check: lights.beacon, is: off }

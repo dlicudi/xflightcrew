@@ -499,7 +499,7 @@ checklist_states:
   engine_bleeds:   { datarefs: [laminar/A333/buttons/eng_bleed_1_pos], on: 1, "off": 0 }
   hydraulic_pumps: { datarefs: [laminar/A333/hyd/elec_green_contactor], on: 1, "off": 0 }
   packs:           { datarefs: [laminar/A333/buttons/pack_1_pos], on: 1, "off": 0 }
-  start_levers:    { datarefs: [laminar/A333/switches/engine1_start_pos], idle: 1, cutoff: 0 }
+  start_levers:    { datarefs: [laminar/A333/switches/engine1_start_pos, laminar/A333/switches/engine2_start_pos], idle: 1, cutoff: 0 }
 
 advisor:
   # THE ADIRS, watched and FIXED. The start sequence sets them from cold, but
