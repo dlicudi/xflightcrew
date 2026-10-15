@@ -891,6 +891,105 @@ fn a_cleared_crossing_holds_the_strip_against_a_takeoff() {
     Station::uninstall();
 }
 
+/// A REFUSED CROSSER GETS THE NEXT GAP, NOT THE NEXT DEPARTURE: refused
+/// while somebody stands on the strip, it waits short of it, and no new
+/// departure is released onto the strip meanwhile; its re-ask is cleared.
+/// EGBB 33 (2026-10-15): RYR3070 asked to cross 19 times in 10 minutes, and
+/// every gap went to a departure the release watch let go at once.
+#[test]
+fn a_refused_crosser_gets_the_next_gap_before_a_new_departure() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let mut st = gatwick_live();
+    let by_26l = |off_m: f64| {
+        let (lat, lon) = along(&book_runways()[0], 0.5);
+        AircraftState::at_position(lat + off_m / 111_320.0, lon, true, 0.0)
+    };
+    let ask = "Gatwick Tower, Cessna three four five, holding short runway two six left, \
+               request crossing";
+    // Somebody on 26L: the crossing is refused, the crosser waits.
+    note_traffic_state(14, by_26l(0.0));
+    note_traffic_state(12, by_26l(-80.0));
+    let held = st.answer_traffic(&call(12, ask, by_26l(-80.0), Vec::new()));
+    assert!(held.line.contains("hold short"), "{}", held.line);
+    // The occupant leaves; a departure becomes ready at the hold.
+    note_traffic_state(14, by_26l(400.0));
+    let hold = at_the_hold();
+    note_traffic_state(13, hold);
+    st.answer_traffic(&call(
+        13,
+        "Gatwick Tower, Cessna three four five, request taxi",
+        hold,
+        Vec::new(),
+    ));
+    let ready = st.answer_traffic(&call(
+        13,
+        "Gatwick Tower, Cessna three four five, ready for departure",
+        hold,
+        Vec::new(),
+    ));
+    assert!(
+        !ready.line.contains("cleared for takeoff") && !ready.line.contains("line up"),
+        "{}",
+        ready.line
+    );
+    let t0 = Instant::now();
+    let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+    for s in [0, 10, 20] {
+        let lines = traffic_tick(13, &[], at(s));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("cleared for takeoff") || l.contains("line up")),
+            "released ahead of the waiting crosser at {s} s: {lines:?}"
+        );
+    }
+    // The crosser re-asks: the strip is free, it is cleared.
+    let cleared = st.answer_traffic(&call(12, ask, by_26l(-80.0), Vec::new()));
+    assert_eq!(cleared.line, format!("{CS}, cross runway two six left."));
+    let strip12 = traffic_strip(12).expect("its strip");
+    assert!(
+        strip12.crossing_waiting.lock().unwrap().is_none(),
+        "the wait ends"
+    );
+    assert!(own_strip_moved().is_empty(), "{:?}", own_strip_moved());
+    Station::uninstall();
+}
+
+/// A crosser's wait holds only a NEW departure, and only while live: one
+/// already lined up still rolls, and the wait lapses after
+/// `CROSSING_WAIT_LAPSE` without a re-ask.
+#[test]
+fn a_crossers_wait_holds_only_a_new_departure_and_lapses() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let st = gatwick_live();
+    let crosser = open_traffic_strip(20);
+    *crosser.crossing_waiting.lock().unwrap() = Some(("26L".into(), Instant::now()));
+    let dep = |end: &str| departure_held_by_others(&book_runways(), end, &OWN_STRIP);
+    let block = dep("08R").expect("either end of the strip");
+    assert_eq!(block, DepartureBlock::Crosser(None));
+    assert!(block.holds(false), "no new line-up or takeoff");
+    assert!(!block.holds(true), "a lined-up departure still rolls");
+    assert_eq!(dep("26R"), None, "not the twin");
+    assert!(
+        !strip_held_by_traffic(&book_runways(), "26L"),
+        "a landing is not held by a waiting crosser"
+    );
+    assert!(
+        runway_conflicts(None).is_empty(),
+        "{:?}",
+        runway_conflicts(None)
+    );
+    let stale = Instant::now()
+        .checked_sub(CROSSING_WAIT_LAPSE + std::time::Duration::from_secs(1))
+        .expect("a past instant");
+    *crosser.crossing_waiting.lock().unwrap() = Some(("26L".into(), stale));
+    assert_eq!(dep("26L"), None, "the wait lapsed");
+    drop(st);
+    Station::uninstall();
+}
+
 /// The book's audit names a takeoff over a cleared crossing (and the
 /// crossing's own claim reads by the rules ours would: the whole strip).
 #[test]

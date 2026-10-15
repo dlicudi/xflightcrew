@@ -352,10 +352,7 @@ pub(super) fn takeoff_hold_tick_for(
         held_ident.and_then(|ident| departure_held_by_others(&active_runways(), &ident, flight))
     };
     let other_strip_holds = other_strip == Some(DepartureBlock::Occupied);
-    let lander_nm = match other_strip {
-        Some(DepartureBlock::Lander(l)) => Some(l.nm),
-        _ => None,
-    };
+    let lander_nm = other_strip.and_then(|b| b.lander()).map(|l| l.nm);
     let player_on_ground = state.on_ground;
     let mut guard = flight.takeoff_hold.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_mut()?;

@@ -299,8 +299,9 @@ struct CallScratch {
     /// stated runway: the strip crossed is not the one departed from.
     crossing_request: Option<String>,
     /// That request resolved to a strip end of this field ("13") and
-    /// judged clear: the reply that clears it notes it on the strip
-    /// ([`crate::party_line::FlightStrip::crossing`]).
+    /// judged: the reply notes it on the strip, cleared
+    /// ([`crate::party_line::FlightStrip::crossing`]) or refused
+    /// ([`crate::party_line::FlightStrip::crossing_waiting`]).
     crossing_ident: Option<String>,
     /// A push request asked to start too ("request push and start").
     push_start: bool,

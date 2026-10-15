@@ -147,8 +147,15 @@ impl Station {
         // order view reads it, and it stands until the flight is seen off
         // the strip it crossed.
         if service.aerodrome() && intent == tower::Intent::RequestCrossing {
+            let refused = ctx.on_ground && ctx.crossing.as_ref().is_some_and(|c| c.1.is_some());
             let cleared = ctx.on_ground && ctx.crossing.as_ref().is_some_and(|c| c.1.is_none());
-            if let Some(end) = self.desk.call.crossing_ident.take().filter(|_| cleared) {
+            let end = self.desk.call.crossing_ident.take();
+            // A refusal leaves the crosser waiting for the next gap
+            // ([`FlightStrip::crossing_waiting`]); a clearance ends the wait.
+            let wait = end.clone().filter(|_| refused).map(|e| (e, Instant::now()));
+            let cell = &self.desk.strip.crossing_waiting;
+            *cell.lock().unwrap_or_else(|e| e.into_inner()) = wait;
+            if let Some(end) = end.filter(|_| cleared) {
                 let cell = &self.desk.strip.crossing;
                 *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some((end, false));
             }

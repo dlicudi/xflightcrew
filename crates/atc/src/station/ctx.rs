@@ -353,22 +353,24 @@ impl Station {
             strip_held_by_others(&self.apt.runways, &runway, &self.desk.strip)
                 .then_some(DepartureBlock::Occupied)
         };
-        let runway_occupied = runway_occupied || block == Some(DepartureBlock::Occupied);
         let lined_up = self.desk.twr.state == tower::State::LinedUp;
-        let final_traffic = match block {
-            Some(b @ DepartureBlock::Lander(Lander { nm, .. })) if b.holds(lined_up) => {
-                Some(match final_traffic {
-                    Some(f) if f.nm <= nm => f,
-                    Some(f) => FinalTraffic { nm, ..f },
-                    None => FinalTraffic {
-                        nm,
-                        callsign: None,
-                        count: 1,
-                        ghosts: Vec::new(),
-                        type_spoken: None,
-                    },
-                })
-            }
+        // A crosser waiting short of the strip holds a new departure as an
+        // occupant would ([`DepartureBlock::Crosser`]).
+        let runway_occupied = runway_occupied
+            || block == Some(DepartureBlock::Occupied)
+            || matches!(block, Some(DepartureBlock::Crosser(_))) && !lined_up;
+        let final_traffic = match block.filter(|b| b.holds(lined_up)).and_then(|b| b.lander()) {
+            Some(Lander { nm, .. }) => Some(match final_traffic {
+                Some(f) if f.nm <= nm => f,
+                Some(f) => FinalTraffic { nm, ..f },
+                None => FinalTraffic {
+                    nm,
+                    callsign: None,
+                    count: 1,
+                    ghosts: Vec::new(),
+                    type_spoken: None,
+                },
+            }),
             _ => final_traffic,
         };
         // "With information X" matching the current broadcast: the clearance
@@ -450,8 +452,9 @@ impl Station {
     /// flight's strip holds the strip or stands on it (the runway book, ours
     /// included for a traffic flight), the picture shows somebody on its
     /// pavement, or an arrival is on its final inside [`CROSSING_FINAL_NM`].
-    /// A clear strip notes the end for the reply that clears it
-    /// (`crossing_ident`). `None` when the words named no runway here.
+    /// The end is noted for the reply (`crossing_ident`): cleared, it is
+    /// the crossing; refused, the crosser waits for the next gap.
+    /// `None` when the words named no runway here.
     fn judge_crossing(
         &mut self,
         targets: &[TcasTarget],
@@ -501,9 +504,7 @@ impl Station {
         } else {
             None
         };
-        if why.is_none() {
-            self.desk.call.crossing_ident = Some(ident.clone());
-        }
+        self.desk.call.crossing_ident = Some(ident.clone());
         Some((atis::spoken_runway(&ident), why.map(str::to_string)))
     }
 }

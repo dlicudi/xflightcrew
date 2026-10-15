@@ -182,7 +182,7 @@ impl FieldDesk {
 
     /// The runway's claims now (module docs), and the clearances they let
     /// through: the first landing asked, else the first takeoff, then the
-    /// crossings.
+    /// crossings; a crossing of our strip clearable now before a takeoff.
     pub fn tick(&mut self, fleet: &Fleet) {
         let now = fleet.clock.now_s();
         let field = &fleet.field;
@@ -201,12 +201,22 @@ impl FieldDesk {
             }
         }
         let claim = |desk: &FieldDesk, except: u32| desk.claimed(fleet, strip, now, except);
+        // A crossing of our strip waiting and clearable now goes before a
+        // new takeoff: else the next departure takes every gap and the
+        // crosser starves (EGBB 33, 2026-10-15).
+        let crosser_ready = self.want_crossing.iter().any(|(id, rwy)| {
+            strip.is_some()
+                && strip_index(field, rwy) == strip
+                && !claim(self, *id)
+                && !arrival_near(fleet, *id)
+        });
         // The departure waiting at the hold, ready.
         let waiting = self
             .want_takeoff
             .first()
             .copied()
-            .filter(|id| fleet.get(*id).is_some_and(|a| a.phase == Phase::HoldShort));
+            .filter(|id| fleet.get(*id).is_some_and(|a| a.phase == Phase::HoldShort))
+            .filter(|_| !crosser_ready);
         if let Some(id) = waiting {
             let gap = self.last_takeoff_s.is_none_or(|t| now - t >= DEPART_GAP_S);
             if gap && !claim(self, id) && goes_ahead(fleet, id) {
@@ -398,6 +408,69 @@ mod tests {
         fleet.remove(2);
         d.tick(&fleet);
         assert_eq!(d.order(3).unwrap().state, TowerState::ClearedToLand);
+    }
+
+    /// A CROSSER GETS THE GAP BEFORE A NEW TAKEOFF (EGBB 33, 2026-10-15):
+    /// a crossing of the strip asked while somebody stands on it is cleared
+    /// the moment the strip frees, ahead of a departure ready at the hold,
+    /// which goes once the crossing is done.
+    #[test]
+    fn a_waiting_crossing_goes_before_a_new_takeoff() {
+        let field = fixtures::xtst();
+        let end = field.end("09").unwrap();
+        let mut fleet = Fleet::new(field.clone());
+        let mut on = TrafficAircraft::at_stand(
+            1,
+            "N1",
+            "November one",
+            "C172",
+            Plan::Circuit {
+                runway: "09".into(),
+                laps: 1,
+                left: true,
+            },
+            &field,
+            &field.net.stands[0].name,
+            1,
+        )
+        .unwrap();
+        on.phase = Phase::LineUp;
+        let p = end.at(300.0, 0.0);
+        on.kin.lat = p.0;
+        on.kin.lon = p.1;
+        let mut held = on.clone();
+        held.id = 2;
+        held.phase = Phase::HoldShort;
+        let s = &field.net.stands[1];
+        held.kin.lat = s.lat;
+        held.kin.lon = s.lon;
+        let mut crosser = held.clone();
+        crosser.id = 3;
+        crosser.phase = Phase::TaxiIn;
+        assert!(fleet.spawn(on) && fleet.spawn(held) && fleet.spawn(crosser));
+        let mut d = FieldDesk::new(Some("09".into()));
+        d.hear(&[
+            ev(
+                3,
+                Call::RequestCrossing {
+                    runway: "09".into(),
+                },
+            ),
+            ev(2, Call::Ready),
+        ]);
+        d.tick(&fleet);
+        assert_eq!(d.order(3).and_then(|o| o.cross_cleared), None);
+        // The runway clears: the crossing goes, the takeoff waits for it.
+        fleet.remove(1);
+        d.tick(&fleet);
+        assert_eq!(
+            d.order(3).and_then(|o| o.cross_cleared).as_deref(),
+            Some("09")
+        );
+        assert_ne!(
+            d.order(2).map(|o| o.state),
+            Some(TowerState::TakeoffCleared)
+        );
     }
 
     /// THE LEMG HOLD (2026-10-14, issue #286): the field handed to the
