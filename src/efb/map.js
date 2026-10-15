@@ -98,7 +98,7 @@
     token = new URLSearchParams(location.search).get('t') || localStorage.getItem(KEY) || '';
   } catch (e) {}
 
-  var Z_MIN = 5.5, Z_MAX = 20.5;
+  var Z_MIN = 2, Z_MAX = 20.5;
   // Px per metre where each layer of a field comes in (the old diagram's
   // view scale, so a field reads as it did).
   var GEO_PPM = 0.02, FADE_PPM = [0.025, 0.05], DASH_PPM = 0.08, PAINT_PPM = 0.12, NAMES_PPM = 0.16;
