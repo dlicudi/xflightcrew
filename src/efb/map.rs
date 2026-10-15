@@ -2,7 +2,9 @@
 //! (`map.js`, Web Mercator): the plan's legs (flown ones marked), the active
 //! fix, our aircraft as the monitor's tick read it, our traffic, every
 //! field's stands free or taken, the top of descent where the follower or
-//! the plan puts it, the plan's fields, and the overview to fit ([`fit`]).
+//! the plan puts it, the altitude windows of the legs ahead, the plan's
+//! fields, the station's field with its tower and runway, and the overview
+//! to fit ([`fit`]).
 //! Pure; the page draws it over the water of X-Plane's own map data
 //! (`efb::basemap`) and any field's diagram (`efb::airport`) once close.
 
@@ -77,6 +79,50 @@ pub(crate) struct MapOut {
     /// The stands of every field anybody knows of, free or taken
     /// (`airport::stands_by_field`).
     pub(crate) stands: Vec<StandsOut>,
+    /// The altitude windows of the legs ahead, labelled ([`window_text`]).
+    pub(crate) constraints: Vec<MapPoint>,
+    /// The installed station's field, its tower frequency and runway in use.
+    pub(crate) tower: Option<MapTower>,
+    /// At or above this, a level is a flight level ([`level_words`]).
+    pub(crate) transition_ft: f64,
+}
+
+/// The installed station's field on the map.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct MapTower {
+    pub(crate) icao: String,
+    pub(crate) lat: f64,
+    pub(crate) lon: f64,
+    /// "118.700".
+    pub(crate) freq: Option<String>,
+    pub(crate) runway: Option<String>,
+}
+
+/// The transition altitude when the flight names none.
+pub(crate) const DEFAULT_TRANSITION_FT: f64 = 18_000.0;
+
+/// A level as a chart writes it: "FL120" at or above the transition, else
+/// feet to the hundred. Pure.
+pub(crate) fn level_words(ft: f64, transition_ft: f64) -> String {
+    if ft >= transition_ft {
+        format!("FL{:03}", (ft / 100.0).round() as i64)
+    } else {
+        format!("{}", ((ft / 100.0).round() * 100.0) as i64)
+    }
+}
+
+/// A leg's altitude window as a label: "+5000" at or above, "-FL100" at or
+/// below, "+5000 -FL100" between. Pure.
+pub(crate) fn window_text(w: &crate::efb::state::LegWindow, transition_ft: f64) -> Option<String> {
+    let lv = |ft: f64| level_words(ft, transition_ft);
+    let a1 = w.alt1_ft?;
+    Some(match (w.desc, w.alt2_ft) {
+        ('+', _) => format!("+{}", lv(a1)),
+        ('-', _) => format!("-{}", lv(a1)),
+        ('B', Some(a2)) => format!("+{} -{}", lv(a2), lv(a1)),
+        ('B', None) => format!("-{}", lv(a1)),
+        _ => return None,
+    })
 }
 
 /// Near the destination: the route map fits the aircraft and the field
@@ -311,6 +357,7 @@ pub(crate) fn build(f: &Facts, a: &AirportOut) -> MapOut {
             lon: *lon,
         })
         .collect();
+    let ta = f.transition_ft.unwrap_or(DEFAULT_TRANSITION_FT);
     let traffic = f.airport.traffic.as_deref();
     // The wanted field's stands take our own aircraft standing on one.
     let here = f
@@ -329,6 +376,25 @@ pub(crate) fn build(f: &Facts, a: &AirportOut) -> MapOut {
             .map(crate::efb::airport::traffic_out)
             .unwrap_or_default(),
         stands: crate::efb::airport::stands_by_field(traffic, here),
+        constraints: f
+            .constraints
+            .iter()
+            .filter_map(|w| {
+                Some(MapPoint {
+                    lat: w.lat,
+                    lon: w.lon,
+                    label: Some(window_text(w, ta)?),
+                })
+            })
+            .collect(),
+        tower: f.tower.as_ref().map(|t| MapTower {
+            icao: t.icao.clone(),
+            lat: t.lat,
+            lon: t.lon,
+            freq: t.khz.map(|k| format!("{:.3}", k as f64 / 1000.0)),
+            runway: t.runway.clone(),
+        }),
+        transition_ft: ta,
     }
 }
 
@@ -371,6 +437,48 @@ mod tests {
             m.traffic.is_empty() && m.stands.is_empty(),
             "no traffic world"
         );
+    }
+
+    /// The legs ahead carry their chart windows as labels beside the fix,
+    /// a level above the transition a flight level; the station's field
+    /// carries its tower frequency and runway in use.
+    #[test]
+    fn the_legs_ahead_carry_their_altitude_windows() {
+        let mut f = cruise();
+        let w = |ident: &str, desc: char, a1: f64, a2: Option<f64>| crate::efb::state::LegWindow {
+            ident: ident.into(),
+            lat: 46.0,
+            lon: -0.8,
+            desc,
+            alt1_ft: Some(a1),
+            alt2_ft: a2,
+        };
+        f.constraints = vec![
+            w("NORMI", '+', 5_000.0, None),
+            w("BOGNA", '-', 10_000.0, None),
+            w("TIMBA", 'B', 12_000.0, Some(8_000.0)),
+        ];
+        f.transition_ft = Some(6_000.0);
+        f.tower = Some(crate::efb::state::TowerFacts {
+            icao: "EGKK".into(),
+            lat: 51.148,
+            lon: -0.19,
+            khz: Some(124_225),
+            runway: Some("26L".into()),
+        });
+        let m = build(&f, &page_of(&f));
+        let labels: Vec<&str> = m
+            .constraints
+            .iter()
+            .filter_map(|p| p.label.as_deref())
+            .collect();
+        assert_eq!(labels, ["+5000", "-FL100", "+FL080 -FL120"]);
+        assert!((m.constraints[0].lat - 46.0).abs() < 1e-9);
+        let t = m.tower.expect("the station's field");
+        assert_eq!(t.freq.as_deref(), Some("124.225"));
+        assert_eq!(t.runway.as_deref(), Some("26L"));
+        assert_eq!(level_words(35_040.0, 18_000.0), "FL350");
+        assert_eq!(level_words(4_460.0, 18_000.0), "4500");
     }
 
     fn traffic_ac(id: u32, lat: f64, lon: f64) -> crate::efb::feed::TrafficAc {

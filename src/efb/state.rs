@@ -382,6 +382,38 @@ pub(crate) struct Facts {
     /// Every field the traffic world simulates, its board payload
     /// (`feed::boards`); `None` with no world running.
     pub(crate) boards: Option<Vec<(String, String)>>,
+    /// The follower's legs ahead that carry a chart's altitude window
+    /// (`procedure::route_ahead`).
+    pub(crate) constraints: Vec<LegWindow>,
+    /// The installed station's field and what it holds.
+    pub(crate) tower: Option<TowerFacts>,
+    /// The transition altitude in force (`instruments::transition_in_force_ft`).
+    pub(crate) transition_ft: Option<f64>,
+}
+
+/// A leg's altitude window as the follower flies it (`nav::ProcLeg`):
+/// `desc` '+' at or above `alt1_ft`, '-' at or below, 'B' between `alt2_ft`
+/// (above) and `alt1_ft` (below).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LegWindow {
+    pub(crate) ident: String,
+    pub(crate) lat: f64,
+    pub(crate) lon: f64,
+    pub(crate) desc: char,
+    pub(crate) alt1_ft: Option<f64>,
+    pub(crate) alt2_ft: Option<f64>,
+}
+
+/// The installed station's field (`party_line::active_icao`), its tower
+/// frequency (`party_line::home_tower_khz`) and the runway in use the
+/// command loop last noted (`traffic_link::station_runway`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TowerFacts {
+    pub(crate) icao: String,
+    pub(crate) lat: f64,
+    pub(crate) lon: f64,
+    pub(crate) khz: Option<i64>,
+    pub(crate) runway: Option<String>,
 }
 
 /// What a setting accepts, as the registry declares it (`settings::Kind`).
@@ -1824,6 +1856,9 @@ pub(crate) mod tests {
                 ("alternate", "EGLL".into(), 51.471, -0.461),
             ],
             boards: None,
+            constraints: Vec::new(),
+            tower: None,
+            transition_ft: None,
         }
     }
 

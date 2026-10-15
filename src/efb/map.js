@@ -104,6 +104,11 @@
   var GEO_PPM = 0.02, FADE_PPM = [0.025, 0.05], DASH_PPM = 0.08, PAINT_PPM = 0.12, NAMES_PPM = 0.16;
   var STAND_PPM = 0.25, HOLD_PPM = 0.5, GROUND_CS_PPM = 0.5, STAND_NAME_PPM = 1.1;
   var FIELDS_KEPT = 24;
+  // Zoom where the traffic's level line, the fields' winds and the
+  // airspace names come in; the airspace the server outlines only for a
+  // view no taller than AIRSPACE_DEG (`overlay::AIRSPACE_SPAN_DEG`).
+  var TAG_Z = 7.5, WX_TEXT_Z = 9, AIRSPACE_NAME_Z = 9, AIRSPACE_DEG = 6;
+  var WX_COL = { VFR: '#4CC77F', MVFR: '#4A9DFF', IFR: '#FF5A5A', LIFR: '#E05AE0' };
 
   var root = null, canvas = null, ctx = null;
   var cardBox = null, cardArrow = null, cardText = null, cardSub = null;
@@ -185,8 +190,13 @@
     var seen = {};
     (list || []).forEach(function (a) {
       seen[a.id] = 1;
-      var g = glideTo(tr[a.id], a.lat, a.lon, a.hdg, t);
+      var was = tr[a.id], g = glideTo(was, a.lat, a.lon, a.hdg, t);
       g.d = a;
+      // Its vertical trend from the change between two updates, fpm.
+      g.vs = 0;
+      if (was && a.alt_ft != null && was.d.alt_ft != null && t > was.t0) {
+        g.vs = 0.5 * (was.vs || 0) + 0.5 * (a.alt_ft - was.d.alt_ft) / ((t - was.t0) / 60000);
+      }
       tr[a.id] = g;
       var tl = trails[a.id] || (trails[a.id] = []);
       var last = tl[tl.length - 1];
@@ -217,7 +227,7 @@
     var a = tr[sel.id].d, n = glideNow(tr[sel.id], t);
     screenTransform();
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    var j = a.journey, here = [latOf(n.Y), lonOf(n.X)];
+    var j = a.journey || fieldEnds(a), here = [latOf(n.Y), lonOf(n.X)];
     if (j) {
       ctx.globalAlpha = 0.7;
       ctx.strokeStyle = C.cyan; ctx.lineWidth = 2;
@@ -257,6 +267,29 @@
         tag(x, y - 14, e[1], { size: 11, bold: true, color: C.cyan, bg: 'rgba(7,9,12,0.75)' });
       });
     }
+  }
+
+  // Where the page knows a field: the basemap's fields, the plan's, the
+  // station's. [lat, lon] or null.
+  function fieldAt(icao) {
+    if (!icao) return null;
+    var lists = [(base && base.fields) || [], (mp && mp.fields) || [], (mp && mp.tower) ? [mp.tower] : []];
+    for (var i = 0; i < lists.length; i++) {
+      for (var k = 0; k < lists[i].length; k++) if (lists[i][k].icao === icao) return [lists[i][k].lat, lists[i][k].lon];
+    }
+    return null;
+  }
+  // A flight with no journey of its own: its two fields' great circle, when
+  // the page knows both ends.
+  function fieldEnds(a) {
+    var f = fieldAt(a.from), t = fieldAt(a.to);
+    return f && t ? { from: a.from, to: a.to, from_pos: f, to_pos: t } : null;
+  }
+  // A level as the server's `map::level_words` writes it.
+  function levelWords(ft) {
+    var ta = (mp && mp.transition_ft) || 18000;
+    if (ft >= ta) { var fl = String(Math.round(ft / 100)); while (fl.length < 3) fl = '0' + fl; return 'FL' + fl; }
+    return String(Math.round(ft / 100) * 100);
   }
 
   // ------------------------------------------------------------ the fields' diagrams
@@ -425,13 +458,44 @@
         if (!baseAgain) baseAgain = setTimeout(function () { baseAgain = null; wantBase(); }, wait + 50);
       });
   }
+  // The weather and airspace for the view (GET /overlay), asked like the
+  // basemap and kept five minutes: placed once, in world units.
+  var ovl = null, ovlBusy = false, ovlRetry = 0;
+  function wantOverlay() {
+    if (ovlBusy || Date.now() < ovlRetry || !W) return;
+    var tl = worldAt(0, 0), br = worldAt(W, H);
+    var lat0 = latOf(Math.min(1, br[1])), lat1 = latOf(Math.max(0, tl[1]));
+    var lon0 = lonOf(Math.max(0, tl[0])), lon1 = lonOf(Math.min(1, br[0]));
+    var tall = lat1 - lat0 > AIRSPACE_DEG;
+    var b = ovl && ovl.bbox;
+    if (b && lat0 >= b[0] && lon0 >= b[1] && lat1 <= b[2] && lon1 <= b[3] && Date.now() - ovl.t < 300000 && (tall || b[2] - b[0] <= AIRSPACE_DEG)) return;
+    var m = (lat1 - lat0) * 1.6 > AIRSPACE_DEG ? 0 : 0.3, dla = (lat1 - lat0) * m, dlo = (lon1 - lon0) * m;
+    var box = [Math.max(-MAX_LAT, lat0 - dla), Math.max(-180, lon0 - dlo), Math.min(MAX_LAT, lat1 + dla), Math.min(180, lon1 + dlo)];
+    ovlBusy = true;
+    fetch(withT('/overlay?bbox=' + box.map(function (v) { return v.toFixed(3); }).join(',')), { headers: tokenHeaders(), credentials: 'same-origin' })
+      .then(function (r) { if (!r.ok) throw r.status; return r.json(); })
+      .then(function (j) {
+        ovlBusy = false;
+        ovl = {
+          bbox: box, t: Date.now(),
+          wx: j.wx.map(function (d) { return { d: d, X: mx(d.lon), Y: my(d.lat) }; }),
+          spaces: j.airspace.map(function (a) {
+            var pts = [], cx = 0, cy = 0;
+            for (var i = 0; i + 1 < a.pts.length; i += 2) { var X = mx(a.pts[i + 1]), Y = my(a.pts[i]); pts.push([X, Y]); cx += X; cy += Y; }
+            return { name: a.name, pts: pts, X: cx / pts.length, Y: cy / pts.length };
+          })
+        };
+        dirty = true;
+      })
+      .catch(function () { ovlBusy = false; ovlRetry = Date.now() + 15000; });
+  }
   // Asked once the view has stood still a quarter of a second.
   var lastAsk = [NaN, NaN, NaN, 0, 0];
   function wantData() {
     if (lastAsk[0] === view.X && lastAsk[1] === view.Y && lastAsk[2] === view.z && lastAsk[3] === W && lastAsk[4] === H) return;
     lastAsk = [view.X, view.Y, view.z, W, H];
     if (baseTimer) clearTimeout(baseTimer);
-    baseTimer = setTimeout(function () { baseTimer = null; wantBase(); wantFields(); savePrefs(); }, 250);
+    baseTimer = setTimeout(function () { baseTimer = null; wantBase(); wantOverlay(); wantFields(); savePrefs(); }, 250);
   }
 
   // ------------------------------------------------------------ DOM
@@ -932,6 +996,49 @@
 
   // ------------------------------------------------------------ drawing
 
+  // The no-go volumes, outlined; under the route.
+  function drawAirspace() {
+    if (!ovl || !ovl.spaces.length) return;
+    screenTransform();
+    ctx.strokeStyle = C.red; ctx.globalAlpha = 0.55; ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ovl.spaces.forEach(function (a) {
+      ctx.beginPath();
+      a.pts.forEach(function (p, i) { if (i) ctx.lineTo(sx(p[0]), sy(p[1])); else ctx.moveTo(sx(p[0]), sy(p[1])); });
+      ctx.closePath();
+      ctx.stroke();
+    });
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  }
+  // A field's weather: a dot in its flight category's colour.
+  function drawWx() {
+    if (!ovl) return;
+    screenTransform();
+    ovl.wx.forEach(function (w) {
+      var x = sx(w.X), y = sy(w.Y);
+      if (!onScreen(x, y, 6)) return;
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = WX_COL[w.d.cat] || C.muted; ctx.fill();
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
+    });
+  }
+  // Our track ahead, airborne: where groundspeed and track put us in 1, 2
+  // and 5 minutes, ticked.
+  function drawTrackAhead(o) {
+    if (!o || !ownD || ownD.on_ground || !(ownD.gs_kts > 40)) return;
+    var ppm = ppmAt(latOf(o.Y)), r = o.h * Math.PI / 180;
+    var ux = Math.sin(r), uy = -Math.cos(r), x = sx(o.X), y = sy(o.Y);
+    var px = function (min) { return ownD.gs_kts * 1852 / 60 * min * ppm; };
+    screenTransform();
+    ctx.strokeStyle = C.text; ctx.globalAlpha = 0.8; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + ux * px(5), y + uy * px(5)); ctx.stroke();
+    [1, 2, 5].forEach(function (min) {
+      var d = px(min), cx = x + ux * d, cy = y + uy * d;
+      ctx.beginPath(); ctx.moveTo(cx - uy * 6, cy + ux * 6); ctx.lineTo(cx + uy * 6, cy - ux * 6); ctx.stroke();
+    });
+    ctx.globalAlpha = 1;
+  }
+
   function drawBase() {
     if (!base || !base.any) return;
     var a = localTransform(base.ox, base.oy, 1 / Q, false);
@@ -1093,7 +1200,8 @@
     plan = {
       fixes: fx,
       fields: (mp.fields || []).map(function (f) { return { f: f, X: mx(f.lon), Y: my(f.lat) }; }),
-      tod: mp.tod ? { X: mx(mp.tod.lon), Y: my(mp.tod.lat), label: mp.tod.label } : null
+      tod: mp.tod ? { X: mx(mp.tod.lon), Y: my(mp.tod.lat), label: mp.tod.label } : null,
+      windows: (mp.constraints || []).map(function (c) { return { X: mx(c.lon), Y: my(c.lat), label: c.label }; })
     };
   }
   // The plan's legs fade out as a field fills the screen (its taxi route
@@ -1312,15 +1420,25 @@
       });
       if (plan.tod && alpha > 0.3 && onScreen(sx(plan.tod.X), sy(plan.tod.Y), 0)) note(sx(plan.tod.X), sy(plan.tod.Y), plan.tod.label || 'TOD', C.amber, 'bold 12px ' + mono, true);
     }
+    // The station's field: its runway in use and tower frequency.
+    var twr = mp && mp.tower;
+    if (twr) {
+      var tx = sx(mx(twr.lon)), ty = sy(my(twr.lat));
+      var words = [planned(twr.icao) ? '' : twr.icao, twr.runway ? 'RWY ' + twr.runway : '', twr.freq ? 'TWR ' + twr.freq : ''].filter(Boolean).join(' ');
+      if (words && onScreen(tx, ty, 0)) note(tx, ty, words, C.green, 'bold 11px ' + mono, false);
+    }
     if (plan && alpha > 0.3) {
       var here = o ? [sx(o.X), sy(o.Y)] : [W / 2, H / 2];
       plan.fixes.filter(function (p) { return !p.f.done && !p.f.active && !planned(p.f.id) && onScreen(sx(p.X), sy(p.Y), 0); })
         .sort(function (a, b) { return Math.hypot(sx(a.X) - here[0], sy(a.Y) - here[1]) - Math.hypot(sx(b.X) - here[0], sy(b.Y) - here[1]); })
         .forEach(function (p) { note(sx(p.X), sy(p.Y), p.f.id, C.text, '12px ' + mono, false); });
+      plan.windows.forEach(function (c) {
+        if (onScreen(sx(c.X), sy(c.Y), 0)) note(sx(c.X), sy(c.Y), c.label, C.amber, '11px ' + mono, false);
+      });
     }
     if (base && view.z >= 7) {
       base.fields.forEach(function (f) {
-        if (!f.towered || (shown[f.icao] || 0) > 0.5 || planned(f.icao)) return;
+        if (!f.towered || (shown[f.icao] || 0) > 0.5 || planned(f.icao) || (twr && twr.icao === f.icao)) return;
         var x = sx(f.X), y = sy(f.Y);
         if (onScreen(x, y, 0)) note(x, y, f.icao, C.muted, '10px ' + mono, false);
       });
@@ -1332,8 +1450,26 @@
       // (or selected): a region's sky of callsigns is noise.
       if (a.model && view.z < 8 && !(sel && sel.id === a.id)) return;
       var x = sx(n.X), y = sy(n.Y);
-      if (onScreen(x, y, 0)) tag(x, y + 16, a.callsign, { size: 11, bold: true, color: C.violet, bg: 'rgba(7,9,12,0.75)' });
+      if (!onScreen(x, y, 0)) return;
+      var named = tag(x, y + 16, a.callsign, { size: 11, bold: true, color: C.violet, bg: 'rgba(7,9,12,0.75)' });
+      // Its level and trend under the callsign, once zoomed in a little.
+      if (named && view.z >= TAG_Z && !a.on_ground && a.alt_ft != null) {
+        var vs = tr[k].vs || 0;
+        tag(x, y + 31, levelWords(a.alt_ft) + (vs > 300 ? ' \u2191' : vs < -300 ? ' \u2193' : ''), { size: 10, color: C.violet, bg: 'rgba(7,9,12,0.75)' });
+      }
     });
+    if (ovl && view.z >= WX_TEXT_Z) {
+      ovl.wx.forEach(function (w) {
+        var x = sx(w.X), y = sy(w.Y);
+        if (onScreen(x, y, 0)) note(x, y, w.d.wind, WX_COL[w.d.cat] || C.muted, '10px ' + mono, false);
+      });
+    }
+    if (ovl && view.z >= AIRSPACE_NAME_Z) {
+      ovl.spaces.forEach(function (a) {
+        var x = sx(a.X), y = sy(a.Y);
+        if (onScreen(x, y, 0)) tag(x, y, a.name, { size: 10, color: C.red });
+      });
+    }
     if (plan && alpha > 0.3) {
       plan.fixes.forEach(function (p) {
         if (p.f.done && !planned(p.f.id) && onScreen(sx(p.X), sy(p.Y), 0)) note(sx(p.X), sy(p.Y), p.f.id, C.muted, '12px ' + mono, false);
@@ -1391,13 +1527,16 @@
     drawBase();
     var vis = visibleFields(), shown = {};
     vis.forEach(function (f) { f.used = t; shown[f.geo.icao] = f.alpha; drawField(f); });
+    drawAirspace();
     var alpha = planAlpha();
     drawPlan(alpha);
     drawTaxiRoute();
     drawFieldMarks(shown);
+    drawWx();
     vis.forEach(drawStands);
     drawSelectedPath(t);
     drawTraffic(t);
+    drawTrackAhead(o);
     drawOwn(o);
     drawLabels(t, o, vis, alpha);
     niceScale();

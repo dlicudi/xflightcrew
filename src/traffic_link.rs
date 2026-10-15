@@ -592,7 +592,7 @@ pub(crate) fn note_station_runway(r: Option<&str>) {
     *STATION_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()) = r.map(str::to_string);
 }
 
-fn station_runway() -> Option<String> {
+pub(crate) fn station_runway() -> Option<String> {
     STATION_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
