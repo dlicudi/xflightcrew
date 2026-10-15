@@ -671,6 +671,9 @@ mod tests {
             // ...and a runway crossing the tower cleared (the 2026-10-08
             // traffic sweep), a strip `facts` cell.
             "CROSSING",
+            // ...and a crossing refused, waiting for the next gap (EGBB
+            // 2026-10-15), a strip `facts` cell.
+            "CROSSING_WAITING",
             // New with our own instrument arrival (2026-10-10): approach's
             // watch for "established", its clearance's readback and the
             // approach / tower handoff, strip `facts` cells.

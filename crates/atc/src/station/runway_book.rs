@@ -37,6 +37,11 @@ pub(crate) enum ClaimKind {
     /// `crossing` cell): the whole strip, from the clearance until the flight
     /// is seen off it again. Nobody lines up, departs or lands meanwhile.
     CrossingCleared,
+    /// Refused a crossing and waiting short of the strip (the strip's
+    /// `crossing_waiting` cell, while live): no NEW departure is released
+    /// onto it ([`RunwayBook::departure_blocked`]); landings and a
+    /// departure already lined up are not held.
+    CrossingWaiting,
     /// Physically on the pavement, on the ground (authorised or not).
     Occupying,
     /// A runway start: the strip the aircraft first appeared on, stopped.
@@ -204,6 +209,23 @@ impl RunwayBook {
                 kind: ClaimKind::CrossingCleared,
                 held: false,
                 since: None,
+            });
+        }
+        let waiting = e
+            .strip
+            .crossing_waiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .filter(|(_, since)| since.elapsed() < CROSSING_WAIT_LAPSE);
+        if let Some((end, since)) = waiting {
+            self.claims.push(Claim {
+                who: who.clone(),
+                end,
+                whole_strip: true,
+                kind: ClaimKind::CrossingWaiting,
+                held: false,
+                since: Some(since),
             });
         }
         let Some(state) = e.state else {
@@ -426,7 +448,10 @@ impl RunwayBook {
     /// LEMG 12 (2026-10-13): Air Nostrum cleared to land held our 737 at HW1
     /// "hold position, traffic on the runway" with nothing on it and the
     /// lander well out. An unknown position, a lander on the ground, or any
-    /// other whole-strip claim is an occupant as before.
+    /// other whole-strip claim is an occupant as before. A crosser waiting
+    /// short of the strip ([`ClaimKind::CrossingWaiting`]) holds a departure
+    /// not yet lined up ([`DepartureBlock::Crosser`]): the waiting crosser
+    /// gets the next gap, never the next departure.
     pub(crate) fn departure_blocked(
         &self,
         end: &str,
@@ -434,10 +459,15 @@ impl RunwayBook {
     ) -> Option<DepartureBlock> {
         let ours = strip(&self.runways, end)?;
         let mut lander: Option<Lander> = None;
+        let mut crosser = false;
         for c in self.claims.iter().filter(|c| {
             matches!(&c.who, Claimant::Strip(f) if Some(*f) != except)
                 && strip(&self.runways, &c.end).is_some_and(|r| std::ptr::eq(r, ours))
         }) {
+            if c.kind == ClaimKind::CrossingWaiting {
+                crosser = true;
+                continue;
+            }
             let whole = c.whole_strip
                 && matches!(
                     c.kind,
@@ -459,6 +489,9 @@ impl RunwayBook {
                 }
                 None => return Some(DepartureBlock::Occupied),
             }
+        }
+        if crosser {
+            return Some(DepartureBlock::Crosser(lander));
         }
         lander.map(DepartureBlock::Lander)
     }
@@ -513,6 +546,11 @@ pub(super) fn seen(strip: &FlightStrip) -> Option<AircraftState> {
 /// ([`note_own_state`]), stands for us in the book.
 pub(super) const OWN_SEEN_FRESH: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a refused crosser's wait ([`ClaimKind::CrossingWaiting`])
+/// holds new departures without a re-ask: a crosser re-calls every 20 to
+/// 40 s, so one that has not in a minute has given up or gone elsewhere.
+pub(crate) const CROSSING_WAIT_LAPSE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A landing clearance holds the whole strip from this close in; farther
 /// out, airborne, only its direction.
 const LANDING_CLAIM_NM: f64 = 4.0;
@@ -550,6 +588,10 @@ pub(crate) enum DepartureBlock {
     Occupied,
     /// Only flights cleared to land, still flying: the soonest one.
     Lander(Lander),
+    /// A crosser waiting short of the strip, and the soonest lander still
+    /// flying, if any: no new line-up or takeoff, a lined-up departure
+    /// judged on the lander alone.
+    Crosser(Option<Lander>),
 }
 
 /// A flight cleared to land and still flying, as a departure reads it.
@@ -575,6 +617,18 @@ impl DepartureBlock {
             DepartureBlock::Lander(l) => {
                 !departure_clears_lander(l.secs, if lined_up { LINED_UP_ROLL_S } else { LINE_UP_S })
             }
+            DepartureBlock::Crosser(l) => {
+                !lined_up || l.is_some_and(|l| DepartureBlock::Lander(l).holds(true))
+            }
+        }
+    }
+
+    /// The lander this block names, if any.
+    pub(crate) fn lander(&self) -> Option<Lander> {
+        match self {
+            DepartureBlock::Occupied => None,
+            DepartureBlock::Lander(l) => Some(*l),
+            DepartureBlock::Crosser(l) => *l,
         }
     }
 }

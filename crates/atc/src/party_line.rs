@@ -213,6 +213,15 @@ flight_strip! {
             /// after being on it (`station::note_aircraft_state_for`). Read by
             /// a traffic flight's order view (`world::traffic_order`).
             crossing: Mutex<Option<(String, bool)>> = Mutex::new(None),
+            /// The runway END this flight asked to cross and was REFUSED
+            /// ("hold short"), and when: while it stands, no NEW line-up or
+            /// takeoff goes out on that strip, so the crosser gets the next
+            /// gap instead of the next departure (EGBB 33, 2026-10-15:
+            /// RYR3070 held short 19 times in 10 minutes, every gap taken by
+            /// a departure). Set by the refusal, cleared by the clearance;
+            /// it lapses after `station::CROSSING_WAIT_LAPSE` without a
+            /// re-ask (`RunwayBook::departure_blocked`).
+            crossing_waiting: Mutex<Option<(String, Instant)>> = Mutex::new(None),
             /// The aerodrome position working this flight (Delivery, Ground or
             /// the Tower: views of one station), as last answered or handed
             /// to. Ground's handoff at the holding point reads it, and a
