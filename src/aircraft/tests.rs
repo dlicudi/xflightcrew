@@ -997,15 +997,6 @@
         assert_eq!(r.best_glide_kts, Some(68.0));
         assert_eq!(r.va_kts, Some(99.0));
         assert_eq!(r.vx_kts, cessna_172sp().reference.unwrap().vx_kts);
-        // The checklist action map loads, and the YAML matches the built-in (same
-        // matches, in the same order) — so behaviour is identical either source.
-        let yaml_map = &p.checklist_map;
-        let builtin_map = &cessna_172sp().checklist_map;
-        assert!(!yaml_map.is_empty());
-        assert_eq!(yaml_map.len(), builtin_map.len());
-        for (a, b) in yaml_map.iter().zip(builtin_map) {
-            assert_eq!(a.match_, b.match_, "map entry mismatch (YAML vs built-in)");
-        }
         // Electrical loads from YAML (not a silent fall-back to the built-in) and
         // matches it key-for-key.
         let builtin = cessna_172sp();
@@ -1034,7 +1025,6 @@
                 .positions
                 .iter()
                 .all(|p| !p.key.is_empty() && !p.command.is_empty()));
-            assert!(!p.checklist_map.is_empty());
         }
     }
 
@@ -1588,33 +1578,13 @@
         assert_eq!(r.best_glide_kts, Some(88.0));
         assert_eq!(r.max_gross_lb, Some(3600.0));
         assert_eq!(p.lights.len(), 3);
-        // Conservative map: only the universal-safe entries, and the YAML matches
-        // the built-in.
-        let yaml_map = &p.checklist_map;
-        let builtin_map = &cirrus_sr22().checklist_map;
-        assert_eq!(yaml_map.len(), builtin_map.len());
-        for (a, b) in yaml_map.iter().zip(builtin_map) {
-            assert_eq!(a.match_, b.match_);
-        }
-        // Still call-out, not mapped: the dual battery/alternator (their file
-        // conditions are compound `&&`).
-        for e in yaml_map {
-            assert!(!e.match_.contains("battery") && !e.match_.contains("generator"));
-        }
-        // The boost pump, key-start ignition, pitch trim and fuel selector ARE
-        // now mapped.
-        let matches: Vec<&str> = yaml_map.iter().map(|e| e.match_.as_str()).collect();
-        for m in [
-            "boost_pump",
-            "ignition_key",
-            "ignition_on",
-            "elevator_trim",
-            "fuel_tank_selector",
-        ] {
-            assert!(matches.contains(&m), "SR22 map missing {m}");
-        }
-        // Fuel-selector positions carry their dataref values so the checklist can
-        // decode `fuel_tank_selector:N` (0=off/1=left/2=right).
+        // The checklist reads the SR22's own boost pump switch.
+        assert_eq!(
+            p.checklist_states["fuel_pump"].datarefs,
+            vec!["laminar/sr22/switch/boost_pump".to_string()]
+        );
+        // Fuel-selector positions carry their dataref values so the checklist
+        // reads `fuel_selector` items (0=off/1=left/2=right).
         let fsel = p.fuel_selector.as_ref().unwrap();
         assert_eq!(
             fsel.readback.as_deref(),

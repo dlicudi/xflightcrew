@@ -1,0 +1,311 @@
+# Native checklist (format: src/checklist.rs), from GoofyJP's (Jean-Pierre) list for the Laminar SR22.
+
+general_data:
+  - { note: "Limits :." }
+  - { note: "Service ceiling: 25.000 ft." }
+  - { note: "Max takeoff altitude: 10.000 ft." }
+  - { note: "Flight load factor limits :." }
+  - { note: "Flaps up, 36,000 lbs:               +3.8g, -1.9g." }
+  - { note: "Flaps 50% & 100%, 36,000 lbs: +1.9g, -0.0g." }
+  - { note: "Aircraft operating speed :." }
+  - { note: "Vne (up to 17,500 ft): 205 kias." }
+  - { note: "Vne (at 25,000 ft): 175 kias." }
+  - { note: "Vno (up to 17,500 ft): 176 kias." }
+  - { note: "Vno (at 25,000 ft): 150 kias." }
+  - { note: "Vo (maneuvering speed): 140 kias @ gross 3600 lbs." }
+  - { note: "Vfe, flaps 50%:   150 kias." }
+  - { note: "Flaps 100%: 110 kias." }
+  - { note: "Takeoff speed." }
+  - { note: "Rotate speed: 80 kias." }
+  - { note: "Vx (best angle of climb): 88 kias." }
+  - { note: "Vy (best rate of climb): 103 kias." }
+  - { note: "Cruise climb: 120 kias." }
+  - { note: "Landing speed :." }
+  - { note: "Flaps up: 90-95 kias." }
+  - { note: "Flaps 50%: 85-90 kias." }
+  - { note: "Flaps 100%: 80-85 kias." }
+
+preflight:
+  - { say: "Atc, file flight plan, file." }
+  - { note: "& read weather." }
+  - { say: "Door(s), open, check.", check: doors, is: open }
+  - { say: "Fuel, refuel as necessary, check." }
+  - { say: "Batteries, both on, check.", check: electrical.batteries, is: on, act: false }
+  - { say: "Interior lights, as required, check." }
+  - { say: "Avionics master, on, check.", check: electrical.avionics, is: on }
+  - { say: "Fuel quantity, verify, check." }
+  - { say: "Avionics master, off, check.", check: electrical.avionics, is: off }
+  - { say: "Batteries, both off, check.", check: electrical.batteries, is: off, act: false }
+
+before_start:
+  title: "Before engine start"
+  items:
+    - { say: "All switches, off, check." }
+    - { say: "Parking brakes, engaged, check.", check: park_brake, is: on }
+    - { say: "Alternate air, pushed, check." }
+    - { say: "Oxygen switch, off, check.", check: oxygen, is: off }
+    - { say: "Flaps, full up, check.", check: flaps, is: up }
+    - { say: "Throttle lever, iddle, check.", check: throttle, is: idle }
+    - { say: "Mixture lever, lean, check.", check: mixture, is: cutoff }
+    - { say: "Fuel tank selector, off, check.", check: fuel_selector, is: off }
+    - { say: "Close all doors, close, check.", check: doors, is: closed }
+
+engine_start:
+  - { say: "Parking brakes, engaged, check.", check: park_brake, is: on }
+  - { say: "Batteries master, both on, check.", check: electrical.batteries, is: on, act: false }
+  - { say: "Strobe lights, on, check.", check: lights.strobe, is: on }
+  - { say: "Power lever, full forward, check.", check: throttle, is: full }
+  - { say: "Mixture, full rich, check.", check: mixture, is: rich }
+  - { say: "Fuel tank selector, left, check.", check: fuel_selector, is: left }
+  - { note: "Propeller area." }
+  - { say: "Power lever, open 1/4 inch, check.", check: throttle, is: start }
+  - { say: "Fuel pump, boost, check.", check: fuel_pump, is: on }
+  - { say: "Magneto, start, check.", check: engine, is: running }
+  - { say: "=> oil pressure, green, check." }
+  - { say: "Both alternator, on, check.", check: electrical.alternators, is: on, act: false }
+  - { say: "Power lever, set 1000 rpm, check." }
+  - { say: "Mixture, lean a little, check." }
+  - { say: "Fuel pump, off, check.", check: fuel_pump, is: off }
+  - { say: "Avionics switch, on, check.", check: electrical.avionics, is: on }
+  - { say: "All parameters, monitor, check." }
+
+before_taxi:
+  title: "Before taxiing"
+  items:
+    - { say: "Nav light, on, check.", check: lights.nav, is: on }
+    - { say: "Transponder, stby and dial, check.", check: transponder, is: standby }
+    - { say: "Hdg bug, set to runway, check." }
+    - { say: "Altimeter, set qnh, check." }
+    - { say: "Mfd g1000, enter flight plan, check." }
+    - { say: "Flight director, on, check.", check: flight_director, is: on }
+    - { say: "Autopilot, off and preconfigured, check." }
+    - { say: "Aileron trims, neutral, check." }
+    - { say: "Elevator trim, set t/o, check.", check: pitch_trim, is: takeoff }
+    - { say: "Flaps, full up, check.", check: flaps, is: up }
+    - { say: "Cabin heat, as required, check." }
+    - { say: "Fuel tank selector, switch to fullest, check." }
+
+taxiing:
+  - { say: "Atc, request taxi, request." }
+  - { say: "Parking brakes, release, check.", check: park_brake, is: off }
+  - { say: "Brakes, test, check." }
+  - { say: "Turn to test hsi, check hsi moving, check." }
+  - { note: "Go to holding point, go, check." }
+  - { say: "... & set parking brakes, engaged, check.", check: park_brake, is: on }
+
+holding_point_tests:
+  - { say: "Mixture, full rich, check.", check: mixture, is: rich }
+  - { say: "Fuel pump, boost, check.", check: fuel_pump, is: on }
+  - { say: "Power lever, set 1700 rpm, check." }
+  - { note: "Magnetos test." }
+  - { say: "Magneto, right, check.", check: magnetos, is: right }
+  - { note: "Max drop 150 rpm, check." }
+  - { say: "Magneto, both, check.", check: magnetos, is: both }
+  - { say: "Magneto, left, check.", check: magnetos, is: left }
+  - { note: "Max drop 150 rpm, check." }
+  - { note: "Max difference 50 rpm, check." }
+  - { say: "Magneto, both, check.", check: magnetos, is: both }
+  - { note: "Alternator test." }
+  - { say: "Both batteries, off 10 sec, check.", check: electrical.batteries, is: off, act: false }
+  - { note: "Check engine parameters." }
+  - { say: "Both batteries, on, check.", check: electrical.batteries, is: on, act: false }
+  - { say: "Both alternators, off, check.", check: electrical.alternators, is: off, act: false }
+  - { note: "Voltmeter ess bus, drop below 25.0 v, check." }
+  - { say: "Both alternators, on, check.", check: electrical.alternators, is: on, act: false }
+  - { say: "Power lever, set 1000 rpm, check." }
+  - { say: "Fuel pump, off, check.", check: fuel_pump, is: off }
+  - { say: "Mixture, lean a little, check." }
+  - { say: "All parameters, monitor, check." }
+
+holding_point_2:
+  title: "Holding point 2/2"
+  items:
+    - { note: "Pitot heat test." }
+    - { say: "Pitot heat, on, check.", check: pitot_heat, is: on }
+    - { note: "Mfd (system) current alt2, incruise, check." }
+    - { say: "Pitot heat, off, check.", check: pitot_heat, is: off }
+    - { note: "Flaps test." }
+    - { say: "Flaps, full down, check.", check: flaps, is: full }
+    - { note: "Check lowered." }
+    - { say: "Flaps, full up, check.", check: flaps, is: up }
+
+before_takeoff:
+  - { say: "Doors, closed, check.", check: doors, is: closed }
+  - { say: "Transponder, set alt, check.", check: transponder, is: altitude }
+  - { say: "Landing light, on, check.", check: lights.landing, is: on }
+  - { say: "Pitot heat, on, check.", check: pitot_heat, is: on }
+  - { say: "Autopilot, disconnected, check.", check: autopilot, is: off, act: false }
+  - { say: "Flaps, down 50%, check.", check: flaps, is: "50", act: false }
+  - { say: "Cabin heat, as required, check." }
+  - { say: "Flight controls, free moving, check." }
+  - { say: "Elevator trim, set t/o, check.", check: pitch_trim, is: takeoff }
+  - { say: "Atc, request takeoff, request." }
+  - { say: "Parking brakes, release, check.", check: park_brake, is: off }
+  - { note: "Go to line up, go." }
+  - { say: "... & set parking brakes, engaged, check.", check: park_brake, is: on }
+
+takeoff:
+  - { note: "Full power." }
+  - { note: "Rotate speed 80 kias." }
+  - { note: "Initial climb speed 90 kias." }
+  - { say: "Hdg bug, align to runway, check." }
+  - { say: "Mixture, full rich, check.", check: mixture, is: rich }
+  - { say: "Fuel tank selector, switch to fullest, check." }
+  - { say: "Fuel pump, boost, check.", check: fuel_pump, is: on }
+  - { note: "Autopilot and sid, ok." }
+  - { say: "Time, note, check." }
+  - { say: "Parking brakes, release, check.", check: park_brake, is: off }
+  - { say: "Power lever, full power, check.", check: throttle, is: full }
+  - { note: "Engine parameters, in green." }
+  - { say: "Vr 77-80 kias, rotate, check." }
+  - { say: "... and takeoff, takeoff, check." }
+
+after_takeoff:
+  - { note: "Full power." }
+  - { note: "Climb speed 103 kias." }
+  - { say: "At 90 kias, flaps, full up, check.", check: flaps, is: up }
+  - { say: "Landing light, off, check.", check: lights.landing, is: off }
+
+climb:
+  - { note: "Cruise climb > 120 kias." }
+  - { note: "Best rate of climb 103 kias." }
+  - { note: "Best angle of climb 88 kias." }
+  - { note: "Power, adjust, check." }
+  - { say: "Mixture (see egt value), lean for climb, check." }
+  - { note: "Maintain cht < 420 f, check." }
+  - { say: "Fuel pump, boost, check.", check: fuel_pump, is: on }
+  - { note: "Passing above transition alt." }
+  - { say: "=> altimeter, set 29.92/1013, check.", check: altimeter, is: standard }
+  - { note: "Passing above 10.000 ft." }
+  - { say: "=> oxygen switch, on, check.", check: oxygen, is: on }
+  - { say: "Cabin heat, as required, check." }
+  - { say: "All parameters, check all green, check." }
+  - { note: "All 15 min, fuel tank selector, switch to fullest, check." }
+  - { note: "Monitor fuel flow & balance." }
+  - { note: "In icing or snowing cond." }
+  - { note: "Alternate air, on, check." }
+  - { note: "Ice protection, on, check." }
+  - { note: "Wind shield, on, check." }
+  - { note: "Cabin heat, adjusted, check." }
+
+cruise:
+  - { note: "Service ceiling 25.000 ft." }
+  - { note: "Vne 205 kias." }
+  - { note: "Vno 176 kias." }
+  - { note: "Power, adjust, check." }
+  - { say: "Mixture (see egt value), lean for cruise, check." }
+  - { note: "Maintain cht < 420 f, check." }
+  - { say: "Fuel pump, off, check.", check: fuel_pump, is: off }
+  - { say: "Cabin heat, as required, check." }
+  - { note: "Above 10.000 ft." }
+  - { say: "=> oxygen switch, on, check.", check: oxygen, is: on }
+  - { say: "All parameters, check all green, check." }
+  - { note: "All 15 min, fuel tank selector, switch to fullest, check." }
+  - { note: "Monitor fuel flow & balance." }
+  - { note: "In icing or snowing cond." }
+  - { note: "Alternate air, on, check." }
+  - { note: "Ice protection, on, check." }
+  - { note: "Wind shield, on, check." }
+  - { note: "Cabin heat, adjusted, check." }
+
+descent:
+  - { note: "Vne 205 kias." }
+  - { note: "Vno 176 kias." }
+  - { note: "Power, adjust, check." }
+  - { say: "Mixture, full rich, check.", check: mixture, is: rich }
+  - { say: "Fuel pump, boost, check.", check: fuel_pump, is: on }
+  - { note: "Passing below 10.000 ft." }
+  - { say: "=> oxygen switch, off, check.", check: oxygen, is: off }
+  - { note: "Passing below transition alt." }
+  - { say: "=> altimeter, set qnh, check." }
+  - { say: "Cabin heat, as required, check." }
+  - { say: "All parameters, check all green, check." }
+  - { note: "All 15 min, fuel tank selector, switch to fullest, check." }
+  - { note: "Monitor fuel flow & balance." }
+  - { note: "In icing or snowing cond." }
+  - { note: "Alternate air, on, check." }
+  - { note: "Ice protection, on, check." }
+  - { note: "Wind shield, on, check." }
+  - { note: "Cabin heat, adjusted, check." }
+
+before_landing:
+  - { note: "Approach speed 110 kias." }
+  - { note: "Vfe flaps 50%: < 150 kias." }
+  - { note: "Vfe flaps 100% < 110 kias." }
+  - { note: "Power, adjust, check." }
+  - { say: "Mixture, full rich, check.", check: mixture, is: rich }
+  - { say: "Fuel pump, on, check.", check: fuel_pump, is: on }
+  - { say: "Landing light, on, check.", check: lights.landing, is: on }
+  - { say: "Flaps ( < 110 kias), down 50%, check.", check: flaps, is: "50", act: false }
+  - { say: "All parameters, check all green, check." }
+  - { note: "All 15 min, fuel tank selector, switch to fullest, check." }
+  - { note: "Monitor fuel flow & balance." }
+  - { note: "In icing or snowing cond." }
+  - { note: "Alternate air, on, check." }
+  - { note: "Ice protection, on, check." }
+  - { note: "Wind shield, on, check." }
+  - { note: "Cabin heat, adjusted, check." }
+
+landing:
+  - { note: "Landing speed (full flaps):." }
+  - { note: "80-85 kias." }
+  - { note: "Vfe flaps 50%: < 150 kias." }
+  - { note: "Vfe flaps 100% 110 kias." }
+  - { note: "Power, adjust, check." }
+  - { say: "Atc, request clearance, request." }
+  - { say: "Mixture, full rich, check.", check: mixture, is: rich }
+  - { say: "Landing light, on, check.", check: lights.landing, is: on }
+  - { say: "Parking brakes, release, check.", check: park_brake, is: off }
+  - { say: "Flaps ( < 95 kias), full down, check.", check: flaps, is: full }
+  - { say: "Autopilot, disengage, check.", check: autopilot, is: off, act: false }
+  - { say: "Land, main gear first, check." }
+
+after_landing:
+  - { say: "Flaps, full up, check.", check: flaps, is: up }
+  - { note: "Clear runway, go." }
+  - { say: "... and set parking brakes, engaged, check.", check: park_brake, is: on }
+
+clear_runway:
+  - { say: "Time, note, check." }
+  - { say: "Mixture, lean a little, check." }
+  - { say: "Transponder, stby, check.", check: transponder, is: standby }
+  - { say: "Landing light, off, check.", check: lights.landing, is: off }
+  - { say: "Pitot heat, off, check.", check: pitot_heat, is: off }
+  - { say: "Fuel pump, off, check.", check: fuel_pump, is: off }
+  - { say: "Flight director, off, check.", check: flight_director, is: off }
+  - { say: "Aileron trims, set neutral, check." }
+  - { say: "Elevator trim, set t/o, check.", check: pitch_trim, is: takeoff }
+  - { say: "Parkbrake, release, check.", check: park_brake, is: off }
+  - { note: "Go parking, go." }
+  - { say: "... and set parkbrakes, set, check.", check: park_brake, is: on }
+
+shutdown:
+  - { say: "Atc leave, com 1 & 2 off, check." }
+  - { say: "Power, set 1200 rpm, check." }
+  - { note: "Wait 1 minute." }
+  - { say: "Alternate air, pushed, check." }
+  - { say: "Fuel pump, off, check.", check: fuel_pump, is: off }
+  - { say: "Flaps, full up, check.", check: flaps, is: up }
+  - { say: "Flight plan, delete, check." }
+  - { note: "After 1 minute." }
+  - { say: "Mixture, cutoff, check.", check: mixture, is: cutoff }
+  - { say: "Power lever, idle, check.", check: throttle, is: idle }
+  - { say: "Magneto, off, check.", check: magnetos, is: off }
+  - { say: "Both alternators, off, check.", check: electrical.alternators, is: off, act: false }
+  - { say: "Fuel tank selector, off, check.", check: fuel_selector, is: off }
+  - { say: "Cabin heat, all minimum, check." }
+  - { say: "Interior lights, all dim or off, check." }
+  - { say: "All switches, off, check." }
+
+exit:
+  - { say: "Door(s), open, check.", check: doors, is: open }
+  - { say: "Pilote and passengers, exit, check." }
+  - { say: "Doors, all closed, check.", check: doors, is: closed }
+  - { note: "It's time for coffee, bye." }
+
+balked_landing:
+  - { say: "Autopilot, disengage, check.", check: autopilot, is: off, act: false }
+  - { say: "Power, full power, check.", check: throttle, is: full }
+  - { say: "Flaps, down 50%, check.", check: flaps, is: "50", act: false }
+  - { say: "Airspeed, 80~85kias, check." }
+  - { say: "Flaps, full up, check.", check: flaps, is: up }

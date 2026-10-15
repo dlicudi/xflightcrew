@@ -258,27 +258,6 @@ fuel_selector:
     - { key: left,  spoken: left,  command: sim/fuel/fuel_selector_lft,  value: 1.0 }
     - { key: right, spoken: right, command: sim/fuel/fuel_selector_rgt,  value: 3.0 }
 
-# The normal checklist (checklists/lancair_evolution.txt, 2026-09-25), from
-# the sim POM's Checklists section (p.44-62) with the POH's low idle for the
-# condition lever, and Taxi / Climb / Descent lists the POM lacks. Section
-# titles are the phase keys, so the tracker's climb / cruise / descent /
-# before landing / after landing lists resolve without a checklist_flow.
-# The condition lever (mixture_ratio) is deliberately NOT mapped: this is a
-# turbine (engine: false) and set_mixture is a piston tool; its items are
-# CHECK reads only.
-checklist: checklists/lancair_evolution.txt
-checklist_map:
-  - { match: electrical/battery_on,     action: !electrical battery1 }
-  - { match: electrical/generator_on,   action: !electrical generator }
-  - { match: electrical/cross_tie,      action: !electrical dc_power }
-  - { match: parking_brake_ratio,       action: parking_brake }
-  - { match: transponder_mode,          action: transponder }
-  - { match: fuel_pump_on,              action: fuel_pump }
-  - { match: flap_handle,               action: flaps }
-  - { match: landing_lights,            action: !light landing }
-  - { match: strobe_lights,             action: !light strobe }
-  - { match: navigation_lights,         action: !light nav }
-
 # Cockpit geography — panel names from the sim POM's "Tour of the Cockpit",
 # left/bottom/right geography from the POH's panel-layout section ("switches
 # for generators and batteries are all grouped on the left; switches for

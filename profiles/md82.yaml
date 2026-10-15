@@ -182,19 +182,14 @@ reference:
   takeoff_roll_ft: 4400.0
   landing_distance_ft: 4850.0
 
-# Laminar's stock MD-82 XChecklist (by royaloak). The copilot reads each item,
-# performs the ones below, and calls out the rest (most MD-82 items use custom
-# laminar/md82/* datarefs or compound conditions, so they stay pilot call-outs).
-checklist: checklists/md82.txt
-checklist_map:
-  - { match: parkbrake,                 action: parking_brake }
-  - { match: transponder_mode,          action: transponder }
-  - { match: pitot_heat,                action: pitot_heat }
-  - { match: elevator_trim,             action: pitch_trim }
-  - { match: taxi_light,                action: !light taxi }
-  - { match: electrical/generator_on,   action: !electrical generators }
-  - { match: electrical/battery_on,     action: !electrical battery }
-  - { match: electrical/avionics_on,    action: !electrical avionics }
+# The checklist's own reads (checklists/md82.yaml) of the MD-82's
+# switches, where the stock dataref does not follow them.
+checklist_states:
+  bus_tie: { datarefs: [laminar/md82/electrical/cross_tie_AC], on: 1, "off": 0 }
+  doors:   { datarefs: ["sim/cockpit2/switches/custom_slider_on[0]"], open: 1, closed: 0 }
+  packs:   { datarefs: [laminar/md82/bleedair/bleedair_HVAC_L, laminar/md82/bleedair/bleedair_HVAC_R], on: 1, "off": 0 }
+  start_switch: { datarefs: [laminar/md82/ignition_sys], ground: [1, 2], normal: 0, continuous: 4 }
+  cargo_doors:  { datarefs: ["sim/cockpit2/switches/custom_slider_on[7]", "sim/cockpit2/switches/custom_slider_on[8]", "sim/cockpit2/switches/custom_slider_on[9]"], open: 1, closed: 0 }
 
 # Phase-expectation advisor: the SOP table. In the listed phases the switch
 # should read as `expect_on`; otherwise the copilot advises once ("aren't you

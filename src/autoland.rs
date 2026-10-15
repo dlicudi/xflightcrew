@@ -158,7 +158,7 @@ const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 const CMD_YAW_DAMPER_OFF: &str = "sim/systems/yaw_damper_off";
 /// The autopilot master as the sim has it (power and failures included).
 const AP_MASTER_ON: &str = autoflight::names::AP_ON;
-const YAW_DAMPER_ON: &str = "sim/cockpit2/switches/yaw_damper_on";
+pub(crate) const YAW_DAMPER_ON: &str = "sim/cockpit2/switches/yaw_damper_on";
 const SERVOS_ON: &str = autoflight::names::SERVOS_ON;
 #[cfg(test)]
 const CMD_SERVOS_FDIR_OFF: &str = autoflight::cmd::SERVOS_FDIR_OFF;

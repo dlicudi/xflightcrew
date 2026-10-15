@@ -349,7 +349,12 @@ pub fn routes_dir() -> PathBuf {
     resources().join("routes")
 }
 
-/// A shipped file: `resource("checklists/md82.txt")`. A relative path a
+/// An airframe's checklist file, by profile id (`checklists/<id>.yaml`).
+pub fn checklist_file(id: &str) -> PathBuf {
+    resources().join("checklists").join(format!("{id}.yaml"))
+}
+
+/// A shipped file: `resource("profiles/learned/x.json")`. A relative path a
 /// profile carries resolves here; an absolute one stays itself.
 pub fn resource(rel: impl AsRef<Path>) -> PathBuf {
     resources().join(rel)
@@ -539,7 +544,7 @@ mod tests {
         let names: Vec<&str> = embedded_files().iter().map(|(n, _)| *n).collect();
         for want in [
             "profiles/cessna_172sp.yaml",
-            "checklists/cessna_172sp.txt",
+            "checklists/cessna_172sp.yaml",
             "assets/afv/Click_f32.wav",
             "assets/afv/Crackle_f32.wav",
             "assets/afv/AFV_COPYING.md",
@@ -741,13 +746,6 @@ mod tests {
 
     /// The lines that may name a root, each with its reason.
     const ALLOWED: &[(&str, &str, &str)] = &[
-        // A profile's own value, as the YAMLs carry it: a shipped file the
-        // checklist loader resolves through `resource`.
-        (
-            "src/aircraft/builtin_profiles.rs",
-            "checklist: Some(\"checklists/",
-            "profile data",
-        ),
         // The spoken word, not a folder.
         ("src/flow.rs", "\"checklists\"", "a word"),
         ("src/router.rs", "\"checklists\"", "a word"),

@@ -18,7 +18,7 @@ use crate::aircraft::SignsSwitch as Signs;
 use crate::xplane::XPlane;
 
 /// 0 off, 1 auto, 2 on.
-const STOCK_SWITCH: &str = "sim/cockpit2/switches/fasten_seat_belts";
+pub(crate) const STOCK_SWITCH: &str = "sim/cockpit2/switches/fasten_seat_belts";
 
 /// The signs change at this altimeter reading, with a band so a level-off at
 /// ten thousand does not ring the cabin chime every minute.
@@ -36,16 +36,6 @@ pub fn publish(own: Option<crate::aircraft::SeatBeltSigns>, has_cabin: bool) {
 /// The live airframe's seat belt switch, `None` with no signs.
 fn signs() -> Option<Signs> {
     crate::aircraft::airframe_facts().signs.clone()
-}
-
-/// Is `dataref` the seat belt switch this airframe's signs are worked by?
-/// The stock switch, or the add-on's declared position dataref.
-pub fn is_signs_dataref(dataref: &str) -> bool {
-    match signs().as_ref() {
-        Some(Signs::Own(own)) => dataref == own.position || dataref == STOCK_SWITCH,
-        Some(Signs::Stock) => dataref == STOCK_SWITCH,
-        None => false,
-    }
 }
 
 /// Switch the signs. `None` on an airframe with none; otherwise whether the

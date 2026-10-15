@@ -19,7 +19,7 @@ use crate::xplane::XPlaneClient;
 
 const APU_N1: &str = "sim/cockpit2/electrical/APU_N1_percent";
 const N2: &str = crate::datarefs::N2_PERCENT;
-const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio"; // the fuel handle
+pub(crate) const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio"; // the fuel handle
 const GEN_ON: &str = "sim/cockpit2/electrical/generator_on";
 const ENGN_RUNNING: &str = crate::datarefs::ENGINE_RUNNING;
 const XFEED_L: &str = "laminar/md82/bleedair/engineL_xfeed_lever";

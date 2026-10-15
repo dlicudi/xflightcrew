@@ -1,0 +1,83 @@
+# Native checklist (format: src/checklist.rs), from the SF50 POM's Checklists section (p.40-60), hand transcribed; the POM's two taxi light rows dropped (no taxi light).
+
+specifications_limitations:
+  - { note: "Engine, 1 x williams fj33." }
+  - { note: "Thrust, 1800 lbf." }
+  - { note: "Mtow - max. takeoff weight, 6000 lb." }
+  - { note: "Mlw - max. landing weight, 5550 lb." }
+  - { note: "Operating empty weight, 3636 lb." }
+  - { note: "Useful payload, 2300 lb." }
+  - { note: "Fuel capacity, 2000 lb jet a-1." }
+  - { note: "Service ceiling, 28000 ft." }
+  - { note: "Range, 1312 nm." }
+  - { note: "Vr - rotate, 90 kias." }
+  - { note: "Vso - stall landing config, 67 kias." }
+  - { note: "Vs - min controllable, 70 kias." }
+  - { note: "Vx - best angle climb, 91 kias." }
+  - { note: "Vbg - best glide, 104 kias." }
+  - { note: "Landing speed - full flap, 87 kias." }
+  - { note: "Vmo - never exceed, 250 kias." }
+  - { note: "Vlo - gear retract (placard), 160 kias." }
+  - { note: "Vle - gear extended (placard), 210 kias." }
+  - { note: "Max cruise, 308 ktas." }
+  - { note: "Long range cruise, 300 ktas." }
+  - { note: "Max demonstrated crosswind, 16 knots." }
+  - { note: "Min takeoff distance, 2036 ft." }
+  - { note: "Min landing distance, 1721 ft." }
+
+engine_start:
+  title: "Cold and dark to engine start"
+  items:
+    - { say: "Cabin door, check closed.", check: doors, is: closed }
+    - { say: "Battery 1 & 2, on.", check: electrical.batteries, is: on }
+    - { say: "Nav lights, on.", check: lights.nav, is: on }
+    - { say: "Fuel control, auto.", check: fuel_selector, is: both }
+    - { say: "Thrust lever, idle.", check: throttle, is: idle }
+    - { say: "Engine start / stop, run." }
+    - { say: "Engine indication system, check green." }
+    - { say: "Generator 1 & 2, on.", check: electrical.generators, is: on }
+    - { say: "Probe heat and ice protection, as required.", check: pitot_heat, is: on }
+
+before_taxi:
+  - { say: "Elevator trim, takeoff." }
+  - { say: "Flaps, set 10 degrees.", check: flaps, is: takeoff, act: false }
+  - { say: "Flight controls, check pitch roll yaw." }
+  - { say: "Transponder, on.", check: transponder, is: standby }
+  - { say: "Parking brake, off.", check: park_brake, is: off }
+
+before_takeoff:
+  - { say: "Altimeter, set." }
+  - { say: "Transponder, alt.", check: transponder, is: altitude }
+
+after_takeoff:
+  - { say: "Landing gear, up.", check: gear, is: up }
+  - { say: "Flaps, retracted.", check: flaps, is: up }
+  - { say: "Thrust, set as required." }
+
+cruise:
+  - { say: "Landing lights, off.", check: lights.landing, is: off }
+  - { say: "Altimeter, set." }
+
+before_landing:
+  - { say: "Altimeter, set." }
+  - { say: "Landing lights, on.", check: lights.landing, is: on }
+
+landing:
+  - { say: "Flaps, set as required." }
+  - { say: "Landing gear, down.", check: gear, is: down }
+
+after_landing:
+  - { say: "Flaps, retracted.", check: flaps, is: up }
+  - { say: "Landing lights, off.", check: lights.landing, is: off }
+  - { say: "Transponder, on.", check: transponder, is: standby }
+
+shutdown:
+  title: "Parking"
+  items:
+    - { say: "Parking brake, on.", check: park_brake, is: on }
+    - { say: "Transponder, standby.", check: transponder, is: standby }
+    - { say: "Engine start / stop, stop." }
+    - { say: "Nav lights, off.", check: lights.nav, is: off }
+    - { say: "Probe heat and ice protection, off.", check: pitot_heat, is: off }
+    - { say: "Generator 1 & 2, off.", check: electrical.generators, is: off }
+    - { say: "Battery 1 & 2, off.", check: electrical.batteries, is: off }

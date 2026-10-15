@@ -26,11 +26,10 @@ tool, XFlightCrew writes the dataref, then **reads back the actual result**
 
 ## Checklists — the copilot runs them with you
 
-Checklists are **interpreted from an XChecklist file**, not baked into the app —
-[checklists/cirrus_sr22.txt](../checklists/cirrus_sr22.txt) (the GoofyJP SR22
-file), the de-facto X-Plane community format (the same files the XChecklist
-plug-in reads). The file is read-only input; the copilot interprets it. Drop in
-any aircraft's `.txt`, point the profile's `checklist:` at it, and it runs.
+Checklists are **data, not code**:
+[checklists/cirrus_sr22.yaml](../checklists/cirrus_sr22.yaml), converted from the
+GoofyJP SR22 XChecklist file. Each item names a state (`flaps`, `park_brake`,
+`lights.landing`), never a dataref; the format is in `src/checklist.rs`.
 
 Say a checklist's name and the copilot **runs it like a pilot-monitoring**, three
 ways per item:

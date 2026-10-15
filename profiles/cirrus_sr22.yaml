@@ -59,10 +59,9 @@ carb_heat: false       # fuel-injected — no carb heat
 fuel_pump: true
 # Fuel selector: OFF / LEFT / RIGHT — no "both" (low-wing twin tanks, fed one at
 # a time). Selector commands verified against the rustdecks deck. The standard
-# sim/cockpit2/fuel/fuel_tank_selector (0=off/1=left/2=right) is the readback the
-# GoofyJP checklist trusts, so it confirms a write and lets the checklist decode
-# the file's `fuel_tank_selector:N` items. ("off" is quoted: bare off is YAML
-# boolean false.)
+# sim/cockpit2/fuel/fuel_tank_selector (0=off/1=left/2=right) is the readback,
+# so it confirms a write and reads the checklist's `fuel_selector` items.
+# ("off" is quoted: bare off is YAML boolean false.)
 fuel_selector:
   readback: sim/cockpit2/fuel/fuel_tank_selector
   positions:
@@ -126,7 +125,6 @@ flaps:
     - { label: "50", spoken: fifty percent, ratio: 0.5, vfe_kts: 150.0 }
     - { label: full, spoken: full,          ratio: 1.0, vfe_kts: 110.0 }
 
-# XChecklist file to interpret (GoofyJP, read-only).
 # Taxi steering. The nosewheel CASTORS: the yoke-heading channel (nosewheel
 # + rudder) has only prop wash behind it at taxi speed, and measured over the
 # blackbox the yaw response per unit of steer is 2.3 deg/s here against 12.8
@@ -237,34 +235,16 @@ ground_plant:
   # rollouts' trk against psi: 3.3 at 11 m/s, 1.6 at 20, 0.7 at 32).
   side_ms2: 30.0
 
-checklist: checklists/cirrus_sr22.txt
+# The checklist's boost pump read (checklists/cirrus_sr22.yaml): the
+# SR22's own switch.
+checklist_states:
+  fuel_pump: { datarefs: [laminar/sr22/switch/boost_pump], on: 1, "off": 0 }
 
 # Lights — datarefs verified against the rustdecks SR22 deck; universal commands.
 lights:
   - { key: nav,     spoken: nav lights,    dataref: sim/cockpit2/switches/navigation_lights_on,   command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
   - { key: strobe,  spoken: strobe lights, dataref: sim/cockpit2/switches/strobe_lights_on,        command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
   - { key: landing, spoken: landing light, dataref: "sim/cockpit2/switches/landing_lights_switch[0]", command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
-
-# Checklist action map. Acts on universal-dataref systems plus the now-wired
-# boost pump, key-start ignition, pitch trim and the off/left/right fuel selector
-# (decoded from the profile's position values). The dual battery/alternator stay
-# call-out — their file conditions are compound &&.
-checklist_map:
-  - { match: parkbrake,        action: parking_brake }
-  - { match: transponder_mode, action: transponder }
-  - { match: pitot_heat_on,    action: pitot_heat }
-  - { match: throttle_ratio,   action: throttle }     # throttle_ratio_all (universal)
-  - { match: ENGN_mixt,        action: mixture }      # set_mixture writes mixture_ratio_all
-  - { match: flap_handle,      action: flaps }        # set_flaps writes flap_ratio
-  - { match: avionics_on,      action: !electrical avionics }  # batteries are compound → call-out
-  - { match: nav_lights,       action: !light nav }
-  - { match: strobe_lights,    action: !light strobe }
-  - { match: landing_lights,   action: !light landing }
-  - { match: boost_pump,         action: fuel_pump }    # set_fuel_pump → fuel_pump_on[0]
-  - { match: ignition_key,       action: ignition }     # actuators/ignition_key: 4=start, 0=off
-  - { match: ignition_on,        action: ignition }     # mag test: 1=R, 2=L, 3=both
-  - { match: elevator_trim,      action: pitch_trim }   # "set T/O" → centre (not ail_trim)
-  - { match: fuel_tank_selector, action: fuel_selector } # 0=off/1=left/2=right
 
 # Cockpit geography — answers "where is the X?" deterministically. Seeded from the
 # POM's layout section (console items are POM-verified); grow as verified live.

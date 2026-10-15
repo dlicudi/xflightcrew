@@ -1,7 +1,7 @@
 //! Profile schema, the configuration: flap detents and the stall by notch, the
 //! reference speeds, taxi and tiller, the yoke, lights, electrics, the
 //! transponder, the load sheet, signs, takeoff power and configuration, pumps,
-//! flow titles and the checklist map.
+//! and the airframe's own checklist state reads.
 
 use super::*;
 
@@ -909,59 +909,20 @@ pub struct PumpCommands {
     pub readback: Vec<String>,
 }
 
-/// One `checklist_flow:` entry: a file section title, or several read in
-/// order as one list.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// An add-on's own read of a checklist state (`checklist_states:`): every
+/// dataref (`name` or `name[i]`) must hold the value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateRead {
+    pub datarefs: Vec<String>,
+    /// Value -> a switch position, or an inclusive `[lo, hi]`.
+    #[serde(flatten)]
+    pub values: std::collections::BTreeMap<String, StateValue>,
+}
+
+/// One value of a [`StateRead`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum FlowTitles {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl FlowTitles {
-    pub fn titles(&self) -> Vec<&str> {
-        match self {
-            FlowTitles::One(t) => vec![t.as_str()],
-            FlowTitles::Many(ts) => ts.iter().map(String::as_str).collect(),
-        }
-    }
-}
-
-/// One entry of the checklist action map: a dataref *substring* and the curated
-/// action it drives. When the interpreter ([`crate::checklist`]) meets a file
-/// item whose dataref contains `match_`, it runs that action — so *which*
-/// dataref maps to *which* system is per-airframe config here, while *how* a
-/// condition becomes the tool's argument stays shared logic in Rust. First match
-/// wins, so order more specific entries first.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChecklistMapEntry {
-    /// Substring matched against the file's dataref (e.g. `"parkbrake"`,
-    /// `"battery_array_on[0]"`).
-    #[serde(rename = "match")]
-    pub match_: String,
-    /// The action this dataref drives.
-    pub action: ChecklistAction,
-}
-
-/// A curated action a checklist item can drive. The variant names *what* system;
-/// the condition supplies the value (handled in [`crate::checklist`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChecklistAction {
-    ParkingBrake,
-    PitotHeat,
-    FuelPump,
-    AutopilotOff,
-    Transponder,
-    FuelSelector,
-    Flaps,
-    Mixture,
-    Throttle,
-    /// Ignition key: start (crank) or magneto position, from the value.
-    Ignition,
-    PitchTrim,
-    /// Electrical system by name (`battery`, `alternator`, `avionics`, `master`).
-    Electrical(String),
-    /// A switchable light by its profile key (`nav`, `landing`, …).
-    Light(String),
+pub enum StateValue {
+    At(f64),
+    Range([f64; 2]),
 }

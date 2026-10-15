@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use super::{Tool, ToolCtx};
 use crate::aircraft::FuelSelectorProfile;
 
-const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio_all";
+pub(crate) const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio_all";
 const BATTERY: &str = "sim/cockpit/electrical/battery_on";
 const BUS_VOLTS: &str = crate::datarefs::BUS_VOLTS;
 const GROUNDSPEED: &str = crate::datarefs::GROUNDSPEED_MS; // m/s
@@ -24,13 +24,13 @@ const CMD_MAGS_OFF: &str = "sim/magnetos/magnetos_off";
 const CMD_ALTERNATOR_ON: &str = "sim/electrical/generator_1_on";
 const GENERATOR: &str = "sim/cockpit/electrical/generator_on"; // array; [0] = alternator
                                                                // Per-engine actuator arrays (the 172 is single-engine → element 0).
-const FUEL_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
-const IGNITION_KEY: &str = "sim/cockpit2/engine/actuators/ignition_key"; // 0 off,1 R,2 L,3 both,4 start
+pub(crate) const FUEL_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
+pub(crate) const IGNITION_KEY: &str = "sim/cockpit2/engine/actuators/ignition_key"; // 0 off,1 R,2 L,3 both,4 start
                                                                          // Per-engine magneto selector (0 off,1 R,2 L,3 both) — for radials whose mags
                                                                          // aren't the single `ignition_key` (e.g. the DC-3, one selector per engine).
 /// The avionics master's position, the readback for `sim/systems/avionics_on`.
 const AVIONICS_POWER: &str = "sim/cockpit2/switches/avionics_power_on";
-const IGNITION_ON: &str = "sim/cockpit/engine/ignition_on";
+pub(crate) const IGNITION_ON: &str = "sim/cockpit/engine/ignition_on";
 const CARB_HEAT: &str = "sim/cockpit2/engine/actuators/carb_heat_ratio"; // 0 cold .. 1 hot
 
 /// Write the same value to elements `0..engines` of an int array dataref — for

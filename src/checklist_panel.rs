@@ -1,8 +1,8 @@
-//! The panel's Checklist tab (2026-10-13): the airframe's PROFILED lists
-//! (`profile.checklist`, as [`crate::flow::installed`] holds them) on
+//! The panel's Checklist tab (2026-10-13): the airframe's lists
+//! (`checklists/<id>.yaml`, as [`crate::flow::installed`] holds them) on
 //! `xcopilot/status/checklist`, the one section on screen judged live.
 //!
-//! No list, no fallback: an airframe whose profile names no checklist is
+//! No list, no fallback: an airframe without a checklist file is
 //! published with no titles, and the tab says it has none.
 //!
 //! Live judging reads only while the tab is ON SCREEN (the plugin's
@@ -29,8 +29,8 @@
 //! `run` 'R' while that flow runs, 'L' for this flight's last list, '-'
 //! none, `phrase` the pilot English the Run button types for the shown
 //! section (empty: no phrase routes to it alone), then every title.
-//! One row per item of the shown section: `kind` A act, V verify, C
-//! call-out, N narration; `state` live p pass, n not yet, u unknown (not
+//! One row per item of the shown section: `kind` A act (a tool sets it), V
+//! verify (read only), C call-out, N narration; `state` live p pass, n not yet, u unknown (not
 //! read, or off screen), '-' no test; from the sheet R now, D done, H held
 //! (`by` names the holder), X discrepancy, S skipped, F failed, U unread,
 //! W said; `text` the spoken line, last so it may hold anything.
@@ -94,11 +94,11 @@ pub(crate) fn state_code(live: Live, sheet: Option<ItemState>) -> char {
 }
 
 fn kind_code(item: &Item) -> char {
-    match item {
-        Item::Act { .. } => 'A',
-        Item::Verify { .. } => 'V',
-        Item::CallOut(_) => 'C',
-        Item::Narrate(_) => 'N',
+    match (item.note, item.has_test(), item.action().is_some()) {
+        (true, ..) => 'N',
+        (_, _, true) => 'A',
+        (_, true, _) => 'V',
+        _ => 'C',
     }
 }
 
@@ -243,8 +243,8 @@ pub(crate) enum Value {
 /// The datarefs a section's pass tests read, each once: (name, array).
 pub(crate) fn read_keys(cl: &Checklist) -> Vec<(String, bool)> {
     let mut keys: Vec<(String, bool)> = Vec::new();
-    for a in cl.items.iter().flat_map(Item::atoms) {
-        let k = (a.dataref, a.index.is_some());
+    for t in cl.items.iter().flat_map(Item::terms) {
+        let k = (t.dataref.clone(), t.index.is_some());
         if !keys.contains(&k) {
             keys.push(k);
         }
@@ -266,7 +266,7 @@ pub(crate) fn judge_all(
                 return Live::NoTest;
             }
             let values: Vec<Option<f64>> = item
-                .atoms()
+                .terms()
                 .iter()
                 .map(|a| {
                     let k = keys
@@ -388,19 +388,19 @@ mod tests {
     use super::*;
     use crate::flow::{Flavour, SheetItem};
 
-    const TEXT: &str = "\
-sw_checklist:BEFORE TAKEOFF
-sw_remark:Run-up
-sw_item:PARKING BRAKE|SET:sim/flightmodel/controls/parkbrake:1
-sw_item:THROTTLE|1800 RPM:sim/cockpit2/engine/actuators/throttle_ratio[0]:>0.5
-sw_item:FLIGHT CONTROLS|FREE AND CORRECT
-sw_checklist:LANDING
-sw_item:FLAPS|AS REQUIRED
-";
+    const TEXT: &str = r#"
+before_takeoff:
+  - { note: "Run-up." }
+  - { say: "Parking brake, set.", check: park_brake, is: on }
+  - { say: "Magnetos, both.", check: magnetos, is: both }
+  - { say: "Flight controls, free and correct." }
+landing:
+  - { say: "Flaps, as required." }
+"#;
 
     fn lists() -> Vec<Checklist> {
         let profile = crate::aircraft::load("cessna_172sp").expect("profile");
-        checklist::parse(TEXT, &profile)
+        checklist::parse(TEXT, &profile).expect("parses")
     }
 
     fn sheet(states: &[ItemState], running: bool) -> Sheet {
@@ -529,19 +529,16 @@ sw_item:FLAPS|AS REQUIRED
         assert_eq!(
             keys,
             vec![
-                ("sim/flightmodel/controls/parkbrake".to_string(), false),
-                (
-                    "sim/cockpit2/engine/actuators/throttle_ratio".to_string(),
-                    true
-                ),
+                (crate::tools::PARK_BRAKE.to_string(), false),
+                (crate::tools::engine::IGNITION_KEY.to_string(), true),
             ]
         );
-        let ok = [Some(Value::Scalar(1.0)), Some(Value::Array(vec![0.2, 0.9]))];
+        let ok = [Some(Value::Scalar(1.0)), Some(Value::Array(vec![2.0, 3.0]))];
         assert_eq!(
             judge_all(&l[0], &keys, &ok),
             vec![Live::NoTest, Live::Pass, Live::NotYet, Live::NoTest]
         );
-        let failed = [None, Some(Value::Array(vec![0.9]))];
+        let failed = [None, Some(Value::Array(vec![3.0]))];
         assert_eq!(
             judge_all(&l[0], &keys, &failed),
             vec![Live::NoTest, Live::Unknown, Live::Pass, Live::NoTest]
@@ -556,14 +553,14 @@ sw_item:FLAPS|AS REQUIRED
 
     #[test]
     fn a_long_section_ends_on_a_whole_row() {
-        let mut text = String::from("sw_checklist:LONG\n");
+        let mut text = String::from("long:\n");
         for i in 0..200 {
             text.push_str(&format!(
-                "sw_item:A VERY LONG CHALLENGE NAMED NUMBER {i} FOR THE BUDGET|CHECKED AND CONFIRMED\n"
+                "  - {{ say: \"A very long challenge named number {i} for the budget, checked and confirmed.\" }}\n"
             ));
         }
         let profile = crate::aircraft::load("cessna_172sp").expect("profile");
-        let l = checklist::parse(&text, &profile);
+        let l = checklist::parse(&text, &profile).expect("parses");
         let p = payload("C172", &l, Some(0), None, &[]);
         assert!(p.len() <= CHECKLIST_MAX, "{}", p.len());
         assert!(p.ends_with("more items not shown"), "{p}");

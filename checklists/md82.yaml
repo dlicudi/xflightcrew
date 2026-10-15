@@ -1,0 +1,287 @@
+# Native checklist (format: src/checklist.rs), from royaloak's Laminar MD-82 checklist.
+
+preliminary_preflight_procedure_1:
+  - { say: "Simulator date and time, check." }
+  - { say: "Simulator sound levels, check." }
+  - { say: "Aircraft weight and fuel, check." }
+  - { note: "See pilot operating handbook for details." }
+  - { say: "Start xacars and xsquawkbox, check." }
+  - { say: "Parking brake, set.", check: park_brake, is: on }
+  - { say: "Landing gear lever, down.", check: gear, is: down }
+  - { say: "External power, on.", check: ground_power, is: on }
+  - { say: "External power left and right bus, on." }
+  - { say: "Weather radar, off.", check: weather_radar, is: off }
+  - { say: "Galley, on." }
+  - { say: "Passenger door (key is shift+f1), open.", check: doors, is: open }
+  - { say: "Passenger stairs (key is shift+f3), extend." }
+  - { say: "Forward cargo door, open.", check: cargo_doors.1, is: open }
+  - { say: "Mid cargo door, open.", check: cargo_doors.2, is: open }
+  - { say: "Aft cargo door, open.", check: cargo_doors.3, is: open }
+  - { say: "Clear master caution, check.", check: master_caution, is: clear }
+  - { say: "Battery, on and locked.", check: electrical.battery, is: on }
+  - { say: "Fmc, program flight plan." }
+
+preliminary_preflight_procedure_2:
+  - { say: "Apu air source, air condition cooler.", check: apu_bleed, is: on }
+  - { say: "Engine start pump, on.", check: fuel_pump, is: on, act: false }
+  - { say: "Apu master, run.", check: apu, is: on }
+  - { say: "Apu master, start." }
+  - { say: "Check apu power avail, check." }
+  - { say: "Apu bus left, on." }
+  - { say: "Apu bus right, on." }
+  - { say: "Check apu volts and frequency, check.", check: apu_generator, is: on }
+  - { say: "Right generator, on.", check: electrical.generators, is: on }
+  - { say: "Left generator, on.", check: electrical.generators, is: on }
+  - { say: "External power left bus, off." }
+  - { say: "External power right bus, off." }
+  - { say: "External power, off.", check: ground_power, is: off }
+  - { say: "Check apu ac load, check." }
+  - { say: "Instrument lights, as required." }
+
+light_test:
+  - { say: "Stall test, check." }
+  - { say: "Max spd warning test, check." }
+  - { say: "Annunciator/digital lights test, check.", check: lamp_test, is: pressed }
+  - { say: "Loops a test, check." }
+  - { say: "Loops b test, check." }
+  - { say: "Clear master caution, check.", check: master_caution, is: clear }
+  - { say: "Clear master warning, check.", check: master_warning, is: clear }
+  - { say: "Seat belt sign, on.", check: seat_belts, is: on }
+  - { say: "No smoking sign, on." }
+
+engine_start:
+  - { say: "Stairs stowed & passenger door closed, check.", check: doors, is: closed }
+  - { say: "Forward cargo door, closed.", check: cargo_doors.1, is: closed }
+  - { say: "Mid cargo door, closed.", check: cargo_doors.2, is: closed }
+  - { say: "Aft cargo door, closed.", check: cargo_doors.3, is: closed }
+  - { say: "Anti collision lights, on.", check: lights.beacon, is: on, act: false }
+  - { say: "Push and start clearance, received and activated." }
+  - { say: "Pushback procedure as required, check." }
+  - { say: "Left engine bleed air cross feed, on." }
+  - { say: "Right engine bleed air cross feed, on." }
+  - { say: "Auxilliary transfer pump, on." }
+  - { say: "Left fuel pumps, on.", check: fuel_pumps.2, is: on }
+  - { say: "Center fuel pumps, on.", check: fuel_pumps.1, is: on }
+  - { say: "Right fuel pumps, on.", check: fuel_pumps.3, is: on }
+  - { say: "Engine start system a or b, select.", check: start_switch, is: ground }
+  - { say: "Right engine starter, hold until 20% n2.", check: n2.2, is: turning }
+  - { say: "Right fuel handles, on.", check: start_levers.2, is: idle }
+  - { say: "Check right volts and frequency, check." }
+  - { say: "Left engine starter, hold until 20% n2.", check: n2.1, is: turning }
+  - { say: "Left fuel handles, on.", check: start_levers.1, is: idle }
+  - { say: "Check left volts and frequency, check." }
+  - { say: "Engine starter system, off.", check: start_switch, is: normal }
+  - { say: "Engine start pump, off.", check: fuel_pump, is: off, act: false }
+  - { say: "Ac bus x-tie, auto.", check: bus_tie, is: on }
+  - { say: "Apu bus left, off." }
+  - { say: "Apu bus right, off." }
+  - { say: "Apu bleed air, off.", check: apu_bleed, is: off }
+  - { say: "Apu master, off.", check: apu, is: off }
+
+flight_controls_check:
+  - { say: "Flight control elevators full forward.", check: controls, is: pitch_forward }
+  - { say: "Flight control elevators full aft.", check: controls, is: pitch_aft }
+  - { say: "Flight control ailerons full left.", check: controls, is: roll_left }
+  - { say: "Flight control ailerons full right.", check: controls, is: roll_right }
+  - { say: "Flight control rudder full left.", check: controls, is: yaw_left }
+  - { say: "Flight control rudder full right.", check: controls, is: yaw_right }
+
+before_taxi:
+  - { say: "Seat belt sign, on.", check: seat_belts, is: on }
+  - { say: "Strobe lights, position." }
+  - { say: "Logo light, on." }
+  - { say: "Air conditioning left system, auto.", check: packs, is: on }
+  - { say: "Air conditioning right system, auto." }
+  - { note: "(check supply pressure)." }
+  - { say: "Cockpit temp, auto as desired." }
+  - { say: "Cabin temp, auto as desired." }
+  - { say: "Anti skid, armed." }
+  - { say: "Yaw damper, off.", check: yaw_damper, is: off }
+  - { say: "Elevator trim, up 10 degrees.", check: pitch_trim, is: takeoff }
+  - { say: "Flaps to 15 degrees, check.", check: flaps, is: "15", act: false }
+  - { say: "Speed bugs set, as calculated." }
+  - { say: "Flight director on.", check: flight_director, is: on }
+  - { say: "Autopilot, data set and off." }
+  - { say: "Heading to runway heading, check." }
+  - { say: "Check doors are closed, check." }
+  - { say: "Nose lights, on dim or bright.", check: lights.taxi, is: on, act: false }
+  - { say: "Barometric value set local qnh, set." }
+  - { say: "Transponder, set as required.", check: transponder, is: standby }
+  - { say: "Pitot/stall heat, capt.", check: pitot_heat, is: on, act: false }
+  - { say: "Left and right air foil heat, on if needed." }
+  - { say: "Windshield anti fog and ice, on.", check: window_heat, is: on }
+  - { say: "Left engine anti ice, on if needed." }
+  - { say: "Right engine anti ice, on if needed." }
+  - { say: "Parking brake, off.", check: park_brake, is: off }
+
+hold_short:
+  - { say: "Engine start system, ovrd.", check: start_switch, is: continuous }
+  - { say: "Annunciator panel, check." }
+  - { say: "Left external flood light, extend on." }
+  - { say: "Right external flood light, extend on." }
+  - { say: "Nose lights, off.", check: lights.taxi, is: off }
+  - { say: "Auto brake, t.o.", check: autobrake, is: rto }
+  - { say: "Galley off for takeoff, off." }
+  - { say: "Check engine instruments, check." }
+  - { say: "Check anti ice, check." }
+  - { say: "Decision height, set." }
+  - { say: "Heading to runway heading, set and active." }
+  - { say: "Vertical speed, set and active." }
+  - { say: "Altitude to first cleared altitude, set." }
+  - { say: "Autothrottle set, 240." }
+  - { note: "Caution vnav button acts as altitude hold." }
+  - { say: "Takeoff clearance, request." }
+  - { say: "Strobe, both." }
+  - { say: "Weather radar, on.", check: weather_radar, is: on }
+  - { say: "Transponder, xpdr.", check: transponder, is: altitude, act: false }
+  - { say: "Timer, on." }
+
+take_off:
+  - { say: "Line up, check." }
+  - { say: "Parking brake, set.", check: park_brake, is: on }
+  - { say: "N1, 90%." }
+  - { say: "Parking brake, off.", check: park_brake, is: off }
+  - { say: "Vr speed check, above 130 knots." }
+  - { say: "Climb, positive." }
+  - { say: "Landing gear lever, up.", check: gear, is: up }
+  - { say: "Flaps, up." }
+  - { say: "Altitude, passing 300 feet." }
+  - { say: "When at 300 feet, engage auto throttle." }
+  - { say: "Altitude, passing 400 feet." }
+  - { say: "When at 400 feet, engage autopilot command.", check: autopilot, is: on, act: false }
+  - { say: "Vertical speed, set and active." }
+  - { say: "Nav source, as required." }
+  - { say: "Galley, on." }
+
+climb:
+  - { say: "At transition altitude, 1013 /2992.", check: altimeter, is: standard }
+  - { say: "Left external flood light, retract and off." }
+  - { say: "Right external flood light, retract and off." }
+  - { say: "Nose lights, off.", check: lights.taxi, is: off }
+  - { say: "Logo light, off." }
+  - { say: "Auto brakes, off.", check: autobrake, is: off }
+  - { say: "Engine start system, off above weather.", check: start_switch, is: normal }
+  - { say: "Yaw damper, on.", check: yaw_damper, is: on }
+  - { note: "Seatbelts as required." }
+  - { say: "Maintain 250kts below 10,000 feet, check." }
+  - { say: "Altitude, passing 10000 feet." }
+  - { say: "Set climb speed above 10000 feet, as required." }
+  - { say: "Monitor engine instruments, check." }
+
+cruise:
+  - { say: "Set cruise speed to 300kts, check." }
+  - { note: "300 is mach 0.79 at fl330." }
+  - { say: "Seat belt sign, off.", check: seat_belts, is: off }
+  - { say: "No smoking sign, on." }
+  - { say: "Bank angle, 10 degrees above flight level 300." }
+  - { say: "Check autopilot data." }
+
+descent:
+  - { say: "Seat belt sign, on.", check: seat_belts, is: on }
+  - { say: "Nav 1 ils frequency, set." }
+  - { note: "Nav radio page of fmc." }
+  - { say: "Landing runway course obs1, set." }
+  - { say: "Landing lights extend & on before 10,000 feet, check." }
+  - { say: "Logo light, on." }
+  - { say: "Left ground flood light, on." }
+  - { say: "Right ground flood light, on." }
+
+approach:
+  - { say: "Anti skid, on." }
+  - { say: "Yaw damper, off.", check: yaw_damper, is: off }
+  - { say: "At transition level set local qnh, set." }
+  - { say: "<230 knots flaps to 11 degrees, check." }
+  - { say: "Speed brakes, armed.", check: speedbrake, is: armed }
+  - { say: "Bank angle, 30." }
+  - { say: "Auto brakes, arm and set.", check: autobrake, is: on }
+  - { say: "180 knots approach, check." }
+  - { say: "Flaps to 28 degrees, check.", check: flaps, is: "28", act: false }
+  - { say: "Gear down at 28 deg flaps, down 3 green.", check: gear, is: down }
+  - { say: "Engine start system, ovrd.", check: start_switch, is: continuous }
+  - { say: "Slow to 160 knots for final, check." }
+  - { note: "Caution auto land indication does not mean an autoland!." }
+  - { say: "Autothrottle, off 200 feet before touchdown." }
+  - { say: "Auto pilot, off 50 feet before touchdown.", check: autopilot, is: off, act: false }
+
+touchdown:
+  - { say: "Ground contact, touchdown." }
+  - { say: "Thrust levers, reverse max." }
+  - { say: "Brakes, as required." }
+  - { say: "Landing speed, 70 knots." }
+  - { say: "Thrust levers, reverse idle." }
+  - { say: "Landing speed, 30 knots." }
+  - { say: "Thrust levers, fwd idle.", check: throttle, is: idle, act: false }
+  - { say: "Landing speed, 20 knots." }
+  - { say: "Auto brake, disengage.", check: autobrake, is: off }
+  - { say: "Flaps to 15 degrees, check." }
+  - { say: "Brake as required, check." }
+
+taxi_to_terminal:
+  - { say: "Auto brakes, off.", check: autobrake, is: off }
+  - { say: "Nose light, on dim or bright.", check: lights.taxi, is: on, act: false }
+  - { say: "Chrono, off/reset." }
+  - { say: "Speed brakes, retract.", check: speedbrake, is: down }
+  - { say: "Flaps, retract.", check: flaps, is: up, act: false }
+  - { say: "Transponder, stby.", check: transponder, is: standby }
+  - { say: "Left external flood light, retract and off." }
+  - { say: "Right external flood light, retract and off." }
+  - { say: "Strobe, position." }
+  - { say: "Left and right surface heat, off." }
+  - { say: "Windshield anti fog and ice, off.", check: window_heat, is: off }
+  - { say: "Left engine anti ice, off." }
+  - { say: "Right engine anti ice, off." }
+
+shut_down_1:
+  - { say: "Parking brake, set.", check: park_brake, is: on }
+  - { say: "Anti skid, off." }
+  - { say: "Nose light, off.", check: lights.taxi, is: off }
+  - { say: "Apu air source, air condition cooler.", check: apu_bleed, is: on }
+  - { say: "Engine start pump, on.", check: fuel_pump, is: on, act: false }
+  - { say: "Apu master, run.", check: apu, is: on }
+  - { say: "Apu master, start." }
+  - { say: "Check apu power avail, check." }
+  - { say: "Apu bus left, on." }
+  - { say: "Apu bus right, on." }
+  - { say: "Apu generator, on.", check: apu_generator, is: on }
+  - { say: "Right generator, off.", check: electrical.generators, is: off }
+  - { say: "Left generator, off.", check: electrical.generators, is: off }
+  - { say: "Seat belt sign, off.", check: seat_belts, is: off }
+  - { say: "Flaps, retract.", check: flaps, is: up, act: false }
+  - { say: "Left fuel, off.", check: start_levers.1, is: cutoff }
+  - { say: "Right fuel, off.", check: start_levers.2, is: cutoff }
+  - { say: "Left fuel pumps, off.", check: fuel_pumps.2, is: off }
+  - { say: "Center fuel pumps, off.", check: fuel_pumps.1, is: off }
+  - { say: "Right fuel pumps, off.", check: fuel_pumps.3, is: off }
+  - { say: "Auxilliary transfer pump, off." }
+  - { say: "Ac bus x-tie, open.", check: bus_tie, is: off }
+  - { say: "Left engine bleed air cross feed, off." }
+  - { say: "Right engine bleed air cross feed, off." }
+  - { say: "Pitot and stall heat, off.", check: pitot_heat, is: off, act: false }
+  - { say: "Engine start system, off.", check: start_switch, is: normal }
+  - { say: "Engine start pump, off.", check: fuel_pump, is: off, act: false }
+  - { say: "Battery, unlocked and off.", check: electrical.battery, is: off }
+  - { say: "External power, on.", check: ground_power, is: on }
+  - { say: "External power left and right bus, on." }
+
+shut_down_2:
+  - { say: "Galley, off." }
+  - { say: "Apu bus left, off." }
+  - { say: "Apu bus right, off." }
+  - { say: "Apu master, off.", check: apu, is: off }
+  - { say: "Apu generator, off.", check: apu_generator, is: off }
+  - { say: "Air conditioning left system, off.", check: packs, is: off }
+  - { say: "Air conditioning right system, off." }
+  - { say: "Cockpit temp, centre." }
+  - { say: "Cabin temp, centre." }
+  - { say: "Yaw damper, off.", check: yaw_damper, is: off }
+  - { say: "Strobe, off." }
+  - { say: "Anti collision lights, off.", check: lights.beacon, is: off, act: false }
+  - { say: "Left ground flood light, off." }
+  - { say: "Right ground flood light, off." }
+  - { say: "Logo light, off." }
+  - { note: "Disembark passengers and cargo." }
+  - { say: "Internal lights, as required." }
+  - { say: "Stairs stowed & doors closed, check." }
+  - { say: "External power left bus, off." }
+  - { say: "External power right bus, off." }
+  - { say: "External power, off.", check: ground_power, is: off }

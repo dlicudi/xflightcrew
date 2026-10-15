@@ -220,6 +220,30 @@ pub const APU_N1_PERCENT: &str = "sim/cockpit2/electrical/APU_N1_percent";
 pub const APU_BLEED: &str = "sim/cockpit2/bleedair/actuators/apu_bleed";
 /// Per bus, volts.
 pub const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
+
+// --- Systems a checklist confirms (`checklist::STATES`), read-only ---
+pub const APU_RUNNING: &str = "sim/cockpit2/electrical/APU_running";
+pub const APU_GENERATOR_ON: &str = "sim/cockpit2/electrical/APU_generator_on";
+pub const PACK_LEFT: &str = "sim/cockpit2/bleedair/actuators/pack_left";
+/// Per engine, the bleed shutoff valve.
+pub const ENGINE_BLEED_SOV: &str = "sim/cockpit2/bleedair/actuators/engine_bleed_sov";
+/// Per door, 1 open.
+pub const DOOR_OPEN: &str = "sim/cockpit2/switches/door_open";
+pub const ELECTRIC_HYDRAULIC_PUMP_ON: &str = "sim/cockpit2/switches/electric_hydraulic_pump_on";
+pub const CROSS_TIE: &str = "sim/cockpit2/electrical/cross_tie";
+pub const WINDOW_HEAT: &str = "sim/cockpit2/ice/ice_window_heat_on";
+pub const O2_VALVE_ON: &str = "sim/cockpit2/oxygen/actuators/o2_valve_on";
+pub const MASTER_CAUTION: &str = "sim/cockpit2/annunciators/master_caution";
+pub const MASTER_WARNING: &str = "sim/cockpit2/annunciators/master_warning";
+pub const WEATHER_RADAR: &str = "sim/cockpit2/EFIS/EFIS_weather_on";
+/// 0 normal, 1 ignition/start, -1 crank.
+pub const ENG_MODE_SELECTOR: &str = "sim/cockpit2/engine/actuators/eng_mode_selector";
+/// The cockpit's control deflections, -1..1.
+pub const CONTROL_ROLL: &str = "sim/cockpit2/controls/yoke_roll_ratio";
+pub const CONTROL_PITCH: &str = "sim/cockpit2/controls/yoke_pitch_ratio";
+pub const CONTROL_YAW: &str = "sim/cockpit2/controls/yoke_heading_ratio";
+/// 1 while the annunciator test is held.
+pub const LAMP_TEST: &str = "sim/cockpit/warnings/annunciator_test_pressed";
 pub const STALL_WARNING_RATIO: &str = "sim/cockpit2/annunciators/stall_warning_ratio";
 /// 1 while a tug is on the bar.
 pub const PUSHBACK_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";

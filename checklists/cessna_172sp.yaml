@@ -1,0 +1,172 @@
+# Native checklist (format: src/checklist.rs), from the Cessna 172SP Streamlined Procedures for X-Plane.
+
+preflight:
+  - { note: "Preflight - cabin." }
+  - { note: "External preflight, completed." }
+  - { note: "Documents, on board." }
+  - { say: "Parking brake, on.", check: park_brake, is: on }
+  - { say: "Ignition switch, off.", check: magnetos, is: off }
+  - { say: "Avionics master switch, off.", check: electrical.avionics, is: off }
+  - { say: "Master switch (battery), on.", check: electrical.battery, is: on }
+  - { say: "Fuel quantity, sufficient." }
+  - { say: "Avionics master switch, on.", check: electrical.avionics, is: on }
+  - { say: "Avionics cooling fan, audible.", check: electrical.avionics, is: on }
+  - { say: "Avionics master switch, off.", check: electrical.avionics, is: off }
+  - { say: "Static pressure alternate, off." }
+  - { say: "Warning lights panel, tested.", check: lamp_test, is: pressed }
+  - { say: "Fuel selector valve, both.", check: fuel_selector, is: both }
+  - { say: "Fuel shutoff valve, pushed in." }
+  - { say: "Flaps (10 20 full), tested.", check: flaps, is: full }
+  - { say: "Flaps, up.", check: flaps, is: up }
+  - { say: "Pitot heat, on.", check: pitot_heat, is: on }
+  - { say: "Ammeter current load, check." }
+  - { say: "Pitot heat, off.", check: pitot_heat, is: off }
+  - { say: "Master switch (battery), off.", check: electrical.battery, is: off }
+  - { say: "Elevator trim, set for takeoff.", check: pitch_trim, is: takeoff }
+
+before_start:
+  title: "Before starting engine"
+  items:
+    - { note: "Preflight inspection, completed." }
+    - { note: "Passenger briefing, completed." }
+    - { note: "Seats & belts, adjusted & secure." }
+    - { note: "Circuit breakers, checked in." }
+    - { note: "Electrical equipment, off." }
+    - { say: "Parking brake, on.", check: park_brake, is: on }
+    - { say: "Autopilot, off.", check: autopilot, is: off }
+    - { say: "Avionics master switch, off.", check: electrical.avionics, is: off }
+    - { say: "Fuel selector valve, both.", check: fuel_selector, is: both }
+    - { say: "Fuel shutoff valve, pushed in." }
+
+engine_start:
+  title: "Starting engine"
+  items:
+    - { say: "Master switch (battery), on.", check: electrical.battery, is: on }
+    - { say: "Beacon light, on.", check: lights.beacon, is: on }
+    - { say: "Throttle, open 1/4 inch.", check: throttle, is: start }
+    - { say: "Mixture, full rich.", check: mixture, is: rich }
+    - { note: "Carb heat, cold." }
+    - { say: "Aux fuel pump, on (3 secs).", check: fuel_pump, is: on }
+    - { say: "Aux fuel pump, off.", check: fuel_pump, is: off }
+    - { say: "Propeller area, clear." }
+    - { say: "Ignition switch, start.", check: engine, is: running }
+    - { say: "Oil pressure, checked." }
+    - { say: "Master switch (alternator), on.", check: electrical.alternator, is: on }
+    - { say: "Ammeter, checked." }
+    - { say: "Nav lights, on (at night).", check: lights.nav, is: on }
+    - { say: "Avionics master switch, on.", check: electrical.avionics, is: on }
+    - { note: "Radios & gps, on." }
+    - { say: "Flaps, up.", check: flaps, is: up }
+
+before_taxi:
+  - { say: "Fuel quantity, checked." }
+  - { say: "Flight controls, free & correct." }
+  - { note: "Seats backs & belts, upright & secure." }
+  - { say: "Cabin doors, close.", check: doors, is: closed }
+  - { say: "Flight instruments, set." }
+  - { say: "Radios & avionics, set." }
+  - { say: "Transponder mode, standby.", check: transponder, is: standby }
+  - { say: "Taxi lights, on.", check: lights.taxi, is: on }
+  - { say: "Parking brake, off.", check: park_brake, is: off }
+  - { say: "Brakes, checked." }
+  - { say: "Parking brake, on.", check: park_brake, is: on }
+
+before_takeoff:
+  - { say: "Parking brake, on.", check: park_brake, is: on }
+  - { say: "Mixture, full rich.", check: mixture, is: rich }
+  - { say: "Fuel selector valve, both.", check: fuel_selector, is: both }
+  - { note: "Magneto test." }
+  - { say: "Throttle, open 1800 rpm.", check: throttle, is: runup }
+  - { say: "Ignition switch to, left.", check: magnetos, is: left }
+  - { say: "Ignition switch to, right.", check: magnetos, is: right }
+  - { say: "Magneto drop & difference, maximum 125 & 50." }
+  - { say: "Ignition switch to, both.", check: magnetos, is: both }
+  - { say: "Throttle, 1000 rpm.", check: throttle, is: start }
+  - { say: "Engine instruments, checked green." }
+  - { say: "Warning lights panel, clear." }
+  - { say: "Strobe lights, on.", check: lights.strobe, is: on }
+  - { say: "Landing lights, on.", check: lights.landing, is: on }
+  - { say: "Radios & avionics, checked and set." }
+  - { say: "Autopilot, off.", check: autopilot, is: off }
+  - { say: "Elevator trim, set for takeoff.", check: pitch_trim, is: takeoff }
+  - { say: "Flaps (0 or 10), as required." }
+
+normal_takeoff:
+  - { say: "Taxi lights, off.", check: lights.taxi, is: off }
+  - { say: "Transponder mode, altitude.", check: transponder, is: altitude }
+  - { say: "Flaps, as required." }
+  - { say: "Mixture, full rich.", check: mixture, is: rich }
+  - { say: "Parking brake, off.", check: park_brake, is: off }
+  - { say: "Throttle to full smoothly, engine responding.", check: throttle, is: full }
+  - { note: "Instruments and airspeed green and alive." }
+  - { say: "Elevator - lift nose wheel at, 60 knots." }
+  - { note: "Recommended climb airspeed 70 to 85 knots." }
+  - { say: "Flaps, up.", check: flaps, is: up }
+
+climb:
+  - { say: "Landing lights, off.", check: lights.landing, is: off }
+  - { say: "Throttle, full.", check: throttle, is: full }
+  - { say: "Mixture, full rich.", check: mixture, is: rich }
+  - { note: "Recommended climb airspeed 70 to 85 knots." }
+
+cruise:
+  - { say: "Power (2100-2500 rpm), adjusted.", check: throttle, is: cruise }
+  - { say: "Elevator trim, adjusted." }
+  - { say: "Mixture, lean.", check: mixture, is: lean }
+  - { say: "Navaids & radios, set." }
+  - { say: "Navigation, on course." }
+  - { say: "Flight instruments, checked." }
+  - { say: "Engine instruments, checked green." }
+  - { say: "Fuel quantity, sufficient." }
+
+descent:
+  - { say: "Power, adjusted." }
+  - { say: "Mixture, full rich.", check: mixture, is: rich }
+  - { say: "Altimeter, set." }
+  - { say: "Nav/gps, set." }
+  - { say: "Fuel selector valve, both.", check: fuel_selector, is: both }
+  - { say: "Flaps, as required." }
+  - { note: "0-10 below 110 kias." }
+  - { note: "10-30 below 85  kias." }
+
+before_landing:
+  - { note: "Seats backs & belts, upright & secure." }
+  - { say: "Fuel selector valve, both.", check: fuel_selector, is: both }
+  - { say: "Mixture, full rich.", check: mixture, is: rich }
+  - { say: "Landing lights, on.", check: lights.landing, is: on }
+  - { say: "Taxi lights, on.", check: lights.taxi, is: on }
+  - { say: "Autopilot, off.", check: autopilot, is: off }
+
+normal_landing:
+  - { say: "Flaps, as required." }
+  - { note: "Recommended approach speeds." }
+  - { note: "Flaps up 65 to 75 knots." }
+  - { note: "Flaps down 60 to 70 knots." }
+  - { note: "Touchdown  main wheels first - lower nose gently." }
+  - { say: "Brakes, minimum possible." }
+  - { say: "Flaps, up.", check: flaps, is: up }
+
+after_landing:
+  - { say: "Flaps, up.", check: flaps, is: up }
+  - { say: "Landing lights, off.", check: lights.landing, is: off }
+  - { say: "Strobe lights, off.", check: lights.strobe, is: off }
+  - { say: "Nav lights, off.", check: lights.nav, is: off }
+  - { say: "Transponder, standby.", check: transponder, is: standby }
+
+shutdown:
+  title: "Engine shutdown"
+  items:
+    - { say: "Parking brake, on.", check: park_brake, is: on }
+    - { say: "Transponder, off.", check: transponder, is: off }
+    - { say: "Electrical equipment, off." }
+    - { say: "Autopilot, off.", check: autopilot, is: off }
+    - { say: "Avionics master switch, off.", check: electrical.avionics, is: off }
+    - { say: "Throttle, 1000/1200 rpm.", check: throttle, is: start }
+    - { say: "Mixture, cutoff smoothly.", check: mixture, is: cutoff }
+    - { say: "Taxi lights, off.", check: lights.taxi, is: off }
+    - { say: "Beacon light, off.", check: lights.beacon, is: off }
+    - { say: "Ignition switch, off.", check: magnetos, is: off }
+    - { say: "Master switch (alternator), off.", check: electrical.alternator, is: off }
+    - { say: "Master switch (battery), off.", check: electrical.battery, is: off }
+    - { note: "Control lock, installed." }
+    - { say: "Fuel selector valve, left or right.", check: fuel_selector, is: left }

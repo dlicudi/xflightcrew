@@ -490,23 +490,16 @@ flaps:
     - { label: "3",    spoken: three, ratio: 0.75, vfe_kts: 186.0, vs_kts: 131.0, idle_decel_kts_s: 1.5 } # VERIFY
     - { label: full,   spoken: full,  ratio: 1.0,  vfe_kts: 180.0, idle_decel_kts_s: 1.5 } # acf Vfe; decel VERIFY
 
-# The normal checklist (checklists/airbus_a330_300.txt, 2026-09-20, from the
-# POM's own lists and the aircraft's switch positions). Section titles are the
-# phase keys, so the tracker's climb / cruise / descent / before landing /
-# after landing lists resolve without an override; until this file existed
-# the tracker logged `no_section` at every phase (EGPH, 2026-09-20).
-checklist: checklists/airbus_a330_300.txt
-checklist_map:
-  - { match: parking_brake_ratio,        action: parking_brake }
-  - { match: flap_ratio,                 action: flaps }
-  - { match: throttle_ratio,             action: throttle }
-  - { match: "landing_lights_switch[1]", action: !light taxi }
-  - { match: "landing_lights_switch[0]", action: !light landing }
-  - { match: strobe_pos,                 action: !light strobe }
-  - { match: beacon_on,                  action: !light beacon }
-  - { match: navigation_lights,          action: !light nav }
-  - { match: buttons/gen1_pos,           action: !electrical generators }
-  - { match: buttons/battery1_pos,       action: !electrical battery }
+# The checklist's own reads (checklists/airbus_a330_300.yaml) of the
+# A330's switches, where the stock dataref does not follow them.
+checklist_states:
+  apu:             { datarefs: [laminar/A333/buttons/apu_master_ctct_on_off], on: 1, "off": 0 }
+  apu_generator:   { datarefs: [laminar/A333/buttons/gen_apu_pos], on: 1, "off": 0 }
+  bus_tie:         { datarefs: [laminar/A333/buttons/bus_tie_pos], on: 1, "off": 0 }
+  engine_bleeds:   { datarefs: [laminar/A333/buttons/eng_bleed_1_pos], on: 1, "off": 0 }
+  hydraulic_pumps: { datarefs: [laminar/A333/hyd/elec_green_contactor], on: 1, "off": 0 }
+  packs:           { datarefs: [laminar/A333/buttons/pack_1_pos], on: 1, "off": 0 }
+  start_levers:    { datarefs: [laminar/A333/switches/engine1_start_pos, laminar/A333/switches/engine2_start_pos], idle: 1, cutoff: 0 }
 
 advisor:
   # THE ADIRS, watched and FIXED. The start sequence sets them from cold, but

@@ -1,8 +1,8 @@
 //! Checklist flows: the airframe's checklist read at the phase it belongs to,
 //! in one of three flavours, off the command loop.
 //!
-//! The XChecklist interpreter ([`crate::checklist`]) knows what each item
-//! says, how to verify it and, for the systems we own, how to act. Until this
+//! The airframe's lists ([`crate::checklist`]) know what each item says,
+//! how to verify it and, for the systems we own, how to act. Until this
 //! module it was reached only from a spoken request and ran INLINE in the
 //! command loop, listening for its own confirms. Nothing read the CLIMB,
 //! CRUISE, DESCENT, BEFORE LANDING or AFTER LANDING lists when the flight
@@ -111,11 +111,8 @@ pub enum Reply {
 
 static REPLY: Mutex<Option<Reply>> = Mutex::new(None);
 
-/// The installed lists (the airframe's), and the profile's section title
-/// overrides (`checklist_flow:` in the YAML, section key -> list title; a
-/// key naming several file sections maps to the list they were joined into).
+/// The installed lists (the airframe's).
 static LISTS: Mutex<Option<Arc<Vec<Checklist>>>> = Mutex::new(None);
-static OVERRIDES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// A proposed section (index into the lists) and when it was offered.
 static PROPOSAL: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
@@ -150,10 +147,9 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Install the airframe's lists: parse the profile's checklist file, remember
-/// the section overrides, and retire whatever the last airframe had running
-/// or proposed (process-wide facts must never outlive their airframe).
-/// Returns the lists for the command loop's own matching.
+/// Install the airframe's lists and retire whatever the last airframe had
+/// running or proposed (process-wide facts must never outlive their
+/// airframe). Returns the lists for the command loop's own matching.
 pub fn install(profile: &AircraftProfile) -> Arc<Vec<Checklist>> {
     let lists = Arc::new(checklist::load(profile).unwrap_or_else(|e| {
         tracing::error!("checklist load failed: {e:#}; running without checklists");
@@ -161,36 +157,8 @@ pub fn install(profile: &AircraftProfile) -> Arc<Vec<Checklist>> {
     }));
     abort();
     *lock(&PROPOSAL) = None;
-    *lock(&OVERRIDES) = overrides_for(profile, &lists);
     *lock(&LISTS) = Some(lists.clone());
     lists
-}
-
-/// The section overrides: a one-title entry names its file section; a
-/// several-title entry names the list `checklist::parse` joined them into
-/// (by its own key), or its first title when nothing was joined (the file
-/// lacks them all, so it resolves to nothing).
-pub(crate) fn overrides_for(
-    profile: &AircraftProfile,
-    lists: &[Checklist],
-) -> Vec<(String, String)> {
-    profile
-        .checklist_flow
-        .iter()
-        .map(|(k, v)| {
-            let key = checklist::section_key(k);
-            let titles = v.titles();
-            let title = match titles.as_slice() {
-                [one] => one.to_string(),
-                many => lists
-                    .iter()
-                    .find(|c| c.section.as_deref() == Some(key.as_str()))
-                    .map(|c| c.title.clone())
-                    .unwrap_or_else(|| many.first().map(|t| t.to_string()).unwrap_or_default()),
-            };
-            (key, title)
-        })
-        .collect()
 }
 
 /// The installed lists, for readers (the panel's Checklist tab): the same
@@ -209,28 +177,17 @@ pub const SECTIONS: [&str; 5] = [
     "after landing",
 ];
 
-/// The list for a section key, by the profile's override title first, then
-/// by the section's own words against the file's titles (the same matcher a
-/// spoken "climb checklist" uses, so the two can never disagree). `None`
-/// when this file has no such section: nothing is proposed, nothing said.
+/// The list for a section key ("before landing" or "before_landing"): the
+/// section keyed so. `None` when the airframe has no such section: nothing
+/// is proposed, nothing said.
 pub fn find_section(key: &str) -> Option<usize> {
-    let lists = installed();
-    find_section_in(&lists, key, &lock(&OVERRIDES))
+    section_in(&installed(), key)
 }
 
-pub(crate) fn find_section_in(
-    lists: &[Checklist],
-    key: &str,
-    overrides: &[(String, String)],
-) -> Option<usize> {
-    let key = checklist::section_key(key);
-    if let Some((_, title)) = overrides.iter().find(|(k, _)| *k == key) {
-        return lists
-            .iter()
-            .position(|c| c.title.eq_ignore_ascii_case(title.trim()));
-    }
-    let want = checklist::match_request(&format!("{key} checklist"), lists)?;
-    lists.iter().position(|c| c.id == want.id)
+/// [`find_section`] over `lists`. Pure.
+pub(crate) fn section_in(lists: &[Checklist], key: &str) -> Option<usize> {
+    let key = key.trim().to_ascii_lowercase().replace(' ', "_");
+    lists.iter().position(|c| c.id == key)
 }
 
 /// A list by a spoken title ("before landing", "the descent checklist"):
@@ -1200,35 +1157,38 @@ pub enum Step {
     Wait(String),
 }
 
-/// "the speed hold" when a running loop owns the item's dataref: the
+/// "the speed hold" when a running loop owns the item's state: the
 /// governor the throttle, the mixture manager the mixture, autoland the
 /// flaps, the flying loops the autopilot. A list must never write under a
 /// loop (one writer per dataref), and an instructor should not ask the
 /// pilot to fight one either.
-pub fn held_by_automation(dataref: &str) -> Option<&'static str> {
+pub fn held_by_automation(state: &str) -> Option<&'static str> {
     use std::sync::atomic::Ordering::Relaxed;
     // The loop flying the aircraft holds its autopilot
     // (`flight_state::crew_flying`): the takeoff, full auto, the helicopter's
     // loops and a recovery too, each by its own name (a circuit was named
     // "the follower"; refactor audit 2026-10-04, duplicates #1).
     let flying = crate::flight_state::crew_flying();
-    if dataref.contains("throttle") && crate::flight_state::speed_held() {
+    if state == "throttle" && crate::flight_state::speed_held() {
         return Some("the speed hold");
     }
     // The circuit's own throttle law holds the pattern speed; the climb
     // list's "throttle, full" is not a discrepancy under it (LXGB 2026-09-14).
-    if dataref.contains("throttle") && crate::flight_state::Owner::Circuit.active() {
+    if state == "throttle" && crate::flight_state::Owner::Circuit.active() {
         return Some("the circuit");
     }
-    if dataref.contains("mixture") && crate::tools::engine::MIX_MANAGED.load(Relaxed) {
+    if state == "mixture" && crate::tools::engine::MIX_MANAGED.load(Relaxed) {
         return Some("the mixture manager");
     }
-    if dataref.contains("autopilot") {
+    if matches!(
+        state,
+        "autopilot" | "flight_director" | "autothrottle" | "speed_bug"
+    ) {
         if let Some(owner) = flying {
             return Some(owner.spoken());
         }
     }
-    if dataref.contains("flap") && crate::flight_state::Owner::Autoland.active() {
+    if state == "flaps" && crate::flight_state::Owner::Autoland.active() {
         return Some("autoland");
     }
     // Full auto works the signs by height (off through ten thousand, on
@@ -1236,38 +1196,38 @@ pub fn held_by_automation(dataref: &str) -> Option<&'static str> {
     // descent, seven thousand feet above that, and "seat belt signs, on" was
     // spoken as a discrepancy on a flight that was exactly as it should be
     // (EGPH-EGTE, 2026-09-21).
-    if crate::flight_state::Owner::FullAuto.active()
-        && crate::tools::signs::is_signs_dataref(dataref)
-    {
+    if crate::flight_state::Owner::FullAuto.active() && state == "seat_belts" {
         return Some("the signs schedule");
     }
     None
 }
 
-/// Decide the step for a SIMPLE `item` from the one read of its dataref
-/// (the tests' view; the runner judges every term with [`decide`]).
+/// Decide the step for `item` from one value for every read (the tests'
+/// view; the runner judges every term with [`decide`]).
 #[cfg(test)]
 pub fn plan(flavour: Flavour, item: &Item, value: Option<f64>, held: Option<&str>) -> Step {
-    let satisfied = item.judge_with(|_| value);
+    let satisfied = checklist::judge_read(item, &vec![value; item.terms().len()]);
     decide(flavour, item, satisfied, held)
 }
 
 /// Decide the step for `item`. `satisfied` is its pass test judged from
 /// the live reads: `None` for no test or a term that did not read.
 pub fn decide(flavour: Flavour, item: &Item, satisfied: Option<bool>, held: Option<&str>) -> Step {
-    match item {
-        Item::Narrate(t) => match flavour {
+    let t = &item.say;
+    if item.note {
+        return match flavour {
             Flavour::Monitor => Step::Skip,
             _ => Step::Say(t.clone()),
-        },
-        Item::CallOut(t) => match flavour {
+        };
+    }
+    if !item.has_test() {
+        return match flavour {
             Flavour::Instruct => Step::Wait(t.clone()),
             Flavour::Monitor => Step::Skip,
             Flavour::Crew => Step::Say(t.clone()),
-        },
-        Item::Act { say, .. } => stateful(flavour, say, satisfied, held, true),
-        Item::Verify { say, settable, .. } => stateful(flavour, say, satisfied, held, *settable),
+        };
     }
+    stateful(flavour, t, satisfied, held, item.action().is_some())
 }
 
 fn stateful(
@@ -1275,7 +1235,7 @@ fn stateful(
     say: &str,
     satisfied: Option<bool>,
     held: Option<&str>,
-    settable: bool,
+    actable: bool,
 ) -> Step {
     if satisfied == Some(true) {
         return match flavour {
@@ -1292,7 +1252,7 @@ fn stateful(
         return Step::Held(format!("{say} {} has it.", cap_first(owner)));
     }
     match flavour {
-        Flavour::Crew if settable => Step::Act,
+        Flavour::Crew if actable => Step::Act,
         Flavour::Crew => Step::Say(say.to_string()),
         // Unreadable is not a discrepancy: the monitor blackboxes it and
         // moves on rather than accuse.
@@ -1377,10 +1337,7 @@ async fn confirm(voice: &Voice, hazard: &str) -> Waited {
 }
 
 pub(crate) fn item_line(item: &Item) -> &str {
-    match item {
-        Item::Narrate(t) | Item::CallOut(t) => t,
-        Item::Act { say, .. } | Item::Verify { say, .. } => say,
-    }
+    &item.say
 }
 
 async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Config, voice: &Voice) {
@@ -1478,19 +1435,15 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
             Some(many) => json!(many),
             None => json!(null),
         };
-        let held = item
-            .datarefs()
-            .into_iter()
-            .find_map(held_by_automation)
-            .or_else(|| {
-                // Under a mission a Crew list writes nothing: every item not in
-                // state is the mission's (one writer per dataref).
-                if flavour == Flavour::Crew && tested {
-                    mission_owner()
-                } else {
-                    None
-                }
-            });
+        let held = item.state().and_then(held_by_automation).or_else(|| {
+            // Under a mission a Crew list writes nothing: every item not in
+            // state is the mission's (one writer per dataref).
+            if flavour == Flavour::Crew && tested {
+                mission_owner()
+            } else {
+                None
+            }
+        });
         let satisfied = if tested { judged } else { Some(false) };
         let mark = |state: ItemState| sheet_item(sheet_gen, i, state, None);
         let read_state = || match satisfied {
@@ -1680,8 +1633,8 @@ enum Acted {
     Aborted,
 }
 
-/// Crew flavour: perform one item, confirming a hazard step first through
-/// the command loop. `None` for an item that is not actionable.
+/// Crew flavour: perform one item through its tool, confirming a hazard
+/// step first through the command loop. `None` for an item with no action.
 async fn act(
     cl: &Checklist,
     item: &Item,
@@ -1689,74 +1642,29 @@ async fn act(
     xp: &XPlaneClient,
     voice: &Voice,
 ) -> Option<Acted> {
-    match item {
-        Item::Act {
-            tool,
-            args,
-            confirm: hazard,
-            expr,
-            ..
-        } => {
-            // Mixture-to-cutoff only stops a RUNNING engine; pre-start it is
-            // the normal lean, so the prompt is skipped and the item done.
-            let ask = match hazard {
-                Some(h) if *h == checklist::CONFIRM_MIXTURE_CUTOFF => {
-                    checklist::engine_running(xp).await
-                }
-                other => other.is_some(),
-            };
-            if ask {
-                match confirm(voice, hazard.expect("ask implies a hazard")).await {
-                    Waited::Advanced => {}
-                    Waited::Aborted => return Some(Acted::Aborted),
-                    _ => return Some(Acted::Skipped),
-                }
-            }
-            let ok = checklist::run_step(tool, args, &cl.profile, ctx)
-                .await
-                .is_ok();
-            if !ok {
-                return Some(Acted::Failed("Didn't take, check it."));
-            }
-            // A compound item is more than the term the tool set ("battery
-            // on AND its guard closed"): judged whole once the tool has read
-            // its own back. Unreadable is no verdict, the tool's stands.
-            if expr.is_some() && checklist::read_item(xp, item).await.satisfied == Some(false) {
-                return Some(Acted::Failed(
-                    "Set, but the rest of the item is not as listed, check it.",
-                ));
-            }
-            Some(Acted::Ok)
+    let a = item.action()?;
+    // Mixture-to-cutoff only stops a RUNNING engine; pre-start it is the
+    // normal lean, so the prompt is skipped and the item done.
+    let ask = match a.confirm {
+        Some(h) if h == checklist::CONFIRM_MIXTURE_CUTOFF => checklist::engine_running(xp).await,
+        other => other.is_some(),
+    };
+    if let (true, Some(hazard)) = (ask, a.confirm) {
+        match confirm(voice, hazard).await {
+            Waited::Advanced => {}
+            Waited::Aborted => return Some(Acted::Aborted),
+            _ => return Some(Acted::Skipped),
         }
-        // The verify path's write: the file's own target, then a re-read.
-        Item::Verify {
-            dataref,
-            index,
-            cond,
-            settable: true,
-            expr: None,
-            ..
-        } => {
-            let target = cond.target();
-            let wrote = match index {
-                Some(i) => xp.set_float_array_elem(dataref, *i, target).await.is_ok(),
-                None => xp.set_float(dataref, target).await.is_ok(),
-            };
-            let now = checklist::read_dataref(xp, dataref, *index).await;
-            Some(if wrote && now.is_some_and(|v| cond.eval(v)) {
-                Acted::Ok
-            } else {
-                Acted::Failed("Couldn't set it, check it.")
-            })
-        }
-        _ => None,
     }
+    Some(match checklist::run_step(a, &cl.profile, ctx).await {
+        Ok(_) => Acted::Ok,
+        Err(_) => Acted::Failed("Didn't take, check it."),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checklist::Cond;
 
     /// The sheet records each item's verdict for readers, in the flight the
     /// list began in only: a late write from the last flight's runner is
@@ -1799,93 +1707,104 @@ mod tests {
         checklist::load(&p172()).expect("172 checklist file")
     }
 
+    /// Every phase key the tracker fires, and the syllabus's ramp lists,
+    /// resolve on every shipped airframe where its old XChecklist file had
+    /// the section (the A330's taxi light still an act through its tool).
     #[test]
-    fn every_phase_section_is_found_in_the_172_file() {
+    fn every_phase_section_is_found_where_the_airframe_has_it() {
+        const ALL: &[&str] = &[
+            "preflight",
+            "before start",
+            "engine start",
+            "before taxi",
+            "before takeoff",
+            "climb",
+            "cruise",
+            "descent",
+            "before landing",
+            "after landing",
+            "shutdown",
+        ];
+        let table: &[(&str, &[&str])] = &[
+            ("cessna_172sp", ALL),
+            ("boeing_737_800", ALL),
+            ("airbus_a330_300", ALL),
+            ("cirrus_sr22", ALL),
+            (
+                "cirrus_vision_sf50",
+                &[
+                    "engine start",
+                    "before taxi",
+                    "before takeoff",
+                    "cruise",
+                    "before landing",
+                    "after landing",
+                    "shutdown",
+                ],
+            ),
+            (
+                "citation_x",
+                &[
+                    "preflight",
+                    "engine start",
+                    "before taxi",
+                    "before takeoff",
+                    "cruise",
+                    "descent",
+                    "after landing",
+                    "shutdown",
+                ],
+            ),
+            ("lancair_evolution", &ALL[1..]),
+            (
+                "md82",
+                &["engine start", "before taxi", "climb", "cruise", "descent"],
+            ),
+            (
+                "zibo_738",
+                &[
+                    "preflight",
+                    "engine start",
+                    "before taxi",
+                    "before takeoff",
+                    "climb",
+                    "cruise",
+                    "descent",
+                    "before landing",
+                    "after landing",
+                    "shutdown",
+                ],
+            ),
+        ];
+        for (id, keys) in table {
+            let p = crate::aircraft::load(id).expect(id);
+            let lists = checklist::load(&p).expect(id);
+            for key in *keys {
+                let i = section_in(&lists, key).unwrap_or_else(|| panic!("{id} lacks {key}"));
+                assert!(!lists[i].items.is_empty(), "{id} {key}");
+            }
+            for key in SECTIONS {
+                assert_eq!(
+                    section_in(&lists, key).is_some(),
+                    keys.contains(&key),
+                    "{id} {key}"
+                );
+            }
+        }
         let lists = lists172();
-        let titles: Vec<&str> = SECTIONS
-            .iter()
-            .map(|s| {
-                lists[find_section_in(&lists, s, &[]).unwrap_or_else(|| panic!("{s}"))]
-                    .title
-                    .as_str()
-            })
-            .collect();
         assert_eq!(
-            titles,
-            [
-                "Climb",
-                "Cruise",
-                "Descent",
-                "Before landing",
-                "After landing"
-            ]
+            lists[section_in(&lists, "before_landing").unwrap()].title,
+            "Before landing"
         );
-        // A profile override names the file's title outright.
-        let over = vec![("before landing".to_string(), "NORMAL LANDING".to_string())];
-        let i = find_section_in(&lists, "before_landing", &over).unwrap();
-        assert_eq!(lists[i].title, "Normal landing");
         // A section the file lacks is None, never a guess.
-        assert_eq!(find_section_in(&lists, "holding", &[]), None);
-    }
-
-    /// The stock 737's list (2026-09-17) names its sections by the phase
-    /// keys outright: every phase the tracker can propose resolves, and so
-    /// do the syllabus's ramp lists, with no profile override.
-    #[test]
-    fn every_phase_section_is_found_in_the_737_file() {
-        let p = crate::aircraft::load("boeing_737_800").expect("737 profile");
-        let lists = crate::checklist::load(&p).expect("737 checklist parses");
-        let ramp = [
-            "preflight",
-            "before start",
-            "engine start",
-            "before taxi",
-            "before takeoff",
-            "shutdown",
-        ];
-        for key in SECTIONS.iter().chain(ramp.iter()) {
-            assert!(
-                find_section_in(&lists, key, &[]).is_some(),
-                "737 file lacks {key}"
-            );
-        }
-    }
-
-    /// The stock A330's list (2026-09-20), same shape: the tracker's phases
-    /// and the syllabus's ramp lists all resolve, and every conditioned item
-    /// reads a dataref the aircraft owns or leaves alone (the map turns the
-    /// ones with a tool into acts, the rest stay verifies).
-    #[test]
-    fn every_phase_section_is_found_in_the_a330_file() {
-        let p = crate::aircraft::load("airbus_a330_300").expect("A330 profile");
-        let lists = crate::checklist::load(&p).expect("A330 checklist parses");
-        let ramp = [
-            "preflight",
-            "before start",
-            "engine start",
-            "before taxi",
-            "before takeoff",
-            "shutdown",
-        ];
-        for key in SECTIONS.iter().chain(ramp.iter()) {
-            assert!(
-                find_section_in(&lists, key, &[]).is_some(),
-                "A330 file lacks {key}"
-            );
-        }
-        // The before-taxi list's taxi light is an ACT through the map, not a
-        // bare verify: the A330's nose light is a three-position switch on
-        // one element of `landing_lights_switch`, so the map entry carries
-        // the index. (The transponder stays a verify: its mode is a laminar
-        // knob whose values the shared stock decoding does not speak.)
-        let bt = &lists[find_section_in(&lists, "before taxi", &[]).unwrap()];
+        assert_eq!(section_in(&lists, "holding"), None);
+        let p = crate::aircraft::load("airbus_a330_300").unwrap();
+        let lists = checklist::load(&p).unwrap();
+        let bt = &lists[section_in(&lists, "before taxi").unwrap()];
         let acts: Vec<&str> = bt
             .items
             .iter()
-            .filter_map(|i| match i {
-                crate::checklist::Item::Act { tool, .. } => Some(*tool),
-                _ => None,
-            })
+            .filter_map(|i| Some(i.action()?.tool))
             .collect();
         assert!(
             acts.contains(&"set_lights"),
@@ -2182,14 +2101,19 @@ mod tests {
     /// every writer at that moment).
     #[test]
     fn the_vacate_lights_agree_with_the_after_landing_list() {
-        let text = std::fs::read_to_string("checklists/boeing_737_800.txt").unwrap();
-        let section: Vec<&str> = text
-            .lines()
-            .skip_while(|l| !l.starts_with("sw_checklist:AFTER LANDING"))
-            .take_while(|l| !l.starts_with("sw_remark:AFTER LANDING COMPLETE"))
+        let p = crate::aircraft::load("boeing_737_800").unwrap();
+        let lists = checklist::load(&p).unwrap();
+        let checks: Vec<(&str, &str)> = lists[section_in(&lists, "after landing").unwrap()]
+            .items
+            .iter()
+            .filter_map(|i| i.check.as_ref())
+            .map(|c| (c.state.as_str(), c.value.as_str()))
             .collect();
-        assert!(section.iter().any(|l| l.contains("landing_lights_on:0")), "{section:?}");
-        assert!(!section.iter().any(|l| l.contains("taxi_light_on")), "{section:?}");
+        assert!(checks.contains(&("lights.landing", "off")), "{checks:?}");
+        assert!(
+            !checks.iter().any(|(s, _)| *s == "lights.taxi"),
+            "{checks:?}"
+        );
         let lp = |key: &str| crate::aircraft::LightProfile {
             key: key.into(),
             spoken: key.into(),
@@ -2295,22 +2219,15 @@ mod tests {
         assert_eq!(instruct_request("run the descent checklist"), None);
     }
 
-    fn act_item(say: &str, cond: Cond) -> Item {
-        Item::Act {
-            say: say.into(),
-            tool: "set_lights",
-            args: json!({}),
-            confirm: None,
-            dataref: "sim/cockpit/electrical/landing_lights_on".into(),
-            index: None,
-            cond,
-            expr: None,
-        }
+    /// One item of a native list, against the 172.
+    fn one(item: &str) -> Item {
+        let mut l = checklist::parse(&format!("t:\n  - {item}\n"), &p172()).expect(item);
+        l.remove(0).items.remove(0)
     }
 
     #[test]
     fn plans_by_flavour() {
-        let it = act_item("Landing lights, off.", Cond::Eq(0.0));
+        let it = one(r#"{ say: "Landing lights, off.", check: lights.landing, is: off }"#);
         // Already in state: confirmed, never written, in every flavour.
         assert_eq!(
             plan(Flavour::Crew, &it, Some(0.0), None),
@@ -2343,29 +2260,27 @@ mod tests {
         assert_eq!(plan(Flavour::Monitor, &it, None, None), Step::Skip);
         // Narration and call-outs: skipped by the monitor, spoken by the
         // crew. Call-outs: the instructor waits on the pilot's word.
-        let n = Item::Narrate("Recommended climb airspeed 70 to 85 knots.".into());
+        let n = one(r#"{ note: "Recommended climb airspeed 70 to 85 knots." }"#);
         assert_eq!(plan(Flavour::Monitor, &n, None, None), Step::Skip);
         assert!(matches!(plan(Flavour::Crew, &n, None, None), Step::Say(_)));
-        let c = Item::CallOut("Fuel quantity, sufficient.".into());
+        let c = one(r#"{ say: "Fuel quantity, sufficient." }"#);
         assert_eq!(plan(Flavour::Monitor, &c, None, None), Step::Skip);
         assert!(matches!(plan(Flavour::Crew, &c, None, None), Step::Say(_)));
         assert!(matches!(
             plan(Flavour::Instruct, &c, None, None),
             Step::Wait(_)
         ));
-        // A verify item that is observe-only never becomes an Act.
-        let v = Item::Verify {
-            say: "Brakes, minimum possible.".into(),
-            dataref: crate::datarefs::AIRSPEED_KTS.into(),
-            index: None,
-            cond: Cond::Lt(50.0),
-            settable: false,
-            expr: None,
-        };
-        assert_eq!(
-            plan(Flavour::Crew, &v, Some(70.0), None),
-            Step::Say("Brakes, minimum possible.".into())
-        );
+        // A read-only state, or an actable one with `act: false`, never
+        // becomes an Act.
+        for v in [
+            one(r#"{ say: "Doors, closed.", check: doors, is: closed }"#),
+            one(r#"{ say: "Doors, closed.", check: park_brake, is: on, act: false }"#),
+        ] {
+            assert_eq!(
+                plan(Flavour::Crew, &v, Some(0.7), None),
+                Step::Say("Doors, closed.".into())
+            );
+        }
     }
 
     #[test]
@@ -2520,7 +2435,7 @@ mod tests {
         assert_eq!(w.step(None), None);
         assert_eq!(w.step(Some("the circuit")), Some("the circuit"));
         // Its items not in state are the mission's, never written.
-        let flaps = act_item("Flaps, up.", Cond::Eq(0.0));
+        let flaps = one(r#"{ say: "Flaps, up.", check: flaps, is: up }"#);
         assert_eq!(
             plan(Flavour::Crew, &flaps, Some(1.0), Some("full auto")),
             Step::Held("Flaps, up. Full auto has it.".into())

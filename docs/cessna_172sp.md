@@ -18,12 +18,10 @@ tool, XFlightCrew writes the dataref, then **reads back the actual result**
 
 ## Checklists — the copilot runs them with you
 
-Checklists are **interpreted from an XChecklist file**, not baked into the app —
-[checklists/cessna_172sp.txt](../checklists/cessna_172sp.txt), the de-facto
-X-Plane community format (the same files the XChecklist plug-in reads). The file
-is read-only input; the copilot interprets it. Drop in any aircraft's `.txt`,
-point the profile's `checklist:` at it, and it runs — so we're compatible with
-the whole ecosystem.
+Checklists are **data, not code**:
+[checklists/cessna_172sp.yaml](../checklists/cessna_172sp.yaml), converted from the
+172SP Streamlined Procedures. Each item names a state (`flaps`, `park_brake`,
+`lights.landing`), never a dataref; the format is in `src/checklist.rs`.
 
 Say a checklist's name and the copilot **runs it like a pilot-monitoring**, three
 ways per item:
@@ -43,8 +41,8 @@ it, anything else and it skips that step and leaves it to you.
 **The checklists** (say any by name, normal flight order):
 
 1. **preflight**
-2. **before starting engine**
-3. **starting engine**
+2. **before start**
+3. **engine start**
 4. **before taxi**
 5. **before takeoff** ("configure for takeoff")
 6. **normal takeoff**
@@ -54,11 +52,11 @@ it, anything else and it skips that step and leaves it to you.
 10. **before landing** ("configure for landing")
 11. **normal landing**
 12. **after landing** ("clean up")
-13. **engine shutdown** ("shutdown")
+13. **shutdown**
 
 Plus **"performance limits"** — a reference read-back (V-speeds & limits), not a
-runnable list. Each is interpreted line-for-line from
-[checklists/cessna_172sp.txt](../checklists/cessna_172sp.txt); the table below is
+runnable list. Each is read from
+[checklists/cessna_172sp.yaml](../checklists/cessna_172sp.yaml); the table below is
 what the copilot does per list.
 
 ```
@@ -72,14 +70,14 @@ what the copilot does per list.
 🔊  before takeoff checklist complete.
 ```
 
-The full set, interpreted line-for-line from the file:
+The full set, from the file:
 
 | Say | What the copilot does (it also calls out your items) |
 |---|---|
 | **"performance limits"** | speaks the V-speeds & key limits (reference, no actions) |
 | **"preflight"** | the cabin power-up/test/power-down: brake, ignition off, the avionics/battery/pitot/flaps test toggles, trim takeoff |
-| **"before starting engine"** | parking brake, autopilot off, avionics off, fuel both |
-| **"starting engine"** | battery, beacon, throttle, mixture, carb heat, fuel-pump prime, **cranks the engine**, alternator + avionics on, flaps up |
+| **"before start"** | parking brake, autopilot off, avionics off, fuel both |
+| **"engine start"** | battery, beacon, throttle, mixture, carb heat, fuel-pump prime, **cranks the engine**, alternator + avionics on, flaps up |
 | **"before taxi"** | transponder standby, taxi light on, parking brake set |
 | **"before takeoff"** / "configure for takeoff" | brake, mixture rich, fuel both, **the mag run-up** (cycles ignition + throttle), strobe + landing on, autopilot off, trim takeoff |
 | **"normal takeoff"** | taxi light off, transponder altitude, mixture rich |
@@ -89,11 +87,11 @@ The full set, interpreted line-for-line from the file:
 | **"before landing"** / "configure for landing" | fuel both, mixture rich, landing + taxi lights on, autopilot off |
 | **"normal landing"** | flaps up after rollout (the approach/touchdown/braking are yours) |
 | **"after landing"** / "clean up" | flaps up, landing/strobe/nav lights off, transponder standby |
-| **"engine shutdown"** / "shutdown" | brake, transponder/avionics off, idle, **engine off** (mixture cutoff), all lights off, alternator + master off |
+| **"shutdown"** | brake, transponder/avionics off, idle, **engine off** (mixture cutoff), all lights off, alternator + master off |
 
-A full flight by voice: *preflight → before starting engine → starting engine →
+A full flight by voice: *preflight → before start → engine start →
 before taxi → before takeoff → normal takeoff → climb → cruise → descent → before
-landing → normal landing → after landing → engine shutdown.*
+landing → normal landing → after landing → shutdown.*
 
 > **Checklist vs single command.** A checklist *runs the whole phase*. A single
 > command (next section) does one thing fast. Note the pair: **"starting engine"**
