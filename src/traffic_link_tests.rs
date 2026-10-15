@@ -1674,12 +1674,15 @@ fn a_new_flight_of_ours_inner() {
     Station::uninstall();
 }
 
-/// Every carrier our traffic flies (`traffic::airlines`) has its telephony
-/// in the station's table, the same words: the tower reads a call's
-/// telephony to know an airline (its go-around is the missed approach,
-/// never the circuit), and a carrier missing there was a tail number to it.
+/// Every carrier our traffic flies (`traffic::airlines`, the route data's
+/// through the crew's provider as `main` registers it) has its telephony
+/// at the station, the same words: the tower reads a call's telephony to
+/// know an airline (its go-around is the missed approach, never the
+/// circuit), and a carrier missing there was a tail number to it.
 #[test]
 fn every_traffic_carrier_has_its_telephony_at_the_station() {
+    crate::callsign::provide_carrier_telephony(traffic::routes::telephony);
+    assert!(!traffic::routes::telephony().is_empty());
     for c in traffic::airlines::all_carriers() {
         let raw = format!("{}123", c.code);
         let spoken = crate::callsign::spoken_id_with(&raw, &[]);

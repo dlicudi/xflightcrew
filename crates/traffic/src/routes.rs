@@ -1,31 +1,30 @@
-//! Who actually flies where from a field, and how often: small route tables
-//! for the fields we fly first (Gibraltar and Malaga, the pilot's approval
-//! of 2026-10-13), from which [`crate::rotation`] builds the day's
-//! ROTATIONS. A field with no table keeps the hour generator
-//! ([`crate::schedule::generate`]).
+//! Who actually flies where from a field, and how often: route tables from
+//! which [`crate::rotation`] builds the day's ROTATIONS. A field with no
+//! table keeps the hour generator ([`crate::schedule::generate`]).
 //!
-//! The timetables are DATA (2026-10-14): one YAML file per field in
-//! `routes/` (`LXGB.yaml`, `LEMG.yaml`, `EGKK.yaml`), each with its sources
-//! as comments, shipped like the profiles (`sim::paths::routes_dir`, built
-//! into the binary and unpacked when nothing is on disk) and parsed once
-//! ([`fields`]): a new field is a file dropped in, never a rebuild. A file
-//! that does not parse is logged and skipped. They were Rust tables until then; Gatwick
-//! and the fields after it would have tripled them. A row names its carrier
-//! by its constant's name in [`crate::airlines`] (`carrier: EZY_GATWICK`),
-//! resolved by [`airlines::carrier_by_name`]: the carriers, their telephony
-//! and number ranges stay Rust, pinned to the station by the bin. The
-//! compile-time check the tables had is now this module's tests: every
-//! file parses, every carrier resolves, every type is one the performance
-//! tables know (never a silent 172), the numbers, windows and frequencies
-//! are sane, and a route between two table fields is written once. The
-//! pilot's own file (`XCOPILOT_TRAFFIC_FILE`) stays the other YAML way in.
+//! The timetables are DATA, shipped like the profiles
+//! (`sim::paths::routes_dir`, built into the binary and unpacked when
+//! nothing is on disk) and parsed once ([`fields`]): `routes/fields.yaml`
+//! names every field a route names (its board name, its place, its clock,
+//! [`crate::places`]), and `routes/carriers/<CODE>.yaml` holds one operator
+//! each (its name, IATA designator, telephony, types, numbers and routes).
+//! Until 2026-10-15 they were one file per field with the carriers, places
+//! and clocks as Rust tables; none of those scaled past a handful of fields
+//! (docs/tasks/global-routes). A carrier file that does not parse is logged
+//! and skipped. The tests check what the compiler once did: every file
+//! parses, every type is one the performance tables know (never a silent
+//! 172), and the numbers, windows and frequencies are sane. The pilot's own
+//! file (`XCOPILOT_TRAFFIC_FILE`) stays the other YAML way in.
 //!
-//! Gatwick (`EGKK.yaml`, 2026-10-14) is the third table and the first that
-//! shares routes: Malaga's and Gibraltar's Gatwick rows are written in
-//! their files only, and Gatwick's rows for them are DERIVED ([`derive`]),
-//! the same flights seen from the other end ([`crate::rotation`]). Its
-//! table holds the busiest routes; the hour generator flies the rest of its
-//! rate (`top_up`, [`crate::midflow::top_up`]).
+//! A route row is written for one field, its `at`, and a carrier writes a
+//! pair from one end only (a row of the same carrier back from `other` to
+//! `at` is a load error naming both; more rows the same way are one route
+//! flown as several, BA's two Heathrow slots at Gibraltar). A field that is some row's `at` has a table; a row
+//! whose `other` has a table too is that table's as well, DERIVED
+//! ([`derive`]): the same flights seen from the other end
+//! ([`crate::rotation`]). Gatwick's table holds its busiest routes; the
+//! hour generator flies the rest of its rate (`top_up`,
+//! [`crate::midflow::top_up`]).
 //!
 //! A weekly frequency is the route's passengers over a full narrowbody each
 //! way (about 150 seated, 85% full) and the 52 weeks, rounded, split
@@ -35,11 +34,12 @@
 //! each aircraft's day built from the route's block time and turnarounds
 //! ([`crate::rotation`]); Gibraltar's rows keep the published slots.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-use crate::airlines::{self, Carrier};
+use crate::airlines::Carrier;
 
 /// One route at a field: a carrier's rotation to and from `other`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,12 +65,12 @@ pub struct RouteRow {
     /// The types flown on the route, by weight; the carrier's own when
     /// empty.
     pub types: &'static [(&'static str, u32)],
-    /// A SHARED route's far end (2026-10-14): the route is written once,
-    /// in `other`'s file, and this row is derived from it ([`derive`]): the
-    /// same carrier, numbers and frequencies, its flights the source's seen
+    /// A SHARED route's far end (2026-10-14): the route is written for
+    /// `other`, and this row is derived from it ([`derive`]): the same
+    /// carrier, numbers and frequencies, its flights the source's seen
     /// from here ([`crate::rotation`] mirrors the source's day: our arrival
-    /// is its departure a block time later). `None`: written in this
-    /// field's own file.
+    /// is its departure a block time later). `None`: written for this
+    /// field.
     pub mirror_of: Option<&'static str>,
 }
 
@@ -103,6 +103,68 @@ pub struct FieldRoutes {
 /// route file: a row with no `windows`.
 pub const LINES: &[(f64, f64)] = &[];
 
+/// A field a route names, as `routes/fields.yaml` writes it: its board
+/// name, its airport reference point (degrees) and its clock (standard
+/// time's offset from UTC, hours, and whether it keeps summer time).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Place {
+    pub icao: String,
+    pub city: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub utc_offset_h: f64,
+    pub dst: bool,
+    #[serde(default)]
+    pub top_up: bool,
+}
+
+/// An operator's file, `routes/carriers/<CODE>.yaml`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileCarrier {
+    code: String,
+    name: String,
+    iata: String,
+    telephony: String,
+    types: Vec<(String, u32)>,
+    numbers: (u32, u32),
+    routes: Vec<FileRow>,
+}
+
+/// A row as written: `windows`, `based` and `types` optional.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileRow {
+    at: String,
+    other: String,
+    number: u32,
+    summer: u8,
+    winter: u8,
+    #[serde(default)]
+    windows: Vec<(f64, f64)>,
+    #[serde(default)]
+    based: bool,
+    #[serde(default)]
+    types: Vec<(String, u32)>,
+}
+
+/// An operator as a board shows it: "easyJet", "U2".
+struct Airline {
+    carrier: Carrier,
+    name: &'static str,
+    iata: &'static str,
+}
+
+/// Everything the route data holds, parsed once ([`data`]).
+#[derive(Default)]
+struct Data {
+    places: Vec<Place>,
+    airlines: Vec<Airline>,
+    telephony: Vec<(&'static str, &'static str)>,
+    tables: Vec<FieldRoutes>,
+}
+
 /// The timetables' folder. This crate's own tests run from its folder, so
 /// they read the checkout's.
 fn routes_dir() -> std::path::PathBuf {
@@ -113,9 +175,8 @@ fn routes_dir() -> std::path::PathBuf {
     }
 }
 
-/// Every `*.yaml` in `dir`, by file name: (name, text). None for a folder
-/// that does not read.
-fn route_files(dir: &std::path::Path) -> Vec<(String, String)> {
+/// Every `*.yaml` in `dir`, by file name: (name, text).
+fn yaml_files(dir: &std::path::Path) -> Vec<(String, String)> {
     let mut files: Vec<(String, String)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -131,161 +192,172 @@ fn route_files(dir: &std::path::Path) -> Vec<(String, String)> {
     files
 }
 
-/// A route file as written.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileTable {
-    icao: String,
-    city: String,
-    utc_offset_h: f64,
-    #[serde(default)]
-    top_up: bool,
-    routes: Vec<FileRow>,
-}
-
-/// A row as written: the carrier by its constant's name, `windows`,
-/// `based` and `types` optional.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileRow {
-    carrier: String,
-    number: u32,
-    other: String,
-    city: String,
-    summer: u8,
-    winter: u8,
-    #[serde(default)]
-    windows: Vec<(f64, f64)>,
-    #[serde(default)]
-    based: bool,
-    #[serde(default)]
-    types: Vec<(String, u32)>,
-}
-
 fn leak_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
-/// Parses route file `file` into a table. An error names the file and,
-/// for a carrier no constant carries, the row. The table's strings and
-/// slices are leaked: called once per shipped file ([`fields`]) and by
-/// tests, never per tick.
-fn parse_table(file: &str, text: &str) -> Result<FieldRoutes, String> {
-    let t: FileTable = serde_yaml::from_str(text).map_err(|e| format!("{file}: {e}"))?;
-    let mut rows = Vec::with_capacity(t.routes.len());
-    for (i, r) in t.routes.into_iter().enumerate() {
-        let carrier = airlines::carrier_by_name(&r.carrier).ok_or_else(|| {
-            format!(
-                "{file}: routes[{i}] ({} {} to {}): no carrier constant is called {}",
-                r.carrier, r.number, r.other, r.carrier
-            )
-        })?;
-        let windows: &'static [(f64, f64)] = if r.windows.is_empty() {
-            LINES
-        } else {
-            Box::leak(r.windows.into_boxed_slice())
+fn leak_types(types: Vec<(String, u32)>) -> &'static [(&'static str, u32)] {
+    if types.is_empty() {
+        return &[];
+    }
+    let v: Vec<_> = types.into_iter().map(|(t, w)| (leak_str(t), w)).collect();
+    Box::leak(v.into_boxed_slice())
+}
+
+/// The route data from `fields.yaml`'s text and the carrier files (name,
+/// text), and every error: a file that does not parse is skipped, a row
+/// whose `at` or `other` is no field, or that writes its carrier's pair
+/// from the other end too, is dropped, each named by its file and row.
+/// Strings and slices are leaked: called once ([`data`]) and by tests,
+/// never per tick.
+fn load(fields: &str, carriers: &[(String, String)]) -> (Data, Vec<String>) {
+    let mut errors = Vec::new();
+    let places: Vec<Place> = match serde_yaml::from_str(fields) {
+        Ok(p) => p,
+        Err(e) => return (Data::default(), vec![format!("fields.yaml: {e}")]),
+    };
+    let by_icao: HashMap<&str, &Place> = places.iter().map(|p| (p.icao.as_str(), p)).collect();
+    let place = |icao: &str| by_icao.get(icao).copied();
+    let mut airlines = Vec::new();
+    let mut rows: BTreeMap<String, Vec<RouteRow>> = BTreeMap::new();
+    let mut seen: HashMap<(String, String, String), String> = HashMap::new();
+    for (file, text) in carriers {
+        let c: FileCarrier = match serde_yaml::from_str(text) {
+            Ok(c) => c,
+            Err(e) => {
+                errors.push(format!("{file}: {e}"));
+                continue;
+            }
         };
-        let types: &'static [(&'static str, u32)] = if r.types.is_empty() {
-            &[]
-        } else {
-            Box::leak(
-                r.types
-                    .into_iter()
-                    .map(|(t, w)| (leak_str(t), w))
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            )
+        let carrier = Carrier {
+            code: leak_str(c.code),
+            telephony: leak_str(c.telephony),
+            types: leak_types(c.types),
+            numbers: c.numbers,
         };
-        rows.push(RouteRow {
+        for (i, r) in c.routes.into_iter().enumerate() {
+            let here = format!(
+                "{file} routes[{i}] ({} {} to {})",
+                carrier.code, r.at, r.other
+            );
+            let (Some(_), Some(other)) = (place(&r.at), place(&r.other)) else {
+                errors.push(format!("{here}: not in fields.yaml"));
+                continue;
+            };
+            let back = (carrier.code.to_string(), r.other.clone(), r.at.clone());
+            if let Some(first) = seen.get(&back) {
+                errors.push(format!("{here}: written at both ends, first at {first}"));
+                continue;
+            }
+            seen.entry((back.0, back.2, back.1)).or_insert(here);
+            let windows: &'static [(f64, f64)] = if r.windows.is_empty() {
+                LINES
+            } else {
+                Box::leak(r.windows.into_boxed_slice())
+            };
+            rows.entry(r.at).or_default().push(RouteRow {
+                carrier,
+                number: r.number,
+                other: leak_str(r.other),
+                city: leak_str(other.city.clone()),
+                summer: r.summer,
+                winter: r.winter,
+                windows,
+                based: r.based,
+                types: leak_types(r.types),
+                mirror_of: None,
+            });
+        }
+        airlines.push(Airline {
             carrier,
-            number: r.number,
-            other: leak_str(r.other),
-            city: leak_str(r.city),
-            summer: r.summer,
-            winter: r.winter,
-            windows,
-            based: r.based,
-            types,
-            mirror_of: None,
+            name: leak_str(c.name),
+            iata: leak_str(c.iata),
         });
     }
-    Ok(FieldRoutes {
-        icao: leak_str(t.icao),
-        utc_offset_h: t.utc_offset_h,
-        city: leak_str(t.city),
-        top_up: t.top_up,
-        rows: Box::leak(rows.into_boxed_slice()),
-    })
+    let tables = rows
+        .into_iter()
+        .filter_map(|(at, rows)| {
+            let p = place(&at)?;
+            Some(FieldRoutes {
+                icao: leak_str(at),
+                utc_offset_h: p.utc_offset_h,
+                city: leak_str(p.city.clone()),
+                top_up: p.top_up,
+                rows: Box::leak(rows.into_boxed_slice()),
+            })
+        })
+        .collect();
+    let telephony = airlines
+        .iter()
+        .map(|a| (a.carrier.code, a.carrier.telephony))
+        .collect();
+    let data = Data {
+        tables: derive(tables),
+        places,
+        airlines,
+        telephony,
+    };
+    (data, errors)
 }
 
 /// Every table with the rows other tables share with it (2026-10-14): a
-/// route between two table fields is ONE thing, written once in one
-/// field's file; the other field's row is DERIVED here from it, after its
-/// own rows (so a table no other names keeps its rows and their order,
-/// and its day, exactly). A derived row keeps the source's carrier,
-/// numbers, frequencies and types; its `other` is the source field, its
-/// city the source's name, and its times are the source's flights a block
-/// time away ([`crate::rotation`]), so `based` and `windows` are the
-/// source's business and unused here. Malaga's EZY8061 row is Gatwick's
-/// too: Malaga's departure EZY8062 is Gatwick's arrival EZY8062.
+/// route between two table fields is ONE thing, written for one field; the
+/// other field's row is DERIVED here from it, after its own rows. A
+/// derived row keeps the source's carrier, numbers, frequencies and types;
+/// its `other` is the source field, its city the source's name, and its
+/// times are the source's flights a block time away ([`crate::rotation`]),
+/// so `based` and `windows` are the source's business and unused here.
+/// Malaga's EZY8061 row is Gatwick's too: Malaga's departure EZY8062 is
+/// Gatwick's arrival EZY8062.
 fn derive(tables: Vec<FieldRoutes>) -> Vec<FieldRoutes> {
-    let shared: Vec<Vec<RouteRow>> = tables
-        .iter()
-        .map(|here| {
-            tables
-                .iter()
-                .filter(|src| src.icao != here.icao)
-                .flat_map(|src| {
-                    src.rows
-                        .iter()
-                        .filter(|r| r.mirror_of.is_none() && r.other == here.icao)
-                        .map(|r| RouteRow {
-                            other: src.icao,
-                            city: src.city,
-                            windows: LINES,
-                            based: false,
-                            mirror_of: Some(src.icao),
-                            ..*r
-                        })
-                })
-                .collect()
-        })
-        .collect();
+    let mut shared: HashMap<&str, Vec<RouteRow>> = HashMap::new();
+    for src in &tables {
+        for r in src
+            .rows
+            .iter()
+            .filter(|r| r.mirror_of.is_none() && r.other != src.icao)
+        {
+            shared.entry(r.other).or_default().push(RouteRow {
+                other: src.icao,
+                city: src.city,
+                windows: LINES,
+                based: false,
+                mirror_of: Some(src.icao),
+                ..*r
+            });
+        }
+    }
     tables
         .into_iter()
-        .zip(shared)
-        .map(|(t, more)| {
-            if more.is_empty() {
-                return t;
-            }
-            let mut rows = t.rows.to_vec();
-            rows.extend(more);
-            FieldRoutes {
-                rows: Box::leak(rows.into_boxed_slice()),
+        .map(|t| match shared.remove(t.icao) {
+            None => t,
+            Some(more) => FieldRoutes {
+                rows: Box::leak([t.rows, &more].concat().into_boxed_slice()),
                 ..t
-            }
+            },
         })
         .collect()
 }
 
-/// Every field with a route table. The tables are parsed from the
-/// timetables' folder on first use and never change after: immutable
-/// shipped data, like a const table, never state (the crate's "no
-/// statics" is about facts; this holds none).
-pub fn fields() -> &'static [FieldRoutes] {
-    static TABLES: OnceLock<Vec<FieldRoutes>> = OnceLock::new();
-    TABLES.get_or_init(|| {
-        derive(
-            route_files(&routes_dir())
-                .iter()
-                .filter_map(|(file, text)| {
-                    parse_table(file, text)
-                        .inspect_err(|e| tracing::error!("route file skipped: {e}"))
-                        .ok()
-                })
-                .collect(),
-        )
+/// The route data, read from the timetables' folder on first use and
+/// never changed after: immutable shipped data, like a const table, never
+/// state (the crate's "no statics" is about facts; this holds none).
+fn data() -> &'static Data {
+    static DATA: OnceLock<Data> = OnceLock::new();
+    DATA.get_or_init(|| {
+        let dir = routes_dir();
+        let fields = std::fs::read_to_string(dir.join("fields.yaml")).unwrap_or_default();
+        let (data, errors) = load(&fields, &yaml_files(&dir.join("carriers")));
+        for e in errors {
+            tracing::error!("route data: {e}");
+        }
+        data
     })
+}
+
+/// Every field with a route table.
+pub fn fields() -> &'static [FieldRoutes] {
+    &data().tables
 }
 
 /// The route table of `icao`, if we fly one there.
@@ -293,100 +365,137 @@ pub fn field_routes(icao: &str) -> Option<&'static FieldRoutes> {
     fields().iter().find(|f| f.icao.eq_ignore_ascii_case(icao))
 }
 
-/// Every carrier a route table names, for the telephony check
+/// A field a route names ([`crate::places`]).
+pub fn place(icao: &str) -> Option<&'static Place> {
+    data()
+        .places
+        .iter()
+        .find(|p| p.icao.eq_ignore_ascii_case(icao))
+}
+
+/// Every carrier the route data holds, for the telephony check
 /// ([`crate::airlines::all_carriers`]).
 pub fn all_carriers() -> Vec<Carrier> {
-    fields()
-        .iter()
-        .flat_map(|f| f.rows.iter().map(|r| r.carrier))
-        .collect()
+    data().airlines.iter().map(|a| a.carrier).collect()
+}
+
+/// Every carrier's (code, telephony): what the station learns through the
+/// party line's provider (`atc::callsign::provide_carrier_telephony`).
+pub fn telephony() -> &'static [(&'static str, &'static str)] {
+    &data().telephony
 }
 
 /// An airline's name as a board shows it, and its IATA designator (the
-/// board's flight numbers: "U2 8901"). The ICAO code itself for one not
-/// listed.
+/// board's flight numbers: "U2 8901"). Empty for one the data does not
+/// hold.
 pub fn airline_name(code: &str) -> (&'static str, &'static str) {
-    match code {
-        "BAW" => ("British Airways", "BA"),
-        "EZY" => ("easyJet", "U2"),
-        "RYR" => ("Ryanair", "FR"),
-        "VLG" => ("Vueling", "VY"),
-        "EXS" => ("Jet2", "LS"),
-        "TOM" => ("TUI", "BY"),
-        "NAX" => ("Norwegian", "DY"),
-        "KLM" => ("KLM", "KL"),
-        "TRA" => ("Transavia", "HV"),
-        "EIN" => ("Aer Lingus", "EI"),
-        "BEL" => ("Brussels Airlines", "SN"),
-        "SAS" => ("SAS", "SK"),
-        "FIN" => ("Finnair", "AY"),
-        "AUA" => ("Austrian", "OS"),
-        "DLH" => ("Lufthansa", "LH"),
-        "EWG" => ("Eurowings", "EW"),
-        "SWR" => ("Swiss", "LX"),
-        "AFR" => ("Air France", "AF"),
-        "IBE" => ("Iberia", "IB"),
-        "IBS" => ("Iberia Express", "I2"),
-        "AEA" => ("Air Europa", "UX"),
-        "ANE" => ("Air Nostrum", "YW"),
-        "TAP" => ("TAP Air Portugal", "TP"),
-        "THY" => ("Turkish Airlines", "TK"),
-        "QTR" => ("Qatar Airways", "QR"),
-        "UAL" => ("United", "UA"),
-        "ETD" => ("Etihad", "EY"),
-        "LOT" => ("LOT", "LO"),
-        "ICE" => ("Icelandair", "FI"),
-        "AEE" => ("Aegean", "A3"),
-        "WZZ" => ("Wizz Air", "W6"),
-        "ITY" => ("ITA Airways", "AZ"),
-        "SXS" => ("SunExpress", "XQ"),
-        "CAI" => ("Corendon", "XC"),
-        "KMM" => ("KM Malta Airlines", "KM"),
-        "SEH" => ("Sky Express", "GQ"),
-        "UBT" => ("Norse Atlantic", "Z0"),
-        "CES" => ("China Eastern", "MU"),
-        "CCA" => ("Air China", "CA"),
-        "AUR" => ("Aurigny", "GR"),
-        "UAE" => ("Emirates", "EK"),
-        _ => ("", ""),
-    }
+    data()
+        .airlines
+        .iter()
+        .find(|a| a.carrier.code == code)
+        .map_or(("", ""), |a| (a.name, a.iata))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every shipped file parses, under its own field's name, and no two
-    /// files are one field.
-    #[test]
-    fn every_route_file_parses() {
-        let files = route_files(&routes_dir());
-        assert!(files.len() >= 3, "{}", routes_dir().display());
-        for (file, text) in &files {
-            let t = parse_table(file, text).unwrap_or_else(|e| panic!("{e}"));
-            assert_eq!(format!("{}.yaml", t.icao), *file);
-            assert!(!t.rows.is_empty(), "{file}");
-            assert!((-12.0..=14.0).contains(&t.utc_offset_h), "{file}");
-        }
-        assert_eq!(fields().len(), files.len());
-        let mut seen = std::collections::HashSet::new();
-        assert!(fields().iter().all(|f| seen.insert(f.icao)));
+    fn shipped() -> (String, Vec<(String, String)>) {
+        let dir = routes_dir();
+        let fields = std::fs::read_to_string(dir.join("fields.yaml")).unwrap();
+        (fields, yaml_files(&dir.join("carriers")))
     }
 
-    /// A file that names a carrier no constant carries, or misspells a
-    /// field, fails naming the file and the row.
+    /// The shipped data loads without a word, each carrier file named by
+    /// its code, each field once, every clock a real one.
+    #[test]
+    fn the_route_data_loads_clean() {
+        let (fields, carriers) = shipped();
+        let (data, errors) = load(&fields, &carriers);
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert!(data.tables.len() >= 3);
+        assert_eq!(data.airlines.len(), carriers.len());
+        for (a, (file, _)) in data.airlines.iter().zip(&carriers) {
+            assert_eq!(format!("{}.yaml", a.carrier.code), *file);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for p in &data.places {
+            assert!(seen.insert(&p.icao), "{} twice", p.icao);
+            assert!((-12.0..=14.0).contains(&p.utc_offset_h), "{}", p.icao);
+            assert!(!p.city.is_empty(), "{}", p.icao);
+        }
+    }
+
+    /// A file that misspells a key fails naming the file and the row; a
+    /// pair written at both ends names both rows; a row to no field names
+    /// it.
     #[test]
     fn a_bad_route_file_names_its_file_and_row() {
-        let bad = "icao: XXXX\ncity: X\nutc_offset_h: 0.0\nroutes:\n  \
-                   - {carrier: EZY, number: 11, other: EGKK, city: A, summer: 7, winter: 7}\n  \
-                   - {carrier: EZY_GATWIK, number: 8001, other: EGKK, city: A, summer: 7, winter: 7}\n";
-        let e = parse_table("XXXX.yaml", bad).unwrap_err();
-        assert!(e.contains("XXXX.yaml") && e.contains("routes[1]"), "{e}");
-        assert!(e.contains("EZY_GATWIK"), "{e}");
-        let typo = "icao: XXXX\ncity: X\nutc_offset_h: 0.0\nroutes:\n  \
-                    - {carrier: EZY, number: 11, other: EGKK, city: A, sumer: 7, winter: 7}\n";
-        let e = parse_table("XXXX.yaml", typo).unwrap_err();
-        assert!(e.contains("XXXX.yaml") && e.contains("routes[0]"), "{e}");
+        let fields = "- {icao: EGKK, city: A, lat: 0, lon: 0, utc_offset_h: 0, dst: true}\n\
+                      - {icao: LEMG, city: B, lat: 1, lon: 1, utc_offset_h: 1, dst: true}\n";
+        let head = "code: EZY\nname: E\niata: U2\ntelephony: Easy\ntypes: [[A320, 1]]\n\
+                    numbers: [11, 8999]\nroutes:\n";
+        let file = |rows: &str| vec![("EZY.yaml".to_string(), format!("{head}{rows}"))];
+        let row = "  - {at: LEMG, other: EGKK, number: 11, summer: 7, winter: 7}\n";
+        let (_, e) = load(fields, &file(&row.replace("summer", "sumer")));
+        assert!(
+            e[0].contains("EZY.yaml") && e[0].contains("routes[0]"),
+            "{e:?}"
+        );
+        let back = "  - {at: EGKK, other: LEMG, number: 13, summer: 7, winter: 7}\n";
+        let (data, e) = load(fields, &file(&format!("{row}{row}{back}")));
+        assert!(
+            e.len() == 1 && e[0].contains("routes[2]") && e[0].contains("routes[0]"),
+            "{e:?}"
+        );
+        assert_eq!(data.tables.len(), 1, "EGKK's one row was dropped");
+        assert_eq!(data.tables[0].rows.len(), 2);
+        let (_, e) = load(fields, &file(&row.replace("EGKK", "EGLL")));
+        assert!(e[0].contains("routes[0]") && e[0].contains("EGLL"), "{e:?}");
+    }
+
+    /// The parse cost of a world's worth of routes: 50,000 rows over 500
+    /// carriers and 2,000 fields, printed (`--nocapture`), never asserted.
+    #[test]
+    fn a_world_of_routes_parses() {
+        let l = |n: usize| char::from(b'A' + (n % 26) as u8);
+        let icao = |i: usize| {
+            let i = i % 2000;
+            format!("K{}{}{}", l(i / 676), l(i / 26), l(i))
+        };
+        let mut fields = String::new();
+        for i in 0..2000 {
+            fields += &format!(
+                "- {{icao: {}, city: \"City {i}\", lat: 10.5, lon: 20.25, utc_offset_h: 1.0, dst: true}}\n",
+                icao(i)
+            );
+        }
+        let carriers: Vec<(String, String)> = (0..500)
+            .map(|c| {
+                let mut t = format!(
+                    "code: C{c:02}\nname: \"Carrier {c}\"\niata: X{c}\ntelephony: \"Tel {c}\"\n\
+                     types: [[A320, 60], [A321, 40]]\nnumbers: [1, 9999]\nroutes:\n"
+                );
+                for r in 0..100 {
+                    t += &format!(
+                        "  - {{at: {}, other: {}, number: {}, summer: 7, winter: 5, windows: [[8.0, 9.5]]}}\n",
+                        icao(c * 3 + r),
+                        icao(c * 7 + r * 13 + 1000),
+                        2 * r + 1
+                    );
+                }
+                (format!("C{c:02}.yaml"), t)
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        let (data, errors) = load(&fields, &carriers);
+        let rows: usize = data.tables.iter().map(|t| t.rows.len()).sum();
+        println!(
+            "50k routes: {:.0} ms, {rows} rows with derived, {} errors",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            errors.len()
+        );
+        assert!(rows >= 50_000);
     }
 
     /// Every row flies types the performance tables know, inside its
@@ -466,35 +575,6 @@ mod tests {
         }
     }
 
-    /// A route between two table fields is written ONCE (2026-10-14): a
-    /// file's own row to another table field whose own file also has a row
-    /// back with the same carrier is the route twice, and the two could
-    /// disagree. One file writes it; the other end derives it ([`derive`]).
-    fn written_twice(tables: &[FieldRoutes]) -> Vec<String> {
-        let mut out = Vec::new();
-        for a in tables {
-            for b in tables.iter().filter(|b| b.icao < a.icao) {
-                for ra in a
-                    .rows
-                    .iter()
-                    .filter(|r| r.mirror_of.is_none() && r.other == b.icao)
-                {
-                    if b.rows.iter().any(|rb| {
-                        rb.mirror_of.is_none()
-                            && rb.other == a.icao
-                            && rb.carrier.code == ra.carrier.code
-                    }) {
-                        out.push(format!(
-                            "{} {}{} to {}: written in both files; write it in one",
-                            a.icao, ra.carrier.code, ra.number, b.icao
-                        ));
-                    }
-                }
-            }
-        }
-        out
-    }
-
     /// Every derived row is its source's: the source's own row back to this
     /// field, the same carrier, numbers, frequencies and types.
     fn derived_disagree(tables: &[FieldRoutes]) -> Vec<String> {
@@ -529,8 +609,6 @@ mod tests {
 
     #[test]
     fn a_shared_route_is_written_once_and_derived_at_the_other_end() {
-        let bad = written_twice(fields());
-        assert!(bad.is_empty(), "{bad:#?}");
         let bad = derived_disagree(fields());
         assert!(bad.is_empty(), "{bad:#?}");
         // Every own row to a table field has its derived row there.
@@ -552,10 +630,11 @@ mod tests {
         }
     }
 
-    /// The rule bites: a route written at both ends is refused, and the
-    /// derived row is the source's, its far end the source field.
+    /// The derived row is the source's, its far end the source field (a
+    /// route written at both ends is the loader's error,
+    /// [`a_bad_route_file_names_its_file_and_row`]).
     #[test]
-    fn the_cross_field_rule_catches_a_route_written_twice() {
+    fn a_derived_row_is_its_sources() {
         let lxgb = *field_routes("LXGB").unwrap();
         let ezy = lxgb.rows.iter().find(|r| r.other == "EGKK").unwrap();
         let table = |rows: Vec<RouteRow>| FieldRoutes {
@@ -565,13 +644,6 @@ mod tests {
             top_up: false,
             rows: Box::leak(rows.into_boxed_slice()),
         };
-        let twice = RouteRow {
-            other: "LXGB",
-            city: "Gibraltar",
-            number: ezy.number + 1,
-            ..*ezy
-        };
-        assert!(!written_twice(&[lxgb, table(vec![twice])]).is_empty());
         let derived = derive(vec![lxgb, table(vec![])]);
         let d = derived[1].rows;
         assert_eq!(
@@ -585,7 +657,6 @@ mod tests {
             (ezy.number, ezy.summer, ezy.winter)
         );
         assert_eq!(derived[0].rows, lxgb.rows, "the source keeps its rows");
-        assert!(written_twice(&derived).is_empty());
         assert!(derived_disagree(&derived).is_empty());
         // A derived row that strays from its source is caught.
         let mut strayed = d.to_vec();
@@ -597,7 +668,7 @@ mod tests {
     /// written out (2026-10-15): pinned before the timetables became
     /// per-carrier data, so the move is proved to fly the same day. A
     /// change that moves a flight rewrites the fixture on purpose
-    /// (`XCOPILOT_GOLDEN=write`).
+    /// (`UPDATE_GOLDEN=write`).
     #[test]
     fn the_golden_days_are_unchanged() {
         use crate::rotation::{day_rotations, hhmm, Date};
@@ -626,7 +697,7 @@ mod tests {
             }
         }
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes_golden.txt");
-        if std::env::var("XCOPILOT_GOLDEN").as_deref() == Ok("write") {
+        if std::env::var("UPDATE_GOLDEN").as_deref() == Ok("write") {
             std::fs::write(path, &got).unwrap();
         }
         let want = std::fs::read_to_string(path).unwrap();

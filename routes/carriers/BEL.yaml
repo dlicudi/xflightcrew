@@ -1,0 +1,9 @@
+# Brussels Airlines: its routes from the hand tables (sources in ../fields.yaml).
+code: BEL
+name: "Brussels Airlines"
+iata: SN
+telephony: "Bee-line"
+types: [[A320, 60], [A319, 40]]
+numbers: [3000, 3999]
+routes:
+  - {at: LEMG, other: EBBR, number: 3713, summer: 21, winter: 14}

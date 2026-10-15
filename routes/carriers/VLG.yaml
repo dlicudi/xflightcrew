@@ -1,0 +1,26 @@
+# Vueling: its routes from the hand tables (sources in ../fields.yaml).
+code: VLG
+name: "Vueling"
+iata: VY
+telephony: "Vueling"
+types: [[A320, 50], [A321, 15], [A319, 10], [A20N, 20], [A21N, 5]]
+numbers: [1000, 8999]
+routes:
+  - {at: EGKK, other: LEBL, number: 8851, summer: 35, winter: 20, based: true}
+  - {at: EGKK, other: LEAL, number: 8871, summer: 6, winter: 4, based: true}
+  - {at: EGKK, other: LEZL, number: 8879, summer: 9, winter: 6, based: true}
+  - {at: EGKK, other: LEBB, number: 8887, summer: 22, winter: 13, based: true}
+  - {at: LEMG, other: EGKK, number: 8812, summer: 7, winter: 7}
+  - {at: LEMG, other: EHAM, number: 8411, summer: 7, winter: 7}
+  - {at: LEMG, other: EBBR, number: 8961, summer: 7, winter: 7}
+  - {at: LEMG, other: LFPO, number: 8013, summer: 14, winter: 14, based: true}
+  - {at: LEMG, other: LEBL, number: 2201, summer: 49, winter: 42, based: true}
+  - {at: LEMG, other: LEPA, number: 3911, summer: 14, winter: 10}
+  - {at: LEMG, other: LEBB, number: 1471, summer: 21, winter: 14, based: true}
+  - {at: LEMG, other: GCLP, number: 3021, summer: 14, winter: 14}
+  - {at: LEMG, other: GCXO, number: 3061, summer: 14, winter: 14}
+  - {at: LEMG, other: LEST, number: 1281, summer: 12, winter: 10}
+  - {at: LEMG, other: LEIB, number: 3519, summer: 7, winter: 2}
+  - {at: LEMG, other: EGFF, number: 4101, summer: 3, winter: 0}
+  - {at: LEMG, other: GCFV, number: 4105, summer: 4, winter: 4}
+  - {at: LEMG, other: GCRR, number: 4109, summer: 4, winter: 4}

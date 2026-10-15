@@ -1,0 +1,9 @@
+# Finnair: its routes from the hand tables (sources in ../fields.yaml).
+code: FIN
+name: "Finnair"
+iata: AY
+telephony: "Finnair"
+types: [[A321, 50], [A320, 30], [A319, 20]]
+numbers: [1000, 1999]
+routes:
+  - {at: LEMG, other: EFHK, number: 1653, summer: 14, winter: 10}

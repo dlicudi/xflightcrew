@@ -1,0 +1,10 @@
+# Corendon: its routes from the hand tables (sources in ../fields.yaml).
+# Telephony read 2026-10-14: Wikipedia's "List of airline codes".
+code: CAI
+name: "Corendon"
+iata: XC
+telephony: "Corendon"
+types: [[B738, 70], [B38M, 30]]
+numbers: [1600, 1699]
+routes:
+  - {at: EGKK, other: LTAI, number: 1661, summer: 5, winter: 1}

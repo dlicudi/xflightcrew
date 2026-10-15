@@ -526,6 +526,14 @@ pub(crate) static CALLSIGN_INPUTS: Mutex<Option<fn() -> crate::callsign::Inputs>
 /// [`CALLSIGN_INPUTS`]: nothing here can go stale.
 pub(crate) static CALLSIGN_TELEPHONY: Mutex<Option<fn() -> String>> = Mutex::new(None);
 
+/// The crew's provider of our traffic's carrier telephony
+/// ([`provide_carrier_telephony`], registered once at boot): (code,
+/// telephony) of every carrier the route data holds, so the station speaks
+/// and recognises the traffic's airlines from the data the traffic flies,
+/// never a second table. Shipped data, read when a callsign is spoken.
+type CarrierTelephonyProvider = fn() -> &'static [(&'static str, &'static str)];
+pub(crate) static CARRIER_TELEPHONY: Mutex<Option<CarrierTelephonyProvider>> = Mutex::new(None);
+
 /// Register the crew's provider of [`crate::callsign::Inputs`]. Called once
 /// at boot; the provider reads the live setting and the plan shelf each time
 /// it is asked (`callsign::inputs`).
@@ -537,6 +545,12 @@ pub fn provide_inputs(f: fn() -> crate::callsign::Inputs) {
 /// text, `callsign::parse_telephony` reads it). Called once at boot.
 pub fn provide_telephony(f: fn() -> String) {
     *lock(&CALLSIGN_TELEPHONY) = Some(f);
+}
+
+/// Register the crew's provider of the route data's carrier telephony.
+/// Called once at boot.
+pub fn provide_carrier_telephony(f: CarrierTelephonyProvider) {
+    *lock(&CARRIER_TELEPHONY) = Some(f);
 }
 
 /// The crew's provider of the route it FILED (`provide_filed_route`,

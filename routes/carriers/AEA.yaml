@@ -1,0 +1,11 @@
+# Air Europa: its routes from the hand tables (sources in ../fields.yaml).
+code: AEA
+name: "Air Europa"
+iata: UX
+telephony: "Air Europa"
+types: [[B738, 60], [B38M, 25], [B789, 15]]
+numbers: [1000, 9999]
+routes:
+  - {at: EGKK, other: LEMD, number: 1001, summer: 12, winter: 7}
+  - {at: LEMG, other: LEMD, number: 1041, summer: 14, winter: 14}
+  - {at: LEMG, other: LEPA, number: 6083, summer: 5, winter: 0}

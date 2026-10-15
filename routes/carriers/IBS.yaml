@@ -1,0 +1,9 @@
+# Iberia Express: its routes from the hand tables (sources in ../fields.yaml).
+code: IBS
+name: "Iberia Express"
+iata: I2
+telephony: "Iberexpres"
+types: [[A320, 60], [A321, 25], [A20N, 15]]
+numbers: [3800, 3999]
+routes:
+  - {at: EGKK, other: LEMD, number: 3801, summer: 12, winter: 7}

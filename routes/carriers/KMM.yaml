@@ -1,0 +1,10 @@
+# KM Malta Airlines: its routes from the hand tables (sources in ../fields.yaml).
+# Telephony read 2026-10-14: 123atc.com and airhex.com (KM Malta Airlines).
+code: KMM
+name: "KM Malta Airlines"
+iata: KM
+telephony: "Skyknight"
+types: [[A20N, 70], [A21N, 30]]
+numbers: [100, 499]
+routes:
+  - {at: EGKK, other: LMML, number: 391, summer: 7, winter: 4}

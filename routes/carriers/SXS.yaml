@@ -1,0 +1,11 @@
+# SunExpress: its routes from the hand tables (sources in ../fields.yaml).
+# Telephony read 2026-10-14: Wikipedia's "List of airline codes".
+code: SXS
+name: "SunExpress"
+iata: XQ
+telephony: "Sunexpress"
+types: [[B738, 70], [B38M, 30]]
+numbers: [1600, 1699]
+routes:
+  - {at: EGKK, other: LTAI, number: 1631, summer: 18, winter: 3}
+  - {at: EGKK, other: LTBS, number: 1643, summer: 6, winter: 0}

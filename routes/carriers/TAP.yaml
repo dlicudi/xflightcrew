@@ -1,0 +1,11 @@
+# TAP Air Portugal: its routes from the hand tables (sources in ../fields.yaml).
+code: TAP
+name: "TAP Air Portugal"
+iata: TP
+telephony: "Air Portugal"
+types: [[A320, 40], [A321, 30], [A20N, 15], [A21N, 15]]
+numbers: [1300, 1399]
+routes:
+  - {at: EGKK, other: LPPT, number: 1331, summer: 14, winter: 8}
+  - {at: EGKK, other: LPPR, number: 1341, summer: 8, winter: 5}
+  - {at: LEMG, other: LPPT, number: 1361, summer: 14, winter: 14}

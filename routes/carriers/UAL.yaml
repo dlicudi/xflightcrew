@@ -1,0 +1,9 @@
+# United: its routes from the hand tables (sources in ../fields.yaml).
+code: UAL
+name: "United"
+iata: UA
+telephony: "United"
+types: [[B772, 45], [B763, 20], [B789, 25], [B788, 10]]
+numbers: [1, 999]
+routes:
+  - {at: LEMG, other: KEWR, number: 120, summer: 7, winter: 0, windows: [[8.0, 8.5]], types: [[B763, 100]]}

@@ -1,0 +1,10 @@
+# Aurigny: its routes from the hand tables (sources in ../fields.yaml).
+# Telephony read 2026-10-14: Wikipedia's "List of airline codes"; it flies its E195 to Gatwick, its ATRs serve the islands.
+code: AUR
+name: "Aurigny"
+iata: GR
+telephony: "Ayline"
+types: [[E195, 100]]
+numbers: [600, 699]
+routes:
+  - {at: EGKK, other: EGJB, number: 601, summer: 14, winter: 14}

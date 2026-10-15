@@ -1,0 +1,10 @@
+# Aer Lingus: its routes from the hand tables (sources in ../fields.yaml).
+code: EIN
+name: "Aer Lingus"
+iata: EI
+telephony: "Shamrock"
+types: [[A320, 60], [A21N, 30], [A321, 10]]
+numbers: [100, 999]
+routes:
+  - {at: LEMG, other: EIDW, number: 584, summer: 21, winter: 14}
+  - {at: LEMG, other: EICK, number: 774, summer: 4, winter: 2}

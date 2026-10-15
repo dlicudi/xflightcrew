@@ -1,0 +1,10 @@
+# Turkish Airlines: its routes from the hand tables (sources in ../fields.yaml).
+code: THY
+name: "Turkish Airlines"
+iata: TK
+telephony: "Turkish"
+types: [[A321, 50], [B738, 25], [A333, 25]]
+numbers: [1960, 1999]
+routes:
+  - {at: EGKK, other: LTFM, number: 1979, summer: 28, winter: 28, windows: [[9.0, 9.5], [12.0, 12.5], [17.0, 17.5], [21.0, 21.5]], types: [[A321, 50], [A333, 30], [B738, 20]]}
+  - {at: LEMG, other: LTFM, number: 1966, summer: 7, winter: 7, windows: [[11.5, 12.0]], types: [[A321, 100]]}

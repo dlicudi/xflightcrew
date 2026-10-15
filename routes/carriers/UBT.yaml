@@ -1,0 +1,11 @@
+# Norse Atlantic: its routes from the hand tables (sources in ../fields.yaml).
+# Telephony read 2026-10-14: airplanes.live and airhex.com (Norse Atlantic UK; NBT LONGSHIP is the Norwegian AOC).
+code: UBT
+name: "Norse Atlantic"
+iata: Z0
+telephony: "Longboat"
+types: [[B789, 100]]
+numbers: [1, 999]
+routes:
+  - {at: EGKK, other: KMCO, number: 1, summer: 4, winter: 4, windows: [[6.5, 7.0]], types: [[B789, 100]]}
+  - {at: EGKK, other: KJFK, number: 7, summer: 7, winter: 4, windows: [[6.0, 6.5]], types: [[B789, 100]]}

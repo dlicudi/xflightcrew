@@ -1,0 +1,11 @@
+# Swiss: its routes from the hand tables (sources in ../fields.yaml).
+code: SWR
+name: "Swiss"
+iata: LX
+telephony: "Swiss"
+types: [[A320, 40], [A321, 20], [A20N, 20], [BCS3, 20]]
+numbers: [300, 499]
+routes:
+  - {at: EGKK, other: LSGG, number: 351, summer: 2, winter: 2}
+  - {at: LEMG, other: LSZH, number: 437, summer: 14, winter: 10}
+  - {at: LEMG, other: LSGG, number: 469, summer: 4, winter: 4}

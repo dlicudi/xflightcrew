@@ -344,7 +344,8 @@ pub fn profiles_dir() -> PathBuf {
     resources().join("profiles")
 }
 
-/// The traffic timetables' folder: one YAML per field.
+/// The traffic timetables' folder: `fields.yaml` and one YAML per carrier
+/// under `carriers/`.
 pub fn routes_dir() -> PathBuf {
     resources().join("routes")
 }

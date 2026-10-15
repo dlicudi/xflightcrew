@@ -1,0 +1,10 @@
+# Lufthansa: its routes from the hand tables (sources in ../fields.yaml).
+code: DLH
+name: "Lufthansa"
+iata: LH
+telephony: "Lufthansa"
+types: [[A320, 40], [A321, 25], [A20N, 20], [A21N, 10], [A319, 5]]
+numbers: [1, 2999]
+routes:
+  - {at: LEMG, other: EDDF, number: 1150, summer: 14, winter: 14}
+  - {at: LEMG, other: EDDM, number: 1802, summer: 14, winter: 10}

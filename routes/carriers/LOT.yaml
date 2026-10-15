@@ -1,0 +1,9 @@
+# LOT: its routes from the hand tables (sources in ../fields.yaml).
+code: LOT
+name: "LOT"
+iata: LO
+telephony: "LOT"
+types: [[B38M, 100]]
+numbers: [400, 499]
+routes:
+  - {at: LEMG, other: EPWA, number: 431, summer: 5, winter: 3}

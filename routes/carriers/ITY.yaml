@@ -1,0 +1,9 @@
+# ITA Airways: its routes from the hand tables (sources in ../fields.yaml).
+code: ITY
+name: "ITA Airways"
+iata: AZ
+telephony: "Itarrow"
+types: [[A320, 50], [A20N, 30], [A21N, 20]]
+numbers: [1, 2999]
+routes:
+  - {at: LEMG, other: LIRF, number: 1286, summer: 7, winter: 4}

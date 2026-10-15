@@ -322,6 +322,9 @@ async fn main() -> Result<()> {
     // ...and the pilot's own airline telephony ("WAT=Walker"), asked before
     // its built-in tables, the same way.
     callsign::provide_telephony(settings::airline_telephony);
+    // ...and our traffic's carriers' telephony, from the route data the
+    // traffic flies, never a second table.
+    callsign::provide_carrier_telephony(traffic::routes::telephony);
     // ...and the route we filed, so an IFR clearance names the SID that
     // joins it, by the crew's own rule (#152).
     party_line::provide_filed_route(simbrief::filed_route);

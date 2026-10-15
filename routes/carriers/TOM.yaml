@@ -1,0 +1,31 @@
+# TUI: its routes from the hand tables (sources in ../fields.yaml).
+code: TOM
+name: "TUI"
+iata: BY
+telephony: "Tomjet"
+types: [[B738, 60], [B38M, 25], [B788, 10], [B789, 5]]
+numbers: [1, 999]
+routes:
+  - {at: EGKK, other: LEAL, number: 651, summer: 3, winter: 1, based: true}
+  - {at: EGKK, other: LEPA, number: 663, summer: 8, winter: 1, based: true}
+  - {at: EGKK, other: LSGG, number: 657, summer: 2, winter: 2, based: true}
+  - {at: EGKK, other: LIRN, number: 751, summer: 2, winter: 1, based: true}
+  - {at: EGKK, other: GCTS, number: 671, summer: 9, winter: 9, based: true}
+  - {at: EGKK, other: GMMX, number: 687, summer: 5, winter: 5, based: true}
+  - {at: EGKK, other: GCRR, number: 699, summer: 5, winter: 5, based: true}
+  - {at: EGKK, other: LTAI, number: 679, summer: 8, winter: 1, based: true}
+  - {at: EGKK, other: LCLK, number: 705, summer: 4, winter: 3, based: true}
+  - {at: EGKK, other: LTBS, number: 711, summer: 10, winter: 0, based: true}
+  - {at: EGKK, other: LCPH, number: 719, summer: 3, winter: 1, based: true}
+  - {at: EGKK, other: LGKR, number: 731, summer: 4, winter: 0, based: true}
+  - {at: EGKK, other: LGIR, number: 737, summer: 6, winter: 0, based: true}
+  - {at: EGKK, other: LGRP, number: 745, summer: 5, winter: 0, based: true}
+  - {at: EGKK, other: KMCO, number: 693, summer: 3, winter: 3, windows: [[7.0, 7.5]], types: [[B789, 100]]}
+  - {at: EGKK, other: MMUN, number: 725, summer: 6, winter: 6, windows: [[10.0, 10.5]], types: [[B789, 60], [B788, 40]]}
+  - {at: LEMG, other: EGKK, number: 614, summer: 5, winter: 2}
+  - {at: LEMG, other: EGCC, number: 652, summer: 5, winter: 2}
+  - {at: LEMG, other: EGNX, number: 286, summer: 3, winter: 0}
+  - {at: LEMG, other: EGFF, number: 318, summer: 3, winter: 0}
+  - {at: LEMG, other: EGNT, number: 900, summer: 3, winter: 0}
+  - {at: LEMG, other: EGBB, number: 904, summer: 4, winter: 0}
+  - {at: LEMG, other: EGGD, number: 908, summer: 3, winter: 0}

@@ -1,0 +1,29 @@
+# Wizz Air: its routes from the hand tables (sources in ../fields.yaml).
+code: WZZ
+name: "Wizz Air"
+iata: W6
+telephony: "Wizz Air"
+types: [[A321, 50], [A21N, 35], [A320, 15]]
+numbers: [1000, 9999]
+routes:
+  - {at: EGKK, other: LPFR, number: 4501, summer: 8, winter: 4, based: true}
+  - {at: EGKK, other: LHBP, number: 4523, summer: 15, winter: 8, based: true}
+  - {at: EGKK, other: LCLK, number: 4509, summer: 6, winter: 4, based: true}
+  - {at: EGKK, other: LTBS, number: 4517, summer: 4, winter: 0, based: true}
+  - {at: LEMG, other: EGKK, number: 4471, summer: 7, winter: 4}
+  - {at: LEMG, other: EGGW, number: 4625, summer: 3, winter: 2}
+  - {at: LEMG, other: LIRF, number: 6201, summer: 7, winter: 4}
+  - {at: LEMG, other: LIMC, number: 1347, summer: 5, winter: 3}
+  - {at: LEMG, other: LHBP, number: 3331, summer: 7, winter: 4}
+  - {at: LEMG, other: LROP, number: 3417, summer: 4, winter: 3}
+  - {at: LEMG, other: LZIB, number: 7001, summer: 3, winter: 2}
+  - {at: LEMG, other: LRCL, number: 7005, summer: 3, winter: 3}
+  - {at: LEMG, other: EPGD, number: 7009, summer: 3, winter: 2}
+  - {at: LEMG, other: EPKT, number: 7013, summer: 4, winter: 3}
+  - {at: LEMG, other: EPKK, number: 7017, summer: 3, winter: 2}
+  - {at: LEMG, other: LBSF, number: 7021, summer: 4, winter: 3}
+  - {at: LEMG, other: LATI, number: 7025, summer: 3, winter: 3}
+  - {at: LEMG, other: LIPZ, number: 7029, summer: 4, winter: 3}
+  - {at: LEMG, other: EYVI, number: 7033, summer: 3, winter: 3}
+  - {at: LEMG, other: EPWA, number: 7037, summer: 4, winter: 3}
+  - {at: LEMG, other: EPWR, number: 7041, summer: 3, winter: 2}
