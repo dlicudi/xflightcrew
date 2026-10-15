@@ -83,7 +83,8 @@ bool board_fresh();
 // the traffic runs at).
 void set_board_field(const char* icao);
 // The Checklist tab's feed (see drefs.cpp): ever written, and written in
-// the last 30 s. The pick (a list title, empty = the app's own) and the
+// the last 30 s. The pick (a list title, empty = the app's own; a non-empty
+// one bumps the pick counter) and the
 // tab drawn this frame ride xcopilot/opt/checklist_view back to the app.
 const ChecklistRef& checklist();
 bool checklist_ever();

@@ -1297,7 +1297,13 @@ pub async fn run(
                 // The Checklist tab: once a second, its shown section read
                 // live only while the tab is on screen (`checklist_panel`).
                 checklist_tab
-                    .tick(&xp, s, || live.get().display_name, Instant::now())
+                    .tick(
+                        &xp,
+                        s,
+                        || live.get().display_name,
+                        flight.phase(),
+                        Instant::now(),
+                    )
                     .await;
                 if auto != last_auto || auto_resend == 0 {
                     s.auto_status(&auto);

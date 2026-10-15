@@ -5,6 +5,11 @@
 //! No list, no fallback: an airframe without a checklist file is
 //! published with no titles, and the tab says it has none.
 //!
+//! The section on screen follows the flight ([`shown`]): the running list,
+//! else the flight phase's ([`phase_list`]), else this flight's last list,
+//! else the first. The pilot's pick in the combo overrides it only until the
+//! next phase change or list start ([`PickGate`]).
+//!
 //! Live judging reads only while the tab is ON SCREEN (the plugin's
 //! [`DR_CHECKLIST_VIEW`]): about once a second, every term of every item of
 //! the shown section in one join, each dataref once, judged by the pure
@@ -38,12 +43,14 @@
 use std::time::{Duration, Instant};
 
 use crate::checklist::{self, Checklist, Item};
+use crate::flight::Phase;
 use crate::flow::{ItemState, Sheet};
 use crate::xplane::XPlaneClient;
 
-/// The panel's view, plugin to app: "1|title" while the Checklist tab is on
-/// screen, "0|title" while it is not (title: the pilot's pick, empty for
-/// ours). An older plugin has none: nothing is ever read live.
+/// The panel's view, plugin to app: "1|seq|title" while the Checklist tab
+/// is on screen, "0|seq|title" while it is not (title: the pilot's pick,
+/// empty for ours; seq: bumped on every pick in the combo). An older plugin
+/// sends "1|title" (no seq), or has none: nothing is ever read live.
 pub(crate) const DR_CHECKLIST_VIEW: &str = "xcopilot/opt/checklist_view";
 
 /// How often the tab is built (and, on screen, read).
@@ -106,17 +113,90 @@ fn kind_code(item: &Item) -> char {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct View {
     pub open: bool,
+    /// The pick's counter; `None` from an older plugin.
+    pub seq: Option<u64>,
     pub title: String,
 }
 
-/// "1|Before takeoff" -> on screen, that pick. Anything else is off
-/// screen. Pure.
+/// "1|7|Before takeoff" -> on screen, pick number 7, that title; an older
+/// plugin's "1|Before takeoff" has no number. Anything else is off screen.
+/// Pure.
 pub(crate) fn parse_view(raw: &str) -> View {
     let raw = raw.trim_matches(char::from(0)).trim();
-    let (flag, title) = raw.split_once('|').unwrap_or((raw, ""));
+    let (flag, rest) = raw.split_once('|').unwrap_or((raw, ""));
+    let (seq, title) = match rest.split_once('|') {
+        Some((n, t)) if n.trim().parse::<u64>().is_ok() => (n.trim().parse().ok(), t),
+        _ => (None, rest),
+    };
     View {
         open: flag.trim() == "1",
+        seq,
         title: title.trim().to_string(),
+    }
+}
+
+/// The flight phase's section key; `None` where no list belongs to it (a
+/// parked aircraft shows the first list, a hover the last run). Pure.
+pub(crate) fn phase_section(phase: Phase) -> Option<&'static str> {
+    use Phase::*;
+    match phase {
+        EngineStart | Ready | Pushback | TaxiOut | Holding | LinedUp | TakeoffRoll
+        | RejectedTakeoff => Some("before takeoff"),
+        InitialClimb | Climb | GoAround => Some("climb"),
+        Cruise => Some("cruise"),
+        Descent => Some("descent"),
+        Approach | Landing => Some("before landing"),
+        Rollout | TaxiIn => Some("after landing"),
+        Parked | Hover => None,
+    }
+}
+
+/// The phase's list: its section through `find`, the first list when
+/// parked, `None` when the phase has none or the file lacks it.
+pub(crate) fn phase_list(
+    lists: &[Checklist],
+    phase: Phase,
+    find: impl Fn(&str) -> Option<usize>,
+) -> Option<usize> {
+    match phase_section(phase) {
+        Some(key) => find(key),
+        None if phase == Phase::Parked && !lists.is_empty() => Some(0),
+        None => None,
+    }
+}
+
+/// Whether the pilot's pick stands: only one made (its counter bumped)
+/// since the last automatic change, a phase list change or a list start.
+#[derive(Default)]
+pub(crate) struct PickGate {
+    /// The pick counter at the last automatic change.
+    floor: Option<u64>,
+    phase: Option<usize>,
+    running: Option<String>,
+}
+
+impl PickGate {
+    /// One tick: the view's counter, the phase's list and the running
+    /// list's title. An older plugin (no counter) keeps its pick. Pure.
+    pub(crate) fn step(
+        &mut self,
+        seq: Option<u64>,
+        phase: Option<usize>,
+        running: Option<&str>,
+    ) -> bool {
+        let started = running.is_some() && running != self.running.as_deref();
+        let changed = phase != self.phase || started;
+        self.phase = phase;
+        self.running = running.map(str::to_string);
+        let Some(seq) = seq else {
+            return true;
+        };
+        // The first view, an automatic change, or a reloaded plugin's
+        // counter starting again: every pick before it is spent.
+        if changed || self.floor.is_none_or(|f| seq < f) {
+            self.floor = Some(seq);
+        }
+        self.floor.is_some_and(|f| seq > f)
     }
 }
 
@@ -127,9 +207,16 @@ pub(crate) fn sheet_list(lists: &[Checklist], sheet: &Sheet) -> Option<usize> {
         .position(|c| c.title == sheet.title && c.items.len() == sheet.items.len())
 }
 
-/// The section on screen: the pilot's pick when it names one, else the
-/// sheet's list, else the first. `None` with no lists. Pure.
-pub(crate) fn shown(lists: &[Checklist], pick: &str, sheet: Option<usize>) -> Option<usize> {
+/// The section on screen: the pilot's standing pick when it names one,
+/// else the running list, else the phase's, else this flight's last list,
+/// else the first. `None` with no lists. Pure.
+pub(crate) fn shown(
+    lists: &[Checklist],
+    pick: &str,
+    running: Option<usize>,
+    phase: Option<usize>,
+    last: Option<usize>,
+) -> Option<usize> {
     if lists.is_empty() {
         return None;
     }
@@ -141,7 +228,11 @@ pub(crate) fn shown(lists: &[Checklist], pick: &str, sheet: Option<usize>) -> Op
                 .position(|c| c.title.eq_ignore_ascii_case(pick))
         })
         .flatten();
-    Some(picked.or(sheet).filter(|i| *i < lists.len()).unwrap_or(0))
+    [picked, running, phase, last]
+        .into_iter()
+        .flatten()
+        .find(|i| *i < lists.len())
+        .or(Some(0))
 }
 
 /// The pilot English that starts list `idx` through the command loop: its
@@ -312,16 +403,19 @@ pub(crate) struct ChecklistTab {
     last: String,
     /// A plugin without the view is not asked again until then.
     view_quiet_until: Option<Instant>,
+    picks: PickGate,
 }
 
 impl ChecklistTab {
     /// Build (and on screen, read) at most once a second; publish on a
-    /// change and every [`RESEND`]. `aircraft` is asked only when due.
+    /// change and every [`RESEND`]. `aircraft` is asked only when due;
+    /// `phase` is the flight model's.
     pub(crate) async fn tick(
         &mut self,
         xp: &XPlaneClient,
         sink: &crate::plugin_status::StatusSink,
         aircraft: impl FnOnce() -> String,
+        phase: Phase,
         now: Instant,
     ) {
         if self
@@ -339,8 +433,24 @@ impl ChecklistTab {
         };
         let sheet = crate::flow::sheet();
         let sheet_idx = sheet.as_ref().and_then(|s| sheet_list(&lists, s));
-        let pick = view.as_ref().map_or("", |v| v.title.as_str());
-        let shown = shown(&lists, pick, sheet_idx);
+        let running = sheet.as_ref().filter(|s| s.running);
+        let phase_idx = phase_list(&lists, phase, crate::flow::find_section);
+        let stands = self.picks.step(
+            view.as_ref().and_then(|v| v.seq),
+            phase_idx,
+            running.map(|s| s.title.as_str()),
+        );
+        let pick = view
+            .as_ref()
+            .filter(|_| stands)
+            .map_or("", |v| v.title.as_str());
+        let shown = shown(
+            &lists,
+            pick,
+            sheet_idx.filter(|_| running.is_some()),
+            phase_idx,
+            sheet_idx,
+        );
         // Off screen nothing is read, so nothing is judged.
         let live = match shown.filter(|_| view.as_ref().is_some_and(|v| v.open)) {
             Some(i) => read_live(xp, &lists[i]).await,
@@ -496,30 +606,87 @@ landing:
             payload("Generic", &[], None, None, &[]),
             "H|Generic|-1|-1|-||"
         );
-        assert_eq!(shown(&[], "anything", None), None);
+        assert_eq!(shown(&[], "anything", None, None, None), None);
     }
 
     #[test]
     fn the_view_names_the_pick_and_whether_it_is_on_screen() {
         assert_eq!(
+            parse_view("1|3|LANDING"),
+            View {
+                open: true,
+                seq: Some(3),
+                title: "LANDING".into()
+            }
+        );
+        // An older plugin's view: no counter.
+        assert_eq!(
             parse_view("1|LANDING"),
             View {
                 open: true,
+                seq: None,
                 title: "LANDING".into()
             }
         );
         assert_eq!(
-            parse_view("0|"),
+            parse_view("0|0|"),
             View {
                 open: false,
+                seq: Some(0),
                 title: String::new()
             }
         );
         assert!(!parse_view("").open);
         let l = lists();
-        assert_eq!(shown(&l, "landing", Some(0)), Some(1));
-        assert_eq!(shown(&l, "", Some(1)), Some(1));
-        assert_eq!(shown(&l, "a list the last airframe had", None), Some(0));
+        assert_eq!(shown(&l, "landing", Some(0), Some(0), None), Some(1));
+        assert_eq!(
+            shown(&l, "a list the last airframe had", None, None, None),
+            Some(0)
+        );
+    }
+
+    /// The tab follows the flight: the running list, else the phase's, else
+    /// the last run, else the first.
+    #[test]
+    fn the_tab_follows_the_flight() {
+        let l = lists();
+        assert_eq!(shown(&l, "", Some(0), Some(1), None), Some(0));
+        assert_eq!(shown(&l, "", None, Some(1), Some(0)), Some(1));
+        assert_eq!(shown(&l, "", None, None, Some(1)), Some(1));
+        assert_eq!(shown(&l, "", None, None, None), Some(0));
+        let find = |k: &str| (k == "before landing").then_some(1);
+        assert_eq!(phase_list(&l, Phase::Approach, find), Some(1));
+        assert_eq!(phase_list(&l, Phase::Landing, find), Some(1));
+        assert_eq!(phase_list(&l, Phase::Parked, find), Some(0));
+        assert_eq!(phase_list(&l, Phase::Cruise, find), None, "no cruise list");
+        assert_eq!(phase_list(&l, Phase::Hover, find), None);
+        assert_eq!(phase_section(Phase::Holding), Some("before takeoff"));
+        assert_eq!(phase_section(Phase::InitialClimb), Some("climb"));
+        assert_eq!(phase_section(Phase::TaxiIn), Some("after landing"));
+    }
+
+    /// The pilot's pick stands until the next phase change or list start;
+    /// a pick made since stands again.
+    #[test]
+    fn a_pick_stands_until_the_next_automatic_change() {
+        let mut g = PickGate::default();
+        // The plugin's pick from before the app started is spent.
+        assert!(!g.step(Some(4), Some(0), None));
+        // A new pick: it stands, through ticks of the same phase.
+        assert!(g.step(Some(5), Some(0), None));
+        assert!(g.step(Some(5), Some(0), None));
+        // The phase's list changes: the pick is spent.
+        assert!(!g.step(Some(5), Some(1), None));
+        assert!(g.step(Some(6), Some(1), None));
+        // A list starts: spent again; it running on is no new start.
+        assert!(!g.step(Some(6), Some(1), Some("Landing")));
+        assert!(g.step(Some(7), Some(1), Some("Landing")));
+        assert!(g.step(Some(7), Some(1), Some("Landing")));
+        // A reloaded plugin counts from zero again.
+        assert!(!g.step(Some(0), Some(1), Some("Landing")));
+        assert!(g.step(Some(1), Some(1), Some("Landing")));
+        // An older plugin keeps its pick, as it always did.
+        assert!(g.step(None, Some(0), None));
     }
 
     #[test]
