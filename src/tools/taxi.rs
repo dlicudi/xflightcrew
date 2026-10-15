@@ -154,6 +154,11 @@ impl Tool for AutoTaxi {
             );
         };
         route.pace = self.pace;
+        // A holding point is reached with the nose behind the line; a stand
+        // is reached by the point the sim places us by.
+        if !party_line::taxi_to_stand() {
+            route.hold_nose_behind_end(autotaxi::OwnSize::read(ctx.xplane).await.nose_m);
+        }
         let (Ok(lat), Ok(lon), Ok(psi)) = (
             ctx.xplane.get_float(autotaxi::LAT).await,
             ctx.xplane.get_float(autotaxi::LON).await,

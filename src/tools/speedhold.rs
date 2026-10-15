@@ -70,7 +70,7 @@ const MS_TO_KTS: f64 = 1.943_844;
 /// Toe-brake ratio above which the pilot is deliberately braking — enough to
 /// clear pedal rest/noise, well below a firm press. Only read once our own
 /// held-brake command has expired, so the ratio IS the pilot's pedal.
-const PILOT_BRAKE_YIELD: f64 = 0.1;
+pub(super) const PILOT_BRAKE_YIELD: f64 = 0.1;
 /// Both pedals back below this = fully released, the brake-pause is over and
 /// the taxi hold rolls again. Lower than the yield threshold on purpose —
 /// hysteresis, so a pedal hovering at the yield point can't flap the hold
@@ -112,6 +112,20 @@ const PILOT_BRAKE_RESUME: f64 = 0.05;
 /// our own brake and the pilot's are genuinely indistinguishable.
 fn pilot_took_the_brakes(left: f64, right: f64, parkbrake: f64, governor_braking: bool) -> bool {
     !governor_braking && (left.min(right) > PILOT_BRAKE_YIELD || parkbrake > PILOT_BRAKE_YIELD)
+}
+
+/// The parking-brake ratio the pause may read as the pilot's toggle: none
+/// until the ratio has READ released once since the governor armed. Before
+/// that it is the brake the arm released still bleeding off, or a crew hold
+/// decaying: the A330's ratio read 0.23 half a second after its release and
+/// the governor paused on it as the pilot's (EGKK, 2026-10-15). The park
+/// HANDLE past 0.5 stands the drive down whatever this says. Pure.
+fn pilot_park_ratio(parkbrake: f64, released_seen: bool) -> f64 {
+    if released_seen {
+        parkbrake
+    } else {
+        0.0
+    }
 }
 
 /// True while the governor loop runs. Public so other control loops could
@@ -1139,10 +1153,16 @@ impl Tool for HoldSpeed {
             if a.knots.is_some_and(|k| k < 1.0) {
                 return Ok("Parking brake's set — we're staying put.".to_string());
             }
+            // Released means READS released: a hydraulic brake still
+            // bleeding off is read below as the pilot's toggle.
             brake_released =
-                super::controls::drive_park_brake(ctx.xplane, false, self.park_brake_valve_set)
-                    .await
-                    .unwrap_or(false);
+                super::controls::release_park_brake_settled(ctx.xplane, self.park_brake_valve_set)
+                    .await;
+            crate::blackbox::record(
+                "speedhold",
+                json!({"event": "park_release", "before": pb, "released": brake_released,
+                       "after": ctx.xplane.get_float(PARK_BRAKE).await.ok()}),
+            );
             if !brake_released {
                 return Ok(
                     "Parking brake's set and it won't release from here — check the handle."
@@ -1346,6 +1366,9 @@ async fn governor(
     // Brake-paused: the pilot pressed both pedals mid-taxi, the throttle went
     // to idle, and the hold is waiting for the pedals to come fully off.
     let mut paused = false;
+    // The parking-brake ratio has read released since the arm
+    // ([`pilot_park_ratio`]).
+    let mut park_released_seen = false;
     // The throttle position this loop last commanded. If the lever is later
     // found far from where we put it, that's the PILOT's hand — yield
     // rather than fight them for the lever (a taxi hold once yanked the
@@ -1592,7 +1615,9 @@ async fn governor(
                 // against the brake at taxi power. Below that, the ratio can
                 // be the pilot's brake TOGGLE (regular effort ~0.36), which
                 // feeds the pause logic further down.
-                let pb = xp.get_float(PARK_BRAKE).await.unwrap_or(0.0);
+                let pb_read = xp.get_float(PARK_BRAKE).await.ok();
+                park_released_seen |= pb_read.is_some_and(|p| p <= PILOT_BRAKE_YIELD);
+                let pb = pb_read.unwrap_or(0.0);
                 if pb > 0.5 {
                     tracing::info!(
                         "speed governor: parking brake set, closing throttle, standing down"
@@ -1601,6 +1626,7 @@ async fn governor(
                     run.lower_flag();
                     break;
                 }
+                let pb = pilot_park_ratio(pb, park_released_seen);
                 // Brake-paused: idle throttle, hands off, waiting on the
                 // brakes — pedals AND the toggle latch, whichever the pilot
                 // used. Fully released rolls the taxi again; a hand advancing
@@ -2659,6 +2685,35 @@ mod tests {
             !pilot_took_the_brakes(0.0, 0.0, 0.36, true),
             "our stop, not their toggle"
         );
+    }
+
+    /// The A330 at EGKK (2026-10-15): the arm released a set brake and the
+    /// ratio read 0.23 half a second later; the governor paused on it as the
+    /// pilot's toggle, "Brakes yours", and the taxi gave up. A ratio bleeding
+    /// off from the release is never the pilot's; once it has read released,
+    /// the pilot's toggle pauses the drive as before.
+    #[test]
+    fn a_release_bleeding_off_is_not_the_pilots_brake() {
+        let mut seen = false;
+        let mut paused_at = None;
+        for (i, pb) in [0.23, 0.18, 0.12, 0.04, 0.0, 0.36].into_iter().enumerate() {
+            seen |= pb <= PILOT_BRAKE_YIELD;
+            if pilot_took_the_brakes(0.0, 0.0, pilot_park_ratio(pb, seen), false) {
+                paused_at.get_or_insert(i);
+            }
+        }
+        assert_eq!(
+            paused_at,
+            Some(5),
+            "only the pilot's toggle, after the release read clear"
+        );
+        // The pedals are the pilot's whatever the ratio is doing.
+        assert!(pilot_took_the_brakes(
+            0.4,
+            0.4,
+            pilot_park_ratio(0.23, false),
+            false
+        ));
     }
 
     /// No drive may start against the last drive's brakes. The channel's

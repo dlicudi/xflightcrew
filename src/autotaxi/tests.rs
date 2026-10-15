@@ -344,6 +344,23 @@
         assert_eq!(schedule_kts(10.0, &r, r.total - STOP_SHORT_M, 3.0), 0.0);
     }
 
+    /// EGKK holding point Mike (2026-10-15): the drive stopped the reference
+    /// point on the hold, the A330's nose 29.6 m past it. A hold is reached
+    /// with the nose behind the line; a short nose keeps the old margin.
+    #[test]
+    fn a_hold_is_reached_with_the_nose_behind_the_line() {
+        let mut r = Route::build(&watch()).expect("route");
+        r.hold_nose_behind_end(29.6);
+        let stop = r.total - 29.6 - NOSE_BEHIND_LINE_M;
+        assert!(r.remaining(stop).abs() < 1e-9);
+        assert_eq!(schedule_kts(10.0, &r, stop, 3.0), 0.0, "stopped there");
+        assert!(schedule_kts(10.0, &r, stop - 20.0, 8.0) > 2.0, "still rolling 20 m before");
+
+        let mut ga = Route::build(&watch()).expect("route");
+        ga.hold_nose_behind_end(1.5);
+        assert_eq!(ga.remaining(0.0), ga.total - STOP_SHORT_M);
+    }
+
     /// LEMG's Alpha (2026-09-26, sortie 1790441293, a 737): an 80-degree
     /// corner drawn at about a 9 m radius (the route asked 38 deg/s at
     /// 11.5 kt), entered at 11.5 kt against the 10 kt turn cap that arrived

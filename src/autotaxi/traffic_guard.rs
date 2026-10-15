@@ -116,6 +116,13 @@ impl OwnSize {
         }
     }
 
+    /// Ours as the sim reads it: the class from the maximum takeoff mass,
+    /// the nose from the `.acf` ([`OwnSize::with_nose`]).
+    pub async fn read(xp: &dyn crate::xplane::XPlane) -> OwnSize {
+        OwnSize::from_mtow(xp.get_float(crate::datarefs::ACF_M_MAX_KG).await.ok())
+            .with_nose(crate::aircraft::learned::acf_model().and_then(|m| m.geometry.nose_m))
+    }
+
     /// Half the corridor about the route a target's centre must be outside.
     pub fn corridor_half_m(&self) -> f64 {
         self.half_span_m + TRAFFIC_SPAN_DEFAULT_M / 2.0 + CORRIDOR_MARGIN_M

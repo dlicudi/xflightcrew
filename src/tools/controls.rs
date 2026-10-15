@@ -153,6 +153,52 @@ pub(crate) async fn release_park_brake_for_roll(
     }
 }
 
+/// At or under this `parking_brake_ratio` a released brake has finished
+/// releasing: the taxi governor's own threshold for the pilot's brake toggle,
+/// so a brake released here is never read there as the pilot's.
+const PARK_RELEASED_RATIO: f64 = super::speedhold::PILOT_BRAKE_YIELD;
+/// How long one release is given to READ released.
+const PARK_RELEASE_SETTLE_S: f64 = 2.0;
+/// Releases tried before the brake is reported as not releasing.
+const PARK_RELEASE_TRIES: u32 = 2;
+
+/// Release the parking brake for a commanded taxi and wait until the ratio
+/// READS released, through [`drive_park_brake`]: `true` only once it reads
+/// at or under [`PARK_RELEASED_RATIO`].
+///
+/// `drive_park_brake`'s readback is "at or under 0.5 after 150 ms", which is
+/// not released on a hydraulic park brake: on the A330 (EGKK, 2026-10-15)
+/// the ratio read 0.23 half a second after the release, the taxi governor
+/// took that for the pilot's brake toggle and paused, and the ratio then
+/// climbed back to 1.0 and the drive gave up. A release that does not read
+/// clear is driven once more, then reported, never rolled against.
+pub(crate) async fn release_park_brake_settled(
+    xp: &dyn crate::xplane::XPlane,
+    valve_set: Option<f64>,
+) -> bool {
+    for _ in 0..PARK_RELEASE_TRIES {
+        if let Err(e) = drive_park_brake(xp, false, valve_set).await {
+            tracing::debug!("park brake release failed: {e:#}");
+        }
+        let mut waited_s = 0.0;
+        loop {
+            if xp
+                .get_float(PARK_BRAKE)
+                .await
+                .is_ok_and(|pb| pb <= PARK_RELEASED_RATIO)
+            {
+                return true;
+            }
+            if waited_s >= PARK_RELEASE_SETTLE_S {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            waited_s += 0.2;
+        }
+    }
+    false
+}
+
 /// Drive the parking brake to `on`, valve-aware — THE one way any tool moves
 /// it. Valve first (per the airframe's SET sense), then the brake, command
 /// before raw write, verified by readback. The taxi hold's auto-release once
@@ -1275,6 +1321,28 @@ mod tests {
         assert!(
             fake.command_index(CMD_VALVE_CLOSE) < fake.command_index(CMD_PARK_RELEASE),
             "valve first, so the ratio has somewhere to vent to"
+        );
+    }
+
+    /// A commanded taxi's release is judged on the ratio READING released,
+    /// not "under 0.5": the A330's 0.23 half a second after the release
+    /// (EGKK, 2026-10-15) is driven again and then reported, never rolled
+    /// against; a ratio that goes to zero is released on the first drive.
+    #[tokio::test(start_paused = true)]
+    async fn a_taxi_release_waits_for_the_ratio_to_read_released() {
+        let clean = FakeXPlane::with_reads(&[(PARK_BRAKE, 1.0)]);
+        clean.set_on_command(CMD_PARK_RELEASE, PARK_BRAKE, 0.0);
+        assert!(release_park_brake_settled(&clean, Some(1.0)).await);
+        assert_eq!(clean.ran_count(CMD_PARK_RELEASE), 1);
+        assert!(clean.ran(CMD_VALVE_CLOSE), "through the valve-aware seam");
+
+        let hydraulic = FakeXPlane::with_reads(&[(PARK_BRAKE, 1.0)]);
+        hydraulic.set_on_command(CMD_PARK_RELEASE, PARK_BRAKE, 0.23);
+        assert!(!release_park_brake_settled(&hydraulic, Some(1.0)).await);
+        assert_eq!(
+            hydraulic.ran_count(CMD_PARK_RELEASE),
+            2,
+            "driven again once"
         );
     }
 
