@@ -643,6 +643,49 @@ mod tests {
         assert_eq!(got, want, "{got:#?}");
     }
 
+    /// The generated days of Gibraltar, Malaga and Gatwick, every movement
+    /// written out (2026-10-15): pinned before the timetables became
+    /// per-carrier data, so the move is proved to fly the same day. A
+    /// change that moves a flight rewrites the fixture on purpose
+    /// (`XCOPILOT_GOLDEN=write`).
+    #[test]
+    fn the_golden_days_are_unchanged() {
+        use crate::rotation::{day_rotations, hhmm, Date};
+        use crate::schedule::Density;
+        let mut got = String::new();
+        for icao in ["LXGB", "LEMG", "EGKK"] {
+            for (y, m, d) in [(2026, 7, 15), (2026, 1, 14)] {
+                let f = field_routes(icao).unwrap();
+                for r in day_rotations(f, Date::ymd(y, m, d), 3, Density::Normal) {
+                    for (kind, l) in [("arr", &r.arr), ("dep", &r.dep)] {
+                        got += &format!(
+                            "{icao} {y}-{m:02}-{d:02} {kind} {} {} {} {} {} {:.0} {:.0} {} {:016x} {}\n",
+                            l.callsign,
+                            r.icao_type,
+                            l.other,
+                            l.city,
+                            hhmm(l.sched_s),
+                            l.sched_s,
+                            l.est_s,
+                            r.night_stop,
+                            r.seed,
+                            l.spoken
+                        );
+                    }
+                }
+            }
+        }
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes_golden.txt");
+        if std::env::var("XCOPILOT_GOLDEN").as_deref() == Ok("write") {
+            std::fs::write(path, &got).unwrap();
+        }
+        let want = std::fs::read_to_string(path).unwrap();
+        for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
+            assert_eq!(g, w, "line {}", i + 1);
+        }
+        assert_eq!(got.lines().count(), want.lines().count());
+    }
+
     #[test]
     fn gibraltar_is_british_airways_and_easyjet() {
         let t = field_routes("lxgb").unwrap();

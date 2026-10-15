@@ -1,0 +1,1468 @@
+LXGB 2026-07-15 arr BAW490 A319 EGLL London Heathrow 10:20 37200 37406 false b205eebf96cca398 Speedbird four niner zero
+LXGB 2026-07-15 dep BAW491 A319 EGLL London Heathrow 11:10 40200 40337 false b205eebf96cca398 Speedbird four niner one
+LXGB 2026-07-15 arr EZY8901 A319 EGKK London Gatwick 11:55 42900 43212 false 69034459904ca402 Easy eight niner zero one
+LXGB 2026-07-15 dep EZY8902 A319 EGKK London Gatwick 12:40 45600 45600 false 69034459904ca402 Easy eight niner zero two
+LXGB 2026-07-15 arr EZY1911 A21N EGCC Manchester 13:20 48000 48063 false bed5d34673badf85 Easy one niner one one
+LXGB 2026-07-15 dep EZY1912 A21N EGCC Manchester 14:05 50700 50937 false bed5d34673badf85 Easy one niner one two
+LXGB 2026-07-15 arr BAW492 A320 EGLL London Heathrow 14:10 51000 52154 false 215ea5f4f507a009 Speedbird four niner two
+LXGB 2026-07-15 dep BAW493 A320 EGLL London Heathrow 14:55 53700 53962 false 215ea5f4f507a009 Speedbird four niner three
+LXGB 2026-07-15 arr EZY6191 A320 EGGD Bristol 15:30 55800 55727 false 03e6f2a6bf7e33f7 Easy six one niner one
+LXGB 2026-07-15 dep EZY6192 A320 EGGD Bristol 16:10 58200 59997 false 03e6f2a6bf7e33f7 Easy six one niner two
+LXGB 2026-07-15 arr EZY2101 A320 EGBB Birmingham 16:45 60300 62055 false 8963be6833689526 Easy two one zero one
+LXGB 2026-07-15 dep EZY2102 A320 EGBB Birmingham 17:30 63000 63555 false 8963be6833689526 Easy two one zero two
+LXGB 2026-07-15 arr EZY8903 A320 EGKK London Gatwick 17:55 64500 64824 false b19fa7e1311c60da Easy eight niner zero three
+LXGB 2026-07-15 dep EZY8904 A320 EGKK London Gatwick 18:50 67800 67800 false b19fa7e1311c60da Easy eight niner zero four
+LXGB 2026-01-14 arr BAW490 A319 EGLL London Heathrow 10:20 37200 37069 false 33fad8e23e6cf14b Speedbird four niner zero
+LXGB 2026-01-14 dep BAW491 A319 EGLL London Heathrow 11:10 40200 41323 false 33fad8e23e6cf14b Speedbird four niner one
+LXGB 2026-01-14 arr EZY8901 A320 EGKK London Gatwick 12:20 44400 44464 false bf83490c3ef3784f Easy eight niner zero one
+LXGB 2026-01-14 dep EZY8902 A320 EGKK London Gatwick 13:05 47100 47353 false bf83490c3ef3784f Easy eight niner zero two
+LXGB 2026-01-14 arr BAW492 A320 EGLL London Heathrow 14:10 51000 51320 false c8ed21c2c75bd350 Speedbird four niner two
+LXGB 2026-01-14 dep BAW493 A320 EGLL London Heathrow 14:55 53700 53754 false c8ed21c2c75bd350 Speedbird four niner three
+LXGB 2026-01-14 arr EZY6191 A20N EGGD Bristol 15:30 55800 56820 false 80935aa5551754b1 Easy six one niner one
+LXGB 2026-01-14 dep EZY6192 A20N EGGD Bristol 16:25 59100 59229 false 80935aa5551754b1 Easy six one niner two
+LEMG 2026-07-15 arr NAX3586 B738 EKCH Copenhagen 14:55 -32700 -32673 true f4ab72bddc5d8fa3 Nor Shuttle three five eight six
+LEMG 2026-07-15 dep NAX3587 B738 EKCH Copenhagen 06:45 24300 24390 true f4ab72bddc5d8fa3 Nor Shuttle three five eight seven
+LEMG 2026-07-15 arr NAX4171 B738 ESSA Stockholm 16:05 -28500 -28683 true dbb73c14558426bd Nor Shuttle four one seven one
+LEMG 2026-07-15 dep NAX4172 B738 ESSA Stockholm 06:30 23400 24602 true dbb73c14558426bd Nor Shuttle four one seven two
+LEMG 2026-07-15 arr NAX3588 B738 EKCH Copenhagen 16:05 -28500 -28291 true 1b9c89fe53514744 Nor Shuttle three five eight eight
+LEMG 2026-07-15 dep NAX3589 B738 EKCH Copenhagen 07:55 28500 28500 true 1b9c89fe53514744 Nor Shuttle three five eight niner
+LEMG 2026-07-15 arr NAX4173 B738 ESSA Stockholm 17:15 -24300 -24277 true 1075e2e869f033b9 Nor Shuttle four one seven three
+LEMG 2026-07-15 dep NAX4174 B738 ESSA Stockholm 07:40 27600 27656 true 1075e2e869f033b9 Nor Shuttle four one seven four
+LEMG 2026-07-15 arr RYR9161 B38M ESSA Stockholm 17:35 -23100 -23333 true 750a2df68ad3ae80 Ryanair niner one six one
+LEMG 2026-07-15 dep RYR9162 B38M ESSA Stockholm 08:00 28800 30304 true 750a2df68ad3ae80 Ryanair niner one six two
+LEMG 2026-07-15 arr NAX3590 B38M EKCH Copenhagen 17:15 -24300 -22702 true 0400a3e7c0c86ceb Nor Shuttle three five niner zero
+LEMG 2026-07-15 dep NAX3591 B38M EKCH Copenhagen 09:05 32700 33330 true 0400a3e7c0c86ceb Nor Shuttle three five niner one
+LEMG 2026-07-15 arr NAX4175 B38M ESSA Stockholm 18:25 -20100 -19989 true af600fabc961c482 Nor Shuttle four one seven five
+LEMG 2026-07-15 dep NAX4176 B38M ESSA Stockholm 08:50 31800 31800 true af600fabc961c482 Nor Shuttle four one seven six
+LEMG 2026-07-15 arr VLG1471 A319 LEBB Bilbao 19:30 -16200 -16175 true 28702dccae17d131 Vueling one four seven one
+LEMG 2026-07-15 dep VLG1472 A319 LEBB Bilbao 06:20 22800 22800 true 28702dccae17d131 Vueling one four seven two
+LEMG 2026-07-15 arr RYR2843 B738 LIMC Milan Malpensa 19:45 -15300 -15193 true c2bc35f34667705a Ryanair two eight four three
+LEMG 2026-07-15 dep RYR2844 B738 LIMC Milan Malpensa 07:35 27300 28588 true c2bc35f34667705a Ryanair two eight four four
+LEMG 2026-07-15 arr RYR3561 B738 EBCI Brussels Charleroi 20:00 -14400 -14268 true 2ca2b071beb5146f Ryanair three five six one
+LEMG 2026-07-15 dep RYR3562 B738 EBCI Brussels Charleroi 06:45 24300 24399 true 2ca2b071beb5146f Ryanair three five six two
+LEMG 2026-07-15 arr VLG2201 A320 LEBL Barcelona 20:15 -13500 -13592 true de60bf7312741853 Vueling two two zero one
+LEMG 2026-07-15 dep VLG2202 A320 LEBL Barcelona 06:55 24900 24900 true de60bf7312741853 Vueling two two zero two
+LEMG 2026-07-15 arr RYR3631 B38M EGNX East Midlands 20:10 -13800 -13503 true 7d767a25ad1f1595 Ryanair three six three one
+LEMG 2026-07-15 dep RYR3632 B38M EGNX East Midlands 06:20 22800 23581 true 7d767a25ad1f1595 Ryanair three six three two
+LEMG 2026-07-15 arr EZY6127 A21N EGGD Bristol 20:20 -13200 -13327 true 5bdd26d6e8ac763b Easy six one two seven
+LEMG 2026-07-15 dep EZY6128 A21N EGGD Bristol 07:20 26400 26400 true 5bdd26d6e8ac763b Easy six one two eight
+LEMG 2026-07-15 arr RYR7062 B38M EIDW Dublin 20:20 -13200 -13280 true b5cbee0db101b0e4 Ryanair seven zero six two
+LEMG 2026-07-15 dep RYR7063 B38M EIDW Dublin 06:10 22200 23084 true b5cbee0db101b0e4 Ryanair seven zero six three
+LEMG 2026-07-15 arr RYR5021 B38M LEBL Barcelona 20:30 -12600 -12466 true 9cdce01d9df999bd Ryanair five zero two one
+LEMG 2026-07-15 dep RYR5022 B38M LEBL Barcelona 07:10 25800 25800 true 9cdce01d9df999bd Ryanair five zero two two
+LEMG 2026-07-15 arr EZY8061 A20N EGKK London Gatwick 20:35 -12300 -12430 true 6dd041136b572b04 Easy eight zero six one
+LEMG 2026-07-15 dep EZY8062 A20N EGKK London Gatwick 07:35 27300 27300 true 6dd041136b572b04 Easy eight zero six two
+LEMG 2026-07-15 arr RYR8171 B738 EGSS London Stansted 20:55 -11100 -11235 true dcf575762da8fb92 Ryanair eight one seven one
+LEMG 2026-07-15 dep RYR8172 B738 EGSS London Stansted 07:25 26700 28160 true dcf575762da8fb92 Ryanair eight one seven two
+LEMG 2026-07-15 arr VLG8013 A320 LFPO Paris Orly 21:00 -10800 -10765 true 8aeb480106dd35fe Vueling eight zero one three
+LEMG 2026-07-15 dep VLG8014 A320 LFPO Paris Orly 08:55 32100 32430 true 8aeb480106dd35fe Vueling eight zero one four
+LEMG 2026-07-15 arr RYR4893 B738 LIRF Rome 21:10 -10200 -10245 true 4647ec13470f2e06 Ryanair four eight niner three
+LEMG 2026-07-15 dep RYR4894 B738 LIRF Rome 08:40 31200 31200 true 4647ec13470f2e06 Ryanair four eight niner four
+LEMG 2026-07-15 arr RYR3913 B738 EHEH Eindhoven 21:20 -9600 -9422 true b7e0b6794251c900 Ryanair three niner one three
+LEMG 2026-07-15 dep RYR3914 B738 EHEH Eindhoven 07:25 26700 26845 true b7e0b6794251c900 Ryanair three niner one four
+LEMG 2026-07-15 arr VLG2207 A319 LEBL Barcelona 21:25 -9300 -9393 true af8ba0d138cd6faf Vueling two two zero seven
+LEMG 2026-07-15 dep VLG2208 A319 LEBL Barcelona 08:05 29100 29317 true af8ba0d138cd6faf Vueling two two zero eight
+LEMG 2026-07-15 arr EZY1925 A21N EGCC Manchester 21:30 -9000 -8917 true 39e7d8db14c8ac5c Easy one niner two five
+LEMG 2026-07-15 dep EZY1926 A21N EGCC Manchester 07:25 26700 27001 true 39e7d8db14c8ac5c Easy one niner two six
+LEMG 2026-07-15 arr RYR7066 B738 EIDW Dublin 21:30 -9000 -8889 true 06915b4859909409 Ryanair seven zero six six
+LEMG 2026-07-15 dep RYR7067 B738 EIDW Dublin 07:20 26400 30878 true 06915b4859909409 Ryanair seven zero six seven
+LEMG 2026-07-15 arr RYR3027 B738 EGGW London Luton 21:45 -8100 -8315 true 4de17ade6a1633c4 Ryanair three zero two seven
+LEMG 2026-07-15 dep RYR3028 B738 EGGW London Luton 08:20 30000 31598 true 4de17ade6a1633c4 Ryanair three zero two eight
+LEMG 2026-07-15 arr RYR1702 B38M EGCC Manchester 21:30 -9000 -7789 true 43b60e69771f68ea Ryanair one seven zero two
+LEMG 2026-07-15 dep RYR1703 B38M EGCC Manchester 07:20 26400 27622 true 43b60e69771f68ea Ryanair one seven zero three
+LEMG 2026-07-15 arr EZY6131 A320 EGGD Bristol 22:05 -6900 -6810 true 61e3384a54edf0c4 Easy six one three one
+LEMG 2026-07-15 dep EZY6132 A320 EGGD Bristol 09:05 32700 32700 true 61e3384a54edf0c4 Easy six one three two
+LEMG 2026-07-15 arr EZY8065 A320 EGKK London Gatwick 22:20 -6000 -5663 true e594d3227b979837 Easy eight zero six five
+LEMG 2026-07-15 dep EZY8066 A320 EGKK London Gatwick 09:20 33600 33629 true e594d3227b979837 Easy eight zero six six
+LEMG 2026-07-15 arr RYR2291 B738 EGBB Birmingham 22:10 -6600 -5215 true 60ecc51201406eb3 Ryanair two two niner one
+LEMG 2026-07-15 dep RYR2292 B738 EGBB Birmingham 08:30 30600 30600 true 60ecc51201406eb3 Ryanair two two niner two
+LEMG 2026-07-15 arr RYR8175 B738 EGSS London Stansted 22:40 -4800 -4943 true 2306de81b0fef104 Ryanair eight one seven five
+LEMG 2026-07-15 dep RYR8176 B738 EGSS London Stansted 09:10 33000 33190 true 2306de81b0fef104 Ryanair eight one seven six
+LEMG 2026-07-15 arr RYR1987 B738 EGGP Liverpool 22:45 -4500 -4710 true 0ed412572663906c Ryanair one niner eight seven
+LEMG 2026-07-15 dep RYR1988 B738 EGGP Liverpool 08:40 31200 31224 true 0ed412572663906c Ryanair one niner eight eight
+LEMG 2026-07-15 arr RYR7070 B738 EIDW Dublin 22:40 -4800 -4558 true 311c9b7a89d2f376 Ryanair seven zero seven zero
+LEMG 2026-07-15 dep RYR7071 B738 EIDW Dublin 08:30 30600 31719 true 311c9b7a89d2f376 Ryanair seven zero seven one
+LEMG 2026-07-15 arr VLG2211 A319 LEBL Barcelona 22:35 -5100 -4282 true c7073a20096fcd21 Vueling two two one one
+LEMG 2026-07-15 dep VLG2212 A319 LEBL Barcelona 09:15 33300 34248 true c7073a20096fcd21 Vueling two two one two
+LEMG 2026-07-15 arr RYR2615 B738 EGPH Edinburgh 23:10 -3000 -2842 true 2aeb9ab1e93a9f4f Ryanair two six one five
+LEMG 2026-07-15 dep RYR2616 B738 EGPH Edinburgh 07:40 27600 28522 true 2aeb9ab1e93a9f4f Ryanair two six one six
+LEMG 2026-07-15 arr VLG3911 A320 LEPA Palma de Mallorca 07:20 26400 26613 false b94ea7341217eb44 Vueling three niner one one
+LEMG 2026-07-15 dep VLG3912 A320 LEPA Palma de Mallorca 08:15 29700 29772 false b94ea7341217eb44 Vueling three niner one two
+LEMG 2026-07-15 arr AEA1041 B738 LEMD Madrid 07:40 27600 27407 false 8cbdbb74930d55bb Air Europa one zero four one
+LEMG 2026-07-15 dep AEA1042 B738 LEMD Madrid 08:25 30300 30300 false 8cbdbb74930d55bb Air Europa one zero four two
+LEMG 2026-07-15 arr ETD131 A321 OMAA Abu Dhabi 07:45 27900 28209 false 4d12db8c41137337 Etihad one three one
+LEMG 2026-07-15 dep ETD132 A321 OMAA Abu Dhabi 08:35 30900 32190 false 4d12db8c41137337 Etihad one three two
+LEMG 2026-07-15 arr UAL120 B763 KEWR Newark 08:05 29100 29118 false e6bb2edc0d818e6d United one two zero
+LEMG 2026-07-15 dep UAL121 B763 KEWR Newark 09:35 34500 34821 false e6bb2edc0d818e6d United one two one
+LEMG 2026-07-15 arr RYR8261 B38M LEIB Ibiza 08:00 28800 29890 false 28bd4b6dc6a0559b Ryanair eight two six one
+LEMG 2026-07-15 dep RYR8262 B38M LEIB Ibiza 08:45 31500 33511 false 28bd4b6dc6a0559b Ryanair eight two six two
+LEMG 2026-07-15 arr ANE8650 AT76 GEML Melilla 08:35 30900 30926 false 72c14f59dfd5aafc Air Nostrum eight six five zero
+LEMG 2026-07-15 dep ANE8651 AT76 GEML Melilla 09:05 32700 33049 false 72c14f59dfd5aafc Air Nostrum eight six five one
+LEMG 2026-07-15 arr AFR1312 A319 LFPG Paris Charles de Gaulle 08:40 31200 31002 false 2a225f51028b2f4c Air France one three one two
+LEMG 2026-07-15 dep AFR1313 A319 LFPG Paris Charles de Gaulle 09:30 34200 35065 false 2a225f51028b2f4c Air France one three one three
+LEMG 2026-07-15 arr VLG1281 A320 LEST Santiago 08:50 31800 31746 false 5f4f19b27b70f38a Vueling one two eight one
+LEMG 2026-07-15 dep VLG1282 A320 LEST Santiago 09:35 34500 35322 false 5f4f19b27b70f38a Vueling one two eight two
+LEMG 2026-07-15 arr RYR9417 B738 EDDN Nuremberg 09:05 32700 33002 false b9e01f0add260e99 Ryanair niner four one seven
+LEMG 2026-07-15 dep RYR9418 B738 EDDN Nuremberg 09:50 35400 35400 false b9e01f0add260e99 Ryanair niner four one eight
+LEMG 2026-07-15 arr EZY7105 A21N LFBD Bordeaux 09:15 33300 33128 false fff8cccfc4fdf5ff Easy seven one zero five
+LEMG 2026-07-15 dep EZY7106 A21N LFBD Bordeaux 10:05 36300 37583 false fff8cccfc4fdf5ff Easy seven one zero six
+LEMG 2026-07-15 arr RYR9453 B738 LBSF Sofia 09:10 33000 33177 false 984a2dda00bfcb31 Ryanair niner four five three
+LEMG 2026-07-15 dep RYR9454 B738 LBSF Sofia 09:50 35400 35692 false 984a2dda00bfcb31 Ryanair niner four five four
+LEMG 2026-07-15 arr RYR9477 B738 EDLV Weeze 09:20 33600 33607 false e19561e70b985bf6 Ryanair niner four seven seven
+LEMG 2026-07-15 dep RYR9478 B738 EDLV Weeze 10:10 36600 36934 false e19561e70b985bf6 Ryanair niner four seven eight
+LEMG 2026-07-15 arr EZY7951 A319 EHAM Amsterdam 09:25 33900 33755 false 72ca24ec2a547cd0 Easy seven niner five one
+LEMG 2026-07-15 dep EZY7952 A319 EHAM Amsterdam 10:20 37200 37377 false 72ca24ec2a547cd0 Easy seven niner five two
+LEMG 2026-07-15 arr FIN1653 A321 EFHK Helsinki 09:35 34500 34399 false 02667d0a682fe900 Finnair one six five three
+LEMG 2026-07-15 dep FIN1654 A321 EFHK Helsinki 10:25 37500 37751 false 02667d0a682fe900 Finnair one six five four
+LEMG 2026-07-15 arr EWG5820 A320 EDDK Cologne 09:15 33300 34517 false 3e12d7e72fc14dba Eurowings five eight two zero
+LEMG 2026-07-15 dep EWG5821 A320 EDDK Cologne 10:00 36000 39742 false 3e12d7e72fc14dba Eurowings five eight two one
+LEMG 2026-07-15 arr RYR7181 B738 EICK Cork 09:55 35700 35623 false 96e041b21e36a0fb Ryanair seven one eight one
+LEMG 2026-07-15 dep RYR7182 B738 EICK Cork 10:50 39000 39000 false 96e041b21e36a0fb Ryanair seven one eight two
+LEMG 2026-07-15 arr EXS695 A21N EGBB Birmingham 09:55 35700 35628 false c8be96ea3a46dfc0 Channex six niner five
+LEMG 2026-07-15 dep EXS696 A21N EGBB Birmingham 10:50 39000 43516 false c8be96ea3a46dfc0 Channex six niner six
+LEMG 2026-07-15 arr WZZ7001 A321 LZIB Bratislava 09:55 35700 35861 false c1f2aedf4071e8bc Wizz Air seven zero zero one
+LEMG 2026-07-15 dep WZZ7002 A321 LZIB Bratislava 10:40 38400 38456 false c1f2aedf4071e8bc Wizz Air seven zero zero two
+LEMG 2026-07-15 arr RYR9501 B738 EDDB Berlin 09:35 34500 36091 false 785b697cdef532a8 Ryanair niner five zero one
+LEMG 2026-07-15 dep RYR9502 B738 EDDB Berlin 10:15 36900 37591 false 785b697cdef532a8 Ryanair niner five zero two
+LEMG 2026-07-15 arr VLG8961 A320 EBBR Brussels 10:05 36300 36225 false 3083a12fb0d8be5c Vueling eight niner six one
+LEMG 2026-07-15 dep VLG8962 A320 EBBR Brussels 10:55 39300 39592 false 3083a12fb0d8be5c Vueling eight niner six two
+LEMG 2026-07-15 arr RYR9421 B38M LKMT Ostrava 10:05 36300 36614 false 2152886cac68e92b Ryanair niner four two one
+LEMG 2026-07-15 dep RYR9422 B38M LKMT Ostrava 10:55 39300 40645 false 2152886cac68e92b Ryanair niner four two two
+LEMG 2026-07-15 arr TRA5341 B738 EHEH Eindhoven 10:00 36000 36700 false cc327832d61f261c Transavia five three four one
+LEMG 2026-07-15 dep TRA5342 B738 EHEH Eindhoven 10:50 39000 39347 false cc327832d61f261c Transavia five three four two
+LEMG 2026-07-15 arr VLG1473 A320 LEBB Bilbao 10:10 36600 36880 false a91ce6dfe90ff568 Vueling one four seven three
+LEMG 2026-07-15 dep VLG1474 A320 LEBB Bilbao 11:00 39600 40467 false a91ce6dfe90ff568 Vueling one four seven four
+LEMG 2026-07-15 arr BAW470 A320 EGLL London Heathrow 10:20 37200 37170 false 152aa61708a3436a Speedbird four seven zero
+LEMG 2026-07-15 dep BAW471 A320 EGLL London Heathrow 11:10 40200 40540 false 152aa61708a3436a Speedbird four seven one
+LEMG 2026-07-15 arr WZZ3331 A321 LHBP Budapest 10:20 37200 37197 false 025fa0d9038b91cf Wizz Air three three three one
+LEMG 2026-07-15 dep WZZ3332 A321 LHBP Budapest 11:05 39900 40111 false 025fa0d9038b91cf Wizz Air three three three two
+LEMG 2026-07-15 arr RYR9385 B738 LPPT Lisbon 10:20 37200 37215 false 37c3f05369435a6a Ryanair niner three eight five
+LEMG 2026-07-15 dep RYR9386 B738 LPPT Lisbon 11:15 40500 40500 false 37c3f05369435a6a Ryanair niner three eight six
+LEMG 2026-07-15 arr EXS643 B738 EGNX East Midlands 10:20 37200 37434 false 9129cdcbb7569432 Channex six four three
+LEMG 2026-07-15 dep EXS644 B738 EGNX East Midlands 11:05 39900 41956 false 9129cdcbb7569432 Channex six four four
+LEMG 2026-07-15 arr RYR6311 B738 LEPA Palma de Mallorca 10:30 37800 37717 false 3d08fc41be333d4f Ryanair six three one one
+LEMG 2026-07-15 dep RYR6312 B738 LEPA Palma de Mallorca 11:20 40800 44848 false 3d08fc41be333d4f Ryanair six three one two
+LEMG 2026-07-15 arr RYR9465 B738 GMTN Tetouan 10:30 37800 37765 false 9648418fb0342422 Ryanair niner four six five
+LEMG 2026-07-15 dep RYR9466 B738 GMTN Tetouan 11:20 40800 41054 false 9648418fb0342422 Ryanair niner four six six
+LEMG 2026-07-15 arr EZY6587 A320 EGAA Belfast 10:15 36900 37887 false 82585a8578c03c26 Easy six five eight seven
+LEMG 2026-07-15 dep EZY6588 A320 EGAA Belfast 11:05 39900 40066 false 82585a8578c03c26 Easy six five eight eight
+LEMG 2026-07-15 arr BAW2614 A320 EGKK London Gatwick 10:05 36300 37891 false ee2145f4bfecb499 Speedbird two six one four
+LEMG 2026-07-15 dep BAW2615 A320 EGKK London Gatwick 10:55 39300 39561 false ee2145f4bfecb499 Speedbird two six one five
+LEMG 2026-07-15 arr RYR9365 B738 EDSB Karlsruhe 10:40 38400 38215 false 20072569426b1458 Ryanair niner three six five
+LEMG 2026-07-15 dep RYR9366 B738 EDSB Karlsruhe 11:25 41100 41370 false 20072569426b1458 Ryanair niner three six six
+LEMG 2026-07-15 arr WZZ4625 A21N EGGW London Luton 10:40 38400 38679 false 91bab54c6a32cfd1 Wizz Air four six two five
+LEMG 2026-07-15 dep WZZ4626 A21N EGGW London Luton 11:35 41700 41909 false 91bab54c6a32cfd1 Wizz Air four six two six
+LEMG 2026-07-15 arr RYR9381 B738 LZKZ Kosice 10:40 38400 38729 false 1bd404c252b60ce3 Ryanair niner three eight one
+LEMG 2026-07-15 dep RYR9382 B738 LZKZ Kosice 11:20 40800 41637 false 1bd404c252b60ce3 Ryanair niner three eight two
+LEMG 2026-07-15 arr EXS617 A21N EGKK London Gatwick 10:35 38100 38856 false 6e87cd7a12e7f543 Channex six one seven
+LEMG 2026-07-15 dep EXS618 A21N EGKK London Gatwick 11:20 40800 42095 false 6e87cd7a12e7f543 Channex six one eight
+LEMG 2026-07-15 arr VLG2203 A320 LEBL Barcelona 10:50 39000 39076 false b70ff1be7d49e6c0 Vueling two two zero three
+LEMG 2026-07-15 dep VLG2204 A320 LEBL Barcelona 11:30 41400 44797 false b70ff1be7d49e6c0 Vueling two two zero four
+LEMG 2026-07-15 arr EZY7121 A21N EGNM Leeds Bradford 11:05 39900 39791 false 8f265e7960a6179e Easy seven one two one
+LEMG 2026-07-15 dep EZY7122 A21N EGNM Leeds Bradford 11:50 42600 42775 false 8f265e7960a6179e Easy seven one two two
+LEMG 2026-07-15 arr RYR9369 B738 EPKT Katowice 11:10 40200 40032 false 88c8678966ede4fa Ryanair niner three six niner
+LEMG 2026-07-15 dep RYR9370 B738 EPKT Katowice 11:55 42900 42966 false 88c8678966ede4fa Ryanair niner three seven zero
+LEMG 2026-07-15 arr NAX6113 B738 ENTO Sandefjord 11:10 40200 40303 false 38444681b6bf2663 Nor Shuttle six one one three
+LEMG 2026-07-15 dep NAX6114 B738 ENTO Sandefjord 11:50 42600 43973 false 38444681b6bf2663 Nor Shuttle six one one four
+LEMG 2026-07-15 arr TRA6112 B738 LFPO Paris Orly 11:15 40500 40355 false 3d8bc8c46109ac95 Transavia six one one two
+LEMG 2026-07-15 dep TRA6113 B738 LFPO Paris Orly 12:10 43800 43867 false 3d8bc8c46109ac95 Transavia six one one three
+LEMG 2026-07-15 arr SAS2581 A20N EKCH Copenhagen 11:10 40200 40423 false 2093742114c4bcd3 Scandinavian two five eight one
+LEMG 2026-07-15 dep SAS2582 A20N EKCH Copenhagen 12:05 43500 43819 false 2093742114c4bcd3 Scandinavian two five eight two
+LEMG 2026-07-15 arr WZZ4471 A321 EGKK London Gatwick 11:15 40500 40693 false 67c0fb174cae45ca Wizz Air four four seven one
+LEMG 2026-07-15 dep WZZ4472 A321 EGKK London Gatwick 12:05 43500 43735 false 67c0fb174cae45ca Wizz Air four four seven two
+LEMG 2026-07-15 arr VLG3061 A319 GCXO Tenerife North 11:25 41100 40941 false 870907124a986634 Vueling three zero six one
+LEMG 2026-07-15 dep VLG3062 A319 GCXO Tenerife North 12:15 44100 44425 false 870907124a986634 Vueling three zero six two
+LEMG 2026-07-15 arr VLG3021 A320 GCLP Gran Canaria 11:30 41400 41166 false 1837c540f77aece2 Vueling three zero two one
+LEMG 2026-07-15 dep VLG3022 A320 GCLP Gran Canaria 12:25 44700 44849 false 1837c540f77aece2 Vueling three zero two two
+LEMG 2026-07-15 arr RYR6941 B738 LIRN Naples 11:15 40500 41304 false b23e5165fdaa4fe7 Ryanair six niner four one
+LEMG 2026-07-15 dep RYR6942 B738 LIRN Naples 11:55 42900 42900 false b23e5165fdaa4fe7 Ryanair six niner four two
+LEMG 2026-07-15 arr VLG3519 A320 LEIB Ibiza 11:30 41400 41426 false c40e6325fa144b16 Vueling three five one niner
+LEMG 2026-07-15 dep VLG3520 A320 LEIB Ibiza 12:15 44100 45196 false c40e6325fa144b16 Vueling three five two zero
+LEMG 2026-07-15 arr TOM652 B738 EGCC Manchester 11:15 40500 41756 false d6daccd3e2742de8 Tomjet six five two
+LEMG 2026-07-15 dep TOM653 B738 EGCC Manchester 12:05 43500 43756 false d6daccd3e2742de8 Tomjet six five three
+LEMG 2026-07-15 arr THY1966 A321 LTFM Istanbul 11:45 42300 42134 false 74963b1f3d46b1e3 Turkish one niner six six
+LEMG 2026-07-15 dep THY1967 A321 LTFM Istanbul 12:35 45300 45517 false 74963b1f3d46b1e3 Turkish one niner six seven
+LEMG 2026-07-15 arr EZY2041 A320 EGGW London Luton 11:45 42300 42425 false 12a3d34acc55afab Easy two zero four one
+LEMG 2026-07-15 dep EZY2042 A320 EGGW London Luton 12:25 44700 46148 false 12a3d34acc55afab Easy two zero four two
+LEMG 2026-07-15 arr IBE3700 A321 LEMD Madrid 11:50 42600 42744 false 576df3f2f60c53dd Iberia three seven zero zero
+LEMG 2026-07-15 dep IBE3701 A321 LEMD Madrid 12:35 45300 46337 false 576df3f2f60c53dd Iberia three seven zero one
+LEMG 2026-07-15 arr EZY4417 A20N LFLL Lyon 11:50 42600 42810 false 76801289d3fee9bb Easy four four one seven
+LEMG 2026-07-15 dep EZY4418 A20N LFLL Lyon 12:30 45000 45000 false 76801289d3fee9bb Easy four four one eight
+LEMG 2026-07-15 arr VLG2209 A20N LEBL Barcelona 12:00 43200 43337 false c9c3847b9bb6fdc1 Vueling two two zero niner
+LEMG 2026-07-15 dep VLG2210 A20N LEBL Barcelona 12:45 45900 47481 false c9c3847b9bb6fdc1 Vueling two two one zero
+LEMG 2026-07-15 arr EZY5531 A319 EDDB Berlin 10:50 39000 43416 false 951f654cd7b654b7 Easy five five three one
+LEMG 2026-07-15 dep EZY5532 A319 EDDB Berlin 11:35 41700 44916 false 951f654cd7b654b7 Easy five five three two
+LEMG 2026-07-15 arr DLH1802 A321 EDDM Munich 11:10 40200 43695 false b8e4e2294202bb9e Lufthansa one eight zero two
+LEMG 2026-07-15 dep DLH1803 A321 EDDM Munich 12:05 43500 46503 false b8e4e2294202bb9e Lufthansa one eight zero three
+LEMG 2026-07-15 arr TOM904 B38M EGBB Birmingham 12:10 43800 43936 false ae75a276789af347 Tomjet niner zero four
+LEMG 2026-07-15 dep TOM905 B38M EGBB Birmingham 12:55 46500 46517 false ae75a276789af347 Tomjet niner zero five
+LEMG 2026-07-15 arr NAX1585 B38M ENGM Oslo 12:10 43800 43990 false c2b589b34fbebd13 Nor Shuttle one five eight five
+LEMG 2026-07-15 dep NAX1586 B38M ENGM Oslo 12:50 46200 46347 false c2b589b34fbebd13 Nor Shuttle one five eight six
+LEMG 2026-07-15 arr WZZ7033 A21N EYVI Vilnius 12:15 44100 44101 false cb084f901ca51e1e Wizz Air seven zero three three
+LEMG 2026-07-15 dep WZZ7034 A21N EYVI Vilnius 13:00 46800 46952 false cb084f901ca51e1e Wizz Air seven zero three four
+LEMG 2026-07-15 arr NAX6125 B738 EKAH Aarhus 12:10 43800 44945 false 895075cce24ca952 Nor Shuttle six one two five
+LEMG 2026-07-15 dep NAX6126 B738 EKAH Aarhus 12:55 46500 46647 false 895075cce24ca952 Nor Shuttle six one two six
+LEMG 2026-07-15 arr EXS527 B738 EGNT Newcastle 12:25 44700 44964 false 3792f1fde48a7063 Channex five two seven
+LEMG 2026-07-15 dep EXS528 B738 EGNT Newcastle 13:20 48000 48308 false 3792f1fde48a7063 Channex five two eight
+LEMG 2026-07-15 arr SWR437 BCS3 LSZH Zurich 12:40 45600 45519 false 203da475d3ec6054 Swiss four three seven
+LEMG 2026-07-15 dep SWR438 BCS3 LSZH Zurich 13:35 48900 53005 false 203da475d3ec6054 Swiss four three eight
+LEMG 2026-07-15 arr EIN584 A21N EIDW Dublin 12:40 45600 45917 false 12649647df35e85e Shamrock five eight four
+LEMG 2026-07-15 dep EIN585 A21N EIDW Dublin 13:30 48600 51864 false 12649647df35e85e Shamrock five eight five
+LEMG 2026-07-15 arr RYR7064 B738 EIDW Dublin 12:50 46200 46479 false 69248fabd32f1528 Ryanair seven zero six four
+LEMG 2026-07-15 dep RYR7065 B738 EIDW Dublin 13:35 48900 49011 false 69248fabd32f1528 Ryanair seven zero six five
+LEMG 2026-07-15 arr TRA6501 B738 EHRD Rotterdam 13:00 46800 46727 false 729c7919ecc84f17 Transavia six five zero one
+LEMG 2026-07-15 dep TRA6502 B738 EHRD Rotterdam 13:45 49500 49500 false 729c7919ecc84f17 Transavia six five zero two
+LEMG 2026-07-15 arr RYR3563 B738 EBCI Brussels Charleroi 13:00 46800 46874 false ae40fd93bcaaa617 Ryanair three five six three
+LEMG 2026-07-15 dep RYR3564 B738 EBCI Brussels Charleroi 13:50 49800 50103 false ae40fd93bcaaa617 Ryanair three five six four
+LEMG 2026-07-15 arr RYR6081 B738 LOWW Vienna 13:05 47100 47102 false 33d723488c659778 Ryanair six zero eight one
+LEMG 2026-07-15 dep RYR6082 B738 LOWW Vienna 13:45 49500 49500 false 33d723488c659778 Ryanair six zero eight two
+LEMG 2026-07-15 arr VLG2213 A320 LEBL Barcelona 13:10 47400 47316 false 8a5743655d6ca26e Vueling two two one three
+LEMG 2026-07-15 dep VLG2214 A320 LEBL Barcelona 14:00 50400 50660 false 8a5743655d6ca26e Vueling two two one four
+LEMG 2026-07-15 arr QTR52 B788 OTHH Doha 13:15 47700 47471 false b37523dff67b0d62 Qatari five two
+LEMG 2026-07-15 dep QTR53 B788 OTHH Doha 15:00 54000 56923 false b37523dff67b0d62 Qatari five three
+LEMG 2026-07-15 arr EWG7520 A319 EDDH Hamburg 13:15 47700 47475 false 950ed3edb3fb2645 Eurowings seven five two zero
+LEMG 2026-07-15 dep EWG7521 A319 EDDH Hamburg 14:00 50400 50400 false 950ed3edb3fb2645 Eurowings seven five two one
+LEMG 2026-07-15 arr RYR4361 B738 LKPR Prague 13:15 47700 47510 false 7480ceb5f701bdfb Ryanair four three six one
+LEMG 2026-07-15 dep RYR4362 B738 LKPR Prague 13:55 50100 50369 false 7480ceb5f701bdfb Ryanair four three six two
+LEMG 2026-07-15 arr EZY6129 A20N EGGD Bristol 13:25 48300 48453 false d8c80fe49b17dfed Easy six one two niner
+LEMG 2026-07-15 dep EZY6130 A20N EGGD Bristol 14:15 51300 51489 false d8c80fe49b17dfed Easy six one three zero
+LEMG 2026-07-15 arr DLH1150 A320 EDDF Frankfurt 13:30 48600 48554 false 90500d10039c10a6 Lufthansa one one five zero
+LEMG 2026-07-15 dep DLH1151 A320 EDDF Frankfurt 14:15 51300 52194 false 90500d10039c10a6 Lufthansa one one five one
+LEMG 2026-07-15 arr KLM1043 B738 EHAM Amsterdam 13:25 48300 48638 false 6d44bd7c080b79be KLM one zero four three
+LEMG 2026-07-15 dep KLM1044 B738 EHAM Amsterdam 14:05 50700 50700 false 6d44bd7c080b79be KLM one zero four four
+LEMG 2026-07-15 arr TRA5091 A21N EHAM Amsterdam 13:30 48600 48811 false d6a0363b3b163614 Transavia five zero niner one
+LEMG 2026-07-15 dep TRA5092 A21N EHAM Amsterdam 14:20 51600 51600 false d6a0363b3b163614 Transavia five zero niner two
+LEMG 2026-07-15 arr VLG8812 A320 EGKK London Gatwick 13:35 48900 48841 false 778c060081909d43 Vueling eight eight one two
+LEMG 2026-07-15 dep VLG8813 A320 EGKK London Gatwick 14:20 51600 51600 false 778c060081909d43 Vueling eight eight one three
+LEMG 2026-07-15 arr EZY6811 A319 EGPH Edinburgh 13:20 48000 48872 false 113e31ee0d07096f Easy six eight one one
+LEMG 2026-07-15 dep EZY6812 A319 EGPH Edinburgh 14:05 50700 50824 false 113e31ee0d07096f Easy six eight one two
+LEMG 2026-07-15 arr EZY8063 A319 EGKK London Gatwick 13:40 49200 49231 false dc28a8ce8893ea35 Easy eight zero six three
+LEMG 2026-07-15 dep EZY8064 A319 EGKK London Gatwick 14:30 52200 52200 false dc28a8ce8893ea35 Easy eight zero six four
+LEMG 2026-07-15 arr BEL3713 A319 EBBR Brussels 13:25 48300 49453 false 4ab02e8ed81a829f Bee-line three seven one three
+LEMG 2026-07-15 dep BEL3714 A319 EBBR Brussels 14:10 51000 51000 false 4ab02e8ed81a829f Bee-line three seven one four
+LEMG 2026-07-15 arr SAS4651 A320 ENGM Oslo 13:40 49200 49521 false 3449bee9e0650bd1 Scandinavian four six five one
+LEMG 2026-07-15 dep SAS4652 A320 ENGM Oslo 14:30 52200 52453 false 3449bee9e0650bd1 Scandinavian four six five two
+LEMG 2026-07-15 arr EXS729 B738 EGNM Leeds Bradford 13:45 49500 49609 false d605be4b0e2ed8e0 Channex seven two niner
+LEMG 2026-07-15 dep EXS730 B738 EGNM Leeds Bradford 14:40 52800 54380 false d605be4b0e2ed8e0 Channex seven three zero
+LEMG 2026-07-15 arr RYR8173 B738 EGSS London Stansted 13:45 49500 49830 false 26a335390dac7ae4 Ryanair eight one seven three
+LEMG 2026-07-15 dep RYR8174 B738 EGSS London Stansted 14:30 52200 57397 false 26a335390dac7ae4 Ryanair eight one seven four
+LEMG 2026-07-15 arr RYR1704 B738 EGCC Manchester 14:00 50400 50521 false 91dcb40830d6955f Ryanair one seven zero four
+LEMG 2026-07-15 dep RYR1705 B738 EGCC Manchester 14:55 53700 58964 false 91dcb40830d6955f Ryanair one seven zero five
+LEMG 2026-07-15 arr RYR7068 B738 EIDW Dublin 14:00 50400 50632 false 6142eeddd3bfbd12 Ryanair seven zero six eight
+LEMG 2026-07-15 dep RYR7069 B738 EIDW Dublin 14:45 53100 53424 false 6142eeddd3bfbd12 Ryanair seven zero six niner
+LEMG 2026-07-15 arr SAS1527 A20N ESSA Stockholm 14:05 50700 50710 false 1c8eeea530315afc Scandinavian one five two seven
+LEMG 2026-07-15 dep SAS1528 A20N ESSA Stockholm 14:50 53400 53400 false 1c8eeea530315afc Scandinavian one five two eight
+LEMG 2026-07-15 arr EZY1927 A20N EGCC Manchester 14:05 50700 50800 false 7cf79122498eb918 Easy one niner two seven
+LEMG 2026-07-15 dep EZY1928 A20N EGCC Manchester 14:55 53700 53849 false 7cf79122498eb918 Easy one niner two eight
+LEMG 2026-07-15 arr EXS813 B738 EGGW London Luton 13:50 49800 50917 false de4af055eb08aeb1 Channex eight one three
+LEMG 2026-07-15 dep EXS814 B738 EGGW London Luton 14:40 52800 52942 false de4af055eb08aeb1 Channex eight one four
+LEMG 2026-07-15 arr NAX5641 B38M EFHK Helsinki 14:15 51300 51314 false 5dc781e68edb2808 Nor Shuttle five six four one
+LEMG 2026-07-15 dep NAX5642 B38M EFHK Helsinki 15:00 54000 54000 false 5dc781e68edb2808 Nor Shuttle five six four two
+LEMG 2026-07-15 arr EZY2263 A20N EGGP Liverpool 13:05 47100 51555 false c1e604e679bba3ea Easy two two six three
+LEMG 2026-07-15 dep EZY2264 A20N EGGP Liverpool 13:50 49800 53055 false c1e604e679bba3ea Easy two two six four
+LEMG 2026-07-15 arr RYR4417 B738 EGNM Leeds Bradford 14:20 51600 51574 false 105b95bc0872cbd6 Ryanair four four one seven
+LEMG 2026-07-15 dep RYR4418 B738 EGNM Leeds Bradford 15:15 54900 55786 false 105b95bc0872cbd6 Ryanair four four one eight
+LEMG 2026-07-15 arr WZZ7005 A21N LRCL Cluj 13:35 48900 51818 false 2431786b4d8ac135 Wizz Air seven zero zero five
+LEMG 2026-07-15 dep WZZ7006 A21N LRCL Cluj 14:25 51900 53318 false 2431786b4d8ac135 Wizz Air seven zero zero six
+LEMG 2026-07-15 arr EWG9105 A320 EDDV Hannover 14:15 51300 51986 false 564b81d66834fb20 Eurowings niner one zero five
+LEMG 2026-07-15 dep EWG9106 A320 EDDV Hannover 15:05 54300 54489 false 564b81d66834fb20 Eurowings niner one zero six
+LEMG 2026-07-15 arr RYR9377 B738 EIKN Knock 14:10 51000 52333 false fca7f11ca385405d Ryanair niner three seven seven
+LEMG 2026-07-15 dep RYR9378 B738 EIKN Knock 14:55 53700 54031 false fca7f11ca385405d Ryanair niner three seven eight
+LEMG 2026-07-15 arr ICE532 B38M BIKF Reykjavik 14:35 52500 52353 false a8933f5a3c99bb77 Iceair five three two
+LEMG 2026-07-15 dep ICE533 B38M BIKF Reykjavik 15:30 55800 59570 false a8933f5a3c99bb77 Iceair five three three
+LEMG 2026-07-15 arr RYR9457 B738 GMTT Tangier 14:40 52800 52655 false f055224274ebd52e Ryanair niner four five seven
+LEMG 2026-07-15 dep RYR9458 B738 GMTT Tangier 15:30 55800 58471 false f055224274ebd52e Ryanair niner four five eight
+LEMG 2026-07-15 arr VLG8015 A20N LFPO Paris Orly 14:35 52500 52786 false 1e082ac771f5914c Vueling eight zero one five
+LEMG 2026-07-15 dep VLG8016 A20N LFPO Paris Orly 15:20 55200 55521 false 1e082ac771f5914c Vueling eight zero one six
+LEMG 2026-07-15 arr EXS805 B738 EGGP Liverpool 14:45 53100 53078 false 76030cfc8b589b6e Channex eight zero five
+LEMG 2026-07-15 dep EXS806 B738 EGGP Liverpool 15:30 55800 55800 false 76030cfc8b589b6e Channex eight zero six
+LEMG 2026-07-15 arr RYR9301 B738 EKAH Aarhus 14:40 52800 53123 false ca901e2135601d95 Ryanair niner three zero one
+LEMG 2026-07-15 dep RYR9302 B738 EKAH Aarhus 15:25 55500 55500 false ca901e2135601d95 Ryanair niner three zero two
+LEMG 2026-07-15 arr RYR4895 B738 LIRF Rome 14:30 52200 53150 false a64f556f5f621007 Ryanair four eight niner five
+LEMG 2026-07-15 dep RYR4896 B738 LIRF Rome 15:10 54600 54650 false a64f556f5f621007 Ryanair four eight niner six
+LEMG 2026-07-15 arr TRA6114 B738 LFPO Paris Orly 14:25 51900 53400 false af0155cae7635e5c Transavia six one one four
+LEMG 2026-07-15 dep TRA6115 B738 LFPO Paris Orly 15:20 55200 55214 false af0155cae7635e5c Transavia six one one five
+LEMG 2026-07-15 arr RYR9437 B738 GMME Rabat 14:40 52800 53635 false ce7e0b9ddf48d256 Ryanair niner four three seven
+LEMG 2026-07-15 dep RYR9438 B738 GMME Rabat 15:25 55500 55544 false ce7e0b9ddf48d256 Ryanair niner four three eight
+LEMG 2026-07-15 arr TAP1361 A21N LPPT Lisbon 14:55 53700 53646 false dee934302d8338df Air Portugal one three six one
+LEMG 2026-07-15 dep TAP1362 A21N LPPT Lisbon 15:45 56700 56700 false dee934302d8338df Air Portugal one three six two
+LEMG 2026-07-15 arr LOT431 B38M EPWA Warsaw 15:00 54000 53763 false 36f28a275241d4a9 LOT four three one
+LEMG 2026-07-15 dep LOT432 B38M EPWA Warsaw 15:40 56400 57503 false 36f28a275241d4a9 LOT four three two
+LEMG 2026-07-15 arr ANE8652 AT76 GEML Melilla 14:40 52800 53898 false de198cc58b55c513 Air Nostrum eight six five two
+LEMG 2026-07-15 dep ANE8653 AT76 GEML Melilla 15:10 54600 59671 false de198cc58b55c513 Air Nostrum eight six five three
+LEMG 2026-07-15 arr TRA6505 B738 LFLL Lyon 15:00 54000 54204 false c746ecd82a952971 Transavia six five zero five
+LEMG 2026-07-15 dep TRA6506 B738 LFLL Lyon 15:45 56700 56860 false c746ecd82a952971 Transavia six five zero six
+LEMG 2026-07-15 arr AFR1314 A320 LFPG Paris Charles de Gaulle 15:10 54600 54492 false 27fccff626f30d51 Air France one three one four
+LEMG 2026-07-15 dep AFR1315 A320 LFPG Paris Charles de Gaulle 16:00 57600 59061 false 27fccff626f30d51 Air France one three one five
+LEMG 2026-07-15 arr RYR7671 B738 GCRR Lanzarote 15:10 54600 55236 false e0c9e37c9cc81d7a Ryanair seven six seven one
+LEMG 2026-07-15 dep RYR7672 B738 GCRR Lanzarote 16:05 57900 57900 false e0c9e37c9cc81d7a Ryanair seven six seven two
+LEMG 2026-07-15 arr WZZ7009 A21N EPGD Gdansk 15:25 55500 55487 false f82a9430b8e3e29a Wizz Air seven zero zero niner
+LEMG 2026-07-15 dep WZZ7010 A21N EPGD Gdansk 16:15 58500 59273 false f82a9430b8e3e29a Wizz Air seven zero one zero
+LEMG 2026-07-15 arr EZY8067 A320 EGKK London Gatwick 15:25 55500 55524 false 68a2df9b466b4953 Easy eight zero six seven
+LEMG 2026-07-15 dep EZY8068 A320 EGKK London Gatwick 16:15 58500 59457 false 68a2df9b466b4953 Easy eight zero six eight
+LEMG 2026-07-15 arr VLG1475 A320 LEBB Bilbao 14:50 53400 55761 false c083931a77ea5ae7 Vueling one four seven five
+LEMG 2026-07-15 dep VLG1476 A320 LEBB Bilbao 15:35 56100 57261 false c083931a77ea5ae7 Vueling one four seven six
+LEMG 2026-07-15 arr RYR9349 B38M EPGD Gdansk 15:30 55800 55885 false 408fcb64239054fb Ryanair niner three four niner
+LEMG 2026-07-15 dep RYR9350 B38M EPGD Gdansk 16:10 58200 58330 false 408fcb64239054fb Ryanair niner three five zero
+LEMG 2026-07-15 arr IBE3702 A321 LEMD Madrid 15:40 56400 56297 false 2c97c6eb05f0d286 Iberia three seven zero two
+LEMG 2026-07-15 dep IBE3703 A321 LEMD Madrid 16:25 59100 59188 false 2c97c6eb05f0d286 Iberia three seven zero three
+LEMG 2026-07-15 arr VLG2205 A321 LEBL Barcelona 15:35 56100 56326 false c9530c32d35ad414 Vueling two two zero five
+LEMG 2026-07-15 dep VLG2206 A321 LEBL Barcelona 16:15 58500 59763 false c9530c32d35ad414 Vueling two two zero six
+LEMG 2026-07-15 arr NAX6121 B738 ENVA Trondheim 15:30 55800 56913 false 574b62413be21228 Nor Shuttle six one two one
+LEMG 2026-07-15 dep NAX6122 B738 ENVA Trondheim 16:15 58500 58717 false 574b62413be21228 Nor Shuttle six one two two
+LEMG 2026-07-15 arr ANE8870 CRJ9 LEVC Valencia 16:00 57600 57536 false 8f6cda2a3298e2ad Air Nostrum eight eight seven zero
+LEMG 2026-07-15 dep ANE8871 CRJ9 LEVC Valencia 16:55 60900 64053 false 8f6cda2a3298e2ad Air Nostrum eight eight seven one
+LEMG 2026-07-15 arr RYR9405 B38M EDJA Memmingen 16:00 57600 57610 false c592dbadbe7e8f51 Ryanair niner four zero five
+LEMG 2026-07-15 dep RYR9406 B38M EDJA Memmingen 16:50 60600 60801 false c592dbadbe7e8f51 Ryanair niner four zero six
+LEMG 2026-07-15 arr RYR5023 B738 LEBL Barcelona 15:45 56700 57821 false 7945dd2074401fc4 Ryanair five zero two three
+LEMG 2026-07-15 dep RYR5024 B738 LEBL Barcelona 16:30 59400 59543 false 7945dd2074401fc4 Ryanair five zero two four
+LEMG 2026-07-15 arr EIN586 A321 EIDW Dublin 16:25 59100 59118 false 80ff02c2b14e3ecf Shamrock five eight six
+LEMG 2026-07-15 dep EIN587 A321 EIDW Dublin 17:10 61800 62639 false 80ff02c2b14e3ecf Shamrock five eight seven
+LEMG 2026-07-15 arr ANE8810 CRJ9 LEMD Madrid 16:25 59100 59320 false f838cdc5bf9afd2a Air Nostrum eight eight one zero
+LEMG 2026-07-15 dep ANE8811 CRJ9 LEMD Madrid 17:05 61500 61500 false f838cdc5bf9afd2a Air Nostrum eight eight one one
+LEMG 2026-07-15 arr VLG8411 A320 EHAM Amsterdam 16:30 59400 59527 false e0a2b25de811523e Vueling eight four one one
+LEMG 2026-07-15 dep VLG8412 A320 EHAM Amsterdam 17:20 62400 63078 false e0a2b25de811523e Vueling eight four one two
+LEMG 2026-07-15 arr EZY2861 A320 LIMC Milan Malpensa 16:50 60600 60494 false e0d048f1e1470cef Easy two eight six one
+LEMG 2026-07-15 dep EZY2862 A320 LIMC Milan Malpensa 17:40 63600 63600 false e0d048f1e1470cef Easy two eight six two
+LEMG 2026-07-15 arr VLG3913 A321 LEPA Palma de Mallorca 16:25 59100 60875 false 839259bfdad7437b Vueling three niner one three
+LEMG 2026-07-15 dep VLG3914 A321 LEPA Palma de Mallorca 17:05 61500 64490 false 839259bfdad7437b Vueling three niner one four
+LEMG 2026-07-15 arr BEL3715 A320 EBBR Brussels 17:00 61200 61209 false 2a2e4f68e5f5a350 Bee-line three seven one five
+LEMG 2026-07-15 dep BEL3716 A320 EBBR Brussels 17:50 64200 64425 false 2a2e4f68e5f5a350 Bee-line three seven one six
+LEMG 2026-07-15 arr RYR9305 B38M LIPE Bologna 17:00 61200 61290 false 682af8e3bb41e798 Ryanair niner three zero five
+LEMG 2026-07-15 dep RYR9306 B38M LIPE Bologna 17:45 63900 63909 false 682af8e3bb41e798 Ryanair niner three zero six
+LEMG 2026-07-15 arr TRA6509 B738 LFMT Montpellier 16:00 57600 61362 false 4cc8879d5b424093 Transavia six five zero niner
+LEMG 2026-07-15 dep TRA6510 B738 LFMT Montpellier 16:45 60300 62862 false 4cc8879d5b424093 Transavia six five one zero
+LEMG 2026-07-15 arr BAW2616 A320 EGKK London Gatwick 17:00 61200 61429 false 85e1dd0a1e36ef6f Speedbird two six one six
+LEMG 2026-07-15 dep BAW2617 A320 EGKK London Gatwick 17:50 64200 64257 false 85e1dd0a1e36ef6f Speedbird two six one seven
+LEMG 2026-07-15 arr KLM1045 B738 EHAM Amsterdam 17:10 61800 61669 false 999b94ce0b3a3167 KLM one zero four five
+LEMG 2026-07-15 dep KLM1046 B738 EHAM Amsterdam 18:00 64800 65009 false 999b94ce0b3a3167 KLM one zero four six
+LEMG 2026-07-15 arr NAX6133 B738 EDDM Munich 17:20 62400 62389 false f4af660253f14f8d Nor Shuttle six one three three
+LEMG 2026-07-15 dep NAX6134 B738 EDDM Munich 18:00 64800 64851 false f4af660253f14f8d Nor Shuttle six one three four
+LEMG 2026-07-15 arr EXS563 B738 EGCC Manchester 17:15 62100 62754 false 26c8c0e346254dcc Channex five six three
+LEMG 2026-07-15 dep EXS564 B738 EGCC Manchester 18:05 65100 66127 false 26c8c0e346254dcc Channex five six four
+LEMG 2026-07-15 arr TRA5343 B738 EHEH Eindhoven 17:25 62700 62778 false 4acf908e48bdfd76 Transavia five three four three
+LEMG 2026-07-15 dep TRA5344 B738 EHEH Eindhoven 18:15 65700 65700 false 4acf908e48bdfd76 Transavia five three four four
+LEMG 2026-07-15 arr TRA5093 B738 EHAM Amsterdam 17:15 62100 62858 false 1fa8b8accef4481e Transavia five zero niner three
+LEMG 2026-07-15 dep TRA5094 B738 EHAM Amsterdam 18:00 64800 64800 false 1fa8b8accef4481e Transavia five zero niner four
+LEMG 2026-07-15 arr TRA6116 B738 LFPO Paris Orly 17:40 63600 63493 false f88bed4c113730bf Transavia six one one six
+LEMG 2026-07-15 dep TRA6117 B738 LFPO Paris Orly 18:25 66300 66528 false f88bed4c113730bf Transavia six one one seven
+LEMG 2026-07-15 arr ANE8654 AT76 GEML Melilla 17:45 63900 63666 false 9cd77833edb64b31 Air Nostrum eight six five four
+LEMG 2026-07-15 dep ANE8655 AT76 GEML Melilla 18:15 65700 65769 false 9cd77833edb64b31 Air Nostrum eight six five five
+LEMG 2026-07-15 arr TRA5221 B738 EBBR Brussels 17:40 63600 63940 false 4531dc8506f822f3 Transavia five two two one
+LEMG 2026-07-15 dep TRA5222 B738 EBBR Brussels 18:25 66300 66300 false 4531dc8506f822f3 Transavia five two two two
+LEMG 2026-07-15 arr VLG3063 A321 GCXO Tenerife North 17:50 64200 63970 false a6b4295f74c104db Vueling three zero six three
+LEMG 2026-07-15 dep VLG3064 A321 GCXO Tenerife North 18:30 66600 66917 false a6b4295f74c104db Vueling three zero six four
+LEMG 2026-07-15 arr VLG3023 A319 GCLP Gran Canaria 17:50 64200 64234 false 18482727c634886d Vueling three zero two three
+LEMG 2026-07-15 dep VLG3024 A319 GCLP Gran Canaria 18:35 66900 67108 false 18482727c634886d Vueling three zero two four
+LEMG 2026-07-15 arr VLG4101 A320 EGFF Cardiff 17:50 64200 64446 false 50d54336c8d9777c Vueling four one zero one
+LEMG 2026-07-15 dep VLG4102 A320 EGFF Cardiff 18:40 67200 67200 false 50d54336c8d9777c Vueling four one zero two
+LEMG 2026-07-15 arr WZZ1347 A321 LIMC Milan Malpensa 17:55 64500 64752 false 05bc0fd1203197ac Wizz Air one three four seven
+LEMG 2026-07-15 dep WZZ1348 A321 LIMC Milan Malpensa 18:45 67500 67500 false 05bc0fd1203197ac Wizz Air one three four eight
+LEMG 2026-07-15 arr RYR9397 B38M GMMX Marrakesh 17:35 63300 64871 false ac61a729486e87a6 Ryanair niner three niner seven
+LEMG 2026-07-15 dep RYR9398 B38M GMMX Marrakesh 18:25 66300 66651 false ac61a729486e87a6 Ryanair niner three niner eight
+LEMG 2026-07-15 arr RYR9313 B38M LZIB Bratislava 18:05 65100 65184 false 276ad250126a6ba8 Ryanair niner three one three
+LEMG 2026-07-15 dep RYR9314 B38M LZIB Bratislava 19:00 68400 68539 false 276ad250126a6ba8 Ryanair niner three one four
+LEMG 2026-07-15 arr EXS787 A321 EGPF Glasgow 18:15 65700 65803 false 760e82eda9e3854a Channex seven eight seven
+LEMG 2026-07-15 dep EXS788 A321 EGPF Glasgow 19:05 68700 68940 false 760e82eda9e3854a Channex seven eight eight
+LEMG 2026-07-15 arr EZY7953 A320 EHAM Amsterdam 16:55 60900 65871 false 842fd528aa8ead05 Easy seven niner five three
+LEMG 2026-07-15 dep EZY7954 A320 EHAM Amsterdam 17:45 63900 67371 false 842fd528aa8ead05 Easy seven niner five four
+LEMG 2026-07-15 arr WZZ7017 A21N EPKK Krakow 18:15 65700 66049 false 6f980afd0f68876b Wizz Air seven zero one seven
+LEMG 2026-07-15 dep WZZ7018 A21N EPKK Krakow 19:05 68700 68700 false 6f980afd0f68876b Wizz Air seven zero one eight
+LEMG 2026-07-15 arr RYR9497 B738 EHAM Amsterdam 18:20 66000 66238 false 13fb07211e0403f6 Ryanair niner four niner seven
+LEMG 2026-07-15 dep RYR9498 B738 EHAM Amsterdam 19:05 68700 68700 false 13fb07211e0403f6 Ryanair niner four niner eight
+LEMG 2026-07-15 arr EXS809 B738 EGAA Belfast 18:25 66300 66568 false 4ea63011fd627b23 Channex eight zero niner
+LEMG 2026-07-15 dep EXS810 B738 EGAA Belfast 19:20 69600 69600 false 4ea63011fd627b23 Channex eight one zero
+LEMG 2026-07-15 arr RYR9473 B738 LIMF Turin 18:45 67500 67674 false 49d9f6e9e8df02e4 Ryanair niner four seven three
+LEMG 2026-07-15 dep RYR9474 B738 LIMF Turin 19:30 70200 70200 false 49d9f6e9e8df02e4 Ryanair niner four seven four
+LEMG 2026-07-15 arr EZY2043 A21N EGGW London Luton 18:50 67800 67892 false a91c4d673d692a75 Easy two zero four three
+LEMG 2026-07-15 dep EZY2044 A21N EGGW London Luton 19:35 70500 70500 false a91c4d673d692a75 Easy two zero four four
+LEMG 2026-07-15 arr DLH1804 A20N EDDM Munich 18:35 66900 67992 false 0c7ceb529a84bf8a Lufthansa one eight zero four
+LEMG 2026-07-15 dep DLH1805 A20N EDDM Munich 19:20 69600 69816 false 0c7ceb529a84bf8a Lufthansa one eight zero five
+LEMG 2026-07-15 arr RYR9389 B738 EPLL Lodz 19:00 68400 68258 false 98008881bad7f63f Ryanair niner three eight niner
+LEMG 2026-07-15 dep RYR9390 B738 EPLL Lodz 19:50 71400 71626 false 98008881bad7f63f Ryanair niner three niner zero
+LEMG 2026-07-15 arr RYR9409 B738 EDDG Munster 19:15 69300 69072 false c2d4b95af8f87e91 Ryanair niner four zero niner
+LEMG 2026-07-15 dep RYR9410 B738 EDDG Munster 20:05 72300 77178 false c2d4b95af8f87e91 Ryanair niner four one zero
+LEMG 2026-07-15 arr EZY5145 A21N LFSB Basel 19:10 69000 69185 false db7e940f4c963f3d Easy five one four five
+LEMG 2026-07-15 dep EZY5146 A21N LFSB Basel 19:55 71700 71700 false db7e940f4c963f3d Easy five one four six
+LEMG 2026-07-15 arr TOM900 B738 EGNT Newcastle 19:10 69000 69360 false 9792b133c6bdde07 Tomjet niner zero zero
+LEMG 2026-07-15 dep TOM901 B738 EGNT Newcastle 19:55 71700 71981 false 9792b133c6bdde07 Tomjet niner zero one
+LEMG 2026-07-15 arr EZY1503 A20N LSZH Zurich 19:15 69300 69412 false 11b2602400343948 Easy one five zero three
+LEMG 2026-07-15 dep EZY1504 A20N LSZH Zurich 20:00 72000 73032 false 11b2602400343948 Easy one five zero four
+LEMG 2026-07-15 arr AEA1043 B38M LEMD Madrid 19:20 69600 69705 false 1f9e0319d1be01d7 Air Europa one zero four three
+LEMG 2026-07-15 dep AEA1044 B38M LEMD Madrid 20:05 72300 74011 false 1f9e0319d1be01d7 Air Europa one zero four four
+LEMG 2026-07-15 arr RYR7317 B738 LIME Bergamo 19:15 69300 70109 false 50f8a1b386093c92 Ryanair seven three one seven
+LEMG 2026-07-15 dep RYR7318 B738 LIME Bergamo 19:55 71700 75943 false 50f8a1b386093c92 Ryanair seven three one eight
+LEMG 2026-07-15 arr ITY1286 A20N LIRF Rome 19:35 70500 70430 false 0df8037d1d9cd0e5 Itarrow one two eight six
+LEMG 2026-07-15 dep ITY1287 A20N LIRF Rome 20:20 73200 78280 false 0df8037d1d9cd0e5 Itarrow one two eight seven
+LEMG 2026-07-15 arr WZZ6201 A21N LIRF Rome 19:40 70800 70611 false 03900a4f3e9b81f5 Wizz Air six two zero one
+LEMG 2026-07-15 dep WZZ6202 A21N LIRF Rome 20:25 73500 73580 false 03900a4f3e9b81f5 Wizz Air six two zero two
+LEMG 2026-07-15 arr RYR9333 B738 EDDK Cologne 19:35 70500 70690 false aa5d1f0d2b551e69 Ryanair niner three three three
+LEMG 2026-07-15 dep RYR9334 B738 EDDK Cologne 20:20 73200 74183 false aa5d1f0d2b551e69 Ryanair niner three three four
+LEMG 2026-07-15 arr EXS751 A321 EGPH Edinburgh 19:45 71100 70981 false 84145241d6a6a71d Channex seven five one
+LEMG 2026-07-15 dep EXS752 A321 EGPH Edinburgh 20:40 74400 74470 false 84145241d6a6a71d Channex seven five two
+LEMG 2026-07-15 arr SWR439 A320 LSZH Zurich 19:30 70200 71937 false b2fd8b7b5342d768 Swiss four three niner
+LEMG 2026-07-15 dep SWR440 A320 LSZH Zurich 20:20 73200 73437 false b2fd8b7b5342d768 Swiss four four zero
+LEMG 2026-07-15 arr RYR9441 B738 EVRA Riga 20:05 72300 72090 false 3b00319c6522398a Ryanair niner four four one
+LEMG 2026-07-15 dep RYR9442 B738 EVRA Riga 20:55 75300 75300 false 3b00319c6522398a Ryanair niner four four two
+LEMG 2026-07-15 arr EIN588 A321 EIDW Dublin 20:10 72600 72373 false 20d18b86441471f8 Shamrock five eight eight
+LEMG 2026-07-15 dep EIN589 A321 EIDW Dublin 21:05 75900 75900 false 20d18b86441471f8 Shamrock five eight niner
+LEMG 2026-07-15 arr SAS2583 A21N EKCH Copenhagen 20:10 72600 72673 false 3eeb783cb93f932d Scandinavian two five eight three
+LEMG 2026-07-15 dep SAS2584 A21N EKCH Copenhagen 20:55 75300 75623 false 3eeb783cb93f932d Scandinavian two five eight four
+LEMG 2026-07-15 arr RYR9445 B738 ENTO Sandefjord 20:10 72600 72689 false 43ba4e1c3599bef1 Ryanair niner four four five
+LEMG 2026-07-15 dep RYR9446 B738 ENTO Sandefjord 20:55 75300 75420 false 43ba4e1c3599bef1 Ryanair niner four four six
+LEMG 2026-07-15 arr RYR9469 B738 LIPH Treviso 20:15 72900 72792 false 27ae03f2db427130 Ryanair niner four six niner
+LEMG 2026-07-15 dep RYR9470 B738 LIPH Treviso 21:00 75600 75600 false 27ae03f2db427130 Ryanair niner four seven zero
+LEMG 2026-07-15 arr RYR9413 B38M EGHQ Newquay 20:20 73200 73408 false 6cb1f5329c24401f Ryanair niner four one three
+LEMG 2026-07-15 dep RYR9414 B38M EGHQ Newquay 21:10 76200 76556 false 6cb1f5329c24401f Ryanair niner four one four
+LEMG 2026-07-15 arr RYR9481 B738 EPWR Wroclaw 20:25 73500 73544 false 569381806a128660 Ryanair niner four eight one
+LEMG 2026-07-15 dep RYR9482 B738 EPWR Wroclaw 21:10 76200 76202 false 569381806a128660 Ryanair niner four eight two
+LEMG 2026-07-15 arr EWG1580 A20N EDDL Dusseldorf 20:30 73800 74032 false e2c3d11c5f97828f Eurowings one five eight zero
+LEMG 2026-07-15 dep EWG1581 A20N EDDL Dusseldorf 21:15 76500 76626 false e2c3d11c5f97828f Eurowings one five eight one
+LEMG 2026-07-15 arr BEL3717 A320 EBBR Brussels 20:30 73800 74597 false e943720037976b2e Bee-line three seven one seven
+LEMG 2026-07-15 dep BEL3718 A320 EBBR Brussels 21:15 76500 76500 false e943720037976b2e Bee-line three seven one eight
+LEMG 2026-07-15 arr FIN1655 A319 EFHK Helsinki 20:45 74700 74789 false e13be6048502a646 Finnair one six five five
+LEMG 2026-07-15 dep FIN1656 A319 EFHK Helsinki 21:35 77700 77700 false e13be6048502a646 Finnair one six five six
+LEMG 2026-07-15 arr RYR1149 B738 EPKK Krakow 20:30 73800 74870 false 47d0b69bcbf1f3c2 Ryanair one one four niner
+LEMG 2026-07-15 dep RYR1150 B738 EPKK Krakow 21:15 76500 76649 false 47d0b69bcbf1f3c2 Ryanair one one five zero
+LEMG 2026-07-15 arr EZY2265 A20N EGGP Liverpool 20:30 73800 74877 false 978f9465ed65e122 Easy two two six five
+LEMG 2026-07-15 dep EZY2266 A20N EGGP Liverpool 21:20 76800 76967 false 978f9465ed65e122 Easy two two six six
+LEMG 2026-07-15 arr EZY6957 A20N EGPF Glasgow 20:50 75000 75357 false 4cd9eefdad189b74 Easy six niner five seven
+LEMG 2026-07-15 dep EZY6958 A20N EGPF Glasgow 21:40 78000 78056 false 4cd9eefdad189b74 Easy six niner five eight
+LEMG 2026-07-15 arr DLH1152 A321 EDDF Frankfurt 20:50 75000 75613 false 95c970f3625bd17f Lufthansa one one five two
+LEMG 2026-07-15 dep DLH1153 A321 EDDF Frankfurt 21:45 78300 78510 false 95c970f3625bd17f Lufthansa one one five three
+LEMG 2026-07-15 arr NAX3731 B738 ESGG Gothenburg 21:00 75600 75644 false 6c2f77df61c61bff Nor Shuttle three seven three one
+LEMG 2026-07-15 dep NAX3732 B738 ESGG Gothenburg 21:40 78000 78205 false 6c2f77df61c61bff Nor Shuttle three seven three two
+LEMG 2026-07-15 arr KLM1047 B738 EHAM Amsterdam 20:55 75300 75659 false f02e97662b022507 KLM one zero four seven
+LEMG 2026-07-15 dep KLM1048 B738 EHAM Amsterdam 21:40 78000 78000 false f02e97662b022507 KLM one zero four eight
+LEMG 2026-07-15 arr TRA5095 B738 EHAM Amsterdam 21:00 75600 75667 false d02f0978cfb54f57 Transavia five zero niner five
+LEMG 2026-07-15 dep TRA5096 B738 EHAM Amsterdam 21:50 78600 78737 false d02f0978cfb54f57 Transavia five zero niner six
+LEMG 2026-07-15 arr EXS675 B738 EGSS London Stansted 20:50 75000 76238 false 03fef67159dce510 Channex six seven five
+LEMG 2026-07-15 dep EXS676 B738 EGSS London Stansted 21:45 78300 78609 false 03fef67159dce510 Channex six seven six
+LEMG 2026-07-15 arr ANE8656 AT76 GEML Melilla 20:45 74700 76381 false c2657644300fb706 Air Nostrum eight six five six
+LEMG 2026-07-15 dep ANE8657 AT76 GEML Melilla 21:15 76500 77581 false c2657644300fb706 Air Nostrum eight six five seven
+LEMG 2026-07-15 arr EZY4581 A21N LFMN Nice 21:25 77100 76906 false 04b68b6e53cff88c Easy four five eight one
+LEMG 2026-07-15 dep EZY4582 A21N LFMN Nice 22:15 80100 80100 false 04b68b6e53cff88c Easy four five eight two
+LEMG 2026-07-15 arr AUA157 A320 LOWW Vienna 21:25 77100 77040 false 24c15da51a58ad52 Austrian one five seven
+LEMG 2026-07-15 dep AUA158 A320 LOWW Vienna 22:20 80400 82363 false 24c15da51a58ad52 Austrian one five eight
+LEMG 2026-07-15 arr AEA6083 B738 LEPA Palma de Mallorca 21:35 77700 77658 false e2f9a5ed95164fa8 Air Europa six zero eight three
+LEMG 2026-07-15 dep AEA6084 B738 LEPA Palma de Mallorca 22:20 80400 82334 false e2f9a5ed95164fa8 Air Europa six zero eight four
+LEMG 2026-07-15 arr RYR9401 B38M LFML Marseille 21:40 78000 78936 false 3134eb017b73ce4c Ryanair niner four zero one
+LEMG 2026-07-15 dep RYR9402 B38M LFML Marseille 22:25 80700 81012 false 3134eb017b73ce4c Ryanair niner four zero two
+LEMG 2026-07-15 arr NAX1587 B738 ENGM Oslo 22:05 79500 79292 false f831af58b539cfb2 Nor Shuttle one five eight seven
+LEMG 2026-07-15 dep NAX1588 B738 ENGM Oslo 22:55 82500 82500 false f831af58b539cfb2 Nor Shuttle one five eight eight
+LEMG 2026-07-15 arr RYR9489 B738 EKCH Copenhagen 22:15 80100 80235 false 83bae274f763498d Ryanair niner four eight niner
+LEMG 2026-07-15 dep RYR9490 B738 EKCH Copenhagen 23:00 82800 82800 false 83bae274f763498d Ryanair niner four niner zero
+LEMG 2026-07-15 arr RYR9429 B38M LPPR Porto 22:15 80100 81556 false a394e8039c85dc09 Ryanair niner four two niner
+LEMG 2026-07-15 dep RYR9430 B38M LPPR Porto 23:05 83100 84314 false a394e8039c85dc09 Ryanair niner four three zero
+LEMG 2026-07-15 arr TAP1363 A321 LPPT Lisbon 22:50 82200 82393 false 3b9d3e12dc658536 Air Portugal one three six three
+LEMG 2026-07-15 dep TAP1364 A321 LPPT Lisbon 23:30 84600 84698 false 3b9d3e12dc658536 Air Portugal one three six four
+LEMG 2026-07-15 arr RYR9329 B738 LHBP Budapest 22:15 80100 83008 false 92a9f8cc4a866529 Ryanair niner three two niner
+LEMG 2026-07-15 dep RYR9330 B738 LHBP Budapest 22:55 82500 84508 false 92a9f8cc4a866529 Ryanair niner three three zero
+LEMG 2026-07-15 arr TOM614 B38M EGKK London Gatwick 23:05 83100 83249 false b50a0568c779bb6d Tomjet six one four
+LEMG 2026-07-15 dep TOM615 B38M EGKK London Gatwick 23:55 86100 86342 false b50a0568c779bb6d Tomjet six one five
+LEMG 2026-07-15 arr EZY7117 A320 GMMX Marrakesh 22:55 82500 83565 false 8914cc497c0379b3 Easy seven one one seven
+LEMG 2026-07-15 dep EZY7118 A320 GMMX Marrakesh 23:45 85500 85500 false 8914cc497c0379b3 Easy seven one one eight
+LEMG 2026-07-15 arr NAX6101 B38M EKYT Aalborg 23:20 84000 84311 false 13055f32a0ffbe75 Nor Shuttle six one zero one
+LEMG 2026-07-15 dep NAX6102 B38M EKYT Aalborg 00:05 86700 88305 false 13055f32a0ffbe75 Nor Shuttle six one zero two
+LEMG 2026-07-15 arr IBE3704 A20N LEMD Madrid 23:25 84300 84451 false a9632c2bffa2ac98 Iberia three seven zero four
+LEMG 2026-07-15 dep IBE3705 A20N LEMD Madrid 00:10 87000 87249 false a9632c2bffa2ac98 Iberia three seven zero five
+LEMG 2026-07-15 arr EZY2863 A320 LIMC Milan Malpensa 23:25 84300 88272 false 2a137c3eac444dba Easy two eight six three
+LEMG 2026-07-15 dep EZY2864 A320 LIMC Milan Malpensa 00:10 87000 89772 false 2a137c3eac444dba Easy two eight six four
+LEMG 2026-01-14 arr NAX3586 B38M EKCH Copenhagen 15:20 -31200 -30293 true 1a773233f3afe244 Nor Shuttle three five eight six
+LEMG 2026-01-14 dep NAX3587 B38M EKCH Copenhagen 07:05 25500 25642 true 1a773233f3afe244 Nor Shuttle three five eight seven
+LEMG 2026-01-14 arr NAX4171 B38M ESSA Stockholm 16:20 -27600 -27439 true f1b032976e1cd744 Nor Shuttle four one seven one
+LEMG 2026-01-14 dep NAX4172 B38M ESSA Stockholm 06:50 24600 24600 true f1b032976e1cd744 Nor Shuttle four one seven two
+LEMG 2026-01-14 arr NAX3588 B738 EKCH Copenhagen 17:05 -24900 -25006 true ab4fe716c5c808c2 Nor Shuttle three five eight eight
+LEMG 2026-01-14 dep NAX3589 B738 EKCH Copenhagen 08:50 31800 33978 true ab4fe716c5c808c2 Nor Shuttle three five eight niner
+LEMG 2026-01-14 arr RYR9161 B738 ESSA Stockholm 17:35 -23100 -23185 true 9bb42775f156128c Ryanair niner one six one
+LEMG 2026-01-14 dep RYR9162 B738 ESSA Stockholm 08:00 28800 28800 true 9bb42775f156128c Ryanair niner one six two
+LEMG 2026-01-14 arr NAX4173 B738 ESSA Stockholm 18:05 -21300 -21309 true 2934f70c0c27ec91 Nor Shuttle four one seven three
+LEMG 2026-01-14 dep NAX4174 B738 ESSA Stockholm 08:35 30900 31090 true 2934f70c0c27ec91 Nor Shuttle four one seven four
+LEMG 2026-01-14 arr VLG1471 A20N LEBB Bilbao 19:30 -16200 -16432 true b9abb3c038d6c17d Vueling one four seven one
+LEMG 2026-01-14 dep VLG1472 A20N LEBB Bilbao 06:20 22800 22955 true b9abb3c038d6c17d Vueling one four seven two
+LEMG 2026-01-14 arr RYR2843 B738 LIMC Milan Malpensa 19:45 -15300 -15520 true 46cfcb6a0889d307 Ryanair two eight four three
+LEMG 2026-01-14 dep RYR2844 B738 LIMC Milan Malpensa 07:35 27300 27300 true 46cfcb6a0889d307 Ryanair two eight four four
+LEMG 2026-01-14 arr RYR3561 B738 EBCI Brussels Charleroi 20:00 -14400 -14239 true e4425472e3e89c3e Ryanair three five six one
+LEMG 2026-01-14 dep RYR3562 B738 EBCI Brussels Charleroi 06:45 24300 24603 true e4425472e3e89c3e Ryanair three five six two
+LEMG 2026-01-14 arr RYR3631 B738 EGNX East Midlands 20:10 -13800 -13541 true f4ca01365f278829 Ryanair three six three one
+LEMG 2026-01-14 dep RYR3632 B738 EGNX East Midlands 06:20 22800 22923 true f4ca01365f278829 Ryanair three six three two
+LEMG 2026-01-14 arr RYR7062 B38M EIDW Dublin 20:25 -12900 -13018 true 1076cfa6feafa760 Ryanair seven zero six two
+LEMG 2026-01-14 dep RYR7063 B38M EIDW Dublin 06:15 22500 22552 true 1076cfa6feafa760 Ryanair seven zero six three
+LEMG 2026-01-14 arr RYR5021 B738 LEBL Barcelona 20:30 -12600 -12527 true 4470a5434aeaf6a4 Ryanair five zero two one
+LEMG 2026-01-14 dep RYR5022 B738 LEBL Barcelona 07:10 25800 27361 true 4470a5434aeaf6a4 Ryanair five zero two two
+LEMG 2026-01-14 arr EZY8061 A319 EGKK London Gatwick 20:35 -12300 -12189 true 44acfa378ee24215 Easy eight zero six one
+LEMG 2026-01-14 dep EZY8062 A319 EGKK London Gatwick 07:35 27300 27643 true 44acfa378ee24215 Easy eight zero six two
+LEMG 2026-01-14 arr VLG2201 A320 LEBL Barcelona 20:45 -11700 -11468 true 13fed2b44ddad1a8 Vueling two two zero one
+LEMG 2026-01-14 dep VLG2202 A320 LEBL Barcelona 07:25 26700 28448 true 13fed2b44ddad1a8 Vueling two two zero two
+LEMG 2026-01-14 arr VLG8013 A320 LFPO Paris Orly 21:00 -10800 -10866 true 46b38848b5b0a098 Vueling eight zero one three
+LEMG 2026-01-14 dep VLG8014 A320 LFPO Paris Orly 08:55 32100 32100 true 46b38848b5b0a098 Vueling eight zero one four
+LEMG 2026-01-14 arr RYR4893 B38M LIRF Rome 21:10 -10200 -9878 true 6d14dedbb5ab6fee Ryanair four eight niner three
+LEMG 2026-01-14 dep RYR4894 B38M LIRF Rome 08:40 31200 31474 true 6d14dedbb5ab6fee Ryanair four eight niner four
+LEMG 2026-01-14 arr RYR3913 B738 EHEH Eindhoven 21:20 -9600 -9535 true abdf34d0baf90df1 Ryanair three niner one three
+LEMG 2026-01-14 dep RYR3914 B738 EHEH Eindhoven 07:25 26700 26704 true abdf34d0baf90df1 Ryanair three niner one four
+LEMG 2026-01-14 arr RYR1702 B38M EGCC Manchester 21:30 -9000 -9098 true 05f273e407033c3e Ryanair one seven zero two
+LEMG 2026-01-14 dep RYR1703 B38M EGCC Manchester 07:20 26400 26490 true 05f273e407033c3e Ryanair one seven zero three
+LEMG 2026-01-14 arr EZY1925 A21N EGCC Manchester 21:30 -9000 -9007 true 7fa0c4b666ec8c14 Easy one niner two five
+LEMG 2026-01-14 dep EZY1926 A21N EGCC Manchester 07:25 26700 26748 true 7fa0c4b666ec8c14 Easy one niner two six
+LEMG 2026-01-14 arr EZY6127 A320 EGGD Bristol 21:40 -8400 -7769 true 02278e54aa7ac83b Easy six one two seven
+LEMG 2026-01-14 dep EZY6128 A320 EGGD Bristol 08:40 31200 31209 true 02278e54aa7ac83b Easy six one two eight
+LEMG 2026-01-14 arr RYR7066 B738 EIDW Dublin 22:10 -6600 -6608 true 2087f36732eeee1b Ryanair seven zero six six
+LEMG 2026-01-14 dep RYR7067 B738 EIDW Dublin 08:00 28800 30083 true 2087f36732eeee1b Ryanair seven zero six seven
+LEMG 2026-01-14 arr RYR2291 B38M EGBB Birmingham 22:10 -6600 -6336 true 98947aac60d07cd2 Ryanair two two niner one
+LEMG 2026-01-14 dep RYR2292 B38M EGBB Birmingham 08:30 30600 30633 true 98947aac60d07cd2 Ryanair two two niner two
+LEMG 2026-01-14 arr EZY8065 A20N EGKK London Gatwick 22:20 -6000 -6144 true b9b8243c0ed33ee5 Easy eight zero six five
+LEMG 2026-01-14 dep EZY8066 A20N EGKK London Gatwick 09:20 33600 33879 true b9b8243c0ed33ee5 Easy eight zero six six
+LEMG 2026-01-14 arr RYR8171 B38M EGSS London Stansted 22:20 -6000 -5953 true dcb426afc1bfaec2 Ryanair eight one seven one
+LEMG 2026-01-14 dep RYR8172 B38M EGSS London Stansted 08:55 32100 32419 true dcb426afc1bfaec2 Ryanair eight one seven two
+LEMG 2026-01-14 arr RYR1987 B738 EGGP Liverpool 22:45 -4500 -4687 true bc707e28809cb8ab Ryanair one niner eight seven
+LEMG 2026-01-14 dep RYR1988 B738 EGGP Liverpool 08:40 31200 31554 true bc707e28809cb8ab Ryanair one niner eight eight
+LEMG 2026-01-14 arr VLG2207 A320 LEBL Barcelona 22:30 -5400 -1949 true 91b81dafab727691 Vueling two two zero seven
+LEMG 2026-01-14 dep VLG2208 A320 LEBL Barcelona 09:10 33000 33645 true 91b81dafab727691 Vueling two two zero eight
+LEMG 2026-01-14 arr VLG3911 A320 LEPA Palma de Mallorca 07:20 26400 26733 false a7d32d8acff578f5 Vueling three niner one one
+LEMG 2026-01-14 dep VLG3912 A320 LEPA Palma de Mallorca 08:10 29400 29511 false a7d32d8acff578f5 Vueling three niner one two
+LEMG 2026-01-14 arr AEA1041 B738 LEMD Madrid 07:40 27600 27763 false 7142ebb33ed67da8 Air Europa one zero four one
+LEMG 2026-01-14 dep AEA1042 B738 LEMD Madrid 08:25 30300 30583 false 7142ebb33ed67da8 Air Europa one zero four two
+LEMG 2026-01-14 arr ANE8650 AT76 GEML Melilla 08:35 30900 30692 false fe662572fda44b65 Air Nostrum eight six five zero
+LEMG 2026-01-14 dep ANE8651 AT76 GEML Melilla 09:05 32700 33737 false fe662572fda44b65 Air Nostrum eight six five one
+LEMG 2026-01-14 arr AFR1312 A20N LFPG Paris Charles de Gaulle 08:40 31200 31215 false 141257858d3b58cd Air France one three one two
+LEMG 2026-01-14 dep AFR1313 A20N LFPG Paris Charles de Gaulle 09:30 34200 34330 false 141257858d3b58cd Air France one three one three
+LEMG 2026-01-14 arr VLG1281 A21N LEST Santiago 08:50 31800 31919 false 9ec1fd0cdcfbe4c6 Vueling one two eight one
+LEMG 2026-01-14 dep VLG1282 A21N LEST Santiago 09:35 34500 35478 false 9ec1fd0cdcfbe4c6 Vueling one two eight two
+LEMG 2026-01-14 arr RYR9417 B738 EDDN Nuremberg 09:05 32700 32577 false a7179cadfd6f536f Ryanair niner four one seven
+LEMG 2026-01-14 dep RYR9418 B738 EDDN Nuremberg 09:55 35700 35960 false a7179cadfd6f536f Ryanair niner four one eight
+LEMG 2026-01-14 arr EWG5820 A320 EDDK Cologne 09:15 33300 33399 false f99f56eded13311b Eurowings five eight two zero
+LEMG 2026-01-14 dep EWG5821 A320 EDDK Cologne 09:55 35700 36611 false f99f56eded13311b Eurowings five eight two one
+LEMG 2026-01-14 arr EZY7105 A320 LFBD Bordeaux 09:15 33300 33638 false 4bd344055d911df4 Easy seven one zero five
+LEMG 2026-01-14 dep EZY7106 A320 LFBD Bordeaux 10:05 36300 40298 false 4bd344055d911df4 Easy seven one zero six
+LEMG 2026-01-14 arr EZY7951 A319 EHAM Amsterdam 09:25 33900 33698 false ac7e10fdac3138a8 Easy seven niner five one
+LEMG 2026-01-14 dep EZY7952 A319 EHAM Amsterdam 10:15 36900 37062 false ac7e10fdac3138a8 Easy seven niner five two
+LEMG 2026-01-14 arr RYR9453 B738 LBSF Sofia 09:10 33000 33944 false 23da4c4d296056ef Ryanair niner four five three
+LEMG 2026-01-14 dep RYR9454 B738 LBSF Sofia 09:55 35700 35700 false 23da4c4d296056ef Ryanair niner four five four
+LEMG 2026-01-14 arr RYR9465 B738 GMTN Tetouan 09:30 34200 34291 false e458bbae1b966296 Ryanair niner four six five
+LEMG 2026-01-14 dep RYR9466 B738 GMTN Tetouan 10:20 37200 37291 false e458bbae1b966296 Ryanair niner four six six
+LEMG 2026-01-14 arr TRA5091 B738 EHAM Amsterdam 09:45 35100 34963 false 102cdbb9ee4f1e22 Transavia five zero niner one
+LEMG 2026-01-14 dep TRA5092 B738 EHAM Amsterdam 10:30 37800 37896 false 102cdbb9ee4f1e22 Transavia five zero niner two
+LEMG 2026-01-14 arr KLM1043 B738 EHAM Amsterdam 09:40 34800 35072 false 198b196f5c91962c KLM one zero four three
+LEMG 2026-01-14 dep KLM1044 B738 EHAM Amsterdam 10:25 37500 37500 false 198b196f5c91962c KLM one zero four four
+LEMG 2026-01-14 arr RYR9501 B738 EDDB Berlin 09:35 34500 35279 false 7ea466517551a511 Ryanair niner five zero one
+LEMG 2026-01-14 dep RYR9502 B738 EDDB Berlin 10:20 37200 37507 false 7ea466517551a511 Ryanair niner five zero two
+LEMG 2026-01-14 arr RYR9477 B38M EDLV Weeze 09:20 33600 35378 false 3cb9af4ed2e53ffd Ryanair niner four seven seven
+LEMG 2026-01-14 dep RYR9478 B38M EDLV Weeze 10:05 36300 37864 false 3cb9af4ed2e53ffd Ryanair niner four seven eight
+LEMG 2026-01-14 arr WZZ7001 A21N LZIB Bratislava 09:55 35700 35528 false ef3a15740aa10270 Wizz Air seven zero zero one
+LEMG 2026-01-14 dep WZZ7002 A21N LZIB Bratislava 10:35 38100 39181 false ef3a15740aa10270 Wizz Air seven zero zero two
+LEMG 2026-01-14 arr EXS695 A21N EGBB Birmingham 09:55 35700 35613 false 930e2830936815e6 Channex six niner five
+LEMG 2026-01-14 dep EXS696 A21N EGBB Birmingham 10:40 38400 38400 false 930e2830936815e6 Channex six niner six
+LEMG 2026-01-14 arr TRA5341 B738 EHEH Eindhoven 10:00 36000 35878 false 6aba3d9fbec44e5e Transavia five three four one
+LEMG 2026-01-14 dep TRA5342 B738 EHEH Eindhoven 10:55 39300 39622 false 6aba3d9fbec44e5e Transavia five three four two
+LEMG 2026-01-14 arr FIN1653 A321 EFHK Helsinki 09:35 34500 36083 false d9c0ff15a36c541b Finnair one six five three
+LEMG 2026-01-14 dep FIN1654 A321 EFHK Helsinki 10:20 37200 38768 false d9c0ff15a36c541b Finnair one six five four
+LEMG 2026-01-14 arr RYR9421 B738 LKMT Ostrava 10:05 36300 36439 false 47eb161152dfe62f Ryanair niner four two one
+LEMG 2026-01-14 dep RYR9422 B738 LKMT Ostrava 10:50 39000 39000 false 47eb161152dfe62f Ryanair niner four two two
+LEMG 2026-01-14 arr EZY6587 A320 EGAA Belfast 10:15 36900 36699 false 163fbdde751837f4 Easy six five eight seven
+LEMG 2026-01-14 dep EZY6588 A320 EGAA Belfast 10:55 39300 39300 false 163fbdde751837f4 Easy six five eight eight
+LEMG 2026-01-14 arr EXS643 B738 EGNX East Midlands 10:20 37200 37291 false c113a2570856147c Channex six four three
+LEMG 2026-01-14 dep EXS644 B738 EGNX East Midlands 11:10 40200 40326 false c113a2570856147c Channex six four four
+LEMG 2026-01-14 arr VLG8961 A320 EBBR Brussels 10:05 36300 37447 false 10396441216fd75a Vueling eight niner six one
+LEMG 2026-01-14 dep VLG8962 A320 EBBR Brussels 10:50 39000 39000 false 10396441216fd75a Vueling eight niner six two
+LEMG 2026-01-14 arr BAW470 A20N EGLL London Heathrow 10:20 37200 37475 false 1a9dec5658e23315 Speedbird four seven zero
+LEMG 2026-01-14 dep BAW471 A20N EGLL London Heathrow 11:15 40500 40582 false 1a9dec5658e23315 Speedbird four seven one
+LEMG 2026-01-14 arr RYR6311 B738 LEPA Palma de Mallorca 10:30 37800 37718 false 0993094fa6dff9ec Ryanair six three one one
+LEMG 2026-01-14 dep RYR6312 B738 LEPA Palma de Mallorca 11:25 41100 41179 false 0993094fa6dff9ec Ryanair six three one two
+LEMG 2026-01-14 arr EXS617 B738 EGKK London Gatwick 10:35 38100 38273 false 6b7f55a6b8a30329 Channex six one seven
+LEMG 2026-01-14 dep EXS618 B738 EGKK London Gatwick 11:15 40500 40500 false 6b7f55a6b8a30329 Channex six one eight
+LEMG 2026-01-14 arr RYR9381 B738 LZKZ Kosice 10:40 38400 38364 false 5ca33abad9661b1f Ryanair niner three eight one
+LEMG 2026-01-14 dep RYR9382 B738 LZKZ Kosice 11:35 41700 41738 false 5ca33abad9661b1f Ryanair niner three eight two
+LEMG 2026-01-14 arr WZZ4625 A21N EGGW London Luton 10:40 38400 40003 false 3aa97af0a25edc3e Wizz Air four six two five
+LEMG 2026-01-14 dep WZZ4626 A21N EGGW London Luton 11:30 41400 41503 false 3aa97af0a25edc3e Wizz Air four six two six
+LEMG 2026-01-14 arr SAS2581 A320 EKCH Copenhagen 11:10 40200 40346 false 03a6243ba56e5978 Scandinavian two five eight one
+LEMG 2026-01-14 dep SAS2582 A320 EKCH Copenhagen 11:55 42900 43147 false 03a6243ba56e5978 Scandinavian two five eight two
+LEMG 2026-01-14 arr TRA6112 B738 LFPO Paris Orly 11:15 40500 40680 false 2f41ccb7154ec5a8 Transavia six one one two
+LEMG 2026-01-14 dep TRA6113 B738 LFPO Paris Orly 12:05 43500 44899 false 2f41ccb7154ec5a8 Transavia six one one three
+LEMG 2026-01-14 arr WZZ4471 A321 EGKK London Gatwick 11:15 40500 40753 false c4ba287e2440642f Wizz Air four four seven one
+LEMG 2026-01-14 dep WZZ4472 A321 EGKK London Gatwick 12:05 43500 43637 false c4ba287e2440642f Wizz Air four four seven two
+LEMG 2026-01-14 arr DLH1802 A320 EDDM Munich 11:10 40200 40995 false 26e1e761d45489ad Lufthansa one eight zero two
+LEMG 2026-01-14 dep DLH1803 A320 EDDM Munich 11:55 42900 42900 false 26e1e761d45489ad Lufthansa one eight zero three
+LEMG 2026-01-14 arr VLG3061 A20N GCXO Tenerife North 11:25 41100 41190 false 068bfa1711d5f3cb Vueling three zero six one
+LEMG 2026-01-14 dep VLG3062 A20N GCXO Tenerife North 12:15 44100 44100 false 068bfa1711d5f3cb Vueling three zero six two
+LEMG 2026-01-14 arr VLG3021 A321 GCLP Gran Canaria 11:30 41400 41388 false 99effaf719bc98fc Vueling three zero two one
+LEMG 2026-01-14 dep VLG3022 A321 GCLP Gran Canaria 12:20 44400 44480 false 99effaf719bc98fc Vueling three zero two two
+LEMG 2026-01-14 arr VLG3519 A320 LEIB Ibiza 11:30 41400 41678 false 81129aeea55abd7b Vueling three five one niner
+LEMG 2026-01-14 dep VLG3520 A320 LEIB Ibiza 12:20 44400 45584 false 81129aeea55abd7b Vueling three five two zero
+LEMG 2026-01-14 arr THY1966 A321 LTFM Istanbul 11:45 42300 42239 false ff411586d7761064 Turkish one niner six six
+LEMG 2026-01-14 dep THY1967 A321 LTFM Istanbul 12:30 45000 45343 false ff411586d7761064 Turkish one niner six seven
+LEMG 2026-01-14 arr VLG2203 A321 LEBL Barcelona 11:20 40800 42449 false cca10ce56dde081d Vueling two two zero three
+LEMG 2026-01-14 dep VLG2204 A321 LEBL Barcelona 12:15 44100 44100 false cca10ce56dde081d Vueling two two zero four
+LEMG 2026-01-14 arr EZY4417 A20N LFLL Lyon 11:50 42600 42620 false a81040e6c173656c Easy four four one seven
+LEMG 2026-01-14 dep EZY4418 A20N LFLL Lyon 12:35 45300 45300 false a81040e6c173656c Easy four four one eight
+LEMG 2026-01-14 arr IBE3700 A20N LEMD Madrid 11:50 42600 42750 false d1b096aaeccac3d9 Iberia three seven zero zero
+LEMG 2026-01-14 dep IBE3701 A20N LEMD Madrid 12:40 45600 46830 false d1b096aaeccac3d9 Iberia three seven zero one
+LEMG 2026-01-14 arr EZY2041 A320 EGGW London Luton 11:45 42300 42919 false b5003218f270b0b5 Easy two zero four one
+LEMG 2026-01-14 dep EZY2042 A320 EGGW London Luton 12:35 45300 46048 false b5003218f270b0b5 Easy two zero four two
+LEMG 2026-01-14 arr WZZ7033 A21N EYVI Vilnius 12:15 44100 44138 false d5df55a7eb37d1ef Wizz Air seven zero three three
+LEMG 2026-01-14 dep WZZ7034 A21N EYVI Vilnius 13:05 47100 47272 false d5df55a7eb37d1ef Wizz Air seven zero three four
+LEMG 2026-01-14 arr EIN584 A320 EIDW Dublin 12:40 45600 45785 false 8e924de6d64f2710 Shamrock five eight four
+LEMG 2026-01-14 dep EIN585 A320 EIDW Dublin 13:35 48900 49242 false 8e924de6d64f2710 Shamrock five eight five
+LEMG 2026-01-14 arr SWR437 A320 LSZH Zurich 12:40 45600 45900 false 558abbadcd44af57 Swiss four three seven
+LEMG 2026-01-14 dep SWR438 A320 LSZH Zurich 13:25 48300 48300 false 558abbadcd44af57 Swiss four three eight
+LEMG 2026-01-14 arr RYR7064 B738 EIDW Dublin 12:55 46500 46692 false dfaa9598fb26a3c9 Ryanair seven zero six four
+LEMG 2026-01-14 dep RYR7065 B738 EIDW Dublin 13:45 49500 49651 false dfaa9598fb26a3c9 Ryanair seven zero six five
+LEMG 2026-01-14 arr RYR3563 B738 EBCI Brussels Charleroi 13:00 46800 46957 false addaa7e0052f582c Ryanair three five six three
+LEMG 2026-01-14 dep RYR3564 B738 EBCI Brussels Charleroi 13:55 50100 50320 false addaa7e0052f582c Ryanair three five six four
+LEMG 2026-01-14 arr VLG2209 A320 LEBL Barcelona 13:05 47100 47168 false 1e168dfe054881bb Vueling two two zero niner
+LEMG 2026-01-14 dep VLG2210 A320 LEBL Barcelona 13:55 50100 51044 false 1e168dfe054881bb Vueling two two one zero
+LEMG 2026-01-14 arr RYR6081 B738 LOWW Vienna 13:05 47100 47416 false 011e400bf708e409 Ryanair six zero eight one
+LEMG 2026-01-14 dep RYR6082 B738 LOWW Vienna 14:00 50400 50666 false 011e400bf708e409 Ryanair six zero eight two
+LEMG 2026-01-14 arr EWG7520 A320 EDDH Hamburg 13:15 47700 47471 false 73990974695a6e07 Eurowings seven five two zero
+LEMG 2026-01-14 dep EWG7521 A320 EDDH Hamburg 14:10 51000 51000 false 73990974695a6e07 Eurowings seven five two one
+LEMG 2026-01-14 arr RYR4361 B738 LKPR Prague 13:15 47700 47584 false 41815bffc67420fb Ryanair four three six one
+LEMG 2026-01-14 dep RYR4362 B738 LKPR Prague 14:00 50400 52962 false 41815bffc67420fb Ryanair four three six two
+LEMG 2026-01-14 arr QTR52 B788 OTHH Doha 13:15 47700 47855 false a973a82abd95c427 Qatari five two
+LEMG 2026-01-14 dep QTR53 B788 OTHH Doha 14:55 53700 54888 false a973a82abd95c427 Qatari five three
+LEMG 2026-01-14 arr BEL3713 A320 EBBR Brussels 13:25 48300 48298 false 41021642bb1ff30a Bee-line three seven one three
+LEMG 2026-01-14 dep BEL3714 A320 EBBR Brussels 14:05 50700 50700 false 41021642bb1ff30a Bee-line three seven one four
+LEMG 2026-01-14 arr DLH1150 A320 EDDF Frankfurt 13:30 48600 48648 false 1face348109bcdc4 Lufthansa one one five zero
+LEMG 2026-01-14 dep DLH1151 A320 EDDF Frankfurt 14:10 51000 51063 false 1face348109bcdc4 Lufthansa one one five one
+LEMG 2026-01-14 arr VLG8812 A319 EGKK London Gatwick 13:35 48900 48687 false b604c34fae728387 Vueling eight eight one two
+LEMG 2026-01-14 dep VLG8813 A319 EGKK London Gatwick 14:25 51900 52237 false b604c34fae728387 Vueling eight eight one three
+LEMG 2026-01-14 arr SAS4651 A21N ENGM Oslo 13:40 49200 49028 false 9d6b923f3c3e76a1 Scandinavian four six five one
+LEMG 2026-01-14 dep SAS4652 A21N ENGM Oslo 14:25 51900 51900 false 9d6b923f3c3e76a1 Scandinavian four six five two
+LEMG 2026-01-14 arr RYR9437 B738 GMME Rabat 13:40 49200 49047 false 1573640748440a93 Ryanair niner four three seven
+LEMG 2026-01-14 dep RYR9438 B738 GMME Rabat 14:20 51600 51600 false 1573640748440a93 Ryanair niner four three eight
+LEMG 2026-01-14 arr RYR9457 B738 GMTT Tangier 13:40 49200 49392 false 40be6eac8f431441 Ryanair niner four five seven
+LEMG 2026-01-14 dep RYR9458 B738 GMTT Tangier 14:30 52200 56165 false 40be6eac8f431441 Ryanair niner four five eight
+LEMG 2026-01-14 arr EZY8063 A21N EGKK London Gatwick 13:40 49200 49466 false 278c893799a1451a Easy eight zero six three
+LEMG 2026-01-14 dep EZY8064 A21N EGKK London Gatwick 14:35 52500 52839 false 278c893799a1451a Easy eight zero six four
+LEMG 2026-01-14 arr EXS729 B738 EGNM Leeds Bradford 13:45 49500 49754 false ff72e2ba04fce54b Channex seven two niner
+LEMG 2026-01-14 dep EXS730 B738 EGNM Leeds Bradford 14:30 52200 52209 false ff72e2ba04fce54b Channex seven three zero
+LEMG 2026-01-14 arr WZZ7005 A321 LRCL Cluj 13:35 48900 50142 false f6d92a96b21dc05c Wizz Air seven zero zero five
+LEMG 2026-01-14 dep WZZ7006 A321 LRCL Cluj 14:20 51600 51642 false f6d92a96b21dc05c Wizz Air seven zero zero six
+LEMG 2026-01-14 arr RYR1704 B38M EGCC Manchester 14:00 50400 50642 false f421cd3e614bb871 Ryanair one seven zero four
+LEMG 2026-01-14 dep RYR1705 B38M EGCC Manchester 14:50 53400 54797 false f421cd3e614bb871 Ryanair one seven zero five
+LEMG 2026-01-14 arr TRA6501 B738 EHRD Rotterdam 13:00 46800 50818 false c47733cac96f3a86 Transavia six five zero one
+LEMG 2026-01-14 dep TRA6502 B738 EHRD Rotterdam 13:50 49800 52318 false c47733cac96f3a86 Transavia six five zero two
+LEMG 2026-01-14 arr RYR9377 B738 EIKN Knock 14:10 51000 50931 false b97db1aff02b3f20 Ryanair niner three seven seven
+LEMG 2026-01-14 dep RYR9378 B738 EIKN Knock 14:55 53700 53995 false b97db1aff02b3f20 Ryanair niner three seven eight
+LEMG 2026-01-14 arr SAS1527 A20N ESSA Stockholm 14:05 50700 51050 false 990a238409a9938f Scandinavian one five two seven
+LEMG 2026-01-14 dep SAS1528 A20N ESSA Stockholm 15:00 54000 54205 false 990a238409a9938f Scandinavian one five two eight
+LEMG 2026-01-14 arr NAX5641 B738 EFHK Helsinki 14:15 51300 51074 false d9261e67b6630d22 Nor Shuttle five six four one
+LEMG 2026-01-14 dep NAX5642 B738 EFHK Helsinki 14:55 53700 58244 false d9261e67b6630d22 Nor Shuttle five six four two
+LEMG 2026-01-14 arr EWG9105 A320 EDDV Hannover 14:15 51300 51654 false 0ba0d2ebaf53cacc Eurowings niner one zero five
+LEMG 2026-01-14 dep EWG9106 A320 EDDV Hannover 15:00 54000 54042 false 0ba0d2ebaf53cacc Eurowings niner one zero six
+LEMG 2026-01-14 arr EZY2263 A319 EGGP Liverpool 13:05 47100 52267 false 9570575a91de1e17 Easy two two six three
+LEMG 2026-01-14 dep EZY2264 A319 EGGP Liverpool 14:00 50400 53767 false 9570575a91de1e17 Easy two two six four
+LEMG 2026-01-14 arr VLG8015 A321 LFPO Paris Orly 14:35 52500 52339 false a62084cb7ef1061b Vueling eight zero one five
+LEMG 2026-01-14 dep VLG8016 A321 LFPO Paris Orly 15:15 54900 56149 false a62084cb7ef1061b Vueling eight zero one six
+LEMG 2026-01-14 arr ICE532 B38M BIKF Reykjavik 14:35 52500 52424 false 35232a9d152a2059 Iceair five three two
+LEMG 2026-01-14 dep ICE533 B38M BIKF Reykjavik 15:15 54900 54900 false 35232a9d152a2059 Iceair five three three
+LEMG 2026-01-14 arr ANE8652 AT76 GEML Melilla 14:40 52800 52594 false 06bc6eb7065d2b60 Air Nostrum eight six five two
+LEMG 2026-01-14 dep ANE8653 AT76 GEML Melilla 15:10 54600 54600 false 06bc6eb7065d2b60 Air Nostrum eight six five three
+LEMG 2026-01-14 arr RYR9301 B738 EKAH Aarhus 14:40 52800 52651 false 1768647af90e67c4 Ryanair niner three zero one
+LEMG 2026-01-14 dep RYR9302 B738 EKAH Aarhus 15:25 55500 55500 false 1768647af90e67c4 Ryanair niner three zero two
+LEMG 2026-01-14 arr RYR4417 B738 EGNM Leeds Bradford 14:20 51600 53004 false 485dd97d7a9bab85 Ryanair four four one seven
+LEMG 2026-01-14 dep RYR4418 B738 EGNM Leeds Bradford 15:10 54600 54600 false 485dd97d7a9bab85 Ryanair four four one eight
+LEMG 2026-01-14 arr RYR7068 B738 EIDW Dublin 14:40 52800 53107 false dd2adba4e2e54300 Ryanair seven zero six eight
+LEMG 2026-01-14 dep RYR7069 B738 EIDW Dublin 15:35 56100 56100 false dd2adba4e2e54300 Ryanair seven zero six niner
+LEMG 2026-01-14 arr EZY6129 A320 EGGD Bristol 14:45 53100 53389 false 74890547c9d994ea Easy six one two niner
+LEMG 2026-01-14 dep EZY6130 A320 EGGD Bristol 15:25 55500 55815 false 74890547c9d994ea Easy six one three zero
+LEMG 2026-01-14 arr TAP1361 A320 LPPT Lisbon 14:55 53700 53742 false 481248f0523807ec Air Portugal one three six one
+LEMG 2026-01-14 dep TAP1362 A320 LPPT Lisbon 15:40 56400 56462 false 481248f0523807ec Air Portugal one three six two
+LEMG 2026-01-14 arr VLG1473 A320 LEBB Bilbao 14:50 53400 53752 false ecd3113595385b8d Vueling one four seven three
+LEMG 2026-01-14 dep VLG1474 A320 LEBB Bilbao 15:30 55800 56035 false ecd3113595385b8d Vueling one four seven four
+LEMG 2026-01-14 arr LOT431 B38M EPWA Warsaw 15:00 54000 54164 false f85fb25832b14a0d LOT four three one
+LEMG 2026-01-14 dep LOT432 B38M EPWA Warsaw 15:45 56700 56738 false f85fb25832b14a0d LOT four three two
+LEMG 2026-01-14 arr RYR7671 B738 GCRR Lanzarote 15:10 54600 54576 false cac41726bf50b0f3 Ryanair seven six seven one
+LEMG 2026-01-14 dep RYR7672 B738 GCRR Lanzarote 16:00 57600 58777 false cac41726bf50b0f3 Ryanair seven six seven two
+LEMG 2026-01-14 arr AFR1314 A321 LFPG Paris Charles de Gaulle 15:10 54600 54914 false 50d2419777dcbadf Air France one three one four
+LEMG 2026-01-14 dep AFR1315 A321 LFPG Paris Charles de Gaulle 15:55 57300 57466 false 50d2419777dcbadf Air France one three one five
+LEMG 2026-01-14 arr WZZ7009 A321 EPGD Gdansk 15:25 55500 55418 false 38383537851ad59e Wizz Air seven zero zero niner
+LEMG 2026-01-14 dep WZZ7010 A321 EPGD Gdansk 16:10 58200 58420 false 38383537851ad59e Wizz Air seven zero one zero
+LEMG 2026-01-14 arr RYR8173 B738 EGSS London Stansted 15:15 54900 56032 false b75fa9dcc2d5969f Ryanair eight one seven three
+LEMG 2026-01-14 dep RYR8174 B738 EGSS London Stansted 16:05 57900 58213 false b75fa9dcc2d5969f Ryanair eight one seven four
+LEMG 2026-01-14 arr RYR9349 B738 EPGD Gdansk 15:30 55800 56108 false 644ca401617c686a Ryanair niner three four niner
+LEMG 2026-01-14 dep RYR9350 B738 EPGD Gdansk 16:20 58800 58800 false 644ca401617c686a Ryanair niner three five zero
+LEMG 2026-01-14 arr IBE3702 A20N LEMD Madrid 15:40 56400 57436 false d99f39e5186220ee Iberia three seven zero two
+LEMG 2026-01-14 dep IBE3703 A20N LEMD Madrid 16:25 59100 59100 false d99f39e5186220ee Iberia three seven zero three
+LEMG 2026-01-14 arr ANE8870 CRJ9 LEVC Valencia 16:00 57600 57564 false 45da772abf942cbd Air Nostrum eight eight seven zero
+LEMG 2026-01-14 dep ANE8871 CRJ9 LEVC Valencia 16:45 60300 60419 false 45da772abf942cbd Air Nostrum eight eight seven one
+LEMG 2026-01-14 arr VLG2205 A320 LEBL Barcelona 16:05 57900 58140 false 5e8b22bc7bbe4cbe Vueling two two zero five
+LEMG 2026-01-14 dep VLG2206 A320 LEBL Barcelona 16:55 60900 60961 false 5e8b22bc7bbe4cbe Vueling two two zero six
+LEMG 2026-01-14 arr ANE8810 CRJ9 LEMD Madrid 16:25 59100 59303 false 40a420ed3e93626e Air Nostrum eight eight one zero
+LEMG 2026-01-14 dep ANE8811 CRJ9 LEMD Madrid 17:15 62100 62100 false 40a420ed3e93626e Air Nostrum eight eight one one
+LEMG 2026-01-14 arr VLG8411 A321 EHAM Amsterdam 16:30 59400 59758 false cbc9b3204284c8e8 Vueling eight four one one
+LEMG 2026-01-14 dep VLG8412 A321 EHAM Amsterdam 17:25 62700 63042 false cbc9b3204284c8e8 Vueling eight four one two
+LEMG 2026-01-14 arr RYR9397 B738 GMMX Marrakesh 16:35 59700 59859 false 6318573406b4a396 Ryanair niner three niner seven
+LEMG 2026-01-14 dep RYR9398 B738 GMMX Marrakesh 17:25 62700 62700 false 6318573406b4a396 Ryanair niner three niner eight
+LEMG 2026-01-14 arr RYR9305 B38M LIPE Bologna 17:00 61200 61073 false 8e6af72789f37eaf Ryanair niner three zero five
+LEMG 2026-01-14 dep RYR9306 B38M LIPE Bologna 17:45 63900 63900 false 8e6af72789f37eaf Ryanair niner three zero six
+LEMG 2026-01-14 arr BAW2614 A20N EGKK London Gatwick 17:00 61200 61539 false 6cf911100d7ceece Speedbird two six one four
+LEMG 2026-01-14 dep BAW2615 A20N EGKK London Gatwick 17:50 64200 64320 false 6cf911100d7ceece Speedbird two six one five
+LEMG 2026-01-14 arr KLM1045 B739 EHAM Amsterdam 17:10 61800 61695 false b30dd5a3ff1fe0b7 KLM one zero four five
+LEMG 2026-01-14 dep KLM1046 B739 EHAM Amsterdam 17:55 64500 64500 false b30dd5a3ff1fe0b7 KLM one zero four six
+LEMG 2026-01-14 arr TRA5093 B738 EHAM Amsterdam 17:15 62100 62874 false 8848f90ddfd3c2e4 Transavia five zero niner three
+LEMG 2026-01-14 dep TRA5094 B738 EHAM Amsterdam 18:10 65400 65729 false 8848f90ddfd3c2e4 Transavia five zero niner four
+LEMG 2026-01-14 arr TRA5221 B738 EBBR Brussels 17:40 63600 63908 false af398d5a15c1a472 Transavia five two two one
+LEMG 2026-01-14 dep TRA5222 B738 EBBR Brussels 18:30 66600 66600 false af398d5a15c1a472 Transavia five two two two
+LEMG 2026-01-14 arr ANE8654 AT76 GEML Melilla 17:45 63900 63941 false 29efa349ab757868 Air Nostrum eight six five four
+LEMG 2026-01-14 dep ANE8655 AT76 GEML Melilla 18:15 65700 65700 false 29efa349ab757868 Air Nostrum eight six five five
+LEMG 2026-01-14 arr VLG2211 A20N LEBL Barcelona 17:50 64200 64434 false a3323e7ac933ac10 Vueling two two one one
+LEMG 2026-01-14 dep VLG2212 A20N LEBL Barcelona 18:35 66900 67169 false a3323e7ac933ac10 Vueling two two one two
+LEMG 2026-01-14 arr VLG3023 A321 GCLP Gran Canaria 17:50 64200 64483 false 5130a1efddb8734a Vueling three zero two three
+LEMG 2026-01-14 dep VLG3024 A321 GCLP Gran Canaria 18:45 67500 67500 false 5130a1efddb8734a Vueling three zero two four
+LEMG 2026-01-14 arr WZZ1347 A21N LIMC Milan Malpensa 17:55 64500 64748 false 9280b3a8cc3591d6 Wizz Air one three four seven
+LEMG 2026-01-14 dep WZZ1348 A21N LIMC Milan Malpensa 18:35 66900 66900 false 9280b3a8cc3591d6 Wizz Air one three four eight
+LEMG 2026-01-14 arr VLG3063 A320 GCXO Tenerife North 17:50 64200 64916 false ff4fa0ca42aeebe0 Vueling three zero six three
+LEMG 2026-01-14 dep VLG3064 A320 GCXO Tenerife North 18:30 66600 67999 false ff4fa0ca42aeebe0 Vueling three zero six four
+LEMG 2026-01-14 arr TRA6114 A21N LFPO Paris Orly 17:40 63600 65157 false 0ea622bdf4687acd Transavia six one one four
+LEMG 2026-01-14 dep TRA6115 A21N LFPO Paris Orly 18:35 66900 67111 false 0ea622bdf4687acd Transavia six one one five
+LEMG 2026-01-14 arr RYR9313 B38M LZIB Bratislava 18:05 65100 65253 false 0da7a24520f9f55c Ryanair niner three one three
+LEMG 2026-01-14 dep RYR9314 B38M LZIB Bratislava 18:55 68100 68137 false 0da7a24520f9f55c Ryanair niner three one four
+LEMG 2026-01-14 arr RYR9497 B738 EHAM Amsterdam 18:20 66000 66055 false b7df1df3d7d250f3 Ryanair niner four niner seven
+LEMG 2026-01-14 dep RYR9498 B738 EHAM Amsterdam 19:10 69000 69261 false b7df1df3d7d250f3 Ryanair niner four niner eight
+LEMG 2026-01-14 arr EZY2043 A320 EGGW London Luton 18:50 67800 67649 false cbabe543c65bf572 Easy two zero four three
+LEMG 2026-01-14 dep EZY2044 A320 EGGW London Luton 19:40 70800 70800 false cbabe543c65bf572 Easy two zero four four
+LEMG 2026-01-14 arr RYR9409 B38M EDDG Munster 19:15 69300 69382 false cca248815b158e6a Ryanair niner four zero niner
+LEMG 2026-01-14 dep RYR9410 B38M EDDG Munster 20:10 72600 73962 false cca248815b158e6a Ryanair niner four one zero
+LEMG 2026-01-14 arr EZY5145 A319 LFSB Basel 19:10 69000 70180 false e284459237f33c31 Easy five one four five
+LEMG 2026-01-14 dep EZY5146 A319 LFSB Basel 19:55 71700 72876 false e284459237f33c31 Easy five one four six
+LEMG 2026-01-14 arr AEA1043 B738 LEMD Madrid 19:20 69600 70769 false 2feff082eefafcc1 Air Europa one zero four three
+LEMG 2026-01-14 dep AEA1044 B738 LEMD Madrid 20:05 72300 72300 false 2feff082eefafcc1 Air Europa one zero four four
+LEMG 2026-01-14 arr RYR9333 B738 EDDK Cologne 19:35 70500 71511 false e28f3ddb17ca26fc Ryanair niner three three three
+LEMG 2026-01-14 dep RYR9334 B738 EDDK Cologne 20:20 73200 73200 false e28f3ddb17ca26fc Ryanair niner three three four
+LEMG 2026-01-14 arr ITY1286 A20N LIRF Rome 19:35 70500 71902 false e10c9f0427c184c3 Itarrow one two eight six
+LEMG 2026-01-14 dep ITY1287 A20N LIRF Rome 20:20 73200 73402 false e10c9f0427c184c3 Itarrow one two eight seven
+LEMG 2026-01-14 arr WZZ6201 A321 LIRF Rome 19:40 70800 72097 false 17338748e34a9008 Wizz Air six two zero one
+LEMG 2026-01-14 dep WZZ6202 A321 LIRF Rome 20:35 74100 74100 false 17338748e34a9008 Wizz Air six two zero two
+LEMG 2026-01-14 arr RYR9441 B738 EVRA Riga 20:05 72300 72360 false f1c91686f1ac145a Ryanair niner four four one
+LEMG 2026-01-14 dep RYR9442 B738 EVRA Riga 20:50 75000 75000 false f1c91686f1ac145a Ryanair niner four four two
+LEMG 2026-01-14 arr RYR9469 B738 LIPH Treviso 20:15 72900 73112 false 7d7e34bb1ac01e53 Ryanair niner four six niner
+LEMG 2026-01-14 dep RYR9470 B738 LIPH Treviso 21:05 75900 76241 false 7d7e34bb1ac01e53 Ryanair niner four seven zero
+LEMG 2026-01-14 arr EZY1503 A319 LSZH Zurich 19:15 69300 73533 false 2a987f3ca21bafde Easy one five zero three
+LEMG 2026-01-14 dep EZY1504 A319 LSZH Zurich 20:00 72000 75033 false 2a987f3ca21bafde Easy one five zero four
+LEMG 2026-01-14 arr EIN586 A320 EIDW Dublin 20:10 72600 73550 false 719124efa77fdaf5 Shamrock five eight six
+LEMG 2026-01-14 dep EIN587 A320 EIDW Dublin 21:05 75900 77104 false 719124efa77fdaf5 Shamrock five eight seven
+LEMG 2026-01-14 arr BEL3715 A320 EBBR Brussels 20:30 73800 73755 false 104028072a240dd6 Bee-line three seven one five
+LEMG 2026-01-14 dep BEL3716 A320 EBBR Brussels 21:10 76200 76200 false 104028072a240dd6 Bee-line three seven one six
+LEMG 2026-01-14 arr EWG1580 A319 EDDL Dusseldorf 20:30 73800 73954 false fa84a9a6892e469f Eurowings one five eight zero
+LEMG 2026-01-14 dep EWG1581 A319 EDDL Dusseldorf 21:10 76200 76200 false fa84a9a6892e469f Eurowings one five eight one
+LEMG 2026-01-14 arr RYR1149 B738 EPKK Krakow 20:30 73800 73990 false c6eaae74368ab89a Ryanair one one four niner
+LEMG 2026-01-14 dep RYR1150 B738 EPKK Krakow 21:25 77100 77411 false c6eaae74368ab89a Ryanair one one five zero
+LEMG 2026-01-14 arr ANE8656 AT76 GEML Melilla 20:45 74700 74502 false 7be08f1213bb4e88 Air Nostrum eight six five six
+LEMG 2026-01-14 dep ANE8657 AT76 GEML Melilla 21:20 76800 76872 false 7be08f1213bb4e88 Air Nostrum eight six five seven
+LEMG 2026-01-14 arr EZY2265 A20N EGGP Liverpool 20:30 73800 74514 false 98b96a1056587e91 Easy two two six five
+LEMG 2026-01-14 dep EZY2266 A20N EGGP Liverpool 21:15 76500 76543 false 98b96a1056587e91 Easy two two six six
+LEMG 2026-01-14 arr DLH1152 A320 EDDF Frankfurt 20:50 75000 75028 false 45e7f6fa34becdf9 Lufthansa one one five two
+LEMG 2026-01-14 dep DLH1153 A320 EDDF Frankfurt 21:35 77700 77700 false 45e7f6fa34becdf9 Lufthansa one one five three
+LEMG 2026-01-14 arr EXS675 B738 EGSS London Stansted 20:50 75000 76690 false 76a22afb48fa177f Channex six seven five
+LEMG 2026-01-14 dep EXS676 B738 EGSS London Stansted 21:30 77400 78190 false 76a22afb48fa177f Channex six seven six
+LEMG 2026-01-14 arr AUA157 A321 LOWW Vienna 21:25 77100 77045 false 6bdf68805b3a2deb Austrian one five seven
+LEMG 2026-01-14 dep AUA158 A321 LOWW Vienna 22:15 80100 80169 false 6bdf68805b3a2deb Austrian one five eight
+LEMG 2026-01-14 arr RYR9401 B38M LFML Marseille 21:40 78000 77936 false 8b90c813f1ca4828 Ryanair niner four zero one
+LEMG 2026-01-14 dep RYR9402 B38M LFML Marseille 22:20 80400 80534 false 8b90c813f1ca4828 Ryanair niner four zero two
+LEMG 2026-01-14 arr EZY7117 A20N GMMX Marrakesh 21:55 78900 79128 false c14223ac0fe765ad Easy seven one one seven
+LEMG 2026-01-14 dep EZY7118 A20N GMMX Marrakesh 22:35 81300 81537 false c14223ac0fe765ad Easy seven one one eight
+LEMG 2026-01-14 arr NAX1585 B738 ENGM Oslo 22:05 79500 79319 false 19c340b9d2edfea2 Nor Shuttle one five eight five
+LEMG 2026-01-14 dep NAX1586 B738 ENGM Oslo 22:55 82500 82637 false 19c340b9d2edfea2 Nor Shuttle one five eight six
+LEMG 2026-01-14 arr RYR9489 B738 EKCH Copenhagen 22:15 80100 79898 false dd304e7d9284539f Ryanair niner four eight niner
+LEMG 2026-01-14 dep RYR9490 B738 EKCH Copenhagen 23:05 83100 83100 false dd304e7d9284539f Ryanair niner four niner zero
+LEMG 2026-01-14 arr NAX3731 B38M ESGG Gothenburg 21:00 75600 80034 false 4f607343fddc724b Nor Shuttle three seven three one
+LEMG 2026-01-14 dep NAX3732 B38M ESGG Gothenburg 21:55 78900 81534 false 4f607343fddc724b Nor Shuttle three seven three two
+LEMG 2026-01-14 arr RYR9429 B38M LPPR Porto 22:15 80100 80337 false beb3d06ae37337e9 Ryanair niner four two niner
+LEMG 2026-01-14 dep RYR9430 B38M LPPR Porto 23:05 83100 83839 false beb3d06ae37337e9 Ryanair niner four three zero
+LEMG 2026-01-14 arr TAP1363 A320 LPPT Lisbon 22:50 82200 82151 false 6e7acfc71ad88a24 Air Portugal one three six three
+LEMG 2026-01-14 dep TAP1364 A320 LPPT Lisbon 23:35 84900 89213 false 6e7acfc71ad88a24 Air Portugal one three six four
+LEMG 2026-01-14 arr IBE3704 A320 LEMD Madrid 23:25 84300 85536 false 8cdd11875fee704c Iberia three seven zero four
+LEMG 2026-01-14 dep IBE3705 A320 LEMD Madrid 00:10 87000 87036 false 8cdd11875fee704c Iberia three seven zero five
+LEMG 2026-01-14 arr NAX6101 B38M EKYT Aalborg 23:20 84000 85750 false 37394a8f10a21f0b Nor Shuttle six one zero one
+LEMG 2026-01-14 dep NAX6102 B38M EKYT Aalborg 00:10 87000 87250 false 37394a8f10a21f0b Nor Shuttle six one zero two
+LEMG 2026-01-14 arr EZY2861 A320 LIMC Milan Malpensa 23:25 84300 86032 false de255be8f55dfb3c Easy two eight six one
+LEMG 2026-01-14 dep EZY2862 A320 LIMC Milan Malpensa 00:10 87000 87532 false de255be8f55dfb3c Easy two eight six two
+EGKK 2026-07-15 arr EZY8902 A319 LXGB Gibraltar 15:00 -118800 -118775 true f49ff0482b9cfc19 Easy eight niner zero two
+EGKK 2026-07-15 dep EZY8901 A319 LXGB Gibraltar 08:10 29400 29295 true f49ff0482b9cfc19 Easy eight niner zero one
+EGKK 2026-07-15 arr EXS618 A21N LEMG Malaga 13:00 -39600 -39599 true d2657306010440af Channex six one eight
+EGKK 2026-07-15 dep EXS617 A21N LEMG Malaga 06:55 24900 25109 true d2657306010440af Channex six one seven
+EGKK 2026-07-15 arr WZZ4472 A21N LEMG Malaga 13:45 -36900 -36899 true db30aca07cfe84dd Wizz Air four four seven two
+EGKK 2026-07-15 dep WZZ4471 A21N LEMG Malaga 07:35 27300 27233 true db30aca07cfe84dd Wizz Air four four seven one
+EGKK 2026-07-15 arr BAW2333 A320 LGIR Heraklion 14:50 -33000 -32995 true a46cc5d1c8c39fed Speedbird two three three three
+EGKK 2026-07-15 dep BAW2334 A320 LGIR Heraklion 06:05 21900 23422 true a46cc5d1c8c39fed Speedbird two three three four
+EGKK 2026-07-15 arr EZY8607 A21N LGRP Rhodes 15:00 -32400 -32461 true 22d666ffad7df2e4 Easy eight six zero seven
+EGKK 2026-07-15 dep EZY8608 A21N LGRP Rhodes 06:05 21900 21900 true 22d666ffad7df2e4 Easy eight six zero eight
+EGKK 2026-07-15 arr EZY8591 A20N LGIR Heraklion 15:00 -32400 -32424 true c977ce2cd64a93c7 Easy eight five niner one
+EGKK 2026-07-15 dep EZY8592 A20N LGIR Heraklion 06:15 22500 22500 true c977ce2cd64a93c7 Easy eight five niner two
+EGKK 2026-07-15 arr EZY8902 A20N LXGB Gibraltar 14:50 -33000 -31938 true 3a65ef3bcab3cfff Easy eight niner zero two
+EGKK 2026-07-15 dep EZY8903 A20N LXGB Gibraltar 14:10 51000 50840 true 3a65ef3bcab3cfff Easy eight niner zero three
+EGKK 2026-07-15 arr TOM699 B738 GCRR Lanzarote 15:10 -31800 -31582 true fcc300209278ec34 Tomjet six niner niner
+EGKK 2026-07-15 dep TOM700 B738 GCRR Lanzarote 06:20 22800 22929 true fcc300209278ec34 Tomjet seven zero zero
+EGKK 2026-07-15 arr TOM711 B738 LTBS Dalaman 15:30 -30600 -30578 true 848584bad0339d69 Tomjet seven one one
+EGKK 2026-07-15 dep TOM712 B738 LTBS Dalaman 06:30 23400 23634 true 848584bad0339d69 Tomjet seven one two
+EGKK 2026-07-15 arr EZY8439 A319 LGAV Athens 15:35 -30300 -30472 true 8ff76b031d4c060f Easy eight four three niner
+EGKK 2026-07-15 dep EZY8440 A319 LGAV Athens 07:35 27300 27575 true 8ff76b031d4c060f Easy eight four four zero
+EGKK 2026-07-15 arr EXS691 B738 LTAI Antalya 15:30 -30600 -30449 true 7bb710698ec2b3f7 Channex six niner one
+EGKK 2026-07-15 dep EXS692 B738 LTAI Antalya 06:15 22500 22500 true 7bb710698ec2b3f7 Channex six niner two
+EGKK 2026-07-15 arr EXS737 B738 LGRP Rhodes 15:35 -30300 -30342 true ba8bccf8718d1cb4 Channex seven three seven
+EGKK 2026-07-15 dep EXS738 B738 LGRP Rhodes 06:40 24000 24000 true ba8bccf8718d1cb4 Channex seven three eight
+EGKK 2026-07-15 arr TOM745 B788 LGRP Rhodes 15:30 -30600 -29857 true f3989f37b9d697fd Tomjet seven four five
+EGKK 2026-07-15 dep TOM746 B788 LGRP Rhodes 06:30 23400 23548 true f3989f37b9d697fd Tomjet seven four six
+EGKK 2026-07-15 arr BAW2239 A320 LTAI Antalya 15:45 -29700 -29791 true 695750658dc32d54 Speedbird two two three niner
+EGKK 2026-07-15 dep BAW2240 A320 LTAI Antalya 06:30 23400 25012 true 695750658dc32d54 Speedbird two two four zero
+EGKK 2026-07-15 arr BAW2245 B772 GMMX Marrakesh 15:45 -29700 -29598 true 5acfa9af64c5273b Speedbird two two four five
+EGKK 2026-07-15 dep BAW2246 B772 GMMX Marrakesh 08:05 29100 29100 true 5acfa9af64c5273b Speedbird two two four six
+EGKK 2026-07-15 arr EXS707 B738 GCRR Lanzarote 16:00 -28800 -28801 true 6ad8e546946c5c80 Channex seven zero seven
+EGKK 2026-07-15 dep EXS708 B738 GCRR Lanzarote 07:10 25800 25833 true 6ad8e546946c5c80 Channex seven zero eight
+EGKK 2026-07-15 arr VLG8813 A320 LEMG Malaga 16:05 -28500 -28433 true 9d2ea0d7b1cd9c79 Vueling eight eight one three
+EGKK 2026-07-15 dep VLG8812 A320 LEMG Malaga 09:55 35700 35736 true 9d2ea0d7b1cd9c79 Vueling eight eight one two
+EGKK 2026-07-15 arr EZY8523 A21N LTBS Dalaman 15:55 -29100 -28254 true 36569cdf2bda6b21 Easy eight five two three
+EGKK 2026-07-15 dep EZY8524 A21N LTBS Dalaman 06:55 24900 26174 true 36569cdf2bda6b21 Easy eight five two four
+EGKK 2026-07-15 arr EZY8064 A320 LEMG Malaga 16:05 -28500 -27806 true 463ddd2db5579ec8 Easy eight zero six four
+EGKK 2026-07-15 dep EZY8061 A320 LEMG Malaga 16:55 -25500 -25289 true 463ddd2db5579ec8 Easy eight zero six one
+EGKK 2026-07-15 arr EZY8507 A20N LCLK Larnaca 16:15 -27900 -27645 true 8f201fa0246821d3 Easy eight five zero seven
+EGKK 2026-07-15 dep EZY8508 A20N LCLK Larnaca 06:05 21900 22244 true 8f201fa0246821d3 Easy eight five zero eight
+EGKK 2026-07-15 arr EZY8281 A320 GCTS Tenerife South 16:20 -27600 -27459 true ee4c0adc4813847e Easy eight two eight one
+EGKK 2026-07-15 dep EZY8282 A320 GCTS Tenerife South 07:05 25500 26100 true ee4c0adc4813847e Easy eight two eight two
+EGKK 2026-07-15 arr EZY8475 A20N GCRR Lanzarote 16:10 -28200 -27422 true 250e417971826c34 Easy eight four seven five
+EGKK 2026-07-15 dep EZY8476 A20N GCRR Lanzarote 07:20 26400 26651 true 250e417971826c34 Easy eight four seven six
+EGKK 2026-07-15 arr EZY8557 A320 LCPH Paphos 16:25 -27300 -27304 true 21b90236f4576932 Easy eight five five seven
+EGKK 2026-07-15 dep EZY8558 A320 LCPH Paphos 06:25 23100 23100 true 21b90236f4576932 Easy eight five five eight
+EGKK 2026-07-15 arr EXS713 A21N LCPH Paphos 16:30 -27000 -27200 true cb97d946d2272b92 Channex seven one three
+EGKK 2026-07-15 dep EXS714 A21N LCPH Paphos 06:30 23400 23400 true cb97d946d2272b92 Channex seven one four
+EGKK 2026-07-15 arr EZY8575 A21N LGKR Corfu 16:30 -27000 -27115 true 8f9053e6ba624f81 Easy eight five seven five
+EGKK 2026-07-15 dep EZY8576 A21N LGKR Corfu 09:25 33900 34108 true 8f9053e6ba624f81 Easy eight five seven six
+EGKK 2026-07-15 arr BAW2327 A320 LGKR Corfu 16:20 -27600 -26834 true 9f2cb9117f7e6117 Speedbird two three two seven
+EGKK 2026-07-15 dep BAW2328 A320 LGKR Corfu 09:15 33300 33300 true 9f2cb9117f7e6117 Speedbird two three two eight
+EGKK 2026-07-15 arr EXS729 A321 LGIR Heraklion 16:35 -26700 -26509 true be1a567276bacada Channex seven two niner
+EGKK 2026-07-15 dep EXS730 A321 LGIR Heraklion 07:50 28200 28261 true be1a567276bacada Channex seven three zero
+EGKK 2026-07-15 arr BAW2307 A320 LTBS Dalaman 16:40 -26400 -26475 true 56dd586972e9e751 Speedbird two three zero seven
+EGKK 2026-07-15 dep BAW2308 A320 LTBS Dalaman 07:40 27600 28922 true 56dd586972e9e751 Speedbird two three zero eight
+EGKK 2026-07-15 arr EZY8371 A21N LMML Malta 16:20 -27600 -26411 true 49c6b5fea92ed8c0 Easy eight three seven one
+EGKK 2026-07-15 dep EZY8372 A21N LMML Malta 09:10 33000 33188 true 49c6b5fea92ed8c0 Easy eight three seven two
+EGKK 2026-07-15 arr EZY8593 A320 LGIR Heraklion 16:45 -26100 -26309 true e16b9b5ea1d27b84 Easy eight five niner three
+EGKK 2026-07-15 dep EZY8594 A320 LGIR Heraklion 08:00 28800 29626 true e16b9b5ea1d27b84 Easy eight five niner four
+EGKK 2026-07-15 arr EZY8297 A320 LTAI Antalya 16:45 -26100 -26236 true f547e7e09d4709b4 Easy eight two niner seven
+EGKK 2026-07-15 dep EZY8298 A320 LTAI Antalya 07:30 27000 27300 true f547e7e09d4709b4 Easy eight two niner eight
+EGKK 2026-07-15 arr EZY8609 A319 LGRP Rhodes 16:45 -26100 -25891 true 7423bd838d308ec8 Easy eight six zero niner
+EGKK 2026-07-15 dep EZY8610 A319 LGRP Rhodes 07:50 28200 28391 true 7423bd838d308ec8 Easy eight six one zero
+EGKK 2026-07-15 arr BAW2253 A20N LMML Malta 16:40 -26400 -25753 true 9e394704e0c2968f Speedbird two two five three
+EGKK 2026-07-15 dep BAW2254 A20N LMML Malta 09:25 33900 33926 true 9e394704e0c2968f Speedbird two two five four
+EGKK 2026-07-15 arr EXS721 A21N LGKR Corfu 16:05 -28500 -25449 true afadec631d9c3123 Channex seven two one
+EGKK 2026-07-15 dep EXS722 A21N LGKR Corfu 09:00 32400 34832 true afadec631d9c3123 Channex seven two two
+EGKK 2026-07-15 arr EXS693 B738 LTAI Antalya 17:15 -24300 -24232 true fb9df4af11e8c56f Channex six niner three
+EGKK 2026-07-15 dep EXS694 B738 LTAI Antalya 08:00 28800 29105 true fb9df4af11e8c56f Channex six niner four
+EGKK 2026-07-15 arr EZY8441 A20N LGAV Athens 17:20 -24000 -24138 true 23226469b565b781 Easy eight four four one
+EGKK 2026-07-15 dep EZY8442 A20N LGAV Athens 09:20 33600 33600 true 23226469b565b781 Easy eight four four two
+EGKK 2026-07-15 arr TOM737 B738 LGIR Heraklion 17:25 -23700 -23548 true cbc7e5a47b420c7d Tomjet seven three seven
+EGKK 2026-07-15 dep TOM738 B738 LGIR Heraklion 08:45 31500 32930 true cbc7e5a47b420c7d Tomjet seven three eight
+EGKK 2026-07-15 arr EZY8525 A21N LTBS Dalaman 17:40 -22800 -22888 true 3dadd41cb9dd0b25 Easy eight five two five
+EGKK 2026-07-15 dep EZY8526 A21N LTBS Dalaman 08:40 31200 31481 true 3dadd41cb9dd0b25 Easy eight five two six
+EGKK 2026-07-15 arr EZY8257 A20N LEPA Palma de Mallorca 17:45 -22500 -22711 true 6ab38a7296ab3dee Easy eight two five seven
+EGKK 2026-07-15 dep EZY8258 A20N LEPA Palma de Mallorca 06:20 22800 22931 true 6ab38a7296ab3dee Easy eight two five eight
+EGKK 2026-07-15 arr TOM679 B38M LTAI Antalya 17:45 -22500 -22505 true bcb01765ec804da4 Tomjet six seven niner
+EGKK 2026-07-15 dep TOM680 B38M LTAI Antalya 08:30 30600 31712 true bcb01765ec804da4 Tomjet six eight zero
+EGKK 2026-07-15 arr EZY8509 A20N LCLK Larnaca 18:00 -21600 -21472 true 8766832f1fda9adc Easy eight five zero niner
+EGKK 2026-07-15 dep EZY8510 A20N LCLK Larnaca 07:50 28200 28200 true 8766832f1fda9adc Easy eight five one zero
+EGKK 2026-07-15 arr EZY8068 A20N LEMG Malaga 18:00 -21600 -21284 true a98f532eb6eda3c0 Easy eight zero six eight
+EGKK 2026-07-15 dep EZY8065 A20N LEMG Malaga 18:40 -19200 -18299 true a98f532eb6eda3c0 Easy eight zero six five
+EGKK 2026-07-15 arr BAW2231 A320 GCTS Tenerife South 18:10 -21000 -21018 true 6ffb0c1acfdd274e Speedbird two two three one
+EGKK 2026-07-15 dep BAW2232 A320 GCTS Tenerife South 08:50 31800 31822 true 6ffb0c1acfdd274e Speedbird two two three two
+EGKK 2026-07-15 arr EZY8129 A320 LEAL Alicante 18:05 -21300 -20970 true 3981602bd326f1e7 Easy eight one two niner
+EGKK 2026-07-15 dep EZY8130 A320 LEAL Alicante 06:05 21900 21992 true 3981602bd326f1e7 Easy eight one three zero
+EGKK 2026-07-15 arr EZY8283 A320 GCTS Tenerife South 18:05 -21300 -20957 true cf33830bc21fc8d7 Easy eight two eight three
+EGKK 2026-07-15 dep EZY8284 A320 GCTS Tenerife South 08:50 31800 32866 true cf33830bc21fc8d7 Easy eight two eight four
+EGKK 2026-07-15 arr BAW2291 A320 LPPR Porto 18:15 -20700 -20790 true 83340f58d300c70f Speedbird two two niner one
+EGKK 2026-07-15 dep BAW2292 A320 LPPR Porto 07:00 25200 25361 true 83340f58d300c70f Speedbird two two niner two
+EGKK 2026-07-15 arr EZY8559 A320 LCPH Paphos 18:10 -21000 -19858 true 63c4993d2b505da2 Easy eight five five niner
+EGKK 2026-07-15 dep EZY8560 A320 LCPH Paphos 08:10 29400 29400 true 63c4993d2b505da2 Easy eight five six zero
+EGKK 2026-07-15 arr TOM671 B38M GCTS Tenerife South 17:25 -23700 -19852 true 30881e02d0cd573b Tomjet six seven one
+EGKK 2026-07-15 dep TOM672 B38M GCTS Tenerife South 08:10 29400 31227 true 30881e02d0cd573b Tomjet six seven two
+EGKK 2026-07-15 arr EXS683 B738 GCTS Tenerife South 18:35 -19500 -19352 true c049d0ee08a9b589 Channex six eight three
+EGKK 2026-07-15 dep EXS684 B738 GCTS Tenerife South 09:20 33600 33600 true c049d0ee08a9b589 Channex six eight four
+EGKK 2026-07-15 arr BAW2201 A320 LEAL Alicante 18:45 -18900 -18681 true 4c5e71bb18c7ccf5 Speedbird two two zero one
+EGKK 2026-07-15 dep BAW2202 A320 LEAL Alicante 06:45 24300 27378 true 4c5e71bb18c7ccf5 Speedbird two two zero two
+EGKK 2026-07-15 arr EZY8109 A320 LEBL Barcelona 18:50 -18600 -18656 true 6903e463920af8d9 Easy eight one zero niner
+EGKK 2026-07-15 dep EZY8110 A320 LEBL Barcelona 08:30 30600 30957 true 6903e463920af8d9 Easy eight one one zero
+EGKK 2026-07-15 arr EZY8309 A320 LEMD Madrid 18:50 -18600 -18510 true 500b026026b0a258 Easy eight three zero niner
+EGKK 2026-07-15 dep EZY8310 A320 LEMD Madrid 07:55 28500 28500 true 500b026026b0a258 Easy eight three one zero
+EGKK 2026-07-15 arr TOM663 B738 LEPA Palma de Mallorca 18:50 -18600 -18326 true aa52dd4e92c3b356 Tomjet six six three
+EGKK 2026-07-15 dep TOM664 B738 LEPA Palma de Mallorca 07:30 27000 27115 true aa52dd4e92c3b356 Tomjet six six four
+EGKK 2026-07-15 arr BAW2299 B77W LCLK Larnaca 19:05 -17700 -17690 true a8e6c1db878ae1c5 Speedbird two two niner niner
+EGKK 2026-07-15 dep BAW2300 B77W LCLK Larnaca 08:55 32100 32350 true a8e6c1db878ae1c5 Speedbird two three zero zero
+EGKK 2026-07-15 arr EXS675 A21N LEPA Palma de Mallorca 19:10 -17400 -17476 true 518b147d7a8d7ef5 Channex six seven five
+EGKK 2026-07-15 dep EXS676 A21N LEPA Palma de Mallorca 07:50 28200 29578 true 518b147d7a8d7ef5 Channex six seven six
+EGKK 2026-07-15 arr EZY8421 A320 LPPT Lisbon 19:10 -17400 -17417 true 3473bfb233525d5e Easy eight four two one
+EGKK 2026-07-15 dep EZY8422 A320 LPPT Lisbon 06:40 24000 24039 true 3473bfb233525d5e Easy eight four two two
+EGKK 2026-07-15 arr TOM651 B738 LEAL Alicante 19:10 -17400 -17284 true deec1e1697c57db3 Tomjet six five one
+EGKK 2026-07-15 dep TOM652 B738 LEAL Alicante 07:15 26100 26126 true deec1e1697c57db3 Tomjet six five two
+EGKK 2026-07-15 arr EZY8151 A320 LIRF Rome Fiumicino 19:15 -17100 -17212 true 803ab487b9d3c711 Easy eight one five one
+EGKK 2026-07-15 dep EZY8152 A320 LIRF Rome Fiumicino 07:25 26700 27007 true 803ab487b9d3c711 Easy eight one five two
+EGKK 2026-07-15 arr VLG8871 A320 LEAL Alicante 19:15 -17100 -16843 true fb7a31a00c03dd90 Vueling eight eight seven one
+EGKK 2026-07-15 dep VLG8872 A320 LEAL Alicante 07:15 26100 26100 true fb7a31a00c03dd90 Vueling eight eight seven two
+EGKK 2026-07-15 arr EZY8261 A20N LEPA Palma de Mallorca 18:55 -18300 -16780 true e10ea18935c02597 Easy eight two six one
+EGKK 2026-07-15 dep EZY8262 A20N LEPA Palma de Mallorca 07:30 27000 27000 true e10ea18935c02597 Easy eight two six two
+EGKK 2026-07-15 arr WZZ4509 A21N LCLK Larnaca 19:25 -16500 -16738 true a69bfc205f4dd7d8 Wizz Air four five zero niner
+EGKK 2026-07-15 dep WZZ4510 A21N LCLK Larnaca 09:15 33300 33377 true a69bfc205f4dd7d8 Wizz Air four five one zero
+EGKK 2026-07-15 arr BAW2617 A20N LEMG Malaga 19:25 -16500 -16499 true a980a59e3be6433e Speedbird two six one seven
+EGKK 2026-07-15 dep BAW2614 A20N LEMG Malaga 06:25 23100 23106 true a980a59e3be6433e Speedbird two six one four
+EGKK 2026-07-15 arr VLG8857 A321 LEBL Barcelona 19:25 -16500 -16395 true 6b643ce707f9c1b7 Vueling eight eight five seven
+EGKK 2026-07-15 dep VLG8858 A321 LEBL Barcelona 09:05 32700 32764 true 6b643ce707f9c1b7 Vueling eight eight five eight
+EGKK 2026-07-15 arr EZY8171 A21N LIRF Rome Fiumicino 19:25 -16500 -16257 true 8fe50e6c21432445 Easy eight one seven one
+EGKK 2026-07-15 dep EZY8172 A21N LIRF Rome Fiumicino 07:35 27300 27300 true 8fe50e6c21432445 Easy eight one seven two
+EGKK 2026-07-15 arr EZY8623 A320 LIRN Naples 19:30 -16200 -16140 true 84b22876d09b1534 Easy eight six two three
+EGKK 2026-07-15 dep EZY8624 A320 LIRN Naples 06:45 24300 24300 true 84b22876d09b1534 Easy eight six two four
+EGKK 2026-07-15 arr BAW2269 A320 LEZL Seville 19:30 -16200 -16138 true c1bef887a917b73a Speedbird two two six niner
+EGKK 2026-07-15 dep BAW2270 A320 LEZL Seville 06:40 24000 25760 true c1bef887a917b73a Speedbird two two seven zero
+EGKK 2026-07-15 arr EZY8183 A319 LPFR Faro 19:55 -14700 -14757 true 72e4b065faf6d0d7 Easy eight one eight three
+EGKK 2026-07-15 dep EZY8184 A319 LPFR Faro 06:40 24000 24000 true 72e4b065faf6d0d7 Easy eight one eight four
+EGKK 2026-07-15 arr EZY8133 A320 LEAL Alicante 19:50 -15000 -14747 true 8f7d50d5993af3af Easy eight one three three
+EGKK 2026-07-15 dep EZY8134 A320 LEAL Alicante 07:50 28200 29025 true 8f7d50d5993af3af Easy eight one three four
+EGKK 2026-07-15 arr EZY8713 A320 EGAA Belfast International 19:35 -15900 -13504 true 727383c0507b2b2a Easy eight seven one three
+EGKK 2026-07-15 dep EZY8714 A320 EGAA Belfast International 07:45 27900 27900 true 727383c0507b2b2a Easy eight seven one four
+EGKK 2026-07-15 arr EXS659 B738 LPFR Faro 20:25 -12900 -12781 true 286ebc8aa2dcb210 Channex six five niner
+EGKK 2026-07-15 dep EXS660 B738 LPFR Faro 07:10 25800 25869 true 286ebc8aa2dcb210 Channex six six zero
+EGKK 2026-07-15 arr EZY8265 A319 LEPA Palma de Mallorca 20:05 -14100 -12424 true 7eb8de192c2fdb9c Easy eight two six five
+EGKK 2026-07-15 dep EZY8266 A319 LEPA Palma de Mallorca 08:40 31200 32142 true 7eb8de192c2fdb9c Easy eight two six six
+EGKK 2026-07-15 arr BAW2223 A320 LEPA Palma de Mallorca 20:40 -12000 -11765 true cc482d7c086e916c Speedbird two two two three
+EGKK 2026-07-15 dep BAW2224 A320 LEPA Palma de Mallorca 09:20 33600 33742 true cc482d7c086e916c Speedbird two two two four
+EGKK 2026-07-15 arr EZY8733 A320 EGAC Belfast City 20:30 -12600 -11273 true f70021ab7c4658c2 Easy eight seven three three
+EGKK 2026-07-15 dep EZY8734 A320 EGAC Belfast City 08:50 31800 31800 true f70021ab7c4658c2 Easy eight seven three four
+EGKK 2026-07-15 arr VLG8879 A320 LEZL Seville 20:50 -11400 -11257 true e79cc7afbe3241e0 Vueling eight eight seven niner
+EGKK 2026-07-15 dep VLG8880 A320 LEZL Seville 08:05 29100 29268 true e79cc7afbe3241e0 Vueling eight eight eight zero
+EGKK 2026-07-15 arr EZY8345 A21N EHAM Amsterdam 20:55 -11100 -10948 true 7ca55e18d6159bc9 Easy eight three four five
+EGKK 2026-07-15 dep EZY8346 A21N EHAM Amsterdam 06:55 24900 26616 true 7ca55e18d6159bc9 Easy eight three four six
+EGKK 2026-07-15 arr BAW2357 B772 EGPF Glasgow 21:10 -10200 -9867 true 7b4d38f56d975cb5 Speedbird two three five seven
+EGKK 2026-07-15 dep BAW2358 B772 EGPF Glasgow 09:10 33000 33861 true 7b4d38f56d975cb5 Speedbird two three five eight
+EGKK 2026-07-15 arr EXS651 A21N LEAL Alicante 21:15 -9900 -9858 true cfec7f3f9be56c95 Channex six five one
+EGKK 2026-07-15 dep EXS652 A21N LEAL Alicante 09:15 33300 38472 true cfec7f3f9be56c95 Channex six five two
+EGKK 2026-07-15 arr WZZ4523 A320 LHBP Budapest 21:15 -9900 -9718 true cbedf2c2bd84cab0 Wizz Air four five two three
+EGKK 2026-07-15 dep WZZ4524 A320 LHBP Budapest 09:10 33000 33000 true cbedf2c2bd84cab0 Wizz Air four five two four
+EGKK 2026-07-15 arr EZY8641 A20N LHBP Budapest 21:00 -10800 -9650 true e448d2e038519999 Easy eight six four one
+EGKK 2026-07-15 dep EZY8642 A20N LHBP Budapest 08:55 32100 32281 true e448d2e038519999 Easy eight six four two
+EGKK 2026-07-15 arr EZY8205 A319 LIMC Milan Malpensa 21:20 -9600 -9562 true 8220af9e0e26a333 Easy eight two zero five
+EGKK 2026-07-15 dep EZY8206 A319 LIMC Milan Malpensa 07:00 25200 25244 true 8220af9e0e26a333 Easy eight two zero six
+EGKK 2026-07-15 arr BAW2217 B77W LSGG Geneva 21:00 -10800 -9557 true e0ac25712fbe3ba0 Speedbird two two one seven
+EGKK 2026-07-15 dep BAW2218 B77W LSGG Geneva 08:05 29100 29103 true e0ac25712fbe3ba0 Speedbird two two one eight
+EGKK 2026-07-15 arr EZY8425 A320 LPPT Lisbon 20:55 -11100 -9550 true 4a839d93daa0fe14 Easy eight four two five
+EGKK 2026-07-15 dep EZY8426 A320 LPPT Lisbon 08:25 30300 30438 true 4a839d93daa0fe14 Easy eight four two six
+EGKK 2026-07-15 arr WZZ4501 A21N LPFR Faro 21:25 -9300 -9339 true a0e001dbc5d6c7a6 Wizz Air four five zero one
+EGKK 2026-07-15 dep WZZ4502 A21N LPFR Faro 08:05 29100 29442 true a0e001dbc5d6c7a6 Wizz Air four five zero two
+EGKK 2026-07-15 arr EZY8783 A320 EGNS Isle of Man 21:25 -9300 -9336 true 33af5a8cf3fb6f39 Easy eight seven eight three
+EGKK 2026-07-15 dep EZY8784 A320 EGNS Isle of Man 06:35 23700 23793 true 33af5a8cf3fb6f39 Easy eight seven eight four
+EGKK 2026-07-15 arr EZY8385 A319 EKCH Copenhagen 21:25 -9300 -9318 true 1fd081d0996a69fc Easy eight three eight five
+EGKK 2026-07-15 dep EZY8386 A319 EKCH Copenhagen 06:25 23100 23100 true 1fd081d0996a69fc Easy eight three eight six
+EGKK 2026-07-15 arr EXS669 B738 LSGG Geneva 21:20 -9600 -9314 true f662b8c38fcb961b Channex six six niner
+EGKK 2026-07-15 dep EXS670 B738 LSGG Geneva 08:25 30300 31089 true f662b8c38fcb961b Channex six seven zero
+EGKK 2026-07-15 arr EZY8155 A20N LIRF Rome Fiumicino 21:00 -10800 -9237 true 59ca871cf55acde7 Easy eight one five five
+EGKK 2026-07-15 dep EZY8156 A20N LIRF Rome Fiumicino 09:10 33000 34359 true 59ca871cf55acde7 Easy eight one five six
+EGKK 2026-07-15 arr EZY8175 A21N LIRF Rome Fiumicino 21:10 -10200 -9161 true 2853c52b45077d9d Easy eight one seven five
+EGKK 2026-07-15 dep EZY8176 A21N LIRF Rome Fiumicino 09:20 33600 33814 true 2853c52b45077d9d Easy eight one seven six
+EGKK 2026-07-15 arr EZY8539 A319 LFPG Paris Charles de Gaulle 21:40 -8400 -8265 true 2ca7308d5151b1f2 Easy eight five three niner
+EGKK 2026-07-15 dep EZY8540 A319 LFPG Paris Charles de Gaulle 08:10 29400 29400 true 2ca7308d5151b1f2 Easy eight five four zero
+EGKK 2026-07-15 arr EZY8187 A319 LPFR Faro 21:40 -8400 -8170 true 908d02ab3bddff6f Easy eight one eight seven
+EGKK 2026-07-15 dep EZY8188 A319 LPFR Faro 08:25 30300 31296 true 908d02ab3bddff6f Easy eight one eight eight
+EGKK 2026-07-15 arr EZY8457 A320 LEZL Seville 20:25 -12900 -8059 true c935d8c4f451396d Easy eight four five seven
+EGKK 2026-07-15 dep EZY8458 A320 LEZL Seville 07:40 27600 27896 true c935d8c4f451396d Easy eight four five eight
+EGKK 2026-07-15 arr EZY8655 A320 EGJJ Jersey 21:50 -7800 -7952 true 916b39519c231581 Easy eight six five five
+EGKK 2026-07-15 dep EZY8656 A320 EGJJ Jersey 08:55 32100 32153 true 916b39519c231581 Easy eight six five six
+EGKK 2026-07-15 arr BAW2209 A321 LPFR Faro 21:50 -7800 -7834 true b7ec7a34d83a85d0 Speedbird two two zero niner
+EGKK 2026-07-15 dep BAW2210 A321 LPFR Faro 08:35 30900 30975 true b7ec7a34d83a85d0 Speedbird two two one zero
+EGKK 2026-07-15 arr BAW2261 A320 LFMN Nice 22:05 -6900 -6964 true e397c1b01957c06f Speedbird two two six one
+EGKK 2026-07-15 dep BAW2262 A320 LFMN Nice 07:00 25200 25544 true e397c1b01957c06f Speedbird two two six two
+EGKK 2026-07-15 arr EZY8101 A20N LEBL Barcelona 22:05 -6900 -6854 true bcc7ba0f661b0f19 Easy eight one zero one
+EGKK 2026-07-15 dep EZY8102 A20N LEBL Barcelona 06:10 22200 23926 true bcc7ba0f661b0f19 Easy eight one zero two
+EGKK 2026-07-15 arr BAW2345 B772 EGJJ Jersey 22:10 -6600 -6359 true 3778720d65870d64 Speedbird two three four five
+EGKK 2026-07-15 dep BAW2346 B772 EGJJ Jersey 09:15 33300 33353 true 3778720d65870d64 Speedbird two three four six
+EGKK 2026-07-15 arr EZY8673 A21N EGPH Edinburgh 22:05 -6900 -5916 true 03f442ba07f1ef07 Easy eight six seven three
+EGKK 2026-07-15 dep EZY8674 A21N EGPH Edinburgh 06:00 21600 21600 true 03f442ba07f1ef07 Easy eight six seven four
+EGKK 2026-07-15 arr VLG8887 A320 LEBB Bilbao 22:25 -5700 -5892 true b5752f727a008f20 Vueling eight eight eight seven
+EGKK 2026-07-15 dep VLG8888 A320 LEBB Bilbao 08:10 29400 29747 true b5752f727a008f20 Vueling eight eight eight eight
+EGKK 2026-07-15 arr EZY8695 A20N EGPF Glasgow 22:30 -5400 -5480 true 7fc762772dd0d824 Easy eight six niner five
+EGKK 2026-07-15 dep EZY8696 A20N EGPF Glasgow 06:10 22200 23329 true 7fc762772dd0d824 Easy eight six niner six
+EGKK 2026-07-15 arr EZY8211 A21N LIMC Milan Malpensa 22:30 -5400 -5132 true 866e83b4576aae6a Easy eight two one one
+EGKK 2026-07-15 dep EZY8212 A21N LIMC Milan Malpensa 08:10 29400 29400 true 866e83b4576aae6a Easy eight two one two
+EGKK 2026-07-15 arr EZY8573 A319 LGKR Corfu 22:35 -5100 -5033 true 978526ab900bf0e6 Easy eight five seven three
+EGKK 2026-07-15 dep EZY8574 A319 LGKR Corfu 07:40 27600 27778 true 978526ab900bf0e6 Easy eight five seven four
+EGKK 2026-07-15 arr EZY8369 A21N LMML Malta 22:35 -5100 -4852 true b2e53348357c727a Easy eight three six niner
+EGKK 2026-07-15 dep EZY8370 A21N LMML Malta 07:25 26700 28498 true b2e53348357c727a Easy eight three seven zero
+EGKK 2026-07-15 arr EZY8751 A21N EGPE Inverness 22:20 -6000 -4777 true 2070fc4249fa344c Easy eight seven five one
+EGKK 2026-07-15 dep EZY8752 A21N EGPE Inverness 09:10 33000 33262 true 2070fc4249fa344c Easy eight seven five two
+EGKK 2026-07-15 arr TOM687 B738 GMMX Marrakesh 22:35 -5100 -4126 true 438a1e794b885409 Tomjet six eight seven
+EGKK 2026-07-15 dep TOM688 B738 GMMX Marrakesh 06:25 23100 26629 true 438a1e794b885409 Tomjet six eight eight
+EGKK 2026-07-15 arr EZY8351 A319 EHAM Amsterdam 22:40 -4800 -3450 true 17edac2fb0d57886 Easy eight three five one
+EGKK 2026-07-15 dep EZY8352 A319 EHAM Amsterdam 08:40 31200 31237 true 17edac2fb0d57886 Easy eight three five two
+EGKK 2026-07-15 arr VLG8851 A320 LEBL Barcelona 23:15 -2700 -2774 true 5dd118dc192a30df Vueling eight eight five one
+EGKK 2026-07-15 dep VLG8852 A320 LEBL Barcelona 07:20 26400 26734 true 5dd118dc192a30df Vueling eight eight five two
+EGKK 2026-07-15 arr EZY8491 A319 LPPR Porto 23:20 -2400 -2483 true a65a88aecc03c64e Easy eight four niner one
+EGKK 2026-07-15 dep EZY8492 A319 LPPR Porto 06:10 22200 22508 true a65a88aecc03c64e Easy eight four niner two
+EGKK 2026-07-15 arr EZY8327 A320 GMMX Marrakesh 23:25 -2100 -2285 true 3e20642eaf9e3e78 Easy eight three two seven
+EGKK 2026-07-15 dep EZY8328 A320 GMMX Marrakesh 07:20 26400 26400 true 3e20642eaf9e3e78 Easy eight three two eight
+EGKK 2026-07-15 arr EZY8767 A320 EGPD Aberdeen 23:25 -2100 -1757 true 18c77db6498923b4 Easy eight seven six seven
+EGKK 2026-07-15 dep EZY8768 A320 EGPD Aberdeen 06:10 22200 23796 true 18c77db6498923b4 Easy eight seven six eight
+EGKK 2026-07-15 arr EZY8235 A320 LSGG Geneva 23:35 -1500 -1338 true eb2b9ddabd0c2bee Easy eight two three five
+EGKK 2026-07-15 dep EZY8236 A320 LSGG Geneva 06:05 21900 23060 true eb2b9ddabd0c2bee Easy eight two three six
+EGKK 2026-07-15 arr EZY8401 A21N LFMN Nice 23:40 -1200 -1081 true 9c18ea907982ce93 Easy eight four zero one
+EGKK 2026-07-15 dep EZY8402 A21N LFMN Nice 08:30 30600 30683 true 9c18ea907982ce93 Easy eight four zero two
+EGKK 2026-07-15 arr EZY8105 A320 LEBL Barcelona 23:15 -2700 -1030 true d70e46acbaf3e01e Easy eight one zero five
+EGKK 2026-07-15 dep EZY8106 A320 LEBL Barcelona 07:20 26400 26400 true d70e46acbaf3e01e Easy eight one zero six
+EGKK 2026-07-15 arr EZY8215 A20N LIMC Milan Malpensa 23:40 -1200 -1014 true 64254a2043e3e43b Easy eight two one five
+EGKK 2026-07-15 dep EZY8216 A20N LIMC Milan Malpensa 09:20 33600 33637 true 64254a2043e3e43b Easy eight two one six
+EGKK 2026-07-15 arr TOM615 B738 LEMG Malaga 01:30 5400 5401 true 24ec4a07c39df124 Tomjet six one five
+EGKK 2026-07-15 dep TOM614 B738 LEMG Malaga 19:25 69900 70671 true 24ec4a07c39df124 Tomjet six one four
+EGKK 2026-07-15 arr UBT7 B789 KJFK New York JFK 06:20 22800 22940 false 452d27d10b7f25a7 Longboat seven
+EGKK 2026-07-15 dep UBT8 B789 KJFK New York JFK 08:05 29100 29391 false 452d27d10b7f25a7 Longboat eight
+EGKK 2026-07-15 arr BAW2277 B77W KMCO Orlando 06:25 23100 23282 false 89c5fc1a94b7f89b Speedbird two two seven seven
+EGKK 2026-07-15 dep BAW2278 B77W KMCO Orlando 08:20 30000 30081 false 89c5fc1a94b7f89b Speedbird two two seven eight
+EGKK 2026-07-15 arr CES551 B77W ZSPD Shanghai 06:45 24300 24414 false 3551e9d5f9a99dec China Eastern five five one
+EGKK 2026-07-15 dep CES552 B77W ZSPD Shanghai 08:20 30000 30000 false 3551e9d5f9a99dec China Eastern five five two
+EGKK 2026-07-15 arr NAX1301 B738 EKCH Copenhagen 07:05 25500 25403 false ac727b567bde804c Nor Shuttle one three zero one
+EGKK 2026-07-15 dep NAX1302 B738 EKCH Copenhagen 07:50 28200 33089 false ac727b567bde804c Nor Shuttle one three zero two
+EGKK 2026-07-15 arr QTR15 B788 OTHH Doha 07:10 25800 25939 false 417083840131164f Qatari one five
+EGKK 2026-07-15 dep QTR16 B788 OTHH Doha 08:45 31500 31841 false 417083840131164f Qatari one six
+EGKK 2026-07-15 arr UAE5 A388 OMDB Dubai 07:00 25200 26682 false 935ea4164a0934a6 Emirates five
+EGKK 2026-07-15 dep UAE6 A388 OMDB Dubai 08:55 32100 32376 false 935ea4164a0934a6 Emirates six
+EGKK 2026-07-15 arr TOM693 B789 KMCO Orlando 07:25 26700 27722 false f2dcf466a4e06946 Tomjet six niner three
+EGKK 2026-07-15 dep TOM694 B789 KMCO Orlando 09:00 32400 32710 false f2dcf466a4e06946 Tomjet six niner four
+EGKK 2026-07-15 arr RYR8301 B738 EIDW Dublin 08:10 29400 29474 false 3feccfa2890dcf18 Ryanair eight three zero one
+EGKK 2026-07-15 dep RYR8302 B738 EIDW Dublin 09:00 32400 32407 false 3feccfa2890dcf18 Ryanair eight three zero two
+EGKK 2026-07-15 arr AEA1001 B38M LEMD Madrid 09:05 32700 32921 false 97e336c496502811 Air Europa one zero zero one
+EGKK 2026-07-15 dep AEA1002 B38M LEMD Madrid 09:50 35400 35486 false 97e336c496502811 Air Europa one zero zero two
+EGKK 2026-07-15 arr EZY8062 A320 LEMG Malaga 09:15 33300 33301 false 0085543a164c1dc0 Easy eight zero six two
+EGKK 2026-07-15 dep EZY8063 A320 LEMG Malaga 10:00 36000 35865 false 0085543a164c1dc0 Easy eight zero six three
+EGKK 2026-07-15 arr THY1979 A321 LTFM Istanbul 09:25 33900 34250 false f7081b0cb2ba277e Turkish one niner seven niner
+EGKK 2026-07-15 dep THY1980 A321 LTFM Istanbul 10:15 36900 38381 false f7081b0cb2ba277e Turkish one niner eight zero
+EGKK 2026-07-15 arr KMM391 A20N LMML Malta 09:35 34500 34348 false 12cb946dcd92f87e Skyknight three niner one
+EGKK 2026-07-15 dep KMM392 A20N LMML Malta 10:25 37500 37676 false 12cb946dcd92f87e Skyknight three niner two
+EGKK 2026-07-15 arr NAX1313 B38M ENGM Oslo 09:40 34800 34815 false cf6f6cadea21d349 Nor Shuttle one three one three
+EGKK 2026-07-15 dep NAX1314 B38M ENGM Oslo 10:35 38100 38285 false cf6f6cadea21d349 Nor Shuttle one three one four
+EGKK 2026-07-15 arr EZY8675 A20N EGPH Edinburgh 09:25 33900 35508 false c82299384a62abe3 Easy eight six seven five
+EGKK 2026-07-15 dep EZY8676 A20N EGPH Edinburgh 10:20 37200 38252 false c82299384a62abe3 Easy eight six seven six
+EGKK 2026-07-15 arr EZY8347 A320 EHAM Amsterdam 09:50 35400 35627 false d13368ae50ef30b6 Easy eight three four seven
+EGKK 2026-07-15 dep EZY8348 A320 EHAM Amsterdam 10:30 37800 39132 false d13368ae50ef30b6 Easy eight three four eight
+EGKK 2026-07-15 arr EZY8237 A20N LSGG Geneva 09:50 35400 35656 false baf5f9db9e474935 Easy eight two three seven
+EGKK 2026-07-15 dep EZY8238 A20N LSGG Geneva 10:35 38100 38314 false baf5f9db9e474935 Easy eight two three eight
+EGKK 2026-07-15 arr TAP1341 A21N LPPR Porto 09:55 35700 35702 false 1cb54de9215b1aa2 Air Portugal one three four one
+EGKK 2026-07-15 dep TAP1342 A21N LPPR Porto 10:50 39000 40310 false 1cb54de9215b1aa2 Air Portugal one three four two
+EGKK 2026-07-15 arr BAW2321 B772 MMUN Cancun 09:55 35700 35840 false 8060f7cf08d824eb Speedbird two three two one
+EGKK 2026-07-15 dep BAW2322 B772 MMUN Cancun 11:50 42600 42741 false 8060f7cf08d824eb Speedbird two three two two
+EGKK 2026-07-15 arr TOM725 B789 MMUN Cancun 10:20 37200 37000 false 4fda59382efc716a Tomjet seven two five
+EGKK 2026-07-15 dep TOM726 B789 MMUN Cancun 12:00 43200 46240 false 4fda59382efc716a Tomjet seven two six
+EGKK 2026-07-15 arr RYR8351 B738 EIDW Dublin 10:35 38100 37931 false 79e21dba5af9c9eb Ryanair eight three five one
+EGKK 2026-07-15 dep RYR8352 B738 EIDW Dublin 11:15 40500 41594 false 79e21dba5af9c9eb Ryanair eight three five two
+EGKK 2026-07-15 arr SXS1631 B38M LTAI Antalya 11:10 40200 40458 false 1d458df6e6a20e3f Sunexpress one six three one
+EGKK 2026-07-15 dep SXS1632 B38M LTAI Antalya 11:55 42900 43187 false 1d458df6e6a20e3f Sunexpress one six three two
+EGKK 2026-07-15 arr EZY8103 A320 LEBL Barcelona 10:55 39300 40649 false f5f3670128b66124 Easy eight one zero three
+EGKK 2026-07-15 dep EZY8104 A320 LEBL Barcelona 11:35 41700 44712 false f5f3670128b66124 Easy eight one zero four
+EGKK 2026-07-15 arr RYR8331 B38M LEAL Alicante 11:20 40800 40659 false 1335c4a494299c5e Ryanair eight three three one
+EGKK 2026-07-15 dep RYR8332 B38M LEAL Alicante 12:10 43800 43910 false 1335c4a494299c5e Ryanair eight three three two
+EGKK 2026-07-15 arr EZY8207 A320 LIMC Milan Malpensa 11:15 40500 40693 false bd8a0f4313604f03 Easy eight two zero seven
+EGKK 2026-07-15 dep EZY8208 A320 LIMC Milan Malpensa 12:05 43500 44851 false bd8a0f4313604f03 Easy eight two zero eight
+EGKK 2026-07-15 arr TAP1331 A320 LPPT Lisbon 11:20 40800 40998 false af30a5a02ffb51e4 Air Portugal one three three one
+EGKK 2026-07-15 dep TAP1332 A320 LPPT Lisbon 12:00 43200 43972 false af30a5a02ffb51e4 Air Portugal one three three two
+EGKK 2026-07-15 arr EZY8715 A320 EGAA Belfast International 11:10 40200 41046 false feb5e8c20cb00052 Easy eight seven one five
+EGKK 2026-07-15 dep EZY8716 A320 EGAA Belfast International 11:55 42900 45459 false feb5e8c20cb00052 Easy eight seven one six
+EGKK 2026-07-15 arr BAW2263 A320 LFMN Nice 11:30 41400 41258 false 1314248537a7b7e0 Speedbird two two six three
+EGKK 2026-07-15 dep BAW2264 A320 LFMN Nice 12:25 44700 44700 false 1314248537a7b7e0 Speedbird two two six four
+EGKK 2026-07-15 arr EZY8259 A21N LEPA Palma de Mallorca 11:40 42000 42208 false 4304f2124631f1f6 Easy eight two five niner
+EGKK 2026-07-15 dep EZY8260 A21N LEPA Palma de Mallorca 12:25 44700 44829 false 4304f2124631f1f6 Easy eight two six zero
+EGKK 2026-07-15 arr BAW2347 A321 EGJJ Jersey 11:55 42900 42742 false 12b84c00c47d09ec Speedbird two three four seven
+EGKK 2026-07-15 dep BAW2348 A321 EGJJ Jersey 12:45 45900 45900 false 12b84c00c47d09ec Speedbird two three four eight
+EGKK 2026-07-15 arr VLG8853 A321 LEBL Barcelona 12:05 43500 43401 false 981601f141ee4f3c Vueling eight eight five three
+EGKK 2026-07-15 dep VLG8854 A321 LEBL Barcelona 12:50 46200 51237 false 981601f141ee4f3c Vueling eight eight five four
+EGKK 2026-07-15 arr EZY8066 A20N LEMG Malaga 11:00 39600 43457 false b97289212edcc9e8 Easy eight zero six six
+EGKK 2026-07-15 dep EZY8067 A20N LEMG Malaga 11:45 42300 44957 false b97289212edcc9e8 Easy eight zero six seven
+EGKK 2026-07-15 arr EZY8107 A320 LEBL Barcelona 12:05 43500 43574 false 40d861e9ab164a49 Easy eight one zero seven
+EGKK 2026-07-15 dep EZY8108 A320 LEBL Barcelona 12:55 46500 46509 false 40d861e9ab164a49 Easy eight one zero eight
+EGKK 2026-07-15 arr RYR8303 B738 EIDW Dublin 12:10 43800 43722 false 77ef43553cca9555 Ryanair eight three zero three
+EGKK 2026-07-15 dep RYR8304 B738 EIDW Dublin 12:50 46200 47500 false 77ef43553cca9555 Ryanair eight three zero four
+EGKK 2026-07-15 arr EZY8735 A320 EGAC Belfast City 12:10 43800 43764 false 31f4f379775e1f14 Easy eight seven three five
+EGKK 2026-07-15 dep EZY8736 A320 EGAC Belfast City 12:55 46500 46734 false 31f4f379775e1f14 Easy eight seven three six
+EGKK 2026-07-15 arr SXS1643 B38M LTBS Dalaman 12:10 43800 44137 false 95cfa8908cd0f8d8 Sunexpress one six four three
+EGKK 2026-07-15 dep SXS1644 B38M LTBS Dalaman 12:55 46500 46500 false 95cfa8908cd0f8d8 Sunexpress one six four four
+EGKK 2026-07-15 arr THY1981 A321 LTFM Istanbul 12:25 44700 44620 false c1972e5fc6a9bb32 Turkish one niner eight one
+EGKK 2026-07-15 dep THY1982 A321 LTFM Istanbul 13:05 47100 47243 false c1972e5fc6a9bb32 Turkish one niner eight two
+EGKK 2026-07-15 arr NAX1303 B738 EKCH Copenhagen 12:20 44400 44636 false 4886761c684eecb8 Nor Shuttle one three zero three
+EGKK 2026-07-15 dep NAX1304 B738 EKCH Copenhagen 13:15 47700 47918 false 4886761c684eecb8 Nor Shuttle one three zero four
+EGKK 2026-07-15 arr EZY8131 A319 LEAL Alicante 11:40 42000 44965 false c6fee0953bec4fad Easy eight one three one
+EGKK 2026-07-15 dep EZY8132 A319 LEAL Alicante 12:25 44700 46465 false c6fee0953bec4fad Easy eight one three two
+EGKK 2026-07-15 arr EZY8423 A20N LPPT Lisbon 12:30 45000 44981 false 9a6bd34eded2a596 Easy eight four two three
+EGKK 2026-07-15 dep EZY8424 A20N LPPT Lisbon 13:10 47400 47533 false 9a6bd34eded2a596 Easy eight four two four
+EGKK 2026-07-15 arr UAE7 A388 OMDB Dubai 12:30 45000 45076 false e7f59292be1a9ba0 Emirates seven
+EGKK 2026-07-15 dep UAE8 A388 OMDB Dubai 14:10 51000 51097 false e7f59292be1a9ba0 Emirates eight
+EGKK 2026-07-15 arr BAW2615 A20N LEMG Malaga 12:30 45000 45242 false a7bc6cdc4905d4f2 Speedbird two six one five
+EGKK 2026-07-15 dep BAW2616 A20N LEMG Malaga 13:20 48000 47797 false a7bc6cdc4905d4f2 Speedbird two six one six
+EGKK 2026-07-15 arr RYR8353 B738 EIDW Dublin 12:35 45300 45243 false 85f3fdf9191693e9 Ryanair eight three five three
+EGKK 2026-07-15 dep RYR8354 B738 EIDW Dublin 13:20 48000 49757 false 85f3fdf9191693e9 Ryanair eight three five four
+EGKK 2026-07-15 arr TOM665 B738 LEPA Palma de Mallorca 12:45 45900 45737 false 1f35973d16f6b4b1 Tomjet six six five
+EGKK 2026-07-15 dep TOM666 B738 LEPA Palma de Mallorca 13:35 48900 48900 false 1f35973d16f6b4b1 Tomjet six six six
+EGKK 2026-07-15 arr EZY8213 A320 LIMC Milan Malpensa 12:25 44700 45833 false bcc60594ebf2098c Easy eight two one three
+EGKK 2026-07-15 dep EZY8214 A320 LIMC Milan Malpensa 13:15 47700 48025 false bcc60594ebf2098c Easy eight two one four
+EGKK 2026-07-15 arr VLG8889 A319 LEBB Bilbao 12:25 44700 45990 false 385d50e56d5483b2 Vueling eight eight eight niner
+EGKK 2026-07-15 dep VLG8890 A319 LEBB Bilbao 13:15 47700 51527 false 385d50e56d5483b2 Vueling eight eight niner zero
+EGKK 2026-07-15 arr EZY8263 A320 LEPA Palma de Mallorca 12:50 46200 46100 false d8b64f76390083da Easy eight two six three
+EGKK 2026-07-15 dep EZY8264 A320 LEPA Palma de Mallorca 13:35 48900 48900 false d8b64f76390083da Easy eight two six four
+EGKK 2026-07-15 arr EZY8625 A21N LIRN Naples 12:45 45900 46197 false 9bb0ccc1aab7af0b Easy eight six two five
+EGKK 2026-07-15 dep EZY8626 A21N LIRN Naples 13:35 48900 49209 false 9bb0ccc1aab7af0b Easy eight six two six
+EGKK 2026-07-15 arr EZY8185 A20N LPFR Faro 12:50 46200 46428 false 8408129433e77480 Easy eight one eight five
+EGKK 2026-07-15 dep EZY8186 A20N LPFR Faro 13:40 49200 49200 false 8408129433e77480 Easy eight one eight six
+EGKK 2026-07-15 arr EZY8311 A320 LEMD Madrid 13:00 46800 46753 false 3b2e2d25653de6f6 Easy eight three one one
+EGKK 2026-07-15 dep EZY8312 A320 LEMD Madrid 13:45 49500 49500 false 3b2e2d25653de6f6 Easy eight three one two
+EGKK 2026-07-15 arr EZY8173 A20N LIRF Rome Fiumicino 13:05 47100 46897 false 4a81e256ba052f51 Easy eight one seven three
+EGKK 2026-07-15 dep EZY8174 A20N LIRF Rome Fiumicino 13:55 50100 51682 false 4a81e256ba052f51 Easy eight one seven four
+EGKK 2026-07-15 arr EZY8153 A320 LIRF Rome Fiumicino 13:00 46800 47044 false 3dc7f8f8335e3067 Easy eight one five three
+EGKK 2026-07-15 dep EZY8154 A320 LIRF Rome Fiumicino 13:40 49200 49273 false 3dc7f8f8335e3067 Easy eight one five four
+EGKK 2026-07-15 arr AFR1081 A320 LFPG Paris Charles de Gaulle 13:05 47100 47445 false df2adcd77ab98e34 Air France one zero eight one
+EGKK 2026-07-15 dep AFR1082 A320 LFPG Paris Charles de Gaulle 14:00 50400 50662 false df2adcd77ab98e34 Air France one zero eight two
+EGKK 2026-07-15 arr EXS677 B738 LEPA Palma de Mallorca 13:10 47400 47557 false 088e2a302fcce74a Channex six seven seven
+EGKK 2026-07-15 dep EXS678 B738 LEPA Palma de Mallorca 14:00 50400 50519 false 088e2a302fcce74a Channex six seven eight
+EGKK 2026-07-15 arr EZY8111 A320 LEBL Barcelona 13:15 47700 48493 false 9d463e802130f29b Easy eight one one one
+EGKK 2026-07-15 dep EZY8112 A320 LEBL Barcelona 14:10 51000 51192 false 9d463e802130f29b Easy eight one one two
+EGKK 2026-07-15 arr EZY8135 A20N LEAL Alicante 13:25 48300 48548 false b16fd36fb9de42a0 Easy eight one three five
+EGKK 2026-07-15 dep EZY8136 A20N LEAL Alicante 14:05 50700 51057 false b16fd36fb9de42a0 Easy eight one three six
+EGKK 2026-07-15 arr EZY8403 A320 LFMN Nice 13:05 47100 48873 false 03ef5a46e96c96b1 Easy eight four zero three
+EGKK 2026-07-15 dep EZY8404 A320 LFMN Nice 13:55 50100 51776 false 03ef5a46e96c96b1 Easy eight four zero four
+EGKK 2026-07-15 arr EZY8459 A320 LEZL Seville 13:40 49200 49348 false 3bd34db73a00e539 Easy eight four five niner
+EGKK 2026-07-15 dep EZY8460 A320 LEZL Seville 14:20 51600 51602 false 3bd34db73a00e539 Easy eight four six zero
+EGKK 2026-07-15 arr VLG8859 A320 LEBL Barcelona 13:50 49800 49738 false 167147f6a17f0e9f Vueling eight eight five niner
+EGKK 2026-07-15 dep VLG8860 A320 LEBL Barcelona 14:45 53100 57565 false 167147f6a17f0e9f Vueling eight eight six zero
+EGKK 2026-07-15 arr EZY8217 A20N LIMC Milan Malpensa 13:35 48900 49954 false 8873ab200a4627cb Easy eight two one seven
+EGKK 2026-07-15 dep EZY8218 A20N LIMC Milan Malpensa 14:30 52200 52492 false 8873ab200a4627cb Easy eight two one eight
+EGKK 2026-07-15 arr EZY8697 A320 EGPF Glasgow 13:55 50100 50252 false 629e0431e382a2f0 Easy eight six niner seven
+EGKK 2026-07-15 dep EZY8698 A320 EGPF Glasgow 14:40 52800 52800 false 629e0431e382a2f0 Easy eight six niner eight
+EGKK 2026-07-15 arr EZY8677 A20N EGPH Edinburgh 13:40 49200 50806 false 12000e58749e009f Easy eight six seven seven
+EGKK 2026-07-15 dep EZY8678 A20N EGPH Edinburgh 14:25 51900 52306 false 12000e58749e009f Easy eight six seven eight
+EGKK 2026-07-15 arr QTR17 A359 OTHH Doha 14:10 51000 51276 false 583a57f88998a92f Qatari one seven
+EGKK 2026-07-15 dep QTR18 A359 OTHH Doha 16:10 58200 58866 false 583a57f88998a92f Qatari one eight
+EGKK 2026-07-15 arr EZY8239 A320 LSGG Geneva 14:25 51900 51810 false 7d90ded41faacd40 Easy eight two three niner
+EGKK 2026-07-15 dep EZY8240 A320 LSGG Geneva 15:10 54600 54731 false 7d90ded41faacd40 Easy eight two four zero
+EGKK 2026-07-15 arr EZY8541 A319 LFPG Paris Charles de Gaulle 14:30 52200 52340 false 6cbbc29b023004c8 Easy eight five four one
+EGKK 2026-07-15 dep EZY8542 A319 LFPG Paris Charles de Gaulle 15:20 55200 55255 false 6cbbc29b023004c8 Easy eight five four two
+EGKK 2026-07-15 arr EZY8157 A20N LIRF Rome Fiumicino 14:45 53100 53237 false 11344e52bba5dcdc Easy eight one five seven
+EGKK 2026-07-15 dep EZY8158 A20N LIRF Rome Fiumicino 15:30 55800 56010 false 11344e52bba5dcdc Easy eight one five eight
+EGKK 2026-07-15 arr UAE9 A359 OMDB Dubai 14:30 52200 53364 false c56d84cd040a6046 Emirates niner
+EGKK 2026-07-15 dep UAE10 A359 OMDB Dubai 16:20 58800 60056 false c56d84cd040a6046 Emirates one zero
+EGKK 2026-07-15 arr EZY8329 A319 GMMX Marrakesh 15:00 54000 53889 false 6f68658f4849c532 Easy eight three two niner
+EGKK 2026-07-15 dep EZY8330 A319 GMMX Marrakesh 15:45 56700 56700 false 6f68658f4849c532 Easy eight three three zero
+EGKK 2026-07-15 arr AEA1003 B738 LEMD Madrid 14:55 53700 54037 false e70053aa26ce6551 Air Europa one zero zero three
+EGKK 2026-07-15 dep AEA1004 B738 LEMD Madrid 15:50 57000 57025 false e70053aa26ce6551 Air Europa one zero zero four
+EGKK 2026-07-15 arr WZZ4525 A321 LHBP Budapest 14:50 53400 55115 false 809f910ebf115ac1 Wizz Air four five two five
+EGKK 2026-07-15 dep WZZ4526 A321 LHBP Budapest 15:35 56100 56615 false 809f910ebf115ac1 Wizz Air four five two six
+EGKK 2026-07-15 arr EZY8717 A320 EGAA Belfast International 15:25 55500 55707 false 4166028c56231711 Easy eight seven one seven
+EGKK 2026-07-15 dep EZY8718 A320 EGAA Belfast International 16:20 58800 59159 false 4166028c56231711 Easy eight seven one eight
+EGKK 2026-07-15 arr NAX1315 B738 ENGM Oslo 15:30 55800 56115 false 1eaa5ace8faa8885 Nor Shuttle one three one five
+EGKK 2026-07-15 dep NAX1316 B738 ENGM Oslo 16:15 58500 58500 false 1eaa5ace8faa8885 Nor Shuttle one three one six
+EGKK 2026-07-15 arr AUR601 E195 EGJB Guernsey 15:55 57300 57303 false 52a6ddf63bd38656 Ayline six zero one
+EGKK 2026-07-15 dep AUR602 E195 EGJB Guernsey 16:50 60600 61864 false 52a6ddf63bd38656 Ayline six zero two
+EGKK 2026-07-15 arr SXS1633 B38M LTAI Antalya 16:10 58200 58050 false 2054bb0c331882f5 Sunexpress one six three three
+EGKK 2026-07-15 dep SXS1634 B38M LTAI Antalya 17:00 61200 61424 false 2054bb0c331882f5 Sunexpress one six three four
+EGKK 2026-07-15 arr RYR8305 B38M EIDW Dublin 16:10 58200 58343 false 3e09dc8ffedf59b5 Ryanair eight three zero five
+EGKK 2026-07-15 dep RYR8306 B38M EIDW Dublin 16:55 60900 60900 false 3e09dc8ffedf59b5 Ryanair eight three zero six
+EGKK 2026-07-15 arr IBS3801 A320 LEMD Madrid 16:15 58500 58496 false eb46abcdf352959a Iberexpres three eight zero one
+EGKK 2026-07-15 dep IBS3802 A320 LEMD Madrid 17:05 61500 62659 false eb46abcdf352959a Iberexpres three eight zero two
+EGKK 2026-07-15 arr EZY8353 A319 EHAM Amsterdam 15:15 54900 58717 false 012c672856344dde Easy eight three five three
+EGKK 2026-07-15 dep EZY8354 A319 EHAM Amsterdam 16:10 58200 60217 false 012c672856344dde Easy eight three five four
+EGKK 2026-07-15 arr EZY8209 A320 LIMC Milan Malpensa 16:20 58800 58950 false dbb8ea0c8447d810 Easy eight two zero niner
+EGKK 2026-07-15 dep EZY8210 A320 LIMC Milan Malpensa 17:15 62100 62100 false dbb8ea0c8447d810 Easy eight two one zero
+EGKK 2026-07-15 arr EZY8737 A20N EGAC Belfast City 16:20 58800 59129 false ed02a6d6aa330380 Easy eight seven three seven
+EGKK 2026-07-15 dep EZY8738 A20N EGAC Belfast City 17:10 61800 61800 false ed02a6d6aa330380 Easy eight seven three eight
+EGKK 2026-07-15 arr RYR8355 B738 EIDW Dublin 16:35 59700 59931 false ce79de0807c2ba29 Ryanair eight three five five
+EGKK 2026-07-15 dep RYR8356 B738 EIDW Dublin 17:25 62700 62795 false ce79de0807c2ba29 Ryanair eight three five six
+EGKK 2026-07-15 arr CCA851 A333 ZSPD Shanghai 16:45 60300 60289 false 1b7f01c638d80d93 Air China eight five one
+EGKK 2026-07-15 dep CCA852 A333 ZSPD Shanghai 18:35 66900 66984 false 1b7f01c638d80d93 Air China eight five two
+EGKK 2026-07-15 arr EZY8349 A320 EHAM Amsterdam 17:15 62100 62388 false ade982ead7e6d98c Easy eight three four niner
+EGKK 2026-07-15 dep EZY8350 A320 EHAM Amsterdam 18:00 64800 64800 false ade982ead7e6d98c Easy eight three five zero
+EGKK 2026-07-15 arr EZY8493 A320 LPPR Porto 17:20 62400 62552 false 82a23eb060fcdd55 Easy eight four niner three
+EGKK 2026-07-15 dep EZY8494 A320 LPPR Porto 18:10 65400 65730 false 82a23eb060fcdd55 Easy eight four niner four
+EGKK 2026-07-15 arr VLG8891 A320 LEBB Bilbao 17:25 62700 62644 false 05f1c3d4c1bccb52 Vueling eight eight niner one
+EGKK 2026-07-15 dep VLG8892 A320 LEBB Bilbao 18:10 65400 69065 false 05f1c3d4c1bccb52 Vueling eight eight niner two
+EGKK 2026-07-15 arr EZY8785 A320 EGNS Isle of Man 17:30 63000 62769 false a60d9841177d66e3 Easy eight seven eight five
+EGKK 2026-07-15 dep EZY8786 A320 EGNS Isle of Man 18:20 66000 66000 false a60d9841177d66e3 Easy eight seven eight six
+EGKK 2026-07-15 arr EZY8387 A320 EKCH Copenhagen 16:10 58200 63229 false a88c778f5b043a1f Easy eight three eight seven
+EGKK 2026-07-15 dep EZY8388 A320 EKCH Copenhagen 17:00 61200 64729 false a88c778f5b043a1f Easy eight three eight eight
+EGKK 2026-07-15 arr EZY8753 A21N EGPE Inverness 17:40 63600 63439 false fdaf8ba4b474c2d0 Easy eight seven five three
+EGKK 2026-07-15 dep EZY8754 A21N EGPE Inverness 18:35 66900 66900 false fdaf8ba4b474c2d0 Easy eight seven five four
+EGKK 2026-07-15 arr VLG8855 A20N LEBL Barcelona 17:40 63600 63464 false 80f101d0b1779095 Vueling eight eight five five
+EGKK 2026-07-15 dep VLG8856 A20N LEBL Barcelona 18:30 66600 66630 false 80f101d0b1779095 Vueling eight eight five six
+EGKK 2026-07-15 arr THY1983 A321 LTFM Istanbul 17:25 62700 64084 false d26654ab99454319 Turkish one niner eight three
+EGKK 2026-07-15 dep THY1984 A321 LTFM Istanbul 18:15 65700 65744 false d26654ab99454319 Turkish one niner eight four
+EGKK 2026-07-15 arr EZY8679 A20N EGPH Edinburgh 17:55 64500 64598 false 93616e65cb4f77e8 Easy eight six seven niner
+EGKK 2026-07-15 dep EZY8680 A20N EGPH Edinburgh 18:45 67500 67500 false 93616e65cb4f77e8 Easy eight six eight zero
+EGKK 2026-07-15 arr TAP1333 A321 LPPT Lisbon 18:00 64800 64952 false 68ec3844930277d9 Air Portugal one three three three
+EGKK 2026-07-15 dep TAP1334 A321 LPPT Lisbon 18:50 67800 68092 false 68ec3844930277d9 Air Portugal one three three four
+EGKK 2026-07-15 arr EZY8405 A320 LFMN Nice 18:20 66000 66306 false 7b01a409c7a48ab5 Easy eight four zero five
+EGKK 2026-07-15 dep EZY8406 A320 LFMN Nice 19:05 68700 69958 false 7b01a409c7a48ab5 Easy eight four zero six
+EGKK 2026-07-15 arr EZY8657 A320 EGJJ Jersey 18:25 66300 66543 false 3ca14cadc85298bb Easy eight six five seven
+EGKK 2026-07-15 dep EZY8658 A320 EGJJ Jersey 19:15 69300 69598 false 3ca14cadc85298bb Easy eight six five eight
+EGKK 2026-07-15 arr BAW2349 A321 EGJJ Jersey 18:45 67500 67597 false 0fe16aad6a5053e4 Speedbird two three four niner
+EGKK 2026-07-15 dep BAW2350 A321 EGJJ Jersey 19:35 70500 70500 false 0fe16aad6a5053e4 Speedbird two three five zero
+EGKK 2026-07-15 arr EZY8241 A320 LSGG Geneva 19:00 68400 68324 false d1c25f5f516ad06c Easy eight two four one
+EGKK 2026-07-15 dep EZY8242 A320 LSGG Geneva 19:50 71400 73289 false d1c25f5f516ad06c Easy eight two four two
+EGKK 2026-07-15 arr EZY8769 A320 EGPD Aberdeen 18:55 68100 69451 false 7256202978fc6b3b Easy eight seven six niner
+EGKK 2026-07-15 dep EZY8770 A320 EGPD Aberdeen 19:35 70500 70951 false 7256202978fc6b3b Easy eight seven seven zero
+EGKK 2026-07-15 arr UAE11 A388 OMDB Dubai 19:30 70200 73177 false 95712c1c700ad630 Emirates one one
+EGKK 2026-07-15 dep UAE12 A388 OMDB Dubai 21:20 76800 77677 false 95712c1c700ad630 Emirates one two
+EGKK 2026-07-15 arr RYR8307 B38M EIDW Dublin 20:10 72600 73323 false ed621c80ff89913c Ryanair eight three zero seven
+EGKK 2026-07-15 dep RYR8308 B38M EIDW Dublin 21:00 75600 75659 false ed621c80ff89913c Ryanair eight three zero eight
+EGKK 2026-07-15 arr RYR8357 B738 EIDW Dublin 20:35 74100 73960 false d2ab69e035bcd82a Ryanair eight three five seven
+EGKK 2026-07-15 dep RYR8358 B738 EIDW Dublin 21:25 77100 78731 false d2ab69e035bcd82a Ryanair eight three five eight
+EGKK 2026-07-15 arr SXS1635 B738 LTAI Antalya 21:15 76500 76573 false ad57e496d6fc3211 Sunexpress one six three five
+EGKK 2026-07-15 dep SXS1636 B738 LTAI Antalya 22:05 79500 80166 false ad57e496d6fc3211 Sunexpress one six three six
+EGKK 2026-07-15 arr NAX1317 B738 ENGM Oslo 21:20 76800 76685 false 5d45230c8227df12 Nor Shuttle one three one seven
+EGKK 2026-07-15 dep NAX1318 B738 ENGM Oslo 22:10 79800 79834 false 5d45230c8227df12 Nor Shuttle one three one eight
+EGKK 2026-07-15 arr THY1985 A333 LTFM Istanbul 21:25 77100 77318 false e8708db9cb4d150e Turkish one niner eight five
+EGKK 2026-07-15 dep THY1986 A333 LTFM Istanbul 23:10 83400 86699 false e8708db9cb4d150e Turkish one niner eight six
+EGKK 2026-07-15 arr SEH411 A21N LGAV Athens 22:25 80700 80996 false 6d9bb10255f2d440 Air Crete four one one
+EGKK 2026-07-15 dep SEH412 A21N LGAV Athens 23:10 83400 87318 false 6d9bb10255f2d440 Air Crete four one two
+EGKK 2026-07-15 arr RYR8359 B738 EIDW Dublin 22:35 81300 81421 false 72017bfda5be2ba0 Ryanair eight three five niner
+EGKK 2026-07-15 dep RYR8360 B738 EIDW Dublin 23:25 84300 84525 false 72017bfda5be2ba0 Ryanair eight three six zero
+EGKK 2026-07-15 arr AUR603 E195 EGJB Guernsey 22:45 81900 81831 false 713e401a2d57769e Ayline six zero three
+EGKK 2026-07-15 dep AUR604 E195 EGJB Guernsey 23:25 84300 84300 false 713e401a2d57769e Ayline six zero four
+EGKK 2026-07-15 arr NAX1305 B738 EKCH Copenhagen 22:50 82200 82215 false 476a82ff0c2765f2 Nor Shuttle one three zero five
+EGKK 2026-07-15 dep NAX1306 B738 EKCH Copenhagen 23:40 85200 85393 false 476a82ff0c2765f2 Nor Shuttle one three zero six
+EGKK 2026-07-15 arr AFR1083 A319 LFPG Paris Charles de Gaulle 23:45 85500 85299 false c822602cc4ba9372 Air France one zero eight three
+EGKK 2026-07-15 dep AFR1084 A319 LFPG Paris Charles de Gaulle 00:25 87900 88189 false c822602cc4ba9372 Air France one zero eight four
+EGKK 2026-01-14 arr EXS618 B738 LEMG Malaga 13:05 -384900 -382925 true f29001da0e6ca8c5 Channex six one eight
+EGKK 2026-01-14 dep EXS617 B738 LEMG Malaga 06:55 24900 25077 true f29001da0e6ca8c5 Channex six one seven
+EGKK 2026-01-14 arr WZZ4472 A21N LEMG Malaga 13:40 -296400 -295650 true 6c8f8e548616f8b3 Wizz Air four four seven two
+EGKK 2026-01-14 dep WZZ4471 A21N LEMG Malaga 07:35 27300 27483 true 6c8f8e548616f8b3 Wizz Air four four seven one
+EGKK 2026-01-14 arr EZY8902 A320 LXGB Gibraltar 15:00 -118800 -118775 true 4c1b514e8e5a2d53 Easy eight niner zero two
+EGKK 2026-01-14 dep EZY8901 A320 LXGB Gibraltar 08:35 30900 31146 true 4c1b514e8e5a2d53 Easy eight niner zero one
+EGKK 2026-01-14 arr EZY8066 A21N LEMG Malaga 11:00 -46800 -46651 true 2d7fb60da247b65c Easy eight zero six six
+EGKK 2026-01-14 dep EZY8061 A21N LEMG Malaga 16:55 -25500 -25446 true 2d7fb60da247b65c Easy eight zero six one
+EGKK 2026-01-14 arr TOM699 B738 GCRR Lanzarote 15:10 -31800 -31656 true 3df96e3b14cee30e Tomjet six niner niner
+EGKK 2026-01-14 dep TOM700 B738 GCRR Lanzarote 06:20 22800 22800 true 3df96e3b14cee30e Tomjet seven zero zero
+EGKK 2026-01-14 arr BAW2239 A321 LTAI Antalya 15:45 -29700 -29652 true 74b89f00e715b7e5 Speedbird two two three niner
+EGKK 2026-01-14 dep BAW2240 A321 LTAI Antalya 06:30 23400 23490 true 74b89f00e715b7e5 Speedbird two two four zero
+EGKK 2026-01-14 arr EXS691 B738 LTAI Antalya 15:45 -29700 -29638 true 054fec1f7ab3354b Channex six niner one
+EGKK 2026-01-14 dep EXS692 B738 LTAI Antalya 06:30 23400 23400 true 054fec1f7ab3354b Channex six niner two
+EGKK 2026-01-14 arr BAW2245 A320 GMMX Marrakesh 15:45 -29700 -29019 true 295cc91911e556a1 Speedbird two two four five
+EGKK 2026-01-14 dep BAW2246 A320 GMMX Marrakesh 08:05 29100 29393 true 295cc91911e556a1 Speedbird two two four six
+EGKK 2026-01-14 arr EXS707 B738 GCRR Lanzarote 16:00 -28800 -29006 true a3973af6e7e73d21 Channex seven zero seven
+EGKK 2026-01-14 dep EXS708 B738 GCRR Lanzarote 07:10 25800 25800 true a3973af6e7e73d21 Channex seven zero eight
+EGKK 2026-01-14 arr EZY8369 A20N LMML Malta 16:05 -28500 -28546 true 4959c8f591f70ff8 Easy eight three six niner
+EGKK 2026-01-14 dep EZY8370 A20N LMML Malta 08:55 32100 32100 true 4959c8f591f70ff8 Easy eight three seven zero
+EGKK 2026-01-14 arr EZY8475 A20N GCRR Lanzarote 16:10 -28200 -28356 true 93a743d955efa9c1 Easy eight four seven five
+EGKK 2026-01-14 dep EZY8476 A20N GCRR Lanzarote 07:20 26400 26754 true 93a743d955efa9c1 Easy eight four seven six
+EGKK 2026-01-14 arr VLG8813 A321 LEMG Malaga 16:05 -28500 -28327 true 8052bbb10580c937 Vueling eight eight one three
+EGKK 2026-01-14 dep VLG8812 A321 LEMG Malaga 09:55 35700 36021 true 8052bbb10580c937 Vueling eight eight one two
+EGKK 2026-01-14 arr EZY8064 A320 LEMG Malaga 16:10 -28200 -28199 true b5d23089bfed675e Easy eight zero six four
+EGKK 2026-01-14 dep EZY8065 A320 LEMG Malaga 18:40 -19200 -18933 true b5d23089bfed675e Easy eight zero six five
+EGKK 2026-01-14 arr EZY8507 A320 LCLK Larnaca 16:15 -27900 -28051 true 58d6c347e9858c15 Easy eight five zero seven
+EGKK 2026-01-14 dep EZY8508 A320 LCLK Larnaca 06:10 22200 22411 true 58d6c347e9858c15 Easy eight five zero eight
+EGKK 2026-01-14 arr EZY8281 A320 GCTS Tenerife South 16:20 -27600 -27386 true 9c864a7e4b54c196 Easy eight two eight one
+EGKK 2026-01-14 dep EZY8282 A320 GCTS Tenerife South 07:05 25500 25500 true 9c864a7e4b54c196 Easy eight two eight two
+EGKK 2026-01-14 arr BAW2253 A320 LMML Malta 16:40 -26400 -26477 true 6db06b9ab2440a02 Speedbird two two five three
+EGKK 2026-01-14 dep BAW2254 A320 LMML Malta 09:25 33900 34546 true 6db06b9ab2440a02 Speedbird two two five four
+EGKK 2026-01-14 arr EZY8557 A20N LCPH Paphos 16:55 -25500 -25365 true 48e646d6fcbb799a Easy eight five five seven
+EGKK 2026-01-14 dep EZY8558 A20N LCPH Paphos 06:55 24900 26154 true 48e646d6fcbb799a Easy eight five five eight
+EGKK 2026-01-14 arr EZY8439 A20N LGAV Athens 17:10 -24600 -23695 true 29c31c084c948625 Easy eight four three niner
+EGKK 2026-01-14 dep EZY8440 A20N LGAV Athens 09:10 33000 33202 true 29c31c084c948625 Easy eight four four zero
+EGKK 2026-01-14 arr TOM671 B738 GCTS Tenerife South 17:25 -23700 -22285 true f654d55daf58992d Tomjet six seven one
+EGKK 2026-01-14 dep TOM672 B738 GCTS Tenerife South 08:10 29400 29627 true f654d55daf58992d Tomjet six seven two
+EGKK 2026-01-14 arr EZY8283 A21N GCTS Tenerife South 18:05 -21300 -21459 true 0d083a5262316569 Easy eight two eight three
+EGKK 2026-01-14 dep EZY8284 A21N GCTS Tenerife South 08:50 31800 36657 true 0d083a5262316569 Easy eight two eight four
+EGKK 2026-01-14 arr EZY8129 A320 LEAL Alicante 18:10 -21000 -20972 true 632b523d83c80e8a Easy eight one two niner
+EGKK 2026-01-14 dep EZY8130 A320 LEAL Alicante 06:15 22500 22603 true 632b523d83c80e8a Easy eight one three zero
+EGKK 2026-01-14 arr BAW2231 A20N GCTS Tenerife South 18:10 -21000 -20923 true 656d3cf3f0d7e0b1 Speedbird two two three one
+EGKK 2026-01-14 dep BAW2232 A20N GCTS Tenerife South 08:50 31800 31800 true 656d3cf3f0d7e0b1 Speedbird two two three two
+EGKK 2026-01-14 arr BAW2291 B772 LPPR Porto 18:15 -20700 -20382 true 2037a54ed27302e7 Speedbird two two niner one
+EGKK 2026-01-14 dep BAW2292 B772 LPPR Porto 07:00 25200 25200 true 2037a54ed27302e7 Speedbird two two niner two
+EGKK 2026-01-14 arr EXS683 B738 GCTS Tenerife South 18:35 -19500 -19488 true 021adc2758918987 Channex six eight three
+EGKK 2026-01-14 dep EXS684 B738 GCTS Tenerife South 09:20 33600 33600 true 021adc2758918987 Channex six eight four
+EGKK 2026-01-14 arr EZY8257 A21N LEPA Palma de Mallorca 18:25 -20100 -18803 true da1d3378cf9f2ca5 Easy eight two five seven
+EGKK 2026-01-14 dep EZY8258 A21N LEPA Palma de Mallorca 07:05 25500 25644 true da1d3378cf9f2ca5 Easy eight two five eight
+EGKK 2026-01-14 arr TOM663 B738 LEPA Palma de Mallorca 18:50 -18600 -18479 true f9f7709386e39e87 Tomjet six six three
+EGKK 2026-01-14 dep TOM664 B738 LEPA Palma de Mallorca 07:30 27000 27000 true f9f7709386e39e87 Tomjet six six four
+EGKK 2026-01-14 arr EZY8309 A320 LEMD Madrid 18:50 -18600 -18468 true 4087a0d591fe823d Easy eight three zero niner
+EGKK 2026-01-14 dep EZY8310 A320 LEMD Madrid 07:55 28500 28500 true 4087a0d591fe823d Easy eight three one zero
+EGKK 2026-01-14 arr BAW2299 B772 LCLK Larnaca 19:05 -17700 -17909 true b7be7bf85ac29201 Speedbird two two niner niner
+EGKK 2026-01-14 dep BAW2300 B772 LCLK Larnaca 08:55 32100 32100 true b7be7bf85ac29201 Speedbird two three zero zero
+EGKK 2026-01-14 arr EXS675 B738 LEPA Palma de Mallorca 19:10 -17400 -17445 true 22525655ebd58a24 Channex six seven five
+EGKK 2026-01-14 dep EXS676 B738 LEPA Palma de Mallorca 07:50 28200 28339 true 22525655ebd58a24 Channex six seven six
+EGKK 2026-01-14 arr BAW2269 A320 LEZL Seville 19:30 -16200 -16360 true 78b8f4bc87d56381 Speedbird two two six niner
+EGKK 2026-01-14 dep BAW2270 A320 LEZL Seville 06:40 24000 27438 true 78b8f4bc87d56381 Speedbird two two seven zero
+EGKK 2026-01-14 arr VLG8855 A20N LEBL Barcelona 19:25 -16500 -16172 true 15d05b54887184e3 Vueling eight eight five five
+EGKK 2026-01-14 dep VLG8856 A20N LEBL Barcelona 09:05 32700 32854 true 15d05b54887184e3 Vueling eight eight five six
+EGKK 2026-01-14 arr EZY8713 A320 EGAA Belfast International 19:35 -15900 -15915 true 2cc5a1af61cac212 Easy eight seven one three
+EGKK 2026-01-14 dep EZY8714 A320 EGAA Belfast International 07:45 27900 28254 true 2cc5a1af61cac212 Easy eight seven one four
+EGKK 2026-01-14 arr EZY8623 A319 LIRN Naples 19:30 -16200 -15874 true 8794c5dd3bb72e83 Easy eight six two three
+EGKK 2026-01-14 dep EZY8624 A319 LIRN Naples 06:45 24300 24592 true 8794c5dd3bb72e83 Easy eight six two four
+EGKK 2026-01-14 arr EZY8421 A21N LPPT Lisbon 19:50 -15000 -14970 true facadd34393e835f Easy eight four two one
+EGKK 2026-01-14 dep EZY8422 A21N LPPT Lisbon 07:20 26400 26671 true facadd34393e835f Easy eight four two two
+EGKK 2026-01-14 arr BAW2615 A320 LEMG Malaga 19:25 -16500 -14378 true f064a2551d021602 Speedbird two six one five
+EGKK 2026-01-14 dep BAW2614 A320 LEMG Malaga 13:20 48000 47848 true f064a2551d021602 Speedbird two six one four
+EGKK 2026-01-14 arr TOM651 B738 LEAL Alicante 19:10 -17400 -13312 true 09103fcceea96d92 Tomjet six five one
+EGKK 2026-01-14 dep TOM652 B738 LEAL Alicante 07:15 26100 26912 true 09103fcceea96d92 Tomjet six five two
+EGKK 2026-01-14 arr EZY8733 A320 EGAC Belfast City 20:30 -12600 -12641 true f672a24b6338820b Easy eight seven three three
+EGKK 2026-01-14 dep EZY8734 A320 EGAC Belfast City 08:50 31800 33357 true f672a24b6338820b Easy eight seven three four
+EGKK 2026-01-14 arr EZY8183 A20N LPFR Faro 20:30 -12600 -12578 true 079dcc8fcd842ee4 Easy eight one eight three
+EGKK 2026-01-14 dep EZY8184 A20N LPFR Faro 07:15 26100 26337 true 079dcc8fcd842ee4 Easy eight one eight four
+EGKK 2026-01-14 arr EZY8457 A320 LEZL Seville 20:25 -12900 -11669 true d26cd1cf0687246e Easy eight four five seven
+EGKK 2026-01-14 dep EZY8458 A320 LEZL Seville 07:40 27600 27938 true d26cd1cf0687246e Easy eight four five eight
+EGKK 2026-01-14 arr EZY8171 A21N LIRF Rome Fiumicino 21:00 -10800 -11026 true 7b007d62f2d26809 Easy eight one seven one
+EGKK 2026-01-14 dep EZY8172 A21N LIRF Rome Fiumicino 09:10 33000 33058 true 7b007d62f2d26809 Easy eight one seven two
+EGKK 2026-01-14 arr EZY8641 A320 LHBP Budapest 21:00 -10800 -11005 true d404898ed7c06d2d Easy eight six four one
+EGKK 2026-01-14 dep EZY8642 A320 LHBP Budapest 08:55 32100 32434 true d404898ed7c06d2d Easy eight six four two
+EGKK 2026-01-14 arr EZY8151 A20N LIRF Rome Fiumicino 20:45 -11700 -10506 true 702a75fa433da127 Easy eight one five one
+EGKK 2026-01-14 dep EZY8152 A20N LIRF Rome Fiumicino 08:50 31800 31958 true 702a75fa433da127 Easy eight one five two
+EGKK 2026-01-14 arr BAW2357 A320 EGPF Glasgow 21:10 -10200 -10309 true 36fe69fdd2506cb5 Speedbird two three five seven
+EGKK 2026-01-14 dep BAW2358 A320 EGPF Glasgow 09:10 33000 33134 true 36fe69fdd2506cb5 Speedbird two three five eight
+EGKK 2026-01-14 arr EZY8783 A320 EGNS Isle of Man 21:25 -9300 -9534 true fd85837541cf669d Easy eight seven eight three
+EGKK 2026-01-14 dep EZY8784 A320 EGNS Isle of Man 06:35 23700 24473 true fd85837541cf669d Easy eight seven eight four
+EGKK 2026-01-14 arr EXS669 B738 LSGG Geneva 21:20 -9600 -9393 true 5052364dccf4149f Channex six six niner
+EGKK 2026-01-14 dep EXS670 B738 LSGG Geneva 08:25 30300 33506 true 5052364dccf4149f Channex six seven zero
+EGKK 2026-01-14 arr EZY8385 A319 EKCH Copenhagen 21:25 -9300 -9333 true ef60fbf1a59fc645 Easy eight three eight five
+EGKK 2026-01-14 dep EZY8386 A319 EKCH Copenhagen 06:25 23100 23418 true ef60fbf1a59fc645 Easy eight three eight six
+EGKK 2026-01-14 arr BAW2217 A321 LSGG Geneva 21:00 -10800 -9164 true f7dfa876ba5a76ed Speedbird two two one seven
+EGKK 2026-01-14 dep BAW2218 A321 LSGG Geneva 08:05 29100 29333 true f7dfa876ba5a76ed Speedbird two two one eight
+EGKK 2026-01-14 arr WZZ4501 A321 LPFR Faro 21:25 -9300 -8945 true 5d05714be822b702 Wizz Air four five zero one
+EGKK 2026-01-14 dep WZZ4502 A321 LPFR Faro 08:05 29100 29100 true 5d05714be822b702 Wizz Air four five zero two
+EGKK 2026-01-14 arr WZZ4523 A21N LHBP Budapest 21:15 -9900 -8568 true bd2e93976047bad4 Wizz Air four five two three
+EGKK 2026-01-14 dep WZZ4524 A21N LHBP Budapest 09:10 33000 33180 true bd2e93976047bad4 Wizz Air four five two four
+EGKK 2026-01-14 arr EZY8205 A319 LIMC Milan Malpensa 21:50 -7800 -7947 true d4ef52d537a68c9c Easy eight two zero five
+EGKK 2026-01-14 dep EZY8206 A319 LIMC Milan Malpensa 07:30 27000 28581 true d4ef52d537a68c9c Easy eight two zero six
+EGKK 2026-01-14 arr EZY8539 A320 LFPG Paris Charles de Gaulle 21:40 -8400 -7759 true 8887cb414fe4b339 Easy eight five three niner
+EGKK 2026-01-14 dep EZY8540 A320 LFPG Paris Charles de Gaulle 08:10 29400 29697 true 8887cb414fe4b339 Easy eight five four zero
+EGKK 2026-01-14 arr BAW2209 B77W LPFR Faro 21:50 -7800 -7735 true 11ec90e906744461 Speedbird two two zero niner
+EGKK 2026-01-14 dep BAW2210 B77W LPFR Faro 08:35 30900 31157 true 11ec90e906744461 Speedbird two two one zero
+EGKK 2026-01-14 arr BAW2261 B772 LFMN Nice 22:05 -6900 -6983 true 556b7f5de3a8a771 Speedbird two two six one
+EGKK 2026-01-14 dep BAW2262 B772 LFMN Nice 07:00 25200 25897 true 556b7f5de3a8a771 Speedbird two two six two
+EGKK 2026-01-14 arr EZY8345 A320 EHAM Amsterdam 21:50 -7800 -6821 true 26f3a1142edc0956 Easy eight three four five
+EGKK 2026-01-14 dep EZY8346 A320 EHAM Amsterdam 07:50 28200 28443 true 26f3a1142edc0956 Easy eight three four six
+EGKK 2026-01-14 arr EZY8751 A21N EGPE Inverness 22:20 -6000 -6155 true 44ae7560e220db73 Easy eight seven five one
+EGKK 2026-01-14 dep EZY8752 A21N EGPE Inverness 09:10 33000 37257 true 44ae7560e220db73 Easy eight seven five two
+EGKK 2026-01-14 arr EZY8673 A21N EGPH Edinburgh 22:05 -6900 -5848 true 0885309a3d0a638f Easy eight six seven three
+EGKK 2026-01-14 dep EZY8674 A21N EGPH Edinburgh 06:00 21600 21600 true 0885309a3d0a638f Easy eight six seven four
+EGKK 2026-01-14 arr EZY8101 A20N LEBL Barcelona 22:20 -6000 -5687 true 03b9c5ddd47184d6 Easy eight one zero one
+EGKK 2026-01-14 dep EZY8102 A20N LEBL Barcelona 06:25 23100 23972 true 03b9c5ddd47184d6 Easy eight one zero two
+EGKK 2026-01-14 arr BAW2345 B772 EGJJ Jersey 22:10 -6600 -5495 true 20fbf7a55893ce9e Speedbird two three four five
+EGKK 2026-01-14 dep BAW2346 B772 EGJJ Jersey 09:15 33300 33543 true 20fbf7a55893ce9e Speedbird two three four six
+EGKK 2026-01-14 arr VLG8887 A320 LEBB Bilbao 22:25 -5700 -5417 true 368bc3599c2fc602 Vueling eight eight eight seven
+EGKK 2026-01-14 dep VLG8888 A320 LEBB Bilbao 08:10 29400 31584 true 368bc3599c2fc602 Vueling eight eight eight eight
+EGKK 2026-01-14 arr EZY8695 A21N EGPF Glasgow 22:30 -5400 -5109 true feb152dbf4c19597 Easy eight six niner five
+EGKK 2026-01-14 dep EZY8696 A21N EGPF Glasgow 06:10 22200 23205 true feb152dbf4c19597 Easy eight six niner six
+EGKK 2026-01-14 arr TOM687 B738 GMMX Marrakesh 22:35 -5100 -4899 true 9eef4a89badffcbc Tomjet six eight seven
+EGKK 2026-01-14 dep TOM688 B738 GMMX Marrakesh 06:25 23100 23251 true 9eef4a89badffcbc Tomjet six eight eight
+EGKK 2026-01-14 arr EZY8491 A21N LPPR Porto 23:20 -2400 -2094 true 82c31c0a9183b2c4 Easy eight four niner one
+EGKK 2026-01-14 dep EZY8492 A21N LPPR Porto 06:10 22200 22243 true 82c31c0a9183b2c4 Easy eight four niner two
+EGKK 2026-01-14 arr EZY8327 A319 GMMX Marrakesh 23:25 -2100 -1954 true c23f6d2c10bbd2b1 Easy eight three two seven
+EGKK 2026-01-14 dep EZY8328 A319 GMMX Marrakesh 07:20 26400 26400 true c23f6d2c10bbd2b1 Easy eight three two eight
+EGKK 2026-01-14 arr EZY8767 A319 EGPD Aberdeen 23:25 -2100 -1773 true 7f000672025b5e91 Easy eight seven six seven
+EGKK 2026-01-14 dep EZY8768 A319 EGPD Aberdeen 06:10 22200 22200 true 7f000672025b5e91 Easy eight seven six eight
+EGKK 2026-01-14 arr EZY8209 A20N LIMC Milan Malpensa 23:35 -1500 -1556 true 2696523192a88eee Easy eight two zero niner
+EGKK 2026-01-14 dep EZY8210 A20N LIMC Milan Malpensa 09:15 33300 34920 true 2696523192a88eee Easy eight two one zero
+EGKK 2026-01-14 arr VLG8851 A320 LEBL Barcelona 23:15 -2700 -1396 true baa6ffa0ded6b906 Vueling eight eight five one
+EGKK 2026-01-14 dep VLG8852 A320 LEBL Barcelona 07:20 26400 27382 true baa6ffa0ded6b906 Vueling eight eight five two
+EGKK 2026-01-14 arr EZY8235 A20N LSGG Geneva 23:35 -1500 -1357 true e2eade7778b944a8 Easy eight two three five
+EGKK 2026-01-14 dep EZY8236 A20N LSGG Geneva 06:05 21900 23281 true e2eade7778b944a8 Easy eight two three six
+EGKK 2026-01-14 arr EZY8401 A20N LFMN Nice 23:40 -1200 897 true 086807edd7c4519c Easy eight four zero one
+EGKK 2026-01-14 dep EZY8402 A20N LFMN Nice 08:30 30600 32317 true 086807edd7c4519c Easy eight four zero two
+EGKK 2026-01-14 arr UBT7 B789 KJFK New York JFK 06:20 22800 22971 false 6583e161906a3ff2 Longboat seven
+EGKK 2026-01-14 dep UBT8 B789 KJFK New York JFK 08:00 28800 28921 false 6583e161906a3ff2 Longboat eight
+EGKK 2026-01-14 arr CES551 A359 ZSPD Shanghai 06:45 24300 24451 false 7ddae4755b1ffb5e China Eastern five five one
+EGKK 2026-01-14 dep CES552 A359 ZSPD Shanghai 08:35 30900 35812 false 7ddae4755b1ffb5e China Eastern five five two
+EGKK 2026-01-14 arr BAW2277 B77W KMCO Orlando 06:25 23100 24548 false 3906c286168fedee Speedbird two two seven seven
+EGKK 2026-01-14 dep BAW2278 B77W KMCO Orlando 08:00 28800 29048 false 3906c286168fedee Speedbird two two seven eight
+EGKK 2026-01-14 arr NAX1301 B738 EKCH Copenhagen 07:05 25500 25481 false 5e813fb45cffcd77 Nor Shuttle one three zero one
+EGKK 2026-01-14 dep NAX1302 B738 EKCH Copenhagen 07:55 28500 29409 false 5e813fb45cffcd77 Nor Shuttle one three zero two
+EGKK 2026-01-14 arr UAE5 A388 OMDB Dubai 07:00 25200 25886 false 5e36892edb056806 Emirates five
+EGKK 2026-01-14 dep UAE6 A388 OMDB Dubai 08:40 31200 31412 false 5e36892edb056806 Emirates six
+EGKK 2026-01-14 arr QTR15 B789 OTHH Doha 07:10 25800 25938 false 95943108eac72ea0 Qatari one five
+EGKK 2026-01-14 dep QTR16 B789 OTHH Doha 08:50 31800 31800 false 95943108eac72ea0 Qatari one six
+EGKK 2026-01-14 arr TOM693 B789 KMCO Orlando 07:25 26700 30349 false 9380e5117e436ec5 Tomjet six niner three
+EGKK 2026-01-14 dep TOM694 B789 KMCO Orlando 09:00 32400 34849 false 9380e5117e436ec5 Tomjet six niner four
+EGKK 2026-01-14 arr AEA1001 B738 LEMD Madrid 09:05 32700 32881 false e23b5043b15184b3 Air Europa one zero zero one
+EGKK 2026-01-14 dep AEA1002 B738 LEMD Madrid 09:50 35400 35510 false e23b5043b15184b3 Air Europa one zero zero two
+EGKK 2026-01-14 arr EZY8062 A320 LEMG Malaga 09:15 33300 33660 false 70d56699ae422dca Easy eight zero six two
+EGKK 2026-01-14 dep EZY8063 A320 LEMG Malaga 10:00 36000 36233 false 70d56699ae422dca Easy eight zero six three
+EGKK 2026-01-14 arr THY1979 A321 LTFM Istanbul 09:25 33900 34501 false 95d358747b16b247 Turkish one niner seven niner
+EGKK 2026-01-14 dep THY1980 A321 LTFM Istanbul 10:15 36900 37004 false 95d358747b16b247 Turkish one niner eight zero
+EGKK 2026-01-14 arr EZY8237 A320 LSGG Geneva 09:50 35400 35565 false 9f2b384601323bd0 Easy eight two three seven
+EGKK 2026-01-14 dep EZY8238 A320 LSGG Geneva 10:35 38100 38440 false 9f2b384601323bd0 Easy eight two three eight
+EGKK 2026-01-14 arr BAW2321 B772 MMUN Cancun 09:55 35700 37169 false 36c9b95b3dafea2f Speedbird two three two one
+EGKK 2026-01-14 dep BAW2322 B772 MMUN Cancun 11:25 41100 41669 false 36c9b95b3dafea2f Speedbird two three two two
+EGKK 2026-01-14 arr TOM725 B788 MMUN Cancun 10:20 37200 37300 false fba9d1e30d85d2c5 Tomjet seven two five
+EGKK 2026-01-14 dep TOM726 B788 MMUN Cancun 12:05 43500 43857 false fba9d1e30d85d2c5 Tomjet seven two six
+EGKK 2026-01-14 arr EZY8347 A320 EHAM Amsterdam 10:45 38700 38594 false af5a617fb59d8189 Easy eight three four seven
+EGKK 2026-01-14 dep EZY8348 A320 EHAM Amsterdam 11:30 41400 41686 false af5a617fb59d8189 Easy eight three four eight
+EGKK 2026-01-14 arr EZY8103 A320 LEBL Barcelona 11:15 40500 40473 false 51b8ccabc5b5967c Easy eight one zero three
+EGKK 2026-01-14 dep EZY8104 A320 LEBL Barcelona 12:05 43500 44934 false 51b8ccabc5b5967c Easy eight one zero four
+EGKK 2026-01-14 arr SXS1631 B38M LTAI Antalya 10:10 36600 41210 false 2a0400a6df4acdcc Sunexpress one six three one
+EGKK 2026-01-14 dep SXS1632 B38M LTAI Antalya 11:00 39600 42710 false 2a0400a6df4acdcc Sunexpress one six three two
+EGKK 2026-01-14 arr EZY8131 A320 LEAL Alicante 11:50 42600 42442 false f80380df4e5d5e46 Easy eight one three one
+EGKK 2026-01-14 dep EZY8132 A320 LEAL Alicante 12:35 45300 46869 false f80380df4e5d5e46 Easy eight one three two
+EGKK 2026-01-14 arr EZY8207 A320 LIMC Milan Malpensa 11:45 42300 43183 false 98b4e2176f9d8850 Easy eight two zero seven
+EGKK 2026-01-14 dep EZY8208 A320 LIMC Milan Malpensa 12:35 45300 45539 false 98b4e2176f9d8850 Easy eight two zero eight
+EGKK 2026-01-14 arr THY1981 A333 LTFM Istanbul 12:25 44700 44508 false 8fadcf79fdec7c99 Turkish one niner eight one
+EGKK 2026-01-14 dep THY1982 A333 LTFM Istanbul 14:20 51600 51950 false 8fadcf79fdec7c99 Turkish one niner eight two
+EGKK 2026-01-14 arr UAE7 A388 OMDB Dubai 12:30 45000 44771 false 38df58dd28175064 Emirates seven
+EGKK 2026-01-14 dep UAE8 A388 OMDB Dubai 14:15 51300 56687 false 38df58dd28175064 Emirates eight
+EGKK 2026-01-14 arr RYR8351 B38M EIDW Dublin 12:35 45300 46804 false c2843d9288a73ee6 Ryanair eight three five one
+EGKK 2026-01-14 dep RYR8352 B38M EIDW Dublin 13:20 48000 48790 false c2843d9288a73ee6 Ryanair eight three five two
+EGKK 2026-01-14 arr RYR8301 B38M EIDW Dublin 12:10 43800 47182 false f8b3c0be486658af Ryanair eight three zero one
+EGKK 2026-01-14 dep RYR8302 B38M EIDW Dublin 13:00 46800 48682 false f8b3c0be486658af Ryanair eight three zero two
+EGKK 2026-01-14 arr EZY8185 A320 LPFR Faro 13:30 48600 48405 false 7be56ddff169dc38 Easy eight one eight five
+EGKK 2026-01-14 dep EZY8186 A320 LPFR Faro 14:15 51300 51300 false 7be56ddff169dc38 Easy eight one eight six
+EGKK 2026-01-14 arr EZY8211 A20N LIMC Milan Malpensa 13:30 48600 48729 false e3896b061cba9477 Easy eight two one one
+EGKK 2026-01-14 dep EZY8212 A20N LIMC Milan Malpensa 14:20 51600 51600 false e3896b061cba9477 Easy eight two one two
+EGKK 2026-01-14 arr EZY8423 A320 LPPT Lisbon 13:10 47400 48842 false 79b82caca46ec0cd Easy eight four two three
+EGKK 2026-01-14 dep EZY8424 A320 LPPT Lisbon 14:05 50700 52891 false 79b82caca46ec0cd Easy eight four two four
+EGKK 2026-01-14 arr QTR17 B788 OTHH Doha 14:10 51000 50897 false 17dc8aff3d477bfe Qatari one seven
+EGKK 2026-01-14 dep QTR18 B788 OTHH Doha 15:55 57300 57387 false 17dc8aff3d477bfe Qatari one eight
+EGKK 2026-01-14 arr EZY8153 A20N LIRF Rome Fiumicino 14:25 51900 52185 false 5fe4c7e666b4cbde Easy eight one five three
+EGKK 2026-01-14 dep EZY8154 A20N LIRF Rome Fiumicino 15:15 54900 56137 false 5fe4c7e666b4cbde Easy eight one five four
+EGKK 2026-01-14 arr UAE9 A388 OMDB Dubai 14:30 52200 52460 false f647c490b0297037 Emirates niner
+EGKK 2026-01-14 dep UAE10 A388 OMDB Dubai 16:25 59100 61005 false f647c490b0297037 Emirates one zero
+EGKK 2026-01-14 arr EZY8173 A20N LIRF Rome Fiumicino 14:40 52800 53025 false b239b8eb1e748fc6 Easy eight one seven three
+EGKK 2026-01-14 dep EZY8174 A20N LIRF Rome Fiumicino 15:25 55500 55500 false b239b8eb1e748fc6 Easy eight one seven four
+EGKK 2026-01-14 arr EZY8239 A21N LSGG Geneva 14:25 51900 53378 false f9ec73846bc60f32 Easy eight two three niner
+EGKK 2026-01-14 dep EZY8240 A21N LSGG Geneva 15:05 54300 54878 false f9ec73846bc60f32 Easy eight two four zero
+EGKK 2026-01-14 arr EZY8329 A319 GMMX Marrakesh 15:00 54000 54301 false 062eb203cdb3ce83 Easy eight three two niner
+EGKK 2026-01-14 dep EZY8330 A319 GMMX Marrakesh 15:50 57000 57084 false 062eb203cdb3ce83 Easy eight three three zero
+EGKK 2026-01-14 arr EZY8715 A320 EGAA Belfast International 15:25 55500 55366 false 2aaf3116d6fd3698 Easy eight seven one five
+EGKK 2026-01-14 dep EZY8716 A320 EGAA Belfast International 16:10 58200 58200 false 2aaf3116d6fd3698 Easy eight seven one six
+EGKK 2026-01-14 arr NAX1313 B38M ENGM Oslo 15:30 55800 56996 false 27f268ba5ae9df7a Nor Shuttle one three one three
+EGKK 2026-01-14 dep NAX1314 B38M ENGM Oslo 16:25 59100 59100 false 27f268ba5ae9df7a Nor Shuttle one three one four
+EGKK 2026-01-14 arr AUR601 E195 EGJB Guernsey 15:55 57300 57940 false eb9e8083c7797b2a Ayline six zero one
+EGKK 2026-01-14 dep AUR602 E195 EGJB Guernsey 16:45 60300 61275 false eb9e8083c7797b2a Ayline six zero two
+EGKK 2026-01-14 arr IBS3801 A320 LEMD Madrid 16:15 58500 58844 false c00475a2e85dae6a Iberexpres three eight zero one
+EGKK 2026-01-14 dep IBS3802 A320 LEMD Madrid 17:00 61200 61462 false c00475a2e85dae6a Iberexpres three eight zero two
+EGKK 2026-01-14 arr EZY8735 A320 EGAC Belfast City 16:20 58800 59045 false e640666cc83e2807 Easy eight seven three five
+EGKK 2026-01-14 dep EZY8736 A320 EGAC Belfast City 17:05 61500 61514 false e640666cc83e2807 Easy eight seven three six
+EGKK 2026-01-14 arr EZY8387 A21N EKCH Copenhagen 16:10 58200 59700 false 12d25c2901469f3c Easy eight three eight seven
+EGKK 2026-01-14 dep EZY8388 A21N EKCH Copenhagen 16:55 60900 61643 false 12d25c2901469f3c Easy eight three eight eight
+EGKK 2026-01-14 arr RYR8353 B738 EIDW Dublin 16:35 59700 59886 false 9d275f9ea6249c0c Ryanair eight three five three
+EGKK 2026-01-14 dep RYR8354 B738 EIDW Dublin 17:25 62700 63012 false 9d275f9ea6249c0c Ryanair eight three five four
+EGKK 2026-01-14 arr EZY8105 A320 LEBL Barcelona 16:50 60600 60403 false 777357a41f37048a Easy eight one zero five
+EGKK 2026-01-14 dep EZY8106 A320 LEBL Barcelona 17:30 63000 64759 false 777357a41f37048a Easy eight one zero six
+EGKK 2026-01-14 arr CCA851 A333 ZSPD Shanghai 16:45 60300 60449 false 93292e2817ca5ae4 Air China eight five one
+EGKK 2026-01-14 dep CCA852 A333 ZSPD Shanghai 18:40 67200 67200 false 93292e2817ca5ae4 Air China eight five two
+EGKK 2026-01-14 arr VLG8889 A320 LEBB Bilbao 17:25 62700 62632 false b712ac8df8e151e7 Vueling eight eight eight niner
+EGKK 2026-01-14 dep VLG8890 A320 LEBB Bilbao 18:15 65700 65700 false b712ac8df8e151e7 Vueling eight eight niner zero
+EGKK 2026-01-14 arr THY1983 A333 LTFM Istanbul 17:25 62700 62806 false cc01aeec4759a815 Turkish one niner eight three
+EGKK 2026-01-14 dep THY1984 A333 LTFM Istanbul 19:20 69600 69953 false cc01aeec4759a815 Turkish one niner eight four
+EGKK 2026-01-14 arr VLG8853 A21N LEBL Barcelona 17:40 63600 63939 false d172c4a4a8948cce Vueling eight eight five three
+EGKK 2026-01-14 dep VLG8854 A21N LEBL Barcelona 18:30 66600 66864 false d172c4a4a8948cce Vueling eight eight five four
+EGKK 2026-01-14 arr EZY8675 A21N EGPH Edinburgh 17:55 64500 64355 false ac42fa522163575b Easy eight six seven five
+EGKK 2026-01-14 dep EZY8676 A21N EGPH Edinburgh 18:40 67200 67319 false ac42fa522163575b Easy eight six seven six
+EGKK 2026-01-14 arr TAP1331 A21N LPPT Lisbon 18:00 64800 64839 false 75de1d7055ce9816 Air Portugal one three three one
+EGKK 2026-01-14 dep TAP1332 A21N LPPT Lisbon 18:50 67800 67876 false 75de1d7055ce9816 Air Portugal one three three two
+EGKK 2026-01-14 arr EZY8349 A21N EHAM Amsterdam 18:10 65400 65442 false f0aa806e2190b3a0 Easy eight three four niner
+EGKK 2026-01-14 dep EZY8350 A21N EHAM Amsterdam 18:55 68100 69287 false f0aa806e2190b3a0 Easy eight three five zero
+EGKK 2026-01-14 arr NAX1303 B38M EKCH Copenhagen 17:35 63300 66588 false 14237d10ea7a8bff Nor Shuttle one three zero three
+EGKK 2026-01-14 dep NAX1304 B38M EKCH Copenhagen 18:20 66000 68088 false 14237d10ea7a8bff Nor Shuttle one three zero four
+EGKK 2026-01-14 arr EZY8403 A320 LFMN Nice 18:20 66000 67071 false 2b127b212955e365 Easy eight four zero three
+EGKK 2026-01-14 dep EZY8404 A320 LFMN Nice 19:15 69300 70885 false 2b127b212955e365 Easy eight four zero four
+EGKK 2026-01-14 arr EZY8241 A20N LSGG Geneva 19:00 68400 68212 false 44e360a78b63b8e9 Easy eight two four one
+EGKK 2026-01-14 dep EZY8242 A20N LSGG Geneva 19:45 71100 71275 false 44e360a78b63b8e9 Easy eight two four two
+EGKK 2026-01-14 arr UAE11 A388 OMDB Dubai 19:30 70200 71914 false 9c0f72565cb9d4d4 Emirates one one
+EGKK 2026-01-14 dep UAE12 A388 OMDB Dubai 21:25 77100 77310 false 9c0f72565cb9d4d4 Emirates one two
+EGKK 2026-01-14 arr AFR1081 A320 LFPG Paris Charles de Gaulle 20:10 72600 72451 false 258f8ae4e7000bd4 Air France one zero eight one
+EGKK 2026-01-14 dep AFR1082 A320 LFPG Paris Charles de Gaulle 20:50 75000 75121 false 258f8ae4e7000bd4 Air France one zero eight two
+EGKK 2026-01-14 arr RYR8303 B738 EIDW Dublin 20:10 72600 72924 false 5dc3a0376c56f683 Ryanair eight three zero three
+EGKK 2026-01-14 dep RYR8304 B738 EIDW Dublin 20:55 75300 75658 false 5dc3a0376c56f683 Ryanair eight three zero four
+EGKK 2026-01-14 arr RYR8355 B738 EIDW Dublin 20:35 74100 73981 false ab84ff3270d0135a Ryanair eight three five five
+EGKK 2026-01-14 dep RYR8356 B738 EIDW Dublin 21:20 76800 80456 false ab84ff3270d0135a Ryanair eight three five six
+EGKK 2026-01-14 arr NAX1315 B38M ENGM Oslo 21:20 76800 76688 false 935c786fa2b23f60 Nor Shuttle one three one five
+EGKK 2026-01-14 dep NAX1316 B38M ENGM Oslo 22:05 79500 79500 false 935c786fa2b23f60 Nor Shuttle one three one six
+EGKK 2026-01-14 arr THY1985 A321 LTFM Istanbul 21:25 77100 78680 false b812cad6c762b38f Turkish one niner eight five
+EGKK 2026-01-14 dep THY1986 A321 LTFM Istanbul 22:10 79800 80180 false b812cad6c762b38f Turkish one niner eight six
+EGKK 2026-01-14 arr SEH411 A20N LGAV Athens 22:25 80700 81059 false 2e0901c53684d28b Air Crete four one one
+EGKK 2026-01-14 dep SEH412 A20N LGAV Athens 23:20 84000 84231 false 2e0901c53684d28b Air Crete four one two
+EGKK 2026-01-14 arr AUR603 E195 EGJB Guernsey 22:45 81900 82132 false 9cdbd9b6d3575d53 Ayline six zero three
+EGKK 2026-01-14 dep AUR604 E195 EGJB Guernsey 23:25 84300 84511 false 9cdbd9b6d3575d53 Ayline six zero four
