@@ -1,0 +1,350 @@
+# Native checklist (format: src/checklist.rs), from Vin Kaizen's Zibo 737 procedures (clist.txt v9.0), the phases the crew runs.
+
+engine_start:
+  - { say: "Contact atc, ifr / start-up clearance, done." }
+  - { say: "Sid, as given by atc, set." }
+  - { say: "Initial altitude, as given by atc, set." }
+  - { say: "Transponder code, as given by atc, set." }
+  - { say: "Transponder, alt off (ivao stby), set.", check: transponder, is: standby, act: false }
+  - { say: "Anti collision light, on, set.", check: lights.beacon, is: on }
+  - { say: "Left & right air conditioning packs, off, set.", check: packs, is: off }
+  - { say: "Normal checklist, before start (read out), compl.." }
+  - { note: "(start below the line till end)." }
+  - { say: "Contact atc, request push & start, done." }
+  - { say: "Start pushback, as given by atc, done." }
+  - { note: "Follow ground instructions for pushback." }
+  - { say: "Engine start switch 2, ground, set." }
+  - { say: "Engine 2 start lever, idle reaching 25% n2, set." }
+  - { note: "Monitor egt 2, cutoff if temp. >500 degrees." }
+  - { say: "Engine 2, stable (20% n1, ~420 deg., 65% n2), checked." }
+  - { say: "Engine start switch 1, ground, set." }
+  - { say: "Engine 1 start lever, idle reaching 25% n2, set." }
+  - { note: "Monitor egt 1, cutoff if temp. >500 degrees." }
+  - { say: "Engine 1, stable (20% n1, ~420 deg., 65% n2), checked." }
+
+before_taxi:
+  - { say: "Engine generators 1 & 2, on, set.", check: electrical.generators, is: on, act: false }
+  - { say: "Apu switch, off, set.", check: apu, is: off }
+  - { say: "Engine start switches 1 & 2, continues, set." }
+  - { note: "Left & right wiper, int / low / high (rain)." }
+  - { say: "Probe heats a & b, on, set.", check: pitot_heat, is: on, act: false }
+  - { note: "Engine anti ice, temp. <10 degrees & vis. moist." }
+  - { note: "Wing anti ice, temp. <10 degrees & vis. moist." }
+  - { say: "Left & right air conditioning pack, auto, set.", check: packs, is: on }
+  - { say: "Isolation valve, auto, set." }
+  - { say: "Apu bleed, off, set.", check: apu_bleed, is: off }
+  - { say: "Pushback crew, disconn. & showing bypass pin, checked." }
+  - { note: "(do nothing until you´ve seen bypass pin!)." }
+  - { say: "Take-off flaps, as calculated, set." }
+  - { say: "Flight control elevators, full forward, checked." }
+  - { say: "Flight control elevators, full back, checked." }
+  - { say: "Flight control ailerons, full left, checked." }
+  - { say: "Flight control ailerons, full right, checked." }
+  - { say: "Flight control rudder, full left, checked." }
+  - { say: "Flight control rudder, full right, checked." }
+  - { say: "Recall, sixpack push (captain or first officer), set." }
+  - { say: "Recall, sixpack all off (captain & first officer), checked." }
+  - { say: "Lower du, switch off engine page (mfd), set." }
+  - { note: "(it will popup during engine exceedance)." }
+  - { say: "Normal checklist, before taxi (read out), compl.." }
+
+before_takeoff:
+  - { say: "Contact atc, request takeoff clearance, done." }
+  - { say: "Position lights, strobe & steady, set.", check: lights.strobe, is: on, act: false }
+  - { say: "Left & right landing lights, on, set.", check: lights.landing, is: on, act: false }
+  - { say: "Autothrottle, active, set.", check: autothrottle, is: armed }
+  - { say: "Lnav or hdg sel, active, set." }
+  - { say: "Vnav, active, set." }
+  - { say: "Weather radar, on (captain, tfc dist. >5), set.", check: weather_radar, is: on }
+  - { say: "Transponder, ta/ra, set.", check: transponder, is: altitude, act: false }
+  - { say: "Yoke checklist, before take-off (read out), compl.." }
+
+cruise:
+  - { say: "Cabin lighting, cruise (passengers), set." }
+  - { say: "Cabin lighting, white medium (entry), set." }
+  - { say: "Pax announcement, level off message, played." }
+
+after_landing:
+  - { say: "Reverse levers, idle <60 knots, done." }
+  - { say: "Reverse levers, closed <30 knots, done." }
+  - { say: "Auto brakes, off, set.", check: autobrake, is: off }
+  - { say: "Manual brakes, till <15 knots, done." }
+  - { say: "Speedbrake lever, down (retract), set.", check: speedbrake, is: down }
+  - { say: "Flaps, up & clear runway, done.", check: flaps, is: up, act: false }
+  - { say: "Weather radar, off (captain), set.", check: weather_radar, is: off }
+  - { say: "Terrain radar, off (first officer), set." }
+  - { say: "Left & right landing lights, off, set.", check: lights.landing, is: off, act: false }
+  - { say: "Position lights, steady (off rwy), set.", check: lights.nav, is: on, act: false }
+  - { say: "Transponder, alt off (ivao stby), set.", check: transponder, is: standby, act: false }
+  - { say: "Contact atc, report rwy vacated, done." }
+
+before_landing:
+  - { note: "At 4,5 nm dme to runway." }
+  - { say: "Landing gear lever, down, set.", check: gear, is: down }
+  - { say: "Flaps, 15, set.", check: flaps, is: "15", act: false }
+  - { say: "Airspeed bug, flaps 15 speed, set." }
+  - { say: "Left & right wiper, int / low / high (in rain), as needed." }
+  - { say: "Engine start switches 1 & 2, continues, set." }
+  - { say: "Recall, sixpack push (captain or first officer), set." }
+  - { say: "Recall, sixpack all off (captain & first officer), checked." }
+  - { say: "Speedbrake lever, armed (green lights), checked.", check: speedbrake, is: armed }
+  - { say: "Auto brakes, set as calculated, checked.", check: autobrake, is: on }
+  - { say: "Landing gear, down (3 green), checked.", check: gear, is: down }
+  - { say: "Landing flaps, set 30 or 40 (green lights), set." }
+  - { say: "Airspeed bug, vref + 50% hw (approach), set." }
+  - { say: "Taxi light, on, set.", check: lights.taxi, is: on }
+  - { say: "A/p disengage, yoke button, set." }
+  - { say: "Autothrottle, off, set.", check: autothrottle, is: off }
+  - { note: "30 feet, check - close - hold." }
+
+climb:
+  - { say: "Landing gear lever, up, done.", check: gear, is: up }
+  - { say: "Left & right wiper, park position (max 200kts), set." }
+  - { note: "Engine anti ice, temp. <10 degrees & vis. moist." }
+  - { note: "Wing anti ice, temp. <10 degrees & vis. moist." }
+  - { say: "Autopilot, engage (above 1000 ft agl), set.", check: autopilot, is: on, act: false }
+  - { note: "For noise abatement departures." }
+  - { note: "Start flaps up speed & flaps retract acc." }
+  - { note: "Nadp1:   >3000 ft agl      nadp2:    > 800 ft agl." }
+  - { note: "Proc a:  >3000 ft agl      proc b:  >1000 ft agl." }
+  - { note: "Accelerate normal climb speed >3000 ft agl." }
+  - { say: "Airspeed bug, flaps up speed, set." }
+  - { say: "Flaps, retract (above each previous flap bug), done.", check: flaps, is: up, act: false }
+  - { say: "Landing gear lever, off, set." }
+  - { say: "Auto brakes, off, set.", check: autobrake, is: off }
+  - { say: "Engine start switches 1 & 2, auto, as needed." }
+  - { note: "(continues if <10 degrees & visible moisture)." }
+  - { say: "Cabin pressure & differential, within limits, checked." }
+  - { say: "Pressurization selector, auto, checked." }
+  - { say: "Apu bleed, off, checked.", check: apu_bleed, is: off }
+  - { say: "Engine bleed air 1 & 2, on, checked.", check: engine_bleeds, is: on }
+  - { say: "Left & right air conditioning pack, auto, checked.", check: packs, is: on }
+  - { say: "Isolation valve, auto, checked." }
+  - { say: "Left & right duct pressure, working, checked." }
+  - { say: "Contact atc, report height & position, done." }
+  - { note: "At transition alt. or if cleared to fl." }
+  - { say: "Altimeters, std (captain & first officer), set." }
+  - { say: "Standby altimeter, std, set." }
+  - { say: "Yoke checklist, after take-off (read out), compl.." }
+  - { say: "Chimes only, off (release cabin crew), set." }
+  - { say: "Cabin attend button, push (as crewinfo), set." }
+
+descent:
+  - { say: "Descend weather, max 3 flightlevel steps, set." }
+  - { say: "Descend weather, flightplan wind data, set." }
+  - { say: "Transition level, arrival, set." }
+  - { say: "Local qnh, arrival, set." }
+  - { say: "Isa deviation, flightplan avg isa, set." }
+  - { say: "Fix, destination landing runway (rw14l), set." }
+  - { say: "Distance rings, /10 /4.5 /xx nautical miles, set." }
+  - { note: "Xx (t/d-ring): ~(cruise fl/10*3)+10nm." }
+  - { say: "Decision altitute height, according chart, set." }
+  - { say: "Nav-frequencies, active (captain & first officer), set." }
+  - { say: "Courses, according approach chart, set." }
+  - { say: "Altitude bug, adjust till iaf clearance, set." }
+  - { note: "Use actual gw (fmc) + actual - landing fuel." }
+  - { say: "Landing performance calculation, done." }
+  - { say: "Landing flaps / vref, select 2* to fill flap/spd, set." }
+  - { say: "Auto brakes, as calculated, set.", check: autobrake, is: on }
+  - { say: "Yoke checklist, descent (read out, move knob), compl.." }
+  - { say: "Cabin lighting, landing (passengers), set." }
+  - { say: "Cabin lighting, white bright (entry), set." }
+  - { say: "Pax announcement, descent message (pa system), played." }
+  - { note: "Engine start switches 1 & 2, cont <10d. & v.m." }
+  - { note: "Engine anti ice, temp. <10 degrees & vis. moist." }
+  - { note: "Wing anti ice, temp. <10 degrees & vis. moist." }
+  - { note: "Passing 10 thousand feet." }
+  - { say: "Left & right landing lights, on, set.", check: lights.landing, is: on, act: false }
+  - { say: "Left & right runway turnoff lights, on, set." }
+  - { say: "Logo light, on (in darkness), as needed." }
+  - { say: "Fasten belts, on, set.", check: seat_belts, is: on }
+  - { note: "At the latest passing transition level." }
+  - { say: "Barometric ref. selector, hpa (capt. & first off.), set." }
+  - { say: "Barometric value, local qnh, set." }
+  - { say: "Standby altimeter barometric selector, hpa, set." }
+  - { say: "Standby altimeter, local qnh, set." }
+  - { say: "Standby altimeter, approach mode (for ils), set." }
+  - { say: "Yoke checklist, approach (read out, move knob), compl.." }
+  - { say: "Contact atc, report height, position, info, done." }
+  - { note: "Reaching initial approach fix (iaf)." }
+  - { note: "Without clearance, fly holding." }
+  - { say: "Pax announcement, prepare landing message, played." }
+
+preflight:
+  - { say: "Master lights, test (panel scan, all 2 bulps), checked." }
+  - { say: "Ap disconnect lights, test 1 (captain), checked." }
+  - { say: "Ap disconnect lights, test 2 (captain), checked." }
+  - { say: "Ap disconnect lights, test 1 (first officer), checked." }
+  - { say: "Ap disconnect lights, test 2 (first officer), checked." }
+  - { say: "Master lights, bright, set." }
+  - { say: "Pilot oxygen mask, normal test (push), checked." }
+  - { say: "Pilot oxygen mask, emergency test (hold), checked." }
+  - { say: "Main panel, backgr., afds lightning, bright, as needed." }
+  - { say: "Nose wheel steering, guard closed, checked." }
+  - { say: "Clock, utc time, checked." }
+  - { say: "Main panel du, norm, checked." }
+  - { say: "Lower du, norm, checked." }
+  - { say: "Weather radar, off, checked.", check: weather_radar, is: off }
+  - { say: "Airport button, on (captain), set." }
+  - { say: "Terrain radar, on (captain), set." }
+  - { say: "Barometric reference selector, in/hpa, set." }
+  - { say: "Barometric value, local qnh, set." }
+  - { say: "Minimums reference selector, baro, set." }
+  - { say: "Minimums, airport elevation + 1000 ft, set." }
+  - { note: "(minimum flap retraction altitude)." }
+  - { say: "First officer oxygen mask, normal test, checked." }
+  - { say: "First officer oxygen mask, emergency test (hold), checked." }
+  - { say: "Panel lightning, set, as needed." }
+  - { say: "Flap inhibit, guard closed, checked." }
+  - { say: "Gear inhibit, guard closed, checked." }
+  - { say: "Terrain inhibit, guard closed, checked." }
+  - { say: "Gwps ground sys, test, set." }
+  - { say: "Clock, utc time, set." }
+  - { say: "Main panel du, norm, checked." }
+  - { say: "Lower du, norm, checked." }
+  - { say: "Terrain radar, on (first officer, tfc dist. <40), set." }
+  - { say: "Weather radar, off, checked.", check: weather_radar, is: off }
+  - { say: "Barometric reference selector, in/hpa, set." }
+  - { say: "Barometric value, local qnh, set." }
+  - { say: "Minimums reference selector, baro, set." }
+  - { say: "Minimums, airport elevation + 1000 ft, set." }
+  - { say: "Service crews on ground, stop, set." }
+  - { say: "Fwd & aft service doors, closed, set." }
+  - { say: "Fwd entry door, open, set.", check: doors, is: open }
+  - { say: "Aft entry door, open, as needed." }
+  - { say: "Pax & cargo, flightplan (match zfw), load." }
+  - { say: "Flight leg, start, set." }
+  - { say: "Aircraft model, correct, checked." }
+  - { say: "Engine rating, correct, checked." }
+  - { say: "Nav data base, actual, checked." }
+  - { say: "Irs position, gps l data (next page), set." }
+  - { say: "Ref airport, origin icao, set." }
+  - { say: "Origin icao, set." }
+  - { say: "Destination icao, set." }
+  - { say: "Flight number, set." }
+  - { say: "Airways & waypoint routing, set." }
+  - { say: "Departure routing, runway & sid, selected." }
+  - { say: "Arrival routing, runway & star, selected." }
+  - { say: "Route, no discontinuities, checked." }
+  - { say: "Route, activated, set." }
+  - { say: "Zero fuel weight, flightplan (estimated), set." }
+  - { say: "Reserves, flightplan, roundup 0.1 tons, set." }
+  - { say: "Cost index, flightplan ci, set." }
+  - { say: "Trip cruise, flightplan altitude, set." }
+  - { say: "Cruise, flightplan toc wind, set." }
+  - { say: "Isa deviation, flightplan toc tdv, set." }
+  - { say: "Transition altitude, sid chart, set." }
+  - { say: "First waypoint after toc, new wind, set." }
+  - { note: "Set avg wind according flightplan." }
+  - { say: "Flt control a & b, guard closed, checked." }
+  - { say: "Spoiler a & b, guard closed, checked." }
+  - { say: "Alternate flaps position, guard closed, checked." }
+  - { say: "Yaw damper, on, set.", check: yaw_damper, is: on }
+  - { say: "Vhf nav transfer, normal, checked." }
+  - { say: "Irs transfer, normal, checked." }
+  - { say: "Fmc transfer, normal, checked." }
+  - { say: "Display source, auto, checked." }
+  - { say: "Display control panel, normal, checked." }
+  - { say: "Engine valve l & r, closed (dimmed), checked." }
+  - { say: "Spar valve l & r, closed (dimmed), checked." }
+  - { say: "Ctr fuel pumps l & r, on (> 453kgs), as needed." }
+  - { say: "Aft & fwd fuel pumps 1, on, set.", check: fuel_pumps, is: on }
+  - { say: "Fwd & aft fuel pumps 2, on, set." }
+  - { say: "Crossfeed valve, set open & light dimmed, checked." }
+  - { say: "Crossfeed valve, set closed & light off, checked." }
+  - { say: "Electrical ac switch, apu gen, set." }
+  - { say: "Battery, guard closed, checked." }
+  - { say: "Standby power, guard closed, checked." }
+  - { say: "Disconnect gen. drives, guards closed, checked." }
+  - { say: "Supply switch, normal, checked." }
+  - { say: "Exhaust switch, normal, checked." }
+  - { say: "Emergency exit lights, guard closed, checked." }
+  - { say: "Fasten belts, on (if refueling completed), set.", check: seat_belts, is: on }
+  - { say: "Left side & fwd window heats, on, set." }
+  - { say: "Right side & fwd window heats, on, set." }
+  - { say: "Engine hydraulic pumps 1 & 2, on, checked." }
+  - { say: "Electric hydraulic pumps a & b, on, checked.", check: hydraulic_pumps, is: on }
+  - { say: "System hyd press > 2800 psi, quantity > 76%, checked." }
+  - { say: "Display, eng (engine page), set." }
+  - { say: "Cabin diff pressure, 0 psi, checked." }
+  - { say: "Cabin alt, indicates airport altitude, checked." }
+  - { say: "Cabin climb, indicates 0, checked." }
+  - { say: "Trim air, on, set." }
+  - { note: "To get a consistent cabin temp." }
+  - { say: "Fwd cab selector, auto or set (aim 28 deg.), as needed." }
+  - { say: "Cont cab selector, turn left (fwd cab -1), set." }
+  - { say: "Aft cab selector, turn right (fwd cab +1), set." }
+  - { say: "Left & right recirc fans, auto, checked." }
+  - { say: "Left & right air conditioning pack, auto, set.", check: packs, is: on }
+  - { say: "Isolation valve, open, checked." }
+  - { say: "Engine bleed air 1 & 2, on, checked.", check: engine_bleeds, is: on }
+  - { say: "Apu bleed, off (on if apu is running), checked." }
+  - { say: "Flight altitude indicator, cruise altitude, set." }
+  - { say: "Landing altitude indicator, rwy elevation, set." }
+  - { note: "(round rwy elevation to nearest +-50 ft)." }
+  - { say: "Pressurization mode selector, auto, set." }
+  - { say: "Wheel well light, off, checked." }
+  - { say: "Wing light, off, checked." }
+  - { say: "Anti collision light, off, checked.", check: lights.beacon, is: off }
+  - { say: "Position lights, steady, checked.", check: lights.nav, is: on, act: false }
+  - { say: "Logo light, on (in darkness), as needed." }
+  - { say: "Ignition select, right position, checked." }
+  - { say: "Engine start switches 1 & 2, auto, checked." }
+  - { say: "Taxi light, off, checked.", check: lights.taxi, is: off }
+  - { say: "Left & right runway turnoff lights, off, checked." }
+  - { say: "Left & right landing lights, off, checked.", check: lights.landing, is: off, act: false }
+  - { note: "Set mcp for departure (rawdata)." }
+  - { say: "Course 1 & 2, to sid-vor, set." }
+  - { say: "Captain flight director, on, set.", check: flight_director, is: on }
+  - { say: "First officer flight director, on, set." }
+  - { say: "Autopilot disengage bar, up, checked." }
+  - { say: "Autopilots, all off, checked." }
+  - { say: "Bank angle below fl300, 25 degrees, set." }
+  - { say: "Departure heading, according charts, set." }
+  - { say: "Initial climb clearance, according charts, set." }
+  - { say: "Standby altimeter baro. select., in/hpa, set." }
+  - { say: "Standby altimeter, local qnh, set." }
+  - { say: "Standby rmi, adf / vor (rawdata backup), as needed." }
+  - { say: "N1 set selector, auto, checked." }
+  - { say: "Spd ref selector, auto, checked." }
+  - { say: "Auto brakes, rto, set.", check: autobrake, is: rto }
+  - { say: "Auto brakes annunciator, unilluminates, checked." }
+  - { say: "Fuel flow, reset then rate, set." }
+  - { say: "Initial com-frequencies, according charts, tuned." }
+  - { say: "Nav-frequencies, active & passive (rawdata), tuned." }
+  - { say: "Adf-frequencies, active & passive (rawdata), as needed." }
+  - { say: "Initial transponder code, 2000, set." }
+  - { note: "Transponder switches, booth 1 (not modeled)." }
+  - { say: "Mic selectors, 1-vhf (capt.) & 2-vhf (first off.), set." }
+  - { say: "Flight deck door, closed, checked." }
+
+shutdown:
+  - { say: "Parking brake, pulled (active), set.", check: park_brake, is: on }
+  - { say: "Engine start levers 1 & 2, cutoff, done.", check: start_levers, is: cutoff }
+  - { say: "Anti collision lights, off (if n1 <20%), set.", check: lights.beacon, is: off }
+  - { say: "Initial transponder code, 2000, set." }
+  - { say: "Transponder, standby, set.", check: transponder, is: standby, act: false }
+  - { say: "Flight deck door, open, done." }
+  - { note: "If gate power available." }
+  - { say: "Ac ground power, on, set." }
+  - { note: "If not connect to gpu." }
+  - { say: "Gpu ground service, connected, set." }
+  - { say: "Ac ground power, on, set." }
+  - { say: "Apu, off, set.", check: apu, is: off }
+  - { say: "Left & right wiper, park position, set." }
+  - { say: "Chimes only, off (release cabin crew), set." }
+  - { say: "Fasten belts, off, set.", check: seat_belts, is: off }
+  - { say: "Electric hydraulic pumps a & b, off, set.", check: hydraulic_pumps, is: off }
+  - { say: "Isolation valve, open, set." }
+  - { say: "Cabin lighting, white bright (passengers), set." }
+  - { say: "Fwd entry door, open, set.", check: doors, is: open }
+  - { say: "Aft entry door, open, as needed." }
+  - { say: "Fwd & aft cargo doors, open, set." }
+  - { say: "Reminder, stop tracking client, done." }
+  - { say: "Pax & cargo, total 0 (efb, loadsheet), unload." }
+  - { say: "Flight leg, terminate, set." }
+  - { say: "Aft entry door, closed, set." }
+  - { say: "Fwd & aft cargo doors, closed, as needed." }
+  - { note: "Opened:  activates turnaround." }
+  - { note: "Closed:  continue to c&d shutdown." }
+  - { say: "Normal checklist, shutdown (read out), compl.." }

@@ -109,7 +109,6 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("flow::ACTIVE", 'L'),
     ("flow::DETAIL", 'L'),
     ("flow::LISTS", 'A'),
-    ("flow::OVERRIDES", 'A'),
     ("flow::PROPOSAL", 'F'),
     ("flow::REPLY", 'L'),
     ("flow::RUN", 'L'),

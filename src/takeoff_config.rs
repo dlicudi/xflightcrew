@@ -606,7 +606,7 @@ async fn flaps_arrive(xp: &dyn XPlane, want: f64) -> bool {
 
 /// The BEFORE TAKEOFF list, audited as a Monitor flow once the roll has
 /// begun: the brakes are off and the transponder at ALT by then, the takeoff's
-/// last two items, so the airframe's own list (XChecklist) cross-checks what
+/// last two items, so the airframe's own list cross-checks what
 /// the takeoff set, read-only, ONE line at its end (`flow::summary_line`).
 /// EGPH 2026-09-21: the phase tracker's flight begins at the roll, so no list
 /// ever audited the takeoff configuration and an armed speedbrake reached
@@ -995,23 +995,17 @@ mod tests {
     /// window) as four discrepancies, and a configured aircraft as none.
     #[test]
     fn the_before_takeoff_list_audits_the_autoflight() {
-        use crate::checklist::Item;
         let profile = crate::aircraft::load("boeing_737_800").unwrap();
-        let lists = crate::checklist::load(&profile).expect("the 737 checklist parses");
+        let lists = crate::checklist::load(&profile).expect("the 737 checklist loads");
         let idx = crate::flow::find_titled(&lists, "before takeoff").expect("section");
         let judge = |state: &[(&str, f64)]| -> Vec<String> {
             lists[idx]
                 .items
                 .iter()
-                .filter_map(|item| {
-                    let (dref, cond) = match item {
-                        Item::Act { cond, dataref, .. } | Item::Verify { cond, dataref, .. } => {
-                            (dataref.as_str(), cond)
-                        }
-                        _ => return None,
-                    };
-                    let v = state.iter().find(|(d, _)| *d == dref)?.1;
-                    (!cond.eval(v)).then(|| dref.to_string())
+                .flat_map(|item| item.terms())
+                .filter_map(|t| {
+                    let v = state.iter().find(|(d, _)| *d == t.dataref)?.1;
+                    (!t.holds(v)).then(|| t.dataref.clone())
                 })
                 .collect()
         };

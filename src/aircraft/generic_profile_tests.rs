@@ -72,7 +72,7 @@ P _engn/0/_type RCP_INJ
             ]
         );
         assert!(
-            p.checklist.is_none(),
+            !sim::paths::checklist_file(&p.id).exists(),
             "the 172's checklist is not this aircraft's"
         );
     }

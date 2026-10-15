@@ -236,6 +236,6 @@ lights:
   # behalf changes nothing another aircraft can see.
   - { key: roof, spoken: roof lights, dataref: laminar/b58/lighting/roof_L_on, also_datarefs: [laminar/b58/lighting/roof_R_on], auto_at_night: true }
 
-# No XChecklist file ships for this airframe, so there is no `checklist` /
-# `checklist_map` block and no `locations` — cockpit geography is answered from
-# a verified layout or not at all, never guessed.
+# No checklist ships for this airframe (no checklists/beechcraft_baron_58.yaml)
+# and no `locations`: cockpit geography is answered from a verified layout or
+# not at all, never guessed.

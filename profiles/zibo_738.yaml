@@ -1307,59 +1307,24 @@ flaps:
     - { label: "30", spoken: thirty,      ratio: 0.875, vfe_kts: 175.0 }
     - { label: "40", spoken: forty,       ratio: 1.0,   vfe_kts: 162.0 }
 
-# The checklist is the aircraft's OWN XChecklist (`clist.txt` in its folder,
-# Vin Kaizen's "real 737 full flight procedures", v9.0): read from the
-# installed aircraft, never copied here (it is not ours to ship). `acf:` is
-# resolved against the loaded .acf's folder at detection; a missing file is
-# said once and no lists run. About half its tests are compound
-# (`(generator_on[0]:1)&&(rel_genera0:0)&&...`): read whole, see
-# src/checklist.rs. Probed 2026-10-06: 359 of its 361 datarefs exist (the
-# two missing are BetterPushback's).
-checklist: acf:clist.txt
-# Only the map acts. The verify path's raw write is off: this aircraft's
-# stock datarefs are its plugin's OUTPUTS (a stock speedbrake_ratio write
-# sticks while the lever never moves; a flap_ratio write is put straight
-# back), so an unmapped item is read and confirmed, never written.
-checklist_map_only: true
-# The tools that work here per this profile, nothing else: the flaps,
-# speedbrake, gear, autobrake and MCP items stay reads (see above; the
-# tools themselves now step the flaps and speedbrake by command, but the
-# list's items are not mapped to them until flown).
-# - battery: the file tests the stock `battery_on[0]` (with the guard and
-#   its failure); the tool fires battery_dn and reads `battery_pos`.
-# - transponder: the knob `transponder_pos`, decoded by the shared stock
-#   ladder (1 standby, 5 altitude = TA/RA, the two values the file's
-#   single-knob items use; "1 OR 2" and the TA-only item name two terms and
-#   stay reads).
-# - lights: the file's beacon, nav, strobe (stock) and taxi (the Zibo's
-#   own switch) through the declared light commands. "Position lights,
-#   steady" is nav AND NOT strobe: two terms, a read.
-# NOT mapped (2026-10-06 review): `electrical/battery_on` (the stock battery
-# reads 1 with the Zibo's off, and the STANDBY POWER guard item would fire
-# the battery) and `transponder_pos` (the knob ladder is unprobed). Both read.
-checklist_map:
-  - { match: parking_brake_ratio,       action: parking_brake }
-  - { match: beacon_lights_on,          action: !light beacon }
-  - { match: navigation_lights_on,      action: !light nav }
-  - { match: strobe_lights_on,          action: !light strobe }
-  - { match: taxi_light_brightness_pos, action: !light taxi }
-# The tracker's phases and the syllabus's ramp lists, by the file's titles.
-# A phase split into parts runs as ONE list, the parts in order (the US/CA
-# variants, for a transition altitude at or above 18,000 ft, are not the
-# default). The file gates DESCENT (2/2) on passing 12,000 ft and LANDING
-# (2/2) on 250 ft radio; the tracker reads them with their (1/2), so a list
-# run at the top of descent finds the (2/2) items not yet due.
-checklist_flow:
-  preflight:      ["PREFLIGHT PREPARATION PROCEDURES (1/7)", "PREFLIGHT PREPARATION PROCEDURES (2/7)", "PREFLIGHT PREPARATION PROCEDURES (3/7)", "PREFLIGHT PREPARATION PROCEDURES (4/7)", "PREFLIGHT PREPARATION PROCEDURES (5/7)", "PREFLIGHT PREPARATION PROCEDURES (6/7)", "PREFLIGHT PREPARATION PROCEDURES (7/7)"]
-  engine_start:   "ENGINE START & PUSHBACK PROCEDURE"
-  before_taxi:    "BEFORE TAXI PROCEDURE"
-  before_takeoff: "BEFORE TAKEOFF PROCEDURE"
-  climb:          ["CLIMB PROCEDURE (1/2)", "CLIMB PROCEDURE (2/2)"]
-  cruise:         "CRUISE PROCEDURE (LEVEL OFF)"
-  descent:        ["DESCENT PROCEDURE (1/2)", "DESCENT PROCEDURE (2/2)"]
-  before_landing: ["LANDING PROCEDURE (1/2)", "LANDING PROCEDURE (2/2)"]
-  after_landing:  "AFTER LANDING PROCEDURE"
-  shutdown:       ["TRANSIT SHUTDOWN PROCEDURE (1/3)", "TRANSIT SHUTDOWN PROCEDURE (2/3)", "TRANSIT SHUTDOWN PROCEDURE (3/3)"]
+# The checklist's own reads (checklists/zibo_738.yaml) of the Zibo's
+# switches: its stock datarefs are its plugin's OUTPUTS, so its own items
+# act only through the tools that work here (park brake, beacon, taxi
+# light) and everything else is confirmed from the Zibo's own switch.
+checklist_states:
+  apu:             { datarefs: [laminar/B738/spring_toggle_switch/APU_start_pos], on: [1, 2], "off": 0 }
+  apu_bleed:       { datarefs: [laminar/B738/toggle_switch/bleed_air_apu_pos], on: 1, "off": 0 }
+  autobrake:       { datarefs: [laminar/B738/autobrake/autobrake_pos], rto: 0, "off": 1, on: [2, 9] }
+  autopilot:       { datarefs: [laminar/B738/autopilot/cmd_a_status], on: 1, "off": 0 }
+  autothrottle:    { datarefs: [laminar/B738/autopilot/autothrottle_arm_pos], armed: 1, "off": 0 }
+  doors:           { datarefs: [laminar/B738/annunciator/fwd_entry], open: 1, closed: 0 }
+  engine_bleeds:   { datarefs: [laminar/B738/toggle_switch/bleed_air_1_pos, laminar/B738/toggle_switch/bleed_air_2_pos], on: 1, "off": 0 }
+  flight_director: { datarefs: [laminar/B738/autopilot/flight_director_pos], on: 1, "off": 0 }
+  fuel_pumps:      { datarefs: [laminar/B738/fuel/fuel_tank_pos_lft1, laminar/B738/fuel/fuel_tank_pos_lft2], on: 1, "off": 0 }
+  gear:            { datarefs: [laminar/B738/controls/gear_handle_down], down: 1, up: 0 }
+  hydraulic_pumps: { datarefs: [laminar/B738/toggle_switch/electric_hydro_pumps1_pos, laminar/B738/toggle_switch/electric_hydro_pumps2_pos], on: 1, "off": 0 }
+  packs:           { datarefs: [laminar/B738/air/l_pack_pos, laminar/B738/air/r_pack_pos], on: [1, 2], "off": 0 }
+  pitot_heat:      { datarefs: [laminar/B738/toggle_switch/capt_probes_pos, laminar/B738/toggle_switch/fo_probes_pos], on: 1, "off": 0 }
 
 # Phase-expectation advisor on the Zibo's own switch positions.
 advisor:

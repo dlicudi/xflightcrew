@@ -851,7 +851,7 @@ impl Registry {
         // Checklists are NOT registered as one-shot tools — the copilot runs them
         // interactively (narrate + act + verify + call out the pilot's items),
         // which needs the voice, so the main loop intercepts the pick. They're
-        // interpreted from the airframe's XChecklist file (see [`crate::checklist`]).
+        // read from the airframe's own list (see [`crate::checklist`]).
 
         Self { tools }
     }

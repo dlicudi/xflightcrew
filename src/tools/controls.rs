@@ -17,10 +17,10 @@ const ELEV_TRIM: &str = crate::datarefs::ELEVATOR_TRIM;
 /// How much one "trim nose up/down" nudge moves the trim wheel.
 const TRIM_STEP: f64 = 0.10;
 /// Takeoff trim setting for the 172 — roughly neutral (the takeoff band).
-const TRIM_TAKEOFF: f64 = 0.0;
+pub(crate) const TRIM_TAKEOFF: f64 = 0.0;
 /// Half-width of the takeoff band: a trim further from [`TRIM_TAKEOFF`] than
 /// this is reset before an automated takeoff roll.
-const TRIM_TAKEOFF_TOL: f64 = 0.15;
+pub(crate) const TRIM_TAKEOFF_TOL: f64 = 0.15;
 
 /// Is the trim outside the takeoff band?
 pub fn trim_needs_reset(current: f64) -> bool {

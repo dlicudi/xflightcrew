@@ -284,38 +284,7 @@ pub(super) fn cessna_172sp() -> AircraftProfile {
             oil_press_max_psi: Some(90.0),
             stall_ref_weight_kg: None,
         }),
-        checklist: Some("checklists/cessna_172sp.txt".into()),
-        checklist_map: {
-            let m = |s: &str, a: ChecklistAction| ChecklistMapEntry {
-                match_: s.into(),
-                action: a,
-            };
-            use ChecklistAction::*;
-            vec![
-                m("parkbrake", ParkingBrake),
-                m("autopilot/autopilot_on", AutopilotOff),
-                m("electrical/battery_on", Electrical("battery".into())),
-                m("electrical/avionics_on", Electrical("avionics".into())),
-                m("electrical/generator_on", Electrical("alternator".into())),
-                m("pitot_heat_on", PitotHeat),
-                m("fuel_pump_on", FuelPump),
-                m("transponder_mode", Transponder),
-                m("fuel_tank_selector", FuelSelector),
-                m("flap_ratio", Flaps),
-                m("mixture_ratio", Mixture),
-                m("throttle_ratio", Throttle),
-                m("ignition_key", Ignition),
-                m("elevator_trim", PitchTrim),
-                m("taxi_light", Light("taxi".into())),
-                m("landing_lights", Light("landing".into())),
-                m("strobe_lights", Light("strobe".into())),
-                m("beacon_lights", Light("beacon".into())),
-                m("navigation_lights", Light("nav".into())),
-                m("nav_lights", Light("nav".into())),
-            ]
-        },
-        checklist_flow: Default::default(),
-        checklist_map_only: false,
+        checklist_states: Default::default(),
         altimeter: None,
         anti_ice: None,
         autoflight: None,
@@ -585,8 +554,8 @@ pub(super) fn cirrus_sr22() -> AircraftProfile {
         // OFF / LEFT / RIGHT — no "both" (low-wing twin tanks, fed one at a
         // time). Selector commands verified against the rustdecks deck. The
         // standard sim/cockpit2/fuel/fuel_tank_selector (0=off/1=left/2=right) is
-        // the readback the GoofyJP checklist trusts, so it both confirms a write
-        // and lets the checklist decode the file's `fuel_tank_selector:N` items.
+        // the readback, so it both confirms a write and reads the checklist's
+        // `fuel_selector` items.
         fuel_selector: Some(FuelSelectorProfile {
             readback: Some("sim/cockpit2/fuel/fuel_tank_selector".into()),
             positions: vec![
@@ -693,7 +662,6 @@ pub(super) fn cirrus_sr22() -> AircraftProfile {
             oil_press_max_psi: None,
             stall_ref_weight_kg: None,
         }),
-        checklist: Some("checklists/cirrus_sr22.txt".into()),
         // Lights — datarefs verified against the rustdecks SR22 deck; universal
         // on/off commands.
         lights: vec![
@@ -719,36 +687,7 @@ pub(super) fn cirrus_sr22() -> AircraftProfile {
                 "sim/lights/landing_lights_off",
             ),
         ],
-        // Acts on universal-dataref systems plus the now-wired boost pump,
-        // key-start ignition, pitch trim and the off/left/right fuel selector
-        // (decoded from the profile's position values). The dual battery/
-        // alternator stay call-out — their file conditions are compound `&&`.
-        checklist_map: {
-            let m = |s: &str, a: ChecklistAction| ChecklistMapEntry {
-                match_: s.into(),
-                action: a,
-            };
-            use ChecklistAction::*;
-            vec![
-                m("parkbrake", ParkingBrake),
-                m("transponder_mode", Transponder),
-                m("pitot_heat_on", PitotHeat),
-                m("throttle_ratio", Throttle),
-                m("ENGN_mixt", Mixture),
-                m("flap_handle", Flaps),
-                m("avionics_on", Electrical("avionics".into())), // batteries are compound → call-out
-                m("nav_lights", Light("nav".into())),
-                m("strobe_lights", Light("strobe".into())),
-                m("landing_lights", Light("landing".into())),
-                m("boost_pump", FuelPump), // laminar/sr22/switch/boost_pump → set_fuel_pump
-                m("ignition_key", Ignition), // actuators/ignition_key: 4=start, 0=off
-                m("ignition_on", Ignition), // mag test: 1=R, 2=L, 3=both
-                m("elevator_trim", PitchTrim), // "set T/O" → centre (not ail_trim)
-                m("fuel_tank_selector", FuelSelector), // 0=off/1=left/2=right
-            ]
-        },
-        checklist_flow: Default::default(),
-        checklist_map_only: false,
+        checklist_states: Default::default(),
         altimeter: None,
         anti_ice: None,
         autoflight: None,

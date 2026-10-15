@@ -391,26 +391,6 @@ flaps:
     - { label: "30", spoken: thirty,      ratio: 0.875, vfe_kts: 175.0, idle_decel_kts_s: 1.4 } # VERIFY
     - { label: "40", spoken: forty,       ratio: 1.0,   vfe_kts: 162.0, idle_decel_kts_s: 2.2 } # acf Vfe
 
-# The normal checklist (checklists/boeing_737_800.txt, written 2026-09-17 on
-# datarefs verified to exist on this aircraft). Section titles are the phase
-# keys, so the tracker's climb / descent / before landing / after landing
-# lists all resolve without an override.
-checklist: checklists/boeing_737_800.txt
-checklist_map:
-  - { match: parking_brake_ratio,       action: parking_brake }
-  - { match: transponder_mode,          action: transponder }
-  - { match: pitot_heat,                action: pitot_heat }
-  - { match: elevator_trim,             action: pitch_trim }
-  - { match: flap_ratio,                action: flaps }
-  - { match: throttle_ratio,            action: throttle }
-  - { match: taxi_light,                action: !light taxi }
-  - { match: landing_lights,            action: !light landing }
-  - { match: strobe_lights,             action: !light strobe }
-  - { match: beacon_on,                 action: !light beacon }
-  - { match: navigation_lights,         action: !light nav }
-  - { match: electrical/generator_on,   action: !electrical generators }
-  - { match: electrical/battery_on,     action: !electrical battery }
-
 # Phase-expectation advisor: the SOP table, the MD-82's on stock switches.
 advisor:
   - dataref: sim/cockpit2/switches/yaw_damper_on

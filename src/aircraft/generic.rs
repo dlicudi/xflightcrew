@@ -37,12 +37,11 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
         .unwrap_or_else(|| icao.to_string());
     // `_name` is one token here (split on whitespace); good enough for a label.
     p.display_name = format!("{name} (no profile)");
-    p.checklist = None;
     // The surveyed autopilot decides the coupled ILS (`ils::coupled_allowed`).
     p.ils_coupled = None;
-    p.checklist_map = Vec::new();
-    p.checklist_flow = Default::default();
-    p.checklist_map_only = false;
+    // Its checklist is found by id (a generic one has none); the 172's
+    // switch reads are not this aircraft's either.
+    p.checklist_states = Default::default();
     p.bus_volts_nominal = None;
 
     let vs = kts("acf/_Vs_kts");
@@ -168,14 +167,13 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
 /// Names are `a/b/...` paths without whitespace; keys that carry prose or
 /// file paths are skipped, an `[index]` suffix is dropped.
 pub fn profile_references(p: &AircraftProfile) -> Vec<String> {
-    const SKIP_KEYS: [&str; 12] = [
+    const SKIP_KEYS: [&str; 11] = [
         "match",
         "say",
         "spoken",
         "label",
         "key",
         "kind",
-        "checklist",
         "id",
         "display_name",
         "voice",

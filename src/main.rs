@@ -1180,16 +1180,7 @@ fn preview_checklist(
         return conversation
             .choose_checklist(choices.iter().map(|cl| cl.title.clone()).collect(), now);
     };
-    let items = cl
-        .items
-        .iter()
-        .map(|item| match item {
-            checklist::Item::Narrate(line)
-            | checklist::Item::CallOut(line)
-            | checklist::Item::Act { say: line, .. }
-            | checklist::Item::Verify { say: line, .. } => line.clone(),
-        })
-        .collect();
+    let items = cl.items.iter().map(|item| item.say.clone()).collect();
     conversation.start_preview(cl.title.clone(), items, now)
 }
 

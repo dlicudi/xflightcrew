@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
 
-const BARO: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot";
+pub(crate) const BARO: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot";
 /// The stock altimeter-knob commands, one hundredth of an inch per press. A
 /// study-level xlua that owns the knob replaces THESE (the 737's handlers move
 /// its own memory dataref), which is what makes them the path that works
@@ -40,7 +40,7 @@ const DG_DRIFT: &str = "sim/cockpit/gyros/dg_drift_vac_deg";
 // Low-vacuum annunciator: the DG is vacuum-driven, so a sync won't hold if the
 // vacuum's failed — worth saying so rather than confirming a sync that'll drift.
 const LOW_VACUUM: &str = "sim/cockpit/warnings/annunciators/low_vacuum";
-const PITOT_HEAT: &str = "sim/cockpit2/ice/ice_pitot_heat_on_pilot";
+pub(crate) const PITOT_HEAT: &str = "sim/cockpit2/ice/ice_pitot_heat_on_pilot";
 // Command-driven so the panel switch animates (a raw write may not); PITOT_HEAT
 // is read back to confirm.
 const CMD_PITOT_HEAT_ON: &str = "sim/ice/pitot_heat0_on";

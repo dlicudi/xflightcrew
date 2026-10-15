@@ -550,30 +550,6 @@ advisor:
     say: Landing lights on.
     command: sim/lights/landing_lights_on
 
-# The XChecklist file, transcribed by hand from the POM's Checklists section
-# (p.40-60). Those pages are IMAGES, so there is no text to extract and no
-# third-party ELATES file shipped with this aircraft - every line was read off
-# the rendered pages. The two "TAXI LIGHTS" rows are deliberately dropped (see
-# the lights note above); everything else is the POM's own wording and order.
-checklist: checklists/cirrus_vision_sf50.txt
-checklist_map:
-  # Batteries and generators are called in PAIRS by the checklist ("BATTERY 1 -
-  # ON" immediately above "BATTERY 2 - ON"), and the interpreter strips the
-  # array index before matching, so one dataref cannot select one side anyway.
-  # Mapping both to the paired key is therefore the honest reading of the item
-  # AND the only one the machinery can express.
-  - { match: electrical/battery_on,   action: !electrical batteries }
-  - { match: electrical/generator_on, action: !electrical generators }
-  - { match: parking_brake_ratio,     action: parking_brake }
-  - { match: transponder_mode,        action: transponder }
-  - { match: fuel_tank_selector,      action: fuel_selector }
-  - { match: flap_ratio,              action: flaps }
-  - { match: throttle_ratio,          action: throttle }
-  - { match: pitot_heat_on,           action: pitot_heat }
-  - { match: landing_lights,          action: !light landing }
-  - { match: strobe_lights,           action: !light strobe }
-  - { match: navigation_lights,       action: !light nav }
-
 # Cockpit geography, from the POM's Tour of the Cockpit (p.15 overhead, p.28-29
 # center pedestal, p.30-32 autopilot panel), its checklist photographs (p.42-60)
 # and the aircraft's own view names. No live panel session yet, so nothing here

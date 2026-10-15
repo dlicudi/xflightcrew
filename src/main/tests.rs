@@ -445,10 +445,11 @@
         let now = std::time::Instant::now();
         let profile = super::aircraft::load("cessna_172sp").unwrap();
         let lists = super::checklist::parse(
-            "sw_checklist:Before Takeoff\nsw_item:Brakes|SET\nsw_item:Flaps|TEN\n\
-             sw_checklist:Before Landing\nsw_item:Mixture|RICH\n",
+            "before_takeoff: [{ say: Brakes set }, { say: Flaps ten }]\n\
+             before_landing: [{ say: Mixture rich }]\n",
             &profile,
-        );
+        )
+        .unwrap();
         let mut crew = Conversation::default();
         let line = super::preview_checklist("before", &lists, &mut crew, now);
         assert!(line.contains("Which checklist"), "{line}");
@@ -737,43 +738,23 @@
         let keys: Vec<&str> = p.lights.iter().map(|l| l.key.as_str()).collect();
         assert_eq!(keys, vec!["nav", "strobe", "landing"]);
         // The checklist is transcribed from the POM's image-only pages, and
-        // parses into runnable lists rather than a wall of call-outs.
-        let text = std::fs::read_to_string(p.checklist.as_ref().expect("a checklist"))
-            .expect("the checklist file exists");
-        let lists = super::checklist::parse(&text, &p);
+        // loads into runnable lists rather than a wall of call-outs.
+        let lists = super::checklist::load(&p).expect("the checklist loads");
         assert!(
             lists.len() >= 8,
             "one list per POM section: {}",
             lists.len()
         );
         // A checklist whose every line is a call-out is a transcription, not a
-        // copilot. The map must actually connect: the lights, gear, flaps,
-        // brake, transponder and electrical items are ours to perform.
-        use super::checklist::Item;
-        let acted = lists
-            .iter()
-            .flat_map(|c| &c.items)
-            .filter(|i| matches!(i, Item::Act { .. }))
-            .count();
+        // copilot: the lights, flaps, brake, transponder and electrical items
+        // are ours to perform.
+        let items = || lists.iter().flat_map(|c| &c.items);
+        let acted = items().filter(|i| i.action().is_some()).count();
+        assert!(acted >= 12, "only {acted} acted items");
+        // ...and no item calls for a taxi light, which this aircraft has not
+        // got: the two POM rows are dropped on purpose.
         assert!(
-            acted >= 12,
-            "the map must connect: only {acted} acted items"
-        );
-        // ...and the "AS REQUIRED" / "CHECK" rows must stay observe-only —
-        // writing a probe-heat item the POM leaves to the pilot is not ours.
-        let forced = lists.iter().flat_map(|c| &c.items).any(|i| {
-            matches!(i, Item::Verify { say, settable, .. }
-                     if *settable && say.to_ascii_lowercase().contains("as required"))
-        });
-        assert!(!forced, "an 'as required' item must never be auto-set");
-        // ...and no ITEM may call for a taxi light, which this aircraft has not
-        // got — the two POM rows are dropped on purpose. (The `#` header
-        // explains the omission, so only real item lines are checked.)
-        assert!(
-            !text
-                .lines()
-                .filter(|l| l.trim_start().starts_with("sw_item"))
-                .any(|l| l.to_ascii_lowercase().contains("taxi light")),
+            !items().any(|i| i.say.to_ascii_lowercase().contains("taxi light")),
             "the taxi-light rows must stay dropped"
         );
         // The fuel selector has no OFF position (POM p.29: AUTO/LEFT/RIGHT).
@@ -920,8 +901,8 @@
         let info = super::aircraft_info(&p, "what aircraft are we in").unwrap();
         assert!(info.contains("twin-engine jet"), "got: {info}");
         assert!(!info.contains("single-engine"));
-        // The MD-82 checklist parses.
-        assert!(crate::checklist::load(&p).is_ok());
+        // The MD-82 checklist loads.
+        assert!(!crate::checklist::load(&p).unwrap().is_empty());
     }
 
     #[test]

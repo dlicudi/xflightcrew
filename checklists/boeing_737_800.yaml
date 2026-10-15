@@ -1,0 +1,147 @@
+# Native checklist (format: src/checklist.rs), from the aircraft's own POM, its auto-start script and ch4dwick's community list, 2026-09-17.
+
+preflight:
+  - { note: "Preflight." }
+  - { say: "Parking brake, set.", check: park_brake, is: on }
+  - { say: "Battery, on.", check: electrical.battery, is: on }
+  - { say: "Ground power (if available), on.", check: ground_power, is: on }
+  - { say: "Apu, start.", check: apu, is: on }
+  - { say: "Apu generator, on.", check: apu_generator, is: on }
+  - { say: "Bus transfer, auto.", check: bus_tie, is: on }
+  - { say: "Fuel pumps left, on.", check: fuel_pumps, is: on }
+  - { say: "Fuel pumps center, on." }
+  - { say: "Fuel pumps right, on." }
+  - { say: "Apu bleed, on.", check: apu_bleed, is: on }
+  - { say: "Packs, auto.", check: packs, is: on }
+  - { say: "Electric hydraulic pumps, on.", check: hydraulic_pumps, is: on }
+  - { say: "Seat belt signs, on.", check: seat_belts, is: on }
+  - { say: "Navigation lights, on.", check: lights.nav, is: on }
+  - { say: "Logo lights, as required." }
+  - { say: "Flight plan, entered in the fmc." }
+  - { say: "Altimeters, set." }
+  - { note: "Preflight complete." }
+
+before_start:
+  - { note: "Before start." }
+  - { say: "Parking brake, set.", check: park_brake, is: on }
+  - { say: "Thrust levers, idle.", check: throttle, is: idle }
+  - { say: "Start levers, cutoff.", check: start_levers, is: cutoff }
+  - { say: "Flaps, up.", check: flaps, is: up }
+  - { say: "Speed brake, down detent.", check: speedbrake, is: down }
+  - { say: "Stabilizer trim, set for takeoff." }
+  - { say: "Transponder, standby.", check: transponder, is: standby }
+  - { say: "Beacon, on.", check: lights.beacon, is: on }
+  - { say: "Fuel quantity, checked." }
+  - { say: "Doors, closed." }
+  - { note: "Before start complete." }
+
+engine_start:
+  - { note: "Engine start, the aircraft's own sequence: say start the engines." }
+  - { say: "Packs, off for start.", check: packs, is: off }
+  - { say: "Engine 2 start switch, grd." }
+  - { say: "Engine 2 n2 rising, 25 percent." }
+  - { say: "Engine 2 start lever, idle." }
+  - { say: "Engine 2 stabilised, checked." }
+  - { say: "Engine 1 start switch, grd." }
+  - { say: "Engine 1 n2 rising, 25 percent." }
+  - { say: "Engine 1 start lever, idle.", check: start_levers, is: idle }
+  - { say: "Engine 1 stabilised, checked." }
+  - { say: "Generator 1, on.", check: electrical.generators, is: on }
+  - { say: "Generator 2, on.", check: electrical.generators, is: on }
+  - { say: "Probe heat, on.", check: pitot_heat, is: on }
+  - { say: "Engine bleeds, on.", check: engine_bleeds, is: on }
+  - { say: "Packs, auto.", check: packs, is: on }
+  - { say: "Apu bleed, off.", check: apu_bleed, is: off }
+  - { say: "Apu, off.", check: apu, is: off }
+  - { note: "Engine start complete." }
+
+before_taxi:
+  - { note: "Before taxi." }
+  - { say: "Generators, on.", check: electrical.generators, is: on }
+  - { say: "Probe heat, on.", check: pitot_heat, is: on }
+  - { say: "Anti-ice, as required." }
+  - { say: "Yaw damper, on.", check: yaw_damper, is: on }
+  - { say: "Flaps, 5 for takeoff.", check: flaps, is: takeoff, act: false }
+  - { say: "Stabilizer trim, set for takeoff.", check: pitch_trim, is: takeoff }
+  - { say: "Flight controls, checked." }
+  - { say: "Transponder, alt.", check: transponder, is: altitude, act: false }
+  - { note: "Before taxi complete." }
+
+before_takeoff:
+  - { note: "Before takeoff." }
+  - { say: "Flaps, 5.", check: flaps, is: takeoff, act: false }
+  - { say: "Stabilizer trim, in the green band.", check: pitch_trim, is: takeoff }
+  - { say: "Speed brake, down detent.", check: speedbrake, is: down }
+  - { say: "Flight directors, on.", check: flight_director, is: on }
+  - { say: "Autothrottle, armed.", check: autothrottle, is: armed }
+  - { say: "Mcp speed, v2.", check: speed_bug, is: v2 }
+  - { say: "Parking brake, released.", check: park_brake, is: off }
+  - { say: "Transponder, alt.", check: transponder, is: altitude, act: false }
+  - { say: "Strobe lights, on.", check: lights.strobe, is: on }
+  - { say: "Landing lights, on.", check: lights.landing, is: on }
+  - { say: "Engine start switches, cont." }
+  - { say: "Cabin, secure." }
+  - { note: "Before takeoff complete. v1 140, vr 145, v2 150 at mid weight, flaps 5." }
+
+climb:
+  - { note: "Climb." }
+  - { say: "Landing gear, up.", check: gear, is: up }
+  - { say: "Flaps, up on schedule.", check: flaps, is: up }
+  - { say: "Landing lights, off above 10,000." }
+  - { say: "Taxi light, off.", check: lights.taxi, is: off }
+  - { say: "Autopilot, engaged as required." }
+  - { say: "Altimeters, standard at transition." }
+  - { say: "Packs, auto.", check: packs, is: on }
+  - { note: "Climb complete." }
+
+cruise:
+  - { note: "Cruise." }
+  - { say: "Seat belt signs, as required." }
+  - { say: "Fuel, balanced and sufficient." }
+  - { say: "Engine instruments, checked." }
+  - { say: "Pressurisation, checked." }
+  - { note: "Cruise complete." }
+
+descent:
+  - { note: "Descent." }
+  - { say: "Seat belt signs, on.", check: seat_belts, is: on }
+  - { say: "Pressurisation, landing altitude set." }
+  - { say: "Approach briefing, complete." }
+  - { say: "Autobrake, as required." }
+  - { say: "Altimeters, qnh below transition." }
+  - { say: "Landing lights, on below 10,000." }
+  - { note: "Descent complete." }
+
+before_landing:
+  - { note: "Before landing." }
+  - { say: "Engine start switches, cont." }
+  - { say: "Speed brake, armed." }
+  - { say: "Landing gear, down.", check: gear, is: down }
+  - { say: "Flaps, 30 or 40.", check: flaps, is: landing, act: false }
+  - { say: "Landing lights, on.", check: lights.landing, is: on }
+  - { say: "Autopilot, off before touchdown." }
+  - { note: "Before landing complete. vref 145 mid weight, flaps 40." }
+
+after_landing:
+  - { note: "After landing." }
+  - { say: "Speed brake, down.", check: speedbrake, is: down }
+  - { say: "Flaps, up.", check: flaps, is: up }
+  - { say: "Landing lights, off.", check: lights.landing, is: off }
+  - { say: "Strobe lights, off.", check: lights.strobe, is: off }
+  - { say: "Transponder, standby.", check: transponder, is: standby }
+  - { say: "Apu, start if required." }
+  - { note: "After landing complete." }
+
+shutdown:
+  - { note: "Shutdown." }
+  - { say: "Parking brake, set.", check: park_brake, is: on }
+  - { say: "Start levers, cutoff.", check: start_levers, is: cutoff }
+  - { say: "Seat belt signs, off.", check: seat_belts, is: off }
+  - { say: "Beacon, off.", check: lights.beacon, is: off }
+  - { say: "Taxi light, off.", check: lights.taxi, is: off }
+  - { say: "Fuel pumps, off.", check: fuel_pumps, is: off }
+  - { say: "Probe heat, off.", check: pitot_heat, is: off }
+  - { say: "Apu, off or as required." }
+  - { say: "Electric hydraulic pumps, off.", check: hydraulic_pumps, is: off }
+  - { say: "Battery, off when leaving.", check: electrical.battery, is: off }
+  - { note: "Shutdown complete." }

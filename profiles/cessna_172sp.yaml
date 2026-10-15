@@ -137,37 +137,6 @@ reference:
   oil_press_min_psi: 50.0
   oil_press_max_psi: 90.0
 
-# XChecklist file to interpret (read-only; the de-facto X-Plane community format,
-# as used by the XChecklist plug-in). The copilot reads each item aloud, performs
-# the ones it owns, verifies what it can read, and calls out the pilot's items.
-checklist: checklists/cessna_172sp.txt
-
-# Maps the checklist file's datarefs to curated actions. `match` is a substring of
-# the file's dataref; the first matching entry wins, so order specific → general.
-# The *value* (on/off, mode, percent, notch) is derived from the file's condition
-# in code — this table only says which dataref drives which system.
-checklist_map:
-  - { match: parkbrake,                     action: parking_brake }
-  - { match: autopilot/autopilot_on,        action: autopilot_off }
-  - { match: electrical/battery_on,         action: !electrical battery }
-  - { match: electrical/avionics_on,        action: !electrical avionics }
-  - { match: electrical/generator_on,       action: !electrical alternator }
-  - { match: pitot_heat_on,                 action: pitot_heat }
-  - { match: fuel_pump_on,                  action: fuel_pump }
-  - { match: transponder_mode,              action: transponder }
-  - { match: fuel_tank_selector,            action: fuel_selector }
-  - { match: flap_ratio,                    action: flaps }
-  - { match: mixture_ratio,                 action: mixture }
-  - { match: throttle_ratio,                action: throttle }
-  - { match: ignition_key,                  action: ignition }
-  - { match: elevator_trim,                 action: pitch_trim }
-  - { match: taxi_light,                    action: !light taxi }
-  - { match: landing_lights,                action: !light landing }
-  - { match: strobe_lights,                 action: !light strobe }
-  - { match: beacon_lights,                 action: !light beacon }
-  - { match: navigation_lights,             action: !light nav }
-  - { match: nav_lights,                    action: !light nav }
-
 # Where things are, for "where's the X?" (answered from here, never guessed;
 # longest matching key wins). Laminar 172SP, verified against the cockpit
 # (2026-09-13, screenshot): the switch panel sits low on the pilot's side, and
@@ -236,12 +205,6 @@ locations:
   nav radio: "on the G1000: the NAV knob at the top left of either display, push 1-2 to swap active and standby"
   standby instruments: "the three round gauges low in the centre of the panel: airspeed, the vacuum attitude indicator, and the altimeter"
   cabin heat: "the two pull knobs at the far right of the panel, right of the flap lever: CABIN HT and CABIN AIR, both PULL ON"
-
-# Checklist flow (src/flow.rs): the section read at each phase boundary. The
-# defaults find this file's own titles by their words (CLIMB, CRUISE, DESCENT,
-# BEFORE LANDING, AFTER LANDING), so nothing is declared here. A file whose
-# titles differ maps them:
-#   checklist_flow: { climb: CLIMB, before_landing: APPROACH, after_landing: TAXI IN }
 
 # Phase-expectation advisor: standard VFR lighting discipline. Taxi light on
 # the ground; strobes whenever airborne; landing light for the takeoff and the

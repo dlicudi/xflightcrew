@@ -36,7 +36,7 @@ const GPU_VOLTS: &str = "sim/cockpit2/electrical/GPU_generator_volts";
 /// with an EXT PWR switch the pilot closes this themselves; the Baron models no
 /// such switch, so nobody was ever going to close it and the cart sat there
 /// humming to itself.
-const GPU_ON: &str = "sim/cockpit/electrical/gpu_on";
+pub(crate) const GPU_ON: &str = "sim/cockpit/electrical/gpu_on";
 /// Main bus volts — what the aircraft actually has to start with, and the only
 /// honest readback for "is there power".
 const BUS_VOLTS: &str = crate::datarefs::BUS_VOLTS;

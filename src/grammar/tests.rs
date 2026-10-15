@@ -2245,10 +2245,7 @@ fn every_checklist_tab_run_phrase_starts_its_own_list() {
         let Some(profile) = aircraft::load(&id) else {
             continue;
         };
-        // An `acf:` list ships with the aircraft, not here.
-        let Ok(lists) = crate::checklist::load(&profile) else {
-            continue;
-        };
+        let lists = crate::checklist::load(&profile).expect(&id);
         let registry = Registry::for_aircraft(&profile);
         for (i, cl) in lists.iter().enumerate() {
             // No phrase only for a title with no words to say: no Run button.
