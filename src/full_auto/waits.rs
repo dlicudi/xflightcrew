@@ -50,19 +50,26 @@ pub(super) static INBOUND_MADE: AtomicBool = AtomicBool::new(false);
 /// Is the inbound call owed now? Only on the DESTINATION's tower frequency
 /// (`home` is whoever the region last handed us to; at LINTO that was
 /// Tangier, mid-strait), inside [`INBOUND_CALL_NM`], and not already made. A
-/// zone challenge from that tower asks for it regardless of the distance.
+/// zone challenge from that tower asks for it regardless of the distance, and
+/// so does an instrument arrival whose call goes to APPROACH
+/// (`approach_first`, [`approach_first_khz`]): it checks in at the handoff,
+/// with the miles approach needs to get it down. EGKK-EGBB (2026-10-15,
+/// sortie 1792081624-full_auto): handed to Birmingham Approach, the call
+/// waited for 10 nm and was cleared to 2,500 ft from 9,800, 7.8 nm from the
+/// join.
 pub fn inbound_due(
     dest_khz: Option<i64>,
     home_khz: Option<i64>,
     dist_nm: f64,
     challenged: bool,
+    approach_first: bool,
     made: bool,
 ) -> bool {
     if made {
         return false;
     }
     match (dest_khz, home_khz) {
-        (Some(d), Some(h)) if d == h => challenged || dist_nm <= INBOUND_CALL_NM,
+        (Some(d), Some(h)) if d == h => challenged || approach_first || dist_nm <= INBOUND_CALL_NM,
         _ => false,
     }
 }
@@ -181,12 +188,18 @@ pub(super) async fn wait_enroute_working_the_radio(
                     (Ok(lat), Ok(lon)) => crate::nav::haversine_nm(lat, lon, dlat, dlon),
                     _ => f64::INFINITY,
                 };
-                if inbound_due(Some(dkhz), home, dist_nm, challenged, false) {
+                let approach_first = approach_first_khz(
+                    true,
+                    crate::party_line::active_approach_khz(),
+                    crate::party_line::own_instrument_arrival(callsign.as_deref().unwrap_or("")),
+                )
+                .is_some();
+                if inbound_due(Some(dkhz), home, dist_nm, challenged, approach_first, false) {
                     event(
                         "inbound_enroute",
                         json!({
                             "khz": dkhz, "dist_nm": (dist_nm * 10.0).round() / 10.0,
-                            "challenged": challenged,
+                            "challenged": challenged, "approach_first": approach_first,
                         }),
                     );
                     call_inbound(xp, ctx, voice, callsign, dkhz, true, arrival_runway().as_deref())

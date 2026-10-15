@@ -1230,8 +1230,39 @@ impl Station {
         }
         let geo = self.final_geometry(wx)?;
         let runway_spoken = atis::spoken_runway(&geo.ident);
-        let words =
-            self.instrument_approach_words(intent, ctx, &runway_spoken, geo.ils, geo.target_alt_ft)?;
+        // Too high to lose the height by the join on a 3 degree path: the
+        // descent and "expect" now, the clearance once it can be flown
+        // (`approach_watch_tick_for`). A missed approach climbs, cleared.
+        let to_join = self.desk.call.caller_at.map(|(lat, lon, _)| {
+            to_join_nm(
+                lat,
+                lon,
+                (geo.thr_lat, geo.thr_lon),
+                geo.course_deg,
+                geo.join_nm,
+            )
+        });
+        let held = *intent != tower::Intent::GoAround
+            && self
+                .desk
+                .call
+                .caller_at
+                .zip(to_join)
+                .is_some_and(|((_, _, alt), d)| !platform_reachable(alt, geo.target_alt_ft, d));
+        let (words, pending) = if held {
+            let (now, later) =
+                self.held_approach_words(ctx, &runway_spoken, geo.ils, geo.target_alt_ft);
+            (now, Some(later))
+        } else {
+            let words = self.instrument_approach_words(
+                intent,
+                ctx,
+                &runway_spoken,
+                geo.ils,
+                geo.target_alt_ft,
+            )?;
+            (words, None)
+        };
         *self.desk.strip.vectors.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // Inbound to the field on the runway approach named: published with
         // the clearance, so the crew's arrival sets up for THIS runway
@@ -1250,14 +1281,18 @@ impl Station {
                 runway_spoken: runway_spoken.clone(),
                 ils: geo.ils,
                 tower: self.tower_unit(ctx),
+                pending,
             });
         *self.desk.strip.approach_readback.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(words.readback);
         sim::blackbox::record(
             "atc",
             serde_json::json!({
-                "event": "approach_cleared", "runway": geo.ident, "ils": geo.ils,
+                "event": if held { "approach_held" } else { "approach_cleared" },
+                "runway": geo.ident, "ils": geo.ils,
                 "platform_ft": geo.target_alt_ft, "join_nm": (geo.join_nm * 10.0).round() / 10.0,
+                "alt_ft": self.desk.call.caller_at.map(|(_, _, a)| a.round()),
+                "to_join_nm": to_join.map(|d| (d * 10.0).round() / 10.0),
                 "missed": *intent == tower::Intent::GoAround,
                 "field_nm": self.desk.call.field_nm.map(|d| (d * 10.0).round() / 10.0),
             }),

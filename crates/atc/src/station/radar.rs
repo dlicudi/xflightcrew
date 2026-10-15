@@ -305,6 +305,33 @@ pub struct ApproachWatch {
     /// The tower handed to: its spoken name ("Gatwick Tower"), its
     /// frequency spoken in the dialect, and in kHz.
     pub(super) tower: (String, String, i64),
+    /// The approach clearance, held while the platform cannot be reached by
+    /// the join ([`platform_reachable`]): the check-in got the descent and
+    /// "expect", the tick says this once the height can be lost. `None`:
+    /// cleared.
+    pub(super) pending: Option<ApproachWords>,
+}
+
+/// Can an arrival at `alt_ft`, `to_join_nm` from the join, be down to the
+/// platform there on no more than a 3 degree path? A height that did not
+/// read is no reason to hold the clearance. Pure. EGKK-EGBB (2026-10-15,
+/// sortie 1792081624-full_auto): Birmingham Approach cleared the ILS 15
+/// "descend 2,500" at 9,800 ft, 7.8 nm from the join.
+pub(super) fn platform_reachable(alt_ft: f64, target_alt_ft: f64, to_join_nm: f64) -> bool {
+    !(alt_ft - target_alt_ft > nav::GLIDE_FT_PER_NM * to_join_nm)
+}
+
+/// From (`lat`, `lon`) to the join: `join_nm` out from the threshold on the
+/// extended centreline of a final flown on `course_deg`, nm.
+pub(super) fn to_join_nm(
+    lat: f64,
+    lon: f64,
+    thr: (f64, f64),
+    course_deg: f64,
+    join_nm: f64,
+) -> f64 {
+    let (jlat, jlon) = nav::project_latlon(thr.0, thr.1, (course_deg + 180.0) % 360.0, join_nm);
+    nav::haversine_nm(lat, lon, jlat, jlon)
 }
 
 /// One tick of the approach watch: silence until the flight is seen
@@ -321,13 +348,45 @@ pub(super) fn approach_watch_tick_for(
     track_deg: Option<f64>,
 ) -> Option<String> {
     let mut guard = flight.approach_watch.lock().unwrap_or_else(|e| e.into_inner());
-    let w = guard.as_ref()?;
+    let w = guard.as_mut()?;
     if state.on_ground {
         *guard = None;
         retire_approach_speed(flight);
         return None;
     }
     let (lat, lon) = state.position()?;
+    if w.pending.is_some() {
+        // Not cleared yet: the clearance once the height can be lost by the
+        // join, and never a handoff before it.
+        let to_join = to_join_nm(lat, lon, (w.thr_lat, w.thr_lon), w.course_deg, w.join_nm);
+        if platform_reachable(state.alt_ft, w.target_alt_ft, to_join) {
+            let words = w.pending.take()?;
+            let mut rb = flight
+                .approach_readback
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *rb = Some(match rb.take() {
+                Some(prev) => format!("{prev}, {}", words.readback),
+                None => words.readback,
+            });
+            drop(rb);
+            sim::blackbox::record(
+                "atc",
+                serde_json::json!({
+                    "event": "approach_cleared", "runway": w.runway_spoken, "held": true,
+                    "alt_ft": state.alt_ft.round(), "to_join_nm": (to_join * 10.0).round() / 10.0,
+                }),
+            );
+            return Some(words.line);
+        }
+        let dialect = crate::station::active_icao().map_or(Dialect::Icao, |(icao, ..)| {
+            crate::station::dialect_for(&icao)
+        });
+        let callsign = w.callsign.clone();
+        let extra =
+            approach_sequence_lines(flight, state, track_deg, None, dialect, Instant::now());
+        return with_sequence(&callsign, None, extra);
+    }
     let dist_thr = crate::nav::haversine_nm(lat, lon, w.thr_lat, w.thr_lon);
     let brg_thr = crate::nav::bearing_deg(lat, lon, w.thr_lat, w.thr_lon);
     let off_course = sim::angles::abs_diff_deg(brg_thr, w.course_deg);

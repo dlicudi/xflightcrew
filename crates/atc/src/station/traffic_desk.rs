@@ -292,18 +292,7 @@ impl Station {
     ) -> Option<ApproachWords> {
         let kind = if ils { "ILS" } else { "straight in" };
         let faa = self.dialect == Dialect::Faa;
-        let level = |ft: f64| {
-            if atis::is_flight_level(ft, ctx.transition_level_ft) {
-                (atis::spoken_flight_level(ft), String::new())
-            } else if faa {
-                (atis::spoken_alt(ft), tower::qnh_clause(ctx))
-            } else {
-                (
-                    format!("altitude {} feet", atis::spoken_alt(ft)),
-                    tower::qnh_clause(ctx),
-                )
-            }
-        };
+        let level = |ft: f64| self.approach_level(ctx, ft);
         let unit = format!("{} Approach", ctx.airport);
         match intent {
             tower::Intent::RequestLanding { .. } => {
@@ -355,6 +344,72 @@ impl Station {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// A level in approach's words: a flight level at or above the
+    /// transition, else the altitude ("altitude ... feet" outside the FAA)
+    /// with the pressure clause.
+    fn approach_level(&self, ctx: &tower::Ctx, ft: f64) -> (String, String) {
+        if atis::is_flight_level(ft, ctx.transition_level_ft) {
+            (atis::spoken_flight_level(ft), String::new())
+        } else if self.dialect == Dialect::Faa {
+            (atis::spoken_alt(ft), tower::qnh_clause(ctx))
+        } else {
+            (
+                format!("altitude {} feet", atis::spoken_alt(ft)),
+                tower::qnh_clause(ctx),
+            )
+        }
+    }
+
+    /// Our instrument arrival checking in too high to be cleared (the
+    /// platform out of reach by the join, [`platform_reachable`]): the
+    /// descent and "expect" the approach now, the clearance itself held for
+    /// the approach watch to say once the height can be lost. In the
+    /// field's dialect, as [`Station::instrument_approach_words`].
+    pub(super) fn held_approach_words(
+        &self,
+        ctx: &tower::Ctx,
+        runway: &str,
+        ils: bool,
+        platform_ft: f64,
+    ) -> (ApproachWords, ApproachWords) {
+        let kind = if ils { "ILS" } else { "straight in" };
+        let (alt, qnh) = self.approach_level(ctx, platform_ft);
+        let (cs, unit) = (&ctx.callsign, format!("{} Approach", ctx.airport));
+        if self.dialect == Dialect::Faa {
+            (
+                ApproachWords {
+                    line: format!(
+                        "{cs}, {unit}, descend and maintain {alt}{qnh}, expect {kind} runway \
+                         {runway} approach."
+                    ),
+                    readback: format!("descend and maintain {alt}"),
+                },
+                ApproachWords {
+                    line: format!(
+                        "{cs}, cleared {kind} runway {runway} approach, report established."
+                    ),
+                    readback: format!("cleared {kind} runway {runway} approach"),
+                },
+            )
+        } else {
+            (
+                ApproachWords {
+                    line: format!(
+                        "{cs}, {unit}, descend {alt}{qnh}, expect {kind} approach runway \
+                         {runway}."
+                    ),
+                    readback: format!("descending {alt}"),
+                },
+                ApproachWords {
+                    line: format!(
+                        "{cs}, cleared {kind} approach runway {runway}, report established."
+                    ),
+                    readback: format!("cleared {kind} approach runway {runway}"),
+                },
+            )
         }
     }
 
