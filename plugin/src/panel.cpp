@@ -1424,21 +1424,17 @@ protected:
     // (xcopilot/opt/checklist_view); a running flow's own verdicts replace
     // the live ones on its list. Run types the app's phrase for the section
     // on the typed line, so the grammar starts it like a spoken request.
+    // Four states only: DONE, NOT YET, HELD (its holder under the line), and
+    // "?" for a tested item with no reading; the rest (now, skipped, said,
+    // no test) say nothing, the NOW row its highlight.
     static void checklistState(char kind, char state, const char*& word, ImU32& col) {
         word = "";
         col = COL_DIM;
         switch (state) {
-            case 'p': word = "OK"; col = COL_GREEN; break;
-            case 'n': word = "NOT YET"; col = COL_AMBER; break;
-            case 'u': word = (kind == 'A' || kind == 'V') ? "?" : ""; break;
-            case 'R': word = "NOW"; col = COL_CYAN; break;
-            case 'D': word = "DONE"; col = COL_GREEN; break;
+            case 'p': case 'D': word = "DONE"; col = COL_GREEN; break;
+            case 'n': case 'X': case 'F': word = "NOT YET"; col = COL_AMBER; break;
             case 'H': word = "HELD"; col = COL_CYAN; break;
-            case 'X': word = "NOT AS LISTED"; col = COL_AMBER; break;
-            case 'S': word = "SKIPPED"; break;
-            case 'F': word = "FAILED"; col = COL_RED; break;
-            case 'U': word = "NO READ"; break;
-            case 'W': word = "SAID"; break;
+            case 'u': case 'U': word = (kind == 'A' || kind == 'V') ? "?" : ""; break;
             default: break;
         }
     }
@@ -1538,7 +1534,7 @@ protected:
         const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH;
         if (!ImGui::BeginTable("checklist_rows", 2, flags)) return;
         ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed,
-                                ImGui::CalcTextSize("NOT AS LISTED").x);
+                                ImGui::CalcTextSize("NOT YET").x);
         ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch);
         for (size_t i = 0; i < rows.size(); ++i) {
             const Row& r = rows[i];

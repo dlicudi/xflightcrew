@@ -121,6 +121,9 @@ static OVERRIDES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// A proposed section (index into the lists) and when it was offered.
 static PROPOSAL: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
 
+/// A phase boundary crossed while a list ran: started when it ends.
+static PENDING: Mutex<Option<String>> = Mutex::new(None);
+
 /// The running flow's flavour (`None` when no flow runs).
 static RUNNING: Mutex<Option<Flavour>> = Mutex::new(None);
 /// Why a running Crew flow was stood down, for its closing line.
@@ -145,6 +148,7 @@ pub fn install(profile: &AircraftProfile) -> Arc<Vec<Checklist>> {
     }));
     abort();
     *lock(&PROPOSAL) = None;
+    *lock(&PENDING) = None;
     *lock(&OVERRIDES) = overrides_for(profile, &lists);
     *lock(&LISTS) = Some(lists.clone());
     lists
@@ -436,9 +440,13 @@ impl Tracker {
         }
         self.taxi_in_since = None;
         let peak = m.peak_agl_ft;
+        // A pattern levels under the climb height: the model's level-off
+        // (its cruise phase, 30 s level) is the climb-out done. A C172's
+        // circuit at 1,000 ft never ran the list (LEMG, sortie
+        // 1791455961-full_auto, `bench/flight/lemg_c172_circuit.jsonl`).
         let climbing = held(
             &mut self.climbing_since,
-            s.vsi_fpm > 300.0 && s.agl_ft >= CLIMB_AGL_FT,
+            (s.vsi_fpm > 300.0 && s.agl_ft >= CLIMB_AGL_FT) || phase == Phase::Cruise,
             CLIMB_SECS,
         );
         // Under an automation the list audits the climb-out, so it waits for
@@ -591,6 +599,9 @@ impl InitWatch {
 /// The first cause is the one said. `true` when a flow was stood down.
 pub fn stand_down(why: StandDown) -> bool {
     *lock(&PROPOSAL) = None;
+    if matches!(why, StandDown::NewFlight(_)) {
+        *lock(&PENDING) = None;
+    }
     let running = *lock(&RUNNING);
     let applies = match why {
         StandDown::Mission(_) => running == Some(Flavour::Crew),
@@ -612,9 +623,18 @@ pub fn stood_down_line(title: &str, why: StandDown) -> String {
     }
 }
 
+/// A boundary crossed while a list runs is held for its end: ONE section,
+/// the newest. `true` when held. Pure.
+pub(crate) fn hold_for_end(pending: &mut Option<String>, section: &str, running: bool) -> bool {
+    if running {
+        *pending = Some(section.to_string());
+    }
+    running
+}
+
 /// The monitor crossed a phase boundary: run the section as the flying
 /// copilot's cross-check, or propose it to the pilot flying. Nothing when
-/// the file has no such section, or a flow is already running.
+/// the file has no such section; held for its end while a flow runs.
 pub fn phase_boundary(section: &str, config: &Config, voice: &Voice) {
     let Some(idx) = find_section(section) else {
         crate::blackbox::record(
@@ -623,7 +643,12 @@ pub fn phase_boundary(section: &str, config: &Config, voice: &Voice) {
         );
         return;
     };
-    if ACTIVE.load(SeqCst) {
+    // Under the lock the run's end takes it with, so none is lost between.
+    if hold_for_end(&mut lock(&PENDING), section, ACTIVE.load(SeqCst)) {
+        crate::blackbox::record(
+            "checklist",
+            json!({ "event": "pending", "section": section }),
+        );
         return;
     }
     let title = lists()
@@ -1156,7 +1181,14 @@ pub fn start(idx: usize, flavour: Flavour, config: Config, voice: Voice) -> bool
             DETAIL.clear();
             *lock(&WAITING) = None;
             *lock(&RUNNING) = None;
-            ACTIVE.store(false, SeqCst);
+            let next = {
+                let mut pending = lock(&PENDING);
+                ACTIVE.store(false, SeqCst);
+                pending.take()
+            };
+            if let Some(section) = next {
+                phase_boundary(&section, &config, &voice);
+            }
         })
         .map(|_| true)
         .unwrap_or_else(|_| {
@@ -1372,6 +1404,14 @@ async fn confirm(voice: &Voice, hazard: &str) -> Waited {
     out
 }
 
+/// A crew-pace beat ([`crate::crew_pace::beat_ms`]), cut short by a stop.
+async fn beat() {
+    let end = Instant::now() + Duration::from_millis(crate::crew_pace::beat_ms());
+    while !stopped() && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 pub(crate) fn item_line(item: &Item) -> &str {
     match item {
         Item::Narrate(t) | Item::CallOut(t) => t,
@@ -1446,6 +1486,10 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
     let init_seq = || async { xp.get_float(crate::tools::setup::INIT_SEQ).await.ok() };
     init.step(init_seq().await);
     for (i, item) in cl.items.iter().enumerate() {
+        // A crew's beat between items (the instructor waits on the pilot).
+        if i > 0 && flavour != Flavour::Instruct {
+            beat().await;
+        }
         if flavour == Flavour::Crew {
             if let Some(owner) = watch.step(mission_owner()) {
                 stand_down(StandDown::Mission(owner));
@@ -2129,13 +2173,15 @@ mod tests {
     }
 
     /// Recorded `state` records through the flight model and the tracker,
-    /// with the pavement's word per tick; the sections and when (+s).
+    /// with the pavement's word per tick; the sections and when (+s from
+    /// `t0`). The landing configuration is set from `configured_from` (+s).
     fn replay_tracker(
         text: &str,
+        t0: f64,
         automation: bool,
+        configured_from: f64,
         on_runway: impl Fn(f64) -> Option<bool>,
     ) -> Vec<(f64, &'static str)> {
-        let t0 = 1790624015.0;
         let start = Instant::now();
         let mut r = crate::flight::Replay::default();
         let mut tr = Tracker::default();
@@ -2149,7 +2195,7 @@ mod tests {
                 agl_ft: s.agl_ft,
                 vsi_fpm: s.vsi_fpm,
                 automation,
-                landing_config: true,
+                landing_config: s.t - t0 >= configured_from,
                 climb_config: true,
                 on_runway: if s.on_ground { on_runway(s.t - t0) } else { None },
             };
@@ -2167,12 +2213,67 @@ mod tests {
     #[test]
     fn the_after_landing_list_waits_for_the_vacate() {
         const ROLL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/flight/egbb15_rollout_to_vacate.jsonl"));
-        let blind = replay_tracker(ROLL, false, |_| None);
+        let blind = replay_tracker(ROLL, 1790624015.0, false, 0.0, |_| None);
         let at = blind.iter().find(|(_, n)| *n == "after landing").map(|(t, _)| *t);
         assert!(at.is_some_and(|t| t < 2850.0), "the recorded failure: {blind:?}");
-        let fed = replay_tracker(ROLL, false, |t| Some(t < 3005.4));
+        let fed = replay_tracker(ROLL, 1790624015.0, false, 0.0, |t| Some(t < 3005.4));
         let at = fed.iter().find(|(_, n)| *n == "after landing").map(|(t, _)| *t);
         assert!(at.is_some_and(|t| t >= 3005.4), "{fed:?}");
+    }
+
+    /// A boundary while a list runs is held, not dropped: one section, the
+    /// newest; none while nothing runs.
+    #[test]
+    fn a_boundary_during_a_list_is_held_for_its_end() {
+        let mut p = None;
+        assert!(!hold_for_end(&mut p, "climb", false));
+        assert_eq!(p, None);
+        assert!(hold_for_end(&mut p, "cruise", true));
+        assert!(hold_for_end(&mut p, "descent", true));
+        assert_eq!(p.as_deref(), Some("descent"), "the newest wins");
+        assert_eq!(p.take().as_deref(), Some("descent"));
+        assert_eq!(p, None, "taken once");
+    }
+
+    /// LEMG C172 circuit (sortie 1791455961-full_auto): a 1,000 ft pattern
+    /// (peak 1,080 ft AGL) never ran the CLIMB list. The model's level-off
+    /// runs it on the downwind; BEFORE LANDING waits for autoland's
+    /// configuration (the handoff, +427 s) under the automation and comes on
+    /// the held sink of the downwind descent for a pilot (the height rule
+    /// already fits a pattern); AFTER LANDING in the taxi in; no
+    /// cruise or descent list. The tracker does not own BEFORE TAKEOFF
+    /// (`takeoff_config` runs it at the arm).
+    #[test]
+    fn a_recorded_circuit_runs_its_lists_in_order() {
+        const CIRCUIT: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/bench/flight/lemg_c172_circuit.jsonl"
+        ));
+        let t0 = 1791457540.0;
+        let names = |f: &[(f64, &'static str)]| f.iter().map(|(_, n)| *n).collect::<Vec<_>>();
+        let at =
+            |f: &[(f64, &'static str)], s: &str| f.iter().find(|(_, n)| *n == s).map(|(t, _)| *t);
+        let auto = replay_tracker(CIRCUIT, t0, true, 427.0, |_| None);
+        assert_eq!(
+            names(&auto),
+            vec!["climb", "before landing", "after landing"],
+            "{auto:?}"
+        );
+        // After the 1,000 ft lights (+158.8), before the downwind descent.
+        assert!(
+            at(&auto, "climb").is_some_and(|t| t > 160.0 && t < 280.0),
+            "{auto:?}"
+        );
+        assert!(
+            at(&auto, "before landing").is_some_and(|t| (427.0..430.0).contains(&t)),
+            "{auto:?}"
+        );
+        let pilot = replay_tracker(CIRCUIT, t0, false, 0.0, |_| None);
+        assert_eq!(
+            names(&pilot),
+            vec!["climb", "before landing", "after landing"],
+            "{pilot:?}"
+        );
     }
 
     /// #174 (EGKK-EGBB): the DESCENT list came at +1750, 7,000 ft into an
@@ -2182,7 +2283,7 @@ mod tests {
     #[test]
     fn the_descent_list_runs_near_the_top_of_a_sawtooth_descent() {
         const TOD: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/flight/egkk_egbb_top_of_descent.jsonl"));
-        let fired = replay_tracker(TOD, true, |_| None);
+        let fired = replay_tracker(TOD, 1790624015.0, true, 0.0, |_| None);
         let at = fired.iter().find(|(_, n)| *n == "descent").map(|(t, _)| *t);
         assert!(at.is_some_and(|t| t < 1630.0), "{fired:?}");
         let cruise = fired.iter().find(|(_, n)| *n == "cruise").map(|(t, _)| *t);

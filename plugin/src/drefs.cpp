@@ -681,20 +681,23 @@ static void WriteChecklist(void*, void* in, int offset, int len) {
     g_checklist.len = len;
     g_checklist_at = XPLMGetElapsedTime();
 }
-// The tab's view, plugin to app (xcopilot/opt/checklist_view): "1|title"
-// while the tab was drawn in the last 2 s, "0|title" otherwise (title: the
-// pilot's pick, empty for the app's own). Built on each read, so a closed
-// window reads "0" without anyone writing it; the app reads live only
-// while it says "1". Read-only to the app: the panel is its one writer.
+// The tab's view, plugin to app (xcopilot/opt/checklist_view): "1|seq|title"
+// while the tab was drawn in the last 2 s, "0|seq|title" otherwise (title:
+// the pilot's pick, empty for the app's own; seq: bumped on every pick, so
+// the app can tell a new pick from one its tab has moved on from). Built
+// on each read, so a closed window reads "0" without anyone writing it; the
+// app reads live only while it says "1". Read-only to the app: the panel is
+// its one writer.
 static char g_checklist_pick[256] = {0};
+static unsigned g_checklist_pick_seq = 0;
 static double g_checklist_drawn_at = -1.0;
 static TextRef g_checklist_view = {{0}, 0};
 static XPLMDataRef g_checklist_view_dref = nullptr;
 static int ReadChecklistView(void* ref, void* out, int offset, int max) {
     const bool open = g_checklist_drawn_at >= 0.0
         && XPLMGetElapsedTime() - g_checklist_drawn_at < 2.0;
-    int n = std::snprintf(g_checklist_view.buf, sizeof g_checklist_view.buf, "%c|%s",
-                          open ? '1' : '0', g_checklist_pick);
+    int n = std::snprintf(g_checklist_view.buf, sizeof g_checklist_view.buf, "%c|%u|%s",
+                          open ? '1' : '0', g_checklist_pick_seq, g_checklist_pick);
     if (n < 0) n = 0;
     if (n > static_cast<int>(sizeof g_checklist_view.buf) - 1) n = static_cast<int>(sizeof g_checklist_view.buf) - 1;
     g_checklist_view.len = n;
@@ -1889,6 +1892,8 @@ bool checklist_fresh() {
 }
 void set_checklist_pick(const char* title) {
     std::snprintf(g_checklist_pick, sizeof g_checklist_pick, "%s", title);
+    // A pick in the combo is a new pick, even of the same title.
+    if (title[0] != '\0') ++g_checklist_pick_seq;
 }
 const char* checklist_pick() { return g_checklist_pick; }
 void note_checklist_drawn() { g_checklist_drawn_at = XPLMGetElapsedTime(); }
