@@ -57,7 +57,10 @@ fn westerly() -> Wx {
 fn on_the_centreline(nm: f64, alt_ft: f64) -> AircraftState {
     let r = &book_runways()[0];
     let (lat, lon) = crate::nav::project_latlon(r.lat_b, r.lon_b, r.heading_a_deg(), nm);
-    AircraftState::at_position(lat, lon, false, alt_ft)
+    AircraftState {
+        alt_ft,
+        ..AircraftState::at_position(lat, lon, false, 180.0)
+    }
 }
 
 /// 26L's final course, degrees true (landing westbound).
@@ -443,4 +446,87 @@ fn a_go_around_goes_back_to_approach_for_another() {
         crate::party_line::approach_watch_armed(),
         "watching the next approach"
     );
+}
+
+/// TOO HIGH TO CLEAR: EGKK-EGBB (2026-10-15, sortie 1792081624-full_auto),
+/// Birmingham Approach cleared the ILS 15 "descend 2,500" at 9,800 ft, 7.8
+/// nm from the join. A check-in that cannot lose its height by the join on
+/// a 3 degree path gets the descent and "expect ILS" only, and no handoff
+/// while the clearance is held; the watch clears the approach once the
+/// height can be lost, read back by the crew, and hands over as before.
+/// 25 nm out at 6,000 ft (the whole exchange above) is cleared at once.
+#[test]
+fn approach_holds_the_clearance_until_the_height_can_be_lost() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _retire = Retire;
+    for dialect in [Dialect::Icao, Dialect::Faa] {
+        let mut st = gatwick_with_approach();
+        st.set_dialect(dialect);
+        let r = say(
+            &mut st,
+            &on_the_centreline(12.0, 9800.0),
+            Service::Approach,
+            "Gatwick Approach, Speedbird one two three, inbound",
+        );
+        let (expect, readback, cleared, cleared_rb) = match dialect {
+            Dialect::Icao => (
+                "expect ILS approach runway two six left.",
+                "descending altitude two thousand seven hundred feet",
+                "cleared ILS approach runway two six left",
+                "cleared ILS approach runway two six left",
+            ),
+            Dialect::Faa => (
+                "expect ILS runway two six left approach.",
+                "descend and maintain two thousand seven hundred",
+                "cleared ILS runway two six left approach",
+                "cleared ILS runway two six left approach",
+            ),
+        };
+        assert!(
+            r.starts_with("Speedbird one two three, Gatwick Approach, descend")
+                && r.ends_with(expect),
+            "{r}"
+        );
+        assert!(!r.contains("cleared"), "{r}");
+        assert_eq!(
+            crate::party_line::take_approach_readback().as_deref(),
+            Some(readback)
+        );
+        assert!(crate::party_line::approach_watch_armed());
+        assert_eq!(
+            crate::party_line::clearance_runway().as_deref(),
+            Some("26L"),
+            "the crew still sets up for the runway approach named"
+        );
+        let tick = |s: &AircraftState| approach_watch_tick_for(&OWN_STRIP, s, Some(course()));
+        assert_eq!(
+            tick(&on_the_centreline(10.0, 9000.0)),
+            None,
+            "still too high"
+        );
+        assert_eq!(
+            crate::party_line::take_arrival_handoff(),
+            None,
+            "no handoff before the clearance"
+        );
+        assert_eq!(
+            tick(&on_the_centreline(12.0, 3500.0)),
+            Some(format!("{CS}, {cleared}, report established."))
+        );
+        assert_eq!(
+            crate::party_line::take_approach_readback().as_deref(),
+            Some(cleared_rb)
+        );
+        let line = tick(&on_the_centreline(9.0, 2900.0)).expect("handed over");
+        assert!(line.contains("contact Gatwick Tower"), "{line}");
+    }
+}
+
+/// The 3 degree rule itself: 318 ft a mile to the join; a height that did
+/// not read holds nothing.
+#[test]
+fn the_platform_is_reachable_on_a_three_degree_path() {
+    assert!(platform_reachable(5680.0, 2500.0, 10.0));
+    assert!(!platform_reachable(9800.0, 2500.0, 7.8));
+    assert!(platform_reachable(f64::NAN, 2500.0, 1.0));
 }

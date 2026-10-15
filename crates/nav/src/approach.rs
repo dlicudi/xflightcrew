@@ -148,6 +148,9 @@ pub fn resolve_proc_fixes(
     }
 }
 
+/// 3° glidepath, feet per nm (tan 3° × 6076).
+pub const GLIDE_FT_PER_NM: f64 = 318.0;
+
 /// Reconstruct a straight-in approach for `runway` from the airport's published
 /// DME fixes when the CIFP carries no APPCH records — the way a pilot flies the
 /// DME/TACAN approach off the chart. X-Plane ships terminal fixes named
@@ -168,8 +171,6 @@ pub fn reconstruct_approach(
     icao: &str,
     runway: &str,
 ) -> Vec<ProcLeg> {
-    /// 3° glidepath, feet per nm (tan 3° × 6076).
-    const GLIDE_FT_PER_NM: f64 = 318.0;
     let Some((thr_lat, thr_lon)) = runway_threshold(airport, runway) else {
         return Vec::new();
     };

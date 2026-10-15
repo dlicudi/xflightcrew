@@ -137,6 +137,7 @@ impl Station {
             .position()
             .zip(self.apt.position())
             .map(|((lat, lon), (flat, flon))| crate::nav::haversine_nm(lat, lon, flat, flon));
+        self.desk.call.caller_at = state.position().map(|(lat, lon)| (lat, lon, state.alt_ft));
         // An IFR clearance's runway is held for its departure only: airborne
         // it has been flown (or abandoned), and the pick is free again.
         // So is a runway start's strip (`start_strip`).

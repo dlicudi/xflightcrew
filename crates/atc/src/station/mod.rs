@@ -277,6 +277,11 @@ struct CallScratch {
     /// arrival that calls it from beyond [`TOWER_TAKES_ARRIVAL_NM`] to
     /// approach.
     field_nm: Option<f64>,
+    /// Where the caller is as it keys: latitude, longitude and altitude, ft
+    /// (`ctx_for_call`; `None` when its position did not read). Approach
+    /// clears an instrument arrival only from where the platform can be
+    /// reached by the join ([`platform_reachable`]).
+    caller_at: Option<(f64, f64, f64)>,
     /// The runway the arrival now calling named for itself, consumed by the
     /// pick that answers the call (`note_stated_runway`).
     stated_runway: Option<String>,
