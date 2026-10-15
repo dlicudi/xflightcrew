@@ -1,0 +1,469 @@
+# Hand-kept corrections for tools/routes/build.py. Keep it small: every
+# entry here is a fact the sources get wrong or do not have. Read by the
+# build's own YAML subset reader: comments, top-level sections, and one
+# flow map or scalar per entry.
+
+# Per ICAO airline code; any field given wins over Wikidata. Seeded
+# (2026-10-15) from crates/traffic/src/airlines.rs (telephony, types,
+# numbers: the widest of a code's constants, a range narrower than 900
+# widened to 1..999 so a global network fits, 1..9999 where
+# that still left rows without a number) and routes.rs `airline_name`
+# (name, iata). The rest are operators the brands below fly under.
+carriers:
+  AAL: {telephony: "American", types: [[A321, 30], [B738, 30], [A319, 10], [B772, 10], [B77W, 8], [B788, 6], [B789, 6]], numbers: [1, 9999]}
+  ACA: {telephony: "Air Canada", types: [[B789, 50], [B77W, 30], [B788, 20]], numbers: [1, 999]}
+  AEA: {telephony: "Air Europa", name: "Air Europa", iata: UX, types: [[B738, 60], [B38M, 25], [B789, 15]], numbers: [1000, 9999]}
+  AEE: {telephony: "Aegean", name: "Aegean", iata: A3, types: [[A20N, 60], [A21N, 40]], numbers: [1, 999]}
+  AFR: {telephony: "Air France", name: "Air France", iata: AF, types: [[A320, 25], [A321, 15], [A319, 10], [BCS3, 10], [B77W, 10], [B772, 5], [A359, 8], [B789, 5]], numbers: [1, 1999]}
+  ANE: {telephony: "Air Nostrum", name: "Air Nostrum", iata: YW, types: [[AT76, 70], [CRJ9, 30], [SF34, 0]], numbers: [8000, 8999]}
+  ASA: {telephony: "Alaska", types: [[B739, 50], [B738, 40], [A320, 10]], numbers: [1, 1999]}
+  AUA: {telephony: "Austrian", name: "Austrian", iata: OS, types: [[A320, 60], [A321, 25], [A20N, 15]], numbers: [1, 999]}
+  AUR: {telephony: "Ayline", name: "Aurigny", iata: GR, types: [[E195, 100]], numbers: [1, 999]}
+  BAW: {telephony: "Speedbird", name: "British Airways", iata: BA, types: [[A320, 28], [A319, 10], [A321, 14], [A20N, 8], [A21N, 6], [B772, 8], [B77W, 7], [B788, 4], [B789, 6], [A359, 5], [A388, 4]], numbers: [1, 2799]}
+  BEL: {telephony: "Bee-line", name: "Brussels Airlines", iata: SN, types: [[A320, 60], [A319, 40]], numbers: [3000, 3999]}
+  CAI: {telephony: "Corendon", name: "Corendon", iata: XC, types: [[B738, 70], [B38M, 30]], numbers: [1, 1699]}
+  CCA: {telephony: "Air China", name: "Air China", iata: CA, types: [[A333, 60], [B789, 40]], numbers: [1, 9999]}
+  CES: {telephony: "China Eastern", name: "China Eastern", iata: MU, types: [[B77W, 60], [A359, 40]], numbers: [1, 9999]}
+  CFG: {telephony: "Condor", types: [[A320, 40], [A321, 30], [A21N, 15], [A339, 15]], numbers: [1000, 2999]}
+  DAL: {telephony: "Delta", types: [[A321, 20], [B739, 15], [A21N, 10], [B752, 15], [A333, 10], [A339, 10], [B763, 10], [A359, 10]], numbers: [1, 9999]}
+  DLH: {telephony: "Lufthansa", name: "Lufthansa", iata: LH, types: [[A320, 25], [A321, 15], [A20N, 10], [A21N, 5], [CRJ9, 6], [E190, 6], [A333, 6], [A346, 4], [A359, 8], [B748, 5], [B744, 3], [B789, 4], [A388, 3]], numbers: [1, 2999]}
+  EIN: {telephony: "Shamrock", name: "Aer Lingus", iata: EI, types: [[A320, 60], [A21N, 30], [A321, 10]], numbers: [1, 999]}
+  ETD: {telephony: "Etihad", name: "Etihad", iata: EY, types: [[B789, 60], [A321, 40]], numbers: [1, 999]}
+  EWG: {telephony: "Eurowings", name: "Eurowings", iata: EW, types: [[A320, 50], [A319, 30], [A20N, 20]], numbers: [1000, 9999]}
+  EXS: {telephony: "Channex", name: "Jet2", iata: LS, types: [[B738, 60], [A321, 25], [A21N, 15]], numbers: [1, 9999]}
+  EZY: {telephony: "Easy", name: "easyJet", iata: U2, types: [[A320, 45], [A319, 15], [A20N, 25], [A21N, 15]], numbers: [11, 8999]}
+  FIN: {telephony: "Finnair", name: "Finnair", iata: AY, types: [[A321, 50], [A320, 30], [A319, 20]], numbers: [1000, 1999]}
+  HOP: {telephony: "Air Hop", types: [[AT76, 50], [CRJ9, 25], [E190, 25], [SF34, 0]], numbers: [1000, 7999]}
+  IBE: {telephony: "Iberia", name: "Iberia", iata: IB, types: [[A320, 25], [A321, 20], [A20N, 15], [A21N, 10], [A333, 10], [A359, 15], [A346, 5]], numbers: [1, 3999]}
+  IBS: {telephony: "Iberexpres", name: "Iberia Express", iata: I2, types: [[A320, 60], [A321, 25], [A20N, 15]], numbers: [1, 3999]}
+  ICE: {telephony: "Iceair", name: "Icelandair", iata: FI, types: [[B38M, 100]], numbers: [1, 999]}
+  ITY: {telephony: "Itarrow", name: "ITA Airways", iata: AZ, types: [[A320, 50], [A20N, 30], [A21N, 20]], numbers: [1, 2999]}
+  JBU: {telephony: "JetBlue", types: [[A320, 40], [A321, 40], [A21N, 10], [BCS3, 10]], numbers: [1, 2999]}
+  KLM: {telephony: "KLM", name: "KLM", iata: KL, types: [[B738, 25], [B739, 10], [E190, 15], [A21N, 5], [B772, 5], [B77W, 6], [B789, 6], [B78X, 4], [A333, 4]], numbers: [1, 1999]}
+  KMM: {telephony: "Skyknight", name: "KM Malta Airlines", iata: KM, types: [[A20N, 70], [A21N, 30]], numbers: [1, 999]}
+  LOG: {telephony: "Logan", types: [[AT76, 50], [SF34, 50]], numbers: [1, 999]}
+  LOT: {telephony: "LOT", name: "LOT", iata: LO, types: [[B38M, 100]], numbers: [1, 999]}
+  NAX: {telephony: "Nor Shuttle", name: "Norwegian", iata: DY, types: [[B738, 70], [B38M, 30]], numbers: [1000, 7999]}
+  QTR: {telephony: "Qatari", name: "Qatar Airways", iata: QR, types: [[A359, 40], [B77W, 30], [A388, 20], [A35K, 10]], numbers: [1, 999]}
+  RYR: {telephony: "Ryanair", name: "Ryanair", iata: FR, types: [[B738, 75], [B38M, 25]], numbers: [1000, 9999]}
+  SAS: {telephony: "Scandinavian", name: "SAS", iata: SK, types: [[A20N, 70], [A320, 20], [A21N, 10]], numbers: [1000, 4999]}
+  SEH: {telephony: "Air Crete", name: "Sky Express", iata: GQ, types: [[A20N, 60], [A21N, 40]], numbers: [1, 999]}
+  SWA: {telephony: "Southwest", types: [[B737, 40], [B738, 40], [B38M, 20]], numbers: [1, 9999]}
+  SWR: {telephony: "Swiss", name: "Swiss", iata: LX, types: [[A320, 40], [A321, 20], [A20N, 20], [BCS3, 20]], numbers: [1, 999]}
+  SXS: {telephony: "Sunexpress", name: "SunExpress", iata: XQ, types: [[B738, 70], [B38M, 30]], numbers: [1, 1699]}
+  TAP: {telephony: "Air Portugal", name: "TAP Air Portugal", iata: TP, types: [[A320, 40], [A321, 30], [A20N, 15], [A21N, 15]], numbers: [1, 1399]}
+  THY: {telephony: "Turkish", name: "Turkish Airlines", iata: TK, types: [[A321, 50], [B738, 25], [A333, 25]], numbers: [1, 9999]}
+  TOM: {telephony: "Tomjet", name: "TUI", iata: BY, types: [[B738, 60], [B38M, 25], [B788, 10], [B789, 5]], numbers: [1, 999]}
+  TRA: {telephony: "Transavia", name: "Transavia", iata: HV, types: [[B738, 75], [A21N, 25]], numbers: [5000, 6999]}
+  TVF: {telephony: "France Soleil", types: [[B738, 80], [A20N, 20]], numbers: [3000, 4999]}
+  UAE: {telephony: "Emirates", name: "Emirates", iata: EK, types: [[A388, 60], [B77W, 40]], numbers: [1, 999]}
+  UAL: {telephony: "United", name: "United", iata: UA, types: [[B738, 15], [B739, 15], [B38M, 5], [A320, 10], [A319, 5], [B772, 15], [B77W, 10], [B789, 15], [B78X, 5], [B763, 5]], numbers: [1, 9999]}
+  UBT: {telephony: "Longboat", name: "Norse Atlantic", iata: Z0, types: [[B789, 100]], numbers: [1, 999]}
+  VIR: {telephony: "Virgin", types: [[A333, 20], [A339, 30], [B789, 35], [A35K, 15]], numbers: [1, 999]}
+  VLG: {telephony: "Vueling", name: "Vueling", iata: VY, types: [[A320, 50], [A321, 15], [A319, 10], [A20N, 20], [A21N, 5]], numbers: [1000, 8999]}
+  WZZ: {telephony: "Wizz Air", name: "Wizz Air", iata: W6, types: [[A321, 50], [A21N, 35], [A320, 15]], numbers: [1000, 9999]}
+  EDV: {name: "Endeavor Air", iata: 9E, telephony: "Endeavor"}
+  SKW: {name: "SkyWest Airlines", iata: OO, telephony: "Skywest"}
+  RPA: {name: "Republic Airways", iata: YX, telephony: "Brickyard"}
+  ENY: {name: "Envoy Air", iata: MQ, telephony: "Envoy"}
+  PDT: {name: "Piedmont Airlines", iata: PT, telephony: "Piedmont"}
+  JIA: {name: "PSA Airlines", iata: OH, telephony: "Blue Streak"}
+  ASH: {name: "Mesa Airlines", iata: YV, telephony: "Air Shuttle"}
+  GJS: {name: "GoJet Airlines", iata: G7, telephony: "Lindbergh"}
+  UCA: {name: "CommuteAir", iata: C5, telephony: "Commutair"}
+  AWI: {name: "Air Wisconsin", iata: ZW, telephony: "Wisconsin"}
+  QXE: {name: "Horizon Air", iata: QX, telephony: "Horizon"}
+  LAN: {name: "LATAM Airlines Chile", iata: LA, telephony: "Lan Chile"}
+  JZA: {name: "Jazz Aviation", iata: QK, telephony: "Jazz"}
+
+# A Wikipedia airline that is a BRAND, not an operator (matched on the
+# link target or its text): its operators, the first the default. Where
+# BTS has the pair, the operator flying most of it takes the row
+# (global-routes spikes: KJFK Delta Connection, KSEA Alaska, KASE).
+brands:
+  "Delta Connection": [EDV, SKW, RPA]
+  "United Express": [SKW, RPA, ASH, GJS, UCA, AWI]
+  "American Eagle": [ENY, PDT, JIA, SKW, RPA]
+  "Alaska Airlines": [ASA, QXE, SKW]
+  "LATAM Chile": [LAN]
+  "Air Canada Express": [JZA]
+
+# Wikidata airline codes that name a sister operator (spike: Norwegian Air
+# Shuttle's first P230 is NOZ, the flights are NAX).
+codes:
+  NOZ: NAX
+
+# Designators the performance tables (crates/traffic/src/perf.rs) do not
+# know, mapped to the nearest one they do. A type in neither is dropped,
+# logged; a row left with no type is dropped, logged.
+type_map:
+  B712: B736
+  B762: B763
+  C206: C208
+  E145: CRJ7
+  E135: CRJ7
+  CRJ2: CRJ7
+  SB20: AT45
+  J328: D328
+  B190: JS41
+  DHC6: C208
+  C408: C208
+  C402: C208
+  PA31: C208
+  BN2P: C208
+  DHC2: C208
+  DHC3: C208
+  GA8: C208
+
+# Field facts that win over the generated ones (today's hand tables).
+fields:
+  LXGB: {city: "Gibraltar"}
+  LEMG: {city: "Malaga"}
+  EGKK: {city: "London Gatwick"}
+
+# Hand rows that WIN: a pair with any hand row is flown by its hand rows
+# only. Copied unchanged (2026-10-15) from routes/carriers/*.yaml as stage 1
+# landed them, a row's carrier types written out where they are not the
+# fleet above. `city` names the other end in fields.yaml and is not
+# written into the route row.
+hand:
+  - {carrier: AEA, at: EGKK, other: LEMD, number: 1001, summer: 12, winter: 7, city: "Madrid"}
+  - {carrier: AEA, at: LEMG, other: LEMD, number: 1041, summer: 14, winter: 14, city: "Madrid"}
+  - {carrier: AEA, at: LEMG, other: LEPA, number: 6083, summer: 5, winter: 0, city: "Palma de Mallorca"}
+  - {carrier: AEE, at: EGKK, other: LGAV, number: 601, summer: 5, winter: 3, city: "Athens"}
+  - {carrier: AEE, at: LEMG, other: LGAV, number: 652, summer: 4, winter: 0, city: "Athens"}
+  - {carrier: AFR, at: EGKK, other: LFPG, number: 1081, summer: 11, winter: 6, types: [[A320, 45], [A321, 20], [A319, 15], [A20N, 20]], city: "Paris Charles de Gaulle"}
+  - {carrier: AFR, at: LEMG, other: LFPG, number: 1312, summer: 14, winter: 14, types: [[A320, 45], [A321, 20], [A319, 15], [A20N, 20]], city: "Paris Charles de Gaulle"}
+  - {carrier: ANE, at: LEMG, other: LEMD, number: 8810, summer: 7, winter: 7, types: [[CRJ9, 100]], city: "Madrid"}
+  - {carrier: ANE, at: LEMG, other: GEML, number: 8650, summer: 28, winter: 28, types: [[AT76, 100]], city: "Melilla"}
+  - {carrier: ANE, at: LEMG, other: LEVC, number: 8870, summer: 10, winter: 10, types: [[CRJ9, 100]], city: "Valencia"}
+  - {carrier: AUA, at: LEMG, other: LOWW, number: 157, summer: 10, winter: 7, city: "Vienna"}
+  - {carrier: AUR, at: EGKK, other: EGJB, number: 601, summer: 14, winter: 14, city: "Guernsey"}
+  - {carrier: BAW, at: EGKK, other: EGJJ, number: 2345, summer: 19, winter: 4, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Jersey"}
+  - {carrier: BAW, at: EGKK, other: EGPF, number: 2357, summer: 11, winter: 6, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Glasgow"}
+  - {carrier: BAW, at: EGKK, other: LEAL, number: 2201, summer: 6, winter: 4, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Alicante"}
+  - {carrier: BAW, at: EGKK, other: LPFR, number: 2209, summer: 8, winter: 4, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Faro"}
+  - {carrier: BAW, at: EGKK, other: LEPA, number: 2223, summer: 8, winter: 1, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Palma de Mallorca"}
+  - {carrier: BAW, at: EGKK, other: LEZL, number: 2269, summer: 6, winter: 4, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Seville"}
+  - {carrier: BAW, at: EGKK, other: LPPR, number: 2291, summer: 6, winter: 4, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Porto"}
+  - {carrier: BAW, at: EGKK, other: LSGG, number: 2217, summer: 4, winter: 4, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Geneva"}
+  - {carrier: BAW, at: EGKK, other: LFMN, number: 2261, summer: 8, winter: 5, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Nice"}
+  - {carrier: BAW, at: EGKK, other: GCTS, number: 2231, summer: 6, winter: 6, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Tenerife South"}
+  - {carrier: BAW, at: EGKK, other: GMMX, number: 2245, summer: 8, winter: 8, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Marrakesh"}
+  - {carrier: BAW, at: EGKK, other: GCRR, number: 2285, summer: 4, winter: 4, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Lanzarote"}
+  - {carrier: BAW, at: EGKK, other: LTAI, number: 2239, summer: 3, winter: 1, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Antalya"}
+  - {carrier: BAW, at: EGKK, other: LMML, number: 2253, summer: 8, winter: 5, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Malta"}
+  - {carrier: BAW, at: EGKK, other: LCLK, number: 2299, summer: 6, winter: 4, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Larnaca"}
+  - {carrier: BAW, at: EGKK, other: LTBS, number: 2307, summer: 6, winter: 0, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Dalaman"}
+  - {carrier: BAW, at: EGKK, other: LCPH, number: 2315, summer: 4, winter: 1, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Paphos"}
+  - {carrier: BAW, at: EGKK, other: LGKR, number: 2327, summer: 5, winter: 0, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Corfu"}
+  - {carrier: BAW, at: EGKK, other: LGIR, number: 2333, summer: 3, winter: 0, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Heraklion"}
+  - {carrier: BAW, at: EGKK, other: LGRP, number: 2339, summer: 3, winter: 0, based: true, types: [[A320, 50], [A321, 15], [A20N, 15], [B772, 15], [B77W, 5]], city: "Rhodes"}
+  - {carrier: BAW, at: EGKK, other: KMCO, number: 2277, summer: 10, winter: 10, windows: [[6.0, 7.0]], types: [[B77W, 60], [B772, 40]], city: "Orlando"}
+  - {carrier: BAW, at: EGKK, other: MMUN, number: 2321, summer: 6, winter: 6, windows: [[9.5, 10.0]], types: [[B772, 100]], city: "Cancun"}
+  - {carrier: BAW, at: LEMG, other: EGKK, number: 2614, summer: 14, winter: 7, types: [[A320, 70], [A20N, 30]], city: "London Gatwick"}
+  - {carrier: BAW, at: LEMG, other: EGLL, number: 470, summer: 7, winter: 7, types: [[A320, 55], [A319, 20], [A321, 15], [A20N, 10]], city: "London Heathrow"}
+  - {carrier: BAW, at: LXGB, other: EGLL, number: 492, summer: 7, winter: 7, windows: [[14.0, 14.5]], types: [[A320, 55], [A319, 20], [A321, 15], [A20N, 10]], city: "London Heathrow"}
+  - {carrier: BAW, at: LXGB, other: EGLL, number: 490, summer: 7, winter: 4, windows: [[10.25, 10.75]], types: [[A320, 55], [A319, 20], [A321, 15], [A20N, 10]], city: "London Heathrow"}
+  - {carrier: BEL, at: LEMG, other: EBBR, number: 3713, summer: 21, winter: 14, city: "Brussels"}
+  - {carrier: CAI, at: EGKK, other: LTAI, number: 1661, summer: 5, winter: 1, city: "Antalya"}
+  - {carrier: CCA, at: EGKK, other: ZSPD, number: 851, summer: 7, winter: 7, windows: [[16.5, 17.0]], types: [[A333, 60], [B789, 40]], city: "Shanghai"}
+  - {carrier: CES, at: EGKK, other: ZSPD, number: 551, summer: 7, winter: 7, windows: [[6.5, 7.0]], types: [[B77W, 60], [A359, 40]], city: "Shanghai"}
+  - {carrier: DLH, at: LEMG, other: EDDF, number: 1150, summer: 14, winter: 14, types: [[A320, 40], [A321, 25], [A20N, 20], [A21N, 10], [A319, 5]], city: "Frankfurt"}
+  - {carrier: DLH, at: LEMG, other: EDDM, number: 1802, summer: 14, winter: 10, types: [[A320, 40], [A321, 25], [A20N, 20], [A21N, 10], [A319, 5]], city: "Munich"}
+  - {carrier: EIN, at: LEMG, other: EIDW, number: 584, summer: 21, winter: 14, city: "Dublin"}
+  - {carrier: EIN, at: LEMG, other: EICK, number: 774, summer: 4, winter: 2, city: "Cork"}
+  - {carrier: ETD, at: LEMG, other: OMAA, number: 131, summer: 3, winter: 0, windows: [[7.5, 8.0]], types: [[A321, 100]], city: "Abu Dhabi"}
+  - {carrier: EWG, at: LEMG, other: EDDL, number: 1580, summer: 10, winter: 7, city: "Dusseldorf"}
+  - {carrier: EWG, at: LEMG, other: EDDH, number: 7520, summer: 7, winter: 4, city: "Hamburg"}
+  - {carrier: EWG, at: LEMG, other: EDDK, number: 5820, summer: 7, winter: 5, city: "Cologne"}
+  - {carrier: EWG, at: LEMG, other: EDDS, number: 2654, summer: 5, winter: 3, city: "Stuttgart"}
+  - {carrier: EWG, at: LEMG, other: EDDB, number: 8710, summer: 5, winter: 3, city: "Berlin"}
+  - {carrier: EWG, at: LEMG, other: LKPR, number: 9101, summer: 3, winter: 0, city: "Prague"}
+  - {carrier: EWG, at: LEMG, other: EDDV, number: 9105, summer: 4, winter: 3, city: "Hannover"}
+  - {carrier: EXS, at: EGKK, other: LEAL, number: 651, summer: 8, winter: 5, based: true, city: "Alicante"}
+  - {carrier: EXS, at: EGKK, other: LPFR, number: 659, summer: 11, winter: 6, based: true, city: "Faro"}
+  - {carrier: EXS, at: EGKK, other: LEPA, number: 675, summer: 8, winter: 1, based: true, city: "Palma de Mallorca"}
+  - {carrier: EXS, at: EGKK, other: LSGG, number: 669, summer: 2, winter: 2, based: true, city: "Geneva"}
+  - {carrier: EXS, at: EGKK, other: LIRN, number: 745, summer: 4, winter: 2, based: true, city: "Naples"}
+  - {carrier: EXS, at: EGKK, other: GCTS, number: 683, summer: 7, winter: 7, based: true, city: "Tenerife South"}
+  - {carrier: EXS, at: EGKK, other: GCRR, number: 707, summer: 5, winter: 5, based: true, city: "Lanzarote"}
+  - {carrier: EXS, at: EGKK, other: LTAI, number: 691, summer: 13, winter: 2, based: true, city: "Antalya"}
+  - {carrier: EXS, at: EGKK, other: LMML, number: 701, summer: 4, winter: 2, based: true, city: "Malta"}
+  - {carrier: EXS, at: EGKK, other: LCPH, number: 713, summer: 7, winter: 1, based: true, city: "Paphos"}
+  - {carrier: EXS, at: EGKK, other: LGKR, number: 721, summer: 8, winter: 0, based: true, city: "Corfu"}
+  - {carrier: EXS, at: EGKK, other: LGIR, number: 729, summer: 8, winter: 0, based: true, city: "Heraklion"}
+  - {carrier: EXS, at: EGKK, other: LGRP, number: 737, summer: 9, winter: 0, based: true, city: "Rhodes"}
+  - {carrier: EXS, at: LEMG, other: EGKK, number: 617, summer: 7, winter: 3, city: "London Gatwick"}
+  - {carrier: EXS, at: LEMG, other: EGCC, number: 563, summer: 7, winter: 5, city: "Manchester"}
+  - {carrier: EXS, at: LEMG, other: EGSS, number: 675, summer: 7, winter: 4, city: "London Stansted"}
+  - {carrier: EXS, at: LEMG, other: EGBB, number: 695, summer: 10, winter: 5, city: "Birmingham"}
+  - {carrier: EXS, at: LEMG, other: EGPH, number: 751, summer: 7, winter: 4, city: "Edinburgh"}
+  - {carrier: EXS, at: LEMG, other: EGPF, number: 787, summer: 7, winter: 4, city: "Glasgow"}
+  - {carrier: EXS, at: LEMG, other: EGNT, number: 527, summer: 7, winter: 4, city: "Newcastle"}
+  - {carrier: EXS, at: LEMG, other: EGNX, number: 643, summer: 7, winter: 4, city: "East Midlands"}
+  - {carrier: EXS, at: LEMG, other: EGNM, number: 729, summer: 7, winter: 4, city: "Leeds Bradford"}
+  - {carrier: EXS, at: LEMG, other: EGGD, number: 801, summer: 4, winter: 0, city: "Bristol"}
+  - {carrier: EXS, at: LEMG, other: EGGP, number: 805, summer: 4, winter: 0, city: "Liverpool"}
+  - {carrier: EXS, at: LEMG, other: EGAA, number: 809, summer: 5, winter: 2, city: "Belfast International"}
+  - {carrier: EXS, at: LEMG, other: EGGW, number: 813, summer: 3, winter: 0, city: "London Luton"}
+  - {carrier: EZY, at: EGKK, other: EGJJ, number: 8655, summer: 19, winter: 4, based: true, city: "Jersey"}
+  - {carrier: EZY, at: EGKK, other: EGPH, number: 8673, summer: 29, winter: 17, based: true, city: "Edinburgh"}
+  - {carrier: EZY, at: EGKK, other: EGPF, number: 8695, summer: 16, winter: 10, based: true, city: "Glasgow"}
+  - {carrier: EZY, at: EGKK, other: EGAA, number: 8713, summer: 25, winter: 15, based: true, city: "Belfast International"}
+  - {carrier: EZY, at: EGKK, other: EGAC, number: 8733, summer: 18, winter: 11, based: true, city: "Belfast City"}
+  - {carrier: EZY, at: EGKK, other: EGPE, number: 8751, summer: 15, winter: 8, based: true, city: "Inverness"}
+  - {carrier: EZY, at: EGKK, other: EGPD, number: 8767, summer: 13, winter: 8, based: true, city: "Aberdeen"}
+  - {carrier: EZY, at: EGKK, other: EGNS, number: 8783, summer: 12, winter: 7, based: true, city: "Isle of Man"}
+  - {carrier: EZY, at: EGKK, other: LEBL, number: 8101, summer: 43, winter: 25, based: true, city: "Barcelona"}
+  - {carrier: EZY, at: EGKK, other: LEAL, number: 8129, summer: 27, winter: 16, based: true, city: "Alicante"}
+  - {carrier: EZY, at: EGKK, other: LPFR, number: 8183, summer: 26, winter: 15, based: true, city: "Faro"}
+  - {carrier: EZY, at: EGKK, other: LEPA, number: 8257, summer: 30, winter: 5, based: true, city: "Palma de Mallorca"}
+  - {carrier: EZY, at: EGKK, other: LEMD, number: 8309, summer: 15, winter: 9, based: true, city: "Madrid"}
+  - {carrier: EZY, at: EGKK, other: LPPT, number: 8421, summer: 18, winter: 10, based: true, city: "Lisbon"}
+  - {carrier: EZY, at: EGKK, other: LEZL, number: 8457, summer: 15, winter: 9, based: true, city: "Seville"}
+  - {carrier: EZY, at: EGKK, other: LPPR, number: 8491, summer: 15, winter: 8, based: true, city: "Porto"}
+  - {carrier: EZY, at: EGKK, other: LIRF, number: 8151, summer: 26, winter: 15, based: true, city: "Rome Fiumicino"}
+  - {carrier: EZY, at: EGKK, other: LIRF, number: 8171, summer: 26, winter: 15, based: true, city: "Rome Fiumicino"}
+  - {carrier: EZY, at: EGKK, other: LIMC, number: 8205, summer: 48, winter: 28, based: true, city: "Milan Malpensa"}
+  - {carrier: EZY, at: EGKK, other: LSGG, number: 8235, summer: 29, winter: 29, based: true, city: "Geneva"}
+  - {carrier: EZY, at: EGKK, other: EHAM, number: 8345, summer: 34, winter: 20, based: true, city: "Amsterdam"}
+  - {carrier: EZY, at: EGKK, other: EKCH, number: 8385, summer: 13, winter: 8, based: true, city: "Copenhagen"}
+  - {carrier: EZY, at: EGKK, other: LFMN, number: 8401, summer: 24, winter: 14, based: true, city: "Nice"}
+  - {carrier: EZY, at: EGKK, other: LFPG, number: 8539, summer: 16, winter: 9, based: true, city: "Paris Charles de Gaulle"}
+  - {carrier: EZY, at: EGKK, other: LIRN, number: 8623, summer: 16, winter: 9, based: true, city: "Naples"}
+  - {carrier: EZY, at: EGKK, other: LHBP, number: 8641, summer: 6, winter: 4, based: true, city: "Budapest"}
+  - {carrier: EZY, at: EGKK, other: GCTS, number: 8281, summer: 14, winter: 14, based: true, city: "Tenerife South"}
+  - {carrier: EZY, at: EGKK, other: GMMX, number: 8327, summer: 19, winter: 19, based: true, city: "Marrakesh"}
+  - {carrier: EZY, at: EGKK, other: GCRR, number: 8475, summer: 11, winter: 11, based: true, city: "Lanzarote"}
+  - {carrier: EZY, at: EGKK, other: LTAI, number: 8297, summer: 5, winter: 1, based: true, city: "Antalya"}
+  - {carrier: EZY, at: EGKK, other: LMML, number: 8369, summer: 15, winter: 9, based: true, city: "Malta"}
+  - {carrier: EZY, at: EGKK, other: LGAV, number: 8439, summer: 18, winter: 11, based: true, city: "Athens"}
+  - {carrier: EZY, at: EGKK, other: LCLK, number: 8507, summer: 13, winter: 8, based: true, city: "Larnaca"}
+  - {carrier: EZY, at: EGKK, other: LTBS, number: 8523, summer: 14, winter: 0, based: true, city: "Dalaman"}
+  - {carrier: EZY, at: EGKK, other: LCPH, number: 8557, summer: 15, winter: 3, based: true, city: "Paphos"}
+  - {carrier: EZY, at: EGKK, other: LGKR, number: 8573, summer: 16, winter: 0, based: true, city: "Corfu"}
+  - {carrier: EZY, at: EGKK, other: LGIR, number: 8591, summer: 14, winter: 0, based: true, city: "Heraklion"}
+  - {carrier: EZY, at: EGKK, other: LGRP, number: 8607, summer: 14, winter: 0, based: true, city: "Rhodes"}
+  - {carrier: EZY, at: LEMG, other: EGKK, number: 8061, summer: 28, winter: 21, based: true, city: "London Gatwick"}
+  - {carrier: EZY, at: LEMG, other: EGCC, number: 1925, summer: 14, winter: 10, based: true, city: "Manchester"}
+  - {carrier: EZY, at: LEMG, other: EGGD, number: 6127, summer: 21, winter: 14, based: true, city: "Bristol"}
+  - {carrier: EZY, at: LEMG, other: EGBB, number: 3367, summer: 5, winter: 3, city: "Birmingham"}
+  - {carrier: EZY, at: LEMG, other: EGGW, number: 2041, summer: 14, winter: 10, city: "London Luton"}
+  - {carrier: EZY, at: LEMG, other: EGGP, number: 2263, summer: 14, winter: 10, city: "Liverpool"}
+  - {carrier: EZY, at: LEMG, other: EGPH, number: 6811, summer: 7, winter: 5, city: "Edinburgh"}
+  - {carrier: EZY, at: LEMG, other: EGPF, number: 6957, summer: 7, winter: 4, city: "Glasgow"}
+  - {carrier: EZY, at: LEMG, other: EGNT, number: 6497, summer: 5, winter: 3, city: "Newcastle"}
+  - {carrier: EZY, at: LEMG, other: EGAA, number: 6587, summer: 5, winter: 3, city: "Belfast International"}
+  - {carrier: EZY, at: LEMG, other: EHAM, number: 7951, summer: 14, winter: 7, city: "Amsterdam"}
+  - {carrier: EZY, at: LEMG, other: LFLL, number: 4417, summer: 4, winter: 3, city: "Lyon"}
+  - {carrier: EZY, at: LEMG, other: LFMN, number: 4581, summer: 3, winter: 2, city: "Nice"}
+  - {carrier: EZY, at: LEMG, other: LFSB, number: 5145, summer: 4, winter: 3, city: "Basel"}
+  - {carrier: EZY, at: LEMG, other: EDDB, number: 5531, summer: 7, winter: 4, city: "Berlin"}
+  - {carrier: EZY, at: LEMG, other: LSZH, number: 1503, summer: 7, winter: 4, city: "Zurich"}
+  - {carrier: EZY, at: LEMG, other: LSGG, number: 1427, summer: 4, winter: 3, city: "Geneva"}
+  - {carrier: EZY, at: LEMG, other: LIMC, number: 2861, summer: 14, winter: 10, city: "Milan Malpensa"}
+  - {carrier: EZY, at: LEMG, other: LFRS, number: 7101, summer: 4, winter: 3, city: "Nantes"}
+  - {carrier: EZY, at: LEMG, other: LFBD, number: 7105, summer: 3, winter: 3, city: "Bordeaux"}
+  - {carrier: EZY, at: LEMG, other: EGMC, number: 7109, summer: 4, winter: 2, city: "London Southend"}
+  - {carrier: EZY, at: LEMG, other: LGAV, number: 7113, summer: 3, winter: 0, city: "Athens"}
+  - {carrier: EZY, at: LEMG, other: GMMX, number: 7117, summer: 4, winter: 3, city: "Marrakesh"}
+  - {carrier: EZY, at: LEMG, other: EGNM, number: 7121, summer: 4, winter: 0, city: "Leeds Bradford"}
+  - {carrier: EZY, at: LXGB, other: EGKK, number: 8901, summer: 9, winter: 6, windows: [[11.5, 12.5], [17.5, 18.5]], city: "London Gatwick"}
+  - {carrier: EZY, at: LXGB, other: EGCC, number: 1911, summer: 5, winter: 3, windows: [[13.0, 13.5]], city: "Manchester"}
+  - {carrier: EZY, at: LXGB, other: EGGD, number: 6191, summer: 3, winter: 2, windows: [[15.5, 16.0]], city: "Bristol"}
+  - {carrier: EZY, at: LXGB, other: EGBB, number: 2101, summer: 2, winter: 0, windows: [[16.5, 17.0]], city: "Birmingham"}
+  - {carrier: FIN, at: LEMG, other: EFHK, number: 1653, summer: 14, winter: 10, city: "Helsinki"}
+  - {carrier: IBE, at: LEMG, other: LEMD, number: 3700, summer: 21, winter: 21, types: [[A320, 40], [A321, 30], [A20N, 20], [A21N, 10]], city: "Madrid"}
+  - {carrier: IBS, at: EGKK, other: LEMD, number: 3801, summer: 12, winter: 7, city: "Madrid"}
+  - {carrier: ICE, at: LEMG, other: BIKF, number: 532, summer: 2, winter: 2, windows: [[14.5, 15.5]], city: "Reykjavik"}
+  - {carrier: ITY, at: LEMG, other: LIRF, number: 1286, summer: 7, winter: 4, city: "Rome Fiumicino"}
+  - {carrier: KLM, at: LEMG, other: EHAM, number: 1043, summer: 21, winter: 14, types: [[B738, 50], [B739, 20], [E190, 30]], city: "Amsterdam"}
+  - {carrier: KMM, at: EGKK, other: LMML, number: 391, summer: 7, winter: 4, city: "Malta"}
+  - {carrier: LOT, at: LEMG, other: EPWA, number: 431, summer: 5, winter: 3, city: "Warsaw"}
+  - {carrier: NAX, at: EGKK, other: EKCH, number: 1301, summer: 20, winter: 11, city: "Copenhagen"}
+  - {carrier: NAX, at: EGKK, other: ENGM, number: 1313, summer: 24, winter: 14, city: "Oslo"}
+  - {carrier: NAX, at: LEMG, other: EKCH, number: 3586, summer: 21, winter: 14, based: true, city: "Copenhagen"}
+  - {carrier: NAX, at: LEMG, other: ESSA, number: 4171, summer: 21, winter: 14, based: true, city: "Stockholm"}
+  - {carrier: NAX, at: LEMG, other: ENGM, number: 1585, summer: 14, winter: 10, city: "Oslo"}
+  - {carrier: NAX, at: LEMG, other: EFHK, number: 5641, summer: 10, winter: 7, city: "Helsinki"}
+  - {carrier: NAX, at: LEMG, other: ESGG, number: 3731, summer: 4, winter: 3, city: "Gothenburg"}
+  - {carrier: NAX, at: LEMG, other: ENBR, number: 2643, summer: 3, winter: 2, city: "Bergen"}
+  - {carrier: NAX, at: LEMG, other: EKYT, number: 6101, summer: 4, winter: 3, city: "Aalborg"}
+  - {carrier: NAX, at: LEMG, other: EKBI, number: 6105, summer: 4, winter: 3, city: "Billund"}
+  - {carrier: NAX, at: LEMG, other: ENZV, number: 6109, summer: 4, winter: 3, city: "Stavanger"}
+  - {carrier: NAX, at: LEMG, other: ENTO, number: 6113, summer: 3, winter: 2, city: "Sandefjord"}
+  - {carrier: NAX, at: LEMG, other: ESKN, number: 6117, summer: 3, winter: 2, city: "Stockholm Skavsta"}
+  - {carrier: NAX, at: LEMG, other: ENVA, number: 6121, summer: 3, winter: 0, city: "Trondheim"}
+  - {carrier: NAX, at: LEMG, other: EKAH, number: 6125, summer: 3, winter: 0, city: "Aarhus"}
+  - {carrier: NAX, at: LEMG, other: ENHD, number: 6129, summer: 2, winter: 0, city: "Haugesund"}
+  - {carrier: NAX, at: LEMG, other: EDDM, number: 6133, summer: 3, winter: 0, city: "Munich"}
+  - {carrier: QTR, at: EGKK, other: OTHH, number: 15, summer: 14, winter: 14, windows: [[7.0, 7.5], [14.0, 14.5]], types: [[B788, 50], [B789, 30], [A359, 20]], city: "Doha"}
+  - {carrier: QTR, at: LEMG, other: OTHH, number: 52, summer: 7, winter: 7, windows: [[13.0, 13.5]], types: [[B788, 60], [A359, 40]], city: "Doha"}
+  - {carrier: RYR, at: EGKK, other: EIDW, number: 8301, summer: 32, winter: 19, city: "Dublin"}
+  - {carrier: RYR, at: EGKK, other: EIDW, number: 8351, summer: 32, winter: 18, city: "Dublin"}
+  - {carrier: RYR, at: EGKK, other: LEAL, number: 8331, summer: 6, winter: 4, city: "Alicante"}
+  - {carrier: RYR, at: LEMG, other: EIDW, number: 7062, summer: 35, winter: 28, based: true, city: "Dublin"}
+  - {carrier: RYR, at: LEMG, other: EGCC, number: 1702, summer: 14, winter: 10, based: true, city: "Manchester"}
+  - {carrier: RYR, at: LEMG, other: EGSS, number: 8171, summer: 21, winter: 14, based: true, city: "London Stansted"}
+  - {carrier: RYR, at: LEMG, other: EGGD, number: 5313, summer: 4, winter: 3, city: "Bristol"}
+  - {carrier: RYR, at: LEMG, other: EGBB, number: 2291, summer: 10, winter: 7, based: true, city: "Birmingham"}
+  - {carrier: RYR, at: LEMG, other: EGGW, number: 3027, summer: 7, winter: 5, based: true, city: "London Luton"}
+  - {carrier: RYR, at: LEMG, other: EGGP, number: 1987, summer: 7, winter: 5, based: true, city: "Liverpool"}
+  - {carrier: RYR, at: LEMG, other: EGPH, number: 2615, summer: 7, winter: 4, based: true, city: "Edinburgh"}
+  - {carrier: RYR, at: LEMG, other: EGNX, number: 3631, summer: 7, winter: 5, based: true, city: "East Midlands"}
+  - {carrier: RYR, at: LEMG, other: EGNM, number: 4417, summer: 4, winter: 2, city: "Leeds Bradford"}
+  - {carrier: RYR, at: LEMG, other: EGAA, number: 8935, summer: 4, winter: 2, city: "Belfast International"}
+  - {carrier: RYR, at: LEMG, other: EICK, number: 7181, summer: 7, winter: 4, city: "Cork"}
+  - {carrier: RYR, at: LEMG, other: EHEH, number: 3913, summer: 10, winter: 7, based: true, city: "Eindhoven"}
+  - {carrier: RYR, at: LEMG, other: EBCI, number: 3561, summer: 14, winter: 10, based: true, city: "Brussels Charleroi"}
+  - {carrier: RYR, at: LEMG, other: ESSA, number: 9161, summer: 4, winter: 3, based: true, city: "Stockholm"}
+  - {carrier: RYR, at: LEMG, other: LOWW, number: 6081, summer: 7, winter: 5, city: "Vienna"}
+  - {carrier: RYR, at: LEMG, other: LIRF, number: 4893, summer: 14, winter: 10, based: true, city: "Rome Fiumicino"}
+  - {carrier: RYR, at: LEMG, other: LIMC, number: 2843, summer: 7, winter: 5, based: true, city: "Milan Malpensa"}
+  - {carrier: RYR, at: LEMG, other: LIME, number: 7317, summer: 7, winter: 5, city: "Bergamo"}
+  - {carrier: RYR, at: LEMG, other: LIRN, number: 6941, summer: 4, winter: 2, city: "Naples"}
+  - {carrier: RYR, at: LEMG, other: EPKK, number: 1149, summer: 5, winter: 3, city: "Krakow"}
+  - {carrier: RYR, at: LEMG, other: LKPR, number: 4361, summer: 3, winter: 2, city: "Prague"}
+  - {carrier: RYR, at: LEMG, other: LEBL, number: 5021, summer: 14, winter: 10, based: true, city: "Barcelona"}
+  - {carrier: RYR, at: LEMG, other: LEPA, number: 6311, summer: 7, winter: 4, city: "Palma de Mallorca"}
+  - {carrier: RYR, at: LEMG, other: GCRR, number: 7671, summer: 7, winter: 7, city: "Lanzarote"}
+  - {carrier: RYR, at: LEMG, other: LEIB, number: 8261, summer: 7, winter: 0, city: "Ibiza"}
+  - {carrier: RYR, at: LEMG, other: EKAH, number: 9301, summer: 5, winter: 3, city: "Aarhus"}
+  - {carrier: RYR, at: LEMG, other: LIPE, number: 9305, summer: 7, winter: 4, city: "Bologna"}
+  - {carrier: RYR, at: LEMG, other: EGHH, number: 9309, summer: 4, winter: 2, city: "Bournemouth"}
+  - {carrier: RYR, at: LEMG, other: LZIB, number: 9313, summer: 5, winter: 3, city: "Bratislava"}
+  - {carrier: RYR, at: LEMG, other: EDDW, number: 9317, summer: 4, winter: 3, city: "Bremen"}
+  - {carrier: RYR, at: LEMG, other: LKTB, number: 9321, summer: 3, winter: 2, city: "Brno"}
+  - {carrier: RYR, at: LEMG, other: LROP, number: 9325, summer: 5, winter: 3, city: "Bucharest"}
+  - {carrier: RYR, at: LEMG, other: LHBP, number: 9329, summer: 6, winter: 4, city: "Budapest"}
+  - {carrier: RYR, at: LEMG, other: EDDK, number: 9333, summer: 6, winter: 4, city: "Cologne"}
+  - {carrier: RYR, at: LEMG, other: EGTE, number: 9337, summer: 3, winter: 2, city: "Exeter"}
+  - {carrier: RYR, at: LEMG, other: GMFF, number: 9341, summer: 4, winter: 4, city: "Fez"}
+  - {carrier: RYR, at: LEMG, other: EDFH, number: 9345, summer: 4, winter: 3, city: "Frankfurt Hahn"}
+  - {carrier: RYR, at: LEMG, other: EPGD, number: 9349, summer: 5, winter: 3, city: "Gdansk"}
+  - {carrier: RYR, at: LEMG, other: EGPK, number: 9353, summer: 4, winter: 2, city: "Glasgow Prestwick"}
+  - {carrier: RYR, at: LEMG, other: ESGG, number: 9357, summer: 4, winter: 3, city: "Gothenburg"}
+  - {carrier: RYR, at: LEMG, other: EDDH, number: 9361, summer: 5, winter: 3, city: "Hamburg"}
+  - {carrier: RYR, at: LEMG, other: EDSB, number: 9365, summer: 6, winter: 4, city: "Karlsruhe"}
+  - {carrier: RYR, at: LEMG, other: EPKT, number: 9369, summer: 5, winter: 3, city: "Katowice"}
+  - {carrier: RYR, at: LEMG, other: EYKA, number: 9373, summer: 3, winter: 3, city: "Kaunas"}
+  - {carrier: RYR, at: LEMG, other: EIKN, number: 9377, summer: 3, winter: 2, city: "Knock"}
+  - {carrier: RYR, at: LEMG, other: LZKZ, number: 9381, summer: 3, winter: 2, city: "Kosice"}
+  - {carrier: RYR, at: LEMG, other: LPPT, number: 9385, summer: 7, winter: 5, city: "Lisbon"}
+  - {carrier: RYR, at: LEMG, other: EPLL, number: 9389, summer: 3, winter: 2, city: "Lodz"}
+  - {carrier: RYR, at: LEMG, other: EDHL, number: 9393, summer: 3, winter: 2, city: "Lubeck"}
+  - {carrier: RYR, at: LEMG, other: GMMX, number: 9397, summer: 7, winter: 7, city: "Marrakesh"}
+  - {carrier: RYR, at: LEMG, other: LFML, number: 9401, summer: 5, winter: 3, city: "Marseille"}
+  - {carrier: RYR, at: LEMG, other: EDJA, number: 9405, summer: 6, winter: 4, city: "Memmingen"}
+  - {carrier: RYR, at: LEMG, other: EDDG, number: 9409, summer: 3, winter: 2, city: "Munster"}
+  - {carrier: RYR, at: LEMG, other: EGHQ, number: 9413, summer: 3, winter: 0, city: "Newquay"}
+  - {carrier: RYR, at: LEMG, other: EDDN, number: 9417, summer: 5, winter: 3, city: "Nuremberg"}
+  - {carrier: RYR, at: LEMG, other: LKMT, number: 9421, summer: 3, winter: 2, city: "Ostrava"}
+  - {carrier: RYR, at: LEMG, other: LIRP, number: 9425, summer: 5, winter: 3, city: "Pisa"}
+  - {carrier: RYR, at: LEMG, other: LPPR, number: 9429, summer: 7, winter: 5, city: "Porto"}
+  - {carrier: RYR, at: LEMG, other: EPPO, number: 9433, summer: 4, winter: 3, city: "Poznan"}
+  - {carrier: RYR, at: LEMG, other: GMME, number: 9437, summer: 5, winter: 5, city: "Rabat"}
+  - {carrier: RYR, at: LEMG, other: EVRA, number: 9441, summer: 5, winter: 3, city: "Riga"}
+  - {carrier: RYR, at: LEMG, other: ENTO, number: 9445, summer: 4, winter: 3, city: "Sandefjord"}
+  - {carrier: RYR, at: LEMG, other: EINN, number: 9449, summer: 5, winter: 3, city: "Shannon"}
+  - {carrier: RYR, at: LEMG, other: LBSF, number: 9453, summer: 5, winter: 3, city: "Sofia"}
+  - {carrier: RYR, at: LEMG, other: GMTT, number: 9457, summer: 7, winter: 7, city: "Tangier"}
+  - {carrier: RYR, at: LEMG, other: EGNV, number: 9461, summer: 3, winter: 2, city: "Teesside"}
+  - {carrier: RYR, at: LEMG, other: GMTN, number: 9465, summer: 4, winter: 4, city: "Tetouan"}
+  - {carrier: RYR, at: LEMG, other: LIPH, number: 9469, summer: 5, winter: 3, city: "Treviso"}
+  - {carrier: RYR, at: LEMG, other: LIMF, number: 9473, summer: 5, winter: 3, city: "Turin"}
+  - {carrier: RYR, at: LEMG, other: EDLV, number: 9477, summer: 6, winter: 4, city: "Weeze"}
+  - {carrier: RYR, at: LEMG, other: EPWR, number: 9481, summer: 5, winter: 3, city: "Wroclaw"}
+  - {carrier: RYR, at: LEMG, other: LDZA, number: 9485, summer: 3, winter: 2, city: "Zagreb"}
+  - {carrier: RYR, at: LEMG, other: EKCH, number: 9489, summer: 6, winter: 4, city: "Copenhagen"}
+  - {carrier: RYR, at: LEMG, other: LEVC, number: 9493, summer: 6, winter: 4, city: "Valencia"}
+  - {carrier: RYR, at: LEMG, other: EHAM, number: 9497, summer: 6, winter: 4, city: "Amsterdam"}
+  - {carrier: RYR, at: LEMG, other: EDDB, number: 9501, summer: 6, winter: 4, city: "Berlin"}
+  - {carrier: SAS, at: LEMG, other: EKCH, number: 2581, summer: 14, winter: 10, city: "Copenhagen"}
+  - {carrier: SAS, at: LEMG, other: ESSA, number: 1527, summer: 7, winter: 7, city: "Stockholm"}
+  - {carrier: SAS, at: LEMG, other: ENGM, number: 4651, summer: 7, winter: 5, city: "Oslo"}
+  - {carrier: SEH, at: EGKK, other: LGAV, number: 411, summer: 8, winter: 4, city: "Athens"}
+  - {carrier: SWR, at: EGKK, other: LSGG, number: 351, summer: 2, winter: 2, city: "Geneva"}
+  - {carrier: SWR, at: LEMG, other: LSZH, number: 437, summer: 14, winter: 10, city: "Zurich"}
+  - {carrier: SWR, at: LEMG, other: LSGG, number: 469, summer: 4, winter: 4, city: "Geneva"}
+  - {carrier: SXS, at: EGKK, other: LTAI, number: 1631, summer: 18, winter: 3, city: "Antalya"}
+  - {carrier: SXS, at: EGKK, other: LTBS, number: 1643, summer: 6, winter: 0, city: "Dalaman"}
+  - {carrier: TAP, at: EGKK, other: LPPT, number: 1331, summer: 14, winter: 8, city: "Lisbon"}
+  - {carrier: TAP, at: EGKK, other: LPPR, number: 1341, summer: 8, winter: 5, city: "Porto"}
+  - {carrier: TAP, at: LEMG, other: LPPT, number: 1361, summer: 14, winter: 14, city: "Lisbon"}
+  - {carrier: THY, at: EGKK, other: LTFM, number: 1979, summer: 28, winter: 28, windows: [[9.0, 9.5], [12.0, 12.5], [17.0, 17.5], [21.0, 21.5]], types: [[A321, 50], [A333, 30], [B738, 20]], city: "Istanbul"}
+  - {carrier: THY, at: LEMG, other: LTFM, number: 1966, summer: 7, winter: 7, windows: [[11.5, 12.0]], types: [[A321, 100]], city: "Istanbul"}
+  - {carrier: TOM, at: EGKK, other: LEAL, number: 651, summer: 3, winter: 1, based: true, city: "Alicante"}
+  - {carrier: TOM, at: EGKK, other: LEPA, number: 663, summer: 8, winter: 1, based: true, city: "Palma de Mallorca"}
+  - {carrier: TOM, at: EGKK, other: LSGG, number: 657, summer: 2, winter: 2, based: true, city: "Geneva"}
+  - {carrier: TOM, at: EGKK, other: LIRN, number: 751, summer: 2, winter: 1, based: true, city: "Naples"}
+  - {carrier: TOM, at: EGKK, other: GCTS, number: 671, summer: 9, winter: 9, based: true, city: "Tenerife South"}
+  - {carrier: TOM, at: EGKK, other: GMMX, number: 687, summer: 5, winter: 5, based: true, city: "Marrakesh"}
+  - {carrier: TOM, at: EGKK, other: GCRR, number: 699, summer: 5, winter: 5, based: true, city: "Lanzarote"}
+  - {carrier: TOM, at: EGKK, other: LTAI, number: 679, summer: 8, winter: 1, based: true, city: "Antalya"}
+  - {carrier: TOM, at: EGKK, other: LCLK, number: 705, summer: 4, winter: 3, based: true, city: "Larnaca"}
+  - {carrier: TOM, at: EGKK, other: LTBS, number: 711, summer: 10, winter: 0, based: true, city: "Dalaman"}
+  - {carrier: TOM, at: EGKK, other: LCPH, number: 719, summer: 3, winter: 1, based: true, city: "Paphos"}
+  - {carrier: TOM, at: EGKK, other: LGKR, number: 731, summer: 4, winter: 0, based: true, city: "Corfu"}
+  - {carrier: TOM, at: EGKK, other: LGIR, number: 737, summer: 6, winter: 0, based: true, city: "Heraklion"}
+  - {carrier: TOM, at: EGKK, other: LGRP, number: 745, summer: 5, winter: 0, based: true, city: "Rhodes"}
+  - {carrier: TOM, at: EGKK, other: KMCO, number: 693, summer: 3, winter: 3, windows: [[7.0, 7.5]], types: [[B789, 100]], city: "Orlando"}
+  - {carrier: TOM, at: EGKK, other: MMUN, number: 725, summer: 6, winter: 6, windows: [[10.0, 10.5]], types: [[B789, 60], [B788, 40]], city: "Cancun"}
+  - {carrier: TOM, at: LEMG, other: EGKK, number: 614, summer: 5, winter: 2, city: "London Gatwick"}
+  - {carrier: TOM, at: LEMG, other: EGCC, number: 652, summer: 5, winter: 2, city: "Manchester"}
+  - {carrier: TOM, at: LEMG, other: EGNX, number: 286, summer: 3, winter: 0, city: "East Midlands"}
+  - {carrier: TOM, at: LEMG, other: EGFF, number: 318, summer: 3, winter: 0, city: "Cardiff"}
+  - {carrier: TOM, at: LEMG, other: EGNT, number: 900, summer: 3, winter: 0, city: "Newcastle"}
+  - {carrier: TOM, at: LEMG, other: EGBB, number: 904, summer: 4, winter: 0, city: "Birmingham"}
+  - {carrier: TOM, at: LEMG, other: EGGD, number: 908, summer: 3, winter: 0, city: "Bristol"}
+  - {carrier: TRA, at: LEMG, other: EHAM, number: 5091, summer: 21, winter: 14, city: "Amsterdam"}
+  - {carrier: TRA, at: LEMG, other: EHEH, number: 5341, summer: 14, winter: 10, city: "Eindhoven"}
+  - {carrier: TRA, at: LEMG, other: EBBR, number: 5221, summer: 7, winter: 4, city: "Brussels"}
+  - {carrier: TRA, at: LEMG, other: LFPO, number: 6112, summer: 21, winter: 14, city: "Paris Orly"}
+  - {carrier: TRA, at: LEMG, other: EHRD, number: 6501, summer: 6, winter: 4, city: "Rotterdam"}
+  - {carrier: TRA, at: LEMG, other: LFLL, number: 6505, summer: 3, winter: 0, city: "Lyon"}
+  - {carrier: TRA, at: LEMG, other: LFMT, number: 6509, summer: 3, winter: 0, city: "Montpellier"}
+  - {carrier: UAE, at: EGKK, other: OMDB, number: 5, summer: 28, winter: 28, windows: [[7.0, 7.5], [12.5, 13.0], [14.5, 15.0], [19.5, 20.0]], types: [[A388, 75], [A359, 25]], city: "Dubai"}
+  - {carrier: UAL, at: LEMG, other: KEWR, number: 120, summer: 7, winter: 0, windows: [[8.0, 8.5]], types: [[B763, 100]], city: "Newark"}
+  - {carrier: UBT, at: EGKK, other: KMCO, number: 1, summer: 4, winter: 4, windows: [[6.5, 7.0]], types: [[B789, 100]], city: "Orlando"}
+  - {carrier: UBT, at: EGKK, other: KJFK, number: 7, summer: 7, winter: 4, windows: [[6.0, 6.5]], types: [[B789, 100]], city: "New York JFK"}
+  - {carrier: VLG, at: EGKK, other: LEBL, number: 8851, summer: 35, winter: 20, based: true, city: "Barcelona"}
+  - {carrier: VLG, at: EGKK, other: LEAL, number: 8871, summer: 6, winter: 4, based: true, city: "Alicante"}
+  - {carrier: VLG, at: EGKK, other: LEZL, number: 8879, summer: 9, winter: 6, based: true, city: "Seville"}
+  - {carrier: VLG, at: EGKK, other: LEBB, number: 8887, summer: 22, winter: 13, based: true, city: "Bilbao"}
+  - {carrier: VLG, at: LEMG, other: EGKK, number: 8812, summer: 7, winter: 7, city: "London Gatwick"}
+  - {carrier: VLG, at: LEMG, other: EHAM, number: 8411, summer: 7, winter: 7, city: "Amsterdam"}
+  - {carrier: VLG, at: LEMG, other: EBBR, number: 8961, summer: 7, winter: 7, city: "Brussels"}
+  - {carrier: VLG, at: LEMG, other: LFPO, number: 8013, summer: 14, winter: 14, based: true, city: "Paris Orly"}
+  - {carrier: VLG, at: LEMG, other: LEBL, number: 2201, summer: 49, winter: 42, based: true, city: "Barcelona"}
+  - {carrier: VLG, at: LEMG, other: LEPA, number: 3911, summer: 14, winter: 10, city: "Palma de Mallorca"}
+  - {carrier: VLG, at: LEMG, other: LEBB, number: 1471, summer: 21, winter: 14, based: true, city: "Bilbao"}
+  - {carrier: VLG, at: LEMG, other: GCLP, number: 3021, summer: 14, winter: 14, city: "Gran Canaria"}
+  - {carrier: VLG, at: LEMG, other: GCXO, number: 3061, summer: 14, winter: 14, city: "Tenerife North"}
+  - {carrier: VLG, at: LEMG, other: LEST, number: 1281, summer: 12, winter: 10, city: "Santiago"}
+  - {carrier: VLG, at: LEMG, other: LEIB, number: 3519, summer: 7, winter: 2, city: "Ibiza"}
+  - {carrier: VLG, at: LEMG, other: EGFF, number: 4101, summer: 3, winter: 0, city: "Cardiff"}
+  - {carrier: VLG, at: LEMG, other: GCFV, number: 4105, summer: 4, winter: 4, city: "Fuerteventura"}
+  - {carrier: VLG, at: LEMG, other: GCRR, number: 4109, summer: 4, winter: 4, city: "Lanzarote"}
+  - {carrier: WZZ, at: EGKK, other: LPFR, number: 4501, summer: 8, winter: 4, based: true, city: "Faro"}
+  - {carrier: WZZ, at: EGKK, other: LHBP, number: 4523, summer: 15, winter: 8, based: true, city: "Budapest"}
+  - {carrier: WZZ, at: EGKK, other: LCLK, number: 4509, summer: 6, winter: 4, based: true, city: "Larnaca"}
+  - {carrier: WZZ, at: EGKK, other: LTBS, number: 4517, summer: 4, winter: 0, based: true, city: "Dalaman"}
+  - {carrier: WZZ, at: LEMG, other: EGKK, number: 4471, summer: 7, winter: 4, city: "London Gatwick"}
+  - {carrier: WZZ, at: LEMG, other: EGGW, number: 4625, summer: 3, winter: 2, city: "London Luton"}
+  - {carrier: WZZ, at: LEMG, other: LIRF, number: 6201, summer: 7, winter: 4, city: "Rome Fiumicino"}
+  - {carrier: WZZ, at: LEMG, other: LIMC, number: 1347, summer: 5, winter: 3, city: "Milan Malpensa"}
+  - {carrier: WZZ, at: LEMG, other: LHBP, number: 3331, summer: 7, winter: 4, city: "Budapest"}
+  - {carrier: WZZ, at: LEMG, other: LROP, number: 3417, summer: 4, winter: 3, city: "Bucharest"}
+  - {carrier: WZZ, at: LEMG, other: LZIB, number: 7001, summer: 3, winter: 2, city: "Bratislava"}
+  - {carrier: WZZ, at: LEMG, other: LRCL, number: 7005, summer: 3, winter: 3, city: "Cluj"}
+  - {carrier: WZZ, at: LEMG, other: EPGD, number: 7009, summer: 3, winter: 2, city: "Gdansk"}
+  - {carrier: WZZ, at: LEMG, other: EPKT, number: 7013, summer: 4, winter: 3, city: "Katowice"}
+  - {carrier: WZZ, at: LEMG, other: EPKK, number: 7017, summer: 3, winter: 2, city: "Krakow"}
+  - {carrier: WZZ, at: LEMG, other: LBSF, number: 7021, summer: 4, winter: 3, city: "Sofia"}
+  - {carrier: WZZ, at: LEMG, other: LATI, number: 7025, summer: 3, winter: 3, city: "Tirana"}
+  - {carrier: WZZ, at: LEMG, other: LIPZ, number: 7029, summer: 4, winter: 3, city: "Venice"}
+  - {carrier: WZZ, at: LEMG, other: EYVI, number: 7033, summer: 3, winter: 3, city: "Vilnius"}
+  - {carrier: WZZ, at: LEMG, other: EPWA, number: 7037, summer: 4, winter: 3, city: "Warsaw"}
+  - {carrier: WZZ, at: LEMG, other: EPWR, number: 7041, summer: 3, winter: 2, city: "Wroclaw"}
