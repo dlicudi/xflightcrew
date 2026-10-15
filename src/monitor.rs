@@ -767,6 +767,7 @@ fn flight_sample(s: &Snapshot, t: f64, crashed: bool) -> crate::flight::Sample {
         automation: flying_loop(),
         autopilot: Some(s.ap_servos_on),
         crashed: Some(crashed),
+        contact: crate::flight::first_contact(),
         situation: Some(situation()),
         ..crate::flight::Sample::default()
     }

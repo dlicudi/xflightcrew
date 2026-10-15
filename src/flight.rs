@@ -256,6 +256,38 @@ pub fn pilot_takeover() -> Option<(f64, &'static str)> {
     *PILOT_TAKEOVER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The wheels' first contact, as a witness ticking faster than the monitor
+/// saw it: the monitor's ~1.5 s sample can fall either side of a bounce
+/// and never see the wheels on (EGBB 15 2026-10-15: the 737 met the runway
+/// at 1,899 fpm, bounced to 23 ft, and the model scored the second
+/// contact's 655). X-Plane latches no contact, so whoever reads the wheels
+/// at tick rate (autoland) notes it here, and the model reads it
+/// ([`Sample::contact`]). `t` on the blackbox's clock, `sink_fpm` signed
+/// (negative is down), as [`Touchdown`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Contact {
+    pub t: f64,
+    pub sink_fpm: f64,
+}
+
+static FIRST_CONTACT: std::sync::Mutex<Option<Contact>> = std::sync::Mutex::new(None);
+
+/// The wheels met the ground at `t` sinking `sink_fpm`: the witness's first
+/// contact of its approach.
+pub(crate) fn note_first_contact(t: f64, sink_fpm: f64) {
+    *FIRST_CONTACT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Contact { t, sink_fpm });
+}
+
+/// The ended flight's contact, forgotten at the new-flight door
+/// (`flight_state::forget_flight`).
+pub(crate) fn forget_first_contact() {
+    *FIRST_CONTACT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+pub(crate) fn first_contact() -> Option<Contact> {
+    *FIRST_CONTACT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// One tick of the aircraft. Mirrors the blackbox `state` record, plus
 /// evidence only the live tick has (`None` = unknown, never guessed).
 #[derive(Debug, Clone, Default)]
@@ -291,6 +323,9 @@ pub struct Sample {
     pub failed: Option<Vec<String>>,
     pub emergency: Option<bool>,
     pub crashed: Option<bool>,
+    /// The fast witness's last first contact ([`first_contact`]); the model
+    /// takes it only inside this airborne spell.
+    pub contact: Option<Contact>,
     /// The crew's side (`None` = unknown: a replayed flight).
     pub situation: Option<Situation>,
 }
@@ -966,7 +1001,10 @@ impl Flight {
     fn step_airborne(&mut self, s: &Sample, ev: &mut Vec<Event>) {
         use Phase::*;
         let t = s.t;
-        if s.on_ground {
+        // On the wheels, or off them again after a contact this sample
+        // never saw (a bounce between two samples): the landing is the
+        // contact, and the rollout counts the bounce when it comes down.
+        if s.on_ground || self.fresh_contact(s).is_some() {
             self.alt_track.clear();
             self.touch_down(s, ev);
             return;
@@ -1159,22 +1197,43 @@ impl Flight {
         if self.go(to, why, s.t, ev) {
             self.memory.landings += 1;
             self.memory.last_touchdown = Some(td);
-            self.off_again = false;
+            self.off_again = !s.on_ground;
             self.recent.clear();
             ev.push(Event::Touchdown(td));
         }
     }
 
-    /// The wheels' first contact, as a touchdown or an impact reads it.
+    /// The wheels' first contact, as a touchdown or an impact reads it: the
+    /// fast witness's when it saw one this airborne spell, else this
+    /// sample's own window.
     fn contact(&self, s: &Sample) -> Touchdown {
-        let recent: Vec<(f64, f64)> = self.recent.iter().copied().collect();
+        let (t, sink_fpm) = match self.fresh_contact(s) {
+            Some(c) => (c.t, c.sink_fpm),
+            None => {
+                let recent: Vec<(f64, f64)> = self.recent.iter().copied().collect();
+                (
+                    s.t,
+                    crate::instructor::touchdown_sink_fpm(&recent, s.t, s.vsi_fpm),
+                )
+            }
+        };
         Touchdown {
-            t: s.t,
-            sink_fpm: crate::instructor::touchdown_sink_fpm(&recent, s.t, s.vsi_fpm),
+            t,
+            sink_fpm,
             gs_kts: s.gs_kts,
             lat: s.lat,
             lon: s.lon,
         }
+    }
+
+    /// The witness's contact when it belongs to this airborne spell: after
+    /// the flight last left the ground and after the last touchdown booked,
+    /// and not after this sample.
+    fn fresh_contact(&self, s: &Sample) -> Option<Contact> {
+        let aloft = self.memory.aloft_t?;
+        s.contact.filter(|c| {
+            c.t > aloft && c.t <= s.t && self.memory.last_touchdown.is_none_or(|td| c.t > td.t)
+        })
     }
 
     /// The ground phase an arrival on the wheels starts in.
@@ -2159,6 +2218,47 @@ mod tests {
         assert_eq!(f.memory().bounces, 1);
         assert_eq!(f.memory().touch_and_goes, 0);
         assert_eq!(ev.iter().filter(|e| **e == Event::Bounce).count(), 1);
+    }
+
+    /// The wheels met the ground between two samples and bounced (the
+    /// witness saw it, the sample after reads airborne): the touchdown is
+    /// the witness's contact, the next ground sample the bounce. A contact
+    /// before the flight left the ground is no contact of this one.
+    #[test]
+    fn a_contact_between_two_samples_is_the_touchdown_and_its_bounce_counts() {
+        use Phase::*;
+        let c = Contact {
+            t: 4.5,
+            sink_fpm: -420.0,
+        };
+        let stale = Contact {
+            t: -10.0,
+            sink_fpm: -2000.0,
+        };
+        let mut v: Vec<Sample> = (0..5)
+            .map(|t| air(t as f64, 50.0 - t as f64 * 10.0, -500.0, 60.0))
+            .collect();
+        v.iter_mut().for_each(|s| s.contact = Some(stale));
+        v.extend((5..8).map(|t| Sample {
+            contact: Some(c),
+            ..air(t as f64, 6.0, 100.0, 58.0)
+        }));
+        v.extend((8..30).map(|t| Sample {
+            contact: Some(c),
+            ..ground(t as f64, 55.0 - (t - 8) as f64 * 2.0, true)
+        }));
+        let (seen, f, ev) = phases(v);
+        assert_eq!(seen, vec![Approach, Landing, Rollout, TaxiIn]);
+        let td = f.memory().last_touchdown.unwrap();
+        assert_eq!((td.t, td.sink_fpm), (4.5, -420.0));
+        assert_eq!(f.memory().landings, 1);
+        assert_eq!(f.memory().bounces, 1);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, Event::Touchdown(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]

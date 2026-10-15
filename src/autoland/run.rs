@@ -380,6 +380,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             let mut wheels_on: Option<f64> = None;
             // When the last live tick read the wheels (the wheels-on clock).
             let mut wheels_read_t: Option<std::time::Instant> = None;
+            // The wheels' first contact, for the flight model (a bounce the
+            // monitor's sample never sees on the wheels).
+            let mut first_contact = FirstContact::default();
             let mut vacate_follows = false;
             let mut roll_law = crate::autotakeoff::RollSteer::default();
             // A castoring nosewheel steers the rollout on its brakes too
@@ -742,6 +745,12 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     .map_or(0.0, |t0| wheels_t.duration_since(t0).as_secs_f64());
                 wheels_read_t = Some(wheels_t);
                 wheels_on = wheels_on_time(wheels_on, on_ground > 0.5, radio_ft, wheels_dt);
+                let wall_t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64());
+                if let Some((t, sink)) = first_contact.tick(wall_t, on_ground > 0.5, vs_fm) {
+                    crate::flight::note_first_contact(t, sink);
+                }
                 if should_start_rollout(
                     rolling_out,
                     on_ground > 0.5,

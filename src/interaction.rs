@@ -49,10 +49,33 @@ pub struct Landing {
     tracking: Option<f64>,
     automated: bool,
     interrupted: bool,
+    /// The flight model's touchdown sink (fpm down) and its bounces: the
+    /// FIRST contact, which this tick's own samples can miss (a bounce
+    /// between two of them).
+    model_sink: Option<f64>,
+    model_bounces: u32,
 }
 impl Landing {
     pub fn note_interruption(&mut self) {
         self.interrupted = true;
+    }
+    /// The flight model's events this tick: its touchdown is the landing's.
+    pub fn note_flight(&mut self, events: &[crate::flight::Event]) {
+        use crate::flight::Event;
+        for e in events {
+            match e {
+                Event::Touchdown(td) | Event::Impact(td) => {
+                    self.model_sink = Some((-td.sink_fpm).max(0.0));
+                    self.model_bounces = 0;
+                }
+                Event::Bounce => self.model_bounces += 1,
+                Event::TouchAndGo | Event::Takeoff => {
+                    self.model_sink = None;
+                    self.model_bounces = 0;
+                }
+                _ => {}
+            }
+        }
     }
     #[allow(clippy::too_many_arguments)]
     pub fn tick(
@@ -106,21 +129,26 @@ impl Landing {
         if speed > 20.0 || now.duration_since(self.contact.unwrap()) < Duration::from_secs(8) {
             return None;
         }
-        let mut line = match self.sink {
-            Some(s) => format!("Landing summary: last airborne sample about {:.0} feet per minute down; exact touchdown rate unavailable.", (s / 50.0).round() * 50.0),
-            None => "Landing summary: touchdown rate unavailable.".into(),
+        let mut line = match (self.model_sink, self.sink) {
+            (Some(s), _) => format!(
+                "Landing summary: touchdown about {:.0} feet per minute down.",
+                (s / 50.0).round() * 50.0
+            ),
+            (None, Some(s)) => format!("Landing summary: last airborne sample about {:.0} feet per minute down; exact touchdown rate unavailable.", (s / 50.0).round() * 50.0),
+            (None, None) => "Landing summary: touchdown rate unavailable.".into(),
         };
+        let bounces = self.bounces.max(self.model_bounces);
         if let Some(x) = self.tracking {
             line.push_str(&format!(
                 " Last approach tracking {:.0} metres from centreline.",
                 x.round()
             ));
         }
-        if self.bounces > 0 {
+        if bounces > 0 {
             line.push_str(&format!(
                 " {} possible bounce{} detected.",
-                self.bounces,
-                if self.bounces == 1 { "" } else { "s" }
+                bounces,
+                if bounces == 1 { "" } else { "s" }
             ));
         }
         if self.automated {

@@ -368,6 +368,9 @@ mod final_report_tests;
 /// the pilot's yoke, the glideslope level-off.
 #[cfg(test)]
 mod egbb15_737_tests;
+/// The wheels' first contact, EGBB 15 2026-10-15.
+#[cfg(test)]
+mod first_contact_tests;
 
 /// LEMG 13 and 31 as apt.dat has them, a 737's heading response and the
 /// autoland loop's lateral composition, for the replays of the 2026-09-28

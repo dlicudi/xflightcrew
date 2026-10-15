@@ -101,6 +101,7 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("efb::ptt::HOLD", 'S'),
     ("env_import::CACHE", 'C'),
     ("env_import::CLEAR", 'C'),
+    ("flight::FIRST_CONTACT", 'F'),
     ("flight::PILOT_TAKEOVER", 'F'),
     ("flight::PUBLISHED", 'S'),
     ("flight_state::FLIGHTS_BEGUN", 'S'),

@@ -510,6 +510,51 @@ pub(super) fn wheels_on_time(prev: Option<f64>, on_ground: bool, radio_ft: f64, 
     }
 }
 
+/// The flare's last tick reaches into the contact's sink only this recent.
+const FIRST_CONTACT_PREV_S: f64 = 1.0;
+
+/// The fast witness to the wheels' FIRST contact of this approach, for the
+/// flight model (`flight::note_first_contact`): the monitor's slower sample
+/// misses a contact a bounce lifts off again. Its sink is the steepest of
+/// the contact tick and the flare tick before it (the scorecard's window,
+/// `scorecard::open_contact`). Once per approach; a contact with no
+/// vertical speed read is no measurement. Pure.
+#[derive(Debug, Default)]
+pub(super) struct FirstContact {
+    airborne: bool,
+    noted: bool,
+    prev: Option<(f64, f64)>,
+}
+
+impl FirstContact {
+    /// One tick at `t` (the blackbox clock); `Some((t, sink_fpm))` on the
+    /// first contact after airborne ticks.
+    pub(super) fn tick(
+        &mut self,
+        t: f64,
+        on_ground: bool,
+        vs_fpm: Option<f64>,
+    ) -> Option<(f64, f64)> {
+        if !on_ground {
+            self.airborne = true;
+            self.prev = vs_fpm.map(|v| (t, v));
+            return None;
+        }
+        if !self.airborne || std::mem::replace(&mut self.noted, true) {
+            return None;
+        }
+        let prev = self
+            .prev
+            .filter(|(tp, _)| t - tp <= FIRST_CONTACT_PREV_S)
+            .map(|(_, v)| v);
+        let sink = match (vs_fpm, prev) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        Some((t, sink))
+    }
+}
+
 /// NO BALK FROM THE PAVEMENT. With the wheels on the runway a landing has
 /// happened: a go-around from there at 145 kt with the throttle closed, the
 /// spoilers out and the autobrake armed is the most dangerous thing the loop

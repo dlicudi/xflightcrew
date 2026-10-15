@@ -1391,6 +1391,7 @@ pub async fn run(
                     had_flying_control = false;
                 }
                 let xtk = crate::autoland::last_tracking_error();
+                landing_summary.note_flight(&flight_events);
                 if let Some(line) = landing_summary.tick(
                     now,
                     snap.on_ground,
