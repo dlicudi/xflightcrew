@@ -3364,10 +3364,19 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     // deceleration as "five knots slow" and walked the 737's
                     // lever from 0.32 to 0.55 at 30 ft over EGCC 23L, and it
                     // climbed away from two feet at 155 kt (2026-09-19).
+                    // On a lever-driven A/THR our lever stays under the CL
+                    // detent (`manual_lever_cap`, the governor's rule): at
+                    // FLX/MCT the A333 script re-arms the A/THR every frame,
+                    // and it held the lever at 0.76 against TECS from 151 to
+                    // 216 kt down the EGKK 26L final, the flap blown back
+                    // to 1 (2026-10-15). A power floor above it still wins.
+                    let top = crate::tools::speedhold::manual_lever_cap(crate::aircraft::athr_cl_detent())
+                        .unwrap_or(1.0)
+                        .max(min_thr);
                     match (out, thr_now) {
-                        (Some(o), Some(t)) if g.arresting && att_out.is_none() => Some(o.lever.min(t).clamp(min_thr, 1.0)),
-                        (Some(o), _) => Some(o.lever.clamp(min_thr, 1.0)),
-                        (None, t) => t.map(|t| t.clamp(min_thr, 1.0)),
+                        (Some(o), Some(t)) if g.arresting && att_out.is_none() => Some(o.lever.min(t).clamp(min_thr, top)),
+                        (Some(o), _) => Some(o.lever.clamp(min_thr, top)),
+                        (None, t) => t.map(|t| t.clamp(min_thr, top)),
                     }
                 };
                 // The A/T holds the speed and retards (`ap_lands`): our
