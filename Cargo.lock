@@ -2734,6 +2734,8 @@ dependencies = [
  "nav",
  "serde",
  "serde_yaml",
+ "sim",
+ "tracing",
 ]
 
 [[package]]

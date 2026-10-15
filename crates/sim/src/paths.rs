@@ -3,7 +3,7 @@
 //! pinned by `every_file_root_goes_through_the_owner` below.
 //!
 //! - [`resources`]: what ships, read only: `profiles/` (the YAMLs),
-//!   `checklists/`, `assets/`.
+//!   `checklists/`, `routes/` (the traffic timetables), `assets/`.
 //! - [`data`]: the user's, writable: `models/`, `logs/` (`sorties/`,
 //!   `blackbox.jsonl`), `prefs.json`, `.env`, `profiles/learned/`.
 //!
@@ -342,6 +342,11 @@ pub fn data() -> &'static Path {
 /// The aircraft profiles' folder (the YAMLs).
 pub fn profiles_dir() -> PathBuf {
     resources().join("profiles")
+}
+
+/// The traffic timetables' folder: one YAML per field.
+pub fn routes_dir() -> PathBuf {
+    resources().join("routes")
 }
 
 /// A shipped file: `resource("checklists/md82.txt")`. A relative path a
@@ -780,6 +785,7 @@ mod tests {
             "models",
             "profiles",
             "checklists",
+            "routes",
             "assets",
             "prefs.json",
             ".env",

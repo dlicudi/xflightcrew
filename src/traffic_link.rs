@@ -2909,7 +2909,7 @@ fn build_link(
         ref runway,
     } = *ctx;
     let table = traffic::routes::field_routes(icao);
-    // Traffic only where a route timetable (`crates/traffic/routes/`) or the
+    // Traffic only where a route timetable (`routes/`) or the
     // pilot's own file defines it. The station's field used to fly a
     // generated hour where it had neither, so every radar handoff en route
     // brought up a field nobody flies to: LEMG to EGKK (2026-10-14) put up

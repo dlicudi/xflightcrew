@@ -1,4 +1,4 @@
-//! Build script: the shipped resources (`profiles/`, `checklists/`,
+//! Build script: the shipped resources (`profiles/`, `checklists/`, `routes/`,
 //! `assets/`) built into the binary, so a bare `xfc` copied anywhere needs
 //! nothing beside it (docs/tasks/embedded-resources/BRIEF.md). `sim::paths`
 //! unpacks them when no resources are on disk.
@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// The folders that ship, relative to the workspace root.
-const FOLDERS: &[&str] = &["profiles", "checklists", "assets"];
+const FOLDERS: &[&str] = &["profiles", "checklists", "routes", "assets"];
 
 /// Files a build must carry: a clean checkout without them is a broken
 /// release, never a quiet one (the AFV clicks were once gitignored).

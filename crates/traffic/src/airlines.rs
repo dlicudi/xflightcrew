@@ -501,7 +501,7 @@ pub(crate) const AUR: Carrier = c("AUR", "Ayline", &[("E195", 100)], (600, 699))
 
 /// Every carrier constant by its Rust name, written once so the name and
 /// the value can never part: the route tables' data files
-/// (`crates/traffic/routes/*.yaml`) name their carriers this way.
+/// (`routes/*.yaml`) name their carriers this way.
 macro_rules! named_carriers {
     ($($name:ident),* $(,)?) => {
         /// The carrier constant called `name` ("EZY_GATWICK"), `None` for a

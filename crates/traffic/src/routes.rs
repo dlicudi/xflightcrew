@@ -5,10 +5,11 @@
 //! ([`crate::schedule::generate`]).
 //!
 //! The timetables are DATA (2026-10-14): one YAML file per field in
-//! `crates/traffic/routes/` (`LXGB.yaml`, `LEMG.yaml`, `EGKK.yaml`), each with its
-//! sources as comments, built into the crate by `include_str!` and parsed
-//! once ([`fields`]), so nothing is read from disk or the network and the
-//! binary needs nothing beside it. They were Rust tables until then; Gatwick
+//! `routes/` (`LXGB.yaml`, `LEMG.yaml`, `EGKK.yaml`), each with its sources
+//! as comments, shipped like the profiles (`sim::paths::routes_dir`, built
+//! into the binary and unpacked when nothing is on disk) and parsed once
+//! ([`fields`]): a new field is a file dropped in, never a rebuild. A file
+//! that does not parse is logged and skipped. They were Rust tables until then; Gatwick
 //! and the fields after it would have tripled them. A row names its carrier
 //! by its constant's name in [`crate::airlines`] (`carrier: EZY_GATWICK`),
 //! resolved by [`airlines::carrier_by_name`]: the carriers, their telephony
@@ -102,13 +103,33 @@ pub struct FieldRoutes {
 /// route file: a row with no `windows`.
 pub const LINES: &[(f64, f64)] = &[];
 
-/// The route files built into the crate, by file name, in [`fields`]'s
-/// order.
-const FILES: &[(&str, &str)] = &[
-    ("LXGB.yaml", include_str!("../routes/LXGB.yaml")),
-    ("LEMG.yaml", include_str!("../routes/LEMG.yaml")),
-    ("EGKK.yaml", include_str!("../routes/EGKK.yaml")),
-];
+/// The timetables' folder. This crate's own tests run from its folder, so
+/// they read the checkout's.
+fn routes_dir() -> std::path::PathBuf {
+    if cfg!(test) {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../routes")
+    } else {
+        sim::paths::routes_dir()
+    }
+}
+
+/// Every `*.yaml` in `dir`, by file name: (name, text). None for a folder
+/// that does not read.
+fn route_files(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml"))
+        .filter_map(|p| {
+            let name = p.file_name()?.to_string_lossy().into_owned();
+            Some((name, std::fs::read_to_string(&p).ok()?))
+        })
+        .collect();
+    files.sort();
+    files
+}
 
 /// A route file as written.
 #[derive(Debug, Deserialize)]
@@ -247,20 +268,20 @@ fn derive(tables: Vec<FieldRoutes>) -> Vec<FieldRoutes> {
         .collect()
 }
 
-/// Every field with a route table. The tables are parsed from the files
-/// built into the crate on first use and never change after: immutable
+/// Every field with a route table. The tables are parsed from the
+/// timetables' folder on first use and never change after: immutable
 /// shipped data, like a const table, never state (the crate's "no
 /// statics" is about facts; this holds none).
 pub fn fields() -> &'static [FieldRoutes] {
     static TABLES: OnceLock<Vec<FieldRoutes>> = OnceLock::new();
     TABLES.get_or_init(|| {
         derive(
-            FILES
+            route_files(&routes_dir())
                 .iter()
-                .map(|(file, text)| {
-                    parse_table(file, text).unwrap_or_else(|e| {
-                        panic!("a shipped route file: {e} (see routes.rs tests)")
-                    })
+                .filter_map(|(file, text)| {
+                    parse_table(file, text)
+                        .inspect_err(|e| tracing::error!("route file skipped: {e}"))
+                        .ok()
                 })
                 .collect(),
         )
@@ -339,13 +360,15 @@ mod tests {
     /// files are one field.
     #[test]
     fn every_route_file_parses() {
-        for (file, text) in FILES {
+        let files = route_files(&routes_dir());
+        assert!(files.len() >= 3, "{}", routes_dir().display());
+        for (file, text) in &files {
             let t = parse_table(file, text).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(format!("{}.yaml", t.icao), *file);
             assert!(!t.rows.is_empty(), "{file}");
             assert!((-12.0..=14.0).contains(&t.utc_offset_h), "{file}");
         }
-        assert_eq!(fields().len(), FILES.len());
+        assert_eq!(fields().len(), files.len());
         let mut seen = std::collections::HashSet::new();
         assert!(fields().iter().all(|f| seen.insert(f.icao)));
     }
@@ -604,18 +627,18 @@ mod tests {
             }
         }
         let want = [
-            "LXGB 2026-07-15 7 BAW490 0d97bda92a9614ee",
-            "LXGB 2026-07-18 4 BAW490 6fae55dc3f7a571e",
-            "LXGB 2026-01-14 4 BAW490 e6bd1df68761b9a1",
-            "LXGB 2026-01-17 3 EZY8901 3bb8c9c69d5e1275",
-            "LEMG 2026-07-15 224 NAX3586 ba3692f54e0ab81f",
-            "LEMG 2026-07-18 227 NAX3586 82b1c932f8bd0438",
-            "LEMG 2026-01-14 154 NAX3586 6eeac15b260dfe52",
-            "LEMG 2026-01-17 170 NAX3586 d2bf3149f7b602af",
             "EGKK 2026-07-15 220 EZY8902 d615124dfa988254",
             "EGKK 2026-07-18 227 EZY8904 40265b14ebaf1785",
             "EGKK 2026-01-14 125 EXS618 d4774891337865b5",
             "EGKK 2026-01-17 130 EZY8066 021370be12c51c71",
+            "LEMG 2026-07-15 224 NAX3586 ba3692f54e0ab81f",
+            "LEMG 2026-07-18 227 NAX3586 82b1c932f8bd0438",
+            "LEMG 2026-01-14 154 NAX3586 6eeac15b260dfe52",
+            "LEMG 2026-01-17 170 NAX3586 d2bf3149f7b602af",
+            "LXGB 2026-07-15 7 BAW490 0d97bda92a9614ee",
+            "LXGB 2026-07-18 4 BAW490 6fae55dc3f7a571e",
+            "LXGB 2026-01-14 4 BAW490 e6bd1df68761b9a1",
+            "LXGB 2026-01-17 3 EZY8901 3bb8c9c69d5e1275",
         ];
         assert_eq!(got, want, "{got:#?}");
     }

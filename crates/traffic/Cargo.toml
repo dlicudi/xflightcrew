@@ -12,6 +12,9 @@ publish = false
 # bin (`cargo tree -p traffic` stays as lean as nav).
 [dependencies]
 nav = { path = "../nav" }
+# The timetables' folder (`sim::paths::routes_dir`), nothing else of it.
+sim = { path = "../sim" }
+tracing = { workspace = true }
 anyhow = { workspace = true }
 # The pilot's traffic file (`XCOPILOT_TRAFFIC_FILE`, YAML): parsing only.
 serde = { workspace = true }
