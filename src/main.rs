@@ -240,11 +240,6 @@ async fn main() -> Result<()> {
     // setup` open it on Checks (`--print`, or no terminal: the checks as
     // text). Headless is plain `xfc` with no terminal, or `XCOPILOT_UI=plain`.
     let arg = std::env::args().nth(1);
-    if arg.as_deref() == Some("run") {
-        return Err(anyhow!(
-            "`xfc run` is gone: plain `xfc` is the app; `XCOPILOT_UI=plain xfc` runs the crew headless"
-        ));
-    }
     if matches!(arg.as_deref(), Some("home" | "setup")) {
         use std::io::IsTerminal;
         let rest: Vec<String> = std::env::args().skip(2).collect();
