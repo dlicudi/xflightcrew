@@ -581,6 +581,106 @@ fn a_held_traffic_departure_is_released_and_synced() {
     Station::uninstall();
 }
 
+/// A HOLD READ BACK AND A "SAY AGAIN" KEEP THEIR WORD (#300, EGKK 26L
+/// 2026-10-15): a traffic departure held for a traffic lander on a short
+/// final (inside the conditional line-up's range) reads the hold back (silence, nothing owed), asks "say
+/// again" (answered, the hold still standing), and is released once the
+/// lander has landed and reported off, before the next arrival is close.
+#[test]
+fn a_held_departure_reads_back_and_is_released_after_the_lander() {
+    let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _strips = ClearStrips;
+    let mut st = gatwick_live();
+    let lander = |state: AircraftState| TrafficTarget {
+        who: FlightId::Traffic(11),
+        target: TcasTarget {
+            callsign: "EZY11".into(),
+            lat: state.lat,
+            lon: state.lon,
+            ele_ft: state.alt_ft,
+            on_ground: state.on_ground,
+            vs_fpm: if state.on_ground { 0.0 } else { -700.0 },
+        },
+    };
+    let on_final = traffic_on_final(1.2, 400.0);
+    note_traffic_state(11, on_final);
+    let r = st.answer_traffic(&call(11, FINAL_26L, on_final, Vec::new()));
+    assert!(r.line.contains("cleared to land"), "{}", r.line);
+    st.answer_traffic(&call(11, LANDING_READBACK, on_final, Vec::new()));
+
+    let hold = at_the_hold();
+    note_traffic_state(10, hold);
+    st.answer_traffic(&call(
+        10,
+        "Gatwick Tower, Cessna three four five, request taxi",
+        hold,
+        Vec::new(),
+    ));
+    let r = st.answer_traffic(&call(
+        10,
+        "Gatwick Tower, Cessna three four five, ready for departure runway two six left",
+        hold,
+        vec![lander(on_final)],
+    ));
+    assert!(r.line.contains("hold position"), "{}", r.line);
+    assert!(traffic_order(10).unwrap().hold, "held for the lander");
+    assert!(traffic_order(10).unwrap().readback_owed.is_some());
+    let r = st.answer_traffic(&call(
+        10,
+        "Holding position, Cessna three four five",
+        hold,
+        Vec::new(),
+    ));
+    assert!(r.line.is_empty(), "the hold read back: {}", r.line);
+    assert!(
+        traffic_order(10).unwrap().readback_owed.is_none(),
+        "nothing owed"
+    );
+    st.answer_traffic(&call(
+        10,
+        "Gatwick Tower, Cessna three four five, say again",
+        hold,
+        Vec::new(),
+    ));
+    let order = traffic_order(10).unwrap();
+    assert!(order.hold, "a say again never loses the hold");
+    assert!(order.readback_owed.is_none(), "nor owes a readback again");
+
+    let t0 = Instant::now();
+    let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+    let held = traffic_tick(10, &[lander(on_final)], at(0));
+    assert!(held.is_empty(), "the lander on final holds it: {held:?}");
+    let (lat, lon) = along(&book_runways()[0], 0.6);
+    let rolling = AircraftState::at_position(lat, lon, true, 60.0);
+    note_traffic_state(11, rolling);
+    let held = traffic_tick(10, &[lander(rolling)], at(30));
+    assert!(
+        held.is_empty(),
+        "the lander on the runway holds it: {held:?}"
+    );
+    let off = AircraftState::at_position(lat - 300.0 / 111_320.0, lon, true, 15.0);
+    note_traffic_state(11, off);
+    st.answer_traffic(&call(
+        11,
+        "Gatwick Tower, Cessna three four five, runway vacated",
+        off,
+        Vec::new(),
+    ));
+    let mut released = Vec::new();
+    for s in [60, 80] {
+        released.extend(traffic_tick(10, &[lander(off)], at(s)));
+    }
+    assert!(
+        released.iter().any(|l| l.contains("cleared for takeoff")),
+        "released after the lander: {released:?}"
+    );
+    assert_eq!(
+        traffic_order(10).unwrap().state,
+        tower::State::TakeoffCleared
+    );
+    Station::uninstall();
+}
+
 /// A DESPAWN CLOSES THE STRIP: its claims leave the book, its order and
 /// tick are gone, and the next desk sync drops its desk.
 #[test]

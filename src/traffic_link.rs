@@ -1259,6 +1259,7 @@ impl Link {
             clear_s,
         } in keyed
         {
+            self.fleet.note_keyed(id, &call);
             let Some(ac) = self.fleet.get(id) else {
                 continue;
             };

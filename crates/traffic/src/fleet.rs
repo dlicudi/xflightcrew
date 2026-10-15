@@ -5,7 +5,7 @@ use crate::aircraft::{Seen, TrafficAircraft};
 use crate::clock::{SimClock, SUBSTEP_S};
 use crate::field::FieldModel;
 use crate::kin::LatLon;
-use crate::phase::{Despawn, Event, Order, OwnTarget, Phase, Plan};
+use crate::phase::{Call, Despawn, Event, Order, OwnTarget, Phase, Plan};
 use crate::rng::XorShift64;
 use std::collections::HashMap;
 
@@ -335,6 +335,21 @@ impl Fleet {
 
     pub fn get(&self, id: u32) -> Option<&TrafficAircraft> {
         self.aircraft.iter().find(|a| a.id == id)
+    }
+
+    /// Flight `id`'s `call` has gone out on the frequency: an owed readback
+    /// (or its "say again") is retried [`crate::aircraft::READBACK_RETRY_S`]
+    /// after it was SAID, never after it was queued. EGKK 26L (#300,
+    /// 2026-10-15): a hold readback waited 23 s for the frequency, and the
+    /// "say again" queued behind it reached a tower that had taken the
+    /// readback a second before.
+    pub fn note_keyed(&mut self, id: u32, call: &Call) {
+        if !matches!(call, Call::Readback(_) | Call::SayAgain) {
+            return;
+        }
+        if let Some(a) = self.aircraft.iter_mut().find(|a| a.id == id) {
+            a.radio.readback_at_s = a.age_s;
+        }
     }
 
     /// Our own aircraft as last given to [`Fleet::step`].
