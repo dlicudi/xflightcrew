@@ -20,9 +20,13 @@
 //! aircraft are drawn by the plugin only inside the draw ring
 //! (`traffic_sink::DrawCull`), never TCAS targets for the station.
 
+use std::collections::HashSet;
+use std::time::Instant;
+
 use traffic::board::Dir;
+use traffic::rotation::{hhmm, Date};
 use traffic::track::{gc_dist_m, End, Fix, Stage, Whole, TAXI_IN_S};
-use traffic::{FlightInfo, Kin, MovementKind, Phase, Plan, TrafficAircraft};
+use traffic::{FlightInfo, Kin, LatLon, MovementKind, Phase, Plan, TrafficAircraft};
 
 use super::{Due, Link};
 
@@ -71,6 +75,100 @@ impl Modeled {
             _ if self.ac.kin.vs_fpm < -300.0 => "descending",
             _ => "cruising",
         }
+    }
+
+    /// The EFB map's aircraft, with its `journey`; `names` the field's
+    /// stands, for the label.
+    fn efb(
+        &self,
+        names: &[&str],
+        journey: crate::efb::feed::Journey,
+    ) -> crate::efb::feed::TrafficAc {
+        let a = &self.ac;
+        let f = self.info.as_ref();
+        // An arrival's way still to come: its entry, where the simulation
+        // takes it (the page draws the great circle to it and on to the
+        // field; the approach's points come with the simulated aircraft, a
+        // map's worth of them for every flight far out would double the
+        // tap).
+        let ahead = if matches!(a.plan, Plan::Arrival { .. }) {
+            vec![self.whole.track.b.pos]
+        } else {
+            Vec::new()
+        };
+        crate::efb::feed::TrafficAc {
+            id: a.id,
+            callsign: a.callsign.clone(),
+            spoken: a.spoken.clone(),
+            airline: f.map(|f| f.airline.clone()).unwrap_or_default(),
+            icao_type: a.icao_type.clone(),
+            from: self.whole.origin.clone(),
+            to: self.whole.dest.clone(),
+            phase: self.words(),
+            stand: f
+                .and_then(|f| f.stand.as_deref())
+                .map(|n| traffic::stands::label(n, names)),
+            sched: f.and_then(|f| f.sched_s).map(hhmm),
+            est: f.and_then(|f| f.est_s).map(hhmm),
+            lat: a.kin.lat,
+            lon: a.kin.lon,
+            hdg: a.kin.hdg_deg,
+            alt_ft: a.kin.alt_ft,
+            on_ground: a.kin.on_ground,
+            gs_kts: a.kin.gs_kts,
+            ahead,
+            journey: Some(journey),
+            modeled: true,
+        }
+    }
+}
+
+/// A departure's whole flight from `origin` (at `here`, `elev_ft`) to
+/// `dest`, off the blocks at `off_s` and wheels up at `up_s`
+/// (`traffic::midflow::out_times`); `None` for a destination the
+/// timetable does not place.
+fn from_wheels_up(
+    origin: &str,
+    here: LatLon,
+    elev_ft: f64,
+    dest: &str,
+    icao_type: &str,
+    (off_s, up_s): (f64, f64),
+) -> Option<Whole> {
+    let perf = traffic::class_for_type(icao_type).0;
+    Whole::outbound(
+        origin,
+        here,
+        dest,
+        End::field(here, elev_ft, perf, true),
+        up_s,
+        off_s,
+        perf,
+    )
+}
+
+/// The EFB's journey of a flight at `now`: both ends, the off-block on
+/// the origin's clock and the on-block on the destination's (`clock`, a
+/// field and a time on the caller's clock to "HH:MM" there), the time
+/// since one and to the other, and the share of the great circle flown.
+fn journey(
+    now: f64,
+    (origin, o): (&str, LatLon),
+    (dest, d): (&str, LatLon),
+    (off_s, on_s): (f64, f64),
+    pos: LatLon,
+    clock: impl Fn(&str, f64) -> String,
+) -> crate::efb::feed::Journey {
+    crate::efb::feed::Journey {
+        from: origin.to_string(),
+        to: dest.to_string(),
+        from_pos: o,
+        to_pos: d,
+        off: clock(origin, off_s),
+        on: clock(dest, on_s),
+        since_s: now - off_s,
+        to_go_s: on_s - now,
+        progress: traffic::track::progress(o, d, pos),
     }
 }
 
@@ -282,15 +380,13 @@ impl Link {
         let info = m.flight.clone()?;
         let here = self.fleet.field.reference()?;
         let elev = self.fleet.field.elev_ft();
-        let perf = traffic::class_for_type(&m.icao_type).0;
-        let whole = Whole::outbound(
+        let whole = from_wheels_up(
             self.icao(),
             here,
+            elev,
             &info.other,
-            End::field(here, elev, perf, true),
-            up_s,
-            off_s,
-            perf,
+            &m.icao_type,
+            (off_s, up_s),
         )?;
         if whole.over(now) {
             return None;
@@ -353,18 +449,31 @@ impl Link {
         on_s: f64,
         pos: (f64, f64),
     ) -> crate::efb::feed::Journey {
-        let now = self.fleet.clock.now_s();
-        crate::efb::feed::Journey {
-            from: origin.to_string(),
-            to: dest.to_string(),
-            from_pos: o,
-            to_pos: d,
-            off: self.clock_at(origin, off_s),
-            on: self.clock_at(dest, on_s),
-            since_s: now - off_s,
-            to_go_s: on_s - now,
-            progress: traffic::track::progress(o, d, pos),
-        }
+        journey(
+            self.fleet.clock.now_s(),
+            (origin, o),
+            (dest, d),
+            (off_s, on_s),
+            pos,
+            |icao, t| self.clock_at(icao, t),
+        )
+    }
+
+    /// The model's aircraft for the EFB's map, `names` the field's stands.
+    pub(crate) fn efb_modeled(&self, names: &[&str]) -> Vec<crate::efb::feed::TrafficAc> {
+        self.modeled()
+            .map(|m| m.efb(names, self.journey_modeled(m)))
+            .collect()
+    }
+
+    /// Every callsign this link has: its board's, its fleet's, its model's.
+    /// The world board shows none of them ([`WorldBoard`]).
+    fn callsigns(&self) -> impl Iterator<Item = &str> {
+        self.board
+            .iter()
+            .map(|f| f.callsign.as_str())
+            .chain(self.fleet.aircraft().iter().map(|a| a.callsign.as_str()))
+            .chain(self.modeled().map(|m| m.ac.callsign.as_str()))
     }
 
     /// A modelled flight's journey.
@@ -439,6 +548,178 @@ impl Link {
     }
 }
 
+/// THE WORLD BOARD (2026-10-15): every timetabled flight of the day on the
+/// EFB's map, not only those touching a field a link simulates. Each route
+/// table's day (`traffic::rotation::window`, the seed and density a link
+/// at that field draws, so the callsigns and types are the ones it would
+/// fly) flown whole by the same closed-form model: a departure from its
+/// wheels up ([`from_wheels_up`]), an arrival to its blocks. A route
+/// between two table fields is in both tables, the departure's model
+/// shown. Times are zulu seconds after the day's midnight, the sim's when
+/// they were last read (`note_clock`, no read of its own), else the system
+/// clock's.
+///
+/// EFB only: never drawn by the plugin, never a TCAS target, never seen by
+/// the station. A flight a link has is the link's, never shown twice.
+#[derive(Default)]
+pub(crate) struct WorldBoard {
+    /// The sim's zulu time and date at their last read, and when.
+    clock: Option<(f64, Option<u32>, Instant)>,
+    /// What the flights were built for.
+    built: Option<(Date, traffic::Density)>,
+    flights: Vec<Modeled>,
+}
+
+impl WorldBoard {
+    /// The sim's zulu time and date as just read (a failed read changes
+    /// nothing).
+    pub(crate) fn note_clock(&mut self, zulu: Option<f64>, day: Option<u32>, now: Instant) {
+        if let Some(z) = zulu {
+            self.clock = Some((z, day, now));
+        }
+    }
+
+    /// The day and zulu seconds into it at `now`: the last read run on by
+    /// the wall clock.
+    fn now(&self, now: Instant) -> (Date, f64) {
+        let (zulu, day) = match self.clock {
+            Some((z, d, at)) => (Some(z + now.saturating_duration_since(at).as_secs_f64()), d),
+            None => (None, None),
+        };
+        let (date, z) = super::sim_day(zulu, day);
+        let days = (z / 86_400.0).floor();
+        (date.plus(days as i64), z - days * 86_400.0)
+    }
+
+    /// The EFB's map field of every flight shown at `now` that none of
+    /// `links` has; the day built once per date and density.
+    pub(crate) fn efb_field<'a>(
+        &mut self,
+        links: impl Iterator<Item = &'a Link>,
+        density: traffic::Density,
+        now: Instant,
+    ) -> crate::efb::feed::TrafficField {
+        let (date, t) = self.now(now);
+        if self.built != Some((date, density)) {
+            self.flights = world_flights(date, density);
+            self.built = Some((date, density));
+        }
+        let owned: HashSet<&str> = links.flat_map(Link::callsigns).collect();
+        let summer = date.summer();
+        let clock =
+            |icao: &str, s: f64| hhmm(s + traffic::places::utc_offset_h(icao, summer) * 3600.0);
+        let mut seen = HashSet::new();
+        let mut aircraft = Vec::new();
+        for m in &mut self.flights {
+            if m.whole.over(t) || owned.contains(m.ac.callsign.as_str()) {
+                continue;
+            }
+            m.fly(t);
+            if !m.shown() || !seen.insert(m.ac.callsign.clone()) {
+                continue;
+            }
+            let w = &m.whole;
+            let j = journey(
+                t,
+                (&w.origin, w.origin_pos),
+                (&w.dest, w.dest_pos),
+                (w.off_block_s, w.on_block_s),
+                m.ac.kin.pos(),
+                clock,
+            );
+            aircraft.push(m.efb(&[], j));
+        }
+        crate::efb::feed::TrafficField {
+            icao: String::new(),
+            aircraft,
+            taken: Vec::new(),
+        }
+    }
+}
+
+/// Every route table's flights about `date` (yesterday's to tomorrow's)
+/// that are off the blocks before its end and on them after its start,
+/// on its zulu clock: the departures first, so a route between two table
+/// fields shows its departure's model. A leg whose other end the
+/// timetable does not place is not flown (never invented).
+fn world_flights(date: Date, density: traffic::Density) -> Vec<Modeled> {
+    let dst = if date.summer() { 1.0 } else { 0.0 };
+    let (mut deps, mut arrs) = (Vec::new(), Vec::new());
+    for table in traffic::routes::fields() {
+        let Some(here) = traffic::places::position(table.icao) else {
+            continue;
+        };
+        let seed = traffic::field_seed(table.icao, super::SESSION_SEED);
+        let zulu = |local: f64| local - (table.utc_offset_h + dst) * 3600.0;
+        let day =
+            traffic::rotation::window(table, date, seed, density, f64::NEG_INFINITY, f64::INFINITY);
+        for r in &day {
+            let perf = traffic::class_for_type(r.icao_type).0;
+            let off = zulu(r.dep.est_s);
+            let up = off + traffic::midflow::out_times(None, r.icao_type).1;
+            if let Some(w) =
+                from_wheels_up(table.icao, here, 0.0, r.dep.other, r.icao_type, (off, up))
+            {
+                deps.push(world_flight(r, false, w));
+            }
+            let on = zulu(r.arr.est_s);
+            let anchor = End::field(here, 0.0, perf, false);
+            if let Some(w) = Whole::inbound(
+                r.arr.other,
+                table.icao,
+                here,
+                anchor,
+                on - TAXI_IN_S,
+                on,
+                perf,
+            ) {
+                arrs.push(world_flight(r, true, w));
+            }
+        }
+    }
+    deps.extend(arrs);
+    deps.retain(|m| m.whole.off_block_s < 86_400.0 && !m.whole.over(0.0));
+    deps
+}
+
+/// One leg of `r` as the world board flies it, under an id of its own
+/// (the top half of the id space, hashed from its callsign: a link's ids
+/// count up from one).
+fn world_flight(r: &traffic::rotation::Rotation, arr: bool, whole: Whole) -> Modeled {
+    let leg = if arr { &r.arr } else { &r.dep };
+    let plan = if arr {
+        Plan::Arrival {
+            entry: whole.dest_pos,
+            star: None,
+            runway: String::new(),
+            straight_in: false,
+        }
+    } else {
+        Plan::Departure {
+            runway: String::new(),
+            sid: None,
+            exit_bearing: 0.0,
+        }
+    };
+    let id = 0x8000_0000 | (traffic::field_seed(&leg.callsign, 0) as u32 >> 1);
+    let ac = TrafficAircraft::new(
+        id,
+        &leg.callsign,
+        &leg.spoken,
+        r.icao_type,
+        plan,
+        Kin::parked(whole.origin_pos, 0.0, 0.0),
+        Phase::Leave,
+        r.seed,
+    );
+    Modeled {
+        ac,
+        whole,
+        info: Some(traffic::midflow::info(r, arr)),
+        stage: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{timetable_start, Link};
@@ -491,6 +772,104 @@ mod tests {
         link.set_summer(true);
         link.make_desk();
         link
+    }
+
+    /// The world board's day (a summer Tuesday's ordinal, the system
+    /// clock's year, as the board itself dates it) and a board whose sim
+    /// clock read `zulu_s` on it at `at`.
+    fn world_at(zulu_s: f64, at: Instant) -> (traffic::rotation::Date, super::WorldBoard) {
+        let ordinal = traffic::rotation::Date::ymd(2026, 7, 14).ordinal;
+        let date = super::super::sim_day(Some(0.0), Some(ordinal)).0;
+        let mut board = super::WorldBoard::default();
+        board.note_clock(Some(zulu_s), Some(ordinal), at);
+        (date, board)
+    }
+
+    /// THE WORLD BOARD (2026-10-15): with no field simulated, a Gatwick to
+    /// Malaga flight halfway along is on the map between the two, in the
+    /// air, and no callsign is shown twice (the route is in both tables).
+    #[test]
+    fn the_world_board_shows_a_flight_no_field_simulates() {
+        let epoch = Instant::now();
+        let (date, _) = world_at(0.0, epoch);
+        let flights = super::world_flights(date, Density::Normal);
+        let (cs, mid) = flights
+            .iter()
+            .filter(|m| m.whole.origin == "EGKK" && m.whole.dest == "LEMG")
+            .map(|m| {
+                (
+                    m.ac.callsign.clone(),
+                    0.5 * (m.whole.track.t_a + m.whole.track.t_b),
+                )
+            })
+            .find(|(_, t)| (0.0..86_400.0).contains(t))
+            .expect("a Gatwick to Malaga flight today");
+        let (_, mut board) = world_at(mid, epoch);
+        let field = board.efb_field(std::iter::empty(), Density::Normal, epoch);
+        let a = field
+            .aircraft
+            .iter()
+            .find(|a| a.callsign == cs)
+            .expect("the flight is shown");
+        assert!(
+            !a.on_ground && a.alt_ft > 10_000.0,
+            "{cs} airborne: {} ft",
+            a.alt_ft
+        );
+        assert_eq!((a.from.as_str(), a.to.as_str()), ("EGKK", "LEMG"));
+        let (g, m) = (
+            traffic::places::position("EGKK").unwrap(),
+            traffic::places::position("LEMG").unwrap(),
+        );
+        assert!(
+            a.lat < g.0 && a.lat > m.0,
+            "{cs} between the two: {}",
+            a.lat
+        );
+        let mut seen = std::collections::HashSet::new();
+        for a in &field.aircraft {
+            assert!(seen.insert(&a.callsign), "{} shown twice", a.callsign);
+        }
+        // The map's load through the day: the most shown at once, and
+        // their bytes on the wire.
+        let (mut most, mut bytes) = (0, 0);
+        for h in 0..24 {
+            let (_, mut board) = world_at(f64::from(h) * 3600.0, epoch);
+            let f = board.efb_field(std::iter::empty(), Density::Normal, epoch);
+            most = most.max(f.aircraft.len());
+            let wire = serde_json::to_string(&crate::efb::airport::traffic_out(&[f])).unwrap();
+            bytes = bytes.max(wire.len());
+        }
+        println!(
+            "the world board: {} flights of the day, up to {most} shown at once, \
+             up to {bytes} bytes",
+            flights.len()
+        );
+    }
+
+    /// A flight a link has is the link's: the world board drops every
+    /// callsign a running link carries.
+    #[test]
+    fn the_world_board_never_shows_a_links_flight() {
+        let link = heathrow_link();
+        let epoch = Instant::now();
+        let owned: std::collections::HashSet<String> =
+            link.callsigns().map(str::to_string).collect();
+        let mut overlap = 0;
+        for h in 0..24 {
+            let (_, mut board) = world_at(f64::from(h) * 3600.0, epoch);
+            let alone = board.efb_field(std::iter::empty(), Density::Normal, epoch);
+            overlap += alone
+                .aircraft
+                .iter()
+                .filter(|a| owned.contains(&a.callsign))
+                .count();
+            let with = board.efb_field(std::iter::once(&link), Density::Normal, epoch);
+            for a in &with.aircraft {
+                assert!(!owned.contains(&a.callsign), "{} shown twice", a.callsign);
+            }
+        }
+        assert!(overlap > 0, "the link and the world share flights");
     }
 
     /// A WHOLE FLIGHT NEVER JUMPS (2026-10-13): every flight of the field,

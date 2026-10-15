@@ -939,43 +939,7 @@ impl Link {
             .collect();
         // The whole flights the model flies (2026-10-13): far out, the
         // arrivals still to enter and the departures flown on.
-        aircraft.extend(self.modeled().map(|m| {
-            let a = &m.ac;
-            let f = m.info.as_ref();
-            let arriving = matches!(a.plan, traffic::Plan::Arrival { .. });
-            // An arrival's way still to come: its entry, where the
-            // simulation takes it (the page draws the great circle to it
-            // and on to the field; the approach's points come with the
-            // simulated aircraft, a map's worth of them for every flight
-            // far out would double the tap).
-            let ahead = if arriving {
-                vec![m.whole.track.b.pos]
-            } else {
-                Vec::new()
-            };
-            TrafficAc {
-                id: a.id,
-                callsign: a.callsign.clone(),
-                spoken: a.spoken.clone(),
-                airline: f.map(|f| f.airline.clone()).unwrap_or_default(),
-                icao_type: a.icao_type.clone(),
-                from: m.whole.origin.clone(),
-                to: m.whole.dest.clone(),
-                phase: m.words(),
-                stand: f.and_then(|f| f.stand.as_deref()).map(|n| traffic::stands::label(n, &names)),
-                sched: f.and_then(|f| f.sched_s).map(traffic::rotation::hhmm),
-                est: f.and_then(|f| f.est_s).map(traffic::rotation::hhmm),
-                lat: a.kin.lat,
-                lon: a.kin.lon,
-                hdg: a.kin.hdg_deg,
-                alt_ft: a.kin.alt_ft,
-                on_ground: a.kin.on_ground,
-                gs_kts: a.kin.gs_kts,
-                ahead,
-                journey: Some(self.journey_modeled(m)),
-                modeled: true,
-            }
-        }));
+        aircraft.extend(self.efb_modeled(&names));
         let taken = self
             .fleet
             .field
@@ -2107,6 +2071,9 @@ pub(crate) struct TrafficWorld {
     /// The density the fleets were built at: a change rebuilds them all
     /// (2026-10-15: a field set up at "off" stayed empty for its hour).
     density: Option<String>,
+    /// Every timetabled flight no link flies, for the EFB's map only
+    /// ([`whole::WorldBoard`]).
+    world: whole::WorldBoard,
 }
 
 /// The draw cull's counts in the blackbox (`traffic` `draw`): simulated
@@ -2254,11 +2221,13 @@ impl TrafficWorld {
                 // the sim's zulu time, read only when a schedule is made.
                 let zulu = sim_zulu_s(xp).await;
                 let day = sim_date_days(xp).await;
+                self.world.note_clock(zulu, day, now);
                 let station = icao == active;
                 self.loading = Some((icao.clone(), self.build(&icao, station, zulu, day)));
             }
         }
         if self.links.is_empty() {
+            self.note_efb_traffic(now);
             return None;
         }
         // Time acceleration freezes the fleets (v1), said once per spell.
@@ -2466,6 +2435,7 @@ impl TrafficWorld {
         }
         self.clock_checked = Some(now);
         let (zulu, day) = tokio::join!(sim_zulu_s(xp), sim_date_days(xp));
+        self.world.note_clock(zulu, day, now);
         // A failed read is no measurement.
         let Some(zulu) = zulu else { return };
         for (icao, link) in self.links.iter_mut() {
@@ -2496,8 +2466,9 @@ impl TrafficWorld {
     }
 
     /// The EFB's Map tab (2026-10-13): every simulated field's aircraft
-    /// and held stands ([`Link::efb_traffic`]), tapped into `efb::feed`
-    /// about once a second while the EFB serves (no reads).
+    /// and held stands ([`Link::efb_traffic`]), then every other
+    /// timetabled flight of the day ([`whole::WorldBoard`]), tapped into
+    /// `efb::feed` about once a second while the EFB serves (no reads).
     fn note_efb_traffic(&mut self, now: Instant) {
         if self
             .efb_traffic_at
@@ -2507,7 +2478,11 @@ impl TrafficWorld {
             return;
         }
         self.efb_traffic_at = Some(now);
-        crate::efb::feed::note_traffic(self.links.values().map(Link::efb_traffic).collect());
+        let density = traffic::Density::parse(&crate::settings::live().traffic_density)
+            .unwrap_or(traffic::Density::Normal);
+        let mut fields: Vec<_> = self.links.values().map(Link::efb_traffic).collect();
+        fields.push(self.world.efb_field(self.links.values(), density, now));
+        crate::efb::feed::note_traffic(fields);
     }
 
     /// The EFB's Board card (2026-10-13): every simulated field's board,
@@ -2659,6 +2634,7 @@ impl TrafficWorld {
             if !fresh && !loading {
                 let zulu = sim_zulu_s(xp).await;
                 let day = sim_date_days(xp).await;
+                self.world.note_clock(zulu, day, now);
                 self.remote_loading =
                     Some((icao.clone(), self.build_remote(icao, zulu, day, sim_s)));
             }
@@ -3106,18 +3082,24 @@ fn timetable_clock(
     zulu_s: Option<f64>,
     day: Option<u32>,
 ) -> (traffic::rotation::Date, f64, f64) {
+    let (date, zulu) = sim_day(zulu_s, day);
+    (
+        date,
+        zulu,
+        traffic::rotation::local_s(zulu, table.utc_offset_h, date),
+    )
+}
+
+/// The sim's date and zulu time when they read, else the system clock's
+/// (the year is the system clock's).
+fn sim_day(zulu_s: Option<f64>, day: Option<u32>) -> (traffic::rotation::Date, f64) {
     use traffic::rotation::Date;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
     let today = Date::from_epoch_days((now / 86_400.0).floor() as i64);
     let date = day.map_or(today, |o| Date::of_year(today.year, o));
-    let zulu = zulu_s.unwrap_or(now % 86_400.0);
-    (
-        date,
-        zulu,
-        traffic::rotation::local_s(zulu, table.utc_offset_h, date),
-    )
+    (date, zulu_s.unwrap_or(now % 86_400.0))
 }
 
 /// The Board tab offers every field with a timetable this near us, nm
