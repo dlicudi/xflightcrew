@@ -28,6 +28,7 @@ pub(crate) mod board;
 pub(crate) mod feed;
 pub(crate) mod flight_tab;
 pub(crate) mod map;
+pub(crate) mod overlay;
 pub(crate) mod ptt;
 pub(crate) mod qr;
 pub(crate) mod state;
@@ -455,6 +456,33 @@ fn gather(server: &Server) -> state::Facts {
     state::Facts {
         fields,
         boards: feed::boards(),
+        constraints: crate::procedure::route_ahead()
+            .map(|(idx, legs)| {
+                legs.into_iter()
+                    .skip(idx)
+                    .filter(|l| matches!(l.alt_desc, '+' | '-' | 'B') && l.alt1_ft.is_some())
+                    .filter_map(|l| {
+                        let fix = l.fix?;
+                        Some(state::LegWindow {
+                            ident: l.fix_ident,
+                            lat: fix.lat,
+                            lon: fix.lon,
+                            desc: l.alt_desc,
+                            alt1_ft: l.alt1_ft,
+                            alt2_ft: l.alt2_ft,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        tower: crate::party_line::active_icao().map(|(icao, lat, lon)| state::TowerFacts {
+            icao,
+            lat,
+            lon,
+            khz: crate::party_line::home_tower_khz(),
+            runway: crate::traffic_link::station_runway(),
+        }),
+        transition_ft: Some(crate::tools::instruments::transition_in_force_ft(18_000.0)),
         now_t: now_unix(),
         flight: crate::flight::published(),
         owner: crate::flight_state::crew_has_aircraft().map(|o| o.name()),
@@ -853,6 +881,31 @@ async fn basemap_route(
     r
 }
 
+/// The map's weather and airspace for a view (`overlay`): the METAR file
+/// and the airspace file, read off this thread and kept.
+async fn overlay_route(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<BasemapQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorised(&live_token(), &headers, q.t.as_deref()) {
+        return refuse(peer, "/overlay");
+    }
+    let bbox: Vec<f64> = q
+        .bbox
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let Ok(bbox) = <[f64; 4]>::try_from(bbox) else {
+        return (StatusCode::BAD_REQUEST, "bbox=lat0,lon0,lat1,lon1").into_response();
+    };
+    match tokio::task::spawn_blocking(move || overlay::answer(bbox)).await {
+        Ok(o) => Json(o).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 /// The Map tab's script: code, no data, so like the icon it needs no token
 /// (a `<script src>` carries no header, and a home-screen app's first load
 /// must not depend on the cookie having landed).
@@ -1201,6 +1254,7 @@ pub(crate) fn router(server: Arc<Server>) -> Router {
         .route("/reposition", post(reposition_route))
         .route("/airport", get(airport_route))
         .route("/basemap", get(basemap_route))
+        .route("/overlay", get(overlay_route))
         .route("/map.js", get(map_js))
         .route("/manifest.webmanifest", get(manifest_route))
         .route("/icon.svg", get(icon))

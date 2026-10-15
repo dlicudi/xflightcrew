@@ -95,6 +95,8 @@ pub(crate) const LIFETIMES: &[(&str, char)] = &[
     ("efb::feed::TICK", 'S'),
     ("efb::feed::TRAFFIC", 'S'),
     ("efb::mod::SERVING", 'S'),
+    ("efb::overlay::AIRSPACE", 'C'),
+    ("efb::overlay::METARS", 'C'),
     ("efb::ptt::AVAILABLE", 'P'),
     ("efb::ptt::HOLD", 'S'),
     ("env_import::CACHE", 'C'),

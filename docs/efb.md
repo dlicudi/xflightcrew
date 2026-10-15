@@ -253,6 +253,24 @@ and the top of descent (never dropped), the origin and alternate, the fixes ahea
 the towered fields, the traffic's callsigns, the flown fixes, every other field. One with no
 free spot is dropped.
 
+## The Map tab: weather, airspace, our picture (2026-10-15)
+
+- **Weather**: `GET /overlay?bbox=` (`efb::overlay`, token required) sends a dot per field the
+  sim's METAR file reports (the file `weather` already reads, re-read only when it changed, at
+  most once a minute), coloured by flight category (`overlay::category`: VFR green, MVFR blue,
+  IFR red, LIFR magenta), the wind ("270/15") written from zoom 9; at most 400.
+- **Airspace**: the same answer outlines the no-go volumes the local planner flies round (the
+  sim's `airspace.txt`, parsed once) for a view under 6 degrees tall, about 200 kB at most,
+  named from zoom 9. Asked when the view stands still, kept five minutes; never per frame.
+- **Our flight**: a track-ahead line from groundspeed and track ticked at 1, 2 and 5 minutes;
+  the altitude windows of the follower's legs ahead (`procedure::route_ahead`, "+5000",
+  "-FL100") beside their fixes; the station's field labelled with its runway in use
+  (`traffic_link::station_runway`) and tower frequency (`party_line::home_tower_khz`).
+- **Traffic**: under each callsign from zoom 7.5 its level ("FL350" at or above the
+  transition in force, else feet) and an arrow from the change between two updates; a tapped
+  flight with no journey of its own draws the great circle between its two fields when the page
+  knows both.
+
 ## The Map tab: the fields
 
 Which field: in the air, the plan's destination (else the station's field); on the ground, the
