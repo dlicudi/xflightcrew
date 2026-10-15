@@ -1174,6 +1174,8 @@ pub(crate) fn stands_by_field(
     let mut out: Vec<StandsOut> = traffic
         .unwrap_or_default()
         .iter()
+        // The world board's flights are no field's (an empty ICAO).
+        .filter(|f| !f.icao.is_empty())
         .map(|f| stand_states(&f.icao, &[], traffic, None))
         .collect();
     if let Some((d, own)) = here {

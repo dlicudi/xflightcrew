@@ -414,7 +414,8 @@ pub(crate) struct StandTaken {
     pub(crate) how: &'static str,
 }
 
-/// One simulated field: its aircraft and the stands they hold.
+/// One simulated field: its aircraft and the stands they hold; with an
+/// empty ICAO, the flights no field simulates (`whole::WorldBoard`).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TrafficField {
     pub(crate) icao: String,

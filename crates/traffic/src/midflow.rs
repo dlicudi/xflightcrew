@@ -89,7 +89,7 @@ pub struct Plan0 {
 }
 
 /// A rotation leg as the board's line.
-fn info(r: &Rotation, arr: bool) -> FlightInfo {
+pub fn info(r: &Rotation, arr: bool) -> FlightInfo {
     let l = if arr { &r.arr } else { &r.dep };
     let (airline, iata) = airline_name(r.carrier.code);
     let n = &l.callsign[3..];
