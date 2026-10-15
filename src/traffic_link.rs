@@ -526,6 +526,11 @@ struct Timetable {
 /// time, never a few seconds of drift.
 pub(crate) const CLOCK_JUMP_S: f64 = 600.0;
 
+/// A gap in the world's ticks longer than this, seconds (the Mac asleep, a
+/// stalled loop), rebuilds the world at UTC: a fleet steps at most
+/// `traffic::clock::MAX_TICK_S` a tick and would stay behind for good.
+const CLOCK_GAP_S: f64 = 60.0;
+
 /// The world's clock (2026-10-15): UTC, seconds since the Unix epoch. The
 /// fleets step on it and their days are built from it, with or without the
 /// sim; the sim's clock is never followed.
@@ -2188,7 +2193,15 @@ impl TrafficWorld {
         self.density = Some(density);
         // The world's clock: UTC, never the sim's.
         let utc = utc_now_s();
-        let dt = self.last_utc_s.map_or(0.0, |prev| (utc - prev).max(0.0));
+        let mut dt = self.last_utc_s.map_or(0.0, |prev| (utc - prev).max(0.0));
+        if dt > CLOCK_GAP_S && !self.links.is_empty() {
+            crate::blackbox::record(
+                "traffic",
+                serde_json::json!({ "event": "clock_gap_rebuild", "gap_s": dt }),
+            );
+            self.stand_down();
+            dt = 0.0;
+        }
         self.last_utc_s = Some(utc);
         if attached && !self.attached {
             self.check_sim_clock(xp, voice, utc).await;
