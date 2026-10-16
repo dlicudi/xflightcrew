@@ -1,37 +1,45 @@
 //! "Direct LESTA": the pilot monitoring does the DIR TO on the FMS and
 //! presses LNAV, the way it was done by hand on the stock 737 at FL380
-//! (2026-10-16): clear the scratchpad, DIR INTC, type the ident, LSK 1L,
-//! EXEC only on a MOD page, LNAV at once (the leg starts at present
-//! position; on HDG the aircraft drifts off it within a minute and LNAV
-//! only arms). Read back on the GPS's active ident and the LNAV lamp,
-//! never assumed.
+//! (2026-10-16): clear the scratchpad, DIR INTC, pick the fix from the
+//! page's own list, EXEC only on a MOD page, LNAV at once (the leg starts
+//! at present position; on HDG the aircraft drifts off it within a minute
+//! and LNAV only arms). Read back on the GPS's active ident and the LNAV
+//! lamp, never assumed.
 //!
-//! Only a fix in the LOADED plan (`plan::match_ident`), only airborne,
-//! only with CMD in, only where the airframe declares its LNAV
-//! (`lnav_command`, the 737 today). LNAV through the panel owner
-//! (`autoflight::LnavEngage`, `press_lnav`). Blackbox `direct_to`.
+//! The FMS is the one source: the fix must be listed on the DIRECT-TO page
+//! (`plan::best_ident` over its rows), so a plan that lives only in the FMS
+//! (xfc restarted mid-flight) still works and nothing outside it is typed.
+//! Only airborne, only with CMD in, only where the airframe declares its
+//! LNAV (`lnav_command`, the 737 today). LNAV pressed ONCE through the
+//! panel owner (`press_lnav`): an ARMED LNAV reads lamp 0 and gpss 1, and a
+//! second press disarms it. Blackbox `direct_to`.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
-use crate::autoflight::{names, LnavEngage, LnavStep};
+use crate::autoflight::names;
+use crate::datarefs::fms_cdu1_line;
 use crate::xplane::XPlane;
 
 const KEY_CLEAR: &str = "sim/FMS/key_clear";
 const DIR_INTC: &str = "sim/FMS/dir_intc";
-const LSK_1L: &str = "sim/FMS/ls_1l";
+const NEXT_PAGE: &str = "sim/FMS/next";
 const EXEC: &str = "sim/FMS/exec";
-/// A key's command is this plus the letter or digit.
-const KEY_PREFIX: &str = "sim/FMS/key_";
+/// The scratchpad's text line.
+const SCRATCHPAD: usize = 13;
+/// The DIRECT-TO page's fix rows: LSK 2L to 6L (LSK 1L is the entry box).
+const ROW_LSKS: std::ops::RangeInclusive<usize> = 2..=6;
+/// Pages of the list looked at, the first included.
+const MAX_PAGES: usize = 3;
 /// CLR presses before a scratchpad that will not blank is refused.
 const MAX_CLEARS: usize = 30;
-/// Between key presses: the FMS takes them in its flight loop.
+/// Between CLR presses: the FMS takes them in its flight loop.
 const KEY_MS: u64 = 150;
-/// After a page change (DIR INTC, LSK, EXEC) before it is read.
+/// After a page change (DIR INTC, NEXT, LSK, EXEC) before it is read.
 const PAGE_MS: u64 = 400;
 
 /// A CDU line's bytes as text, the NUL padding and edges trimmed. Pure.
@@ -56,86 +64,110 @@ pub fn is_mod(line0: &str) -> bool {
     line0.trim_start().starts_with("MOD")
 }
 
-/// The key commands that type `ident`, `None` if it holds anything but
-/// letters and digits. Pure.
-pub fn key_commands(ident: &str) -> Option<Vec<String>> {
-    if ident.is_empty() {
-        return None;
+/// The fix a DIRECT-TO row lists, `<LESTA            FL374>`: the word
+/// after the `<`, letters and digits only (`<-----` is no fix). Pure.
+pub fn row_ident(line: &str) -> Option<&str> {
+    let id = line.trim().strip_prefix('<')?.split_whitespace().next()?;
+    id.chars().all(|c| c.is_ascii_alphanumeric()).then_some(id)
+}
+
+/// What LNAV reads after the press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum Lnav {
+    Engaged,
+    Armed,
+    Out,
+    Unread,
+}
+
+/// From the lamp-or-bitfield read and `gpss_status` (live on the 737:
+/// armed is lamp 0 with gpss 1, engaged lamp 1 with gpss 2). Pure.
+pub fn lnav_state(engaged: Option<bool>, gpss: Option<f64>) -> Lnav {
+    match (engaged, gpss.map(f64::round)) {
+        (_, Some(2.0)) => Lnav::Engaged,
+        (_, Some(1.0)) => Lnav::Armed,
+        (Some(true), _) => Lnav::Engaged,
+        (Some(false), _) => Lnav::Out,
+        (None, _) => Lnav::Unread,
     }
-    ident
-        .chars()
-        .map(|c| {
-            c.is_ascii_alphanumeric()
-                .then(|| format!("{KEY_PREFIX}{}", c.to_ascii_uppercase()))
-        })
-        .collect()
 }
 
 /// The spoken readback. Pure.
-pub fn readback(ident: &str, on_fix: bool, lnav: Option<bool>, armed: bool) -> String {
+pub fn readback(ident: &str, on_fix: bool, lnav: Lnav) -> String {
     if !on_fix {
         return format!(
             "Executed direct {ident}, but the FMS isn't showing it as the active waypoint."
         );
     }
-    match (lnav, armed) {
-        (Some(true), false) => format!("Direct {ident}, LNAV."),
-        (_, true) => format!("Direct {ident}, LNAV armed."),
-        (Some(false), _) => format!("Direct {ident}, but LNAV didn't engage. Check the heading."),
-        (None, _) => format!("Direct {ident}, but I can't read LNAV."),
+    match lnav {
+        Lnav::Engaged => format!("Direct {ident}, LNAV."),
+        Lnav::Armed => format!("Direct {ident}, LNAV armed."),
+        Lnav::Out => format!("Direct {ident}, but LNAV didn't engage. Check the heading."),
+        Lnav::Unread => format!("Direct {ident}, but I can't read LNAV."),
     }
 }
 
-async fn read_line(xp: &dyn XPlane, name: &str) -> Option<String> {
-    xp.get_bytes(name).await.ok().map(|b| cdu_text(&b))
+async fn read_line(xp: &dyn XPlane, n: usize) -> Option<String> {
+    xp.get_bytes(&fms_cdu1_line(n))
+        .await
+        .ok()
+        .map(|b| cdu_text(&b))
 }
 
-async fn press(xp: &dyn XPlane, cmd: &str, ms: u64) -> bool {
-    let ok = xp.run_command(cmd).await.is_ok();
+async fn press(xp: &dyn XPlane, cmd: &str, ms: u64) {
+    let _ = xp.run_command(cmd).await;
     tokio::time::sleep(Duration::from_millis(ms)).await;
-    ok
 }
 
 /// CLR until the scratchpad reads blank, at most [`MAX_CLEARS`] presses.
 /// `None` unread.
 async fn clear_scratchpad(xp: &dyn XPlane) -> Option<bool> {
     for _ in 0..MAX_CLEARS {
-        if scratchpad_blank(&read_line(xp, crate::datarefs::FMS_CDU1_SCRATCHPAD).await?) {
+        if scratchpad_blank(&read_line(xp, SCRATCHPAD).await?) {
             return Some(true);
         }
         press(xp, KEY_CLEAR, KEY_MS).await;
     }
-    Some(scratchpad_blank(
-        &read_line(xp, crate::datarefs::FMS_CDU1_SCRATCHPAD).await?,
-    ))
+    Some(scratchpad_blank(&read_line(xp, SCRATCHPAD).await?))
 }
 
-/// LNAV in through the panel owner: read before every press, a press only
-/// on a settled read that says out. `None` unread.
-async fn engage_lnav(xp: &dyn XPlane) -> Option<bool> {
-    let mut eng = LnavEngage::default();
-    let t0 = Instant::now();
-    loop {
-        match eng.step(
-            t0.elapsed().as_secs_f64(),
-            crate::autoflight::read_lnav(xp).await,
-        ) {
-            LnavStep::Engaged => return Some(true),
-            LnavStep::Failed => return Some(false),
-            LnavStep::Unread => return None,
-            LnavStep::Press => {
-                crate::autoflight::press_lnav(xp, "direct_to").await;
-            }
-            LnavStep::Wait => {}
+/// LNAV and gpss read together.
+async fn read_lnav(xp: &dyn XPlane) -> Lnav {
+    let (on, gpss) = tokio::join!(
+        crate::autoflight::read_lnav(xp),
+        xp.get_float(names::GPSS_STATUS)
+    );
+    lnav_state(on, gpss.ok())
+}
+
+/// The listed fix the heard word names, page by page: its LSK and ident.
+/// The rows seen go on the tape either way.
+async fn find_row(xp: &dyn XPlane, heard: &str, seen: &mut Vec<String>) -> Option<(usize, String)> {
+    for page in 0..MAX_PAGES {
+        if page > 0 {
+            press(xp, NEXT_PAGE, PAGE_MS).await;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut rows = Vec::new();
+        for lsk in ROW_LSKS {
+            if let Some(id) = read_line(xp, 2 * lsk).await.as_deref().and_then(row_ident) {
+                rows.push((lsk, id.to_string()));
+            }
+        }
+        seen.extend(rows.iter().map(|(_, id)| id.clone()));
+        if let Some(lsk) =
+            crate::plan::best_ident(heard, rows.iter().map(|(l, id)| (*l, id.as_str())))
+        {
+            return rows.into_iter().find(|(l, _)| *l == lsk);
+        }
     }
+    None
 }
 
-/// The whole DIR TO, the gates first. `fix` is as heard; it must name a
-/// fix of the loaded plan.
+/// The whole DIR TO, the gates first. `fix` is as heard; it must be listed
+/// on the FMS's DIRECT-TO page.
 pub async fn run(xp: &dyn XPlane, fix: &str) -> String {
-    if fix.trim().is_empty() {
+    let heard = fix.trim();
+    if heard.is_empty() {
         return "Direct to which fix?".to_string();
     }
     if !crate::autoflight::panel().lnav_declared() {
@@ -149,19 +181,6 @@ pub async fn run(xp: &dyn XPlane, fix: &str) -> String {
             owner.name()
         );
     }
-    let Some(plan) = crate::simbrief::loaded_plan() else {
-        return "There's no flight plan loaded.".to_string();
-    };
-    let Some((_, wp)) = crate::plan::match_ident(fix.trim(), &plan.waypoints) else {
-        return format!(
-            "I can't find {} in the flight plan.",
-            fix.trim().to_ascii_uppercase()
-        );
-    };
-    let ident = crate::simbrief::fms_ident(&wp.ident);
-    let Some(keys) = key_commands(&ident) else {
-        return format!("I can't type {ident} into the FMS.");
-    };
     match xp.get_float(crate::datarefs::ON_GROUND_ANY).await {
         Ok(g) if !sim::ground::on_ground(g) => {}
         Ok(_) => return "We're on the ground. Direct to is for the air.".to_string(),
@@ -172,44 +191,54 @@ pub async fn run(xp: &dyn XPlane, fix: &str) -> String {
         Ok(_) => return "The autopilot isn't engaged, so no LNAV. Engage CMD first.".to_string(),
         Err(_) => return "I can't read the autopilot.".to_string(),
     }
+    // A leftover in the scratchpad would be entered by the row's LSK.
     match clear_scratchpad(xp).await {
         Some(true) => {}
         Some(false) => return "The FMS scratchpad won't clear.".to_string(),
         None => return "I can't read the FMS.".to_string(),
     }
     press(xp, DIR_INTC, PAGE_MS).await;
-    for k in &keys {
-        press(xp, k, KEY_MS).await;
-    }
-    press(xp, LSK_1L, PAGE_MS).await;
-    let line0 = read_line(xp, crate::datarefs::FMS_CDU1_LINE0).await;
-    let modded = line0.as_deref().is_some_and(is_mod);
-    if !modded {
+    let mut seen = Vec::new();
+    let Some((lsk, ident)) = find_row(xp, heard, &mut seen).await else {
         let _ = clear_scratchpad(xp).await;
         crate::blackbox::record(
             "direct_to",
-            json!({"ident": ident, "line0": line0, "executed": false}),
+            json!({"heard": heard, "listed": seen, "executed": false}),
+        );
+        return format!(
+            "{} isn't in the FMS route. Nothing executed.",
+            heard.to_ascii_uppercase()
+        );
+    };
+    press(xp, &format!("sim/FMS/ls_{lsk}l"), PAGE_MS).await;
+    let line0 = read_line(xp, 0).await;
+    if !line0.as_deref().is_some_and(is_mod) {
+        let _ = clear_scratchpad(xp).await;
+        crate::blackbox::record(
+            "direct_to",
+            json!({"heard": heard, "ident": ident, "line0": line0, "executed": false}),
         );
         return format!("The FMS didn't take direct {ident}. Nothing executed.");
     }
     press(xp, EXEC, PAGE_MS).await;
-    let lnav = engage_lnav(xp).await;
-    let (nav_id, gpss) = tokio::join!(
-        xp.get_bytes(crate::datarefs::GPS_NAV_ID),
-        xp.get_float(names::GPSS_STATUS)
-    );
+    // Pressed once, never again: a second press disarms an armed LNAV.
+    let before = read_lnav(xp).await;
+    let pressed = matches!(before, Lnav::Out);
+    if pressed {
+        crate::autoflight::press_lnav(xp, "direct_to").await;
+        tokio::time::sleep(Duration::from_secs_f64(crate::autoflight::LNAV_SETTLE_S)).await;
+    }
+    let (lnav, nav_id) = tokio::join!(read_lnav(xp), xp.get_bytes(crate::datarefs::GPS_NAV_ID));
     let nav_id = nav_id.ok().map(|b| cdu_text(&b));
-    let gpss = gpss.ok();
     let on_fix = nav_id
         .as_deref()
         .is_some_and(|n| crate::lnav::same_ident(n, &ident));
-    let armed = gpss.is_some_and(|g| g.round() == 1.0);
     crate::blackbox::record(
         "direct_to",
-        json!({"ident": ident, "line0": line0, "executed": true, "gps_nav_id": nav_id,
-               "lnav": lnav, "gpss_status": gpss}),
+        json!({"heard": heard, "ident": ident, "line0": line0, "executed": true,
+               "gps_nav_id": nav_id, "lnav_before": before, "pressed": pressed, "lnav": lnav}),
     );
-    readback(&ident, on_fix, lnav, armed)
+    readback(&ident, on_fix, lnav)
 }
 
 pub struct DirectTo;
@@ -222,8 +251,8 @@ impl Tool for DirectTo {
 
     fn description(&self) -> &str {
         "'Direct LESTA', 'proceed direct LESTA', 'go direct to LESTA': DIR TO a \
-         fix of the loaded plan on the FMS, executed, and LNAV engaged. Read back \
-         on the active waypoint and the LNAV lamp."
+         fix of the FMS route, executed, and LNAV engaged. Read back on the \
+         active waypoint and the LNAV lamp."
     }
 
     fn parameters(&self) -> Value {
@@ -252,7 +281,6 @@ mod tests {
         assert!(scratchpad_blank(&cdu_text(b"[                      ]\0\0")));
         assert!(scratchpad_blank(""));
         assert!(!scratchpad_blank("[VNAV UNAVAILABLE      ]"));
-        assert!(!scratchpad_blank("[LES                   ]"));
     }
 
     /// EXEC only on a MOD page: the DIR INTC page itself is ACT.
@@ -263,35 +291,40 @@ mod tests {
         assert!(!is_mod(""));
     }
 
-    /// The ident decodes from the NUL-padded bytes, and types key by key.
+    /// The DIRECT-TO rows as seen live, and the heard word matched to one.
     #[test]
-    fn the_ident_decodes_and_types() {
-        assert_eq!(cdu_text(b"LESTA\0\0\0\0"), "LESTA");
+    fn the_page_rows_name_their_fixes() {
         assert_eq!(
-            key_commands("LE5"),
-            Some(vec![
-                "sim/FMS/key_L".into(),
-                "sim/FMS/key_E".into(),
-                "sim/FMS/key_5".into()
-            ])
+            row_ident(&cdu_text(b"<LESTA            FL374>\0")),
+            Some("LESTA")
         );
-        assert_eq!(key_commands("LE-S"), None);
-        assert_eq!(key_commands(""), None);
+        assert_eq!(row_ident("<EMBOR            FL380>"), Some("EMBOR"));
+        assert_eq!(row_ident("<-----     NEAREST APTS>"), None);
+        assert_eq!(row_ident(""), None);
+        let rows = [(2, "LESTA"), (3, "EMBOR")];
+        assert_eq!(crate::plan::best_ident("lesta", rows), Some(2));
+        assert_eq!(crate::plan::best_ident("embor", rows), Some(3));
+        assert_eq!(crate::plan::best_ident("pimos", rows), None);
     }
 
+    /// Armed and engaged as the 737 reads them, and what is said for each.
     /// Never "Roger" on a failed readback: what did not take is named.
     #[test]
-    fn the_readback_names_what_did_not_take() {
+    fn lnav_armed_is_told_from_engaged_and_said() {
+        assert_eq!(lnav_state(Some(false), Some(1.0)), Lnav::Armed);
+        assert_eq!(lnav_state(Some(true), Some(2.0)), Lnav::Engaged);
+        assert_eq!(lnav_state(Some(false), Some(0.0)), Lnav::Out);
+        assert_eq!(lnav_state(None, None), Lnav::Unread);
         assert_eq!(
-            readback("LESTA", true, Some(true), false),
+            readback("LESTA", true, Lnav::Engaged),
             "Direct LESTA, LNAV."
         );
         assert_eq!(
-            readback("LESTA", true, Some(true), true),
+            readback("LESTA", true, Lnav::Armed),
             "Direct LESTA, LNAV armed."
         );
-        assert!(readback("LESTA", true, Some(false), false).contains("LNAV didn't engage"));
-        assert!(readback("LESTA", false, Some(true), false).contains("isn't showing it"));
+        assert!(readback("LESTA", true, Lnav::Out).contains("LNAV didn't engage"));
+        assert!(readback("LESTA", false, Lnav::Engaged).contains("isn't showing it"));
     }
 
     /// An airframe without a declared LNAV is refused before anything is

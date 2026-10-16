@@ -55,17 +55,25 @@ pub(crate) fn match_ident<'a>(
     token: &str,
     waypoints: &'a [simbrief::Waypoint],
 ) -> Option<(usize, &'a simbrief::Waypoint)> {
+    let last = waypoints.len().checked_sub(1)?;
+    let middle = waypoints.iter().enumerate().filter(|(i, _)| *i != 0 && *i != last);
+    let i = best_ident(token, middle.map(|(i, wp)| (i, wp.ident.as_str())))?;
+    Some((i, &waypoints[i]))
+}
+
+/// [`match_ident`]'s rule over any list of `(key, ident)`: the key of the
+/// ident the token most plausibly names (the DIR TO page's rows too).
+pub(crate) fn best_ident<'a>(
+    token: &str,
+    idents: impl IntoIterator<Item = (usize, &'a str)>,
+) -> Option<usize> {
     let tok = token.to_ascii_lowercase();
     if tok.len() < 3 {
         return None;
     }
-    let last = waypoints.len().checked_sub(1)?;
-    let mut best: Option<(usize, usize, &simbrief::Waypoint)> = None;
-    for (i, wp) in waypoints.iter().enumerate() {
-        if i == 0 || i == last {
-            continue;
-        }
-        let id = wp.ident.to_ascii_lowercase();
+    let mut best: Option<(usize, usize)> = None;
+    for (i, ident) in idents {
+        let id = ident.to_ascii_lowercase();
         if id.len() < 3 || id.as_bytes()[0] != tok.as_bytes()[0] {
             continue;
         }
@@ -77,11 +85,11 @@ pub(crate) fn match_ident<'a>(
             0
         };
         let d = ident_distance(&tok, &id);
-        if d <= allowed && best.is_none_or(|(bd, _, _)| d < bd) {
-            best = Some((d, i, wp));
+        if d <= allowed && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, i));
         }
     }
-    best.map(|(_, i, wp)| (i, wp))
+    best.map(|(_, i)| i)
 }
 
 /// "How much left for PIMOS", "what's after PIMOS", "when do we reach
