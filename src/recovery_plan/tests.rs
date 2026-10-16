@@ -259,3 +259,43 @@ fn the_path_is_probed_every_quarter_mile_to_forty() {
     let short = path_points(36.0, -5.0, 36.0, -4.99);
     assert!(short.len() >= 1);
 }
+
+/// EGKK-EGPH, 737 at FL380, 2026-10-16 (sortie 1792158539-full_auto): "can
+/// you resume the flight plan?" 13 nm west of the RIBEL-INPIP leg. The
+/// shortest way in is the synthetic gateway, which no FMS holds; INPIP,
+/// the STAR's first fix, is about 2 nm longer, so the join goes there.
+#[test]
+fn a_direct_join_never_ends_on_the_gateway_when_a_real_fix_is_no_detour() {
+    let w = vec![
+        wp("EGKK", 51.148, -0.190, 202.0),
+        wp("NELSA", 53.863333, -2.184797, 31_900.0),
+        wp("RIBEL", 54.016111, -2.289656, 30_100.0),
+        wp("INPIP", 54.876539, -2.896139, 26_000.0),
+        wp("INREV", 55.149289, -3.094294, 20_000.0),
+        wp("ESKDO", 55.298889, -3.204239, 17_000.0),
+        wp("TARTN", 55.717192, -3.138536, 7_000.0),
+        wp("EGPH", 55.950145, -3.372288, 136.0),
+    ];
+    let mut legs = crate::procedure::enroute_legs(&w, "EGKK", "EGPH", 38_000.0);
+    assert!(crate::procedure::extend_to_arrival_gateway(
+        &mut legs,
+        w.last().unwrap(),
+        Some(136.0)
+    ));
+    let join = choose_join(
+        &legs,
+        &w,
+        "EGPH",
+        54.40,
+        -2.96,
+        None,
+        None,
+        Some(7.7),
+        Purpose::Resume,
+    )
+    .unwrap();
+    let Join::Direct { index, .. } = join else {
+        panic!("{join:?}")
+    };
+    assert_eq!(legs[index].fix_ident, "INPIP");
+}

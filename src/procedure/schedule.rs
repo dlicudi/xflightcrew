@@ -582,6 +582,11 @@ pub fn arrival_gateway_alt_ft(last_alt_ft: Option<f64>, field_elev_ft: Option<f6
     }
 }
 
+/// The gateway leg's ident: synthetic, never a fix an FMS holds.
+pub fn arrival_gateway_ident(destination: &str) -> String {
+    format!("{destination} arrival")
+}
+
 pub fn extend_to_arrival_gateway(
     legs: &mut Vec<ProcLeg>,
     destination: &crate::simbrief::Waypoint,
@@ -605,7 +610,7 @@ pub fn extend_to_arrival_gateway(
         seq: legs.len() as u32,
         transition: String::new(),
         leg_type: "TF".to_string(),
-        fix_ident: format!("{} arrival", destination.ident),
+        fix_ident: arrival_gateway_ident(&destination.ident),
         fix_region: String::new(),
         fix: Some(crate::nav::Fix {
             ident: destination.ident.clone(),

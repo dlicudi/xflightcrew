@@ -58,6 +58,12 @@ pub const LOST_S: f64 = 2.0;
 pub const IDENT_MISMATCH_S: f64 = 5.0;
 /// Fallbacks in one run before LNAV is retired for it.
 pub const MAX_FALLBACKS: u32 = 3;
+/// The FMS on the leg but the aircraft off its line by more than this, nm:
+/// the follower flies the fix direct from here (a resume's join, about
+/// 13 nm off RIBEL-INPIP), where LNAV would only arm (737 at FL380, "LNAV
+/// NOT ON INTERCEPT HEADING", 2026-10-16), so the FMS is given the same leg
+/// by its own DIR TO first. Wide of the few miles an intercept engages from.
+pub const DIRECT_TO_XTK_NM: f64 = 5.0;
 
 /// A leg LNAV can fly: a plain leg to a fix (TF, DF, IF) with a resolved
 /// fix and an ident, never a hold, an RF arc, a course leg or a MAP. Pure.
@@ -167,6 +173,9 @@ pub enum Act {
     Press,
     /// Sequence the FMS to the follower's leg again (`xcopilot/fms/goto`).
     ReGoto,
+    /// The FMS's own DIR TO the leg's fix (`tools::direct_to::execute`),
+    /// once per leg; LNAV is then pressed as ever.
+    DirectTo,
     /// A fallback: LNAV out through the owner, the bug flies, said.
     Drop(Why),
     /// A planned hand-back to the bug (a leg LNAV does not fly): LNAV out
@@ -255,6 +264,8 @@ pub struct LnavLateral {
     mismatch_since: Option<f64>,
     /// The leg the one re-goto was spent on.
     regoto_leg: Option<usize>,
+    /// The leg the one DIR TO was spent on.
+    direct_leg: Option<usize>,
     lost_since: Option<f64>,
     /// When LNAV was last taken out (HDG SEL settling).
     out_at: Option<f64>,
@@ -278,6 +289,7 @@ impl Default for LnavLateral {
             agreed_leg: None,
             mismatch_since: None,
             regoto_leg: None,
+            direct_leg: None,
             lost_since: None,
             out_at: None,
             basis: None,
@@ -416,6 +428,14 @@ impl LnavLateral {
                         return Decision::act(Act::ReGoto);
                     }
                     return nothing;
+                }
+                // On the leg's fix but far off its line: DIR TO once, then
+                // engage whatever it left (a failed one is today's path).
+                if t.xtk_nm.is_some_and(|x| x.abs() > DIRECT_TO_XTK_NM)
+                    && self.direct_leg != Some(t.idx)
+                {
+                    self.direct_leg = Some(t.idx);
+                    return Decision::act(Act::DirectTo);
                 }
                 self.phase = Phase::Engaging;
                 self.engage = LnavEngage::default();
