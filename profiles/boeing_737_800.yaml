@@ -106,6 +106,12 @@ autoflight:
   heading_command: laminar/B738/autopilot/hdg_sel_press
   vs_command: laminar/B738/autopilot/vs_press
   altitude_hold_command: laminar/B738/autopilot/alt_hld_press
+  # The A/T flies the airborne speed, as a 737 crew has it: armed, the MCP
+  # window on the target, SPEED pressed, watched, our levers the fallback
+  # (src/tools/speedhold.rs `athr_tick`). VERIFY airborne: `speedhold`
+  # `athr` reaching `active` with `at_on` / `at_mode` read, no thrust fight.
+  speed_command: laminar/B738/autopilot/speed_press
+  athr_holds_speed: true
   # LNAV on the stock FMS (#227, probed live 2026-10-06 at FL360 over Spain):
   # lnav_press is a toggle firing the stock GPSS (only with CMD in), the lamp
   # reads 1 engaged, autopilot_state 540672 (LNAV 524288 + ALT HOLD).

@@ -593,7 +593,7 @@ async fn athr_tick(
     xp: &XPlaneClient,
     voice: &Option<crate::voice::Voice>,
     h: &mut AthrHold,
-    d: f64,
+    d: Option<f64>,
     r: &AthrReads,
     t: AthrTick,
 ) -> bool {
@@ -622,8 +622,10 @@ async fn athr_tick(
         crate::autoflight::press_logged(xp, Button::Speed, "speed_governor").await;
     }
     let engaging = matches!(h.at, crate::ap_lands::AtSpeed::Engaging { .. });
-    let lever_set = engaging && (t.thr - d).abs() > ATHR_DETENT_TOL;
-    if lever_set {
+    // A lever-driven A/THR is engaged from its detent; a servo A/T moves
+    // the levers itself.
+    let lever_set = engaging && d.is_some_and(|d| (t.thr - d).abs() > ATHR_DETENT_TOL);
+    if let (true, Some(d)) = (lever_set, d) {
         glide(xp, &throttle_dataref(), d, 200).await;
     }
     if let Some(line) = o.say {
@@ -1494,13 +1496,13 @@ async fn governor(
         match mode {
             Mode::Flight => {
                 let thr_name = throttle_dataref();
-                let detent = crate::aircraft::athr_cl_detent();
+                let athr_speed = crate::aircraft::athr_speed();
                 let (ias_r, thr_r, engaged, at_reads) = tokio::join!(
                     xp.get_float(IAS),
                     xp.get_float(&thr_name),
                     crate::autoflight::read_autothrottle_engaged(&xp),
                     async {
-                        match detent {
+                        match athr_speed {
                             Some(_) => Some(read_athr(&xp).await),
                             None => None,
                         }
@@ -1589,7 +1591,7 @@ async fn governor(
                     };
                     prev_ias = Some((ias, now_t));
                     *ACTUAL.lock().unwrap_or_else(|e| e.into_inner()) = ias;
-                    if let (Some(d), Some(r)) = (detent, &at_reads) {
+                    if let (Some(d), Some(r)) = (athr_speed, &at_reads) {
                         let tick = AthrTick {
                             target,
                             ias,
@@ -1600,8 +1602,9 @@ async fn governor(
                         };
                         if athr_tick(&xp, &voice, &mut athr, d, r, tick).await {
                             // The levers sit in the detent: moved off it is
-                            // a hand (the override check above).
-                            last_cmd = Some(d);
+                            // a hand (the override check above). A servo
+                            // A/T moves them itself: no hand is read off it.
+                            last_cmd = d;
                             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                             continue;
                         }
@@ -1619,7 +1622,7 @@ async fn governor(
                     }
                     let adj = throttle_adjust_live(target - ias, trend);
                     // Below a lever-driven A/THR's CL detent (`manual_lever_cap`).
-                    if let Some(cmd) = governor_lever(thr, adj, manual_lever_cap(detent)) {
+                    if let Some(cmd) = governor_lever(thr, adj, manual_lever_cap(athr_speed.flatten())) {
                         glide(&xp, &throttle_dataref(), cmd, 200).await; // ~most of the tick
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         last_cmd = Some(cmd);

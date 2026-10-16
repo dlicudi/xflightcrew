@@ -222,6 +222,13 @@ pub struct AutoflightProfile {
     /// the fallback, stays below this detent. `None`: the levers are ours.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub athr_cl_detent: Option<f64>,
+    /// A SERVO-driven autothrottle (a Boeing's): the A/T moves the levers
+    /// itself, so the speed governor's airborne hold arms it, sets the MCP
+    /// window and presses SPEED (`speed_command`), then stands aside and
+    /// watches (`speedhold` `athr`), as on a lever-driven A/THR but with no
+    /// detent. `false`: the levers are ours.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub athr_holds_speed: bool,
 }
 
 /// The mode lamps of a panel whose MCP is not the stock autopilot's
@@ -554,6 +561,20 @@ pub fn speed_governor() -> Option<SpeedGovernorProfile> {
 /// The live airframe's lever-driven A/THR CL detent
 /// (`autoflight.athr_cl_detent`), when declared and a lever ratio inside
 /// the travel.
+/// The airframe's autothrottle flies the governor's airborne speed: a
+/// lever-driven A/THR (`Some(Some(detent))`) or a servo-driven A/T that
+/// moves the levers itself (`Some(None)`, `autoflight.athr_holds_speed`).
+/// `None`: the levers are ours.
+pub fn athr_speed() -> Option<Option<f64>> {
+    match athr_cl_detent() {
+        Some(d) => Some(Some(d)),
+        None => live_profile()
+            .and_then(|p| p.autoflight.as_ref().map(|a| a.athr_holds_speed))
+            .unwrap_or(false)
+            .then_some(None),
+    }
+}
+
 pub fn athr_cl_detent() -> Option<f64> {
     live_profile()
         .and_then(|p| p.autoflight.as_ref().and_then(|a| a.athr_cl_detent))
