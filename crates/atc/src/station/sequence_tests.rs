@@ -305,6 +305,14 @@ fn approach_speaks_our_number_once_and_assigns_the_band() {
         judge_speed_readback("one eight zero knots", "Speedbird one"),
         None
     );
+    // Flown back out past the 210's band: the schedule never raises the
+    // speed it gave (EGPH 2026-10-16: 180/210 every 5 s on a band edge).
+    note_own_times(Some(RunwayTimes {
+        dist_nm: 16.0,
+        ..times("13", 300.0, "US", now)
+    }));
+    assert_eq!(vector_tick_for(&OWN_STRIP, &state, Some(130.0), now), None);
+    assert_eq!(crate::party_line::assigned_speed(), Some(180.0));
     // A go-around voids the speed.
     retire_sequence(&OWN_STRIP);
     assert_eq!(crate::party_line::assigned_speed(), None);

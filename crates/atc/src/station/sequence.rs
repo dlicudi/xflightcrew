@@ -467,7 +467,13 @@ pub(crate) fn approach_sequence_lines(
     if let Some(speeds) = crate::party_line::approach_speeds() {
         let was_spacing = said.speed.is_some_and(|(_, w)| w == "spacing");
         let want = wanted_speed(own.dist_nm, state.alt_ft, speeds, short, was_spacing);
+        // The schedule only ever slows us: a band speed is never raised by
+        // the next band out (a pattern flown away from the field, a
+        // distance dithering on a band edge: EGPH 2026-10-16, 180/210
+        // every 5 s). A new speed after a go-around or the handoff only.
+        let raised = matches!((want, said.speed), (Some((k, "band")), Some((p, "band"))) if k > p);
         match want {
+            Some(_) if raised => {}
             Some((kts, why)) if said.speed != Some((kts, why)) => {
                 let reducing = state.gs_kts.is_finite() && state.gs_kts > kts + 10.0;
                 let words = speed_words(dialect, kts, reducing);

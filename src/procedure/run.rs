@@ -783,6 +783,13 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
                 (EndAction::Approach { approach_ias, .. }, true) => *approach_ias,
                 _ => planned,
             };
+            // Approach's assigned speed is flown, not just read back, until
+            // the handoff voids it; the final keeps the landing's (EGPH
+            // 2026-10-16: "maintain 180" read back, 188 flown).
+            let planned = match crate::party_line::assigned_speed() {
+                Some(kts) if !on_map_final => kts,
+                _ => planned,
+            };
             if on_map_final {
                 if !gear_set && crate::autoland::gear_may_extend(ias, crate::aircraft::gear_limit_kts()) {
                     gear_set = crate::tools::gear::set_handle(&xp, false).await.is_ok();
