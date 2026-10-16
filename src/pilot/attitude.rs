@@ -277,7 +277,6 @@ impl AttitudeFlare {
             self.entry = Some(entry);
         }
         let flaring = i.radio_ft <= entry.gate_ft;
-        self.alpha_f += (i.alpha_deg - self.alpha_f) * (dt / ALPHA_TAU_S).min(1.0);
         let vs_t = match i.path {
             Some(p) if !flaring => path_vs_fpm(p, i.radio_ft),
             _ => vs_target_fpm(i.radio_ft, entry.vs_fpm, entry.gate_ft),
@@ -290,6 +289,16 @@ impl AttitudeFlare {
         let dvs_dh = (entry.vs_fpm.min(HOLDOFF_VS_FPM) - HOLDOFF_VS_FPM) * 6.0 * k * (1.0 - k)
             / (entry.gate_ft - HOLDOFF_FT).max(1.0);
         let gamma_rate = (dvs_dh * (v_fpm * gamma.to_radians().sin() / 60.0) / v_fpm).to_degrees();
+        // The path follows the nose over 1 / the measured path answer: the
+        // lead is the angle of attack that bends the path at that rate.
+        let path_lag_s = if r.path > 0.1 { (1.0 / r.path).min(2.5) } else { 1.0 };
+        let lead = path_lag_s * gamma_rate;
+        // The filter is for the alpha that HOLDS the path, so the lead's own
+        // alpha is taken out of what it reads: read whole, the round-out's
+        // alpha came back through the filter as a second lead, and on the
+        // 737-800's 1.5 s path (its filter no slower than the path) the
+        // nose ran 1.4 to 3 degrees past its command (EGPH 24, 1792158539).
+        self.alpha_f += (i.alpha_deg - lead - self.alpha_f) * (dt / ALPHA_TAU_S).min(1.0);
         // The filtered alpha holds the path on the attitude; what the filter
         // misses in a flare (the speed bleeding, the power coming off) only
         // ever asks for more nose, so the trim never goes below zero: a gust
@@ -300,13 +309,16 @@ impl AttitudeFlare {
         // following a nose that is still turning is not a path error. Nor
         // while the elevator could not give what it was asked the same way:
         // more trim is more column the surface cannot deliver.
+        // Never faster than the path answers: an integrator quicker than the
+        // lag it closes through winds up on the path still following. The
+        // light aircraft's paths answer at 1.2 to 2.8 /s and keep the 1 /s;
+        // the 737-800's 0.66 /s, trimmed at 1, wound 1.6 degrees into the
+        // round-out and ballooned (EGPH 24, 1792158539).
+        let trim_per_s = GAMMA_TRIM_PER_S.min(1.0 / path_lag_s);
         let err = gamma_cmd - gamma;
         if self.last_theta_cmd.is_none_or(|c| (c - i.theta_deg).abs() < TRIM_BAND_DEG) && err * self.short <= 0.0 {
-            self.gamma_trim =
-                (self.gamma_trim + err * GAMMA_TRIM_PER_S * dt).clamp(0.0, 3.0);
+            self.gamma_trim = (self.gamma_trim + err * trim_per_s * dt).clamp(0.0, 3.0);
         }
-        // The path follows the nose over 1 / the measured path answer.
-        let path_lag_s = if r.path > 0.1 { (1.0 / r.path).min(2.5) } else { 1.0 };
         // The mains-first floor is for the wheels: it rises toward them a
         // degree a foot from the hold-off, never a step into the round-out
         // (a level floor met at the gate stepped the Evolution's nose 4.6
@@ -315,7 +327,7 @@ impl AttitudeFlare {
             Some(m) if flaring => m - (i.radio_ft - HOLDOFF_FT).max(0.0) * FLOOR_DEG_PER_FT,
             _ => f64::MIN,
         };
-        let theta_cmd = (gamma_cmd + self.alpha_f + self.gamma_trim + path_lag_s * gamma_rate)
+        let theta_cmd = (gamma_cmd + self.alpha_f + self.gamma_trim + lead)
             .min(limits.max_deg)
             .max(floor.min(limits.max_deg));
         let e_theta = theta_cmd - i.theta_deg;
