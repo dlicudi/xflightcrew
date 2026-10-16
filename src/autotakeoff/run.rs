@@ -75,6 +75,10 @@ pub(super) async fn no_pitch_take_over(xp: &XPlaneClient, p: &Params, voice: &Op
     RUN.record(sim::run::Outcome::Failed(AP_NO_PITCH.into()));
 }
 
+/// An engage still not read back after this long is given to the recovery:
+/// the 737's took three presses in 3 s when it worked (EGKK 08R, 1792149156).
+pub(super) const ENGAGE_GIVE_UP_S: f64 = 20.0;
+
 /// A mode command is only a request; handoff needs live mode and dial readbacks.
 /// The SERVOS are read too: lit modes are not an autopilot flying (#160).
 /// The servos go in through the one engage door (`ap_engage::press_logged`:
@@ -123,6 +127,12 @@ pub(super) async fn engage_climb(
         }
         *pressed_at = Some(now);
         *tries += 1;
+        // Which read kept it pressing: none was on the tape (1792152599).
+        crate::blackbox::record(
+            "autotakeoff",
+            serde_json::json!({"event": "engage_status", "try": *tries,
+                               "hdg": heading, "vs": vertical, "servos": servos}),
+        );
         if !crate::ap_engage::press_logged(xp, fd, "autotakeoff", "climb", *tries).await {
             return false;
         }
@@ -459,6 +469,8 @@ pub(super) async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
     // The servo presses of the 300 ft engage (`engage_climb`).
     let mut engage_tries: u32 = 0;
     let mut engage_pressed_at: Option<std::time::Instant> = None;
+    // When the engage began failing to read back above the engage height.
+    let mut engage_since: Option<std::time::Instant> = None;
     // The autopilot's climb from the engage on: the climb flown, carried
     // into the law without a step (#150).
     let mut climb_vs = ClimbVs::default();
@@ -1266,6 +1278,16 @@ pub(super) async fn fly(xp: XPlaneClient, voice: Option<Voice>, mut p: Params) {
             &mut engage_pressed_at,
         )
         .await {
+            // An engage that never reads back is no autopilot: nobody flies
+            // the thrust and the modes are pressed on and off. The 737 left
+            // EGKK 26L at climb thrust, pressed 167 times over four minutes,
+            // levelled at 5,000 ft and reached 360 kt (1792152599). The
+            // recovery takes it: our column, the governor on the thrust.
+            let since = engage_since.get_or_insert_with(std::time::Instant::now);
+            if !ap_engaged && since.elapsed().as_secs_f64() >= ENGAGE_GIVE_UP_S {
+                no_pitch_take_over(&xp, &p, &voice, "ap_wont_engage").await;
+                return;
+            }
             continue;
         }
         if !ap_engaged {
