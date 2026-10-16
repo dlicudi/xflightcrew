@@ -20,6 +20,7 @@ pub mod cabin_air;
 pub mod circuit;
 pub mod controls;
 pub mod cycle;
+pub mod direct_to;
 pub mod electrical;
 pub mod engine;
 pub mod flaps;
@@ -192,6 +193,8 @@ pub const ROTORCRAFT_WITHHELD: &[&str] = &[
     // The autopilot's own speed and GPS modes (#92) share the autopilot the
     // hover loop holds, and were measured on no helicopter.
     "ap_mode",
+    // DIR TO presses LNAV on the same autopilot.
+    "direct_to",
     // The pilot's go-around is ordered to autoland or the circuit; the hover
     // loop has its own words for a balked arrival.
     "go_around",
@@ -330,6 +333,9 @@ impl Registry {
             // The autopilot's own modes, read back (#92): refused per
             // airframe by `systems::ap_modes`, never assumed.
             tools.push(Box::new(autoflight::ApModeTool));
+            // DIR TO a plan fix on the FMS, then LNAV: refused where the
+            // airframe declares no LNAV, so every autopilot hears the ask.
+            tools.push(Box::new(direct_to::DirectTo));
             // Emergency upset/stall recovery — takes the controls, so it needs the
             // autopilot (for the level-hold handoff) present. It also drives the
             // props full forward for max power, and holds ≈1.3×Vs.

@@ -2486,3 +2486,30 @@ fn grammar_snapshot() {
     std::panic::set_hook(hook);
     std::fs::write(&out, s).expect("snapshot");
 }
+
+/// "Direct LESTA" at FL380 on the stock 737 (2026-10-16): the DIR TO
+/// request shapes, and a readback with a callsign after it never arms.
+#[test]
+fn direct_to_a_fix_is_its_own_request() {
+    for words in [
+        "Direct LESTA.",
+        "Proceed direct LESTA.",
+        "Go direct to LESTA.",
+        "Direct to LESTA.",
+        "Can you go direct LESTA please",
+    ] {
+        assert_eq!(
+            one(words),
+            Some(("direct_to".into(), json!({ "fix": "lesta" }))),
+            "{words}"
+        );
+        assert!(crate::router::looks_like_command(words), "{words}");
+    }
+    for words in [
+        "proceed direct lesta speedbird one two three",
+        "flight director on",
+        "set the heading directly to 270",
+    ] {
+        assert_ne!(one(words).map(|c| c.0), Some("direct_to".into()), "{words}");
+    }
+}
