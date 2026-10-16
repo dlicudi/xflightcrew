@@ -930,13 +930,13 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         // from what it learnt steering the air.
                         rollout_brakes = RolloutBrakeSteer::for_airframe();
                     }
-                    // A declared rollout steer damps on the sim's yaw rate
-                    // (`RolloutSteer`, #197): carried by the tick's one read
-                    // (`sim::state`, `F::R`), no round of its own.
-                    let yaw_r = match rollout_steer.as_ref() {
-                        Some(_) if !airborne => st.opt(F::R),
-                        _ => None,
-                    };
+                    // The sim's yaw rate on the wheels, carried by the tick's
+                    // one read (`sim::state`, `F::R`), no round of its own: a
+                    // declared rollout steer damps on it (`RolloutSteer`,
+                    // #197), and every rollout records it, the measurement a
+                    // rollout yaw response is fitted from (the 737's two
+                    // rollouts of 2026-10-16 could not pin its transport).
+                    let yaw_r = if airborne { None } else { st.opt(F::R) };
                     let steer = if airborne {
                         if let Some(law) = rollout_steer.as_mut() {
                             law.in_air();
