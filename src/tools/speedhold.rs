@@ -1510,7 +1510,13 @@ async fn governor(
                 );
                 // The A/THR this hold engages is not taken out by its own
                 // watch; let go, it is watched as ever.
-                let engaged = if athr.at.quiets_thrust_watch() { None } else { engaged };
+                // Nor is one this hold is about to take: an engaged A/T at
+                // the arm was pressed off, then SPD on, a second later, both
+                // said (EGPH 2026-10-16).
+                let takes_it = athr_speed.is_some()
+                    && matches!(athr.at, crate::ap_lands::AtSpeed::Off)
+                    && on_ground != Some(true);
+                let engaged = if athr.at.quiets_thrust_watch() || takes_it { None } else { engaged };
                 let step = thrust_watch.step(clock.elapsed().as_secs_f64(), engaged);
                 let took = matches!(step, crate::autoflight::ThrustStep::Take { .. });
                 if let Some(line) = crate::autoflight::act_thrust(&xp, step, "speed_governor").await {
