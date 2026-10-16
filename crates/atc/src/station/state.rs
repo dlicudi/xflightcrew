@@ -705,8 +705,15 @@ mod tests {
         ];
         // INSTRUMENT_DECLARED (2026-10-10): the crew flies a published
         // approach, declared before the destination's station installs.
-        let flight_carried =
-            ["IFR_FLIGHT", "REGION_HANDOFF", "ARRIVAL_PIN", "OWN_FIXES", "INSTRUMENT_DECLARED"];
+        // DISTRESS (2026-10-16): a mayday declared airborne, number one.
+        let flight_carried = [
+            "IFR_FLIGHT",
+            "REGION_HANDOFF",
+            "ARRIVAL_PIN",
+            "OWN_FIXES",
+            "INSTRUMENT_DECLARED",
+            "DISTRESS",
+        ];
         let station_field = [
             "OUT_OF_REACH",
             "GO_AROUND_LAST",

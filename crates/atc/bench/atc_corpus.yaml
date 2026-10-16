@@ -336,6 +336,11 @@
 - {text: "declaring an emergency", intent: mayday, radio: true}
 - {text: "pan pan, pan pan, pan pan", intent: mayday, radio: true}
 - {text: "mayday, engine failure, november 172SP", intent: mayday, radio: true}
+- {text: "Mayday, mayday, mayday, fuel. Speedbird one two three.", intent: mayday, radio: true}
+- {text: "mayday fuel", intent: mayday, radio: true}
+# Minimum fuel (2026-10-16): acknowledged, never a priority or a clearance.
+- {text: "Edinburgh Approach, Speedbird one two three, minimum fuel.", intent: minimum_fuel, radio: true}
+- {text: "Speedbird one two three, declaring minimum fuel.", intent: minimum_fuel, radio: true}
 # Not maydays: cockpit sentences that merely contain the vocabulary.
 - {text: "emergency fuel pump on", intent: unknown, radio: false}
 - {text: "emergency landing checklist", intent: unknown, radio: false}

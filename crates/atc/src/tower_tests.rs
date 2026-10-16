@@ -985,6 +985,7 @@ fn state_intent_matrix_holds_the_invariants() {
         GoAround,
         RejectingTakeoff,
         Mayday,
+        MinimumFuel,
         WindCheck,
         SquawkCheck,
         RequestTaxiIn,
@@ -1068,6 +1069,8 @@ fn state_intent_matrix_holds_the_invariants() {
                 let want = match intent {
                     RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance
                     | RequestStartup | RequestPushback | RequestShutdown => start,
+                    // Minimum fuel is no priority: acknowledged, nothing moves.
+                    MinimumFuel => start,
                     // A reject is a ground report: ctx() is airborne, so it
                     // is a garble there and moves nothing (the ground half
                     // has its own test).
@@ -1311,6 +1314,42 @@ fn mayday_gets_priority_from_any_state() {
     assert_eq!(parse_intent("emergency fuel pump on"), Intent::Unknown);
     // And the emergency CHECKLIST is cockpit ritual, not a distress call.
     assert_eq!(parse_intent("emergency landing checklist"), Intent::Unknown);
+}
+
+/// A FUEL mayday (Doc 4444 15.5.4, CAP 413 "MAYDAY MAYDAY MAYDAY FUEL") is
+/// a mayday: the distress path, cleared to land without a final report.
+/// "Minimum fuel" is not: acknowledged, no priority, the sequence unmoved.
+#[test]
+fn a_fuel_mayday_is_a_mayday_and_minimum_fuel_is_only_acknowledged() {
+    for call in [
+        "mayday mayday mayday fuel",
+        "Mayday, mayday, mayday, fuel. Speedbird one two three",
+        "mayday fuel",
+    ] {
+        assert_eq!(parse_intent(call), Intent::Mayday, "{call}");
+    }
+    let mut twr = Tower::new();
+    twr.state = State::Inbound;
+    let r = twr.handle(parse_intent("mayday mayday mayday fuel"), &ctx());
+    assert!(r.contains("roger mayday, cleared to land"), "{r}");
+    assert_eq!(twr.state, State::ClearedToLand);
+    for call in [
+        "minimum fuel",
+        "Speedbird one two three, minimum fuel",
+        "Edinburgh Tower, Speedbird one two three, declaring minimum fuel",
+    ] {
+        assert_eq!(parse_intent(call), Intent::MinimumFuel, "{call}");
+    }
+    // Not a declaration: the words without "minimum fuel".
+    assert_ne!(parse_intent("fuel minimum"), Intent::MinimumFuel);
+    for start in [State::Inbound, State::ClearedToLand] {
+        let mut twr = Tower::new();
+        twr.state = start;
+        let r = twr.handle(Intent::MinimumFuel, &ctx());
+        assert!(r.ends_with(", roger minimum fuel."), "{r}");
+        assert!(!r.contains("cleared"), "{r}");
+        assert_eq!(twr.state, start, "no priority, nothing changes");
+    }
 }
 
 #[test]
