@@ -11,8 +11,10 @@
 //! ([`PERIOD_SF`]; NPFG_ROLL_TC is the time constant the roll loop closes
 //! in). A guidance faster than its inner loop rings: the period is the
 //! inner loop's, never typed. The sideways velocity is judged where the bank
-//! already flown will have taken it one `tc` from now (the inner loop's lag,
-//! seen by the outer). It replaced a closure over 4 s, a velocity loop of
+//! will have taken it one `tc` from now (the inner loop's lag, seen by the
+//! outer): the bank the inner loop is being ASKED for, as that loop answers
+//! it ([`bank_ahead`]), never the bank read, which is the inner loop's own
+//! state. It replaced a closure over 4 s, a velocity loop of
 //! 1 s and a bank lead of 1 s (2026-10-12), all hand picked.
 //!
 //! The safety factor is 1, not NPFG's default 1.5: our `tc` is the closed
@@ -46,24 +48,33 @@ pub fn period_s(roll_tc_s: f64) -> f64 {
     PERIOD_SF * 4.0 * std::f64::consts::PI * DAMPING * roll_tc_s.clamp(0.2, 5.0)
 }
 
+/// The bank loop's time constant the period was bounded by, s.
+fn bank_tc_s(period_s: f64) -> f64 {
+    period_s / (PERIOD_SF * 4.0 * std::f64::consts::PI * DAMPING)
+}
+
 /// The bank that closes the centreline: the offset (`xtk_m`, right
 /// positive), the sideways velocity over the ground (`side_m_s`, right
-/// positive), the height, the track keeper's period, and the sideways
-/// acceleration the sideslip already gives (`slip_m_s2`, [`slip_accel_m_s2`]:
-/// in the decrab the wing goes down into the wind by that much). No offset
-/// read is no bank. Pure.
-pub fn bank_for_line(xtk_m: f64, side_m_s: f64, phi_deg: f64, radio_ft: f64, period_s: f64, slip_m_s2: f64) -> f64 {
+/// positive), the bank the bank loop is taking the aircraft to
+/// (`ahead_deg`, [`bank_ahead`]; the bank read on the first tick), the
+/// height, the track keeper's period, and the sideways acceleration the
+/// sideslip already gives (`slip_m_s2`, [`slip_accel_m_s2`]: in the decrab
+/// the wing goes down into the wind by that much). No offset read is no
+/// bank. Pure.
+pub fn bank_for_line(xtk_m: f64, side_m_s: f64, ahead_deg: f64, radio_ft: f64, period_s: f64, slip_m_s2: f64) -> f64 {
     if !xtk_m.is_finite() || !side_m_s.is_finite() {
         return 0.0;
     }
     let slip = if slip_m_s2.is_finite() { slip_m_s2 } else { 0.0 };
-    // The sideways velocity the bank already flown will have made by the
-    // time the bank loop answers (its time constant, the period's bound):
-    // a 5 degree bank inherited at the A330's floated gate carried it 5 m
-    // past the line before a slow sidestick could take it out.
-    let phi = if phi_deg.is_finite() { phi_deg.clamp(-30.0, 30.0) } else { 0.0 };
-    let lead_s = period_s / (PERIOD_SF * 4.0 * std::f64::consts::PI * DAMPING);
-    let side_m_s = side_m_s + (G_M_S2 * phi.to_radians().sin() + slip) * lead_s;
+    // The sideways velocity the bank will have made by the time the bank
+    // loop answers (its time constant, the period's bound): a 5 degree bank
+    // inherited at the A330's floated gate carried it 5 m past the line
+    // before a slow sidestick could take it out. The bank the loop is
+    // taking the aircraft to, never the bank read: the read is the inner
+    // loop's own state, and subtracted here it doubled that loop's gain
+    // (the 737 rang at the tick below minimums, EGPH 24, 1792158539).
+    let phi = if ahead_deg.is_finite() { ahead_deg.clamp(-30.0, 30.0) } else { 0.0 };
+    let side_m_s = side_m_s + (G_M_S2 * phi.to_radians().sin() + slip) * bank_tc_s(period_s);
     let cap = if radio_ft.is_finite() {
         (BANK_WHEELS_DEG + radio_ft.max(0.0) * BANK_PER_FT).min(BANK_MAX_DEG)
     } else {
@@ -83,6 +94,15 @@ pub fn bank_for_line(xtk_m: f64, side_m_s: f64, phi_deg: f64, radio_ft: f64, per
     let correct = (accel / G_M_S2).atan().to_degrees().clamp(-cap, cap);
     let hold = (-slip / G_M_S2).clamp(-1.0, 1.0).asin().to_degrees();
     (correct + hold).clamp(-SLIP_BANK_MAX_DEG, SLIP_BANK_MAX_DEG)
+}
+
+/// Where the bank loop has taken the bank `dt` seconds on from `from_deg`
+/// toward `target_deg`: the closed loop's first-order answer over its time
+/// constant (the period's bound). Fed back its own output tick by tick,
+/// from the bank read on the first, it is the bank [`bank_for_line`] leads
+/// on. Pure.
+pub fn bank_ahead(from_deg: f64, target_deg: f64, dt: f64, period_s: f64) -> f64 {
+    from_deg + (target_deg - from_deg) * (1.0 - (-dt.max(0.0) / bank_tc_s(period_s).max(0.05)).exp())
 }
 
 /// The steepest bank with the wing down into a crosswind, degrees: a wing

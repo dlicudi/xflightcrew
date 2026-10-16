@@ -67,14 +67,16 @@ pub fn decrab_from_s(resp: &Response, ias_kts: f64, tas_kts: f64, tick_s: f64, c
     (crab_deg.abs() / RATE_MAX_DPS + 2.0 * attitude_tc_s(&g)).clamp(1.5, 8.0)
 }
 
-/// The sideslip the bank must hold, degrees (X-Plane's beta): the one
-/// flown while coordinating, and in the decrab the one the aligned nose
-/// WILL have on the same airpath (the slip now less the crab still to
-/// come out), so the wing goes down WITH the rudder, as a pilot crosses
-/// the controls, not after the drift has begun. Pure.
+/// The sideslip the bank must hold, degrees (X-Plane's beta): none while
+/// coordinating (the rudder is taking out what there is: a wing held down
+/// for it turned every slip the ailerons made into more bank, the 737 at
+/// EGPH 24, 1792158539), and in the decrab the one the aligned nose WILL
+/// have on the same airpath (the heading less the slip: the airpath, which
+/// a wagging nose does not move), so the wing goes down WITH the rudder, as
+/// a pilot crosses the controls, not after the drift has begun. Pure.
 pub fn slip_planned_deg(i: &In, mode: Mode) -> f64 {
     match mode {
-        Mode::Coordinate => i.beta_deg,
+        Mode::Coordinate => 0.0,
         Mode::Decrab => i.beta_deg - crate::angles::signed_diff_deg(i.psi_deg, i.course_deg),
     }
 }
