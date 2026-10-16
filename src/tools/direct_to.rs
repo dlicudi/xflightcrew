@@ -140,9 +140,29 @@ async fn read_lnav(xp: &dyn XPlane) -> Lnav {
     lnav_state(on, gpss.ok())
 }
 
-/// The listed fix the heard word names, page by page: its LSK and ident.
+/// The row's LSK for `fix`: as heard, the row it most plausibly names
+/// (`plan::best_ident`); `exact`, only the row spelt as the FMS spells it
+/// (the follower's own leg, never a near namesake). Pure.
+pub fn pick_row(fix: &str, rows: &[(usize, String)], exact: bool) -> Option<usize> {
+    let rows = rows.iter().map(|(l, id)| (*l, id.as_str()));
+    if exact {
+        let want = crate::simbrief::fms_ident(fix);
+        rows.into_iter()
+            .find(|(_, id)| id.eq_ignore_ascii_case(&want))
+            .map(|(l, _)| l)
+    } else {
+        crate::plan::best_ident(fix, rows)
+    }
+}
+
+/// The listed fix [`pick_row`] names, page by page: its LSK and ident.
 /// The rows seen go on the tape either way.
-async fn find_row(xp: &dyn XPlane, heard: &str, seen: &mut Vec<String>) -> Option<(usize, String)> {
+async fn find_row(
+    xp: &dyn XPlane,
+    fix: &str,
+    exact: bool,
+    seen: &mut Vec<String>,
+) -> Option<(usize, String)> {
     for page in 0..MAX_PAGES {
         if page > 0 {
             press(xp, NEXT_PAGE, PAGE_MS).await;
@@ -154,13 +174,55 @@ async fn find_row(xp: &dyn XPlane, heard: &str, seen: &mut Vec<String>) -> Optio
             }
         }
         seen.extend(rows.iter().map(|(_, id)| id.clone()));
-        if let Some(lsk) =
-            crate::plan::best_ident(heard, rows.iter().map(|(l, id)| (*l, id.as_str())))
-        {
+        if let Some(lsk) = pick_row(fix, &rows, exact) {
             return rows.into_iter().find(|(l, _)| *l == lsk);
         }
     }
     None
+}
+
+/// The FMS half of a DIR TO, no gates and no LNAV: clear the scratchpad,
+/// DIR INTC, the row [`pick_row`] names, EXEC only on a MOD page. `Ok` the
+/// ident executed, `Err` the spoken reason nothing was. Blackbox
+/// `direct_to` with `by` (the pilot's tool, or the follower's leg).
+pub async fn execute(xp: &dyn XPlane, fix: &str, exact: bool, by: &str) -> Result<String, String> {
+    // A leftover in the scratchpad would be entered by the row's LSK.
+    match clear_scratchpad(xp).await {
+        Some(true) => {}
+        Some(false) => return Err("The FMS scratchpad won't clear.".to_string()),
+        None => return Err("I can't read the FMS.".to_string()),
+    }
+    press(xp, DIR_INTC, PAGE_MS).await;
+    let mut seen = Vec::new();
+    let Some((lsk, ident)) = find_row(xp, fix, exact, &mut seen).await else {
+        let _ = clear_scratchpad(xp).await;
+        crate::blackbox::record(
+            "direct_to",
+            json!({"by": by, "heard": fix, "listed": seen, "executed": false}),
+        );
+        return Err(format!(
+            "{} isn't in the FMS route. Nothing executed.",
+            fix.to_ascii_uppercase()
+        ));
+    };
+    press(xp, &format!("sim/FMS/ls_{lsk}l"), PAGE_MS).await;
+    let line0 = read_line(xp, 0).await;
+    if !line0.as_deref().is_some_and(is_mod) {
+        let _ = clear_scratchpad(xp).await;
+        crate::blackbox::record(
+            "direct_to",
+            json!({"by": by, "heard": fix, "ident": ident, "line0": line0, "executed": false}),
+        );
+        return Err(format!(
+            "The FMS didn't take direct {ident}. Nothing executed."
+        ));
+    }
+    press(xp, EXEC, PAGE_MS).await;
+    crate::blackbox::record(
+        "direct_to",
+        json!({"by": by, "heard": fix, "ident": ident, "line0": line0, "executed": true}),
+    );
+    Ok(ident)
 }
 
 /// The whole DIR TO, the gates first. `fix` is as heard; it must be listed
@@ -191,36 +253,10 @@ pub async fn run(xp: &dyn XPlane, fix: &str) -> String {
         Ok(_) => return "The autopilot isn't engaged, so no LNAV. Engage CMD first.".to_string(),
         Err(_) => return "I can't read the autopilot.".to_string(),
     }
-    // A leftover in the scratchpad would be entered by the row's LSK.
-    match clear_scratchpad(xp).await {
-        Some(true) => {}
-        Some(false) => return "The FMS scratchpad won't clear.".to_string(),
-        None => return "I can't read the FMS.".to_string(),
-    }
-    press(xp, DIR_INTC, PAGE_MS).await;
-    let mut seen = Vec::new();
-    let Some((lsk, ident)) = find_row(xp, heard, &mut seen).await else {
-        let _ = clear_scratchpad(xp).await;
-        crate::blackbox::record(
-            "direct_to",
-            json!({"heard": heard, "listed": seen, "executed": false}),
-        );
-        return format!(
-            "{} isn't in the FMS route. Nothing executed.",
-            heard.to_ascii_uppercase()
-        );
+    let ident = match execute(xp, heard, false, "pilot").await {
+        Ok(ident) => ident,
+        Err(line) => return line,
     };
-    press(xp, &format!("sim/FMS/ls_{lsk}l"), PAGE_MS).await;
-    let line0 = read_line(xp, 0).await;
-    if !line0.as_deref().is_some_and(is_mod) {
-        let _ = clear_scratchpad(xp).await;
-        crate::blackbox::record(
-            "direct_to",
-            json!({"heard": heard, "ident": ident, "line0": line0, "executed": false}),
-        );
-        return format!("The FMS didn't take direct {ident}. Nothing executed.");
-    }
-    press(xp, EXEC, PAGE_MS).await;
     // Pressed once, never again: a second press disarms an armed LNAV.
     let before = read_lnav(xp).await;
     let pressed = matches!(before, Lnav::Out);
@@ -235,7 +271,7 @@ pub async fn run(xp: &dyn XPlane, fix: &str) -> String {
         .is_some_and(|n| crate::lnav::same_ident(n, &ident));
     crate::blackbox::record(
         "direct_to",
-        json!({"heard": heard, "ident": ident, "line0": line0, "executed": true,
+        json!({"by": "pilot", "ident": ident, "readback": true,
                "gps_nav_id": nav_id, "lnav_before": before, "pressed": pressed, "lnav": lnav}),
     );
     readback(&ident, on_fix, lnav)
@@ -305,6 +341,19 @@ mod tests {
         assert_eq!(crate::plan::best_ident("lesta", rows), Some(2));
         assert_eq!(crate::plan::best_ident("embor", rows), Some(3));
         assert_eq!(crate::plan::best_ident("pimos", rows), None);
+    }
+
+    /// As heard, the nearest spelling; the follower's own leg, only its
+    /// exact ident (never DIR TO a near namesake of the leg).
+    #[test]
+    fn the_follower_picks_only_its_exact_row() {
+        let rows = vec![(2, "INPIP".to_string()), (3, "INREV".to_string())];
+        assert_eq!(pick_row("inpip", &rows, false), Some(2));
+        assert_eq!(pick_row("INPIP", &rows, true), Some(2));
+        assert_eq!(pick_row("INREV", &rows, true), Some(3));
+        assert_eq!(pick_row("inpit", &rows, false), Some(2));
+        assert_eq!(pick_row("INPIT", &rows, true), None);
+        assert_eq!(pick_row("EGPH arrival", &rows, true), None);
     }
 
     /// Armed and engaged as the 737 reads them, and what is said for each.

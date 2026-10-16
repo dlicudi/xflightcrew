@@ -1046,6 +1046,17 @@ impl FullAuto {
         ) else {
             return Err("The plan has no route and no destination I can fly to. Review the plan; you have control.".into());
         };
+        // The FMS's active fix, read before the resume reloads the plan.
+        let fms_active = xp.get_string(crate::datarefs::GPS_NAV_ID).await.ok();
+        let join = rp::toward_active_fix(
+            join,
+            &legs,
+            dest_wp.as_ref(),
+            lat,
+            lon,
+            track_true,
+            fms_active.as_deref(),
+        );
         // The way's floor: the ground along the path to the join, probed out
         // to 40 nm (the follower's own floor watches the rest in flight),
         // else the grid MORA along it, else the fields' sector altitude.
@@ -1136,7 +1147,7 @@ impl FullAuto {
                 "join_fix": join.leg_index().and_then(|i| legs.get(i)).map(|l| l.fix_ident.clone()),
                 "floor_ft": floor_true.round(), "floor_source": source, "climb_ft": climb,
                 "alt_ft": altitude.round(), "to_go_nm": to_go.round(), "endurance_min": endurance_min.map(f64::round),
-                "fetched": fetched, "destination": fp.destination,
+                "fetched": fetched, "destination": fp.destination, "fms_active": fms_active,
             }),
         );
         if let Some(why) = rp::impossible(

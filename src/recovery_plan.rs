@@ -151,6 +151,26 @@ pub fn remaining_nm(legs: &[ProcLeg], i: usize, dest: Option<&Waypoint>) -> f64 
     nm
 }
 
+/// The way in direct to the fix of leg `i`: its cost (the route from it and
+/// the turn to it), the distance to it and the route through it. Pure.
+fn direct_via(
+    legs: &[ProcLeg],
+    i: usize,
+    dest: Option<&Waypoint>,
+    lat: f64,
+    lon: f64,
+    track_true: Option<f64>,
+) -> Option<(f64, f64, f64)> {
+    let f = legs.get(i)?.fix.as_ref()?;
+    let d = crate::nav::haversine_nm(lat, lon, f.lat, f.lon);
+    let turn = track_true
+        .filter(|t| t.is_finite())
+        .map(|t| crate::angles::abs_diff_deg(t, crate::nav::bearing_deg(lat, lon, f.lat, f.lon)))
+        .unwrap_or(0.0);
+    let via = d + remaining_nm(legs, i, dest);
+    Some((via + turn * TURN_NM_PER_DEG, d, via))
+}
+
 /// The direct fix whose way on to the destination is shortest: the distance
 /// to it, the route from it and the turn to it. Pure.
 pub fn best_direct(
@@ -160,22 +180,48 @@ pub fn best_direct(
     lon: f64,
     track_true: Option<f64>,
 ) -> Option<Join> {
-    legs.iter()
-        .enumerate()
-        .filter_map(|(i, l)| {
-            let f = l.fix.as_ref()?;
-            let d = crate::nav::haversine_nm(lat, lon, f.lat, f.lon);
-            let turn = track_true
-                .filter(|t| t.is_finite())
-                .map(|t| {
-                    crate::angles::abs_diff_deg(t, crate::nav::bearing_deg(lat, lon, f.lat, f.lon))
-                })
-                .unwrap_or(0.0);
-            let via = d + remaining_nm(legs, i, dest);
-            Some((via + turn * TURN_NM_PER_DEG, i, d, via))
+    (0..legs.len())
+        .filter_map(|i| {
+            direct_via(legs, i, dest, lat, lon, track_true).map(|(c, d, v)| (c, i, d, v))
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, index, dist_nm, via_nm)| Join::Direct {
+            index,
+            dist_nm,
+            via_nm,
+        })
+}
+
+/// A direct join goes to the FMS's active fix instead when the route holds
+/// it and its way in is no detour (within [`ARRIVAL_DETOUR_NM`] of the
+/// join's): the box was flying there, and the FMS's DIR TO and LNAV need a
+/// fix it holds. The shortest way in is often the arrival gateway, a point
+/// no FMS holds: 737 at FL380 toward EGPH, 2026-10-16, resumed direct "EGPH
+/// arrival" with INPIP active and flew the descent on the bug. Any other
+/// join, an unread or foreign ident, is kept. Pure.
+pub fn toward_active_fix(
+    join: Join,
+    legs: &[ProcLeg],
+    dest: Option<&Waypoint>,
+    lat: f64,
+    lon: f64,
+    track_true: Option<f64>,
+    fms_ident: Option<&str>,
+) -> Join {
+    let (Join::Direct { index, .. }, Some(fms)) = (&join, fms_ident) else {
+        return join;
+    };
+    let Some((cost, ..)) = direct_via(legs, *index, dest, lat, lon, track_true) else {
+        return join;
+    };
+    (0..legs.len())
+        .filter(|&i| i != *index && crate::lnav::same_ident(fms, &legs[i].fix_ident))
+        .filter_map(|i| {
+            direct_via(legs, i, dest, lat, lon, track_true).map(|(c, d, v)| (c, i, d, v))
+        })
+        .filter(|(c, ..)| *c <= cost + ARRIVAL_DETOUR_NM)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map_or(join, |(_, index, dist_nm, via_nm)| Join::Direct {
             index,
             dist_nm,
             via_nm,

@@ -1140,6 +1140,16 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
                     );
                     sequence_fms(&xp, idx, leg).await;
                 }
+                crate::lnav::Act::DirectTo => {
+                    let r =
+                        crate::tools::direct_to::execute(&xp, &leg.fix_ident, true, "procedure")
+                            .await;
+                    crate::blackbox::record(
+                        "lnav",
+                        serde_json::json!({"event": "direct_to", "idx": idx, "fix": leg.fix_ident,
+                            "fms": fms, "xtk": xtk, "executed": r.is_ok(), "refused": r.err()}),
+                    );
+                }
                 crate::lnav::Act::Drop(why) => {
                     crate::blackbox::record(
                         "lnav",

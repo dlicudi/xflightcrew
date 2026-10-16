@@ -822,3 +822,61 @@ fn the_bug_says_why_it_flies_instead_of_lnav() {
     assert_eq!(why(BugWhy { fms_ident: Some("MID"), ..base }), Some("fms_not_on_leg"));
     assert_eq!(why(base), Some("engaging"));
 }
+
+/// The EGPH resume (737 FL380, 2026-10-16): the FMS on INPIP but the
+/// aircraft about 13 nm off its RIBEL-INPIP line, where LNAV only arms. A
+/// DIR TO first, once for the leg; then the press as ever.
+#[test]
+fn far_off_the_fms_leg_a_dir_to_comes_first_once() {
+    let at = |l: &mut LnavLateral, t: f64, engaged: bool, xtk: Option<f64>| {
+        l.decide(tick(
+            t,
+            0,
+            "INPIP",
+            Some("INREV"),
+            Some("INPIP"),
+            Some(engaged),
+            xtk,
+        ))
+        .act
+    };
+    let mut l = LnavLateral::default();
+    assert_eq!(at(&mut l, 0.0, false, Some(-13.0)), Act::DirectTo);
+    assert!(l.bug_write_allowed(), "the bug flies through the DIR TO");
+    // Done: the leg starts here, LNAV is pressed in.
+    assert_eq!(at(&mut l, 4.0, false, Some(0.0)), Act::Press);
+    assert_eq!(at(&mut l, 6.0, true, Some(0.0)), Act::Nothing);
+    assert!(l.owns_lateral());
+
+    // A DIR TO that did not take is never retried on the leg: the press,
+    // as before.
+    let mut l = LnavLateral::default();
+    assert_eq!(at(&mut l, 0.0, false, Some(13.0)), Act::DirectTo);
+    assert_eq!(at(&mut l, 4.0, false, Some(13.0)), Act::Press);
+
+    // Near the line, an intercept: no DIR TO. Unread: no measurement.
+    let mut l = LnavLateral::default();
+    assert_eq!(at(&mut l, 0.0, false, Some(4.0)), Act::Press);
+    let mut l = LnavLateral::default();
+    assert_eq!(at(&mut l, 0.0, false, None), Act::Press);
+}
+
+/// The FMS not on the leg (a fix it does not hold, the synthetic gateway):
+/// never a DIR TO, never a press; the goto and the bug as before.
+#[test]
+fn a_leg_the_fms_is_not_on_never_gets_a_dir_to() {
+    let mut l = LnavLateral::default();
+    for s in 0..40 {
+        let t = s as f64 * 0.5;
+        let d = l.decide(tick(
+            t,
+            0,
+            "EGPH arrival",
+            None,
+            Some("D257B"),
+            Some(false),
+            Some(250.0),
+        ));
+        assert!(!matches!(d.act, Act::DirectTo | Act::Press), "{d:?} at {t}");
+    }
+}
