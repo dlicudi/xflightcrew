@@ -1654,6 +1654,7 @@ const MATCHERS: &[fn(&Line) -> Option<ToolCall>] = &[
     ground::ramp,
     radio::tune,
     surfaces::config,
+    autopilot::direct,
     autopilot::modes,
     automation::ground_drive,
     speed::speed,

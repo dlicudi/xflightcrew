@@ -691,6 +691,8 @@ pub(crate) const COMMAND_KEYWORDS: &[&str] = &[
     "fms",
     // couple the autopilot to the flight plan
     "navigate",
+    // DIR TO a plan fix ("direct LESTA")
+    "direct",
     "follow",
     "track",
     // navigation progress queries

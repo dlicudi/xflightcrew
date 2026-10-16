@@ -251,6 +251,12 @@ pub const STALL_WARNING_RATIO: &str = "sim/cockpit2/annunciators/stall_warning_r
 pub const PUSHBACK_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
 /// The GPS's active waypoint ident.
 pub const GPS_NAV_ID: &str = "sim/cockpit2/radios/indicators/gps_nav_id";
+/// The captain's CDU text line `n` (a `data` string), 0 to 13: line 0 the
+/// title (" MOD ..." once a change waits for EXEC), line 2n beside LSK n,
+/// line 13 the scratchpad ("[" and "]" round blanks when empty).
+pub fn fms_cdu1_line(n: usize) -> String {
+    format!("sim/cockpit2/radios/indicators/fms_cdu1_text_line{n}")
+}
 /// The GPS cross-track error from the FMS's active leg, nm, signed: what
 /// LNAV captures to 0.0 (#227).
 pub const GPS_XTK: &str = "sim/cockpit2/radios/indicators/gps_xtk";

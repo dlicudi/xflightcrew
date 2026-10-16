@@ -2,6 +2,29 @@
 
 use super::*;
 
+/// "Direct LESTA", "proceed direct LESTA", "go direct to LESTA": the
+/// whole line is the request, an optional verb, "direct", an optional
+/// "to" and ONE fix word, so a readback with a callsign after it never
+/// arms. The fix is resolved against the loaded plan by the tool.
+pub(super) fn direct(line: &Line) -> Option<ToolCall> {
+    let words: Vec<&str> = line
+        .t
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let rest = match words.as_slice() {
+        ["direct", rest @ ..] => rest,
+        ["proceed" | "go" | "fly", "direct", rest @ ..] => rest,
+        _ => return None,
+    };
+    let rest = rest.strip_prefix(&["to"][..]).unwrap_or(rest);
+    match rest {
+        [] => Some(call("direct_to", json!({ "fix": "" }))),
+        [fix] => Some(call("direct_to", json!({ "fix": fix }))),
+        _ => None,
+    }
+}
+
 /// The autopilot's own modes: level change, LNAV, autothrottle.
 pub(super) fn modes(line: &Line) -> Option<ToolCall> {
     let t = line.t;
