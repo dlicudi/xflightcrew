@@ -1323,10 +1323,16 @@ form.say .send { min-height: 52px; }
   // Live: Server-Sent Events, falling back to polling /state.
   var es = null, poll = null;
   function setConn(state) { $('conn').className = 'dot ' + state; $('conn').title = 'connection ' + state; }
+  // The map's traffic box rides on the URL (`XvlMap.box`); a new box
+  // reconnects.
+  function live(path) {
+    var b = window.XvlMap && window.XvlMap.box();
+    return withT(b ? path + '?bbox=' + b : path);
+  }
   function startPoll() {
     if (poll) return;
     poll = setInterval(function () {
-      fetch(withT('/state'), { headers: { 'X-EFB-Token': token }, credentials: 'same-origin' })
+      fetch(live('/state'), { headers: { 'X-EFB-Token': token }, credentials: 'same-origin' })
         .then(function (r) { if (!r.ok) throw r.status; return r.json(); })
         .then(function (s) { setConn('live'); render(s); })
         .catch(function () { setConn('lost'); });
@@ -1334,13 +1340,21 @@ form.say .send { min-height: 52px; }
   }
   function startEvents() {
     if (!window.EventSource) { startPoll(); return; }
-    es = new EventSource(withT('/events'));
+    es = new EventSource(live('/events'));
     es.onmessage = function (e) {
       setConn('live');
       if (poll) { clearInterval(poll); poll = null; }
       try { render(JSON.parse(e.data)); } catch (err) {}
     };
     es.onerror = function () { setConn('lost'); startPoll(); };
+  }
+
+  if (window.XvlMap) {
+    window.XvlMap.onBox = function () {
+      if (es) { es.close(); es = null; }
+      if (poll) { clearInterval(poll); poll = null; }
+      startEvents();
+    };
   }
 
   pick(tab);

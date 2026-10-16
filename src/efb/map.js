@@ -160,25 +160,33 @@
 
   // ------------------------------------------------------------ gliding
 
-  // Positions arrive about once a second; our aircraft and the traffic
-  // glide between them. A jump over 400 m (a reposition) is a jump.
+  // Positions arrive every second or so; between them each aircraft flies
+  // on at its groundspeed along its heading (for EXTRAP_MS at most), and a
+  // new fix's difference from where it was drawn is blended out over
+  // BLEND_MS. A fix that repeats the last is no fix; a jump over 400 m (a
+  // reposition) is a jump.
+  var BLEND_MS = 1000, EXTRAP_MS = 3000;
   function angDiff(a, b) { return ((b - a + 540) % 360) - 180; }
   function glideNow(g, t) {
     if (!g) return null;
-    var k = g.dur > 0 ? Math.min(1, (t - g.t0) / g.dur) : 1;
+    var dt = Math.min(EXTRAP_MS, Math.max(0, t - g.t0)), k = Math.max(0, 1 - (t - g.t0) / BLEND_MS);
     return {
-      X: g.from.X + (g.to.X - g.from.X) * k,
-      Y: g.from.Y + (g.to.Y - g.from.Y) * k,
-      h: (g.from.h + angDiff(g.from.h, g.to.h) * k + 360) % 360,
-      moving: k < 1
+      X: g.X + g.vx * dt + g.eX * k,
+      Y: g.Y + g.vy * dt + g.eY * k,
+      h: (g.h + g.eh * k + 360) % 360,
+      moving: k > 0 || ((g.vx !== 0 || g.vy !== 0) && dt < EXTRAP_MS)
     };
   }
-  function glideTo(was, lat, lon, h, t) {
-    var to = { X: mx(lon), Y: my(lat), h: h };
+  function glideTo(was, lat, lon, h, gs, t) {
+    if (was && was.lat === lat && was.lon === lon && was.h === h) return was;
+    var k = kAt(lat), r = h * Math.PI / 180;
+    var v = (gs || 0) * 1852 / 3600000 * k;   // world units a millisecond
+    var g = { lat: lat, lon: lon, X: mx(lon), Y: my(lat), h: h, vx: v * Math.sin(r), vy: -v * Math.cos(r), t0: t, eX: 0, eY: 0, eh: 0 };
     var cur = glideNow(was, t);
-    var from = cur ? { X: cur.X, Y: cur.Y, h: cur.h } : to;
-    if (Math.hypot(to.X - from.X, to.Y - from.Y) / kAt(lat) > 400) from = to;
-    return { from: from, to: to, t0: t, dur: was ? Math.min(1500, Math.max(300, t - was.t0)) : 0 };
+    if (cur && Math.hypot(cur.X - g.X, cur.Y - g.Y) / k <= 400) {
+      g.eX = cur.X - g.X; g.eY = cur.Y - g.Y; g.eh = angDiff(h, cur.h);
+    }
+    return g;
   }
   var own = null;   // our aircraft's glide, and `ownD` its last state
   var ownD = null;
@@ -190,7 +198,8 @@
     var seen = {};
     (list || []).forEach(function (a) {
       seen[a.id] = 1;
-      var was = tr[a.id], g = glideTo(was, a.lat, a.lon, a.hdg, t);
+      var was = tr[a.id], g = glideTo(was, a.lat, a.lon, a.hdg, a.gs_kts, t);
+      if (g === was) { was.d = a; return; }
       g.d = a;
       // Its vertical trend from the change between two updates, fpm.
       g.vs = 0;
@@ -496,6 +505,26 @@
     lastAsk = [view.X, view.Y, view.z, W, H];
     if (baseTimer) clearTimeout(baseTimer);
     baseTimer = setTimeout(function () { baseTimer = null; wantBase(); wantOverlay(); wantFields(); savePrefs(); }, 250);
+  }
+
+  // The traffic the server sends is the box the page hands it (/events'
+  // bbox): the view and as much again each side, asked anew once the view
+  // leaves it or is zoomed well inside it.
+  var tbox = null, tboxTimer = null;
+  function viewBox() {
+    var tl = worldAt(0, 0), br = worldAt(W, H);
+    return [latOf(Math.min(1, br[1])), lonOf(Math.max(0, tl[0])), latOf(Math.max(0, tl[1])), lonOf(Math.min(1, br[0]))];
+  }
+  function wantBox() {
+    if (tboxTimer || !W) return;
+    var v = viewBox(), b = tbox;
+    if (b && v[0] >= b[0] && v[1] >= b[1] && v[2] <= b[2] && v[3] <= b[3] && (v[2] - v[0]) * 6 > b[2] - b[0]) return;
+    tboxTimer = setTimeout(function () {
+      tboxTimer = null;
+      var v = viewBox(), dla = v[2] - v[0], dlo = v[3] - v[1];
+      tbox = [Math.max(-MAX_LAT, v[0] - dla), Math.max(-180, v[1] - dlo), Math.min(MAX_LAT, v[2] + dla), Math.min(180, v[3] + dlo)];
+      if (window.XvlMap.onBox) window.XvlMap.onBox();
+    }, 300);
   }
 
   // ------------------------------------------------------------ DOM
@@ -1536,7 +1565,7 @@
     scaleText.textContent = nm ? len + ' nm' : (len >= 1000 ? (len / 1000) + ' km' : len + ' m');
   }
 
-  var lastT = 0, lastDraw = 0;
+  var lastT = 0;
   function frame(t) {
     requestAnimationFrame(frame);
     var dt = lastT ? Math.min(64, t - lastT) : 0;
@@ -1547,12 +1576,10 @@
     var moving = !!(o && o.moving);
     Object.keys(tr).forEach(function (k) { if (glideNow(tr[k], t).moving) moving = true; });
     if (follow && o) { view.X = o.X; view.Y = o.Y; }
-    // A glide alone redraws at 20 a second; a finger or a zoom every frame.
-    if (!dirty && !busy && !(moving && t - lastDraw > 50)) return;
+    if (!dirty && !busy && !moving) return;
     dirty = false;
-    lastDraw = t;
     draw(t, o);
-    if (placed) wantData();
+    if (placed) { wantData(); wantBox(); }
   }
   function draw(t, o) {
     screenTransform();
@@ -1783,7 +1810,7 @@
     if (o) {
       // On the ground the nose; flying, the ground track.
       var h = !o.on_ground && o.track !== null && o.track !== undefined && o.gs_kts > 40 ? o.track : o.heading;
-      own = glideTo(own, o.lat, o.lon, h, t);
+      own = glideTo(own, o.lat, o.lon, h, o.gs_kts, t);
     } else {
       own = null;
     }
@@ -1801,7 +1828,10 @@
     dirty = true;
   }
 
-  window.XvlMap = { update: update, mount: mount };
+  window.XvlMap = {
+    update: update, mount: mount, onBox: null,
+    box: function () { return tbox && tbox.map(function (v) { return v.toFixed(3); }).join(','); }
+  };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);
   else mount();
 })();

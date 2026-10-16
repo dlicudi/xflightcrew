@@ -589,8 +589,10 @@ fn airport_facts() -> airport::AirportFacts {
     }
 }
 
-/// The page state now, the METAR cache refreshed first when due.
-async fn current(server: &Arc<Server>) -> state::EfbState {
+/// The page state now, the METAR cache refreshed first when due. The map's
+/// traffic is only what lies in the page's `view` (lat0, lon0, lat1, lon1):
+/// the whole world's timetable is thousands of aircraft, none without one.
+async fn current(server: &Arc<Server>, view: Option<[f64; 4]>) -> state::EfbState {
     let fields = metar_fields(plan_facts().as_ref())
         .into_iter()
         .map(|(_, i)| i)
@@ -609,12 +611,34 @@ async fn current(server: &Arc<Server>) -> state::EfbState {
         f.airport.diagram = airport::lookup(&w.icao).map(|r| r.reference.clone());
         f.airport.unavailable = airport::unavailable(&w.icao);
     }
-    state::build(&f)
+    let mut s = state::build(&f);
+    s.map.traffic.retain(|a| {
+        view.is_some_and(|[lat0, lon0, lat1, lon1]| {
+            (lat0..=lat1).contains(&a.lat) && (lon0..=lon1).contains(&a.lon)
+        })
+    });
+    s
+}
+
+/// "lat0,lon0,lat1,lon1", the page's box for a view.
+fn parse_bbox(s: Option<&str>) -> Option<[f64; 4]> {
+    let v: Vec<f64> = s?
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    v.try_into().ok()
 }
 
 #[derive(serde::Deserialize, Default)]
 struct TokenQuery {
     t: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ViewQuery {
+    t: Option<String>,
+    /// The map's box, "lat0,lon0,lat1,lon1": the traffic sent is in it.
+    bbox: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -744,13 +768,13 @@ fn png(bytes: &'static [u8]) -> Response {
 async fn state_route(
     State(server): State<Arc<Server>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Query(q): Query<TokenQuery>,
+    Query(q): Query<ViewQuery>,
     headers: HeaderMap,
 ) -> Response {
     if !authorised(&live_token(), &headers, q.t.as_deref()) {
         return refuse(peer, "/state");
     }
-    let s = current(&server).await;
+    let s = current(&server, parse_bbox(q.bbox.as_deref())).await;
     ([(header::CACHE_CONTROL, "no-store")], Json(s)).into_response()
 }
 
@@ -826,13 +850,7 @@ async fn basemap_route(
     if !authorised(&live_token(), &headers, q.t.as_deref()) {
         return refuse(peer, "/basemap");
     }
-    let bbox: Vec<f64> = q
-        .bbox
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|v| v.trim().parse().ok())
-        .collect();
-    let Ok(bbox) = <[f64; 4]>::try_from(bbox) else {
+    let Some(bbox) = parse_bbox(q.bbox.as_deref()) else {
         return (StatusCode::BAD_REQUEST, "bbox=lat0,lon0,lat1,lon1").into_response();
     };
     let px = q.px.unwrap_or(1000.0);
@@ -891,13 +909,7 @@ async fn overlay_route(
     if !authorised(&live_token(), &headers, q.t.as_deref()) {
         return refuse(peer, "/overlay");
     }
-    let bbox: Vec<f64> = q
-        .bbox
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|v| v.trim().parse().ok())
-        .collect();
-    let Ok(bbox) = <[f64; 4]>::try_from(bbox) else {
+    let Some(bbox) = parse_bbox(q.bbox.as_deref()) else {
         return (StatusCode::BAD_REQUEST, "bbox=lat0,lon0,lat1,lon1").into_response();
     };
     match tokio::task::spawn_blocking(move || overlay::answer(bbox)).await {
@@ -923,23 +935,24 @@ async fn map_js() -> Response {
 async fn events(
     State(server): State<Arc<Server>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Query(q): Query<TokenQuery>,
+    Query(q): Query<ViewQuery>,
     headers: HeaderMap,
 ) -> Response {
     if !authorised(&live_token(), &headers, q.t.as_deref()) {
         return refuse(peer, "/events");
     }
+    let view = parse_bbox(q.bbox.as_deref());
     // Change-gated: the state is sent when its JSON differs from the last
     // one sent (the clock field excluded), else nothing but keep-alives.
     let stream = futures::stream::unfold(
         (server, None::<String>, true),
-        |(server, last, mut first)| async move {
+        move |(server, last, mut first)| async move {
             loop {
                 if !first {
                     tokio::time::sleep(PUSH_EVERY).await;
                 }
                 first = false;
-                let s = current(&server).await;
+                let s = current(&server, view).await;
                 let mut v = serde_json::to_value(&s).unwrap_or_default();
                 let body = v.to_string();
                 if let Some(o) = v.as_object_mut() {
