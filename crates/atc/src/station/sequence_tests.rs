@@ -108,6 +108,62 @@ fn an_order_once_spoken_holds_until_the_gap_reverses() {
     assert!(own_leader_at(now).is_none());
 }
 
+/// A MAYDAY is number one (Doc 4444 15.1.2): once declared airborne, no
+/// flight still flying its final is ahead of us, and our landing clearance
+/// is never withheld behind one. EGPH (sortie 1792158539-full_auto,
+/// 2026-10-16): fuel down to about 800 kg and a landing held behind traffic.
+#[test]
+fn a_mayday_is_number_one_and_its_landing_is_never_held_for_a_lander() {
+    let _g = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _s = ClearStrips;
+    let _o = ClearOwnSequence;
+    struct ClearDistress;
+    impl Drop for ClearDistress {
+        fn drop(&mut self) {
+            OWN_STRIP.distress.store(false, Ordering::SeqCst);
+        }
+    }
+    let _d = ClearDistress;
+    OWN_STRIP.distress.store(false, Ordering::SeqCst);
+    let now = Instant::now();
+    note_traffic_state(8, AircraftState::at_position(0.0, 0.0, false, 140.0));
+    note_traffic_times(8, Some(times("26L", 100.0, "LEAD8", now)));
+    note_own_times(Some(times("26L", 200.0, "US", now)));
+    assert_eq!(own_number_at(now), Some(2));
+    assert!(landing_leader_blocking(&OWN_STRIP, "26L", &[], now).is_some());
+    // The mayday, airborne, through the station's own reply path.
+    let mut st = super::strip_tests::gatwick();
+    let ctx = st.make_ctx(
+        Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 8.0,
+        },
+        "QNH one zero one three".into(),
+        "Speedbird one two three".into(),
+        false,
+        false,
+        None,
+        false,
+        None,
+    );
+    let wx = Wx {
+        wind_from_deg: 250.0,
+        wind_kts: 8.0,
+    };
+    let r = st.respond(
+        "mayday mayday mayday fuel",
+        Service::Tower,
+        tower::Intent::Mayday,
+        &ctx,
+        wx,
+    );
+    assert!(r.contains("roger mayday"), "{r}");
+    assert!(OWN_STRIP.distress.load(Ordering::SeqCst));
+    assert_eq!(own_number_at(now), Some(1));
+    assert!(own_leader_at(now).is_none());
+    assert!(landing_leader_blocking(&OWN_STRIP, "26L", &[], now).is_none());
+}
+
 /// A 737's approach speeds: its 145 kt approach plus ten, no faster than 250.
 fn b738_speeds() -> Option<crate::party_line::ApproachSpeeds> {
     Some(crate::party_line::ApproachSpeeds {

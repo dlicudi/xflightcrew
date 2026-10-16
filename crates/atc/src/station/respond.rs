@@ -20,6 +20,11 @@ impl Station {
             return line;
         }
         self.note_working(service);
+        // A mayday in the air puts the flight first in its landing sequence
+        // for the rest of the flight (`OWN_STRIP.distress`).
+        if intent == tower::Intent::Mayday && !ctx.on_ground {
+            self.desk.strip.distress.store(true, Ordering::SeqCst);
+        }
         // "Request push and start" asks for both; "request push back" the
         // push alone (`Station::push_line`).
         self.desk.call.push_start = intent == tower::Intent::RequestPushback
@@ -575,6 +580,7 @@ impl Station {
             tower::Intent::SquawkCheck => {
                 format!("{}, squawk seven zero zero zero.", ctx.callsign)
             }
+            tower::Intent::MinimumFuel => format!("{}, roger minimum fuel.", ctx.callsign),
             // Coming back in: vectors are approach's job when the field has
             // one; otherwise departure does what approach would.
             tower::Intent::RequestVectors => match &ctx.approach {
@@ -1111,6 +1117,7 @@ impl Station {
             tower::Intent::SquawkCheck => {
                 format!("{}, squawk seven zero zero zero.", ctx.callsign)
             }
+            tower::Intent::MinimumFuel => format!("{}, roger minimum fuel.", ctx.callsign),
             tower::Intent::RequestVectors => self.arm_vectors(ctx, wx),
             tower::Intent::RequestLanding { touch_and_go } => {
                 // The option request rides through the vectors: the tower's

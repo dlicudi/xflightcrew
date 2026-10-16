@@ -174,8 +174,11 @@ pub(crate) fn own_ahead(now: Instant) -> Option<(String, f64, Vec<(FlightId, f64
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .filter(|s| s.runway.eq_ignore_ascii_case(&own.runway));
+    // A mayday is number one: nobody still flying a final is ahead of it.
+    let distress = OWN_STRIP.distress.load(Ordering::SeqCst);
     let ahead = landing_sequence(&own.runway, now)
         .into_iter()
+        .filter(|_| !distress)
         .filter(|(id, _)| *id != FlightId::Own)
         .filter(|(id, s)| ahead_with_hysteresis(spoken.as_ref(), *id, *s, own.to_thr_s))
         .collect();
@@ -694,7 +697,8 @@ pub(crate) fn landing_leader_blocking(
     targets: &[TcasTarget],
     now: Instant,
 ) -> Option<tower::LandingLeader> {
-    if !flight.is_own() {
+    // A mayday's landing is never withheld behind traffic still flying.
+    if !flight.is_own() || flight.distress.load(Ordering::SeqCst) {
         return None;
     }
     let own_times = fresh_times(flight, now)

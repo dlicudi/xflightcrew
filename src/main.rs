@@ -34,6 +34,7 @@ mod crew_pace;
 mod conversation;
 mod course_leg;
 mod crew_radio;
+mod fuel_declaration;
 mod debrief;
 mod heading_bug;
 mod home;

@@ -92,6 +92,11 @@ pub enum Intent {
     /// The ONE intent that earns a landing clearance without a final report:
     /// an emergency outranks the sequence, never the other way round.
     Mayday,
+    /// "minimum fuel" / "declaring minimum fuel" (Doc 4444 15.5.4, CAP 413):
+    /// committed to land at a specific aerodrome, and any change to the
+    /// clearance may mean landing with less than final reserve. Not an
+    /// emergency and no priority: acknowledged, nothing changes.
+    MinimumFuel,
     /// "say wind" / "wind check" / "say QNH".
     WindCheck,
     /// "what's my squawk" / "say transponder" — the pilot asking for the code
@@ -771,6 +776,12 @@ pub fn parse_intent(transcript: &str) -> Intent {
     {
         return Intent::Mayday;
     }
+    // "Minimum fuel": strict words, after the mayday (a "mayday fuel" is a
+    // distress call) and before every other reading ("minimum fuel, request
+    // landing" is the declaration first).
+    if t.contains("minimum fuel") {
+        return Intent::MinimumFuel;
+    }
     // "do you read/copy/hear me" / "are you there" are how pilots actually ask
     // for a radio check (five times across the 2026-07 flights, all
     // stonewalled with "say again").
@@ -1325,6 +1336,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "go_around" => Intent::GoAround,
         "rejecting_takeoff" => Intent::RejectingTakeoff,
         "mayday" => Intent::Mayday,
+        "minimum_fuel" => Intent::MinimumFuel,
         "wind_check" => Intent::WindCheck,
         "squawk_check" => Intent::SquawkCheck,
         "request_taxi_in" => Intent::RequestTaxiIn,
@@ -2613,7 +2625,11 @@ impl Tower {
                 // The question-shaped calls a controller answers regardless.
                 if matches!(
                     intent,
-                    Intent::RadioCheck | Intent::WindCheck | Intent::SquawkCheck | Intent::Greeting
+                    Intent::RadioCheck
+                        | Intent::WindCheck
+                        | Intent::SquawkCheck
+                        | Intent::Greeting
+                        | Intent::MinimumFuel
                 ) {
                     return None;
                 }
@@ -2668,6 +2684,7 @@ impl Tower {
                 | Intent::WindCheck
                 | Intent::SquawkCheck
                 | Intent::Greeting
+                | Intent::MinimumFuel
                 | Intent::RequestFlightFollowing
                 | Intent::RequestFrequencyChange
                 | Intent::RequestShutdown
@@ -3211,6 +3228,7 @@ impl Tower {
                     ctx.callsign, ctx.runway, ctx.wind
                 )
             }
+            Intent::MinimumFuel => format!("{}, roger minimum fuel.", ctx.callsign),
             Intent::WindCheck => {
                 format!("{}, wind {}{}.", ctx.callsign, ctx.wind, qnh_clause(ctx))
             }

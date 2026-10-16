@@ -310,6 +310,12 @@ flight_strip! {
             /// The FLIGHT's: it is declared before the destination's station is
             /// installed, so `install` must not reset it.
             instrument_declared: AtomicBool = AtomicBool::new(false),
+            /// The flight declared a MAYDAY airborne (fuel or any other): it is
+            /// number one in its landing sequence and its landing is never
+            /// withheld behind traffic still flying its final
+            /// (`station::own_ahead`, `station::landing_leader_blocking`). The
+            /// FLIGHT's: a mayday to the region's controller holds at the field.
+            distress: AtomicBool = AtomicBool::new(false),
         },
         /// The installed station's watches over this flight: reset by `install`
         /// and `uninstall`, never by `retire_for_new_flight` (`go_around_last`

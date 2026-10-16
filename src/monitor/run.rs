@@ -134,6 +134,9 @@ pub async fn run(
     // "request taxi" went out, the cancel handed back, and the reply was
     // judged as the pilot's with the waiver gone).
     let mut full_auto_seen: Option<std::time::Instant> = None;
+    // ICAO fuel declarations, each once per flight (reset on the ground).
+    let mut fuel_declared = crate::fuel_declaration::Declarations::default();
+    let fuel_clock = Instant::now();
     // Landing-clearance coach: when the approach hands us to the tower we owe
     // a "final" report before "cleared to land". `seen` starts the grace so a
     // prompt reporter is never nagged; `spoken` fires the nudge once.
@@ -903,6 +906,50 @@ pub async fn run(
                     &config.xplane_base_url,
                     crate::full_auto::running() && crate::mode::crew_actuates(),
                 );
+                // Minimum fuel and mayday fuel: declared by the crew that
+                // works the radio, advised to a pilot who works it himself
+                // (`fuel_declaration`).
+                if snap.on_ground {
+                    fuel_declared = Default::default();
+                } else if let Some((at_landing, reserve)) = live
+                    .get()
+                    .fuel
+                    .as_ref()
+                    .and_then(|f| crate::fuel_declaration::predict(&snap, f))
+                    .filter(|_| crew_on)
+                {
+                    let due = crate::fuel_declaration::due(at_landing, reserve);
+                    let t = fuel_clock.elapsed().as_secs_f64();
+                    if let Some(d) = fuel_declared.tick(due, t) {
+                        let crew_declares =
+                            crate::full_auto::running() && crate::mode::crew_actuates();
+                        crate::blackbox::record(
+                            "fuel_declared",
+                            serde_json::json!({
+                                "declaration": format!("{d:?}"),
+                                "crew_declares": crew_declares,
+                                "at_landing_min": r1(at_landing),
+                                "final_reserve_min": r1(reserve),
+                                "fuel_kg": snap.fuel_kg.map(r1),
+                                "dest_nm": snap.dest_route_nm.or(snap.dest_dist_nm).map(r1),
+                                "gs_kts": r1(snap.groundspeed_kts),
+                            }),
+                        );
+                        voice.alert(
+                            Priority::Caution,
+                            crate::fuel_declaration::intercom_line(d, crew_declares).to_string(),
+                        );
+                        if crew_declares {
+                            let base = config.xplane_base_url.clone();
+                            tokio::spawn(async move {
+                                let xp = XPlaneClient::new(base);
+                                let cs = crate::crew_radio::crew_callsign(&xp).await;
+                                let words = crate::fuel_declaration::radio_words(d, &cs);
+                                crate::crew_radio::transmit(words);
+                            });
+                        }
+                    }
+                }
                 if let Some(nudge) = crate::party_line::take_squawk_nudge() {
                     if crate::mode::crew_actuates() {
                         let base = config.xplane_base_url.clone();

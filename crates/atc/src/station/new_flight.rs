@@ -362,6 +362,10 @@ pub(super) fn note_aircraft_state_for(flight: &FlightStrip, state: &AircraftStat
             }
         }
     }
+    // A mayday's priority ends on the ground: it was declared airborne.
+    if on_ground {
+        flight.distress.store(false, Ordering::SeqCst);
+    }
     note_crossing_for(flight, lat, lon, on_ground);
 }
 
