@@ -35,7 +35,7 @@
 //!   2026-10-12 (`SPEED_CLOSE_SLOW_S`, `URGENT_SLOW_KTS`), which did the
 //!   same thing from a typed band of knots.
 //! - **Bad descent** (TECS's): sinking more than [`BAD_DESCENT_FPM`] below
-//!   the path's energy for a second, the same full power.
+//!   the path's energy for a second, and not fast, the same full power.
 //! - **The flare**: height has priority (the elevator holds the path the
 //!   flare plans) and the lever only comes back, walking to idle so the
 //!   engine has spooled down ([`Tecs::spool_s`], the engine class's, or
@@ -182,7 +182,11 @@ impl EnergyThrottle {
             + (speed_term_fpm(i.ias_kts, i.target_kts - i.ias_kts) * weight).min(SPEED_TERM_MAX_FPM * weight);
         let raw = want - have;
         self.bad_s = if raw > BAD_DESCENT_FPM { self.bad_s + dt } else { 0.0 };
-        let bad_descent = self.bad_s >= BAD_DESCENT_S && !self.underspeed;
+        // Only with the speed not in hand (TECS's: the energy itself short,
+        // not just its rate): fast, energy shed is the speed coming back, and
+        // full power on it pumped a 737's coupled glideslope 145 to 165 kt
+        // into a go-around (EGPH 24, 2026-10-16, sortie 1792158539).
+        let bad_descent = self.bad_s >= BAD_DESCENT_S && !self.underspeed && i.ias_kts <= i.target_kts;
         if bad_descent {
             let lever = (i.thr_now + SLEW_PROTECT_PER_S * dt).min(1.0);
             return Out { lever, underspeed: false, bad_descent, flare: false };

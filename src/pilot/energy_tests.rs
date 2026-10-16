@@ -229,3 +229,38 @@ fn a_737_far_fast_on_the_path_flies_it_at_idle() {
     let late = &r.kts[r.kts.len() * 5 / 6..];
     assert!(late.iter().all(|k| (k - 145.0).abs() < 4.0), "settles: {:?}", late.last());
 }
+
+/// One tick of the 737's final at `ias` against 145, slowing at `accel`
+/// kt/s, sinking `vs` on an 800 fpm path, the lever at 0.2.
+fn bad_descent_tick(ias: f64, accel: f64, vs: f64) -> Out {
+    let mut law = EnergyThrottle::default();
+    let tecs = Tecs::from_book(Some(3_000.0), EngineClass::Jet);
+    let i = In {
+        ias_kts: ias,
+        accel_kts_s: accel,
+        vs_fpm: vs,
+        target_kts: 145.0,
+        floor_kts: None,
+        path_vs_fpm: -800.0,
+        thr_now: 0.2,
+        dt: 0.35,
+        flare_to_wheels_s: None,
+    };
+    for _ in 0..5 {
+        law.step(i, tecs);
+    }
+    law.step(i, tecs)
+}
+
+/// EGPH 24, 2026-10-16 (sortie 1792158539-full_auto): 7 kt fast on the
+/// coupled glideslope, the AP's pitch-down shedding speed at 3.8 kt/s, read
+/// as a bad descent: power at the quick hand, 165 kt, a go-around. Fast is
+/// energy in hand, never a bad descent; on speed, a real sink still is.
+#[test]
+fn shedding_speed_while_fast_is_no_bad_descent() {
+    let fast = bad_descent_tick(152.0, -3.8, -970.0);
+    assert!(!fast.bad_descent, "{fast:?}");
+    assert!(fast.lever <= 0.2 + SLEW_PER_S * 0.35 + 1e-9, "the slow hand at most: {fast:?}");
+    let sinking = bad_descent_tick(145.0, 0.0, -2_000.0);
+    assert!(sinking.bad_descent, "{sinking:?}");
+}
