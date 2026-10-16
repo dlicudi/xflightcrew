@@ -334,6 +334,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
             // the band), for the blackbox's `roundout_held` edges.
             let mut roundout_held = false;
             let mut bank_hold = crate::pilot::bank::BankHold::default();
+            // The bank the bank hold was last asked for, as it answers it by
+            // this tick (`pilot::line::bank_ahead`): the centreline leads on
+            // it. Set only on a tick the hold flew; else the bank read.
+            let mut line_bank: Option<f64> = None;
             // What the hand-flown segment flies on: this airframe's measured
             // responses (`xfc identify`, `aircraft::learned`), else the
             // fleet's priors; the throttle's energy; the nose's geometry.
@@ -948,10 +952,13 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         .unwrap_or(xtk_rate);
                     let phi_roll = phi_r.as_ref().ok().copied();
                     let tas_roll = plant_at(5).map_or(ias, |v| v * 1.943_844);
+                    let roll_period = line_period_s(ias, tas_roll, roll_dt);
+                    let roll_from = line_bank.take().or(phi_roll).unwrap_or(0.0);
                     let air_bank_tgt = phi_roll
-                        .map(|_| crate::pilot::line::bank_for_line(xtk_m, side_roll, phi_roll.unwrap_or(0.0), radio_ft, line_period_s(ias, tas_roll, roll_dt), 0.0));
+                        .map(|_| crate::pilot::line::bank_for_line(xtk_m, side_roll, roll_from, radio_ft, roll_period, 0.0));
                     let air_ail = match (airborne && arrest_hands && !roll_yielded, phi_roll, air_bank_tgt) {
                         (true, Some(phi), Some(tgt)) => {
+                            line_bank = Some(crate::pilot::line::bank_ahead(roll_from, tgt, roll_dt, roll_period));
                             Some(bank_hold.step(phi, tgt, roll_dt, &pilot_airframe.roll, ias, tas_roll, plant_at(8).unwrap_or(0.0)))
                         }
                         _ => None,
@@ -2725,27 +2732,24 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     }
                     _ => None,
                 };
-                // The bank: the centreline's (NPFG), with the wing down for
-                // the slip the rudder holds (or will hold, in the decrab).
+                // The bank: the centreline's (NPFG), leading on the bank last
+                // asked for, with the wing down for the slip the decrab will
+                // hold (none while coordinating: the rudder takes it out).
                 let line_period = line_period_s(ias, tas_now, tick_dt);
+                let line_from = line_bank.take().or(phi_r.as_ref().ok().copied()).unwrap_or(0.0);
                 let bank_tgt = crate::pilot::line::bank_for_line(
                     xtk_m_now,
                     side_now,
-                    phi_r.as_ref().ok().copied().unwrap_or(0.0),
+                    line_from,
                     radio_ft,
                     line_period,
                     crate::pilot::line::slip_accel_m_s2(slip_deg, pilot_airframe.yaw.at(ias, tas_now).path, tas_now),
                 );
                 let flare_ail = match (arrest_hands, phi_r.as_ref().ok().copied(), roll_yielded) {
-                    (true, Some(phi), false) => Some(bank_hold.step(
-                        phi,
-                        bank_tgt,
-                        tick_dt,
-                        &pilot_airframe.roll,
-                        ias,
-                        tas_now,
-                        plant_at(8).unwrap_or(0.0),
-                    )),
+                    (true, Some(phi), false) => {
+                        line_bank = Some(crate::pilot::line::bank_ahead(line_from, bank_tgt, tick_dt, line_period));
+                        Some(bank_hold.step(phi, bank_tgt, tick_dt, &pilot_airframe.roll, ias, tas_now, plant_at(8).unwrap_or(0.0)))
+                    }
                     _ => None,
                 };
                 TRACKING_ERROR.set_in(flight, xtk_now * M_PER_NM);
