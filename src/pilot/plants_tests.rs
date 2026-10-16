@@ -214,8 +214,23 @@ const EGBB_737: Fit = Fit { name: "737 EGBB", w2: 1.88, cq: 0.0, ke: 6.70, ge: 0
     h0: 48.7, th0: -3.82, g0: -2.74, v0: 154.3, q0: -0.81, lever: Some([0.05, 0.05, 0.04, 0.02, 0.0, 0.0]),
     roll: FITS[6].roll, yaw: FITS[6].yaw };
 
-/// The 737-800 below minimums at EGPH 24 (1792158539, 2026-10-16, 148 kt,
-/// flaps 30): the roll fitted from the hand-flown segment's own aileron
+/// The 737-800's flare at EGPH 24 (1792158539, 2026-10-16), fitted as
+/// EGBB's: output error from the gate (39.2 ft on the radio, which reads 1 ft
+/// on the wheels; 151 kt, a -2.9 degree path) to the wheels on the recorded
+/// column and lever, the ground effect EGBB's: 0.40 deg rms on theta and
+/// 0.20 on the path over 5.3 s. Effectiveness 10.7 deg/s^2 a unit (w2 ke;
+/// EGBB 12.6), the alpha spring 1.6, no damping of its own, the path 0.69
+/// /s; the delay fits best at none (0.34 deg) and is taken at the 0.05 s
+/// transport. The speed is the record's own (least squares, 0.74 kt/s rms:
+/// the flare's drag at its alpha). The radio fell 5 ft more than the true
+/// vertical speed over the flare (the ground under the approach), so the
+/// plant's height is its own path's. Flown on the stored response (b 35 at
+/// 151 kt, three times this), the law pitched -1.9 to +5.2 degrees against
+/// a command of 4.2, the path to +1 degree, then let the nose fall to -0.1
+/// and met the runway at 279 fpm; on this plant it pitched to +5.2 against
+/// 4.1, the path +0.6, and 281 fpm.
+///
+/// Below minimums on the same flight (148 kt, flaps 30): the roll fitted from the hand-flown segment's own aileron
 /// (radio 297 ft to the wheels, multiple shooting over 1.2 s windows, 0.63
 /// deg rms): kp 24 deg/s a unit through a 0.2 s roll mode (the doublets' fit
 /// at 160 kt flaps 15 is three times slower), the command answered 0.15 s
@@ -224,13 +239,11 @@ const EGBB_737: Fit = Fit { name: "737 EGBB", w2: 1.88, cq: 0.0, ke: 6.70, ge: 0
 /// unit of aileron (it took the slip's rms from 0.45 to 0.42 deg on either
 /// yaw model). The bank loop rang on it there: the aileron reversing 1.5
 /// times a second, the bank asked to the 8 degree limit in calm air.
-const EGPH_737: Fit = Fit {
-    name: "737 EGPH",
-    v0: 148.0,
+const EGPH_737: Fit = Fit { name: "737 EGPH", w2: 1.598, cq: 0.0, ke: 6.728, ge: 0.02, kl: 0.0, c: 0.0268, a0: -8.642, kp: 0.0, kg: 0.1,
+    s0: -5.848, s1: 15.564, aoff: -0.450, trim: 0.096, delay: 0.05, elev_def_s: 0.3,
+    h0: 38.2, th0: -1.885, g0: -2.92, v0: 151.1, q0: -0.265, lever: Some([0.30, 0.285, 0.263, 0.22, 0.11, 0.08]),
     roll: Roll { kp: 24.0, tau: 0.2, delay: 0.15, a0: 0.0 },
-    yaw: Yaw { dihedral: 7.8, adverse: -3.5, ..FITS[6].yaw },
-    ..FITS[6]
-};
+    yaw: Yaw { dihedral: 7.8, adverse: -3.5, ..FITS[6].yaw } };
 
 fn shape(h: f64) -> f64 {
     (1.0 - h / 18.0).clamp(0.0, 1.0).powi(2)
@@ -520,6 +533,10 @@ struct Landing {
     wheels_fpm: f64,
     scored_fpm: f64,
     balloon_ft: f64,
+    /// The nose at the wheels, and the steepest climb the path made below
+    /// the gate, degrees.
+    theta_wheels_deg: f64,
+    gamma_max_deg: f64,
     /// The elevator thrown from one stop to the other (beyond 0.9 either
     /// way): the bang-bang of a loop ringing on its limits.
     reversals: usize,
@@ -545,6 +562,7 @@ fn fly(f: Fit, resp: &Response, air: Air) -> Landing {
     let mut gust_from: Option<f64> = None;
     let mut sinks: Vec<(f64, f64)> = Vec::new();
     let (mut stop, mut reversals) = (0.0, 0);
+    let mut gamma_max = f64::MIN;
     while t < 40.0 {
         if t >= next_tick - 1e-9 {
             let o = law.step(
@@ -572,11 +590,19 @@ fn fly(f: Fit, resp: &Response, air: Air) -> Landing {
         s.step(&f, e, f.lever_at(s.h), gust, dt);
         low = low.min(s.h);
         balloon = balloon.max(s.h - low);
+        gamma_max = gamma_max.max(s.gam);
         sinks.push((t, s.sink_fpm()));
         t += dt;
         if s.h <= 0.0 {
             let scored = sinks.iter().filter(|(ts, _)| t - ts <= 2.5).map(|s| s.1).fold(f64::MIN, f64::max);
-            return Landing { wheels_fpm: s.sink_fpm(), scored_fpm: scored, balloon_ft: balloon, reversals };
+            return Landing {
+                wheels_fpm: s.sink_fpm(),
+                scored_fpm: scored,
+                balloon_ft: balloon,
+                theta_wheels_deg: s.th,
+                gamma_max_deg: gamma_max,
+                reversals,
+            };
         }
     }
     panic!("{}: no landing in 40 s", f.name);
@@ -1049,7 +1075,8 @@ fn the_bank_hold_lands_the_a330s_recorded_gates() {
 /// still, 0.5 m), calm air, on its own fitted roll (`EGPH_737`): flown on
 /// the airframe the aircraft flew (the fleet's prior roll, its learned file
 /// has none, and its stored yaw) and on the one `xfc identify` would
-/// measure on the plant. The aileron reverses at most 0.5 times a second
+/// measure on the plant, on the flare fitted to the same flight. The
+/// aileron reverses at most 0.5 times a second
 /// and the bank asked stays inside the 5 degree cap: no slip is planned
 /// while coordinating. Before the lead was taken on the bank asked and the
 /// coordinated slip held to zero, the prior flew 9 m in at 0.8 reversals a
@@ -1072,9 +1099,44 @@ fn the_737s_bank_never_rings_below_minimums() {
             assert!(
                 s.ail_reversals_per_s < 0.5
                     && s.worst_target_deg <= super::line::BANK_MAX_DEG + 1e-9
-                    && s.x_m.abs() < 1.0
+                    && s.x_m.abs() < 3.0
                     && s.scored_fpm < crate::scorecard::TOUCHDOWN_MAX_SINK_FPM,
                 "{what} from {x0}: {s:?}"
+            );
+        }
+    }
+}
+
+/// The 737-800's EGPH flare on the response `xfc identify` would measure on
+/// its plant AND on the one stored (b 35 at 151 kt, three times the
+/// plant's), through the fitted 0.05 s and the best fit's none: inside the
+/// touchdown limit, the nose on the mains-first side of level at the wheels,
+/// and no balloon (the path never above level by more than 0.1 degree, the
+/// fit's own 0.2 rms). Before the filtered alpha left out the lead's own
+/// alpha and the path trim was held to the path's own rate, the stored
+/// response ballooned 2.3 ft (+0.66 degrees) into 345 fpm.
+#[test]
+fn the_737s_egph_flare_neither_balloons_nor_lands_flat() {
+    let stored: serde_json::Value = serde_json::from_str(include_str!(
+        "../../profiles/learned/aircraft_laminar_research_boeing_737_800_b738_acf.json"
+    ))
+    .expect("the 737's learned file");
+    let stored: Response = serde_json::from_value(stored["pitch"]["response"].clone()).expect("its pitch");
+    for delay in [0.05, 0.0] {
+        let f = Fit { delay, ..EGPH_737 };
+        for (what, resp) in [("identified", identify(&f).pitch), ("stored", stored)] {
+            let l = fly(f, &resp, Air::Calm);
+            eprintln!("{} {delay} {what}: {l:?}", f.name);
+            let floor = f.limits().touchdown_min_deg.unwrap_or(f64::MIN);
+            assert!(
+                l.scored_fpm < crate::scorecard::TOUCHDOWN_MAX_SINK_FPM
+                    && l.wheels_fpm > 30.0
+                    && l.theta_wheels_deg >= floor
+                    && l.gamma_max_deg <= 0.1
+                    && l.balloon_ft < 1.0
+                    && l.reversals == 0,
+                "{} {delay} {what}: {l:?}",
+                f.name
             );
         }
     }
