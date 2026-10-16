@@ -83,6 +83,17 @@ pub const ROLL_MAX_XTK_M: f64 = 5.0;
 /// stress); 400 passed landings a pilot would call hard.
 pub const TOUCHDOWN_MAX_SINK_FPM: f64 = 240.0;
 pub const TOUCHDOWN_MAX_DRIFT_DEG: f64 = 5.0;
+/// The wheels later than the flare planned them from its gate
+/// (`att_to_wheels_s`) by more than this fail: a float, the runway and the
+/// speed spent holding off. One flare response time
+/// (`pilot::attitude::RESPONSE_S`): the 737-800 met the runway 12 s past
+/// its plan at LEMG 30 (1792138836, 148 to 113 kt) and 4 s at LEMG 12
+/// (1792149156, 145 to 125 kt); a flare that met its plan landed within
+/// 0.1 s of it (1791979030).
+pub const TOUCHDOWN_MAX_FLOAT_S: f64 = crate::pilot::attitude::RESPONSE_S;
+/// A tick this far over the flare gate has gone around: the gate is met
+/// again.
+const GATE_LEFT_FT: f64 = 50.0;
 /// The first contact is judged, not the one the state record happens to
 /// catch. The 1 Hz `state` sample never saw the wheels on LEMG 13
 /// (1790441293): the 737 met the runway at 17:04:34Z at -794 fpm (the
@@ -321,6 +332,9 @@ struct Landing {
     /// Off the runway again after the first contact: the height reached
     /// and the sink at the contact the state record caught.
     bounce: Option<(f64, f64)>,
+    /// Seconds the wheels came after the flare planned them (see
+    /// [`Contact::float_s`]).
+    float_s: Option<f64>,
 }
 
 /// The first time the wheels met the runway, from the autoland ticks.
@@ -339,6 +353,9 @@ struct Contact {
     /// `bounce` records), and when the current one began.
     air_s: f64,
     off_at: Option<f64>,
+    /// Seconds from the flare gate to this contact beyond the seconds the
+    /// flare planned there (`att_to_wheels_s`): a float.
+    float_s: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -380,6 +397,9 @@ pub struct Scorer {
     /// Recent autoland (t, vvi) for the first contact's sink.
     flare_vvi: Vec<(f64, f64)>,
     contact: Option<Contact>,
+    /// The flare gate's autoland tick: its time and the seconds to the
+    /// wheels the flare planned from it (`att_to_wheels_s`).
+    flare_gate: Option<(f64, f64)>,
     /// The flight model's last `touchdown` (t, sink): the landing's sink
     /// when it belongs to the state record's touchdown (#142).
     flight_td: Option<(f64, f64)>,
@@ -708,6 +728,7 @@ impl Scorer {
         self.set_down_t = None;
         self.air.clear();
         self.contact = None;
+        self.flare_gate = None;
         self.flare_vvi.clear();
         self.flight_td = None;
     }
@@ -907,6 +928,16 @@ impl Scorer {
             Some(g) => g,
             None => radio <= CONTACT_RADIO_FT,
         };
+        // The flare gate: the first tick at or under it, with the seconds
+        // the flare planned to the wheels from there. Far back over it is a
+        // go-around.
+        if let (Some(gate), Some(planned)) = (f(r, "att_gate"), f(r, "att_to_wheels_s")) {
+            if radio > gate + GATE_LEFT_FT {
+                self.flare_gate = None;
+            } else if radio <= gate && !wheels {
+                self.flare_gate.get_or_insert((t, planned));
+            }
+        }
         match self.contact.as_mut() {
             None if wheels => self.open_contact(t, radio, CONTACT_SINK_WINDOW_S),
             Some(c) => c.up_ft = c.up_ft.max(radio - c.radio0),
@@ -932,6 +963,7 @@ impl Scorer {
             up_ft: 0.0,
             air_s: 0.0,
             off_at: None,
+            float_s: self.flare_gate.take().map(|(t0, planned)| t - t0 - planned),
         })
     }
 
@@ -1011,6 +1043,7 @@ impl Scorer {
             t_last: t,
             sortie: self.sortie.clone(),
             bounce,
+            float_s: first.and_then(|c| c.float_s),
         });
         if crashed {
             self.close_landing(out);
@@ -1032,11 +1065,15 @@ impl Scorer {
         if l.max_xtk.is_some_and(|x| x > ROLLOUT_MAX_XTK_M) {
             fails.push(format!("{:.1} m off the centreline rolling out", l.max_xtk.unwrap_or(0.0)));
         }
+        if let Some(s) = l.float_s.filter(|s| *s > TOUCHDOWN_MAX_FLOAT_S) {
+            fails.push(format!("floated {s:.0} s past the flare's plan"));
+        }
         self.push("landing", l.sortie.clone(), fails, json!({
             "sink_fpm": l.sink.round(), "drift_deg": r1(l.drift),
             "rollout_max_xtk_m": l.max_xtk.map(r1), "t_touchdown": l.t_td,
             "bounce_ft": l.bounce.map(|(up, _)| r1(up)),
             "second_contact_sink_fpm": l.bounce.map(|(_, s2)| s2.round()),
+            "float_s": l.float_s.map(r1),
         }), out);
     }
 
@@ -1352,6 +1389,28 @@ mod tests {
             let l = landing(&states);
             println!("state only: {} {}", line(&l), l["sink_fpm"]);
             assert!(l["sink_fpm"].as_f64().unwrap() < TOUCHDOWN_MAX_SINK_FPM, "{l}");
+        }
+    }
+
+    /// The 737-800's two floated flares (#311), trimmed to their landings:
+    /// the state records 45 s either side of the flight model's touchdown,
+    /// the autoland ticks from 40 s before it (the guidance ticks cut to the
+    /// fields the scorer and the flare replay read). LEMG 30 held 5 to 20 ft
+    /// from 36 ft for 23 s on a plan of 10.8 (148 to 113 kt); LEMG 12 for 15
+    /// s on 10.9 (145 to 125 kt). Both passed live at 125 and 126 fpm.
+    const FLOATED_737: [(&str, f64); 2] = [
+        (include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1792138836-approach.trimmed.jsonl")), 11.9),
+        (include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/sorties/1792149156-landing.trimmed.jsonl")), 3.8),
+    ];
+
+    #[test]
+    fn a_floated_flare_fails_the_landing() {
+        for (text, float_s) in FLOATED_737 {
+            let l = score_all(records(text).iter()).into_iter().find(|v| s(v, "stage") == "landing").unwrap();
+            println!("{}", line(&l));
+            assert_eq!(l["pass"], false, "{l}");
+            assert_eq!(l["float_s"], float_s, "{l}");
+            assert!(l["sink_fpm"].as_f64().unwrap() < TOUCHDOWN_MAX_SINK_FPM, "soft, and still a fail: {l}");
         }
     }
 
