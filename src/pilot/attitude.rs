@@ -93,6 +93,11 @@ const ALPHA_TAU_S: f64 = 1.5;
 /// airframes' fitted plants, 2026-10-12), left the path 0.8 to 2 deg under
 /// its command: the windy evening's 202 to 274 fpm.
 const GAMMA_TRIM_PER_S: f64 = 1.0;
+/// ...and only while the nose is within this of its command, degrees (the
+/// bank hold's trim band, `pilot::bank`): on the 737-800's slow path the
+/// trim wound up through the round-out on a nose still catching up and
+/// ballooned the flare (EGBB 15, 1792092651).
+const TRIM_BAND_DEG: f64 = 1.0;
 /// Knots to feet a minute.
 const FPM_PER_KT: f64 = 101.268_591;
 
@@ -269,8 +274,12 @@ impl AttitudeFlare {
         // that shallowed the path wound it down, and its unwinding pushed
         // the SR22 to -7.8 deg and the runway at 441 fpm (LEMG 13,
         // 1791813026), the Evolution's -0.71 deg into its sag (1791815852).
-        self.gamma_trim =
-            (self.gamma_trim + (gamma_cmd - gamma) * GAMMA_TRIM_PER_S * dt).clamp(0.0, 3.0);
+        // It integrates only while the nose holds its command: a path still
+        // following a nose that is still turning is not a path error.
+        if self.last_theta_cmd.is_none_or(|c| (c - i.theta_deg).abs() < TRIM_BAND_DEG) {
+            self.gamma_trim =
+                (self.gamma_trim + (gamma_cmd - gamma) * GAMMA_TRIM_PER_S * dt).clamp(0.0, 3.0);
+        }
         // The path follows the nose over 1 / the measured path answer.
         let path_lag_s = if r.path > 0.1 { (1.0 / r.path).min(2.5) } else { 1.0 };
         // The mains-first floor is for the wheels: it rises toward them a

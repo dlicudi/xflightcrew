@@ -180,6 +180,21 @@ const FITS: [Fit; 7] = [
           yaw: Yaw { b: 11.2, damping: 0.03, stiffness: 1.35, path: 0.24, dihedral: 2.0 } },
 ];
 
+/// The 737-800's own flare, EGBB 15 (1792092651, 2026-10-15): fitted from
+/// the gate (48.7 ft, 154 kt, -3.8 deg, flaps 40) to the wheels on the
+/// recorded column (0.7 deg rms on theta, the flare in ground effect):
+/// effectiveness 12.6 deg/s^2 a unit (w2 ke), the alpha spring 1.9, no
+/// damping of its own (the output-error fit, `pilot::ident`, read 11.8, 2.1
+/// and 0.02 at R2 0.96), the path 0.75 /s, the command answered 0.175 s
+/// after the tick that wrote it. The pilot flew it on the 116 kt
+/// identification scaled to 154 kt (b 36), and the column went stop to stop
+/// through the flare: 439 fpm and a bounce. The speed is the book's, the
+/// lever the one that holds it.
+const EGBB_737: Fit = Fit { name: "737 EGBB", w2: 1.88, cq: 0.0, ke: 6.70, ge: 0.02, kl: 0.0, c: 0.0263, a0: -9.68, kp: 0.0, kg: 0.1,
+    s0: -1.4, s1: 8.07, aoff: -0.69, trim: 0.0, delay: 0.175,
+    h0: 48.7, th0: -3.82, g0: -2.74, v0: 154.3, q0: -0.81, lever: Some([0.05, 0.05, 0.04, 0.02, 0.0, 0.0]),
+    roll: FITS[6].roll, yaw: FITS[6].yaw };
+
 fn shape(h: f64) -> f64 {
     (1.0 - h / 18.0).clamp(0.0, 1.0).powi(2)
 }
@@ -458,6 +473,9 @@ struct Landing {
     wheels_fpm: f64,
     scored_fpm: f64,
     balloon_ft: f64,
+    /// The elevator thrown from one stop to the other (beyond 0.9 either
+    /// way): the bang-bang of a loop ringing on its limits.
+    reversals: usize,
 }
 
 /// A path disturbance: none, or one gust that shallows the path by `deg`
@@ -479,6 +497,7 @@ fn fly(f: Fit, resp: &Response, air: Air) -> Landing {
     let (mut low, mut balloon) = (s.h, 0.0_f64);
     let mut gust_from: Option<f64> = None;
     let mut sinks: Vec<(f64, f64)> = Vec::new();
+    let (mut stop, mut reversals) = (0.0, 0);
     while t < 40.0 {
         if t >= next_tick - 1e-9 {
             let o = law.step(
@@ -486,6 +505,10 @@ fn fly(f: Fit, resp: &Response, air: Air) -> Landing {
                 resp,
                 PitchLimits::default(),
             );
+            if o.elev.abs() > 0.9 {
+                reversals += usize::from(stop == -o.elev.signum());
+                stop = o.elev.signum();
+            }
             d.push(t + f.delay.max(0.02), o.elev + f.trim);
             next_tick += tick;
         }
@@ -506,7 +529,7 @@ fn fly(f: Fit, resp: &Response, air: Air) -> Landing {
         t += dt;
         if s.h <= 0.0 {
             let scored = sinks.iter().filter(|(ts, _)| t - ts <= 2.5).map(|s| s.1).fold(f64::MIN, f64::max);
-            return Landing { wheels_fpm: s.sink_fpm(), scored_fpm: scored, balloon_ft: balloon };
+            return Landing { wheels_fpm: s.sink_fpm(), scored_fpm: scored, balloon_ft: balloon, reversals };
         }
     }
     panic!("{}: no landing in 40 s", f.name);
@@ -530,6 +553,26 @@ fn every_fitted_airframe_lands_soft_in_calm_air() {
         assert!(
             (50.0..=180.0).contains(&l.wheels_fpm) && l.scored_fpm < 200.0 && l.balloon_ft < 1.0,
             "{}: {l:?}",
+            f.name
+        );
+    }
+}
+
+/// The 737-800's EGBB flare, identified as `xfc identify` would fly it,
+/// through its own 0.175 s and a shorter 0.1: inside the touchdown limit
+/// and never stop to stop. Before the feed-forward was taken at the
+/// attitude crossover and the path trim held while the nose catches up,
+/// the 0.175 s plant threw the column stop to stop twice and met the runway
+/// at 820 fpm; the 0.1 s one rang four times.
+#[test]
+fn the_737s_flare_never_rings_on_its_stops() {
+    for delay in [0.175, 0.1] {
+        let f = Fit { delay, ..EGBB_737 };
+        let l = fly(f, &identify(&f).pitch, Air::Calm);
+        eprintln!("{} {delay}: {l:?}", f.name);
+        assert!(
+            l.reversals == 0 && l.scored_fpm < crate::scorecard::TOUCHDOWN_MAX_SINK_FPM && l.wheels_fpm > 30.0,
+            "{} {delay}: {l:?}",
             f.name
         );
     }
