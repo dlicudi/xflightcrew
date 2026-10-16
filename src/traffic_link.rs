@@ -1067,6 +1067,7 @@ impl Link {
 
     /// Aircraft in the fleet that are going somewhere (not
     /// [`TrafficAircraft::dormant`]).
+    #[cfg(test)]
     pub(crate) fn active(&self) -> usize {
         self.fleet
             .aircraft()

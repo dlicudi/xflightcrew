@@ -927,6 +927,7 @@ const APRON_SPOTS_MAX: usize = 12;
 const AT_SPEED_ON_STRIP_M: f64 = 150.0;
 
 /// The length of a polyline, metres.
+#[cfg(test)]
 fn path_m(path: &[LatLon]) -> f64 {
     path.windows(2).map(|w| dist_m(w[0], w[1])).sum()
 }

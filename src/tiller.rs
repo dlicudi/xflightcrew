@@ -67,6 +67,7 @@ pub struct Tiller {
 
 impl Tiller {
     /// Nothing declared: every call is a no-op.
+    #[cfg(test)]
     pub fn none() -> Self {
         Self { profile: None }
     }
