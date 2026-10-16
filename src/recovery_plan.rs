@@ -172,7 +172,12 @@ fn direct_via(
 }
 
 /// The direct fix whose way on to the destination is shortest: the distance
-/// to it, the route from it and the turn to it. Pure.
+/// to it, the route from it and the turn to it. When that is the synthetic
+/// arrival gateway, a point no FMS holds, the first real fix whose way in
+/// is no detour (within [`ARRIVAL_DETOUR_NM`]) instead, so the FMS's DIR TO
+/// and LNAV have it and the arrival is flown: 737 at FL380 toward EGPH,
+/// 2026-10-16, resumed direct "EGPH arrival", 2 nm shorter than INPIP and
+/// its STAR, and flew the descent on the bug. Pure.
 pub fn best_direct(
     legs: &[ProcLeg],
     dest: Option<&Waypoint>,
@@ -180,52 +185,26 @@ pub fn best_direct(
     lon: f64,
     track_true: Option<f64>,
 ) -> Option<Join> {
-    (0..legs.len())
+    let ways: Vec<_> = (0..legs.len())
         .filter_map(|i| {
             direct_via(legs, i, dest, lat, lon, track_true).map(|(c, d, v)| (c, i, d, v))
         })
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, index, dist_nm, via_nm)| Join::Direct {
-            index,
-            dist_nm,
-            via_nm,
-        })
-}
-
-/// A direct join goes to the FMS's active fix instead when the route holds
-/// it and its way in is no detour (within [`ARRIVAL_DETOUR_NM`] of the
-/// join's): the box was flying there, and the FMS's DIR TO and LNAV need a
-/// fix it holds. The shortest way in is often the arrival gateway, a point
-/// no FMS holds: 737 at FL380 toward EGPH, 2026-10-16, resumed direct "EGPH
-/// arrival" with INPIP active and flew the descent on the bug. Any other
-/// join, an unread or foreign ident, is kept. Pure.
-pub fn toward_active_fix(
-    join: Join,
-    legs: &[ProcLeg],
-    dest: Option<&Waypoint>,
-    lat: f64,
-    lon: f64,
-    track_true: Option<f64>,
-    fms_ident: Option<&str>,
-) -> Join {
-    let (Join::Direct { index, .. }, Some(fms)) = (&join, fms_ident) else {
-        return join;
+        .collect();
+    let best = ways.iter().min_by(|a, b| a.0.total_cmp(&b.0))?;
+    let gateway = dest.map(|d| crate::procedure::arrival_gateway_ident(&d.ident));
+    let pick = if gateway.as_deref() == Some(legs[best.1].fix_ident.as_str()) {
+        ways.iter()
+            .find(|w| w.1 != best.1 && w.0 <= best.0 + ARRIVAL_DETOUR_NM)
+            .unwrap_or(best)
+    } else {
+        best
     };
-    let Some((cost, ..)) = direct_via(legs, *index, dest, lat, lon, track_true) else {
-        return join;
-    };
-    (0..legs.len())
-        .filter(|&i| i != *index && crate::lnav::same_ident(fms, &legs[i].fix_ident))
-        .filter_map(|i| {
-            direct_via(legs, i, dest, lat, lon, track_true).map(|(c, d, v)| (c, i, d, v))
-        })
-        .filter(|(c, ..)| *c <= cost + ARRIVAL_DETOUR_NM)
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map_or(join, |(_, index, dist_nm, via_nm)| Join::Direct {
-            index,
-            dist_nm,
-            via_nm,
-        })
+    let &(_, index, dist_nm, via_nm) = pick;
+    Some(Join::Direct {
+        index,
+        dist_nm,
+        via_nm,
+    })
 }
 
 /// Where the way to the destination joins, from anywhere ([`Join`]'s order).

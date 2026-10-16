@@ -261,13 +261,11 @@ fn the_path_is_probed_every_quarter_mile_to_forty() {
 }
 
 /// EGKK-EGPH, 737 at FL380, 2026-10-16 (sortie 1792158539-full_auto): "can
-/// you resume the flight plan?" 13 nm west of the RIBEL-INPIP leg with the
-/// FMS on INPIP. The shortest way in is the synthetic gateway, which no FMS
-/// holds; the box's own INPIP is barely longer, so the join goes there and
-/// the STAR is flown. A fix the route lacks, an unread FMS or a fix far
-/// behind keeps the join.
+/// you resume the flight plan?" 13 nm west of the RIBEL-INPIP leg. The
+/// shortest way in is the synthetic gateway, which no FMS holds; INPIP,
+/// the STAR's first fix, is about 2 nm longer, so the join goes there.
 #[test]
-fn a_direct_join_goes_to_the_fms_active_fix_when_it_is_no_detour() {
+fn a_direct_join_never_ends_on_the_gateway_when_a_real_fix_is_no_detour() {
     let w = vec![
         wp("EGKK", 51.148, -0.190, 202.0),
         wp("NELSA", 53.863333, -2.184797, 31_900.0),
@@ -279,44 +277,25 @@ fn a_direct_join_goes_to_the_fms_active_fix_when_it_is_no_detour() {
         wp("EGPH", 55.950145, -3.372288, 136.0),
     ];
     let mut legs = crate::procedure::enroute_legs(&w, "EGKK", "EGPH", 38_000.0);
-    crate::procedure::extend_to_arrival_gateway(&mut legs, w.last().unwrap(), Some(136.0));
-    let (lat, lon, trk) = (54.40, -2.96, 7.7);
+    assert!(crate::procedure::extend_to_arrival_gateway(
+        &mut legs,
+        w.last().unwrap(),
+        Some(136.0)
+    ));
     let join = choose_join(
         &legs,
         &w,
         "EGPH",
-        lat,
-        lon,
+        54.40,
+        -2.96,
         None,
         None,
-        Some(trk),
+        Some(7.7),
         Purpose::Resume,
     )
     .unwrap();
-    let ident = |j: &Join| legs[j.leg_index().unwrap()].fix_ident.clone();
-    assert_eq!(ident(&join), "EGPH arrival", "{join:?}");
-    let to = |fms: Option<&str>| {
-        toward_active_fix(join.clone(), &legs, w.last(), lat, lon, Some(trk), fms)
+    let Join::Direct { index, .. } = join else {
+        panic!("{join:?}")
     };
-    let j = to(Some("INPIP"));
-    assert!(matches!(j, Join::Direct { .. }), "{j:?}");
-    assert_eq!(ident(&j), "INPIP");
-    assert_eq!(to(Some("D257B")), join, "not in the route");
-    assert_eq!(to(Some("")), join, "an empty FMS");
-    assert_eq!(to(None), join, "unread");
-    assert_eq!(to(Some("RIBEL")), join, "behind: a detour");
-    // Only a direct join is redirected.
-    let abeam = Join::Abeam(3);
-    assert_eq!(
-        toward_active_fix(
-            abeam.clone(),
-            &legs,
-            w.last(),
-            lat,
-            lon,
-            Some(trk),
-            Some("INPIP")
-        ),
-        abeam
-    );
+    assert_eq!(legs[index].fix_ident, "INPIP");
 }
