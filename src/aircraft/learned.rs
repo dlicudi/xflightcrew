@@ -244,6 +244,9 @@ impl Learned {
 pub struct AcfModel {
     pub geometry: GroundGeometry,
     pub engine: Option<EngineClass>,
+    /// The elevator's full travel time, s (`acf/_elev_def_time`; zero: it
+    /// follows the column at once). `None`: not in the file.
+    pub elev_full_travel_s: Option<f64>,
     /// What an identification learned on THIS `.acf`; `Err` says why not.
     pub learned: Result<Learned, Refused>,
 }
@@ -255,6 +258,9 @@ impl AcfModel {
         AcfModel {
             geometry: GroundGeometry::from_acf(acf_text),
             engine: EngineClass::from_acf(acf_text),
+            elev_full_travel_s: acf_value(acf_text, "acf/_elev_def_time")
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0),
             learned: Learned::load_for(acf_rel, acf_text),
         }
     }
@@ -476,6 +482,16 @@ mod tests {
         let tail = g.tail_strike_deg.expect("a tail");
         assert!((9.0..13.0).contains(&tail), "{g:?}");
         assert_eq!(GroundGeometry::from_acf("").tail_strike_deg, None);
+    }
+
+    /// The elevator's travel time is the `.acf`'s own (the stock 737-800
+    /// declares 0.3 s, the 172 none: 0); not in the file, no reading.
+    #[test]
+    fn the_elevator_travel_time_comes_from_the_acf() {
+        let read = |t: &str| AcfModel::read("Aircraft/none.acf", t).elev_full_travel_s;
+        assert_eq!(read("P acf/_elev_def_time 0.300000012\n"), Some(0.300000012));
+        assert_eq!(read("P acf/_elev_def_time 0.000000000\n"), Some(0.0));
+        assert_eq!(read(""), None);
     }
 
     /// The nose reaches ahead of the CG the sim places the aircraft by: the

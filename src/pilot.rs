@@ -72,6 +72,9 @@ impl Airframe {
                 Some(g) => g.level_deg.map(|l| l + MAINS_FIRST_MARGIN_DEG),
                 None => attitude::PitchLimits::default().touchdown_min_deg,
             },
+            elev_full_travel_s: model
+                .and_then(|m| m.elev_full_travel_s)
+                .unwrap_or(attitude::ELEV_FULL_TRAVEL_PRIOR_S),
         };
         Airframe { pitch, roll, yaw, tecs, limits, measured: [p, r, y, measured_energy.is_some()] }
     }

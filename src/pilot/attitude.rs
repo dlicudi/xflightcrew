@@ -44,10 +44,17 @@ pub const HOLDOFF_VS_FPM: f64 = -70.0;
 pub const HOLDOFF_FT: f64 = 2.0;
 /// Never flare lower than this, ft (a very shallow approach).
 const MIN_GATE_FT: f64 = 6.0;
-/// The disturbance observer's time, seconds: the elevator the aircraft
-/// needs to hold its nose (ground effect, the bleeding speed), read from
-/// what it holds and how the nose answers.
-const DOB_TAU_S: f64 = 1.0;
+/// The disturbance observer (the elevator the aircraft needs to hold its
+/// nose: ground effect, the bleeding speed, read from what it holds and how
+/// the nose answers) is this many times slower than the attitude loop's
+/// crossover. Closed through the loop it is an attitude gain of its own,
+/// `(ff + k_rate) / tau` a degree against the loop's designed `angle_w (ff
+/// + k_rate)`: at this separation never more than half of it. A fixed 1 s
+/// was faster than the 737-800's attitude loop (0.88 rad/s through its
+/// 0.175 s), doubled its gain unseen by the design, and the flare rang
+/// stop to stop (EGBB 15, 1792092651); on the light aircraft's 1.1 to 1.7
+/// rad/s the rule asks 1.2 to 1.7 s, near the 1 s they landed on.
+const DOB_SEPARATION: f64 = 2.0;
 /// The elevator, at most either way: all of it. The NOSE is limited
 /// ([`PitchLimits`]), never the column.
 const ELEV_MAX: f64 = 1.0;
@@ -66,14 +73,26 @@ pub struct PitchLimits {
     /// the nosewheel would meet the runway with the mains, plus a margin
     /// (the mains first). `None`: a tailwheel.
     pub touchdown_min_deg: Option<f64>,
+    /// The elevator's full travel, stop to stop, in seconds (the `.acf`'s
+    /// `_elev_def_time`; zero: it follows at once): the column is never
+    /// asked to move faster than the surface can. The 737-800's flare asked
+    /// its 0.3 s surface for steps of up to 0.98 a tick (EGBB 15,
+    /// 1792092651): a surface lagging its column is lag the loop was not
+    /// designed for.
+    pub elev_full_travel_s: f64,
 }
+
+/// The elevator's full travel time when the `.acf` was not read, s: the
+/// slower of the stock fleet's declared surfaces (the 737-800's and the
+/// King Air's), so an unread airframe's column never outruns them.
+pub const ELEV_FULL_TRAVEL_PRIOR_S: f64 = 0.3;
 
 impl Default for PitchLimits {
     /// Unread geometry: no tail strike below 10 degrees on anything flown
     /// here (the 737-800's is 11 on extended struts, its `.acf` says), and
     /// the mains first at a level nose.
     fn default() -> Self {
-        PitchLimits { max_deg: 10.0, touchdown_min_deg: Some(0.0) }
+        PitchLimits { max_deg: 10.0, touchdown_min_deg: Some(0.0), elev_full_travel_s: ELEV_FULL_TRAVEL_PRIOR_S }
     }
 }
 
@@ -171,6 +190,9 @@ pub struct AttitudeFlare {
     gamma_trim: f64,
     integ: f64,
     last_elev: f64,
+    /// What the last command asked beyond what the surface could give
+    /// (its rate, its stops): positive, nose up undelivered.
+    short: f64,
     last_theta_cmd: Option<f64>,
 }
 
@@ -275,10 +297,13 @@ impl AttitudeFlare {
         // the SR22 to -7.8 deg and the runway at 441 fpm (LEMG 13,
         // 1791813026), the Evolution's -0.71 deg into its sag (1791815852).
         // It integrates only while the nose holds its command: a path still
-        // following a nose that is still turning is not a path error.
-        if self.last_theta_cmd.is_none_or(|c| (c - i.theta_deg).abs() < TRIM_BAND_DEG) {
+        // following a nose that is still turning is not a path error. Nor
+        // while the elevator could not give what it was asked the same way:
+        // more trim is more column the surface cannot deliver.
+        let err = gamma_cmd - gamma;
+        if self.last_theta_cmd.is_none_or(|c| (c - i.theta_deg).abs() < TRIM_BAND_DEG) && err * self.short <= 0.0 {
             self.gamma_trim =
-                (self.gamma_trim + (gamma_cmd - gamma) * GAMMA_TRIM_PER_S * dt).clamp(0.0, 3.0);
+                (self.gamma_trim + err * GAMMA_TRIM_PER_S * dt).clamp(0.0, 3.0);
         }
         // The path follows the nose over 1 / the measured path answer.
         let path_lag_s = if r.path > 0.1 { (1.0 / r.path).min(2.5) } else { 1.0 };
@@ -304,18 +329,26 @@ impl AttitudeFlare {
             .map_or(0.0, |p| (theta_cmd - p) / dt)
             .clamp(-THETA_RATE_MAX_DPS, THETA_RATE_MAX_DPS);
         self.last_theta_cmd = Some(theta_cmd);
-        // What holding the nose takes: the elevator held, less what the
+        // What holding the nose takes: the elevator held (as delivered:
+        // `last_elev` is what the surface could give), less what the
         // nose's rate says it is doing beyond holding (at the measured rate
         // a unit holds). Ground effect and the bleeding speed show up here
-        // within a second; a slow trim could not find them in the flare's
-        // three (226 to 287 fpm, LEMG 2026-10-11).
+        // within [`DOB_SEPARATION`] attitude loops (1.2 to 2.3 s on the
+        // fleet); a slow trim could not find them in the flare's three (226
+        // to 287 fpm, LEMG 2026-10-11).
         let need = self.last_elev - i.q_dps * g.ff;
-        self.integ = (self.integ + (need - self.integ) * (dt / DOB_TAU_S).min(1.0)).clamp(-ELEV_MAX, ELEV_MAX);
+        let tau = DOB_SEPARATION / g.angle_w;
+        self.integ = (self.integ + (need - self.integ) * (dt / tau).min(1.0)).clamp(-ELEV_MAX, ELEV_MAX);
         // The rate wanted: the attitude error at the attitude loop's
         // crossover, plus the command's own rate; flown by its feed-forward
         // and the rate loop's gain.
         let q_c = g.angle_w * e_theta + theta_rate;
-        let elev = (self.integ + q_c * g.ff + g.k_rate * (q_c - i.q_dps)).clamp(-ELEV_MAX, ELEV_MAX);
+        // Never faster than the surface moves: a column it cannot follow
+        // is lag the loop was not designed for.
+        let asked = self.integ + q_c * g.ff + g.k_rate * (q_c - i.q_dps);
+        let slew = if limits.elev_full_travel_s > 0.0 { 2.0 / limits.elev_full_travel_s * dt } else { f64::INFINITY };
+        let elev = asked.clamp(self.last_elev - slew, self.last_elev + slew).clamp(-ELEV_MAX, ELEV_MAX);
+        self.short = asked - elev;
         self.last_elev = elev;
         let path_sink = i.path.map_or(entry.vs_fpm, |p| p.vs_fpm);
         Out {

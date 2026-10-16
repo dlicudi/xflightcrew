@@ -58,6 +58,19 @@ fn the_sink_wanted_shrinks_with_the_height_left() {
     assert_eq!(vs_target_fpm(5.0, -50.0, 6.0), HOLDOFF_VS_FPM, "never asks a climb");
 }
 
+/// Asked for all of the elevator at once, the column moves no faster than
+/// the `.acf`'s surface: a 1 s surface, 0.4 a 0.2 s tick.
+#[test]
+fn the_column_never_outruns_the_surface() {
+    let mut law = AttitudeFlare::default();
+    let limits = PitchLimits { elev_full_travel_s: 1.0, ..PitchLimits::default() };
+    let path = Some(Path { vs_fpm: 0.0, above_ft: 0.0 });
+    let i = In { radio_ft: 500.0, theta_deg: -20.0, alpha_deg: 3.0, q_dps: 0.0, ias_kts: 75.0, tas_kts: 75.0, dt: 0.2, path };
+    let first = law.step(i, &super::response::prior_pitch(), limits).elev;
+    let second = law.step(i, &super::response::prior_pitch(), limits).elev;
+    assert!((first - 0.4).abs() < 1e-9 && (second - 0.8).abs() < 1e-9, "{first} {second}");
+}
+
 const G: f64 = 9.806_65;
 const KT: f64 = 0.514_444;
 const FPM_PER_KT: f64 = 101.268_591;
@@ -90,6 +103,10 @@ struct Fit {
     trim: f64,
     /// Transport delay, s.
     delay: f64,
+    /// The elevator's full travel time, s (the `.acf`'s `_elev_def_time`;
+    /// zero: it follows at once): the surface moves at most 2 / this a
+    /// second, stop to stop.
+    elev_def_s: f64,
     /// The recorded gate: height, pitch, path, speed, pitch rate.
     h0: f64,
     th0: f64,
@@ -132,38 +149,38 @@ const TWIN_YAW: Yaw = Yaw { b: 40.0, damping: 1.0, stiffness: 3.0, path: 0.12, d
 const FITS: [Fit; 7] = [
     // Lancair Evolution, LEMG 13 (1791801818, 1791802111, 1791815852).
     Fit { name: "Evolution", w2: 19.71, cq: 3.703, ke: 12.87, ge: 0.0222, kl: -0.1628, c: 0.0755, a0: -10.56, kp: 0.1541, kg: 0.1019,
-          s0: -2.876, s1: 2.934, aoff: -1.48, trim: -0.0455, delay: 0.10,
+          s0: -2.876, s1: 2.934, aoff: -1.48, trim: -0.0455, delay: 0.10, elev_def_s: 0.0,
           h0: 51.8, th0: -5.50, g0: -3.91, v0: 92.7, q0: -0.44, lever: Some([0.293, 0.293, 0.293, 0.068, 0.012, 0.0]),
           // 6 arrests, 54 windows.
           roll: Roll { kp: 14.30, tau: 0.45, delay: 0.10, a0: -0.040 }, yaw: LIGHT_YAW },
     // Cirrus SR22, LEMG 13 (1791812680, 1791813026, 1791814190, 1791814508).
     Fit { name: "SR22", w2: 6.920, cq: 1.455, ke: 11.15, ge: 0.2165, kl: -0.1656, c: 0.0982, a0: -11.31, kp: 0.1917, kg: 0.0304,
-          s0: -3.084, s1: 8.160, aoff: -2.56, trim: 0.0398, delay: 0.02,
+          s0: -3.084, s1: 8.160, aoff: -2.56, trim: 0.0398, delay: 0.02, elev_def_s: 0.0,
           h0: 49.9, th0: -3.77, g0: -2.56, v0: 78.9, q0: 0.04, lever: Some([0.255, 0.255, 0.255, 0.114, 0.0, 0.0]),
           // 13 arrests, 78 windows.
           roll: Roll { kp: 14.19, tau: 0.60, delay: 0.05, a0: -0.038 }, yaw: LIGHT_YAW },
     // King Air C90B, LEMG 13 (1791799361, 1791800024, 1791815553).
     Fit { name: "King Air", w2: 8.404, cq: 1.171, ke: 14.75, ge: -0.0454, kl: -0.2320, c: 0.0513, a0: -9.364, kp: 0.1006, kg: 0.0092,
-          s0: -4.455, s1: 5.417, aoff: -0.13, trim: -0.102, delay: 0.02,
+          s0: -4.455, s1: 5.417, aoff: -0.13, trim: -0.102, delay: 0.02, elev_def_s: 0.3,
           h0: 68.7, th0: -4.12, g0: -4.40, v0: 113.3, q0: 0.26, lever: Some([0.495, 0.495, 0.444, 0.213, 0.092, 0.0]),
           // 4 arrests, 29 windows.
           roll: Roll { kp: 19.24, tau: 0.60, delay: 0.10, a0: -0.061 }, yaw: TWIN_YAW },
     // Baron 58, LEMG 13 (1791802802, 1791803088, 1791816184).
     Fit { name: "Baron", w2: 19.61, cq: 3.304, ke: 12.47, ge: 0.0906, kl: -0.2359, c: 0.0581, a0: -7.760, kp: 0.3633, kg: 0.0992,
-          s0: -3.096, s1: 3.873, aoff: -2.22, trim: 0.0945, delay: 0.02,
+          s0: -3.096, s1: 3.873, aoff: -2.22, trim: 0.0945, delay: 0.02, elev_def_s: 0.0,
           h0: 60.3, th0: -2.85, g0: -3.69, v0: 104.2, q0: 0.12, lever: Some([0.512, 0.512, 0.48, 0.359, 0.275, 0.09]),
           // 6 arrests, 55 windows.
           roll: Roll { kp: 18.18, tau: 0.30, delay: 0.15, a0: -0.004 }, yaw: TWIN_YAW },
     // Cessna 172 G1000, LEMG 13 (1791814879).
     Fit { name: "C172", w2: 10.31, cq: 1.502, ke: 11.34, ge: 0.0255, kl: -0.2245, c: 0.2000, a0: -7.534, kp: -0.0186, kg: -0.0896,
-          s0: -2.935, s1: 4.045, aoff: 0.30, trim: -0.1572, delay: 0.02,
+          s0: -2.935, s1: 4.045, aoff: 0.30, trim: -0.1572, delay: 0.02, elev_def_s: 0.0,
           h0: 49.7, th0: -3.28, g0: -2.84, v0: 67.4, q0: 0.34, lever: Some([0.515, 0.473, 0.359, 0.172, 0.068, 0.003]),
           // 25 arrests, 171 windows.
           roll: Roll { kp: 18.26, tau: 0.45, delay: 0.0, a0: 0.009 }, yaw: LIGHT_YAW },
     // Cirrus SF50, LEMG 13 (1791805150, 1791805443, 1791809604; fitted 2026-10-12
     // as the five above, 0.21 deg rms; the gate and lever are 1791809604's).
     Fit { name: "SF50", w2: 9.074, cq: 2.864, ke: 17.65, ge: 0.0169, kl: 0.0578, c: 0.0708, a0: -10.14, kp: 0.0118, kg: 0.1085,
-          s0: -2.256, s1: 5.837, aoff: 2.83, trim: -0.086, delay: 0.10,
+          s0: -2.256, s1: 5.837, aoff: 2.83, trim: -0.086, delay: 0.10, elev_def_s: 0.0,
           h0: 49.9, th0: -1.62, g0: -2.62, v0: 92.0, q0: 0.17, lever: Some([0.203, 0.203, 0.181, 0.075, 0.0, 0.0]),
           // 3 arrests, 25 windows.
           roll: Roll { kp: 11.83, tau: 0.60, delay: 0.15, a0: -0.002 }, yaw: LIGHT_YAW },
@@ -174,7 +191,7 @@ const FITS: [Fit; 7] = [
     // the lever twice the 3,000 fpm book climb); roll 47 deg/s^2 a unit
     // over 1.87 /s; yaw as fitted, a synthetic dihedral.
     Fit { name: "737", w2: 1.28, cq: 0.58, ke: 13.2, ge: 0.02, kl: 0.0, c: 0.0243, a0: -10.0, kp: 0.0, kg: 0.1,
-          s0: -1.4, s1: 8.07, aoff: 0.0, trim: 0.0, delay: 0.05,
+          s0: -1.4, s1: 8.07, aoff: 0.0, trim: 0.0, delay: 0.05, elev_def_s: 0.3,
           h0: 0.0, th0: 0.0, g0: 0.0, v0: 140.0, q0: 0.0, lever: None,
           roll: Roll { kp: 21.6, tau: 0.62, delay: 0.05, a0: 0.0 },
           yaw: Yaw { b: 11.2, damping: 0.03, stiffness: 1.35, path: 0.24, dihedral: 2.0 } },
@@ -191,7 +208,7 @@ const FITS: [Fit; 7] = [
 /// through the flare: 439 fpm and a bounce. The speed is the book's, the
 /// lever the one that holds it.
 const EGBB_737: Fit = Fit { name: "737 EGBB", w2: 1.88, cq: 0.0, ke: 6.70, ge: 0.02, kl: 0.0, c: 0.0263, a0: -9.68, kp: 0.0, kg: 0.1,
-    s0: -1.4, s1: 8.07, aoff: -0.69, trim: 0.0, delay: 0.175,
+    s0: -1.4, s1: 8.07, aoff: -0.69, trim: 0.0, delay: 0.175, elev_def_s: 0.3,
     h0: 48.7, th0: -3.82, g0: -2.74, v0: 154.3, q0: -0.81, lever: Some([0.05, 0.05, 0.04, 0.02, 0.0, 0.0]),
     roll: FITS[6].roll, yaw: FITS[6].yaw };
 
@@ -200,6 +217,11 @@ fn shape(h: f64) -> f64 {
 }
 
 impl Fit {
+    /// The nose's limits as read from its `.acf`: the elevator's travel time.
+    fn limits(&self) -> PitchLimits {
+        PitchLimits { elev_full_travel_s: self.elev_def_s, ..PitchLimits::default() }
+    }
+
     fn lever_at(&self, h: f64) -> f64 {
         const AT: [f64; 6] = [40.0, 30.0, 20.0, 10.0, 5.0, 0.0];
         let lever = self.lever.unwrap_or([0.0; 6]);
@@ -228,6 +250,8 @@ impl Fit {
 /// The pitch plant's state.
 #[derive(Clone, Copy, Debug)]
 struct Pitch {
+    /// The elevator surface, where it is (the column it has caught up to).
+    el: f64,
     th: f64,
     q: f64,
     gam: f64,
@@ -239,6 +263,9 @@ impl Pitch {
     /// One step of `dt` with the column `e`, the lever and a path
     /// disturbance (deg/s).
     fn step(&mut self, f: &Fit, e: f64, lev: f64, gust: f64, dt: f64) {
+        let slew = if f.elev_def_s > 0.0 { 2.0 / f.elev_def_s * dt } else { f64::INFINITY };
+        self.el += (e - self.el).clamp(-slew, slew);
+        let e = self.el;
         let al = self.th - self.gam;
         let sh = shape(self.h);
         let ae = f.aoff + f.ke * (e - f.ge * sh - f.kl * lev);
@@ -333,7 +360,7 @@ fn identify(f: &Fit) -> Airframe {
     let pitch_runs: Vec<Vec<Sample>> = [1.0, -1.0]
         .into_iter()
         .map(|sign| {
-            let mut s = Pitch { th: al0, q: 0.0, gam: 0.0, v: v0, h: 3000.0 };
+            let mut s = Pitch { el: e0, th: al0, q: 0.0, gam: 0.0, v: v0, h: 3000.0 };
             let mut d = Delay::new(e0);
             let mut out = Vec::new();
             let (mut t, mut next) = (0.0, 0.0);
@@ -390,7 +417,7 @@ fn identify(f: &Fit) -> Airframe {
     let yaw = ident::fit_axis(&yaw_runs, true).expect("yaw identified");
     // ENERGY: the lever stepped 0.1 either way while the attitude law holds
     // the level path on the fleet's prior pitch response.
-    let mut s = Pitch { th: al0, q: 0.0, gam: 0.0, v: v0, h: 3000.0 };
+    let mut s = Pitch { el: e0, th: al0, q: 0.0, gam: 0.0, v: v0, h: 3000.0 };
     let mut law = AttitudeFlare::default();
     let mut d = Delay::new(e0);
     let mut energy = Vec::new();
@@ -411,7 +438,7 @@ fn identify(f: &Fit) -> Airframe {
                     path: Some(Path { vs_fpm: 0.0, above_ft: s.h - 3000.0 }),
                 },
                 &super::response::prior_pitch(),
-                PitchLimits::default(),
+                f.limits(),
             );
             d.push(t + f.delay.max(0.01), o.elev + e0);
             energy.push(EnergySample { t, thr: lev, ias_kts: s.v, accel_kts_s: (s.v - prev_v) / 0.2, vs_fpm: -s.sink_fpm() });
@@ -428,7 +455,7 @@ fn identify(f: &Fit) -> Airframe {
         roll: roll.response,
         yaw: yaw.response,
         tecs: Tecs { fpm_per_unit: e.fpm_per_unit, spool_s: e.spool_s },
-        limits: PitchLimits::default(),
+        limits: f.limits(),
         measured: [true; 4],
     }
 }
@@ -491,7 +518,7 @@ enum Air {
 fn fly(f: Fit, resp: &Response, air: Air) -> Landing {
     let (dt, tick) = (0.01, 0.2);
     let mut law = AttitudeFlare::default();
-    let mut s = Pitch { th: f.th0, q: f.q0, gam: f.g0, v: f.v0, h: f.h0 };
+    let mut s = Pitch { el: f.trim, th: f.th0, q: f.q0, gam: f.g0, v: f.v0, h: f.h0 };
     let mut d = Delay::new(f.trim);
     let (mut t, mut next_tick) = (0.0, 0.0);
     let (mut low, mut balloon) = (s.h, 0.0_f64);
@@ -503,7 +530,7 @@ fn fly(f: Fit, resp: &Response, air: Air) -> Landing {
             let o = law.step(
                 In { radio_ft: s.h, theta_deg: s.th, alpha_deg: s.th - s.gam, q_dps: s.q, ias_kts: s.v, tas_kts: s.v, dt: tick, path: None },
                 resp,
-                PitchLimits::default(),
+                f.limits(),
             );
             if o.elev.abs() > 0.9 {
                 reversals += usize::from(stop == -o.elev.signum());
@@ -558,23 +585,35 @@ fn every_fitted_airframe_lands_soft_in_calm_air() {
     }
 }
 
-/// The 737-800's EGBB flare, identified as `xfc identify` would fly it,
-/// through its own 0.175 s and a shorter 0.1: inside the touchdown limit
-/// and never stop to stop. Before the feed-forward was taken at the
-/// attitude crossover and the path trim held while the nose catches up,
-/// the 0.175 s plant threw the column stop to stop twice and met the runway
-/// at 820 fpm; the 0.1 s one rang four times.
+/// The 737-800's EGBB flare through its own 0.175 s and a shorter 0.1, its
+/// elevator moving at the `.acf`'s 0.3 s stop to stop, flown on the
+/// response `xfc identify` would measure on this plant AND on the one
+/// stored for the 737 (116 kt flaps 15, b 36 at 154 kt against the
+/// plant's 12.7): inside the touchdown limit and never stop to stop.
+/// Before the feed-forward was taken at the attitude crossover and the path
+/// trim held while the nose catches up, the 0.175 s plant threw the column
+/// stop to stop twice and met the runway at 820 fpm; the 0.1 s one rang
+/// four times. With the surface's rate in the plant and the observer's 1 s
+/// (faster than the 737's attitude loop), the identified 0.175 s rang four
+/// times and the stored one twice, into the runway at 678 fpm.
 #[test]
 fn the_737s_flare_never_rings_on_its_stops() {
+    let stored: serde_json::Value = serde_json::from_str(include_str!(
+        "../../profiles/learned/aircraft_laminar_research_boeing_737_800_b738_acf.json"
+    ))
+    .expect("the 737's learned file");
+    let stored: Response = serde_json::from_value(stored["pitch"]["response"].clone()).expect("its pitch");
     for delay in [0.175, 0.1] {
         let f = Fit { delay, ..EGBB_737 };
-        let l = fly(f, &identify(&f).pitch, Air::Calm);
-        eprintln!("{} {delay}: {l:?}", f.name);
-        assert!(
-            l.reversals == 0 && l.scored_fpm < crate::scorecard::TOUCHDOWN_MAX_SINK_FPM && l.wheels_fpm > 30.0,
-            "{} {delay}: {l:?}",
-            f.name
-        );
+        for (what, resp) in [("identified", identify(&f).pitch), ("stored", stored)] {
+            let l = fly(f, &resp, Air::Calm);
+            eprintln!("{} {delay} {what}: {l:?}", f.name);
+            assert!(
+                l.reversals == 0 && l.scored_fpm < crate::scorecard::TOUCHDOWN_MAX_SINK_FPM && l.wheels_fpm > 30.0,
+                "{} {delay} {what}: {l:?}",
+                f.name
+            );
+        }
     }
 }
 
@@ -686,7 +725,7 @@ fn segment(f: Fit, a: &Airframe, c: Case) -> Segment {
     let gp = -3.0_f64;
     let (lev0, al0, e0) = f.trimmed(f.v0, gp);
     let trim = e0 + c.trim_off;
-    let mut s = Pitch { th: gp + al0, q: 0.0, gam: gp, v: f.v0, h: c.h0 };
+    let mut s = Pitch { el: trim, th: gp + al0, q: 0.0, gam: gp, v: f.v0, h: c.h0 };
     let mut path_h = c.h0 - c.above_ft;
     let mut lever = lev0;
     let (mut law, mut energy, mut bank, mut yaw) =

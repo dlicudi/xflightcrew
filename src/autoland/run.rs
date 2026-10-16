@@ -344,6 +344,9 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     "pitch_b": pilot_airframe.pitch.b, "roll_b": pilot_airframe.roll.b,
                     "yaw_b": pilot_airframe.yaw.b, "k_thr2ste": pilot_airframe.tecs.fpm_per_unit,
                     "spool_s": pilot_airframe.tecs.spool_s, "theta_max": pilot_airframe.limits.max_deg,
+                    "elev_def_time": pilot_airframe.limits.elev_full_travel_s,
+                    "elev_def_time_read":
+                        crate::aircraft::learned::acf_model().and_then(|m| m.elev_full_travel_s).is_some(),
                     "theta_min_td": pilot_airframe.limits.touchdown_min_deg}),
             );
             // The centreline's period (NPFG): bounded by the bank loop's own
@@ -517,8 +520,10 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                 extra_names.extend(YOKE_READS.iter().map(|n| n.to_string()));
                 let extra_refs: Vec<&str> = extra_names.iter().map(String::as_str).collect();
                 // ...and on a landing the autopilot flies (`ap_lands`), its
-                // FMA, second channel and speed window, in the same round.
-                let ((st, extra), lands_read) = tokio::join!(
+                // FMA, second channel and speed window, in the same round;
+                // while our column flies, where the elevator SURFACE is (it
+                // follows the column at the `.acf`'s rate, `elev_surf`).
+                let ((st, extra), lands_read, elev_surf) = tokio::join!(
                     async {
                         if ils.is_some() {
                             sim::state::read_with(&xp, sim::state::Want(AUTOLAND_WANT_ILS), &extra_refs).await
@@ -532,7 +537,14 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                             None => None,
                         }
                     },
+                    async {
+                        match arrest_hands {
+                            true => xp.get_float_array(sim::datarefs::ELEVATOR1_DEG).await.ok(),
+                            false => None,
+                        }
+                    },
                 );
+                let elev_surf = elev_surf.and_then(|v| sim::datarefs::elevator_surface_deg(&v));
                 if st.frozen() {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     continue;
@@ -2751,6 +2763,7 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                     "vs_dial": vs_dial, "vvi": vvi, "vs_fm": vs_fm, "vvi_trend": vvi_trend, "arresting": g.arresting,
                     "theta": plant_at(0), "alpha": plant_at(1), "q": plant_at(2),
                     "vy_true": plant_at(3).map(|v| v * 196.850_394), "elev_total": plant_at(4),
+                    "elev_surf": elev_surf,
                     "tas": plant_at(5).map(|v| v * 1.943_844),
                     "ail_total": plant_at(6), "rud_total": plant_at(7), "beta": plant_at(8),
                     "att_gate": att_out.map(|o| o.gate_ft), "att_vs_t": att_out.map(|o| o.vs_target_fpm),
