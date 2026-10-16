@@ -2146,6 +2146,13 @@ const SPUR_SCAN_PTS: usize = 30;
 /// comes back this much nearer the start than the snap took it, metres.
 const SPUR_MARGIN_M: f64 = 5.0;
 
+/// The longest cut a spur trim makes, metres: a JOIN back onto the line the
+/// aircraft is on, never a new leg. A route that runs out and comes back (a
+/// U) passes nearer the start than its first node too: EGPH (2026-10-16)
+/// left Bravo up Alpha 784 m and came back down Echo to 750 m from the
+/// start, and the trim cut 750 m straight across the apron.
+const SPUR_CUT_MAX_M: f64 = 20.0;
+
 /// A route that opens by snapping BACK to a node behind the aircraft and
 /// retracing the line it is already on: cut from the start straight to the
 /// point where the route passes nearest it. UUYY 18 (world sweep,
@@ -2175,7 +2182,7 @@ fn trim_snap_spur(plan: &mut TaxiRoutePlan) {
     else {
         return;
     };
-    if dm + SPUR_MARGIN_M >= first {
+    if dm + SPUR_MARGIN_M >= first || dm > SPUR_CUT_MAX_M {
         return;
     }
     let lead = plan.seg.get(m - 1).cloned().unwrap_or_default();
@@ -2212,5 +2219,11 @@ mod spur_tests {
         let mut plain = TaxiRoutePlan { path: away.clone(), seg: vec![Default::default(); 2], ..Default::default() };
         trim_snap_spur(&mut plain);
         assert_eq!(plain.path, away);
+        // A U: out 784 m, back to 750 m from the start (EGPH Bravo, Alpha,
+        // Echo). Nearer than the first node, and still no spur.
+        let u = vec![start, (60.0 + 784.0 * m, 50.0), (60.0 + 784.0 * m, 50.01), (60.0 + 750.0 * m, 50.01)];
+        let mut plain = TaxiRoutePlan { path: u.clone(), seg: vec![Default::default(); 3], ..Default::default() };
+        trim_snap_spur(&mut plain);
+        assert_eq!(plain.path, u);
     }
 }
