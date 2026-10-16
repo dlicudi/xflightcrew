@@ -118,6 +118,9 @@ const NOSE_BEHIND_LINE_M: f64 = 3.0;
 /// pursuit error was still honest at 8 m to run (-8°) and had begun walking
 /// by 4 m (+1°), so the swap happens before it degrades rather than after.
 const STOP_HEADING_HOLD_M: f64 = 8.0;
+/// Within this of the route's end the steering reference is back at the
+/// sim's point ([`Route::steer_ref`]): the stop zone plus the shortest aim.
+const STEER_REF_END_M: f64 = STOP_HEADING_HOLD_M + 8.0;
 // The drive's route limits (the established stop, the engage limit, the
 // join's room) live with the route geometry in `taxi_guide`, which judges
 // the same joins (pillars audit 2026-10-07, stage A).
