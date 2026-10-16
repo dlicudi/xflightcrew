@@ -40,7 +40,8 @@ pub struct Gains {
     pub angle_w: f64,
     /// Control per deg/s of rate error.
     pub k_rate: f64,
-    /// Control per deg/s of rate wanted, fed forward: 1 / the rate gain.
+    /// Control per deg/s of rate wanted, fed forward: 1 / the rate a unit
+    /// holds at the attitude loop's crossover.
     pub ff: f64,
     /// The loop's whole delay, s: measured, half the tick, the transport.
     pub delay_s: f64,
@@ -55,7 +56,19 @@ pub fn design(r: &Response, tick_s: f64) -> Gains {
     let angle_w = budget / (delay_s + 1.0 / rate_w);
     // |L| = k b / |jw + damping| = 1 at the crossover.
     let k_rate = (rate_w * rate_w + r.damping * r.damping).sqrt() / r.b.max(1e-6);
-    Gains { rate_w, angle_w, k_rate, ff: 1.0 / r.rate_gain().max(1e-6), delay_s }
+    Gains { rate_w, angle_w, k_rate, ff: 1.0 / gain_at(r, angle_w).max(1e-6), delay_s }
+}
+
+/// The rate a unit of control holds at `w` rad/s, deg/s per unit: `|x / u|`
+/// of the response at that frequency (the settled [`Response::rate_gain`]
+/// at zero). The feed-forward is taken at the attitude loop's crossover,
+/// where it works: settled, a soft short period's alpha spring asks two to
+/// 2.5 times the elevator it does there, and the 737-800's nose, flown on
+/// it, rang stop to stop through its flare (EGBB 15, 1792092651). On the
+/// light aircraft's stiff short periods the two barely differ.
+fn gain_at(r: &Response, w: f64) -> f64 {
+    let (re, im) = (r.stiffness + r.damping * r.path - w * w, w * (r.damping + r.path));
+    r.b * (w * w + r.path * r.path).sqrt() / (re * re + im * im).sqrt().max(1e-9)
 }
 
 /// The closed attitude loop's time constant, s: what an outer loop (the
