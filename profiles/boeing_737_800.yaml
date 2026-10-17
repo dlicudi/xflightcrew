@@ -334,6 +334,11 @@ reference:
   enroute_descent_fpm: 2000.0
   approach_kts: 145.0          # POM 135-155, full flap / gear down; Vref40 ~140 mid weight
   vs0_kts: 114.0               # acf: stall, landing configuration
+  # The stalls above are the type's at 64 t, as the Zibo's: the speed
+  # floors (1.2 Vs) and the monitor's bands ride the live weight as
+  # sqrt(W / 64 t). Unweighed, the 137 floor took the weighed 129 at 51.9 t
+  # back up (EGPH 24, 2026-10-17).
+  stall_ref_weight_kg: 64000.0
   cruise_kts: 450.0            # POM long-range cruise, KTAS (max level 490)
   max_gross_lb: 174200.0       # acf MTOW
   empty_weight_lb: 91300.0     # acf empty
