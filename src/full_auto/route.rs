@@ -455,7 +455,12 @@ pub(super) async fn fly_route(
     // listening.
     let mut inbound_owed: Option<i64> = None;
     if let Some(khz) = built.tower_khz {
-        let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+        // Unless Approach already has us: its handoff tunes the tower. Tuned
+        // here under Approach, its speed and its handoff went unheard and our
+        // readback earned the tower's "say again" (EGPH, 2026-10-17).
+        if !(INBOUND_MADE.load(SeqCst) && APPROACH_FIRST.load(SeqCst)) {
+            let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+        }
         // You call it, you get it - for the crew's own retune as much as the
         // pilot's. The enroute region weighs a field by its published
         // services, so a tower-only strip beside a primary never wins the

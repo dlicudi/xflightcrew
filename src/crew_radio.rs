@@ -547,6 +547,15 @@ pub async fn work_position(
     callsign: &Option<String>,
     khz: Option<i64>,
 ) {
+    // A call still queued goes out where it was meant to, never retuned
+    // under: "runway vacated" queued for the tower went to Ground, which
+    // sent us back to the tower (EGPH, 2026-10-17). Bounded, 10 s.
+    for _ in 0..40 {
+        if !crew_radio_pending() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
     let handed = follow_position_handoff(xp, callsign).await;
     if let Some(k) = khz.filter(|k| handed != Some(*k)) {
         let _ = xp.set_float(crate::datarefs::COM1_FREQ_KHZ, k as f64).await;
