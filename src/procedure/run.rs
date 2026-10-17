@@ -262,6 +262,9 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
     let mut faf_said = false;
     let mut faf_flap_out: Option<f64> = None;
     let mut faf_now: Option<FafEnergy> = None;
+    // The speed owed last tick: on the leg to the FAF the final never asks
+    // for more (#325).
+    let mut last_owed_kts: Option<f64> = None;
     // The speedbrake's last change and which changes are said (`descent_drag`,
     // `DragVoice`).
     let mut drag_changed: Option<std::time::Instant> = None;
@@ -790,6 +793,16 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
                 Some(kts) if !on_map_final => kts,
                 _ => planned,
             };
+            // A final asks for descent OR deceleration, never more speed:
+            // on the leg to the FAF, no target above the last one owed.
+            // Approach's 160 voided at the tower handoff put the plan's 210
+            // back under the FAF's 188 cap, and the 737 went to full thrust
+            // 2.7 nm out with the gear down (EGPH ILS 24, 2026-10-17).
+            let on_final = on_map_final || handoff == Some(idx);
+            let planned = match last_owed_kts {
+                Some(owed) if on_final => planned.min(owed),
+                _ => planned,
+            };
             if on_map_final {
                 if !gear_set && crate::autoland::gear_may_extend(ias, crate::aircraft::gear_limit_kts()) {
                     gear_set = crate::tools::gear::set_handle(&xp, false).await.is_ok();
@@ -853,6 +866,7 @@ pub(super) async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>
             let limited = speed_ceiling.map_or(limited, |c| limited.min(c));
             let want = crate::aircraft::floored_target(limited, floor);
             speed_owed = Some(want);
+            last_owed_kts = Some(want);
             // In a descent the governor sits under the speed owed and the
             // pitch holds it (`IdleDescent`); on a MAP's final the speed is
             // the landing's, flown on power.
