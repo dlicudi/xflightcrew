@@ -166,22 +166,48 @@ async fn ap_off(xp: &XPlaneClient) {
 }
 
 /// The lever held near `ias`: a hand on the throttle while the autopilot
-/// holds the height (ident.py's).
-async fn speed_hand(xp: &XPlaneClient, lever: &str, k: &Tick, ias: f64) {
+/// holds the height (ident.py's), damped on the speed's trend (`trend`,
+/// kt/s). Integrating the error alone, the 737 at landing flap swung the
+/// lever idle to full and back with its phugoid, 122 to 157 kt against
+/// 140, and never settled for the power step (2026-10-17, #324).
+async fn speed_hand(xp: &XPlaneClient, lever: &str, k: &Tick, ias: f64, trend: f64) {
     if let Ok(t) = xp.get_float(lever).await {
-        let _ = xp.set_float(lever, (t + 0.004 * (ias - k.ias)).clamp(0.0, 1.0)).await;
+        let w = (t + 0.004 * (ias - k.ias) - SPEED_DAMP * trend).clamp(0.0, 1.0);
+        let _ = xp.set_float(lever, w).await;
+        crate::blackbox::record("identify", serde_json::json!({"event": "speed_hand", "read": t, "wrote": w, "ias": k.ias, "target": ias, "trend": trend}));
     }
 }
+/// Lever a call per kt/s of the speed's trend: a 1 kt/s trend weighs as
+/// five knots of error.
+const SPEED_DAMP: f64 = 0.02;
 
 /// Settle on the autopilot for `secs`, the speed held.
 async fn settle(xp: &XPlaneClient, lever: &str, t0: std::time::Instant, ias: f64, secs: f64) -> anyhow::Result<()> {
+    settle_until(xp, lever, t0, ias, secs, false).await
+}
+
+/// [`settle`] for `secs`, or, `steady`, until the speed has held within 3 kt
+/// of `ias` and 0.3 kt/s for 8 s (at most `secs`): the power step starts
+/// from a trimmed lever, never a stop.
+async fn settle_until(xp: &XPlaneClient, lever: &str, t0: std::time::Instant, ias: f64, secs: f64, steady: bool) -> anyhow::Result<()> {
     let end = t0.elapsed().as_secs_f64() + secs;
+    let (mut prev, mut trend, mut held_since): (Option<Tick>, f64, Option<f64>) = (None, 0.0, None);
     while t0.elapsed().as_secs_f64() < end {
         if crate::xplane::sim_frozen(xp).await {
             anyhow::bail!("the sim is paused or replaying: refused");
         }
         if let Some(k) = read_tick(xp, t0).await {
-            speed_hand(xp, lever, &k, ias).await;
+            if let Some(p) = prev {
+                let dt = (k.t - p.t).max(0.05);
+                trend += ((k.ias - p.ias) / dt - trend) * (dt / 1.0).min(1.0);
+            }
+            speed_hand(xp, lever, &k, ias, trend).await;
+            let held = (k.ias - ias).abs() < 3.0 && trend.abs() < 0.3;
+            held_since = if held { held_since.or(Some(k.t)) } else { None };
+            if steady && held_since.is_some_and(|s| k.t - s >= 8.0) {
+                return Ok(());
+            }
+            prev = Some(k);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -511,6 +537,7 @@ pub async fn main_cmd(args: &[String], base_url: &str) -> anyhow::Result<bool> {
     let energy = if aborted.is_none() {
         // The same bar as the axes: the Evolution's power step stored 8,081
         // fpm a unit on a fit of R2 0.37 (LEMG, 2026-10-13).
+        settle_until(&xp, &lever, t0, ias, 120.0, true).await?;
         let e = ident::fit_energy(&power_step(&xp, &lever, t0).await).filter(|e| {
             let ok = e.r2 >= MIN_R2;
             if !ok {
