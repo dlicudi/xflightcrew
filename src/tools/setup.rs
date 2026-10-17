@@ -1209,18 +1209,14 @@ impl Tool for SetUpApproach {
             Err(line) => return Ok(line),
         };
         // On the path at the approach speed where the runway and the speed
-        // are known; else the sim's own final start. The speed is the one the
-        // autoland will fly, for what the aircraft weighs (`weight_speeds:`):
-        // the 737 at 77.6 t started at the declared 145, far under its Vref,
-        // and sank at 3,700 fpm with the autopilot's pitch pegged (#323).
-        let weighed = crate::aircraft::approach_kts_now(ctx.xplane).await.map(|(kts, _)| kts);
+        // are known; else the sim's own final start.
         let body = self
             .land
             .as_ref()
             .zip(info.runways.iter().find(|r| {
                 r.ident_a.eq_ignore_ascii_case(&rwy) || r.ident_b.eq_ignore_ascii_case(&rwy)
             }))
-            .and_then(|((_, ias), r)| approach_air_init_json(&acf, r, &rwy, info.elev_ft, final_nm, weighed.unwrap_or(*ias)))
+            .and_then(|((_, ias), r)| approach_air_init_json(&acf, r, &rwy, info.elev_ft, final_nm, *ias))
             .unwrap_or_else(|| approach_init_json(&acf, &icao, &rwy, final_nm));
         crate::blackbox::record(
             "setup",
