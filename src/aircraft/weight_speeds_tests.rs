@@ -153,8 +153,9 @@ fn the_zibo_takeoff_speeds_come_off_its_card() {
     assert_eq!(takeoff_speeds_at_weight(&bad, flap, 45_700.0), None);
 }
 
-/// Only the Zibo declares speeds by weight: every other profile flies its
-/// fixed figures and declared stalls, byte-identical.
+/// Only the 737-800s (the Zibo and the stock aircraft, one Boeing card)
+/// declare speeds by weight: every other profile flies its fixed figures
+/// and declared stalls, byte-identical.
 #[test]
 fn no_other_profile_weighs_its_speeds() {
     for entry in std::fs::read_dir("profiles").unwrap() {
@@ -168,6 +169,6 @@ fn no_other_profile_weighs_its_speeds() {
             || p.reference
                 .as_ref()
                 .is_some_and(|r| r.stall_ref_weight_kg.is_some());
-        assert_eq!(declares, id == "zibo_738", "{id}");
+        assert_eq!(declares, id == "zibo_738" || id == "boeing_737_800", "{id}");
     }
 }

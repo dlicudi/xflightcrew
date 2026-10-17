@@ -448,3 +448,19 @@ ils_decouple_agl_ft: 500.0
 # Its own APP button (the press handler fires the stock approach command
 # after its power check and lights the lamp).
 approach_command: laminar/B738/autopilot/app_press
+
+# The approach speed for what the aircraft weighs, as a crew reads it off
+# the card (`aircraft::approach_kts_now`): the same Boeing 737-800 Vref card
+# as the Zibo's (`zibo_738.yaml`), flaps 15/30/40 at the stock handle's
+# 0.625/0.875/1.0 (the same detents). EGPH 24, 2026-10-17: the fixed 145 put
+# the nose at the 8.66 deg tail limit at 77 t, under the 0.24 deg mains-first
+# floor at 54 t, and at 77.6 t the air start sank 3,700 fpm with the
+# autopilot's pitch pegged (#323).
+weight_speeds:
+  vref:
+    weights_t: [40, 45, 50, 55, 60, 65, 70, 75, 80, 85]
+    flaps: [0.625, 0.875, 1.0]          # 15, 30, 40
+    table:
+      - [121, 128, 136, 143, 149, 156, 161, 167, 172, 177]
+      - [115, 122, 129, 136, 142, 148, 153, 158, 163, 168]
+      - [108, 115, 122, 128, 135, 141, 146, 151, 155, 160]
