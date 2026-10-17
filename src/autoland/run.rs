@@ -2528,8 +2528,13 @@ pub(super) fn spawn_autoland(launch: AutolandLaunch) {
                         crate::climb_watch::arm_authority("autoland", v, vs_dial);
                         authority_owed = false;
                     }
+                // The dial is judged only while the autopilot flies it: in
+                // ALT HOLD (the watchdog's own press) the 737 climbed +322
+                // back to its captured level while the dial still said -747,
+                // and the gap read as no pitch authority (EGPH 06,
+                // 1792239798, 2026-10-17). An unread mode keeps the dial.
                 } else if let Some(crate::climb_watch::Authority::NoAuthority(why)) =
-                    crate::climb_watch::feed_authority(vvi, Some(vs_dial))
+                    crate::climb_watch::feed_authority(vvi, ap_modes.map_or(Some(vs_dial), |m| m.vs().then_some(vs_dial)))
                 {
                     let started = crate::tools::recover::take_over(
                         base_url.clone(),

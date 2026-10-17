@@ -617,7 +617,6 @@ impl Modes {
     pub fn heading(self) -> bool {
         self.has(Self::HEADING)
     }
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn vs(self) -> bool {
         self.has(Self::VS)
     }
