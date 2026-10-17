@@ -288,23 +288,6 @@
         assert_eq!(steer_cmd_with(-170.0, STEER_FULL_DEG), -1.0);
     }
 
-    /// Cockpit over centreline (EGPH, 2026-10-16): the route is steered
-    /// from the nose, slid back to the sim's point over the route's last
-    /// metres so the pursuit aim never saturates before the stop zone.
-    #[test]
-    fn the_route_is_steered_by_the_nose_until_the_end() {
-        let r = Route::build(&watch()).expect("route");
-        let (lat, lon) = ll(50.0, 0.0);
-        let ((nlat, nlon), s) = r.steer_ref(lat, lon, 90.0, 50.0, 18.1);
-        assert!((s - 68.1).abs() < 1e-9, "{s}");
-        let (along, off) = r.fix(nlat, nlon).expect("fix");
-        assert!((along - 68.1).abs() < 0.2 && off < 0.2, "{along} {off}");
-        // Near the end the reference slides back onto the sim's point.
-        let end = r.total - STEER_REF_END_M;
-        assert_eq!(r.steer_ref(lat, lon, 0.0, end, 18.1).1, end);
-        assert_eq!(r.steer_ref(lat, lon, 0.0, end - 9.0, 18.1).1, end);
-    }
-
     #[test]
     fn pure_pursuit_steers_back_to_the_centreline() {
         let r = Route::build(&watch()).expect("route");
@@ -3766,4 +3749,3 @@
         assert_eq!(t.dir, 1.0, "right, as the pilot turned");
         assert!(t.lead.iter().all(|&(a, b)| pave(a, b) == Some(true)));
     }
-

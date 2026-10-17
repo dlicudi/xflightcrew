@@ -337,32 +337,6 @@ impl Route {
         crate::angles::signed_diff_deg(taxi_guide::bearing(here, aim), heading_true)
     }
 
-    /// The point the route is STEERED by: the nose, `nose_m` ahead of the
-    /// sim's point along the heading, with its along-route distance. Cockpit
-    /// over centreline, what ICAO and FAA fillets are sized for: steered by
-    /// the CG the 737's nose ran 9 to 14 m outside every EGPH corner
-    /// (2026-10-16), the turn looking late from the seat.
-    ///
-    /// Over the route's last metres the reference slides back to the sim's
-    /// point, so the aim never saturates at the end ([`final_bearing_deg`])
-    /// before the stop zone takes over. Pure.
-    pub fn steer_ref(
-        &self,
-        lat: f64,
-        lon: f64,
-        heading_true: f64,
-        progress: f64,
-        nose_m: f64,
-    ) -> ((f64, f64), f64) {
-        let ahead = nose_m.min((self.total - progress - STEER_REF_END_M).max(0.0));
-        let psi = heading_true.to_radians();
-        let point = (
-            lat + ahead * psi.cos() / 111_320.0,
-            lon + ahead * psi.sin() / (111_320.0 * lat.to_radians().cos()),
-        );
-        (point, progress + ahead)
-    }
-
     /// The yaw rate the ROUTE ITSELF asks for across the aim span, degrees
     /// per second at this groundspeed: the route's direction at the aim point
     /// minus its direction underfoot, over the time the aircraft takes to

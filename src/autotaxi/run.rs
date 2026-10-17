@@ -443,15 +443,6 @@ pub(super) async fn drive(
     // second (the sim's TCAS table is five Web API reads), the hold's
     // state. No picture, no guard.
     let own_size = OwnSize::read(&xp).await;
-    // The nose the route is steered by: the `.acf`'s, never the class guess
-    // (unread, the sim's point as before).
-    let steer_nose_m = crate::aircraft::learned::acf_model()
-        .and_then(|m| m.geometry.nose_m)
-        .unwrap_or(0.0);
-    crate::blackbox::record(
-        "autotaxi",
-        serde_json::json!({"event": "steer_ref", "nose_m": steer_nose_m}),
-    );
     let mut traffic_track = TrafficTrack::default();
     let mut traffic_seen: Vec<Seen> = Vec::new();
     let mut traffic_read_at: Option<std::time::Instant> = None;
@@ -751,19 +742,10 @@ pub(super) async fn drive(
         // and steers the aircraft into a turn toward a waypoint behind it.
         // Holding the last segment's direction is what a pilot does — nose
         // straight down the paint, roll to a halt.
-        // Steered by the NOSE once on the line ([`Route::steer_ref`]); a join
-        // keeps the sim's point, which its capture and projections are judged by.
-        let ((slat, slon), steer_s) = route.steer_ref(
-            lat,
-            lon,
-            psi,
-            progress,
-            if joining { 0.0 } else { steer_nose_m },
-        );
         let err = if remaining <= STOP_HEADING_HOLD_M {
-            route.stop_heading_err_deg(slat, slon, psi, steer_s, look)
+            route.stop_heading_err_deg(lat, lon, psi, progress, look)
         } else {
-            route.heading_err_deg(slat, slon, psi, steer_s, look)
+            route.heading_err_deg(lat, lon, psi, progress, look)
         };
         // The first fix: a join the nose cannot point at is flown as a
         // planned turn onto the route ahead, or refused and said (#190).
@@ -830,7 +812,7 @@ pub(super) async fn drive(
         let route_turn_dps = if remaining <= STOP_HEADING_HOLD_M {
             0.0
         } else {
-            route.route_turn_rate_dps(steer_s, look, gs_kts)
+            route.route_turn_rate_dps(progress, look, gs_kts)
         };
         let allow = *join_allow.get_or_insert_with(|| {
             let a = join_allowance_m(lateral, err);
