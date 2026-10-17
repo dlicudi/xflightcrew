@@ -709,23 +709,23 @@ pub(super) const REPOSITION_RELEASE_XTK_NM: f64 = 0.5;
 /// ~50 ft AGL 5 nm out over rising ground, no climb authority anywhere in the loop.
 pub(super) const TERRAIN_FLOOR_AGL_FT: f64 = 500.0;
 
-/// Fast by more than this on final and the speed law may still idle a jet.
-pub(super) const APPROACH_FAST_KTS: f64 = 10.0;
 /// The flap ratio that is the landing configuration (the schedule's full).
 pub(crate) const LANDING_FLAP_RATIO: f64 = 0.999;
 /// The lever's idle stop in the speed law.
 pub(super) const IDLE_THROTTLE: f64 = 0.1;
 
-/// The least the speed law may pull the lever to. On FINAL, not more than
-/// `APPROACH_FAST_KTS` fast, it is the airframe's approach thrust floor
-/// (jets fly the approach on thrust: the 737 idled its last mile and touched
-/// down 17 kt under Vref, LFLL 2026-09-17) - but only in the LANDING
-/// configuration (`landing_flaps`), the one the floor was measured in (0.4
-/// at Vref with flaps 40). With flaps 10 the same 0.3 is more than the
-/// path needs: from the FAP to 3 nm every LEMG 13 final of 2026-09-26 sat
-/// at 161 to 164 kt, the lever flipping 0.1 / 0.3 on the ten-knot edge of
-/// the flaps-10 floor (152), so the landing flaps came out late and the
-/// final was still 155 to 158 kt through 800 ft. In a REPOSITION below the
+/// The least the speed law may pull the lever to. On FINAL, at or below the
+/// target, it is the airframe's approach thrust floor (jets fly the approach
+/// on thrust: the 737 idled its last mile and touched down 17 kt under
+/// Vref, LFLL 2026-09-17) - but only in the LANDING configuration
+/// (`landing_flaps`), the one the floor was measured in (0.4 at Vref with
+/// flaps 40). With flaps 10 the same 0.3 is more than the path needs: from
+/// the FAP to 3 nm every LEMG 13 final of 2026-09-26 sat at 161 to 164 kt.
+/// FAST by any amount the lever is TECS's down to idle (`pilot::energy`):
+/// light, 0.3 is the path's own power at the final's speed, and a floor
+/// standing up to ten knots fast held the 737 at 137 to 139 kt against 129
+/// from 1,000 ft to the flare and floated it (EGPH 06, 2026-10-17, sortie
+/// 1792238650-approach, 51.9 t; #238 the Zibo's LEMG 30). In a REPOSITION below the
 /// terrain floor it is full power: excess speed there is spent on the
 /// climb, never on the lever ("land the aircraft" from 140 ft at 237 kt
 /// pulled the throttle to idle for its 179 kt target and the aircraft
@@ -740,7 +740,7 @@ pub fn approach_power_floor(
 ) -> f64 {
     match phase {
         ApproachPhase::Intercept if radio_alt_ft < TERRAIN_FLOOR_AGL_FT => 1.0,
-        ApproachPhase::Final if err_kts > -APPROACH_FAST_KTS && landing_flaps => {
+        ApproachPhase::Final if err_kts >= 0.0 && landing_flaps => {
             approach_thrust_min
                 .unwrap_or(IDLE_THROTTLE)
                 .max(IDLE_THROTTLE)
