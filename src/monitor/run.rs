@@ -1256,7 +1256,7 @@ pub async fn run(
             crate::blackbox::record(
                 "state",
                 serde_json::json!({
-                    "lat": lat, "lon": lon, "hdg": r1(snap.heading_deg), "alt": r1(alt),
+                    "lat": lat, "lon": lon, "hdg": r1(snap.heading_deg), "alt": r1(alt), "alt_true": snap.alt_true_ft.map(r1),
                     "pos": snap.pos_source.map(|s| s.as_str()),
                     "bank": r1(snap.bank_deg), "track": snap.track_deg.map(r1),
                     "ias": r1(snap.ias_kts), "gs": r1(snap.groundspeed_kts),

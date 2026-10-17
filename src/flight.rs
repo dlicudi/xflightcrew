@@ -299,6 +299,11 @@ pub struct Sample {
     pub vsi_fpm: f64,
     pub agl_ft: f64,
     pub alt_ft: f64,
+    /// Where the aircraft IS, feet above sea level (`position/elevation`):
+    /// the height's trend is judged on it, never on the altimeter, whose
+    /// setting change at the transition is no movement (`None`: an older
+    /// record, the altimeter stands in).
+    pub alt_true_ft: Option<f64>,
     pub engine_running: bool,
     pub fuel_kg: Option<f64>,
     pub lat: Option<f64>,
@@ -347,6 +352,7 @@ impl Sample {
             vsi_fpm: f("vs").or(f("vsi")).unwrap_or(0.0),
             agl_ft: f("agl").unwrap_or(0.0),
             alt_ft: f("alt").unwrap_or(0.0),
+            alt_true_ft: f("alt_true"),
             engine_running: v.get("eng").and_then(|x| x.as_bool()).unwrap_or(true),
             fuel_kg: f("fuel_kg"),
             lat: f("lat"),
@@ -1130,11 +1136,14 @@ impl Flight {
     }
 
     /// Whether the height lost over the last [`DESCENT_SECS`] is a descent
-    /// past the band: the trend of the altitude, not the needle's run.
-    /// Keeps one sample at or before the window's start as its anchor.
+    /// past the band: the trend of the TRUE altitude, not the needle's run.
+    /// On the altimeter the 737's reset to 29.92 climbing through 6,000 ft
+    /// (EGKK, 1792223120) read 500 ft lost while it climbed at 600 fpm: the
+    /// phase went to Descent and the descent checklist ran four minutes after
+    /// takeoff. Keeps one sample at or before the window's start as its anchor.
     fn losing_height(&mut self, s: &Sample) -> bool {
         let t = s.t;
-        self.alt_track.push_back((t, s.alt_ft));
+        self.alt_track.push_back((t, s.alt_true_ft.unwrap_or(s.alt_ft)));
         while self
             .alt_track
             .get(1)
@@ -1149,7 +1158,7 @@ impl Flight {
         if !(DESCENT_SECS..=TREND_MAX_SECS).contains(&span) {
             return false;
         }
-        (s.alt_ft - a0) / span * 60.0 < -VS_BAND_FPM
+        (s.alt_true_ft.unwrap_or(s.alt_ft) - a0) / span * 60.0 < -VS_BAND_FPM
     }
 
     /// A level-off well below the flight's highest level, in a descent, is a
@@ -1852,6 +1861,21 @@ mod tests {
             engine_running: true,
             ..Sample::default()
         }
+    }
+
+    /// The 737 climbing through 6,000 ft at 600 fpm while the crew reset the
+    /// altimeter to 29.92 (EGKK, 1792223120, 2026-10-17): the needle dropped
+    /// 500 ft, the true altitude kept climbing. Still a climb, never a
+    /// descent (it ran the descent checklist four minutes after takeoff).
+    #[test]
+    fn an_altimeter_reset_in_the_climb_is_no_descent() {
+        let climb = |t: f64, reset: bool| {
+            let alt_true = 5000.0 + 10.0 * t;
+            Sample { alt_true_ft: Some(alt_true), alt_ft: alt_true - if reset { 500.0 } else { 0.0 }, ..air(t, alt_true - 100.0, 600.0, 250.0) }
+        };
+        let samples = (0..60).map(|t| climb(t as f64, false)).chain((60..120).map(|t| climb(t as f64, true)));
+        let (seen, ..) = phases(std::iter::once(air(-1.0, 4000.0, 600.0, 250.0)).chain(samples));
+        assert!(seen.contains(&Phase::Climb) && !seen.contains(&Phase::Descent), "{seen:?}");
     }
 
     /// Feed a script of samples at 1 Hz; the phases visited, in order.

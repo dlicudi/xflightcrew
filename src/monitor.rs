@@ -753,6 +753,7 @@ fn flight_sample(s: &Snapshot, t: f64, crashed: bool) -> crate::flight::Sample {
         vsi_fpm: s.vs_fpm.unwrap_or(s.vsi_fpm),
         agl_ft: s.agl_ft,
         alt_ft: s.alt_ft,
+        alt_true_ft: s.alt_true_ft,
         engine_running: s.engine_running,
         fuel_kg: s.fuel_kg,
         lat: Some(s.lat),
