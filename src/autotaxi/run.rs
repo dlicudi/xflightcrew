@@ -378,10 +378,13 @@ pub(super) async fn drive(
     };
     let mut crossing_lit = false;
     tracing::info!("auto taxi started");
+    // The point the drive steers and stops by: the `.acf`'s nose, never a
+    // class guess (unmeasured, the sim's point as before; `Route::nose_fix`).
+    let steer_nose_m = acf_nose_m().unwrap_or(0.0);
     crate::blackbox::record(
         "autotaxi",
         serde_json::json!({"event": "engaged", "total_m": route.total, "base_kts": base_kts,
-                           "stop_short_m": route.stop_short_m}),
+                           "stop_short_m": route.stop_short_m, "nose_m": steer_nose_m}),
     );
     // The pilot's pace: adopted from a spoken "taxi at N" mid-drive.
     let mut base = base_kts;
@@ -443,6 +446,12 @@ pub(super) async fn drive(
     // second (the sim's TCAS table is five Web API reads), the hold's
     // state. No picture, no guard.
     let own_size = OwnSize::read(&xp).await;
+    // Measured from the nose fix: only an unmeasured nose (the class's
+    // guess) still lies ahead of it.
+    let guard_size = OwnSize {
+        nose_m: own_size.nose_m - steer_nose_m,
+        ..own_size
+    };
     let mut traffic_track = TrafficTrack::default();
     let mut traffic_seen: Vec<Seen> = Vec::new();
     let mut traffic_read_at: Option<std::time::Instant> = None;
@@ -660,7 +669,17 @@ pub(super) async fn drive(
         };
         let lateral = offset.abs();
         last_lateral = Some(lateral);
-        let remaining = route.remaining(progress);
+        // The nose's own fix (`Route::nose_fix`): every stop is judged by it,
+        // and once joined every steer; the join keeps the sim's point its
+        // capture and projections are judged by.
+        let ((nlat, nlon), nose_s, nose_off) =
+            route.nose_fix(((lat, lon), progress, offset), psi, steer_nose_m, joining);
+        let (slat, slon, steer_s, steer_off) = if joining {
+            (lat, lon, progress, offset)
+        } else {
+            (nlat, nlon, nose_s, nose_off)
+        };
+        let remaining = route.remaining(nose_s);
         progress_note(progress);
         published.publish(route.path_ahead(progress));
         if ext_stopped {
@@ -680,7 +699,7 @@ pub(super) async fn drive(
                 target_tail_m(crate::world::traffic_type(cs).as_deref())
             });
         }
-        let traffic_ahead = route.traffic_ahead(progress, gs_ms, &own_size, &traffic_seen);
+        let traffic_ahead = route.traffic_ahead(nose_s, gs_ms, &guard_size, &traffic_seen);
         let (traffic_cap, traffic_ev) = traffic_hold.step(traffic_ahead.as_ref(), clock_s());
         if let Some(ev) = &traffic_ev {
             let rec = match ev {
@@ -716,7 +735,7 @@ pub(super) async fn drive(
             (remaining.max(0.0) / 10.0).round() as i64 * 10
         ));
         if let Some(l) = crossing_light.as_ref() {
-            let want = on_runway_span(&route.runway_spans, progress);
+            let want = on_runway_span(&route.runway_spans, nose_s);
             if want != crossing_lit {
                 crossing_lit = want;
                 let ok = crate::tools::lights::apply(&xp, l, want).await.is_ok();
@@ -732,7 +751,7 @@ pub(super) async fn drive(
         let look = steer_look_m(
             &route.pace,
             gs_kts,
-            route.route_turn_rate_dps(progress, BEND_PROBE_M, gs_kts),
+            route.route_turn_rate_dps(steer_s, BEND_PROBE_M, gs_kts),
             remaining,
             free_nose,
         );
@@ -742,10 +761,20 @@ pub(super) async fn drive(
         // and steers the aircraft into a turn toward a waypoint behind it.
         // Holding the last segment's direction is what a pilot does — nose
         // straight down the paint, roll to a halt.
-        let err = if remaining <= STOP_HEADING_HOLD_M {
-            route.stop_heading_err_deg(lat, lon, psi, progress, look)
+        let err_at = |la: f64, lo: f64, s: f64| {
+            if remaining <= STOP_HEADING_HOLD_M {
+                route.stop_heading_err_deg(la, lo, psi, s, look)
+            } else {
+                route.heading_err_deg(la, lo, psi, s, look)
+            }
+        };
+        let err = err_at(slat, slon, steer_s);
+        // The nose's error too, while joining: the capture waits for both, so
+        // the steer does not step when it moves to the nose.
+        let nose_err = if joining {
+            err_at(nlat, nlon, nose_s)
         } else {
-            route.heading_err_deg(lat, lon, psi, progress, look)
+            err
         };
         // The first fix: a join the nose cannot point at is flown as a
         // planned turn onto the route ahead, or refused and said (#190).
@@ -812,7 +841,7 @@ pub(super) async fn drive(
         let route_turn_dps = if remaining <= STOP_HEADING_HOLD_M {
             0.0
         } else {
-            route.route_turn_rate_dps(progress, look, gs_kts)
+            route.route_turn_rate_dps(steer_s, look, gs_kts)
         };
         let allow = *join_allow.get_or_insert_with(|| {
             let a = join_allowance_m(lateral, err);
@@ -825,7 +854,18 @@ pub(super) async fn drive(
             }
             a
         });
-        if allow > 0.0 && join_capture.step(lateral, err, t_join.elapsed().as_secs_f64()) {
+        let worst_err = if nose_err.abs() > err.abs() {
+            nose_err
+        } else {
+            err
+        };
+        if allow > 0.0
+            && join_capture.step(
+                lateral.max(nose_off.abs()),
+                worst_err,
+                t_join.elapsed().as_secs_f64(),
+            )
+        {
             tracing::info!(lateral, "auto taxi: joined the route");
             crate::blackbox::record("autotaxi", serde_json::json!({"event": "joined"}));
             join_allow = Some(0.0);
@@ -857,16 +897,17 @@ pub(super) async fn drive(
         // captured, and declared the holding point 27.4 m off the line; full
         // auto then found the runway 34 degrees off. Hold it where it is and
         // hand the steering back, with the number.
-        if remaining <= 1.0 && gs_kts < 1.5 && !arrived_on_line(lateral) {
-            tracing::warn!(lateral, "auto taxi: route end reached off the line");
+        if remaining <= 1.0 && gs_kts < 1.5 && !arrived_on_line(nose_off) {
+            let off_m = nose_off.abs();
+            tracing::warn!(off_m, "auto taxi: route end reached off the line");
             crate::blackbox::record(
                 "autotaxi",
-                serde_json::json!({"event": "stopped_off_line", "lateral_m": lateral,
+                serde_json::json!({"event": "stopped_off_line", "lateral_m": off_m,
                                    "joining": join_allow.is_none_or(|a| a > 0.0)}),
             );
             speedhold::set_taxi_target(0.0);
             let _ = xp.set_float(TAXI_STEER, 0.0).await;
-            alert(&voice, Priority::Caution, &off_line_stop_line(lateral));
+            alert(&voice, Priority::Caution, off_line_stop_line(off_m));
             gen.lower_flag();
             break;
         }
@@ -1018,7 +1059,7 @@ pub(super) async fn drive(
                 // The stop zone: the route's final bearing, as every nose.
                 (err, 0.0)
             } else {
-                crate::ground_steer::path_demand(&ref_path, progress, route.local_m(lat, lon), psi, v, &ground, max_yaw_dps)
+                crate::ground_steer::path_demand(&ref_path, steer_s, route.local_m(slat, slon), psi, v, &ground, max_yaw_dps)
             };
             let e = committed_err(e, &mut ref_dir);
             let s = ground.step(crate::ground_steer::Demand {
@@ -1045,7 +1086,7 @@ pub(super) async fn drive(
             (s.rudder, bl, br, 0.0)
         } else {
             let trim = straight_trim.step(
-                offset,
+                steer_off,
                 route_turn_dps,
                 gs_kts,
                 join_allow.unwrap_or(0.0) > 0.0,
@@ -1097,7 +1138,8 @@ pub(super) async fn drive(
             (steer, bl, br, trim)
         };
         let mut drive_rec = serde_json::json!({
-            // `lat_m` is SIGNED: right of the route is positive. It was
+            // `lat_m` is the STEERED point's (the nose once joined, what the
+            // scorecard judges), SIGNED: right of the route is positive. It was
             // a distance until 2026-08-05, which made every taxi trail in
             // the log unreadable against the paint: "two metres off" says
             // nothing about which side, and the side is the whole
@@ -1108,7 +1150,7 @@ pub(super) async fn drive(
             // from a swing in the trace.
             "event": "drive", "gs": gs_kts, "err": err, "yaw_dps": yaw_rate,
             "turn_dps": route_turn_dps, "look_m": look,
-            "steer": steer, "lat_m": offset, "remaining_m": remaining, "trim": trim,
+            "steer": steer, "lat_m": steer_off, "remaining_m": remaining, "trim": trim,
             "bs": bs_on, "bl": bl, "br": br, "tug": tug_on,
             // "plugin": one frame's position; "split": separate reads (#157).
             "pos": sim::position::source_word(&pos),
@@ -1178,14 +1220,14 @@ pub(super) async fn drive(
             _ => {}
         }
         if !ext_stopped {
-            let mut sched = schedule_kts(base, &route, progress, gs_kts);
+            let mut sched = schedule_kts(base, &route, nose_s, gs_kts);
             if join_allow.unwrap_or(0.0) > 0.0 {
                 sched = sched.min(route.pace.join_cap_kts(err));
             }
             // Applied every tick, joined or not: the route's bends know nothing
             // about where the aircraft actually is, and the join cap lets go
             // too early to cover it.
-            sched = sched.min(route.pace.track_cap_kts(lateral, err));
+            sched = sched.min(route.pace.track_cap_kts(steer_off.abs(), err));
             // The traffic ahead, through the same one writer: held on
             // TRAFFIC_HOLD_KTS, idle and brakes like every other wait.
             if let Some(c) = traffic_cap {
