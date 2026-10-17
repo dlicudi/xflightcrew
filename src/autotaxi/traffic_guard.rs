@@ -77,6 +77,15 @@ pub const TRAFFIC_READ_S: f64 = 1.0;
 /// progress.
 pub const TRAFFIC_EXCUSES_BELOW_KTS: f64 = 2.0;
 
+/// Our nose ahead of the sim's point as the `.acf` measures it
+/// (`GroundGeometry::nose_m`), never a class guess: the point the drive
+/// steers and stops by ([`Route::nose_fix`]).
+pub fn acf_nose_m() -> Option<f64> {
+    crate::aircraft::learned::acf_model()
+        .and_then(|m| m.geometry.nose_m)
+        .filter(|n| *n > 0.0)
+}
+
 /// Our own size for the guard: the span from the maximum takeoff mass (the
 /// drive reads it already for its join turns), the nose MEASURED from the
 /// `.acf` where it was read ([`OwnSize::with_nose`]).
@@ -120,7 +129,7 @@ impl OwnSize {
     /// the nose from the `.acf` ([`OwnSize::with_nose`]).
     pub async fn read(xp: &dyn crate::xplane::XPlane) -> OwnSize {
         OwnSize::from_mtow(xp.get_float(crate::datarefs::ACF_M_MAX_KG).await.ok())
-            .with_nose(crate::aircraft::learned::acf_model().and_then(|m| m.geometry.nose_m))
+            .with_nose(acf_nose_m())
     }
 
     /// Half the corridor about the route a target's centre must be outside.

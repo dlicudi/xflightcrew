@@ -39,9 +39,9 @@ pub struct Route {
     /// TOWARD the centreline ([`turn_round_hint`]). `None` leaves the
     /// first sign of the error to decide ([`committed_err`]).
     pub turn_hint: Option<f64>,
-    /// How far short of the route's end the drive stops its reference point:
-    /// [`STOP_SHORT_M`], or the nose's length back from a hold line
-    /// ([`Route::hold_nose_behind_end`]).
+    /// How far short of the route's end the drive stops its nose
+    /// ([`Route::nose_fix`]): [`STOP_SHORT_M`], or a hold line's or a
+    /// stand's own mark ([`Route::stop_nose_behind_end`]).
     pub(super) stop_short_m: f64,
 }
 
@@ -420,12 +420,43 @@ impl Route {
         self.total - self.stop_short_m - progress
     }
 
-    /// This route ends at a hold line: stop with the NOSE behind it, `nose_m`
-    /// ahead of the reference point the route is flown by, never less than
-    /// [`STOP_SHORT_M`]. The reference point on the line put an A330's nose
-    /// 29.6 m past it, a 737's 18.1 m (EGKK, 2026-10-15).
-    pub fn hold_nose_behind_end(&mut self, nose_m: f64) {
-        self.stop_short_m = STOP_SHORT_M.max(nose_m + NOSE_BEHIND_LINE_M);
+    /// Stop the measured nose `behind_m` short of the route's end: a hold
+    /// line's [`NOSE_BEHIND_LINE_M`], a stand's mark none (a stop bar is the
+    /// nose wheel's). Stopped by the sim's point (the CG) a 737 parked its
+    /// nose ~18 m past the EGPH stand mark and an A330's went 29.6 m past
+    /// EGKK's hold Mike (#320). No nose measured, the drive's nose IS the
+    /// sim's point and [`STOP_SHORT_M`] stands.
+    pub fn stop_nose_behind_end(&mut self, nose_m: f64, behind_m: f64) {
+        if nose_m > 0.0 {
+            self.stop_short_m = behind_m;
+        }
+    }
+
+    /// The nose's own fix: `nose_m` ahead of the sim's point `sim` (lat/lon,
+    /// along m, signed off m) along the heading, projected ONTO the route the
+    /// way the drive projects the sim's point (facing while `joining`). Never
+    /// the sim's along plus `nose_m`: in a bend the two differ, and steered
+    /// from the one and stopped by the other the 737's steering inverted in
+    /// an EGKK corner (0286548, #320). No nose, the sim's own fix. Pure.
+    pub fn nose_fix(
+        &self,
+        sim: ((f64, f64), f64, f64),
+        heading_true: f64,
+        nose_m: f64,
+        joining: bool,
+    ) -> ((f64, f64), f64, f64) {
+        if nose_m <= 0.0 {
+            return sim;
+        }
+        let ((lat, lon), psi) = (sim.0, heading_true.to_radians());
+        let nose =
+            taxi_guide::Geo::new(lat).to_ll((lat, lon), (nose_m * psi.sin(), nose_m * psi.cos()));
+        let fix = if joining {
+            self.fix_signed_facing(nose.0, nose.1, heading_true)
+        } else {
+            self.fix_signed(nose.0, nose.1)
+        };
+        fix.map_or(sim, |(s, off)| (nose, s, off))
     }
 
     /// The bend-imposed speed cap near `progress`, if a corner is close

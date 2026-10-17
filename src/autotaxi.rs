@@ -111,8 +111,8 @@ const M_PER_NM: f64 = 1852.0;
 /// runway centreline, and the aircraft still stopped past the hold line
 /// (2026-07-20): the standoff belongs to the planner, not this margin.
 const STOP_SHORT_M: f64 = 5.0;
-/// How far behind a hold line the nose stops ([`Route::hold_nose_behind_end`]).
-const NOSE_BEHIND_LINE_M: f64 = 3.0;
+/// How far behind a hold line the nose stops ([`Route::stop_nose_behind_end`]).
+pub const NOSE_BEHIND_LINE_M: f64 = 3.0;
 /// Inside this many meters of the stop, steer to the route's FINAL BEARING
 /// rather than to a pursuit aim point. Chosen from the live trace: the
 /// pursuit error was still honest at 8 m to run (-8°) and had begun walking

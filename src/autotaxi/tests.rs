@@ -344,21 +344,105 @@
         assert_eq!(schedule_kts(10.0, &r, r.total - STOP_SHORT_M, 3.0), 0.0);
     }
 
-    /// EGKK holding point Mike (2026-10-15): the drive stopped the reference
-    /// point on the hold, the A330's nose 29.6 m past it. A hold is reached
-    /// with the nose behind the line; a short nose keeps the old margin.
-    #[test]
-    fn a_hold_is_reached_with_the_nose_behind_the_line() {
-        let mut r = Route::build(&watch()).expect("route");
-        r.hold_nose_behind_end(29.6);
-        let stop = r.total - 29.6 - NOSE_BEHIND_LINE_M;
-        assert!(r.remaining(stop).abs() < 1e-9);
-        assert_eq!(schedule_kts(10.0, &r, stop, 3.0), 0.0, "stopped there");
-        assert!(schedule_kts(10.0, &r, stop - 20.0, 8.0) > 2.0, "still rolling 20 m before");
+    /// North 100 m, then a tight 90 degree right turn east for `east_m`.
+    fn corner(east_m: f64) -> Route {
+        Route::build(&TaxiWatch {
+            path: vec![ll(0.0, 0.0), ll(0.0, 100.0), ll(east_m, 100.0)],
+            via: String::new(),
+            seg: Vec::new(),
+            holding_point: "A1".into(),
+            lead_on: Vec::new(),
+        })
+        .expect("route")
+    }
 
-        let mut ga = Route::build(&watch()).expect("route");
-        ga.hold_nose_behind_end(1.5);
-        assert_eq!(ga.remaining(0.0), ga.total - STOP_SHORT_M);
+    /// The sim's fix for a pose in metres, as the established drive takes it.
+    fn sim_fix(r: &Route, x: f64, y: f64) -> ((f64, f64), f64, f64) {
+        let (lat, lon) = ll(x, y);
+        let (s, off) = r.fix_signed(lat, lon).expect("fix");
+        ((lat, lon), s, off)
+    }
+
+    /// #320, the EGKK corner 0286548 inverted: the 737's CG 2 m right of
+    /// the north leg 8 m before the corner, turned to 060, its nose 18 m
+    /// ahead already over the east leg. Steered from the nose with the
+    /// along of the CG plus 18 m, the aim lies BEHIND the nose and the error
+    /// wraps to a hard left; the nose's own fix turns it right, onto the line.
+    #[test]
+    fn the_nose_is_steered_from_its_own_fix_never_the_cg_along_plus_its_length() {
+        let r = corner(100.0);
+        let (psi, nose_m, look) = (60.0, 18.0, 4.0);
+        let sim = sim_fix(&r, 2.0, 92.0);
+        let ((nlat, nlon), nose_s, nose_off) = r.nose_fix(sim, psi, nose_m, false);
+        assert!((nose_s - 117.6).abs() < 0.5, "the nose over the east leg: {nose_s:.1}");
+        assert!(nose_off < 0.0 && nose_off > -2.0, "a metre left of it: {nose_off:.1}");
+        let old = r.heading_err_deg(nlat, nlon, psi, sim.1 + nose_m, look);
+        let new = r.heading_err_deg(nlat, nlon, psi, nose_s, look);
+        assert!(old < -90.0, "the frame mix steered left: {old:.0}");
+        assert!(new > 0.0 && new < 90.0, "the nose fix steers right: {new:.0}");
+    }
+
+    /// A hold is reached with the NOSE behind the line, on a route that
+    /// bends in its last 18 m: the stop is the nose fix's, never the CG's
+    /// along plus the nose (EGKK hold Mike, an A330's nose 29.6 m past it,
+    /// 2026-10-15). A stand stops the nose ON its mark (EGPH, #320).
+    #[test]
+    fn a_hold_stops_the_nose_behind_the_line_and_a_stand_on_its_mark() {
+        let nose_m = 18.0;
+        // The CG for a nose at `nose_x` on a 10 m last leg, turning at 060.
+        let pose = |nose_x: f64| {
+            let psi = 60.0_f64.to_radians();
+            (nose_x - nose_m * psi.sin(), 100.0 - nose_m * psi.cos())
+        };
+        let mut hold = corner(10.0);
+        hold.stop_nose_behind_end(nose_m, NOSE_BEHIND_LINE_M);
+        let (x, y) = pose(10.0 - NOSE_BEHIND_LINE_M);
+        let (_, s, off) = hold.nose_fix(sim_fix(&hold, x, y), 60.0, nose_m, false);
+        assert!(hold.remaining(s).abs() < 0.1, "stopped: {:.2}", hold.remaining(s));
+        assert!(arrived_on_line(off), "{off:.1}");
+        assert_eq!(schedule_kts(10.0, &hold, s, 3.0), 0.0);
+        assert!(schedule_kts(10.0, &hold, s - 20.0, 8.0) > 2.0, "rolling 20 m before");
+
+        let mut stand = corner(10.0);
+        stand.stop_nose_behind_end(nose_m, 0.0);
+        let (x, y) = pose(10.0);
+        let (_, s, _) = stand.nose_fix(sim_fix(&stand, x, y), 60.0, nose_m, false);
+        assert!(stand.remaining(s).abs() < 0.1, "on the mark: {:.2}", stand.remaining(s));
+    }
+
+    /// No nose measured: the sim's own fix and the old margin, today's numbers.
+    #[test]
+    fn no_nose_is_the_sims_point_and_the_old_margin() {
+        let mut r = corner(100.0);
+        r.stop_nose_behind_end(0.0, NOSE_BEHIND_LINE_M);
+        assert_eq!(r.remaining(0.0), r.total - STOP_SHORT_M);
+        let sim = sim_fix(&r, 2.0, 92.0);
+        assert_eq!(r.nose_fix(sim, 60.0, 0.0, false), sim);
+        assert_eq!(r.nose_fix(sim, 60.0, 0.0, true), sim);
+    }
+
+    /// The traffic gap from the nose fix in a bend: a castoring 737 pivoted
+    /// to 090 with its CG 8 m before the corner has its nose 18 m along the
+    /// east leg, 8 m further than the CG's along plus 18 m.
+    #[test]
+    fn the_traffic_gap_is_measured_from_the_nose_fix() {
+        let r = corner(200.0);
+        let own = OwnSize::from_mtow(Some(79_000.0));
+        let (_, nose_s, _) = r.nose_fix(sim_fix(&r, 0.0, 92.0), 90.0, own.nose_m, false);
+        assert!((nose_s - 118.0).abs() < 0.5, "{nose_s:.1}");
+        let (lat, lon) = ll(60.0, 100.0);
+        let seen = [Seen {
+            callsign: "EZY12".into(),
+            lat,
+            lon,
+            v_east: 0.0,
+            v_north: 0.0,
+            tail_m: 20.0,
+        }];
+        // The drive's guard size: the nose already in the fix.
+        let guard = OwnSize { nose_m: 0.0, ..own };
+        let a = r.traffic_ahead(nose_s, 4.0, &guard, &seen).expect("ahead");
+        assert!((a.gap_m - 22.0).abs() < 0.5, "160 - 118 - 20: {a:?}");
     }
 
     /// LEMG's Alpha (2026-09-26, sortie 1790441293, a 737): an 80-degree

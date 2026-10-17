@@ -154,11 +154,15 @@ impl Tool for AutoTaxi {
             );
         };
         route.pace = self.pace;
-        // A holding point is reached with the nose behind the line; a stand
-        // is reached by the point the sim places us by.
-        if !party_line::taxi_to_stand() {
-            route.hold_nose_behind_end(autotaxi::OwnSize::read(ctx.xplane).await.nose_m);
-        }
+        // The drive stops the nose (`Route::nose_fix`): behind a hold line,
+        // on a stand's mark.
+        let nose_m = autotaxi::acf_nose_m().unwrap_or(0.0);
+        let behind_m = if party_line::taxi_to_stand() {
+            0.0
+        } else {
+            autotaxi::NOSE_BEHIND_LINE_M
+        };
+        route.stop_nose_behind_end(nose_m, behind_m);
         let (Ok(lat), Ok(lon), Ok(psi)) = (
             ctx.xplane.get_float(autotaxi::LAT).await,
             ctx.xplane.get_float(autotaxi::LON).await,
@@ -179,7 +183,8 @@ impl Tool for AutoTaxi {
                 (lateral / 10.0).round() as i64 * 10
             ));
         }
-        if route.remaining(progress) <= 1.0 {
+        let (_, nose_s, _) = route.nose_fix(((lat, lon), progress, lateral), psi, nose_m, true);
+        if route.remaining(nose_s) <= 1.0 {
             return Ok("We're already at the holding point.".to_string());
         }
         let err = route.heading_err_deg(lat, lon, psi, progress, 20.0);
