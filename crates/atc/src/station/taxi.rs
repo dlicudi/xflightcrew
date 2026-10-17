@@ -274,13 +274,14 @@ pub(crate) fn plan_vacate_from(
     lon: f64,
     psi_true: f64,
     runway: &str,
+    clear_m: f64,
 ) -> Option<nav::VacatePlan> {
     let net = TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
     let mut zone = vec![runway.to_string()];
     if let Some(r) = reciprocal_end(runway) {
         zone.push(r);
     }
-    net.plan_vacate(lat, lon, psi_true, &zone, nav::VACATE_CLEAR_M)
+    net.plan_vacate(lat, lon, psi_true, &zone, clear_m)
 }
 
 /// The other end of the same strip: "09L" -> "27R", "36" -> "18". `None` when

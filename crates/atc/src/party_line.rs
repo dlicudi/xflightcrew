@@ -872,14 +872,17 @@ pub fn taxi_to_stand() -> bool {
 /// it is the completion of the landing clearance the crew already holds. So
 /// the crew asks the world a question about pavement and gets an answer, with
 /// no controller in the loop and nothing to read back. The station can still
-/// never actuate; this returns geometry.
+/// never actuate; this returns geometry. `clear_m` past the runway's zone
+/// the route ends ([`crate::nav::VACATE_CLEAR_M`] plus what of the aircraft
+/// trails its stopping point).
 pub fn plan_vacate(
     lat: f64,
     lon: f64,
     psi_true: f64,
     runway: &str,
+    clear_m: f64,
 ) -> Option<crate::nav::VacatePlan> {
-    crate::station::plan_vacate_from(lat, lon, psi_true, runway)
+    crate::station::plan_vacate_from(lat, lon, psi_true, runway, clear_m)
 }
 
 /// The discrete squawk the controller assigned, if one has been — the crew dials

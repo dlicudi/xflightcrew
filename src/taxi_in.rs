@@ -334,7 +334,10 @@ async fn vacate(
         crate::blackbox::record("taxi_in", json!({ "event": "vacate_no_position" }));
         return VacateEnd::Carry;
     };
-    let Some(plan) = crate::party_line::plan_vacate(lat, lon, psi, rwy) else {
+    // The drive stops the NOSE (`Route::nose_fix`): the route runs on by the
+    // nose's length, so the aircraft behind it clears the zone as before (#320).
+    let clear_m = atc::nav::VACATE_CLEAR_M + crate::autotaxi::acf_nose_m().unwrap_or(0.0);
+    let Some(plan) = crate::party_line::plan_vacate(lat, lon, psi, rwy, clear_m) else {
         // No network, or no exit ahead. The taxi-in still runs; it just starts
         // from the runway as it always did.
         crate::blackbox::record("taxi_in", json!({ "event": "vacate_no_plan", "rwy": rwy }));
