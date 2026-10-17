@@ -972,7 +972,7 @@ impl Flight {
 
     fn step_rollout(&mut self, s: &Sample, ev: &mut Vec<Event>) {
         let t = s.t;
-        if !s.on_ground {
+        if !s.on_ground && self.read_after_touchdown() {
             // Off the wheels again: a bounce until it climbs away. A touch
             // and go climbs away; a bounce, however long, comes back down
             // (-107 fpm, airborne 6 s, down again, in the recorded flights).
@@ -1206,7 +1206,10 @@ impl Flight {
         if self.go(to, why, s.t, ev) {
             self.memory.landings += 1;
             self.memory.last_touchdown = Some(td);
-            self.off_again = !s.on_ground;
+            // The sample that books a witnessed contact was read across it:
+            // airborne, it may be the height before the wheels met, never
+            // proof they left (`read_after_touchdown`).
+            self.off_again = !s.on_ground && self.read_after_touchdown();
             self.recent.clear();
             ev.push(Event::Touchdown(td));
         }
@@ -1232,6 +1235,19 @@ impl Flight {
             gs_kts: s.gs_kts,
             lat: s.lat,
             lon: s.lon,
+        }
+    }
+
+    /// This sample was read wholly after the last touchdown: the tick's
+    /// reads happen between the previous sample and this one, so a contact
+    /// inside that span may postdate them. Autoland's witness booked three
+    /// 737 contacts at EGPH (2026-10-17) and the monitor's next sample, read
+    /// before them, still said 3.7 ft and airborne: three bounces the wheels
+    /// never made, and the crew apologised for each.
+    fn read_after_touchdown(&self) -> bool {
+        match (self.memory.last_touchdown, self.last.as_ref()) {
+            (Some(td), Some(prev)) => prev.t >= td.t,
+            _ => true,
         }
     }
 
@@ -2225,6 +2241,20 @@ mod tests {
         let (s, _) = r.feed(&state(31.0, true, 44.0)).unwrap();
         assert_eq!(s.crashed, Some(true));
         assert_eq!(r.flight.abnormal(), &Abnormal::Crashed);
+    }
+
+    /// EGPH 24 (737, 1792227611, 2026-10-17): the witness booked the
+    /// contact at t, the monitor's next sample, read before it, still said
+    /// 3.7 ft and airborne, then the wheels read on: no bounce.
+    #[test]
+    fn a_sample_read_before_the_witnessed_contact_is_no_bounce() {
+        let mut v: Vec<Sample> = (0..5).map(|t| air(t as f64, 40.0 - t as f64 * 9.0, -175.0, 130.0)).collect();
+        let contact = Some(Contact { t: 4.9, sink_fpm: 175.0 });
+        v.push(Sample { contact, ..air(5.1, 3.7, -175.0, 129.0) });
+        v.extend((6..30).map(|t| Sample { contact, ..ground(t as f64, 129.0 - (t - 6) as f64 * 5.0, true) }));
+        let (_, f, ev) = phases(v);
+        assert_eq!(f.memory().landings, 1);
+        assert_eq!(f.memory().bounces, 0, "{ev:?}");
     }
 
     #[test]
