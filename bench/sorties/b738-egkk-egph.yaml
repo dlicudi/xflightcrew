@@ -1,0 +1,15 @@
+# The whole 737 flight EGKK to EGPH on the SimBrief plan, gate to gate:
+# confirms the 2026-10-16 fixes (#321 bank and flare, #320/#319 taxi at
+# EGPH, #313 takeoff engage, #317 TECS, #315 approach speed, #308, #257,
+# #294, #289) and records the rollout's yaw rate for #322.
+#   xfc sortie bench/sorties/b738-egkk-egph.yaml --check
+#   xfc sortie bench/sorties/b738-egkk-egph.yaml
+after: park
+
+cases:
+  - name: B738 EGKK to EGPH, the flight plan from the ramp
+    setup:
+      aircraft: "Aircraft/Laminar Research/Boeing 737-800/b738.acf"
+      ramp: { field: EGKK }
+    command: fly the flight plan
+    deadline_min: 150
