@@ -266,11 +266,6 @@
             ),
             (
                 "autoland",
-                "APPROACH_FAST_KTS",
-                "MARGIN: over the approach speed",
-            ),
-            (
-                "autoland",
                 "CLIMB_SPEED_MARGIN_KTS",
                 "MARGIN: surplus before a climb engages",
             ),

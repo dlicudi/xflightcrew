@@ -1,8 +1,8 @@
     use super::{approach_power_floor, ApproachPhase::*};
 
-    /// The 737 (thrust floor 0.3): on final at Vref the lever never goes
-    /// under 0.3; 20 kt fast it may idle; a piston with no floor idles; a
-    /// reposition under 500 ft is full power whatever the speed.
+    /// The 737 (thrust floor 0.3): on final at or under Vref the lever never
+    /// goes under 0.3; fast by any amount it may idle; a piston with no floor
+    /// idles; a reposition under 500 ft is full power whatever the speed.
     #[test]
     fn the_lever_floor_follows_the_phase_and_the_airframe() {
         assert_eq!(
@@ -10,8 +10,12 @@
             0.3
         );
         assert_eq!(
-            approach_power_floor(Final, 300.0, -6.0, Some(0.3), true),
+            approach_power_floor(Final, 300.0, 4.0, Some(0.3), true),
             0.3
+        );
+        assert_eq!(
+            approach_power_floor(Final, 300.0, -1.0, Some(0.3), true),
+            0.1
         );
         assert_eq!(
             approach_power_floor(Final, 300.0, -20.0, Some(0.3), true),
@@ -34,7 +38,8 @@
     /// to 164 kt for a minute with the lever flipping 0.1 and 0.3 on the
     /// ten-knot edge (0.3 on a 3 degree path with flaps 10 accelerates it).
     /// Short of the landing flaps the speed law may idle; with them out the
-    /// floor stands as before. An airframe with no floor never had one.
+    /// floor stands at or under the target. An airframe with no floor never
+    /// had one.
     #[test]
     fn the_thrust_floor_is_the_landing_configurations() {
         // 161 kt against the flaps-10 floor of 152: nine knots fast.
@@ -43,7 +48,7 @@
             0.1
         );
         assert_eq!(
-            approach_power_floor(Final, 1200.0, -9.0, Some(0.3), true),
+            approach_power_floor(Final, 1200.0, 0.0, Some(0.3), true),
             0.3
         );
         assert_eq!(approach_power_floor(Final, 1200.0, -9.0, None, false), 0.1);
@@ -197,4 +202,69 @@
         let circuit = crate::test_support::module_source("circuit");
         assert!(circuit.contains("descent_shape.steep().then(|| descent_shape.glidepath_deg())"));
         assert!(!circuit.contains("HandDown::visual_segment("));
+    }
+
+    /// The 737's speed on a 3 degree final in the landing flap, FITTED to
+    /// EGPH 06 (sortie 1792238650-approach, 2026-10-17, 51.9 t, 3.8 nm to
+    /// 60 ft, 10-tick means): level, -1.96 + 3.0 kt/s a unit of lever at
+    /// 138 kt (rms 0.23), so 0.32 is the path's own power there. The drag
+    /// part scales with the square of the speed, the engine 2.5 s behind the
+    /// lever, the law (the flight's book TECS, 6,000 fpm a unit) at the
+    /// flight's 0.27 s tick under `approach_power_floor`. A heavier aircraft
+    /// is the same plant needing `trim` at `ref_kts`. Returns the speed and
+    /// the lever, a tick each.
+    fn final_on_the_floor(ref_kts: f64, trim: f64, from_kts: f64, target: f64, secs: f64) -> (Vec<f64>, Vec<f64>) {
+        use crate::pilot::energy::{EnergyThrottle, In, Tecs};
+        const PER_UNIT: f64 = 3.0;
+        let tecs = Tecs { fpm_per_unit: 6_000.0, spool_s: 2.5 };
+        let (dt, tick) = (0.05, 0.27);
+        let slope = 32.174 / 1.687_81 * 3f64.to_radians().sin();
+        let level = -(slope + PER_UNIT * trim);
+        let mut law = EnergyThrottle::default();
+        let (mut v, mut thrust, mut thr, mut t, mut next, mut prev) = (from_kts, 0.3, 0.3, 0.0, 0.0, from_kts);
+        let (mut kts, mut lever) = (vec![], vec![]);
+        while t < secs {
+            let path_vs = -v * 1.687_81 * 60.0 * 3f64.to_radians().sin();
+            if t >= next {
+                let i = In { ias_kts: v, accel_kts_s: (v - prev) / tick, vs_fpm: path_vs, target_kts: target, floor_kts: Some(target - 6.0), path_vs_fpm: path_vs, thr_now: thr, dt: tick, flare_to_wheels_s: None };
+                let floor = approach_power_floor(Final, 500.0, target - v, Some(0.3), true);
+                thr = law.step(i, tecs).lever.clamp(floor, 1.0);
+                prev = v;
+                next += tick;
+                kts.push(v);
+                lever.push(thr);
+            }
+            thrust += (thr - thrust) * dt / tecs.spool_s;
+            v += (level * (v / ref_kts).powi(2) + PER_UNIT * thrust + slope) * dt;
+            t += dt;
+        }
+        (kts, lever)
+    }
+
+    /// EGPH 06, 2026-10-17: 137 to 139 kt against 129 from 1,000 ft to the
+    /// flare, the lever on the 0.3 floor, 10 s of float. On its fitted plant
+    /// the floor standing ten knots fast holds 136 kt; fast is TECS's to
+    /// idle, and from the flight's 138 kt (or 150) the speed is inside 2 kt
+    /// of 129 within 60 s, then 129.0 to 129.8, the floor catching the
+    /// lever (0.23 to 0.30) only as it touches the target: no 0.1 / 0.3
+    /// flip. A heavy 737 (LFLL's 0.4 at Vref) slow at 138 against 145
+    /// never sits under 0.3 and arrives without falling further.
+    #[test]
+    fn fast_on_final_is_tecs_to_idle_and_the_floor_never_arrives_slow() {
+        let tick = 0.27;
+        for from in [138.0, 150.0] {
+            let (k, l) = final_on_the_floor(138.0, 0.32, from, 129.0, 140.0);
+            let settled = k.iter().position(|v| (v - 129.0).abs() < 2.0).map(|i| i as f64 * tick);
+            assert!(settled.is_some_and(|s| s < 60.0), "from {from}: settled at {settled:?}");
+            let after = (60.0 / tick) as usize;
+            assert!(k[after..].iter().all(|v| (v - 129.0).abs() < 2.0), "from {from}: {:?}", &k[after..]);
+            let last = k.len() - (40.0 / tick) as usize;
+            assert!(k[last..].iter().all(|v| (v - 129.0).abs() < 1.0), "from {from}: {:?}", &k[last..]);
+            let worst_step = l[after..].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
+            assert!(worst_step < 0.1, "from {from}: the lever stepped {worst_step:.2}");
+        }
+        let (k, l) = final_on_the_floor(145.0, 0.4, 138.0, 145.0, 140.0);
+        assert!(k.iter().all(|v| *v >= 137.9), "fell under the start");
+        assert!(l.iter().all(|x| *x >= 0.3), "under the floor slow");
+        assert!(k[k.len() / 2..].iter().all(|v| (v - 145.0).abs() < 1.5), "{:?}", k.last());
     }
